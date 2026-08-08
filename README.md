@@ -11,9 +11,9 @@
   <strong>把鼠标交给键盘：轻量、原生、可配置。</strong>
 </p>
 
-KeySteer 是 Windows 和 macOS 上的使用键盘操控鼠标工具。
+KeySteer 是 Windows 和 macOS 上的使用键盘操控鼠标工具。 
 
-在线文档位于 <https://dccif.github.io/KeySteer/>。
+[在线文档](https://dccif.github.io/KeySteer/)。
 
 ## 功能
 

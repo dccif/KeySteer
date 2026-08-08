@@ -12,17 +12,16 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
-    ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessageW, HCURSOR, HICON,
     IDI_APPLICATION, LoadIconW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND,
     MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, PostMessageW, PostThreadMessageW,
-    RegisterClassExW, RegisterWindowMessageW, SW_SHOWNORMAL, SetForegroundWindow, TPM_BOTTOMALIGN,
-    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP,
-    WM_CANCELMODE, WM_DISPLAYCHANGE, WM_LBUTTONUP, WM_NULL, WM_QUIT, WM_RBUTTONUP,
-    WM_SETTINGCHANGE, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CANCELMODE,
+    WM_DISPLAYCHANGE, WM_LBUTTONUP, WM_NULL, WM_QUIT, WM_RBUTTONUP, WM_SETTINGCHANGE, WNDCLASSEXW,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -46,6 +45,7 @@ static DISPLAY_CHANGED: AtomicBool = AtomicBool::new(false);
 static APPEARANCE_CHANGED: AtomicBool = AtomicBool::new(false);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static UPDATE_UI_VISIBLE: AtomicBool = AtomicBool::new(false);
+const UPDATE_UI_THREAD_STACK_BYTES: usize = 256 * 1024;
 
 struct UpdateUiGuard;
 
@@ -406,10 +406,21 @@ pub(super) fn present_update_result(result: &UpdateCheckResult) -> Result<(), St
     let result = result.clone();
     std::thread::Builder::new()
         .name("keysteer-update-ui".into())
+        .stack_size(UPDATE_UI_THREAD_STACK_BYTES)
         .spawn(move || {
             let _guard = guard;
             let presentation = match result {
-                UpdateCheckResult::UpdateAvailable { url, .. } => open_url(&url),
+                UpdateCheckResult::UpdateDownloaded {
+                    current,
+                    latest,
+                    path,
+                } => show_message(
+                    &format!(
+                        "KeySteer {latest} was downloaded successfully.\n\nSaved to:\n{}\n\nQuit KeySteer, extract the ZIP, and replace version {current} when ready.",
+                        path.display()
+                    ),
+                    false,
+                ),
                 UpdateCheckResult::UpToDate { current } => show_message(
                     &format!("KeySteer {current} is already the latest version."),
                     false,
@@ -424,28 +435,6 @@ pub(super) fn present_update_result(result: &UpdateCheckResult) -> Result<(), St
         })
         .map(|_| ())
         .map_err(|error| format!("cannot start Windows update UI: {error}"))
-}
-
-fn open_url(url: &str) -> Result<(), String> {
-    let url = wide(url);
-    let result = unsafe {
-        ShellExecuteW(
-            None,
-            w!("open"),
-            PCWSTR(url.as_ptr()),
-            None,
-            None,
-            SW_SHOWNORMAL,
-        )
-    };
-    if result.0 as isize <= 32 {
-        Err(format!(
-            "ShellExecuteW could not open the release page ({:?})",
-            result.0
-        ))
-    } else {
-        Ok(())
-    }
 }
 
 fn show_message(message: &str, is_error: bool) -> Result<(), String> {

@@ -9,6 +9,7 @@ use super::command::{ButtonAction, FocusedApp, MouseButton, UiScanRequest, UiSca
 use super::geometry::{Point, Screen};
 use super::input::{InputEvent, Key};
 use super::overlay::OverlayScene;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,10 +55,10 @@ pub enum UpdateCheckResult {
     UpToDate {
         current: String,
     },
-    UpdateAvailable {
+    UpdateDownloaded {
         current: String,
         latest: String,
-        url: String,
+        path: PathBuf,
     },
     Failed(String),
 }

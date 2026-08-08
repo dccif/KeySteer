@@ -177,9 +177,6 @@ export default defineComponent({
                   </a>
                 ))}
               </div>
-              <a class="hero-download-all" href={RELEASE_URL} target="_blank" rel="noopener" onClick={closeMenu}>
-                查看 {RELEASE_TAG} Release →
-              </a>
               <a class="hero-download-all" href={RELEASES_URL} target="_blank" rel="noopener" onClick={closeMenu}>
                 查看全部 Release →
               </a>

@@ -11,9 +11,9 @@ use objc2::{
 use objc2_app_kit::{
     NSAlert, NSApplication, NSApplicationActivationPolicy, NSControlStateValueOff,
     NSControlStateValueOn, NSImage, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem,
-    NSVariableStatusItemLength, NSWorkspace,
+    NSVariableStatusItemLength,
 };
-use objc2_foundation::{NSData, NSSize, NSString, NSURL};
+use objc2_foundation::{NSData, NSSize, NSString};
 
 use crate::api::Autostart;
 use crate::api::backend::{BackendEvent, UpdateCheckResult};
@@ -186,7 +186,17 @@ impl StatusItem {
         result: &UpdateCheckResult,
     ) -> Result<(), String> {
         match result {
-            UpdateCheckResult::UpdateAvailable { url, .. } => open_url(url),
+            UpdateCheckResult::UpdateDownloaded {
+                current,
+                latest,
+                path,
+            } => self.show_alert(
+                "KeySteer update downloaded",
+                &format!(
+                    "KeySteer {latest} was saved to {}. Quit KeySteer, extract the ZIP, then move the new app to Applications to replace version {current}.",
+                    path.display()
+                ),
+            ),
             UpdateCheckResult::UpToDate { current } => self.show_alert(
                 "KeySteer is up to date",
                 &format!("KeySteer {current} is already the latest version."),
@@ -216,16 +226,6 @@ impl StatusItem {
             self._target.show_update_alert(alert);
         });
         Ok(())
-    }
-}
-
-fn open_url(url: &str) -> Result<(), String> {
-    let url = NSURL::URLWithString(&NSString::from_str(url))
-        .ok_or_else(|| "GitHub release URL is invalid".to_string())?;
-    if NSWorkspace::sharedWorkspace().openURL(&url) {
-        Ok(())
-    } else {
-        Err("macOS could not open the GitHub release page".into())
     }
 }
 
