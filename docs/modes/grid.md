@@ -1,6 +1,16 @@
 # Grid 网格模式
 
+<script setup>
+import ModeVideo from '../.vitepress/components/ModeVideo'
+</script>
+
 Grid 把当前显示器划分成带标签的网格。
+
+<ModeVideo
+  file="grid.mp4"
+  title="Grid 模式演示"
+  description="展示一级大标签与内部二级预览，以及连续输入标签完成快速定位。"
+/>
 
 从 Normal 按 `g` 进入。默认布局为 5 列 × 4 行：
 

@@ -1,8 +1,18 @@
 # Normal 普通模式
 
+<script setup>
+import ModeVideo from '../.vitepress/components/ModeVideo'
+</script>
+
 Normal 可能是最常用和简单上手的：直接移动鼠标、滚动、点击、拖拽，并进入三种定位模式。按 `Primary+E` 从 Idle 进入
 
 在 Normal 中，已绑定的键会被接管，不会输入到当前应用。
+
+<ModeVideo
+  file="normal.mp4"
+  title="Normal 模式演示"
+  description="展示键盘移动鼠标、速度修饰、滚动和常用点击操作。"
+/>
 
 ## 默认按键
 

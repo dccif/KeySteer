@@ -1098,3 +1098,33 @@
   margin-top: 6px;
   padding-top: 9px;
 }
+.mode-video {
+  margin: 1.5rem 0 2rem;
+  overflow: hidden;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 12px;
+  background: var(--vp-c-bg-soft);
+  box-shadow: var(--vp-shadow-1);
+}
+
+.mode-video-player {
+  display: block;
+  width: 100%;
+  max-height: min(70vh, 720px);
+  background: #080a0f;
+  object-fit: contain;
+}
+
+.mode-video figcaption {
+  display: grid;
+  gap: 0.25rem;
+  padding: 0.8rem 1rem 0.9rem;
+  color: var(--vp-c-text-2);
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.mode-video figcaption strong {
+  color: var(--vp-c-text-1);
+  font-size: 0.95rem;
+}

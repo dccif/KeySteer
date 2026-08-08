@@ -1,6 +1,16 @@
 # Recursive Grid 递归网格
 
+<script setup>
+import ModeVideo from '../.vitepress/components/ModeVideo'
+</script>
+
 Recursive Grid 会在当前区域中反复细分，像逐层放大的地图。它适合小图标、细小按钮、画布对象，以及需要连续操作同一区域的场景。
+
+<ModeVideo
+  file="recursivegrid.mp4"
+  title="Recursive Grid 模式演示"
+  description="展示在当前区域逐层细分、回退和继续定位细小目标。"
+/>
 
 从 Normal 按 `f` 进入，默认是 3 × 3：
 

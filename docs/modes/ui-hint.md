@@ -1,6 +1,16 @@
 # UI Hint 标签模式
 
+<script setup>
+import ModeVideo from '../.vitepress/components/ModeVideo'
+</script>
+
 UI Hint 会为屏幕上的可交互元素显示短标签。它适合按钮、链接、菜单、复选框、输入框、滑块和列表项；输入标签即可定位，不必估算坐标。
+
+<ModeVideo
+  file="uihint.mp4"
+  title="UI Hint 模式演示"
+  description="展示扫描界面元素、输入标签筛选并把鼠标定位到目标控件。"
+/>
 
 从 Normal 按 `Primary+F` 进入。默认只定位，不自动点击：标签命中后先移动鼠标，再用 `Normal`状态的点击键确认。
 

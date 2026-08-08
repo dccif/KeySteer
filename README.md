@@ -25,6 +25,15 @@ KeySteer 是 Windows 和 macOS 上的使用键盘操控鼠标工具。
 - **多显示器**：`Primary+S` 切换到下一块显示器；Grid 与 Recursive Grid 可保留当前定位路径。
 - **外观与配置**：Grid/Hint 标签样式、光标旁模式和点击指示器等可通过 TOML 调整。
 
+## 视频演示
+
+| 模式 | 演示内容 | 视频 |
+| --- | --- | --- |
+| Normal | 键盘移动、速度修饰、滚动与点击 | [Normal 演示](docs/public/video/normal.mp4) |
+| Grid | 一级大标签、二级预览与二键快速定位 | [Grid 演示](docs/public/video/grid.mp4) |
+| Recursive Grid | 逐层细分、回退与精确定位 | [Recursive Grid 演示](docs/public/video/recursivegrid.mp4) |
+| UI Hint | 扫描界面元素、标签筛选与控件定位 | [UI Hint 演示](docs/public/video/uihint.mp4) |
+
 ## 默认按键
 
 先按 `Primary+E` 进入 Normal。默认配置中的 `Primary` 为：macOS Command、Windows 左 Alt、Linux Ctrl；可在 `[key_aliases]` 改成自己的习惯。
