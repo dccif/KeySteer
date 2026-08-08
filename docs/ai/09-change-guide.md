@@ -17,7 +17,7 @@
 | 修改覆盖层性能 | 两端 `overlay.rs` | `OverlayScene` equality、dismiss 内存、DPI/Retina |
 | 修改状态栏/开机启动 | 两端 `status_item.rs`/`autostart.rs` | `BackendEvent`、打包应用身份 |
 | 修改配置路径 | `app/paths.rs`, `config::discover` | packaged app 与 portable tests、README |
-| 修改打包 | `packaging/<os>/`、`build.rs` | CI + release matrix、图标/签名/checksum |
+| 修改打包 | `packaging/<os>/`、`build.rs` | CI + release matrix、图标/签名、仅发布平台 ZIP |
 | 修改网页模拟器 | `docs/.vitepress/components/ConfigStudio.tsx` | style controls、Node tests、typecheck/build |
 
 ## 跨层改动顺序

@@ -54,9 +54,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: KeySteer-Windows-x64
-          path: |
-            dist/x86_64-pc-windows-msvc/*.zip
-            dist/x86_64-pc-windows-msvc/*.sha256
+          path: dist/x86_64-pc-windows-msvc/*.zip
           if-no-files-found: error
           retention-days: 30
 
@@ -64,9 +62,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: KeySteer-Windows-ARM64
-          path: |
-            dist/aarch64-pc-windows-msvc/*.zip
-            dist/aarch64-pc-windows-msvc/*.sha256
+          path: dist/aarch64-pc-windows-msvc/*.zip
           if-no-files-found: error
           retention-days: 30
 
@@ -102,9 +98,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: KeySteer-macOS-Apple-Silicon
-          path: |
-            dist/aarch64-apple-darwin/*.zip
-            dist/aarch64-apple-darwin/*.sha256
+          path: dist/aarch64-apple-darwin/*.zip
           if-no-files-found: error
           retention-days: 30
 
@@ -112,9 +106,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: KeySteer-macOS-Intel
-          path: |
-            dist/x86_64-apple-darwin/*.zip
-            dist/x86_64-apple-darwin/*.sha256
+          path: dist/x86_64-apple-darwin/*.zip
           if-no-files-found: error
           retention-days: 30
 
@@ -147,7 +139,7 @@ jobs:
         shell: bash
         run: |
           test "$(find release-assets -maxdepth 1 -name '*.zip' | wc -l)" -eq 4
-          test "$(find release-assets -maxdepth 1 -name '*.sha256' | wc -l)" -eq 4
+          test "$(find release-assets -maxdepth 1 -name '*.sha256' | wc -l)" -eq 0
           find release-assets -maxdepth 1 -type f -printf '%f\n' | sort
 
       - name: Create GitHub Release
@@ -165,4 +157,4 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "KeySteer v$VERSION" \
             --generate-notes \
-            release-assets/*.zip release-assets/*.sha256
+            release-assets/*.zip

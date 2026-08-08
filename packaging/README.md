@@ -17,7 +17,7 @@ bash packaging/macos/package.sh
 
 Pass `aarch64-apple-darwin` or `x86_64-apple-darwin` to build a specific target.
 The script builds an optimized binary, creates and signs `KeySteer.app`, embeds
-the icon, and produces a ZIP plus SHA-256 file under `dist/<target>/`.
+the icon, and produces one versioned ZIP under `dist/<target>/`.
 
 Local builds use an ad-hoc signature. A public release should provide a stable
 Developer ID identity so Accessibility and Screen Recording permissions remain
@@ -44,7 +44,7 @@ Run in PowerShell; the host architecture is selected automatically:
 
 Pass `x86_64-pc-windows-msvc` or `aarch64-pc-windows-msvc` for a specific
 target. The output is a portable ZIP containing the icon-bearing, GUI-subsystem
-`KeySteer.exe`, plus its SHA-256 file under `dist/<target>/`.
+`KeySteer.exe` under `dist/<target>/`.
 
 ### Benchmark the unpacked Windows package
 
@@ -65,6 +65,7 @@ application-settle window, not a readiness metric.
 
 ## GitHub releases
 
-CI calls the same scripts. Pushing a tag such as `v0.1.0` builds all four
-archives and publishes them to a GitHub Release. Optional macOS signing secrets
-are documented by the variable names in `.github/workflows/release.yml`.
+CI calls the same scripts. A manual all-platform build creates the Cargo-versioned
+tag and publishes exactly the four platform ZIPs to a GitHub Release. Optional
+macOS signing secrets are documented by the variable names in
+`.github/workflows/build.yml`.

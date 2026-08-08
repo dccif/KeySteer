@@ -17,7 +17,7 @@ case "$target" in
   *) echo "unsupported macOS target: $target" >&2; exit 2 ;;
 esac
 
-for tool in cargo codesign ditto iconutil plutil sips shasum; do
+for tool in cargo codesign ditto iconutil plutil sips; do
   command -v "$tool" >/dev/null || {
     echo "required packaging tool is missing: $tool" >&2
     exit 1
@@ -46,13 +46,13 @@ test -f "$default_config"
 version="$(awk -F '"' '/^version = / { print $2; exit }' "$project_root/Cargo.toml")"
 [[ -n "$version" ]] || { echo "cannot read package version" >&2; exit 1; }
 archive="$dist/KeySteer-v$version-$target.zip"
-checksum="$archive.sha256"
 legacy_archive="$dist/KeySteer-$target.zip"
+stale_checksum="$archive.sha256"
 legacy_checksum="$legacy_archive.sha256"
 
 mkdir -p "$dist"
 rm -rf "$app" "$payload" "$iconset"
-rm -f "$archive" "$checksum" "$legacy_archive" "$legacy_checksum"
+rm -f "$archive" "$stale_checksum" "$legacy_archive" "$legacy_checksum"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$iconset"
 trap 'rm -rf "$iconset"' EXIT
 
@@ -101,12 +101,8 @@ cp "$default_config" "$payload/keysteer.default.toml"
 app="$payload/KeySteer.app"
 
 make_archive() {
-  rm -f "$archive" "$checksum"
+  rm -f "$archive" "$stale_checksum"
   ditto -c -k --sequesterRsrc --keepParent "$payload" "$archive"
-  (
-    cd "$dist"
-    shasum -a 256 "$(basename "$archive")" > "$(basename "$checksum")"
-  )
 }
 
 make_archive
@@ -140,4 +136,3 @@ elif [[ -n "${APPLE_ID:-}" || -n "${APPLE_TEAM_ID:-}" || -n "${APPLE_APP_PASSWOR
 fi
 
 echo "$archive"
-echo "$checksum"

@@ -68,15 +68,14 @@ else {
 $dist = Join-Path $projectRoot "dist\$Target"
 $payload = Join-Path $dist "KeySteer"
 $archive = Join-Path $dist "KeySteer-v$version-$Target.zip"
-$checksum = "$archive.sha256"
 $legacyArchive = Join-Path $dist "KeySteer-$Target.zip"
-$legacyChecksum = "$legacyArchive.sha256"
+$staleChecksums = @("$archive.sha256", "$legacyArchive.sha256")
 
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 if (Test-Path -LiteralPath $payload) {
     Remove-Item -LiteralPath $payload -Recurse -Force
 }
-foreach ($path in @($archive, $checksum, $legacyArchive, $legacyChecksum)) {
+foreach ($path in @($archive, $legacyArchive) + $staleChecksums) {
     if (Test-Path -LiteralPath $path) {
         Remove-Item -LiteralPath $path -Force
     }
@@ -88,22 +87,4 @@ Copy-Item -LiteralPath $defaultConfig -Destination (Join-Path $payload "keysteer
 Compress-Archive -LiteralPath $payload `
     -DestinationPath $archive -CompressionLevel Optimal
 
-$stream = [System.IO.File]::OpenRead($archive)
-try {
-    $sha256 = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $hashBytes = $sha256.ComputeHash($stream)
-    }
-    finally {
-        $sha256.Dispose()
-    }
-}
-finally {
-    $stream.Dispose()
-}
-$hash = ([System.BitConverter]::ToString($hashBytes) -replace "-", "").ToLowerInvariant()
-$line = "$hash  $(Split-Path -Leaf $archive)"
-[System.IO.File]::WriteAllText($checksum, "$line`n", [System.Text.Encoding]::ASCII)
-
 Write-Output $archive
-Write-Output $checksum
