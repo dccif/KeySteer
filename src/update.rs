@@ -30,10 +30,7 @@ pub(crate) fn check_async(
 }
 
 fn check_latest_release() -> Result<UpdateCheckResult, String> {
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(REQUEST_TIMEOUT))
-        .build();
-    let agent: ureq::Agent = config.into();
+    let agent: ureq::Agent = update_agent_config().into();
     let release: LatestRelease = agent
         .get(LATEST_RELEASE_API)
         .header("Accept", "application/vnd.github+json")
@@ -48,6 +45,18 @@ fn check_latest_release() -> Result<UpdateCheckResult, String> {
         .map_err(|error| format!("cannot read GitHub release response: {error}"))?;
 
     compare_versions(env!("CARGO_PKG_VERSION"), &release.tag_name)
+}
+
+fn update_agent_config() -> ureq::config::Config {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(REQUEST_TIMEOUT))
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .build()
 }
 
 fn compare_versions(current: &str, latest_tag: &str) -> Result<UpdateCheckResult, String> {
@@ -73,6 +82,20 @@ fn compare_versions(current: &str, latest_tag: &str) -> Result<UpdateCheckResult
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_agent_uses_the_enabled_native_tls_provider() {
+        let config = update_agent_config();
+
+        assert_eq!(
+            config.tls_config().provider(),
+            ureq::tls::TlsProvider::NativeTls
+        );
+        assert!(matches!(
+            config.tls_config().root_certs(),
+            &ureq::tls::RootCerts::PlatformVerifier
+        ));
+    }
 
     #[test]
     fn newer_release_is_available() {

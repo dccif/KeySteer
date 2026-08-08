@@ -36,6 +36,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 semver = "1.0"
 toml = "1.1.4"
 toml_edit = "0.24"
+# update.rs must explicitly select NativeTls because ureq defaults to Rustls.
 ureq = { version = "3.3", default-features = false, features = ["json", "native-tls"] }
 
 # ---------------------------------------------------------------------------
