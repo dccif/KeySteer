@@ -422,8 +422,18 @@ fn download_to(
     drop(file);
     Ok(DownloadReceipt {
         bytes,
-        sha256: format!("{:x}", hasher.finalize()),
+        sha256: hex_encode(hasher.finalize().as_ref()),
     })
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 fn download_percent(received: u64, total: u64) -> u8 {
@@ -623,6 +633,11 @@ mod tests {
         assert_eq!(download_percent(11, 10), 100);
         assert_eq!(download_percent(u64::MAX, u64::MAX), 100);
         assert_eq!(download_percent(10, 0), 0);
+    }
+
+    #[test]
+    fn sha256_hex_encoding_is_lowercase_and_zero_padded() {
+        assert_eq!(hex_encode(&[0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
     }
 
     #[test]
