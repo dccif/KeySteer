@@ -1,4 +1,5 @@
 import { computed, defineComponent, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { withBase } from 'vitepress'
 import { parse, stringify } from 'smol-toml'
 import {
   MOVEMENT_ACTIONS,
@@ -177,7 +178,7 @@ export default defineComponent({
 
     async function loadDefault(): Promise<void> {
       try {
-        const response = await fetch('/generated/keysteer.default.toml')
+        const response = await fetch(withBase('/generated/keysteer.default.toml'))
         if (!response.ok) throw new Error(`HTTP ${response.status}`)
         defaultSource.value = await response.text()
         document.value = parse(defaultSource.value) as ConfigDocument

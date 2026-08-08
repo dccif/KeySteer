@@ -1,5 +1,8 @@
 # KeySteer
 
+[![文档部署](https://github.com/dccif/KeySteer/actions/workflows/pages.yml/badge.svg)](https://github.com/dccif/KeySteer/actions/workflows/pages.yml)
+[![手动构建](https://github.com/dccif/KeySteer/actions/workflows/build.yml/badge.svg)](https://github.com/dccif/KeySteer/actions/workflows/build.yml)
+
 <p align="center">
   <img src="assets/brand/keysteer-wordmark.webp" alt="KeySteer" width="760">
 </p>
@@ -10,7 +13,7 @@
 
 KeySteer 是 Windows 和 macOS 上的原生键盘鼠标工具。它用键盘驱动指针、滚轮和鼠标按钮，也提供 Grid、Recursive Grid 与 UI Hint 三种定位方式。输入、覆盖层、辅助功能扫描和显示帧同步都直接使用系统 API；不带 WebView，也不需要浏览器运行时。
 
-完整使用文档在 [`docs/`](docs/index.md)，其中包含[快速上手](docs/guide/getting-started.md)、[配置参考](docs/reference/configuration.md)、[动作参考](docs/reference/modes-and-actions.md)和[开发文档](docs/development/architecture.md)。
+在线文档位于 <https://dccif.github.io/KeySteer/>。仓库中的 [`docs/`](docs/index.md) 包含[快速上手](docs/guide/getting-started.md)、[配置参考](docs/reference/configuration.md)、[动作参考](docs/reference/modes-and-actions.md)和[开发文档](docs/development/architecture.md)。
 
 ## 功能
 

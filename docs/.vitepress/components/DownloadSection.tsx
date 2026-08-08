@@ -1,4 +1,5 @@
 import { defineComponent, onBeforeUnmount, onMounted, ref } from 'vue'
+import { withBase } from 'vitepress'
 
 interface DownloadAsset {
   key: string
@@ -9,8 +10,8 @@ interface DownloadAsset {
   fileName: string
 }
 
-const RELEASES_URL = 'https://github.com/dccif/mousemover/releases'
-const LATEST_RELEASE_URL = 'https://github.com/dccif/mousemover/releases/latest'
+const RELEASES_URL = 'https://github.com/dccif/KeySteer/releases'
+const LATEST_RELEASE_URL = 'https://github.com/dccif/KeySteer/releases/latest'
 
 const ASSETS: DownloadAsset[] = [
   {
@@ -184,8 +185,8 @@ export default defineComponent({
             </div>
           )}
         </div>
-        <a class="hero-action-link" href="/guide/getting-started">快速开始</a>
-        <a class="hero-action-link" href="/development/architecture">一起开发</a>
+        <a class="hero-action-link" href={withBase('/guide/getting-started')}>快速开始</a>
+        <a class="hero-action-link" href={withBase('/development/architecture')}>一起开发</a>
       </div>
     )
   },

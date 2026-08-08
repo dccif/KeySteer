@@ -1,14 +1,17 @@
 import vueJsx from '@vitejs/plugin-vue-jsx'
 import { withMermaid } from 'vitepress-plugin-mermaid'
 
+const base = process.env.KEYSTEER_DOCS_BASE || '/'
+
 export default withMermaid({
+  base,
   lang: 'zh-CN',
   title: 'KeySteer',
   description: '用键盘操控鼠标的原生小工具：快、轻量、可定制。',
   cleanUrls: true,
   ignoreDeadLinks: [/^\/generated\//],
   head: [
-    ['link', { rel: 'icon', type: 'image/png', href: '/generated/keysteer-icon.png' }],
+    ['link', { rel: 'icon', type: 'image/png', href: `${base}generated/keysteer-icon.png` }],
     ['meta', { name: 'theme-color', content: '#6578d4' }],
   ],
   vite: {
@@ -65,7 +68,7 @@ export default withMermaid({
         items: [{ text: '配置与模拟器', link: '/editor/' }],
       },
     ],
-    socialLinks: [{ icon: 'github', link: 'https://github.com/dccif/mousemover' }],
+    socialLinks: [{ icon: 'github', link: 'https://github.com/dccif/KeySteer' }],
     search: {
       provider: 'local',
       options: {

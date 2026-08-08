@@ -5,6 +5,9 @@ edition = "2024"
 rust-version = "1.97"
 license = "GPL-3.0-or-later"
 description = "Keyboard-driven mouse control with grid, recursive-grid and accessibility hint modes"
+repository = "https://github.com/dccif/KeySteer"
+homepage = "https://dccif.github.io/KeySteer/"
+documentation = "https://dccif.github.io/KeySteer/"
 default-run = "keysteer"
 
 [lints.rust]

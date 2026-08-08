@@ -1,0 +1,85 @@
+name: Build release packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Packages to build
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - windows
+          - macos
+      run_tests:
+        description: Run the Rust test suite before packaging
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    if: ${{ inputs.platform == 'all' || inputs.platform == 'windows' }}
+    runs-on: windows-2025
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust targets
+        run: rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc
+
+      - name: Test
+        if: ${{ inputs.run_tests }}
+        run: cargo test --locked --all-features
+
+      - name: Package Windows x64
+        shell: pwsh
+        run: ./packaging/windows/package.ps1 -Target x86_64-pc-windows-msvc
+
+      - name: Package Windows ARM64
+        shell: pwsh
+        run: ./packaging/windows/package.ps1 -Target aarch64-pc-windows-msvc -SkipConfigCheck
+
+      - name: Upload Windows packages
+        uses: actions/upload-artifact@v5
+        with:
+          name: KeySteer-Windows
+          path: |
+            dist/*/*.zip
+            dist/*/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  macos:
+    if: ${{ inputs.platform == 'all' || inputs.platform == 'macos' }}
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Test
+        if: ${{ inputs.run_tests }}
+        run: cargo test --locked --all-features
+
+      - name: Package macOS Apple Silicon
+        run: ./packaging/macos/package.sh aarch64-apple-darwin
+
+      - name: Package macOS Intel
+        run: ./packaging/macos/package.sh x86_64-apple-darwin
+
+      - name: Upload macOS packages
+        uses: actions/upload-artifact@v5
+        with:
+          name: KeySteer-macOS
+          path: |
+            dist/*/*.zip
+            dist/*/*.sha256
+          if-no-files-found: error
+          retention-days: 30

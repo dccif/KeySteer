@@ -2,7 +2,10 @@
 param(
     [Parameter(Position = 0)]
     [ValidateSet("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc")]
-    [string] $Target
+    [string] $Target,
+
+    # Cross-compiled executables cannot be launched on the x64 Actions runner.
+    [switch] $SkipConfigCheck
 )
 
 $ErrorActionPreference = "Stop"
@@ -36,10 +39,15 @@ if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
 # Catch stale target-specific artifacts and config/schema drift before they can
 # be copied into a portable archive. `--check` only parses and validates; it
 # does not start the backend or request operating-system permissions.
-$defaultConfig = Join-Path $projectRoot "keysteer.default.toml"
-& $binary --config $defaultConfig --check
-if ($LASTEXITCODE -ne 0) {
-    throw "release executable rejected the shipped configuration (exit code $LASTEXITCODE)"
+if (-not $SkipConfigCheck) {
+    $defaultConfig = Join-Path $projectRoot "keysteer.default.toml"
+    & $binary --config $defaultConfig --check
+    if ($LASTEXITCODE -ne 0) {
+        throw "release executable rejected the shipped configuration (exit code $LASTEXITCODE)"
+    }
+}
+else {
+    Write-Verbose "Skipping target executable config check for cross compilation"
 }
 
 $dist = Join-Path $projectRoot "dist\$Target"
