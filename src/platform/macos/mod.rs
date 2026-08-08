@@ -332,6 +332,23 @@ impl Backend for MacOsBackend {
         Ok(enabled)
     }
 
+    fn check_for_updates(&mut self) -> Result<(), String> {
+        let sender = self.event_tx.clone();
+        crate::update::check_async(move |result| {
+            let _ = sender.send(BackendEvent::UpdateChecked(result));
+        })
+    }
+
+    fn present_update_result(
+        &mut self,
+        result: &crate::api::backend::UpdateCheckResult,
+    ) -> Result<(), String> {
+        let Some(item) = self.status_item.as_mut() else {
+            return Err("macOS status item is unavailable".into());
+        };
+        item.present_update_result(result)
+    }
+
     fn name(&self) -> &'static str {
         "macos"
     }

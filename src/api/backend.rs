@@ -40,8 +40,26 @@ pub enum BackendEvent {
     ToggleEnabled,
     /// The user toggled whether KeySteer runs when the current user signs in.
     ToggleAutostart,
+    /// The user explicitly requested an update check from the native menu.
+    CheckForUpdates,
+    /// A background update request completed.
+    UpdateChecked(UpdateCheckResult),
     /// Non-fatal backend problem worth logging.
     Warning(String),
+}
+
+/// Result of comparing the running package version with GitHub's latest release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateCheckResult {
+    UpToDate {
+        current: String,
+    },
+    UpdateAvailable {
+        current: String,
+        latest: String,
+        url: String,
+    },
+    Failed(String),
 }
 
 /// Whether a key event should be hidden from the focused application.
@@ -133,6 +151,16 @@ pub trait Backend {
             "{} does not support login-time startup",
             self.name()
         ))
+    }
+
+    /// Start a user-requested update check without blocking the engine loop.
+    fn check_for_updates(&mut self) -> Result<(), String> {
+        Err(format!("{} does not support update checks", self.name()))
+    }
+
+    /// Present the result using the platform's native UI.
+    fn present_update_result(&mut self, _result: &UpdateCheckResult) -> Result<(), String> {
+        Ok(())
     }
 
     /// Name of the backend, for diagnostics.

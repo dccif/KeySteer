@@ -6,13 +6,14 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{AnyThread, MainThreadMarker, define_class, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSControlStateValueOff, NSControlStateValueOn,
-    NSImage, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+    NSAlert, NSApplication, NSApplicationActivationPolicy, NSControlStateValueOff,
+    NSControlStateValueOn, NSImage, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem,
+    NSVariableStatusItemLength, NSWorkspace,
 };
-use objc2_foundation::{NSData, NSSize, NSString};
+use objc2_foundation::{NSData, NSSize, NSString, NSURL};
 
 use crate::api::Autostart;
-use crate::api::backend::BackendEvent;
+use crate::api::backend::{BackendEvent, UpdateCheckResult};
 
 use super::EventSender;
 
@@ -41,6 +42,11 @@ define_class!(
             emit(BackendEvent::ToggleAutostart);
         }
 
+        #[unsafe(method(checkForUpdates:))]
+        fn check_for_updates(&self, _sender: Option<&AnyObject>) {
+            emit(BackendEvent::CheckForUpdates);
+        }
+
         #[unsafe(method(quitApplication:))]
         fn quit_application(&self, _sender: Option<&AnyObject>) {
             emit(BackendEvent::Quit);
@@ -61,6 +67,7 @@ pub struct StatusItem {
     _target: Retained<StatusTarget>,
     toggle_item: Retained<NSMenuItem>,
     autostart_item: Retained<NSMenuItem>,
+    update_alert: Option<Retained<NSAlert>>,
     enabled: bool,
 }
 
@@ -82,6 +89,7 @@ impl StatusItem {
         let toggle_item = menu_item(mtm, "Pause", sel!(toggleEnabled:), &target);
         let reload_item = menu_item(mtm, "Reload Configuration", sel!(reloadConfig:), &target);
         let autostart_item = menu_item(mtm, "Start at Login", sel!(toggleAutostart:), &target);
+        let update_item = menu_item(mtm, "Check for Updates...", sel!(checkForUpdates:), &target);
         let autostart_enabled = match super::autostart::MacosAutostart::new().is_enabled() {
             Ok(enabled) => enabled,
             Err(error) => {
@@ -94,6 +102,7 @@ impl StatusItem {
         menu.addItem(&toggle_item);
         menu.addItem(&reload_item);
         menu.addItem(&autostart_item);
+        menu.addItem(&update_item);
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         menu.addItem(&quit_item);
 
@@ -124,6 +133,7 @@ impl StatusItem {
             _target: target,
             toggle_item,
             autostart_item,
+            update_alert: None,
             enabled: true,
         }
     }
@@ -139,6 +149,47 @@ impl StatusItem {
 
     pub(super) fn set_autostart_enabled(&mut self, enabled: bool) {
         set_checked(&self.autostart_item, enabled);
+    }
+
+    pub(super) fn present_update_result(
+        &mut self,
+        result: &UpdateCheckResult,
+    ) -> Result<(), String> {
+        match result {
+            UpdateCheckResult::UpdateAvailable { url, .. } => open_url(url),
+            UpdateCheckResult::UpToDate { current } => self.show_alert(
+                "KeySteer is up to date",
+                &format!("KeySteer {current} is already the latest version."),
+            ),
+            UpdateCheckResult::Failed(error) => {
+                self.show_alert("Could not check for updates", error)
+            }
+        }
+    }
+
+    fn show_alert(&mut self, title: &str, details: &str) -> Result<(), String> {
+        let mtm = MainThreadMarker::new().ok_or_else(|| {
+            "update result must be presented on the macOS main thread".to_string()
+        })?;
+        let alert = NSAlert::new(mtm);
+        alert.setMessageText(&NSString::from_str(title));
+        alert.setInformativeText(&NSString::from_str(details));
+        alert.addButtonWithTitle(&NSString::from_str("OK"));
+        let window = alert.window();
+        window.center();
+        window.orderFrontRegardless();
+        self.update_alert = Some(alert);
+        Ok(())
+    }
+}
+
+fn open_url(url: &str) -> Result<(), String> {
+    let url = NSURL::URLWithString(&NSString::from_str(url))
+        .ok_or_else(|| "GitHub release URL is invalid".to_string())?;
+    if NSWorkspace::sharedWorkspace().openURL(&url) {
+        Ok(())
+    } else {
+        Err("macOS could not open the GitHub release page".into())
     }
 }
 
@@ -212,6 +263,11 @@ mod tests {
         assert!(matches!(
             receiver.recv().unwrap(),
             BackendEvent::ReloadConfig
+        ));
+        emit(BackendEvent::CheckForUpdates);
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            BackendEvent::CheckForUpdates
         ));
         *SENDER.get().unwrap().lock().unwrap() = None;
     }

@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use objc2::rc::Retained;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSBackingStoreType, NSColor, NSPanel, NSScreenSaverWindowLevel, NSView,
@@ -83,6 +83,10 @@ impl Overlay {
     }
 
     pub fn present(&mut self, scene: Arc<OverlayScene>) -> Result<(), String> {
+        autoreleasepool(|_| self.present_inner(scene))
+    }
+
+    fn present_inner(&mut self, scene: Arc<OverlayScene>) -> Result<(), String> {
         if self.visible && self.scene.as_ref() == Some(&scene) {
             return Ok(());
         }
@@ -120,11 +124,17 @@ impl Overlay {
     }
 
     pub fn dismiss(&mut self) -> Result<(), String> {
-        if let Some(content) = self.content.take() {
-            let _transaction = DisabledActions::begin();
-            content.window.orderOut(None);
-            // Dropping WindowContent releases the complete layer tree and any
-            // compositor backing stores. No full-screen image survives Hide.
+        autoreleasepool(|_| self.dismiss_inner())
+    }
+
+    fn dismiss_inner(&mut self) -> Result<(), String> {
+        if let Some(mut content) = self.content.take() {
+            {
+                let _transaction = DisabledActions::begin();
+                content.teardown();
+            }
+            // Keep the typed owners alive until the detach transaction has
+            // committed; dropping `content` after this point releases them.
         }
         self.scene = None;
         self.area = None;
@@ -170,6 +180,12 @@ impl Overlay {
             NSBackingStoreType::Buffered,
             false,
         );
+        if window.isReleasedWhenClosed() {
+            return Err(
+                "macOS overlay NSPanel unexpectedly releases itself when closed; refusing ambiguous ownership"
+                    .into(),
+            );
+        }
         let root_view = NSView::initWithFrame(NSView::alloc(mtm), view_frame);
         let root_layer = CALayer::new();
         root_layer.setFrame(view_frame);
@@ -220,6 +236,7 @@ impl WindowContent {
     fn update_static(&mut self, scene: &OverlayScene, area: Rect) {
         let backdrop = scene.backdrop.map(|color| self.color(color));
         self.root_layer.setBackgroundColor(backdrop.as_deref());
+        self.trim_shapes(scene.shapes.len());
         self.ensure_shapes(scene.shapes.len());
         for (index, shape) in scene.shapes.iter().enumerate() {
             self.configure_shape(index, shape, area);
@@ -247,7 +264,9 @@ impl WindowContent {
         let dynamic_labels = scene.indicator.as_ref().map_or(0, |indicator| {
             1 + usize::from(indicator.held_text.is_some())
         });
-        self.ensure_labels(static_labels + dynamic_labels);
+        let required_labels = static_labels + dynamic_labels;
+        self.trim_labels(required_labels);
+        self.ensure_labels(required_labels);
         let mut used = static_labels;
         if let Some(indicator) = &scene.indicator {
             let (width, _, main, held) = indicator_layout(indicator);
@@ -301,6 +320,12 @@ impl WindowContent {
         }
     }
 
+    fn trim_shapes(&mut self, count: usize) {
+        trim_pool(&mut self.shapes, count, |shape| {
+            shape.removeFromSuperlayer()
+        });
+    }
+
     fn ensure_labels(&mut self, count: usize) {
         while self.labels.len() < count {
             let base = CATextLayer::layer();
@@ -330,6 +355,26 @@ impl WindowContent {
                 text: String::new(),
             });
         }
+    }
+
+    fn trim_labels(&mut self, count: usize) {
+        trim_pool(&mut self.labels, count, LabelLayers::detach);
+    }
+
+    fn teardown(&mut self) {
+        self.window.orderOut(None);
+        self.trim_shapes(0);
+        self.trim_labels(0);
+        self.cursor.removeFromSuperlayer();
+        self.root_layer.setBackgroundColor(None);
+        self.root_view.setLayer(None);
+        self.window.setContentView(None);
+        self.colors.clear();
+        self.fonts.clear();
+        // NSPanel defaults to releasedWhenClosed=false, which is also
+        // explicitly validated at construction. Retained<NSPanel> remains the
+        // sole release owner after AppKit closes its WindowServer resources.
+        self.window.close();
     }
 
     fn configure_shape(&mut self, index: usize, shape: &OverlayShape, area: Rect) {
@@ -572,6 +617,23 @@ impl WindowContent {
     }
 }
 
+impl LabelLayers {
+    fn detach(self) {
+        // Disconnect both parent relationships explicitly. The mask is owned
+        // only by `matched` and this value, so it is released with the detached
+        // label tree without another Objective-C mutation.
+        self.matched.removeFromSuperlayer();
+        self.base.removeFromSuperlayer();
+    }
+}
+
+fn trim_pool<T>(items: &mut Vec<T>, count: usize, mut detach: impl FnMut(T)) {
+    let keep = count.min(items.len());
+    for item in items.drain(keep..) {
+        detach(item);
+    }
+}
+
 struct DisabledActions;
 
 impl DisabledActions {
@@ -704,6 +766,25 @@ mod tests {
         assert!(!overlay.is_visible());
         assert!(overlay.scene.is_none());
         assert!(overlay.area.is_none());
+        assert!(overlay.content.is_none());
+    }
+
+    #[test]
+    fn trimming_a_native_pool_detaches_only_surplus_slots() {
+        let mut slots = vec![0, 1, 2, 3];
+        let mut detached = Vec::new();
+
+        trim_pool(&mut slots, 2, |slot| detached.push(slot));
+        assert_eq!(slots, [0, 1]);
+        assert_eq!(detached, [2, 3]);
+
+        trim_pool(&mut slots, 8, |slot| detached.push(slot));
+        assert_eq!(slots, [0, 1]);
+        assert_eq!(detached, [2, 3]);
+
+        trim_pool(&mut slots, 0, |slot| detached.push(slot));
+        assert!(slots.is_empty());
+        assert_eq!(detached, [2, 3, 0, 1]);
     }
 
     #[test]

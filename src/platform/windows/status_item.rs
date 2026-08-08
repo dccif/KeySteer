@@ -12,20 +12,22 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
+    ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessageW, HCURSOR, HICON,
-    IDI_APPLICATION, LoadIconW, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, PostMessageW,
-    PostThreadMessageW, RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow,
-    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
-    TranslateMessage, WM_APP, WM_CANCELMODE, WM_DISPLAYCHANGE, WM_LBUTTONUP, WM_NULL, WM_QUIT,
-    WM_RBUTTONUP, WM_SETTINGCHANGE, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    IDI_APPLICATION, LoadIconW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MF_CHECKED, MF_SEPARATOR,
+    MF_STRING, MSG, MessageBoxW, PostMessageW, PostThreadMessageW, RegisterClassExW,
+    RegisterWindowMessageW, SW_SHOWNORMAL, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CANCELMODE,
+    WM_DISPLAYCHANGE, WM_LBUTTONUP, WM_NULL, WM_QUIT, WM_RBUTTONUP, WM_SETTINGCHANGE, WNDCLASSEXW,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
 use crate::api::Autostart;
-use crate::api::backend::BackendEvent;
+use crate::api::backend::{BackendEvent, UpdateCheckResult};
 
 use super::EventSender;
 
@@ -35,7 +37,8 @@ const APP_ICON_RESOURCE_ID: usize = 1;
 const CMD_TOGGLE: i32 = 1;
 const CMD_RELOAD: i32 = 2;
 const CMD_AUTOSTART: i32 = 3;
-const CMD_QUIT: i32 = 4;
+const CMD_CHECK_UPDATES: i32 = 4;
+const CMD_QUIT: i32 = 5;
 
 static SENDER: OnceLock<Mutex<Option<EventSender>>> = OnceLock::new();
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -321,6 +324,14 @@ fn show_menu(hwnd: HWND) {
                     w!("Start at Login"),
                 )
             })
+            .and_then(|_| {
+                AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    CMD_CHECK_UPDATES as usize,
+                    w!("Check for Updates..."),
+                )
+            })
             .and_then(|_| AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()))
             .and_then(|_| AppendMenuW(menu, MF_STRING, CMD_QUIT as usize, w!("Quit KeySteer")))
     };
@@ -337,12 +348,10 @@ fn show_menu(hwnd: HWND) {
             format!("cannot position tray menu: {error}"),
         );
     }
-    let previous_foreground = unsafe { GetForegroundWindow() };
-    unsafe {
+    let (previous_foreground, command) = unsafe {
+        let previous_foreground = GetForegroundWindow();
         let _ = SetForegroundWindow(hwnd);
-    }
-    let command = unsafe {
-        TrackPopupMenu(
+        let command = TrackPopupMenu(
             menu,
             TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_BOTTOMALIGN,
             point.x,
@@ -350,7 +359,8 @@ fn show_menu(hwnd: HWND) {
             None,
             hwnd,
             None,
-        )
+        );
+        (previous_foreground, command)
     };
     if let Err(error) = unsafe { DestroyMenu(menu) } {
         crate::log_warning!("windows-tray", "cannot destroy tray menu: {error}");
@@ -365,9 +375,71 @@ fn show_menu(hwnd: HWND) {
         CMD_TOGGLE => emit(BackendEvent::ToggleEnabled),
         CMD_RELOAD => emit(BackendEvent::ReloadConfig),
         CMD_AUTOSTART => emit(BackendEvent::ToggleAutostart),
+        CMD_CHECK_UPDATES => emit(BackendEvent::CheckForUpdates),
         CMD_QUIT => emit(BackendEvent::Quit),
         _ => {}
     }
+}
+
+pub(super) fn present_update_result(result: &UpdateCheckResult) -> Result<(), String> {
+    let result = result.clone();
+    std::thread::Builder::new()
+        .name("keysteer-update-ui".into())
+        .spawn(move || match result {
+            UpdateCheckResult::UpdateAvailable { url, .. } => {
+                if let Err(error) = open_url(&url) {
+                    crate::app::logging::report_error("windows-update", error);
+                }
+            }
+            UpdateCheckResult::UpToDate { current } => show_message(
+                &format!("KeySteer {current} is already the latest version."),
+                false,
+            ),
+            UpdateCheckResult::Failed(error) => {
+                show_message(&format!("Could not check for updates.\n\n{error}"), true)
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| format!("cannot start Windows update UI: {error}"))
+}
+
+fn open_url(url: &str) -> Result<(), String> {
+    let url = wide(url);
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR(url.as_ptr()),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        )
+    };
+    if result.0 as isize <= 32 {
+        Err(format!(
+            "ShellExecuteW could not open the release page ({:?})",
+            result.0
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn show_message(message: &str, is_error: bool) {
+    let message = wide(message);
+    let flags = MB_OK
+        | if is_error {
+            MB_ICONERROR
+        } else {
+            MB_ICONINFORMATION
+        };
+    unsafe {
+        let _ = MessageBoxW(None, PCWSTR(message.as_ptr()), w!("KeySteer Update"), flags);
+    }
+}
+
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 unsafe extern "system" fn window_proc(
@@ -421,6 +493,11 @@ mod tests {
         assert!(matches!(
             receiver.recv().unwrap(),
             BackendEvent::ReloadConfig
+        ));
+        emit(BackendEvent::CheckForUpdates);
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            BackendEvent::CheckForUpdates
         ));
         clear_sender();
     }

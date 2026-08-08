@@ -32,7 +32,7 @@ frame clock、overlay、UI scan、appearance、状态栏开关和 autostart。�
 | `overlay.rs` | topmost layered click-through HWND、RGBA DIB、文字栅格化 |
 | `accessibility.rs` | UI Automation 与 popup/遮挡扫描 |
 | `frame_clock.rs` | `DwmFlush` 合成帧 |
-| `status_item.rs` | notification-area 图标和菜单 |
+| `status_item.rs` | notification-area 图标、菜单、非阻塞更新提示和 Release 页面打开 |
 | `autostart.rs` | 当前用户登录启动注册表项 |
 | `system_events.rs` | foreground/display/appearance 变化 |
 | `console_control.rs` | 控制台关闭和进程退出事件 |
@@ -73,7 +73,7 @@ item、window 和 display link 都有线程亲和性。
 | `vision.rs` | Rust FFI 封装和视觉候选后处理 |
 | `vision_bridge.m` | ScreenCaptureKit + Vision Objective-C bridge |
 | `workspace.rs` | 前台应用、appearance、run-loop wait/wake |
-| `status_item.rs` | NSStatusItem 菜单栏菜单 |
+| `status_item.rs` | NSStatusItem 菜单、非模态 NSAlert 和 NSWorkspace 页面打开 |
 | `permissions.rs` | Accessibility trust 检测、提示和设置入口 |
 | `autostart.rs`/bridge | ServiceManagement `SMAppService` 登录项 |
 

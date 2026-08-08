@@ -99,6 +99,11 @@ Engine 为每个物理键保存 disposition，确保 key-up 与 key-down 使用�
 - `ScanUi` 异步返回 `UiScanned`；scan owner 按 id 路由，旧结果不得进入新 session。
 - `SetFrameClock` 使用原生显示帧，不使用 Mode timer 模拟移动帧率。
 
+状态栏的 `CheckForUpdates` 经 BackendEvent 进入 Engine，再由 Backend 启动独立 HTTPS
+worker。worker 只查询 GitHub 最新正式 Release，并以 SemVer 对比 `CARGO_PKG_VERSION`；
+结果通过 `UpdateChecked` 返回。发现更高版本时原生层直接打开 `/releases/latest`，否则显示
+“已经是最新版本”。它不是启动任务，也没有定时轮询。
+
 ## 可恢复输入失败
 
 合成输入在 Windows 高权限窗口等环境可能因权限被拒绝。`command_executor.rs` 把这类

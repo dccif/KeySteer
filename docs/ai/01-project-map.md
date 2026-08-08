@@ -28,6 +28,7 @@ keysteer/
 | `src/domain/hints/` | 与平台无关的 UI Hint 标签分配、匹配和空间算法 | `labels.rs`, `matcher.rs`, `grid.rs` |
 | `src/modes/` | 五个内置 Mode 状态机 | `normal.rs`, `grid.rs`, `recursive_grid.rs`, `hint.rs` |
 | `src/plugins/` | 使用公共 API 实现的内置插件示例 | `builtin/screen_selector.rs` |
+| `src/update.rs` | 用户主动触发的 GitHub Release 查询和 SemVer 比较 | `check_async` |
 | `src/platform/windows/` | Win32/COM/UIA/GDI/DWM 后端 | `mod.rs` 组合所有子模块 |
 | `src/platform/macos/` | AppKit/CGEventTap/AX/Vision/Core Graphics 后端 | `mod.rs` 组合所有子模块 |
 | `src/platform/unsupported.rs` | 非 Windows/macOS 的可编译占位后端 | 用于检查公共层可移植性 |
@@ -63,7 +64,7 @@ Windows：
 - `overlay.rs` click-through layered window 与软件栅格化。
 - `accessibility.rs` UIA 流式扫描、popup HWND、遮挡过滤。
 - `frame_clock.rs` DWM 合成帧时钟。
-- `status_item.rs` 托盘菜单；`autostart.rs` 登录启动；`system_events.rs` 前台/显示事件。
+- `status_item.rs` 托盘菜单、更新提示与浏览器打开；`autostart.rs` 登录启动；`system_events.rs` 前台/显示事件。
 
 macOS：
 
@@ -73,7 +74,7 @@ macOS：
 - `accessibility.rs` AX 树遍历；`vision.rs`/`vision_bridge.m` 视觉检测。
 - `ui_scan.rs` 单一持久 worker、AX/Vision/Hybrid 调度。
 - `display_link.rs` macOS 14 AppKit `CADisplayLink`。
-- `status_item.rs` 菜单栏；`autostart.rs`/`autostart_bridge.m` 登录启动。
+- `status_item.rs` 菜单栏、非模态更新提示与浏览器打开；`autostart.rs`/`autostart_bridge.m` 登录启动。
 
 ## 文档站
 

@@ -1036,6 +1036,16 @@ impl Engine {
                 ),
                 Err(error) => crate::app::logging::report_error("autostart", error),
             },
+            BackendEvent::CheckForUpdates => {
+                if let Err(error) = backend.check_for_updates() {
+                    crate::app::logging::report_error("update-check", error);
+                }
+            }
+            BackendEvent::UpdateChecked(result) => {
+                if let Err(error) = backend.present_update_result(&result) {
+                    crate::app::logging::report_error("update-check", error);
+                }
+            }
             BackendEvent::Quit => self.should_quit = true,
             BackendEvent::Warning(message) => {
                 crate::report_warning!("backend", "{message}")

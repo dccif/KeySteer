@@ -501,6 +501,20 @@ impl Backend for WindowsBackend {
         autostart::WindowsAutostart::new().toggle()
     }
 
+    fn check_for_updates(&mut self) -> Result<(), String> {
+        let sender = self.event_tx.clone();
+        crate::update::check_async(move |result| {
+            let _ = sender.send(BackendEvent::UpdateChecked(result));
+        })
+    }
+
+    fn present_update_result(
+        &mut self,
+        result: &crate::api::backend::UpdateCheckResult,
+    ) -> Result<(), String> {
+        status_item::present_update_result(result)
+    }
+
     fn name(&self) -> &'static str {
         "windows"
     }

@@ -46,9 +46,14 @@ mode scene，也不重建静态 Grid/Hint 内容。latched 的真实按钮状态
 - `NSPanel`、`NSView`、`CALayer`、`CAShapeLayer`、`CATextLayer` 全部由 typed `Retained<T>` 管理。
 - Core Graphics 颜色和路径使用拥有型 Core Foundation wrapper。
 - 静态 shapes/labels、cursor 和 indicator 分层；光标移动只更新动态层。
-- CALayer/CATextLayer 在覆盖层可见期间按槽位复用，文字内容不变时不重新创建 `NSString`。
+- CALayer/CATextLayer 按当前 scene 所需槽位复用，文字内容不变时不重新创建 `NSString`；
+  scene 缩小时，多余 shape 会从 root layer 移除，多余 label 会先断开 mask、子层与父层再释放。
+  因此 Grid 首屏的二级预览层不会在返回 Normal 后继续成为常驻高水位缓存。
 - 所有属性更新放在禁用隐式动画的 `CATransaction` 中，避免输入后出现动画拖尾。
-- Hide 直接释放整个窗口 layer tree，因此不会在隐藏期间保留 4K/5K `NSImage` 或 bitmap backing。
+- 每次 present/dismiss 都有独立 autorelease pool，AppKit/QuartzCore 的临时对象不会依赖
+  下一次手动 run-loop pump 才释放。
+- Hide 先移除 shape、label、cursor，清除 root view 的 layer 和 window 的 content view，
+  再关闭 `NSPanel` 并释放 typed owner；隐藏期间不保留完整 layer tree 或 compositor backing。
 
 窗口仍在 AppKit 主线程创建和更新。Engine、输入 Hook 与扫描工作不通过原生对象共享状态，只通过有界队列/安全 mailbox 通信。
 
@@ -79,7 +84,8 @@ mode scene，也不重建静态 Grid/Hint 内容。latched 的真实按钮状态
 - producer 不得无限快于消费者；frame/scan channel 必须有界或合并。
 - cursor/indicator 变化不得重建静态 Grid/Hint 内容。
 - GPU 路径不得引入与屏幕像素数成比例的 CPU buffer。
-- Hide 必须释放全屏 native surface、DIB、image 和 layer tree。
+- Hide 必须释放全屏 native surface、DIB、image 和 layer tree；macOS 不能只 `orderOut` 后
+  假设 WindowServer、content view 与子图层会同步解除所有权。
 - 新原生调用必须位于平台边界，使用 RAII/typed owner，并为最小 unsafe 块记录 SAFETY 契约。
 
 最终性能结论必须来自双 4K、高 DPI、高刷新率真机的 p95/p99、分配次数、峰值 RAM/VRAM 和截图容差数据；API 名称或 GPU 标签本身不构成性能证明。
