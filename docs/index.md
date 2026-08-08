@@ -26,6 +26,6 @@ features:
     title: 外观任你打扮
     details: 提示框颜色、字号、间距、标签位置可调。
   - icon: 🔒
-    title: 离线本地，隐私无忧
-    details: 本地，无网络连接，不上传任何内容。
+    title: 开源透明，数据留在本地
+    details: 输入、屏幕和使用数据仅在本地处理。
 ---

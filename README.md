@@ -1,13 +1,13 @@
 # KeySteer
 
 <p align="center">
-  <a href="https://github.com/dccif/KeySteer/actions/workflows/pages.yml"><img alt="Page status" src="https://img.shields.io/github/actions/workflow/status/dccif/KeySteer/pages.yml?branch=main&amp;label=Page&amp;style=flat-square&amp;logo=githubactions&amp;logoColor=white"></a>
-  <a href="https://github.com/dccif/KeySteer/actions/workflows/build.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/dccif/KeySteer/build.yml?branch=main&amp;label=Build&amp;style=flat-square&amp;logo=githubactions&amp;logoColor=white"></a>
-  <a href="https://github.com/dccif/KeySteer/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/dccif/KeySteer?display_name=tag&amp;sort=semver&amp;label=Release&amp;style=flat-square"></a>
-  <a href="rust-toolchain.toml"><img alt="Rust 1.97" src="https://img.shields.io/badge/Rust-1.97-dea584?style=flat-square&amp;logo=rust&amp;logoColor=white"></a>
-  <img alt="Windows 10 and 11" src="https://img.shields.io/badge/Windows-10%2F11-0078D4?style=flat-square&amp;logo=windows11&amp;logoColor=white">
-  <img alt="macOS 14 or later" src="https://img.shields.io/badge/macOS-14%2B-000000?style=flat-square&amp;logo=apple&amp;logoColor=white">
-  <a href="LICENSE"><img alt="License: GPL-3.0-or-later" src="https://img.shields.io/github/license/dccif/KeySteer?label=License&amp;style=flat-square"></a>
+  <a href="https://github.com/dccif/KeySteer/actions/workflows/pages.yml"><img alt="Page status" src="https://img.shields.io/github/actions/workflow/status/dccif/KeySteer/pages.yml?branch=main&amp;label=Page&amp;style=flat&amp;logo=github&amp;logoColor=white"></a>
+  <a href="https://github.com/dccif/KeySteer/actions/workflows/build.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/dccif/KeySteer/build.yml?branch=main&amp;label=Build&amp;style=flat&amp;logo=github&amp;logoColor=white"></a>
+  <a href="https://github.com/dccif/KeySteer/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/dccif/KeySteer?display_name=tag&amp;sort=semver&amp;label=Release&amp;style=flat"></a>
+  <a href="rust-toolchain.toml"><img alt="Rust 1.97" src="https://img.shields.io/badge/Rust-1.97-dea584?style=flat&amp;logo=rust&amp;logoColor=white"></a>
+  <img alt="Windows 10 and 11" src="https://img.shields.io/badge/Windows-10%2F11-0078D4?style=flat&amp;logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI%2BPHBhdGggZmlsbD0iI2ZmZiIgZD0iTTEgMy4yIDEwLjYgMS44djkuNEgxVjMuMlptMTEgNy45VjEuNkwyMyAwdjExLjFIMTJaTTEgMTIuOGg5LjZ2OS40TDEgMjAuOHYtOFptMTEgMGgxMXYxMS4yTDEyIDIyLjR2LTkuNloiLz48L3N2Zz4%3D">
+  <img alt="macOS 14 or later" src="https://img.shields.io/badge/macOS-14%2B-000000?style=flat&amp;logo=apple&amp;logoColor=white">
+  <a href="LICENSE"><img alt="License: GPL-3.0-or-later" src="https://img.shields.io/github/license/dccif/KeySteer?label=License&amp;style=flat"></a>
 </p>
 
 <p align="center">
@@ -18,7 +18,7 @@
   <strong>把鼠标交给键盘：轻量、原生、可配置。</strong>
 </p>
 
-KeySteer 是 Windows 和 macOS 上的使用键盘操控鼠标工具。 
+KeySteer 是 Windows 和 macOS 上使用键盘操控鼠标的工具。 
 
 [在线文档](https://dccif.github.io/KeySteer/)
 
