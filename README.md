@@ -27,12 +27,29 @@ KeySteer 是 Windows 和 macOS 上的使用键盘操控鼠标工具。
 
 ## 视频演示
 
-| 模式 | 演示内容 | 视频 |
-| --- | --- | --- |
-| Normal | 键盘移动、速度修饰、滚动与点击 | [Normal 演示](docs/public/video/normal.mp4) |
-| Grid | 一级大标签、二级预览与二键快速定位 | [Grid 演示](docs/public/video/grid.mp4) |
-| Recursive Grid | 逐层细分、回退与精确定位 | [Recursive Grid 演示](docs/public/video/recursivegrid.mp4) |
-| UI Hint | 扫描界面元素、标签筛选与控件定位 | [UI Hint 演示](docs/public/video/uihint.mp4) |
+### Normal
+
+键盘移动、速度修饰、滚动与点击。
+
+https://github.com/user-attachments/assets/255ba0b5-57c6-4a2b-ae68-ffc1bf06ad6c
+
+### Grid
+
+一级大标签、二级预览与二键快速定位。
+
+https://github.com/user-attachments/assets/98e63544-89d2-464d-823b-3a0d5712b49a
+
+### Recursive Grid
+
+逐层细分、回退与精确定位。
+
+https://github.com/user-attachments/assets/874ed096-1ab0-4228-879e-e53efb0b1a55
+
+### UI Hint
+
+扫描界面元素、标签筛选与控件定位。
+
+https://github.com/user-attachments/assets/11aff61b-acd3-4e2b-bf27-f089b79f430b
 
 ## 默认按键
 
