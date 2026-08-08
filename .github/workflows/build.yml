@@ -157,4 +157,5 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "KeySteer v$VERSION" \
             --generate-notes \
+            --notes "$(cat .github/release-notes.md)" \
             release-assets/*.zip

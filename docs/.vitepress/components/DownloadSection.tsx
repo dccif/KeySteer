@@ -1,5 +1,6 @@
 import { defineComponent, onBeforeUnmount, onMounted, ref } from 'vue'
 import { withBase } from 'vitepress'
+import { RELEASE_TAG, RELEASE_URL, RELEASES_URL, releaseAssetUrl } from '../generated/release'
 
 interface DownloadAsset {
   key: string
@@ -7,20 +8,17 @@ interface DownloadAsset {
   platformLabel: string
   label: string
   description: string
-  fileName: string
+  target: string
 }
-
-const RELEASES_URL = 'https://github.com/dccif/KeySteer/releases'
-const LATEST_RELEASE_URL = 'https://github.com/dccif/KeySteer/releases/latest'
 
 const ASSETS: DownloadAsset[] = [
   {
     key: 'windows-x64',
     platform: 'windows',
     platformLabel: 'Windows',
-    label: 'x64',
+    label: 'x86_x64',
     description: '绝大多数电脑',
-    fileName: 'KeySteer-x86_64-pc-windows-msvc.zip',
+    target: 'x86_64-pc-windows-msvc',
   },
   {
     key: 'windows-arm64',
@@ -28,7 +26,7 @@ const ASSETS: DownloadAsset[] = [
     platformLabel: 'Windows',
     label: 'ARM64',
     description: 'Windows on ARM',
-    fileName: 'KeySteer-aarch64-pc-windows-msvc.zip',
+    target: 'aarch64-pc-windows-msvc',
   },
   {
     key: 'macos-apple-silicon',
@@ -36,7 +34,7 @@ const ASSETS: DownloadAsset[] = [
     platformLabel: 'macOS',
     label: 'Apple Silicon',
     description: 'M 系列芯片',
-    fileName: 'KeySteer-aarch64-apple-darwin.zip',
+    target: 'aarch64-apple-darwin',
   },
   {
     key: 'macos-intel',
@@ -44,7 +42,7 @@ const ASSETS: DownloadAsset[] = [
     platformLabel: 'macOS',
     label: 'Intel',
     description: 'Intel 芯片',
-    fileName: 'KeySteer-x86_64-apple-darwin.zip',
+    target: 'x86_64-apple-darwin',
   },
 ]
 
@@ -87,8 +85,8 @@ function detectAsset(): DownloadAsset {
   return ASSETS[0]
 }
 
-function assetUrl(fileName: string) {
-  return `${LATEST_RELEASE_URL}/download/${fileName}`
+function assetUrl(asset: DownloadAsset) {
+  return releaseAssetUrl(asset.target)
 }
 
 export default defineComponent({
@@ -115,7 +113,7 @@ export default defineComponent({
         <div class="hero-download" onClick={(event) => event.stopPropagation()}>
           <a
             class="hero-download-main"
-            href={assetUrl(detected.value.fileName)}
+            href={assetUrl(detected.value)}
             title={`下载 KeySteer ${detected.value.platformLabel} ${detected.value.label}`}
           >
             <span class="hero-download-emoji" aria-hidden="true">💾</span>
@@ -147,7 +145,7 @@ export default defineComponent({
                   <a
                     key={asset.key}
                     class={`hero-download-option ${asset.key === detected.value.key ? 'detected' : ''}`}
-                    href={assetUrl(asset.fileName)}
+                    href={assetUrl(asset)}
                     role="menuitem"
                     onClick={closeMenu}
                   >
@@ -166,7 +164,7 @@ export default defineComponent({
                   <a
                     key={asset.key}
                     class={`hero-download-option ${asset.key === detected.value.key ? 'detected' : ''}`}
-                    href={assetUrl(asset.fileName)}
+                    href={assetUrl(asset)}
                     role="menuitem"
                     onClick={closeMenu}
                   >
@@ -179,6 +177,9 @@ export default defineComponent({
                   </a>
                 ))}
               </div>
+              <a class="hero-download-all" href={RELEASE_URL} target="_blank" rel="noopener" onClick={closeMenu}>
+                查看 {RELEASE_TAG} Release →
+              </a>
               <a class="hero-download-all" href={RELEASES_URL} target="_blank" rel="noopener" onClick={closeMenu}>
                 查看全部 Release →
               </a>

@@ -59,6 +59,18 @@ cargo run -- --doctor
 
 详情请看[配置文件](docs/reference/configuration.md)与[模式和动作](docs/reference/modes-and-actions.md)。也可以通过[配置与模拟器](https://dccif.github.io/KeySteer/editor/)编辑键位和样式。
 
+## 安装
+
+请从 [GitHub Releases](https://github.com/dccif/KeySteer/releases/latest) 下载与系统和 CPU 架构对应的 ZIP。Windows 解压后运行 `KeySteer.exe`；macOS 解压后将 `KeySteer.app` 移入 `/Applications`。
+
+如果从 GitHub Release 手动安装的 macOS 应用被 Gatekeeper 提示无法打开，请确认文件来自上述官方发布页，然后运行：
+
+```bash
+sudo xattr -cr /Applications/KeySteer.app
+```
+
+该命令会递归清除应用包的扩展属性；不要对来源不明的应用使用。随后重新打开 KeySteer，并按系统提示授予“辅助功能”和“屏幕录制”权限。
+
 ## 运行与打包
 
 开发环境：Rust 版本以 `rust-toolchain.toml` 为准。文档站需要 Node 24+ 和 `package.json` 指定的 pnpm 版本。

@@ -75,7 +75,9 @@ stops its launched process unless `-KeepRunning` is selected.
 `.github/workflows/build.yml` 手动运行时会构建所选平台；选择 `all` 时，待四个平台的
 ZIP 都成功后，以 Cargo 版本创建 `v<version>` GitHub Release，并且只上传四个 ZIP。
 只构建单个平台时保留 workflow artifact，但不创建不完整的 Release。macOS 证书和
-notarization 通过 secrets 注入。
+notarization 通过 secrets 注入。创建 Release 时把 `.github/release-notes.md` 的固定安装
+提示置于 GitHub 自动生成的变更说明之前；该文件必须保留未 notarize macOS 下载包所需的
+`sudo xattr -cr /Applications/KeySteer.app` 指引和来源安全提示。
 
 每个 target 的 workflow artifact 也独立上传：Windows x64/ARM64、macOS Apple
 Silicon/Intel 各一份；不会把不同架构放入同一个 ZIP 或 artifact。
@@ -92,10 +94,16 @@ GitHub Pages。需要更新线上文档时，在 Actions 页面运行 `Deploy do
 
 工具链：VitePress 1.6、Vue 3 TSX、`smol-toml`、pnpm。主要脚本：
 
-- `pnpm docs:dev`：同步 default TOML/icon 后启动开发服务器。
+- `pnpm docs:dev`：同步 default TOML/icon 和 Release 元数据后启动开发服务器。
 - `pnpm docs:test`：Node tests，覆盖浏览器端绑定继承、配置 clone 和模拟状态。
-- `pnpm docs:check`：`vue-tsc --noEmit`。
-- `pnpm docs:build`：同步静态资源并生产构建。
+- `pnpm docs:check`：先同步生成文件，再执行 `tsc --noEmit`。当前文档组件全部是 `.ts`/`.tsx`，不使用 Vue SFC；
+  直接使用仓库固定的 TypeScript 可避免 `vue-tsc` 对编译器私有子路径的版本耦合。
+- `pnpm docs:build`：同步静态资源和 Release 元数据后生产构建。
+
+`scripts/sync-doc-assets.mjs` 以 `Cargo.toml` 的 `[package].version` 为唯一版本来源，生成
+被忽略的 `docs/.vitepress/generated/release.ts`。下载组件用它构造当前 tag 和四个
+`KeySteer-v<version>-<target>.zip` 直链，因此只要修改 Cargo 版本并运行文档构建，页面
+就会自动指向同版本的 GitHub Release；不需要手改前端版本号。
 
 模拟器重点是键位和 Grid/Recursive Grid/UI Hint 样式可视化，不是完整 Rust runtime。它：
 

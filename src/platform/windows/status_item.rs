@@ -17,12 +17,12 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessageW, HCURSOR, HICON,
-    IDI_APPLICATION, LoadIconW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MF_CHECKED, MF_SEPARATOR,
-    MF_STRING, MSG, MessageBoxW, PostMessageW, PostThreadMessageW, RegisterClassExW,
-    RegisterWindowMessageW, SW_SHOWNORMAL, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CANCELMODE,
-    WM_DISPLAYCHANGE, WM_LBUTTONUP, WM_NULL, WM_QUIT, WM_RBUTTONUP, WM_SETTINGCHANGE, WNDCLASSEXW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    IDI_APPLICATION, LoadIconW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND,
+    MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, PostMessageW, PostThreadMessageW,
+    RegisterClassExW, RegisterWindowMessageW, SW_SHOWNORMAL, SetForegroundWindow, TPM_BOTTOMALIGN,
+    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP,
+    WM_CANCELMODE, WM_DISPLAYCHANGE, WM_LBUTTONUP, WM_NULL, WM_QUIT, WM_RBUTTONUP,
+    WM_SETTINGCHANGE, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -45,6 +45,24 @@ static ENABLED: AtomicBool = AtomicBool::new(true);
 static DISPLAY_CHANGED: AtomicBool = AtomicBool::new(false);
 static APPEARANCE_CHANGED: AtomicBool = AtomicBool::new(false);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+static UPDATE_UI_VISIBLE: AtomicBool = AtomicBool::new(false);
+
+struct UpdateUiGuard;
+
+impl UpdateUiGuard {
+    fn acquire() -> Option<Self> {
+        UPDATE_UI_VISIBLE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then_some(Self)
+    }
+}
+
+impl Drop for UpdateUiGuard {
+    fn drop(&mut self) {
+        UPDATE_UI_VISIBLE.store(false, Ordering::Release);
+    }
+}
 
 pub struct StatusItem {
     thread_id: u32,
@@ -382,21 +400,26 @@ fn show_menu(hwnd: HWND) {
 }
 
 pub(super) fn present_update_result(result: &UpdateCheckResult) -> Result<(), String> {
+    let Some(guard) = UpdateUiGuard::acquire() else {
+        return Ok(());
+    };
     let result = result.clone();
     std::thread::Builder::new()
         .name("keysteer-update-ui".into())
-        .spawn(move || match result {
-            UpdateCheckResult::UpdateAvailable { url, .. } => {
-                if let Err(error) = open_url(&url) {
-                    crate::app::logging::report_error("windows-update", error);
+        .spawn(move || {
+            let _guard = guard;
+            let presentation = match result {
+                UpdateCheckResult::UpdateAvailable { url, .. } => open_url(&url),
+                UpdateCheckResult::UpToDate { current } => show_message(
+                    &format!("KeySteer {current} is already the latest version."),
+                    false,
+                ),
+                UpdateCheckResult::Failed(error) => {
+                    show_message(&format!("Could not check for updates.\n\n{error}"), true)
                 }
-            }
-            UpdateCheckResult::UpToDate { current } => show_message(
-                &format!("KeySteer {current} is already the latest version."),
-                false,
-            ),
-            UpdateCheckResult::Failed(error) => {
-                show_message(&format!("Could not check for updates.\n\n{error}"), true)
+            };
+            if let Err(error) = presentation {
+                crate::app::logging::report_error("windows-update", error);
             }
         })
         .map(|_| ())
@@ -425,17 +448,48 @@ fn open_url(url: &str) -> Result<(), String> {
     }
 }
 
-fn show_message(message: &str, is_error: bool) {
-    let message = wide(message);
-    let flags = MB_OK
-        | if is_error {
-            MB_ICONERROR
-        } else {
-            MB_ICONINFORMATION
-        };
-    unsafe {
-        let _ = MessageBoxW(None, PCWSTR(message.as_ptr()), w!("KeySteer Update"), flags);
+fn show_message(message: &str, is_error: bool) -> Result<(), String> {
+    // A detached MessageBox without an owner can remain inactive. This hidden
+    // same-thread owner gives the dialog a complete native modal lifetime while
+    // keeping the engine and tray threads unblocked.
+    let (response, destroy) = unsafe {
+        let owner = CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            w!("STATIC"),
+            w!("KeySteer Update"),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .map_err(|error| format!("cannot create Windows update dialog owner: {error}"))?;
+        let message = wide(message);
+        let flags = MB_OK
+            | MB_SETFOREGROUND
+            | if is_error {
+                MB_ICONERROR
+            } else {
+                MB_ICONINFORMATION
+            };
+        let response = MessageBoxW(
+            Some(owner),
+            PCWSTR(message.as_ptr()),
+            w!("KeySteer Update"),
+            flags,
+        );
+        let destroy = DestroyWindow(owner)
+            .map_err(|error| format!("cannot destroy Windows update dialog owner: {error}"));
+        (response, destroy)
+    };
+    if response.0 == 0 {
+        return Err("MessageBoxW could not present the update result".into());
     }
+    destroy
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -500,5 +554,14 @@ mod tests {
             BackendEvent::CheckForUpdates
         ));
         clear_sender();
+    }
+
+    #[test]
+    fn update_ui_is_single_instance_and_releases_its_guard() {
+        let first = UpdateUiGuard::acquire().expect("first dialog should acquire the guard");
+        assert!(UpdateUiGuard::acquire().is_none());
+
+        drop(first);
+        assert!(UpdateUiGuard::acquire().is_some());
     }
 }

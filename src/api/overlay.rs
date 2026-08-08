@@ -8,7 +8,12 @@
 //! This is what lets a plugin draw its own grid or full-screen mode with
 //! exactly the fidelity of the built-in modes — it has the same primitives.
 
-use serde::{Deserialize, Serialize};
+use std::{
+    ops::{Deref, DerefMut},
+    sync::Arc,
+};
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::geometry::{Point, Rect};
 
@@ -35,7 +40,12 @@ impl Color {
     /// Parse the configuration's canonical `#RRGGBBAA` representation.
     pub fn parse(hex: &str) -> Option<Self> {
         let hex = hex.trim().trim_start_matches('#');
-        let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+        // `str::get` also rejects non-UTF-8 boundaries, so malformed Unicode
+        // configuration cannot panic despite having an eight-byte length.
+        let byte = |i: usize| {
+            hex.get(i..i + 2)
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+        };
         match hex.len() {
             8 => Some(Self::rgba(byte(0)?, byte(2)?, byte(4)?, byte(6)?)),
             _ => None,
@@ -309,12 +319,127 @@ pub struct Indicator {
     pub style: LabelStyle,
 }
 
+/// Copy-on-write storage for the static primitives in an overlay scene.
+///
+/// Overlay scenes are cloned whenever the cursor marker or mode indicator
+/// moves. Sharing the usually much larger shape and label arrays keeps that
+/// operation constant-time; mutation still behaves like a `Vec` and detaches
+/// the storage only when necessary.
+#[derive(Debug, Clone)]
+pub struct OverlayItems<T>(Arc<Vec<T>>);
+
+impl<T> OverlayItems<T> {
+    pub fn new() -> Self {
+        Self(Arc::new(Vec::new()))
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self(Arc::new(Vec::with_capacity(capacity)))
+    }
+
+    #[cfg(any(target_os = "windows", test))]
+    pub(crate) fn shares_storage_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl<T> Default for OverlayItems<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> From<Vec<T>> for OverlayItems<T> {
+    fn from(items: Vec<T>) -> Self {
+        Self(Arc::new(items))
+    }
+}
+
+impl<T> Deref for OverlayItems<T> {
+    type Target = Vec<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T: Clone> DerefMut for OverlayItems<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
+impl<'a, T> IntoIterator for &'a OverlayItems<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<'a, T: Clone> IntoIterator for &'a mut OverlayItems<T> {
+    type Item = &'a mut T;
+    type IntoIter = std::slice::IterMut<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.deref_mut().iter_mut()
+    }
+}
+
+impl<T: Clone> IntoIterator for OverlayItems<T> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Arc::try_unwrap(self.0)
+            .unwrap_or_else(|items| items.as_ref().clone())
+            .into_iter()
+    }
+}
+
+impl<T: Clone> Extend<T> for OverlayItems<T> {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        self.deref_mut().extend(iter);
+    }
+}
+
+impl<T> FromIterator<T> for OverlayItems<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Self::from(iter.into_iter().collect::<Vec<_>>())
+    }
+}
+
+impl<T: PartialEq> PartialEq for OverlayItems<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0
+    }
+}
+
+impl<T: Serialize> Serialize for OverlayItems<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.as_ref().serialize(serializer)
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for OverlayItems<T> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Vec::deserialize(deserializer).map(Self::from)
+    }
+}
+
 /// One complete frame for the backend to present.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct OverlayScene {
     /// Shapes are drawn beneath labels of equal z-index.
-    pub shapes: Vec<OverlayShape>,
-    pub labels: Vec<OverlayLabel>,
+    pub shapes: OverlayItems<OverlayShape>,
+    pub labels: OverlayItems<OverlayLabel>,
     pub cursor_marker: Option<CursorMarker>,
     pub indicator: Option<Indicator>,
     /// Dim the whole desktop before drawing, e.g. for grid modes.
@@ -332,8 +457,8 @@ impl OverlayScene {
     /// mode rendering.
     pub fn with_capacity(shapes: usize, labels: usize) -> Self {
         Self {
-            shapes: Vec::with_capacity(shapes),
-            labels: Vec::with_capacity(labels),
+            shapes: OverlayItems::with_capacity(shapes),
+            labels: OverlayItems::with_capacity(labels),
             ..Self::default()
         }
     }
@@ -381,6 +506,7 @@ mod tests {
             Color::rgba(255, 0, 0, 0x80)
         );
         assert_eq!(Color::rgba(255, 0, 0, 0x80).to_hex(), "#FF000080");
+        assert!(Color::parse("a€aaaa").is_none());
     }
 
     #[test]
@@ -429,5 +555,33 @@ mod tests {
             Color::rgba(255, 128, 0, 128).premultiplied(),
             [128, 64, 0, 128]
         );
+    }
+
+    #[test]
+    fn cloned_scene_items_share_storage_until_mutated() {
+        let mut scene = OverlayScene::with_capacity(1, 1);
+        scene.push_label(OverlayLabel::new(
+            "a",
+            Rect::new(0.0, 0.0, 10.0, 10.0),
+            LabelStyle::default(),
+        ));
+        let mut clone = scene.clone();
+
+        assert!(scene.labels.shares_storage_with(&clone.labels));
+        clone.labels[0].text.push('b');
+
+        assert!(!scene.labels.shares_storage_with(&clone.labels));
+        assert_eq!(scene.labels[0].text, "a");
+        assert_eq!(clone.labels[0].text, "ab");
+    }
+
+    #[test]
+    fn shared_items_keep_the_plain_array_serialization_format() {
+        let items = OverlayItems::from(vec!["a".to_owned(), "b".to_owned()]);
+        let encoded = toml::Value::try_from(&items).unwrap();
+        assert_eq!(encoded, toml::Value::Array(vec!["a".into(), "b".into()]));
+
+        let decoded: OverlayItems<String> = encoded.try_into().unwrap();
+        assert_eq!(&*decoded, &["a".to_owned(), "b".to_owned()]);
     }
 }

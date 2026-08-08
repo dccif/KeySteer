@@ -1,5 +1,6 @@
 //! User-initiated release checks. No polling or automatic startup request.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use semver::Version;
@@ -10,6 +11,25 @@ use crate::api::backend::UpdateCheckResult;
 const LATEST_RELEASE_API: &str = "https://api.github.com/repos/dccif/KeySteer/releases/latest";
 const LATEST_RELEASE_PAGE: &str = "https://github.com/dccif/KeySteer/releases/latest";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_RELEASE_RESPONSE_BYTES: u64 = 64 * 1024;
+static CHECK_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+struct UpdateCheckGuard;
+
+impl UpdateCheckGuard {
+    fn acquire() -> Option<Self> {
+        CHECK_IN_PROGRESS
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then_some(Self)
+    }
+}
+
+impl Drop for UpdateCheckGuard {
+    fn drop(&mut self) {
+        CHECK_IN_PROGRESS.store(false, Ordering::Release);
+    }
+}
 
 #[derive(Deserialize)]
 struct LatestRelease {
@@ -19,9 +39,13 @@ struct LatestRelease {
 pub(crate) fn check_async(
     complete: impl FnOnce(UpdateCheckResult) + Send + 'static,
 ) -> Result<(), String> {
+    let Some(guard) = UpdateCheckGuard::acquire() else {
+        return Ok(());
+    };
     std::thread::Builder::new()
         .name("keysteer-update-check".into())
         .spawn(move || {
+            let _guard = guard;
             let result = check_latest_release().unwrap_or_else(UpdateCheckResult::Failed);
             complete(result);
         })
@@ -41,8 +65,13 @@ fn check_latest_release() -> Result<UpdateCheckResult, String> {
         .call()
         .map_err(|error| format!("cannot query GitHub releases: {error}"))?
         .body_mut()
+        .with_config()
+        .limit(MAX_RELEASE_RESPONSE_BYTES)
         .read_json()
         .map_err(|error| format!("cannot read GitHub release response: {error}"))?;
+    // The agent is intentionally request-scoped. Dropping it here releases its
+    // native TLS session and any pooled socket before UI presentation begins.
+    drop(agent);
 
     compare_versions(env!("CARGO_PKG_VERSION"), &release.tag_name)
 }
@@ -95,6 +124,15 @@ mod tests {
             config.tls_config().root_certs(),
             &ureq::tls::RootCerts::PlatformVerifier
         ));
+    }
+
+    #[test]
+    fn update_checks_are_single_flight_and_release_the_guard() {
+        let first = UpdateCheckGuard::acquire().expect("first check should acquire the guard");
+        assert!(UpdateCheckGuard::acquire().is_none());
+
+        drop(first);
+        assert!(UpdateCheckGuard::acquire().is_some());
     }
 
     #[test]

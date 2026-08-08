@@ -34,6 +34,16 @@ bash packaging/macos/package.sh
 `KEYSTEER_NOTARY_PROFILE` may be used instead of the three Apple account
 variables when a `notarytool` keychain profile is already configured.
 
+When a user installs `KeySteer.app` manually from the official GitHub Release
+and Gatekeeper refuses to open it, move the app to `/Applications` and run:
+
+```bash
+sudo xattr -cr /Applications/KeySteer.app
+```
+
+This recursively clears the app bundle's extended attributes and must only be
+used for an archive verified to come from the official KeySteer release page.
+
 ## Windows
 
 Run in PowerShell; the host architecture is selected automatically:
@@ -68,4 +78,6 @@ application-settle window, not a readiness metric.
 CI calls the same scripts. A manual all-platform build creates the Cargo-versioned
 tag and publishes exactly the four platform ZIPs to a GitHub Release. Optional
 macOS signing secrets are documented by the variable names in
-`.github/workflows/build.yml`.
+`.github/workflows/build.yml`. The workflow prepends `.github/release-notes.md`
+to GitHub's automatically generated notes so the macOS manual-install command
+is present on every release page.

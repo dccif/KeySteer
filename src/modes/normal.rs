@@ -19,8 +19,53 @@ use crate::api::command::{Command, HostContext, Mode, ModeEvent};
 use crate::api::input::{Key, KeyState, ModeId};
 use crate::api::overlay::Color;
 use crate::config::{Config, Palette, Pointer, Scroll};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
+
+/// Allocation-free set of active movement directions.
+#[derive(Debug, Clone, Copy, Default)]
+struct DirectionMask(u8);
+
+impl DirectionMask {
+    const fn bit(direction: Direction) -> u8 {
+        match direction {
+            Direction::Left => 1 << 0,
+            Direction::Down => 1 << 1,
+            Direction::Up => 1 << 2,
+            Direction::Right => 1 << 3,
+        }
+    }
+
+    fn insert(&mut self, direction: Direction) {
+        self.0 |= Self::bit(direction);
+    }
+
+    fn contains(self, direction: Direction) -> bool {
+        self.0 & Self::bit(direction) != 0
+    }
+
+    fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    fn delta(self) -> (f64, f64) {
+        let active = |direction| u8::from(self.contains(direction)) as f64;
+        (
+            active(Direction::Right) - active(Direction::Left),
+            active(Direction::Down) - active(Direction::Up),
+        )
+    }
+}
+
+impl FromIterator<Direction> for DirectionMask {
+    fn from_iter<T: IntoIterator<Item = Direction>>(directions: T) -> Self {
+        let mut mask = Self::default();
+        for direction in directions {
+            mask.insert(direction);
+        }
+        mask
+    }
+}
 
 /// Acceleration state for one continuous gesture.
 ///
@@ -44,7 +89,7 @@ impl Motion {
     /// display cadence never changes travel over an equal amount of time.
     fn step(
         &mut self,
-        directions: &BTreeSet<Direction>,
+        directions: DirectionMask,
         profile: &Pointer,
         multiplier: f64,
         elapsed: Duration,
@@ -106,22 +151,12 @@ impl Motion {
 
     /// Move once immediately so a press-and-release faster than the next
     /// display update remains observable without synthesising a frame interval.
-    fn tap(
-        &mut self,
-        directions: &BTreeSet<Direction>,
-        profile: &Pointer,
-        multiplier: f64,
-    ) -> (f64, f64) {
+    fn tap(&mut self, directions: DirectionMask, profile: &Pointer, multiplier: f64) -> (f64, f64) {
         self.advance(directions, profile.tap_distance * multiplier)
     }
 
-    fn advance(&mut self, directions: &BTreeSet<Direction>, distance: f64) -> (f64, f64) {
-        let (mut dx, mut dy) = (0.0, 0.0);
-        for direction in directions {
-            let (ax, ay) = direction.delta();
-            dx += ax;
-            dy += ay;
-        }
+    fn advance(&mut self, directions: DirectionMask, distance: f64) -> (f64, f64) {
+        let (dx, dy) = directions.delta();
         // Opposed keys cancel out; nothing to do.
         if dx == 0.0 && dy == 0.0 || distance <= 0.0 {
             return (0.0, 0.0);
@@ -186,7 +221,7 @@ impl NormalMode {
         }
     }
 
-    fn directions(&self) -> BTreeSet<Direction> {
+    fn directions(&self) -> DirectionMask {
         self.moving.values().copied().collect()
     }
 
@@ -211,13 +246,13 @@ impl NormalMode {
                         self.motion.reset();
                         self.fallback_tick = Some(now);
                         self.motion
-                            .tap(&directions, &self.profile, self.multiplier())
+                            .tap(directions, &self.profile, self.multiplier())
                     } else {
                         let elapsed = now.saturating_duration_since(
                             self.fallback_tick.replace(now).unwrap_or(now),
                         );
                         self.motion
-                            .step(&directions, &self.profile, self.multiplier(), elapsed)
+                            .step(directions, &self.profile, self.multiplier(), elapsed)
                     };
                     if dx != 0.0 || dy != 0.0 {
                         out.push(Command::MovePointer { dx, dy });
@@ -288,7 +323,7 @@ impl NormalMode {
         let directions = self.directions();
         let (dx, dy) = self
             .motion
-            .step(&directions, &self.profile, self.multiplier(), elapsed);
+            .step(directions, &self.profile, self.multiplier(), elapsed);
         if dx == 0.0 && dy == 0.0 {
             Vec::new()
         } else {
@@ -458,13 +493,13 @@ mod tests {
         profile.max_speed = 200.0;
         profile.acceleration = 500.0;
         profile.smooth_acceleration = false;
-        let directions = BTreeSet::from([Direction::Right]);
+        let directions = [Direction::Right].into_iter().collect();
         let mut motion = Motion::default();
         let elapsed = Duration::from_millis(100);
 
-        let first = motion.step(&directions, &profile, 1.0, elapsed).0;
-        let second = motion.step(&directions, &profile, 1.0, elapsed).0;
-        let third = motion.step(&directions, &profile, 1.0, elapsed).0;
+        let first = motion.step(directions, &profile, 1.0, elapsed).0;
+        let second = motion.step(directions, &profile, 1.0, elapsed).0;
+        let third = motion.step(directions, &profile, 1.0, elapsed).0;
         assert_eq!((first, second, third), (12.0, 18.0, 20.0));
         assert!((motion.elapsed_seconds - 0.3).abs() < f64::EPSILON);
     }
@@ -519,12 +554,12 @@ mod tests {
         profile.initial_speed = 100.0;
         profile.max_speed = 600.0;
         profile.acceleration = 500.0;
-        let directions = BTreeSet::from([Direction::Right]);
+        let directions = [Direction::Right].into_iter().collect();
 
         let distance = |updates: usize, elapsed: Duration| {
             let mut motion = Motion::default();
             (0..updates)
-                .map(|_| motion.step(&directions, &profile, 1.0, elapsed).0)
+                .map(|_| motion.step(directions, &profile, 1.0, elapsed).0)
                 .sum::<f64>()
         };
         assert_eq!(

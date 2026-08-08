@@ -1,10 +1,13 @@
 //! Native menu-bar controls.
 
+use std::cell::RefCell;
 use std::sync::{Mutex, OnceLock};
 
-use objc2::rc::Retained;
+use objc2::rc::{Allocated, Retained, autoreleasepool};
 use objc2::runtime::{AnyObject, NSObject};
-use objc2::{AnyThread, MainThreadMarker, define_class, sel};
+use objc2::{
+    AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
+};
 use objc2_app_kit::{
     NSAlert, NSApplication, NSApplicationActivationPolicy, NSControlStateValueOff,
     NSControlStateValueOn, NSImage, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem,
@@ -21,9 +24,15 @@ static SENDER: OnceLock<Mutex<Option<EventSender>>> = OnceLock::new();
 const STATUS_ICON_PNG: &[u8] = include_bytes!("../../../assets/icons/keysteer-icon.png");
 const STATUS_ICON_SIZE: f64 = 18.0;
 
+struct StatusTargetIvars {
+    update_alert: RefCell<Option<Retained<NSAlert>>>,
+}
+
 define_class!(
     #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
     #[name = "KeySteerStatusTarget"]
+    #[ivars = StatusTargetIvars]
     struct StatusTarget;
 
     impl StatusTarget {
@@ -47,6 +56,11 @@ define_class!(
             emit(BackendEvent::CheckForUpdates);
         }
 
+        #[unsafe(method(dismissUpdateAlert:))]
+        fn dismiss_update_alert_action(&self, _sender: Option<&AnyObject>) {
+            self.dismiss_update_alert();
+        }
+
         #[unsafe(method(quitApplication:))]
         fn quit_application(&self, _sender: Option<&AnyObject>) {
             emit(BackendEvent::Quit);
@@ -55,11 +69,29 @@ define_class!(
 );
 
 impl StatusTarget {
-    objc2::extern_methods!(
-        #[unsafe(method(new))]
-        #[unsafe(method_family = new)]
-        fn new() -> Retained<Self>;
-    );
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this: Allocated<Self> = mtm.alloc();
+        let this = this.set_ivars(StatusTargetIvars {
+            update_alert: RefCell::new(None),
+        });
+        // SAFETY: The NSObject superclass is initialized after Rust ivars.
+        unsafe { msg_send![super(this), init] }
+    }
+
+    fn show_update_alert(&self, alert: Retained<NSAlert>) {
+        self.dismiss_update_alert();
+        let window = alert.window();
+        *self.ivars().update_alert.borrow_mut() = Some(alert);
+        window.center();
+        NSApplication::sharedApplication(self.mtm()).activate();
+        window.makeKeyAndOrderFront(None);
+    }
+
+    fn dismiss_update_alert(&self) {
+        if let Some(alert) = self.ivars().update_alert.borrow_mut().take() {
+            alert.window().close();
+        }
+    }
 }
 
 pub struct StatusItem {
@@ -67,7 +99,6 @@ pub struct StatusItem {
     _target: Retained<StatusTarget>,
     toggle_item: Retained<NSMenuItem>,
     autostart_item: Retained<NSMenuItem>,
-    update_alert: Option<Retained<NSAlert>>,
     enabled: bool,
 }
 
@@ -82,7 +113,7 @@ impl StatusItem {
         application.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
         application.finishLaunching();
 
-        let target = StatusTarget::new();
+        let target = StatusTarget::new(mtm);
         let menu = NSMenu::new(mtm);
         menu.setAutoenablesItems(false);
 
@@ -133,7 +164,6 @@ impl StatusItem {
             _target: target,
             toggle_item,
             autostart_item,
-            update_alert: None,
             enabled: true,
         }
     }
@@ -171,14 +201,20 @@ impl StatusItem {
         let mtm = MainThreadMarker::new().ok_or_else(|| {
             "update result must be presented on the macOS main thread".to_string()
         })?;
-        let alert = NSAlert::new(mtm);
-        alert.setMessageText(&NSString::from_str(title));
-        alert.setInformativeText(&NSString::from_str(details));
-        alert.addButtonWithTitle(&NSString::from_str("OK"));
-        let window = alert.window();
-        window.center();
-        window.orderFrontRegardless();
-        self.update_alert = Some(alert);
+        autoreleasepool(|_| {
+            let alert = NSAlert::new(mtm);
+            alert.setMessageText(&NSString::from_str(title));
+            alert.setInformativeText(&NSString::from_str(details));
+            let button = alert.addButtonWithTitle(&NSString::from_str("OK"));
+            // NSAlert only wires its buttons while using runModal or sheet APIs.
+            // KeySteer stays non-modal so the engine loop can keep servicing the
+            // keyboard hook; explicitly close and release the retained alert.
+            unsafe {
+                button.setTarget(Some(&self._target));
+                button.setAction(Some(sel!(dismissUpdateAlert:)));
+            }
+            self._target.show_update_alert(alert);
+        });
         Ok(())
     }
 }
@@ -206,6 +242,7 @@ fn status_icon() -> Option<Retained<NSImage>> {
 
 impl Drop for StatusItem {
     fn drop(&mut self) {
+        self._target.dismiss_update_alert();
         if let Some(mutex) = SENDER.get() {
             *mutex.lock().unwrap_or_else(|error| error.into_inner()) = None;
         }

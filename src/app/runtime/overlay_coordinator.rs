@@ -9,18 +9,13 @@ impl Engine {
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
         if self.command_batch_depth > 0 {
-            self.pending_overlay = Some(PendingOverlay::Show(Arc::new(scene)));
+            self.pending_overlay = Some(PendingOverlay::Show(Box::new(scene)));
             return Ok(());
         }
-        self.show_overlay_now(scene, backend)
-    }
-
-    fn show_overlay_now(
-        &mut self,
-        scene: OverlayScene,
-        backend: &mut dyn Backend,
-    ) -> Result<(), String> {
-        self.show_shared_overlay_now(Arc::new(scene), backend)
+        // Static primitives keep their order for the lifetime of the mode
+        // scene. Sort once before sharing them instead of sorting (and
+        // detaching copy-on-write storage) on every cursor refresh.
+        self.show_shared_overlay_now(Arc::new(scene.sorted()), backend)
     }
 
     fn show_shared_overlay_now(
@@ -105,8 +100,6 @@ impl Engine {
             scene.clip =
                 Screen::containing(&self.screens, &self.cursor).map(|screen| screen.bounds);
         }
-        let scene = scene.sorted();
-
         let trace_overlay = if cursor_only {
             self.config.debug.motion
         } else {
@@ -190,7 +183,9 @@ impl Engine {
     ) -> Result<(), String> {
         match self.pending_overlay.take() {
             Some(PendingOverlay::Refresh) => self.refresh_overlay_now(backend),
-            Some(PendingOverlay::Show(scene)) => self.show_shared_overlay_now(scene, backend),
+            Some(PendingOverlay::Show(scene)) => {
+                self.show_shared_overlay_now(Arc::new((*scene).sorted()), backend)
+            }
             Some(PendingOverlay::Hide) => self.hide_overlay_now(backend),
             None => Ok(()),
         }

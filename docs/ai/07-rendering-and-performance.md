@@ -4,7 +4,16 @@
 
 `Backend::present` 接收 `Arc<OverlayScene>`。Windows 使用 latest-frame 单槽队列：Engine 只替换待绘制帧并立即返回，已经过期的帧不会进入原生绘制。同一输入批次中的 Warp、Show、Finish、Click、Hide 会先合并覆盖层意图；输入注入保持立即执行，批次结束只提交一次最终画面。
 
-Engine 保存最后一次 scene 并跳过完全相同的提交。Grid 使用 `Rect::subdivision` 直接计算单格，Recursive Grid 的层级布局在配置应用阶段编译，选择热路径不构造完整 `Vec<Cell>`。
+Engine 保存最后一次 scene 并跳过完全相同的提交。`OverlayScene` 的静态 shapes/labels 使用
+`OverlayItems<T>` 写时复制存储：移动 cursor/indicator 时 clone 只增加 `Arc` 引用计数，
+不会复制数百个标签；共享存储的相等判断也有指针快速路径。场景只在进入 Engine 时排序
+一次，逐帧刷新不得再次排序并触发写时复制。序列化仍保持普通数组格式。Grid 使用
+`Rect::subdivision` 直接计算单格，Recursive Grid 的层级布局在配置应用阶段编译，选择
+热路径不构造完整 `Vec<Cell>`。
+
+Normal 的活动方向使用四位 mask，而不是每个显示帧收集一个 `BTreeSet`。移动距离仍由
+真实 elapsed 的解析积分决定；这个优化只消除逐帧堆分配，不改变对向抵消、对角线归一化
+或多物理键绑定到同一方向时的去重语义。
 
 cursor marker 由 Engine 在 mode scene 之上装饰；合成鼠标按钮进入 latched 状态，或普通
 click 的物理触发键仍按住时，仅替换 marker 的填充/轮廓颜色并刷新动态 overlay，不改变
@@ -24,6 +33,9 @@ mode scene，也不重建静态 Grid/Hint 内容。latched 的真实按钮状态
   持续响应窗口消息，并对 `WM_NCHITTEST` 返回 `HTTRANSPARENT`。禁止让全屏 HWND 在
   Condvar/普通 channel 上无限等待，否则 Windows 会将其判为挂起并阻塞底层窗口输入。
 - Hide 销毁 HWND/visual/surface，只保留轻量 device、brush 和字体描述缓存。
+- Windows 高 DPI 标签缩放由渲染线程按“源标签共享存储 + scale”缓存。cursor/indicator
+  更新复用已缩放静态标签；源场景变化、缩放变化时才重建。进入空场景、回到 100%
+  缩放、Hide 和 Shutdown 都会清空该缓存，不能把上一张大型 Grid 留在 Normal 中。
 
 恢复规则位于 `overlay_worker.rs`：
 
@@ -57,6 +69,10 @@ mode scene，也不重建静态 Grid/Hint 内容。latched 的真实按钮状态
 
 窗口仍在 AppKit 主线程创建和更新。Engine、输入 Hook 与扫描工作不通过原生对象共享状态，只通过有界队列/安全 mailbox 通信。
 
+UI Hint 在活动扫描和重试期间复用 `scanned`/`hints` 容量；离开模式时若容量超过小型扫描
+上限则直接释放 backing allocation。`BTreeSet` 的节点在 `clear` 时本来就会逐项释放，
+无需伪造 shrink 操作。这样常见小扫描不反复分配，而 2000 目标级扫描不会成为 Idle 常驻内存。
+
 ## 帧时钟
 
 - Windows 11 优先使用 `DCompositionWaitForCompositorClock` 的 display-independent
@@ -83,6 +99,8 @@ mode scene，也不重建静态 Grid/Hint 内容。latched 的真实按钮状态
 - Hook disposition 和点击注入不能等待渲染。
 - producer 不得无限快于消费者；frame/scan channel 必须有界或合并。
 - cursor/indicator 变化不得重建静态 Grid/Hint 内容。
+- 静态 scene clone 必须保持写时复制；对 `OverlayItems` 排序或可变遍历只能发生在新场景
+  构造/高 DPI cache miss 阶段。
 - GPU 路径不得引入与屏幕像素数成比例的 CPU buffer。
 - Hide 必须释放全屏 native surface、DIB、image 和 layer tree；macOS 不能只 `orderOut` 后
   假设 WindowServer、content view 与子图层会同步解除所有权。

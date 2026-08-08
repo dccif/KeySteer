@@ -2,6 +2,16 @@
 
 KeySteer 支持 macOS 14 及以上。将 `KeySteer.app` 移动到程序目录即可。
 
+## GitHub Release 手动安装
+
+从[官方 GitHub Releases](https://github.com/dccif/KeySteer/releases/latest)下载对应架构的 ZIP，解压后将 `KeySteer.app` 移入 `/Applications`。如果 Gatekeeper 提示应用无法打开，请先确认下载来源，然后运行：
+
+```bash
+sudo xattr -cr /Applications/KeySteer.app
+```
+
+该命令会递归清除应用包的扩展属性，只应对从 KeySteer 官方发布页下载的应用使用。运行后重新打开 KeySteer，再完成下面的系统授权。
+
 ## 首次授权（推荐）
 
 1. 打开 `KeySteer.app` 之前。

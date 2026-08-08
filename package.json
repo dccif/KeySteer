@@ -9,7 +9,7 @@
   "scripts": {
     "docs:sync": "node scripts/sync-doc-assets.mjs",
     "docs:dev": "pnpm docs:sync && vitepress dev docs",
-    "docs:check": "vue-tsc --noEmit",
+    "docs:check": "pnpm docs:sync && tsc --noEmit",
     "docs:build": "pnpm docs:sync && vitepress build docs",
     "docs:preview": "vitepress preview docs",
     "docs:test": "node --test docs/.vitepress/simulator/*.test.ts"
@@ -26,7 +26,6 @@
     "typescript": "7.0.2",
     "vitepress": "1.6.4",
     "vitepress-plugin-mermaid": "^2.0.17",
-    "vue": "3.5.41",
-    "vue-tsc": "3.3.9"
+    "vue": "3.5.41"
   }
 }

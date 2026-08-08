@@ -21,6 +21,9 @@ use crate::config::{Config, Palette, UiHint as HintsConfig};
 use crate::hints::{self, Hint, Match};
 
 const SCAN_RETRY_TIMER_ID: &str = "ui_hint.scan_retry";
+/// Keep small scans warm, but do not pin a multi-thousand-target allocation
+/// after leaving this comparatively heavy mode.
+const MAX_IDLE_RETAINED_TARGETS: usize = 128;
 const MAX_SCAN_TIMEOUT_MS: u64 = 30_000;
 
 /// What the keyboard is currently doing.
@@ -90,12 +93,24 @@ impl HintMode {
         }
     }
 
-    fn request_scan(&mut self, ctx: &HostContext<'_>) -> Vec<Command> {
-        self.scanning = true;
-        self.status = None;
+    fn clear_scan_results(&mut self, release_large_buffers: bool) {
         self.scanned.clear();
         self.seen_targets.clear();
         self.hints.clear();
+        if release_large_buffers {
+            if self.scanned.capacity() > MAX_IDLE_RETAINED_TARGETS {
+                self.scanned = Vec::new();
+            }
+            if self.hints.capacity() > MAX_IDLE_RETAINED_TARGETS {
+                self.hints = Vec::new();
+            }
+        }
+    }
+
+    fn request_scan(&mut self, ctx: &HostContext<'_>) -> Vec<Command> {
+        self.scanning = true;
+        self.status = None;
+        self.clear_scan_results(false);
         self.input = Input::Labels(String::new());
         self.selected = None;
         self.finished = false;
@@ -220,7 +235,14 @@ impl HintMode {
     fn scene(&self, ctx: &HostContext<'_>) -> OverlayScene {
         let palette = ctx.palette;
         let placement = self.config.placement;
-        let mut scene = OverlayScene::new();
+        let shape_capacity = if self.config.boundary_highlight.enabled {
+            self.hints.len()
+        } else {
+            0
+        };
+        let label_capacity =
+            self.hints.len() + usize::from(matches!(&self.input, Input::Search(_)));
+        let mut scene = OverlayScene::with_capacity(shape_capacity, label_capacity);
         scene.clip = self.scan_bounds.or_else(|| Some(ctx.active_bounds()));
 
         let mut label_style = self.config.ui.resolve(
@@ -256,7 +278,6 @@ impl HintMode {
             Input::Labels(s) => s.as_str(),
             Input::Search(_) => "",
         };
-        let mut labels = Vec::new();
         for hint in self.hints.iter().filter(|hint| self.hint_is_visible(hint)) {
             let width = label_style.font_size * 0.75 * hint.label.chars().count() as f64
                 + label_style.padding_x * 2.0;
@@ -268,17 +289,14 @@ impl HintMode {
                 placed.width,
                 placed.height,
             );
-            labels.push(
+            scene.push_label(
                 OverlayLabel::new(hint.label.clone(), rect, label_style.clone())
                     .with_matched_prefix(typed.chars().count())
                     .with_z_index(2),
             );
         }
         if !self.held_overlap_keys.is_empty() {
-            rotate_overlapping_labels(&mut labels, self.overlap_cycle);
-        }
-        for label in labels {
-            scene.push_label(label);
+            rotate_overlapping_labels(&mut scene.labels, self.overlap_cycle);
         }
 
         // Search box, shown only while searching.
@@ -554,9 +572,7 @@ impl Mode for HintMode {
                 super::lifecycle_commands(&self.config.lifecycle.after_click, &self.return_mode)
             }
             ModeEvent::Deactivated => {
-                self.scanned.clear();
-                self.seen_targets.clear();
-                self.hints.clear();
+                self.clear_scan_results(true);
                 self.scanning = false;
                 self.scan_bounds = None;
                 self.input = Input::Labels(String::new());
@@ -573,9 +589,7 @@ impl Mode for HintMode {
             ModeEvent::UiScanned(result) if result.id == self.scan_id => {
                 if result.status == UiScanStatus::ContextChanged {
                     self.scanning = false;
-                    self.scanned.clear();
-                    self.seen_targets.clear();
-                    self.hints.clear();
+                    self.clear_scan_results(false);
                     self.status = Some("Focused window changed — Esc to exit".into());
                     return self.status_scene(ctx);
                 }
@@ -793,6 +807,21 @@ mod tests {
                 _ => None,
             })
             .expect("expected an overlay")
+    }
+
+    #[test]
+    fn deactivation_releases_large_scan_buffers() {
+        let env = Env::new();
+        let mut mode = HintMode::new(&env.config);
+        mode.scanned.reserve(1_024);
+        mode.hints.reserve(1_024);
+        assert!(mode.scanned.capacity() > MAX_IDLE_RETAINED_TARGETS);
+        assert!(mode.hints.capacity() > MAX_IDLE_RETAINED_TARGETS);
+
+        mode.handle(&ModeEvent::Deactivated, &env.ctx());
+
+        assert_eq!(mode.scanned.capacity(), 0);
+        assert_eq!(mode.hints.capacity(), 0);
     }
 
     #[test]

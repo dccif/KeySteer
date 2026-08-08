@@ -28,7 +28,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{PCWSTR, w};
 
 use crate::api::geometry::{Point, Rect};
-use crate::api::overlay::{Color, LabelStyle, OverlayLabel, OverlayScene, OverlayShape};
+use crate::api::overlay::{
+    Color, LabelStyle, OverlayItems, OverlayLabel, OverlayScene, OverlayShape,
+};
 
 use super::native::{OwnedWindow, SelectedObject};
 
@@ -332,17 +334,77 @@ impl Overlay {
 /// simple style is preserved; only its existing dimensions change. Compact
 /// labels grow around their centre, while grid-cell labels keep their container
 /// rectangle and cap the scale so text cannot overflow it.
-pub fn scene_for_dpi(scene: &OverlayScene, scale: f64) -> Cow<'_, OverlayScene> {
-    let scale = if scale.is_finite() {
+#[derive(Default)]
+pub(super) struct DpiSceneCache {
+    scale_bits: Option<u64>,
+    source_labels: Option<OverlayItems<OverlayLabel>>,
+    scaled_labels: Option<OverlayItems<OverlayLabel>>,
+}
+
+impl DpiSceneCache {
+    pub(super) fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    pub(super) fn scene_for_dpi<'a>(
+        &mut self,
+        scene: &'a OverlayScene,
+        scale: f64,
+    ) -> Cow<'a, OverlayScene> {
+        let scale = normalized_scale(scale);
+        if (scale - 1.0).abs() < f64::EPSILON {
+            self.clear();
+            return Cow::Borrowed(scene);
+        }
+
+        let mut scaled = scene.clone();
+        if scene.labels.is_empty() {
+            // Entering a lightweight/empty scene must not leave the previous
+            // high-DPI grid retained solely by this cache.
+            self.clear();
+        } else {
+            let cached_labels = self
+                .source_labels
+                .as_ref()
+                .zip(self.scaled_labels.as_ref())
+                .filter(|(source, _)| {
+                    self.scale_bits == Some(scale.to_bits())
+                        && source.shares_storage_with(&scene.labels)
+                })
+                .map(|(_, labels)| labels.clone());
+            if let Some(labels) = cached_labels {
+                scaled.labels = labels;
+            } else {
+                scale_labels(&mut scaled.labels, scale);
+                self.scale_bits = Some(scale.to_bits());
+                self.source_labels = Some(scene.labels.clone());
+                self.scaled_labels = Some(scaled.labels.clone());
+            }
+        }
+        if let Some(indicator) = &mut scaled.indicator {
+            scale_style(&mut indicator.style, scale);
+            indicator.position.x = indicator.position.x.round();
+            indicator.position.y = indicator.position.y.round();
+        }
+        Cow::Owned(scaled)
+    }
+}
+
+#[cfg(test)]
+fn scene_for_dpi(scene: &OverlayScene, scale: f64) -> Cow<'_, OverlayScene> {
+    DpiSceneCache::default().scene_for_dpi(scene, scale)
+}
+
+fn normalized_scale(scale: f64) -> f64 {
+    if scale.is_finite() {
         scale.max(1.0)
     } else {
         1.0
-    };
-    if (scale - 1.0).abs() < f64::EPSILON {
-        return Cow::Borrowed(scene);
     }
-    let mut scaled = scene.clone();
-    for label in &mut scaled.labels {
+}
+
+fn scale_labels(labels: &mut OverlayItems<OverlayLabel>, scale: f64) {
+    for label in labels {
         let chars = label.text.chars().count().max(1) as f64;
         let expected_width = label.style.font_size * 0.75 * chars + label.style.padding_x * 2.0;
         let expected_height = label.style.font_size * 1.4 + label.style.padding_y * 2.0;
@@ -364,12 +426,6 @@ pub fn scene_for_dpi(scene: &OverlayScene, scale: f64) -> Cow<'_, OverlayScene> 
         };
         scale_style(&mut label.style, effective);
     }
-    if let Some(indicator) = &mut scaled.indicator {
-        scale_style(&mut indicator.style, scale);
-        indicator.position.x = indicator.position.x.round();
-        indicator.position.y = indicator.position.y.round();
-    }
-    Cow::Owned(scaled)
 }
 
 fn scale_style(style: &mut LabelStyle, scale: f64) {
@@ -386,27 +442,30 @@ fn scene_matches_local(
     cached: &OverlayScene,
     cached_area: Rect,
 ) -> bool {
+    let same_area = area == cached_area;
     scene.backdrop == cached.backdrop
         && scene.shapes.len() == cached.shapes.len()
-        && scene
-            .shapes
-            .iter()
-            .zip(&cached.shapes)
-            .all(|(shape, cached)| shape_matches_local(shape, area, cached, cached_area))
+        && ((same_area && scene.shapes.shares_storage_with(&cached.shapes))
+            || scene
+                .shapes
+                .iter()
+                .zip(&cached.shapes)
+                .all(|(shape, cached)| shape_matches_local(shape, area, cached, cached_area)))
         && scene.labels.len() == cached.labels.len()
-        && scene
-            .labels
-            .iter()
-            .zip(&cached.labels)
-            .all(|(label, cached)| {
-                label.text == cached.text
-                    && rect_relative_to_area(label.rect, area)
-                        == rect_relative_to_area(cached.rect, cached_area)
-                    && label.style == cached.style
-                    && label.matched_prefix_len == cached.matched_prefix_len
-                    && label.z_index == cached.z_index
-                    && label.fit_to_text == cached.fit_to_text
-            })
+        && ((same_area && scene.labels.shares_storage_with(&cached.labels))
+            || scene
+                .labels
+                .iter()
+                .zip(&cached.labels)
+                .all(|(label, cached)| {
+                    label.text == cached.text
+                        && rect_relative_to_area(label.rect, area)
+                            == rect_relative_to_area(cached.rect, cached_area)
+                        && label.style == cached.style
+                        && label.matched_prefix_len == cached.matched_prefix_len
+                        && label.z_index == cached.z_index
+                        && label.fit_to_text == cached.fit_to_text
+                }))
         && match (&scene.cursor_marker, &cached.cursor_marker) {
             (Some(marker), Some(cached)) => {
                 point_relative_to_area(marker.center, area)
@@ -1462,5 +1521,33 @@ mod tests {
         let scaled = scene_for_dpi(&scene, 2.0);
         assert_eq!(scaled.labels[0].rect, scene.labels[0].rect);
         assert_eq!(scaled.labels[0].style.font_size, 20.0);
+    }
+
+    #[test]
+    fn dpi_cache_reuses_scaled_static_labels_and_releases_them() {
+        let mut source = OverlayScene::new();
+        source.labels.push(OverlayLabel::new(
+            "AA",
+            Rect::new(100.0, 100.0, 24.0, 16.0),
+            LabelStyle::default(),
+        ));
+        let mut cache = DpiSceneCache::default();
+        let first = cache.scene_for_dpi(&source, 1.5).into_owned();
+
+        let mut next_frame = source.clone();
+        next_frame.cursor_marker = Some(crate::api::overlay::CursorMarker {
+            center: Point::new(10.0, 20.0),
+            radius: 8.0,
+            fill: Color::TRANSPARENT,
+            stroke: Color::rgb(1, 2, 3),
+            stroke_width: 1.0,
+        });
+        let second = cache.scene_for_dpi(&next_frame, 1.5).into_owned();
+
+        assert!(first.labels.shares_storage_with(&second.labels));
+        let empty = OverlayScene::new();
+        let _ = cache.scene_for_dpi(&empty, 1.5);
+        assert!(cache.source_labels.is_none());
+        assert!(cache.scaled_labels.is_none());
     }
 }

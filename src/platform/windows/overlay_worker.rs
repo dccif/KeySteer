@@ -145,6 +145,7 @@ fn render_loop(shared: &Shared, events: &EventSender, ready: SyncSender<u32>) {
         return;
     }
     let (mut renderer, startup_notice) = AdaptiveRenderer::new();
+    let mut dpi_cache = overlay::DpiSceneCache::default();
     if let Some(notice) = startup_notice {
         warn(events, notice);
     }
@@ -173,6 +174,9 @@ fn render_loop(shared: &Shared, events: &EventSender, ready: SyncSender<u32>) {
 
         if let Some(control) = control {
             let result = renderer.dismiss();
+            // Drop both the source and scaled copies of a potentially large
+            // grid as soon as the overlay leaves the screen.
+            dpi_cache.clear();
             let shutdown = matches!(control, Control::Shutdown(_));
             match control {
                 Control::Dismiss(reply) | Control::Shutdown(reply) => {
@@ -185,7 +189,7 @@ fn render_loop(shared: &Shared, events: &EventSender, ready: SyncSender<u32>) {
         }
 
         if let Some(frame) = frame {
-            let scene = match overlay::scene_for_dpi(frame.scene.as_ref(), frame.scale) {
+            let scene = match dpi_cache.scene_for_dpi(frame.scene.as_ref(), frame.scale) {
                 std::borrow::Cow::Borrowed(_) => Arc::clone(&frame.scene),
                 std::borrow::Cow::Owned(scene) => Arc::new(scene),
             };

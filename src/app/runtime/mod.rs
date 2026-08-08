@@ -215,7 +215,7 @@ impl<T> IntoIterator for KeyMap<T> {
 /// coalesced until the outermost batch completes.
 enum PendingOverlay {
     Refresh,
-    Show(Arc<OverlayScene>),
+    Show(Box<OverlayScene>),
     Hide,
 }
 
