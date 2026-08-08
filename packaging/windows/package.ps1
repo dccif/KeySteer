@@ -20,6 +20,18 @@ if (-not $Target) {
 }
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+$manifest = Join-Path $projectRoot "Cargo.toml"
+$version = $null
+foreach ($line in Get-Content -LiteralPath $manifest) {
+    if ($line -match '^version\s*=\s*"([^"]+)"') {
+        $version = $Matches[1]
+        break
+    }
+}
+if ([string]::IsNullOrWhiteSpace($version)) {
+    throw "cannot read package version from: $manifest"
+}
+
 Push-Location $projectRoot
 try {
     & cargo build --locked --release --target $Target
@@ -35,12 +47,15 @@ $binary = Join-Path $projectRoot "target\$Target\release\keysteer.exe"
 if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
     throw "release executable was not produced: $binary"
 }
+$defaultConfig = Join-Path $projectRoot "keysteer.default.toml"
+if (-not (Test-Path -LiteralPath $defaultConfig -PathType Leaf)) {
+    throw "shipped default configuration is missing: $defaultConfig"
+}
 
 # Catch stale target-specific artifacts and config/schema drift before they can
 # be copied into a portable archive. `--check` only parses and validates; it
 # does not start the backend or request operating-system permissions.
 if (-not $SkipConfigCheck) {
-    $defaultConfig = Join-Path $projectRoot "keysteer.default.toml"
     & $binary --config $defaultConfig --check
     if ($LASTEXITCODE -ne 0) {
         throw "release executable rejected the shipped configuration (exit code $LASTEXITCODE)"
@@ -52,14 +67,16 @@ else {
 
 $dist = Join-Path $projectRoot "dist\$Target"
 $payload = Join-Path $dist "KeySteer"
-$archive = Join-Path $dist "KeySteer-$Target.zip"
+$archive = Join-Path $dist "KeySteer-v$version-$Target.zip"
 $checksum = "$archive.sha256"
+$legacyArchive = Join-Path $dist "KeySteer-$Target.zip"
+$legacyChecksum = "$legacyArchive.sha256"
 
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 if (Test-Path -LiteralPath $payload) {
     Remove-Item -LiteralPath $payload -Recurse -Force
 }
-foreach ($path in @($archive, $checksum)) {
+foreach ($path in @($archive, $checksum, $legacyArchive, $legacyChecksum)) {
     if (Test-Path -LiteralPath $path) {
         Remove-Item -LiteralPath $path -Force
     }
@@ -67,7 +84,8 @@ foreach ($path in @($archive, $checksum)) {
 
 New-Item -ItemType Directory -Path $payload | Out-Null
 Copy-Item -LiteralPath $binary -Destination (Join-Path $payload "KeySteer.exe")
-Compress-Archive -LiteralPath (Join-Path $payload "KeySteer.exe") `
+Copy-Item -LiteralPath $defaultConfig -Destination (Join-Path $payload "keysteer.default.toml")
+Compress-Archive -LiteralPath $payload `
     -DestinationPath $archive -CompressionLevel Optimal
 
 $stream = [System.IO.File]::OpenRead($archive)

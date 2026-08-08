@@ -35,19 +35,24 @@ icon_master="$project_root/assets/icons/keysteer-icon.png"
 template="$project_root/packaging/macos/Info.plist.in"
 dist="$project_root/dist/$target"
 app="$dist/KeySteer.app"
-archive="$dist/KeySteer-$target.zip"
-checksum="$archive.sha256"
+payload="$dist/KeySteer"
 iconset="$dist/KeySteer.iconset"
+default_config="$project_root/keysteer.default.toml"
 
 test -f "$binary"
 test -f "$icon_master"
 test -f "$template"
+test -f "$default_config"
 version="$(awk -F '"' '/^version = / { print $2; exit }' "$project_root/Cargo.toml")"
 [[ -n "$version" ]] || { echo "cannot read package version" >&2; exit 1; }
+archive="$dist/KeySteer-v$version-$target.zip"
+checksum="$archive.sha256"
+legacy_archive="$dist/KeySteer-$target.zip"
+legacy_checksum="$legacy_archive.sha256"
 
 mkdir -p "$dist"
-rm -rf "$app" "$iconset"
-rm -f "$archive" "$checksum"
+rm -rf "$app" "$payload" "$iconset"
+rm -f "$archive" "$checksum" "$legacy_archive" "$legacy_checksum"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$iconset"
 trap 'rm -rf "$iconset"' EXIT
 
@@ -88,9 +93,16 @@ fi
 codesign "${sign_args[@]}" "$app"
 codesign --verify --deep --strict --verbose=2 "$app"
 
+# Keep the editable shipped profile beside the app in the release archive.
+# macOS application data itself remains in Application Support at runtime.
+mkdir -p "$payload"
+mv "$app" "$payload/KeySteer.app"
+cp "$default_config" "$payload/keysteer.default.toml"
+app="$payload/KeySteer.app"
+
 make_archive() {
   rm -f "$archive" "$checksum"
-  ditto -c -k --sequesterRsrc --keepParent "$app" "$archive"
+  ditto -c -k --sequesterRsrc --keepParent "$payload" "$archive"
   (
     cd "$dist"
     shasum -a 256 "$(basename "$archive")" > "$(basename "$checksum")"

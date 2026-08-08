@@ -28,8 +28,9 @@ release profile：`opt-level=3`、fat LTO、`codegen-units=1`、abort panic、st
 `packaging/windows/package.ps1 [target]`：
 
 1. `cargo build --locked --release --target`。
-2. 复制图标已嵌入、GUI-subsystem 的 `KeySteer.exe`。
-3. 生成 `dist/<target>/KeySteer-<target>.zip`。
+2. 复制图标已嵌入、GUI-subsystem 的 `KeySteer.exe` 与
+   `keysteer.default.toml` 到 `dist/<target>/KeySteer/`。
+3. 生成包含该目录的 `dist/<target>/KeySteer-v<version>-<target>.zip`。
 4. 生成 SHA-256 文件。
 
 支持 `x86_64-pc-windows-msvc`、`aarch64-pc-windows-msvc`。
@@ -51,7 +52,8 @@ stops its launched process unless `-KeepRunning` is selected.
 3. 从 `Info.plist.in` 注入版本/最低系统，生成 `.icns` 并嵌入。
 4. 默认 ad-hoc codesign；有 Developer ID 时正式签名。
 5. 可通过 notary profile 或 Apple account notarize/staple。
-6. `ditto` 生成 ZIP 和 SHA-256。
+6. 将 `.app` 和 `keysteer.default.toml` 放入 `KeySteer/`，再由 `ditto`
+   生成带 Cargo 版本的 ZIP 和 SHA-256。
 
 支持 Apple Silicon 和 Intel。正式签名身份必须稳定，否则 Accessibility/Screen Recording
 授权可能无法跨升级延续。
@@ -66,8 +68,13 @@ stops its launched process unless `-KeepRunning` is selected.
 - Linux job 跑 fmt 和 shipped-config integration test。
 - docs job 使用 Node 24 + pnpm 10，跑 test/typecheck/build。
 
-`.github/workflows/release.yml` 在 `v*` tag：复用同一平台打包脚本，上传四套 ZIP/checksum，
-最终生成 GitHub Release。macOS 证书和 notarization 通过 secrets 注入。
+`.github/workflows/build.yml` 手动运行时会构建所选平台；选择 `all` 时，待四个平台的
+ZIP/checksum 都成功后，以 Cargo 版本创建 `v<version>` GitHub Release 并上传全部资产。
+只构建单个平台时保留 workflow artifact，但不创建不完整的 Release。macOS 证书和
+notarization 通过 secrets 注入。
+
+每个 target 的 workflow artifact 也独立上传：Windows x64/ARM64、macOS Apple
+Silicon/Intel 各一份；不会把不同架构放入同一个 ZIP 或 artifact。
 
 ## VitePress 文档与模拟器
 

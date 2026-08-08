@@ -1,4 +1,4 @@
-name: Build release packages
+name: Build and publish release
 
 on:
   workflow_dispatch:
@@ -19,7 +19,7 @@ on:
         type: boolean
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   windows:
@@ -27,7 +27,7 @@ jobs:
     runs-on: windows-2025
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Install Rust targets
         run: rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc
@@ -44,13 +44,23 @@ jobs:
         shell: pwsh
         run: ./packaging/windows/package.ps1 -Target aarch64-pc-windows-msvc -SkipConfigCheck
 
-      - name: Upload Windows packages
-        uses: actions/upload-artifact@v5
+      - name: Upload Windows x64 package
+        uses: actions/upload-artifact@v7
         with:
-          name: KeySteer-Windows
+          name: KeySteer-Windows-x64
           path: |
-            dist/*/*.zip
-            dist/*/*.sha256
+            dist/x86_64-pc-windows-msvc/*.zip
+            dist/x86_64-pc-windows-msvc/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Windows ARM64 package
+        uses: actions/upload-artifact@v7
+        with:
+          name: KeySteer-Windows-ARM64
+          path: |
+            dist/aarch64-pc-windows-msvc/*.zip
+            dist/aarch64-pc-windows-msvc/*.sha256
           if-no-files-found: error
           retention-days: 30
 
@@ -59,7 +69,7 @@ jobs:
     runs-on: macos-14
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Install Rust targets
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
@@ -69,17 +79,78 @@ jobs:
         run: cargo test --locked --all-features
 
       - name: Package macOS Apple Silicon
-        run: ./packaging/macos/package.sh aarch64-apple-darwin
+        shell: bash
+        run: bash packaging/macos/package.sh aarch64-apple-darwin
 
       - name: Package macOS Intel
-        run: ./packaging/macos/package.sh x86_64-apple-darwin
+        shell: bash
+        run: bash packaging/macos/package.sh x86_64-apple-darwin
 
-      - name: Upload macOS packages
-        uses: actions/upload-artifact@v5
+      - name: Upload macOS Apple Silicon package
+        uses: actions/upload-artifact@v7
         with:
-          name: KeySteer-macOS
+          name: KeySteer-macOS-Apple-Silicon
           path: |
-            dist/*/*.zip
-            dist/*/*.sha256
+            dist/aarch64-apple-darwin/*.zip
+            dist/aarch64-apple-darwin/*.sha256
           if-no-files-found: error
           retention-days: 30
+
+      - name: Upload macOS Intel package
+        uses: actions/upload-artifact@v7
+        with:
+          name: KeySteer-macOS-Intel
+          path: |
+            dist/x86_64-apple-darwin/*.zip
+            dist/x86_64-apple-darwin/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    # A public release must contain every supported platform. Partial manual
+    # builds still retain their downloadable workflow artifacts.
+    if: ${{ inputs.platform == 'all' }}
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Read package version
+        id: version
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version = "\([^" ]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test -n "$version"
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Download release assets
+        uses: actions/download-artifact@v8
+        with:
+          pattern: KeySteer-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify release assets
+        shell: bash
+        run: |
+          test "$(find release-assets -maxdepth 1 -name '*.zip' | wc -l)" -eq 4
+          test "$(find release-assets -maxdepth 1 -name '*.sha256' | wc -l)" -eq 4
+          find release-assets -maxdepth 1 -type f -printf '%f\n' | sort
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.value }}
+        shell: bash
+        run: |
+          tag="v$VERSION"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release already exists: $tag" >&2
+            exit 1
+          fi
+          gh release create "$tag" \
+            --target "$GITHUB_SHA" \
+            --title "KeySteer v$VERSION" \
+            --generate-notes \
+            release-assets/*.zip release-assets/*.sha256
