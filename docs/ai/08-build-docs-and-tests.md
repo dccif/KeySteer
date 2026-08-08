@@ -85,7 +85,8 @@ GitHub Pages。需要更新线上文档时，在 Actions 页面运行 `Deploy do
 
 `.github/ISSUE_TEMPLATE/` 提供错误报告、功能建议和配置/按键问题三种 Issue Form；错误
 报告收集平台、架构、版本、受影响功能、复现步骤和脱敏 TOML，避免把不完整的环境信息留给
-维护者猜测。不要在模板中预设 labels，因为 GitHub 只会添加仓库中已经存在的 labels。
+维护者猜测。空白 Issue 仍允许创建。不要在模板中预设 labels，因为 GitHub 只会添加仓库中
+已经存在的 labels。
 
 ## VitePress 文档与模拟器
 
