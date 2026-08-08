@@ -20,7 +20,9 @@ pub mod plugin;
 pub mod theme;
 
 pub use autostart::Autostart;
-pub use backend::{Appearance, Backend, BackendEvent, KeyDisposition, UpdateCheckResult};
+pub use backend::{
+    Appearance, Backend, BackendEvent, KeyDisposition, UpdateCheckResult, UpdateProgress,
+};
 pub use binding::{
     Action, ActionPhase, ActionSequence, Binding, Button, DEFAULT_WAIT_MS, Direction, InputTarget,
     ScrollAmount, Speed,

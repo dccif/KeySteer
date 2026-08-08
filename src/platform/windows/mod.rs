@@ -502,10 +502,24 @@ impl Backend for WindowsBackend {
     }
 
     fn check_for_updates(&mut self) -> Result<(), String> {
-        let sender = self.event_tx.clone();
-        crate::update::check_async(move |result| {
-            let _ = sender.send(BackendEvent::UpdateChecked(result));
-        })
+        let progress_sender = self.event_tx.clone();
+        let complete_sender = self.event_tx.clone();
+        crate::app::update::check_async(
+            move |progress| {
+                let _ = progress_sender.send(BackendEvent::UpdateProgress(progress));
+            },
+            move |result| {
+                let _ = complete_sender.send(BackendEvent::UpdateChecked(result));
+            },
+        )
+    }
+
+    fn present_update_progress(
+        &mut self,
+        progress: &crate::api::backend::UpdateProgress,
+    ) -> Result<(), String> {
+        status_item::set_update_progress(progress);
+        Ok(())
     }
 
     fn present_update_result(

@@ -1041,6 +1041,11 @@ impl Engine {
                     crate::app::logging::report_error("update-check", error);
                 }
             }
+            BackendEvent::UpdateProgress(progress) => {
+                if let Err(error) = backend.present_update_progress(&progress) {
+                    crate::app::logging::report_error("update-check", error);
+                }
+            }
             BackendEvent::UpdateChecked(result) => {
                 if let Err(error) = backend.present_update_result(&result) {
                     crate::app::logging::report_error("update-check", error);

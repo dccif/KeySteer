@@ -1,6 +1,7 @@
 //! Native menu-bar controls.
 
 use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use objc2::rc::{Allocated, Retained, autoreleasepool};
@@ -12,12 +13,12 @@ use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton,
     NSControlStateValueOff, NSControlStateValueOn, NSFont, NSImage, NSImageView, NSMenu,
     NSMenuItem, NSPanel, NSStatusBar, NSStatusItem, NSTextField, NSVariableStatusItemLength,
-    NSView, NSWindowStyleMask,
+    NSView, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{NSData, NSPoint, NSRect, NSSize, NSString};
 
 use crate::api::Autostart;
-use crate::api::backend::{BackendEvent, UpdateCheckResult};
+use crate::api::backend::{BackendEvent, UpdateCheckResult, UpdateProgress};
 
 use super::EventSender;
 
@@ -27,6 +28,7 @@ const STATUS_ICON_SIZE: f64 = 18.0;
 
 struct StatusTargetIvars {
     update_alert: RefCell<Option<Retained<NSPanel>>>,
+    downloaded_update: RefCell<Option<PathBuf>>,
 }
 
 define_class!(
@@ -62,6 +64,29 @@ define_class!(
             self.dismiss_update_alert();
         }
 
+        #[unsafe(method(showDownloadedUpdate:))]
+        fn show_downloaded_update(&self, _sender: Option<&AnyObject>) {
+            let downloaded_update = self.ivars().downloaded_update.borrow();
+            let Some(path) = downloaded_update.as_deref() else {
+                return;
+            };
+            let full_path = NSString::from_str(&path.to_string_lossy());
+            let root_path = NSString::from_str(
+                &path
+                    .parent()
+                    .unwrap_or(path)
+                    .to_string_lossy(),
+            );
+            if !NSWorkspace::sharedWorkspace()
+                .selectFile_inFileViewerRootedAtPath(Some(&full_path), &root_path)
+            {
+                crate::app::logging::report_error(
+                    "macos-update",
+                    format!("Finder could not reveal {}", path.display()),
+                );
+            }
+        }
+
         #[unsafe(method(quitApplication:))]
         fn quit_application(&self, _sender: Option<&AnyObject>) {
             emit(BackendEvent::Quit);
@@ -74,24 +99,26 @@ impl StatusTarget {
         let this: Allocated<Self> = mtm.alloc();
         let this = this.set_ivars(StatusTargetIvars {
             update_alert: RefCell::new(None),
+            downloaded_update: RefCell::new(None),
         });
         // SAFETY: The NSObject superclass is initialized after Rust ivars.
         unsafe { msg_send![super(this), init] }
     }
 
-    fn show_update_alert(&self, alert: Retained<NSPanel>) {
+    fn show_update_alert(&self, alert: Retained<NSPanel>, downloaded_update: Option<PathBuf>) {
         self.dismiss_update_alert();
+        *self.ivars().downloaded_update.borrow_mut() = downloaded_update;
         *self.ivars().update_alert.borrow_mut() = Some(alert);
         let alert = self.ivars().update_alert.borrow();
-        let window = alert
-            .as_ref()
-            .expect("the update panel was retained immediately before presentation");
-        window.center();
-        NSApplication::sharedApplication(self.mtm()).activate();
-        window.makeKeyAndOrderFront(None);
+        if let Some(window) = alert.as_ref() {
+            window.center();
+            NSApplication::sharedApplication(self.mtm()).activate();
+            window.makeKeyAndOrderFront(None);
+        }
     }
 
     fn dismiss_update_alert(&self) {
+        self.ivars().downloaded_update.borrow_mut().take();
         if let Some(alert) = self.ivars().update_alert.borrow_mut().take() {
             alert.close();
         }
@@ -103,6 +130,7 @@ pub struct StatusItem {
     _target: Retained<StatusTarget>,
     toggle_item: Retained<NSMenuItem>,
     autostart_item: Retained<NSMenuItem>,
+    update_item: Retained<NSMenuItem>,
     enabled: bool,
 }
 
@@ -168,6 +196,7 @@ impl StatusItem {
             _target: target,
             toggle_item,
             autostart_item,
+            update_item,
             enabled: true,
         }
     }
@@ -185,10 +214,30 @@ impl StatusItem {
         set_checked(&self.autostart_item, enabled);
     }
 
+    pub(super) fn present_update_progress(&mut self, progress: &UpdateProgress) {
+        let title = match progress {
+            UpdateProgress::Checking => "Checking for Updates...".to_string(),
+            UpdateProgress::Downloading { latest, percent } => {
+                format!("Downloading KeySteer {latest}... {}%", (*percent).min(100))
+            }
+        };
+        self.set_update_menu(&title, false);
+    }
+
     pub(super) fn present_update_result(
         &mut self,
         result: &UpdateCheckResult,
     ) -> Result<(), String> {
+        let title = match result {
+            UpdateCheckResult::UpdateDownloaded { latest, .. } => {
+                format!("KeySteer {latest} Downloaded")
+            }
+            UpdateCheckResult::UpToDate { current } => {
+                format!("KeySteer {current} Is Up to Date")
+            }
+            UpdateCheckResult::Failed(_) => "Update Check Failed - Retry...".to_string(),
+        };
+        self.set_update_menu(&title, true);
         match result {
             UpdateCheckResult::UpdateDownloaded {
                 current,
@@ -200,18 +249,30 @@ impl StatusItem {
                     "KeySteer {latest} was saved to {}. Quit KeySteer, extract the ZIP, then move the new app to Applications to replace version {current}.",
                     path.display()
                 ),
+                Some(path),
             ),
             UpdateCheckResult::UpToDate { current } => self.show_alert(
                 "KeySteer is up to date",
                 &format!("KeySteer {current} is already the latest version."),
+                None,
             ),
             UpdateCheckResult::Failed(error) => {
-                self.show_alert("Could not check for updates", error)
+                self.show_alert("Could not check for updates", error, None)
             }
         }
     }
 
-    fn show_alert(&mut self, title: &str, details: &str) -> Result<(), String> {
+    fn set_update_menu(&self, title: &str, enabled: bool) {
+        self.update_item.setTitle(&NSString::from_str(title));
+        self.update_item.setEnabled(enabled);
+    }
+
+    fn show_alert(
+        &mut self,
+        title: &str,
+        details: &str,
+        downloaded_update: Option<&Path>,
+    ) -> Result<(), String> {
         let mtm = MainThreadMarker::new().ok_or_else(|| {
             "update result must be presented on the macOS main thread".to_string()
         })?;
@@ -264,13 +325,22 @@ impl StatusItem {
             ));
             content.addSubview(&details_label);
 
-            let button = unsafe {
-                NSButton::buttonWithTitle_target_action(
+            let (button, reveal_button) = unsafe {
+                let button = NSButton::buttonWithTitle_target_action(
                     &NSString::from_str("OK"),
                     Some(&self._target),
                     Some(sel!(dismissUpdateAlert:)),
                     mtm,
-                )
+                );
+                let reveal_button = downloaded_update.is_some().then(|| {
+                    NSButton::buttonWithTitle_target_action(
+                        &NSString::from_str("Show in Finder"),
+                        Some(&self._target),
+                        Some(sel!(showDownloadedUpdate:)),
+                        mtm,
+                    )
+                });
+                (button, reveal_button)
             };
             button.setFrame(NSRect::new(
                 NSPoint::new(412.0, 16.0),
@@ -279,8 +349,17 @@ impl StatusItem {
             button.setKeyEquivalent(&NSString::from_str("\r"));
             content.addSubview(&button);
 
+            if let Some(reveal_button) = reveal_button {
+                reveal_button.setFrame(NSRect::new(
+                    NSPoint::new(276.0, 16.0),
+                    NSSize::new(124.0, 32.0),
+                ));
+                content.addSubview(&reveal_button);
+            }
+
             panel.setContentView(Some(&content));
-            self._target.show_update_alert(panel);
+            self._target
+                .show_update_alert(panel, downloaded_update.map(Path::to_path_buf));
             Ok(())
         })
     }

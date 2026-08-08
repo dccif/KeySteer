@@ -43,10 +43,19 @@ pub enum BackendEvent {
     ToggleAutostart,
     /// The user explicitly requested an update check from the native menu.
     CheckForUpdates,
+    /// A background update request changed phase or download percentage.
+    UpdateProgress(UpdateProgress),
     /// A background update request completed.
     UpdateChecked(UpdateCheckResult),
     /// Non-fatal backend problem worth logging.
     Warning(String),
+}
+
+/// Visible progress for a user-requested background update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateProgress {
+    Checking,
+    Downloading { latest: String, percent: u8 },
 }
 
 /// Result of comparing the running package version with GitHub's latest release.
@@ -157,6 +166,11 @@ pub trait Backend {
     /// Start a user-requested update check without blocking the engine loop.
     fn check_for_updates(&mut self) -> Result<(), String> {
         Err(format!("{} does not support update checks", self.name()))
+    }
+
+    /// Reflect background update progress in the platform status menu.
+    fn present_update_progress(&mut self, _progress: &UpdateProgress) -> Result<(), String> {
+        Ok(())
     }
 
     /// Present the result using the platform's native UI.

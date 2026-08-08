@@ -29,7 +29,6 @@ pub mod domain;
 pub mod modes;
 pub mod platform;
 pub mod plugins;
-mod update;
 
 // Compatibility module aliases keep existing library callers working while the
 // implementation lives behind explicit application and domain boundaries.

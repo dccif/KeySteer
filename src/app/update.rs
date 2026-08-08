@@ -10,7 +10,7 @@ use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::api::backend::UpdateCheckResult;
+use crate::api::backend::{UpdateCheckResult, UpdateProgress};
 
 const LATEST_RELEASE_API: &str = "https://api.github.com/repos/dccif/KeySteer/releases/latest";
 const CDN_LATEST_MANIFEST: &str = "https://cdn.jsdelivr.net/gh/dccif/KeySteer@latest/Cargo.toml";
@@ -106,6 +106,7 @@ impl FetchFailure {
 }
 
 pub(crate) fn check_async(
+    progress: impl Fn(UpdateProgress) + Send + 'static,
     complete: impl FnOnce(UpdateCheckResult) + Send + 'static,
 ) -> Result<(), String> {
     let Some(guard) = UpdateCheckGuard::acquire() else {
@@ -116,14 +117,15 @@ pub(crate) fn check_async(
         .stack_size(UPDATE_THREAD_STACK_BYTES)
         .spawn(move || {
             let _guard = guard;
-            let result = check_latest_release().unwrap_or_else(UpdateCheckResult::Failed);
+            progress(UpdateProgress::Checking);
+            let result = check_latest_release(&progress).unwrap_or_else(UpdateCheckResult::Failed);
             complete(result);
         })
         .map(|_| ())
         .map_err(|error| format!("cannot start update check: {error}"))
 }
 
-fn check_latest_release() -> Result<UpdateCheckResult, String> {
+fn check_latest_release(progress: &dyn Fn(UpdateProgress)) -> Result<UpdateCheckResult, String> {
     let current = Version::parse(env!("CARGO_PKG_VERSION"))
         .map_err(|error| format!("invalid current package version: {error}"))?;
     let target = release_target()?;
@@ -135,7 +137,15 @@ fn check_latest_release() -> Result<UpdateCheckResult, String> {
         });
     }
 
-    let path = download_release(&latest, target)?;
+    let latest_version = latest.version.to_string();
+    let report_download = |percent| {
+        progress(UpdateProgress::Downloading {
+            latest: latest_version.clone(),
+            percent,
+        });
+    };
+    report_download(0);
+    let path = download_release(&latest, target, &report_download)?;
     Ok(UpdateCheckResult::UpdateDownloaded {
         current: current.to_string(),
         latest: latest.version.to_string(),
@@ -259,7 +269,11 @@ fn release_asset_name(version: &Version, target: &str) -> String {
     format!("KeySteer-v{version}-{target}.zip")
 }
 
-fn download_release(release: &ReleaseInfo, target: &str) -> Result<PathBuf, String> {
+fn download_release(
+    release: &ReleaseInfo,
+    target: &str,
+    progress: &dyn Fn(u8),
+) -> Result<PathBuf, String> {
     let file_name = release_asset_name(&release.version, target);
     let url = format!("{RELEASE_DOWNLOAD_ROOT}/v{}/{file_name}", release.version);
     let directory = downloads_directory()?;
@@ -284,16 +298,21 @@ fn download_release(release: &ReleaseInfo, target: &str) -> Result<PathBuf, Stri
     }
 
     if let Err(direct_error) =
-        download_and_validate(&url, partial_guard.path(), release.asset.as_ref())
+        download_and_validate(&url, partial_guard.path(), release.asset.as_ref(), progress)
     {
         let proxy_url = gh_proxy_url(&url);
-        download_and_validate(&proxy_url, partial_guard.path(), release.asset.as_ref()).map_err(
-            |proxy_error| {
+        progress(0);
+        download_and_validate(
+            &proxy_url,
+            partial_guard.path(),
+            release.asset.as_ref(),
+            progress,
+        )
+        .map_err(|proxy_error| {
                 format!(
                     "Official GitHub download failed: {direct_error}\n\ngh-proxy retry failed: {proxy_error}"
                 )
-            },
-        )?;
+            })?;
     }
     replace_download(partial_guard.path(), &destination)?;
     Ok(destination)
@@ -307,8 +326,9 @@ fn download_and_validate(
     url: &str,
     path: &Path,
     asset: Option<&ReleaseAsset>,
+    progress: &dyn Fn(u8),
 ) -> Result<(), String> {
-    let receipt = download_to(url, path)?;
+    let receipt = download_to(url, path, asset.map(|asset| asset.size), progress)?;
     validate_zip(path)?;
     if let Some(asset) = asset {
         if receipt.bytes != asset.size {
@@ -323,10 +343,16 @@ fn download_and_validate(
             return Err("downloaded update failed GitHub SHA-256 verification".into());
         }
     }
+    progress(100);
     Ok(())
 }
 
-fn download_to(url: &str, path: &Path) -> Result<DownloadReceipt, String> {
+fn download_to(
+    url: &str,
+    path: &Path,
+    expected_size: Option<u64>,
+    progress: &dyn Fn(u8),
+) -> Result<DownloadReceipt, String> {
     let agent: ureq::Agent = download_agent_config().into();
     let mut response = agent
         .get(url)
@@ -337,6 +363,16 @@ fn download_to(url: &str, path: &Path) -> Result<DownloadReceipt, String> {
         )
         .call()
         .map_err(|error| download_network_error("cannot start update download", &error))?;
+    let response_size = response.body().content_length();
+    if let Some(size) = response_size
+        && size > MAX_DOWNLOAD_BYTES
+    {
+        return Err(format!(
+            "release asset is {size} bytes, above the {} MiB update limit",
+            MAX_DOWNLOAD_BYTES / (1024 * 1024)
+        ));
+    }
+    let total = expected_size.filter(|size| *size > 0).or(response_size);
     let mut file = File::create(path).map_err(|error| {
         format!(
             "cannot create temporary download {}: {error}",
@@ -350,6 +386,7 @@ fn download_to(url: &str, path: &Path) -> Result<DownloadReceipt, String> {
         .reader();
     let mut hasher = Sha256::new();
     let mut bytes = 0_u64;
+    let mut last_percent = 0_u8;
     let mut buffer = [0_u8; DOWNLOAD_BUFFER_BYTES];
     loop {
         let read = reader
@@ -366,6 +403,13 @@ fn download_to(url: &str, path: &Path) -> Result<DownloadReceipt, String> {
         })?;
         hasher.update(&buffer[..read]);
         bytes += read as u64;
+        if let Some(total) = total {
+            let percent = download_percent(bytes, total).min(99);
+            if percent > last_percent {
+                last_percent = percent;
+                progress(percent);
+            }
+        }
     }
     file.flush()
         .and_then(|()| file.sync_all())
@@ -380,6 +424,13 @@ fn download_to(url: &str, path: &Path) -> Result<DownloadReceipt, String> {
         bytes,
         sha256: format!("{:x}", hasher.finalize()),
     })
+}
+
+fn download_percent(received: u64, total: u64) -> u8 {
+    if total == 0 {
+        return 0;
+    }
+    ((u128::from(received) * 100 / u128::from(total)).min(100)) as u8
 }
 
 fn validate_zip(path: &Path) -> Result<(), String> {
@@ -561,6 +612,17 @@ mod tests {
         assert_eq!(MAX_DOWNLOAD_BYTES, 10 * 1024 * 1024);
         assert_eq!(DOWNLOAD_BUFFER_BYTES, 32 * 1024);
         assert_eq!(UPDATE_THREAD_STACK_BYTES, 512 * 1024);
+    }
+
+    #[test]
+    fn download_percentage_is_bounded_and_monotonic() {
+        assert_eq!(download_percent(0, 10), 0);
+        assert_eq!(download_percent(1, 10), 10);
+        assert_eq!(download_percent(5, 10), 50);
+        assert_eq!(download_percent(10, 10), 100);
+        assert_eq!(download_percent(11, 10), 100);
+        assert_eq!(download_percent(u64::MAX, u64::MAX), 100);
+        assert_eq!(download_percent(10, 0), 0);
     }
 
     #[test]

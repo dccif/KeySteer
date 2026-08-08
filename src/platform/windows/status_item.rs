@@ -3,6 +3,7 @@
 //! `TrackPopupMenu` runs a modal loop. Keeping the tray window on its own
 //! thread prevents that loop from blocking keyboard-disposition handshakes.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -16,17 +17,17 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessageW, HCURSOR, HICON,
-    IDI_APPLICATION, LoadIconW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND,
-    MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, PostMessageW, PostThreadMessageW,
-    RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CANCELMODE,
-    WM_DISPLAYCHANGE, WM_LBUTTONUP, WM_NULL, WM_QUIT, WM_RBUTTONUP, WM_SETTINGCHANGE, WNDCLASSEXW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    IDI_APPLICATION, IDYES, LoadIconW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND,
+    MB_YESNO, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, PostMessageW,
+    PostThreadMessageW, RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow,
+    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+    TranslateMessage, WM_APP, WM_CANCELMODE, WM_DISPLAYCHANGE, WM_LBUTTONUP, WM_NULL, WM_QUIT,
+    WM_RBUTTONUP, WM_SETTINGCHANGE, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
 use crate::api::Autostart;
-use crate::api::backend::{BackendEvent, UpdateCheckResult};
+use crate::api::backend::{BackendEvent, UpdateCheckResult, UpdateProgress};
 
 use super::EventSender;
 
@@ -45,7 +46,26 @@ static DISPLAY_CHANGED: AtomicBool = AtomicBool::new(false);
 static APPEARANCE_CHANGED: AtomicBool = AtomicBool::new(false);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static UPDATE_UI_VISIBLE: AtomicBool = AtomicBool::new(false);
+static UPDATE_MENU_STATE: OnceLock<Mutex<UpdateMenuState>> = OnceLock::new();
 const UPDATE_UI_THREAD_STACK_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+enum UpdateMenuState {
+    #[default]
+    Idle,
+    Checking,
+    Downloading {
+        latest: String,
+        percent: u8,
+    },
+    Downloaded {
+        latest: String,
+    },
+    UpToDate {
+        current: String,
+    },
+    Failed,
+}
 
 struct UpdateUiGuard;
 
@@ -72,6 +92,7 @@ pub struct StatusItem {
 
 impl StatusItem {
     pub fn new(sender: EventSender) -> Result<Self, String> {
+        set_update_menu_state(UpdateMenuState::Idle);
         *SENDER
             .get_or_init(|| Mutex::new(None))
             .lock()
@@ -144,6 +165,17 @@ impl StatusItem {
         }
         clear_sender();
     }
+}
+
+pub(super) fn set_update_progress(progress: &UpdateProgress) {
+    let state = match progress {
+        UpdateProgress::Checking => UpdateMenuState::Checking,
+        UpdateProgress::Downloading { latest, percent } => UpdateMenuState::Downloading {
+            latest: latest.clone(),
+            percent: (*percent).min(100),
+        },
+    };
+    set_update_menu_state(state);
 }
 
 impl Drop for StatusItem {
@@ -324,6 +356,13 @@ fn show_menu(hwnd: HWND) {
     } else {
         MF_STRING
     };
+    let (update_title, update_enabled) = update_menu_entry();
+    let update_title = wide(&update_title);
+    let update_flags = if update_enabled {
+        MF_STRING
+    } else {
+        MF_STRING | MF_GRAYED
+    };
     let menu_result = unsafe {
         AppendMenuW(menu, MF_STRING, CMD_TOGGLE as usize, toggle)
             .and_then(|_| {
@@ -345,9 +384,9 @@ fn show_menu(hwnd: HWND) {
             .and_then(|_| {
                 AppendMenuW(
                     menu,
-                    MF_STRING,
+                    update_flags,
                     CMD_CHECK_UPDATES as usize,
-                    w!("Check for Updates..."),
+                    PCWSTR(update_title.as_ptr()),
                 )
             })
             .and_then(|_| AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()))
@@ -400,6 +439,7 @@ fn show_menu(hwnd: HWND) {
 }
 
 pub(super) fn present_update_result(result: &UpdateCheckResult) -> Result<(), String> {
+    set_update_result(result);
     let Some(guard) = UpdateUiGuard::acquire() else {
         return Ok(());
     };
@@ -415,18 +455,33 @@ pub(super) fn present_update_result(result: &UpdateCheckResult) -> Result<(), St
                     latest,
                     path,
                 } => show_message(
-                    &format!(
-                        "KeySteer {latest} was downloaded successfully.\n\nSaved to:\n{}\n\nQuit KeySteer, extract the ZIP, and replace version {current} when ready.",
-                        path.display()
-                    ),
-                    false,
-                ),
+                        &format!(
+                            "KeySteer {latest} was downloaded successfully.\n\nSaved to:\n{}\n\nQuit KeySteer, extract the ZIP, and replace version {current} when ready.\n\nOpen the download folder now?",
+                            path.display()
+                        ),
+                        false,
+                        true,
+                    )
+                    .and_then(|open| {
+                        if open {
+                            open_download_folder(&path)
+                        } else {
+                            Ok(())
+                        }
+                    }),
                 UpdateCheckResult::UpToDate { current } => show_message(
                     &format!("KeySteer {current} is already the latest version."),
                     false,
-                ),
+                    false,
+                )
+                .map(|_| ()),
                 UpdateCheckResult::Failed(error) => {
-                    show_message(&format!("Could not check for updates.\n\n{error}"), true)
+                    show_message(
+                        &format!("Could not check for updates.\n\n{error}"),
+                        true,
+                        false,
+                    )
+                    .map(|_| ())
                 }
             };
             if let Err(error) = presentation {
@@ -437,7 +492,49 @@ pub(super) fn present_update_result(result: &UpdateCheckResult) -> Result<(), St
         .map_err(|error| format!("cannot start Windows update UI: {error}"))
 }
 
-fn show_message(message: &str, is_error: bool) -> Result<(), String> {
+fn update_menu_state() -> &'static Mutex<UpdateMenuState> {
+    UPDATE_MENU_STATE.get_or_init(|| Mutex::new(UpdateMenuState::Idle))
+}
+
+fn set_update_menu_state(state: UpdateMenuState) {
+    *update_menu_state()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = state;
+}
+
+fn set_update_result(result: &UpdateCheckResult) {
+    let state = match result {
+        UpdateCheckResult::UpdateDownloaded { latest, .. } => UpdateMenuState::Downloaded {
+            latest: latest.clone(),
+        },
+        UpdateCheckResult::UpToDate { current } => UpdateMenuState::UpToDate {
+            current: current.clone(),
+        },
+        UpdateCheckResult::Failed(_) => UpdateMenuState::Failed,
+    };
+    set_update_menu_state(state);
+}
+
+fn update_menu_entry() -> (String, bool) {
+    let state = update_menu_state()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    match &*state {
+        UpdateMenuState::Idle => ("Check for Updates...".into(), true),
+        UpdateMenuState::Checking => ("Checking for Updates...".into(), false),
+        UpdateMenuState::Downloading { latest, percent } => (
+            format!("Downloading KeySteer {latest}... {percent}%"),
+            false,
+        ),
+        UpdateMenuState::Downloaded { latest } => (format!("KeySteer {latest} Downloaded"), true),
+        UpdateMenuState::UpToDate { current } => {
+            (format!("KeySteer {current} Is Up to Date"), true)
+        }
+        UpdateMenuState::Failed => ("Update Check Failed - Retry...".into(), true),
+    }
+}
+
+fn show_message(message: &str, is_error: bool, offer_open: bool) -> Result<bool, String> {
     // A detached MessageBox without an owner can remain inactive. This hidden
     // same-thread owner gives the dialog a complete native modal lifetime while
     // keeping the engine and tray threads unblocked.
@@ -458,7 +555,7 @@ fn show_message(message: &str, is_error: bool) -> Result<(), String> {
         )
         .map_err(|error| format!("cannot create Windows update dialog owner: {error}"))?;
         let message = wide(message);
-        let flags = MB_OK
+        let flags = (if offer_open { MB_YESNO } else { MB_OK })
             | MB_SETFOREGROUND
             | if is_error {
                 MB_ICONERROR
@@ -478,7 +575,27 @@ fn show_message(message: &str, is_error: bool) -> Result<(), String> {
     if response.0 == 0 {
         return Err("MessageBoxW could not present the update result".into());
     }
-    destroy
+    destroy?;
+    Ok(offer_open && response == IDYES)
+}
+
+fn open_download_folder(download: &Path) -> Result<(), String> {
+    let directory = download.parent().ok_or_else(|| {
+        format!(
+            "download path {} has no parent directory",
+            download.display()
+        )
+    })?;
+    std::process::Command::new("explorer.exe")
+        .arg(directory)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "Windows could not open the download folder {}: {error}",
+                directory.display()
+            )
+        })
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -552,5 +669,34 @@ mod tests {
 
         drop(first);
         assert!(UpdateUiGuard::acquire().is_some());
+    }
+
+    #[test]
+    fn update_menu_reports_checking_download_progress_and_completion() {
+        set_update_progress(&UpdateProgress::Checking);
+        assert_eq!(
+            update_menu_entry(),
+            ("Checking for Updates...".into(), false)
+        );
+
+        set_update_progress(&UpdateProgress::Downloading {
+            latest: "0.6.0".into(),
+            percent: 42,
+        });
+        assert_eq!(
+            update_menu_entry(),
+            ("Downloading KeySteer 0.6.0... 42%".into(), false)
+        );
+
+        set_update_result(&UpdateCheckResult::UpdateDownloaded {
+            current: "0.5.0".into(),
+            latest: "0.6.0".into(),
+            path: "KeySteer.zip".into(),
+        });
+        assert_eq!(
+            update_menu_entry(),
+            ("KeySteer 0.6.0 Downloaded".into(), true)
+        );
+        set_update_menu_state(UpdateMenuState::Idle);
     }
 }
