@@ -3,7 +3,7 @@
 配置与模拟器适合“先试试再保存”：在浏览器中编辑键位、预览鼠标操作、调整 `Grid`/`Recursive Grid`/`UI Hint` 的样式。数据只在本机浏览器中处理，不会上传。复杂动作、外部命令和高级字段请以 TOML 文档为准。
 
 <p class="ks-open-simulator">
-  <a href="/simulator" target="_blank" rel="noopener">打开配置与模拟器 ↗</a>
+  <a href="../simulator" target="_blank" rel="noopener">打开配置与模拟器 ↗</a>
 </p>
 
 ## 推荐用法

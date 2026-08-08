@@ -9,11 +9,12 @@ use objc2::{
     AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
 };
 use objc2_app_kit::{
-    NSAlert, NSApplication, NSApplicationActivationPolicy, NSControlStateValueOff,
-    NSControlStateValueOn, NSImage, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem,
-    NSVariableStatusItemLength,
+    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton,
+    NSControlStateValueOff, NSControlStateValueOn, NSFont, NSImage, NSImageView, NSMenu,
+    NSMenuItem, NSPanel, NSStatusBar, NSStatusItem, NSTextField, NSVariableStatusItemLength,
+    NSView, NSWindowStyleMask,
 };
-use objc2_foundation::{NSData, NSSize, NSString};
+use objc2_foundation::{NSData, NSPoint, NSRect, NSSize, NSString};
 
 use crate::api::Autostart;
 use crate::api::backend::{BackendEvent, UpdateCheckResult};
@@ -25,7 +26,7 @@ const STATUS_ICON_PNG: &[u8] = include_bytes!("../../../assets/icons/keysteer-ic
 const STATUS_ICON_SIZE: f64 = 18.0;
 
 struct StatusTargetIvars {
-    update_alert: RefCell<Option<Retained<NSAlert>>>,
+    update_alert: RefCell<Option<Retained<NSPanel>>>,
 }
 
 define_class!(
@@ -78,10 +79,13 @@ impl StatusTarget {
         unsafe { msg_send![super(this), init] }
     }
 
-    fn show_update_alert(&self, alert: Retained<NSAlert>) {
+    fn show_update_alert(&self, alert: Retained<NSPanel>) {
         self.dismiss_update_alert();
-        let window = alert.window();
         *self.ivars().update_alert.borrow_mut() = Some(alert);
+        let alert = self.ivars().update_alert.borrow();
+        let window = alert
+            .as_ref()
+            .expect("the update panel was retained immediately before presentation");
         window.center();
         NSApplication::sharedApplication(self.mtm()).activate();
         window.makeKeyAndOrderFront(None);
@@ -89,7 +93,7 @@ impl StatusTarget {
 
     fn dismiss_update_alert(&self) {
         if let Some(alert) = self.ivars().update_alert.borrow_mut().take() {
-            alert.window().close();
+            alert.close();
         }
     }
 }
@@ -140,7 +144,7 @@ impl StatusItem {
         let status_bar = NSStatusBar::systemStatusBar();
         let item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
         if let Some(button) = item.button(mtm) {
-            if let Some(image) = status_icon() {
+            if let Some(image) = status_icon(STATUS_ICON_SIZE) {
                 button.setImage(Some(&image));
                 button.setTitle(&NSString::from_str(""));
             } else {
@@ -212,29 +216,82 @@ impl StatusItem {
             "update result must be presented on the macOS main thread".to_string()
         })?;
         autoreleasepool(|_| {
-            let alert = NSAlert::new(mtm);
-            alert.setMessageText(&NSString::from_str(title));
-            alert.setInformativeText(&NSString::from_str(details));
-            let button = alert.addButtonWithTitle(&NSString::from_str("OK"));
-            // NSAlert only wires its buttons while using runModal or sheet APIs.
-            // KeySteer stays non-modal so the engine loop can keep servicing the
-            // keyboard hook; explicitly close and release the retained alert.
-            unsafe {
-                button.setTarget(Some(&self._target));
-                button.setAction(Some(sel!(dismissUpdateAlert:)));
+            const WIDTH: f64 = 520.0;
+            const HEIGHT: f64 = 210.0;
+            let content_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WIDTH, HEIGHT));
+            let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
+                NSPanel::alloc(mtm),
+                content_rect,
+                NSWindowStyleMask::Titled,
+                NSBackingStoreType::Buffered,
+                false,
+            );
+            if panel.isReleasedWhenClosed() {
+                return Err(
+                    "macOS update panel unexpectedly releases itself when closed; refusing ambiguous ownership"
+                        .into(),
+                );
             }
-            self._target.show_update_alert(alert);
-        });
-        Ok(())
+
+            panel.setTitle(&NSString::from_str("KeySteer"));
+            panel.setFloatingPanel(true);
+            panel.setHidesOnDeactivate(false);
+            panel.setBecomesKeyOnlyIfNeeded(false);
+
+            let content = NSView::initWithFrame(NSView::alloc(mtm), content_rect);
+            if let Some(icon) = status_icon(64.0) {
+                let image_view = NSImageView::imageViewWithImage(&icon, mtm);
+                image_view.setFrame(NSRect::new(
+                    NSPoint::new(28.0, 118.0),
+                    NSSize::new(64.0, 64.0),
+                ));
+                content.addSubview(&image_view);
+            }
+
+            let title_label = NSTextField::labelWithString(&NSString::from_str(title), mtm);
+            title_label.setFont(Some(&NSFont::boldSystemFontOfSize(17.0)));
+            title_label.setFrame(NSRect::new(
+                NSPoint::new(112.0, 158.0),
+                NSSize::new(380.0, 24.0),
+            ));
+            content.addSubview(&title_label);
+
+            let details_label =
+                NSTextField::wrappingLabelWithString(&NSString::from_str(details), mtm);
+            details_label.setFrame(NSRect::new(
+                NSPoint::new(112.0, 58.0),
+                NSSize::new(380.0, 88.0),
+            ));
+            content.addSubview(&details_label);
+
+            let button = unsafe {
+                NSButton::buttonWithTitle_target_action(
+                    &NSString::from_str("OK"),
+                    Some(&self._target),
+                    Some(sel!(dismissUpdateAlert:)),
+                    mtm,
+                )
+            };
+            button.setFrame(NSRect::new(
+                NSPoint::new(412.0, 16.0),
+                NSSize::new(80.0, 32.0),
+            ));
+            button.setKeyEquivalent(&NSString::from_str("\r"));
+            content.addSubview(&button);
+
+            panel.setContentView(Some(&content));
+            self._target.show_update_alert(panel);
+            Ok(())
+        })
     }
 }
 
-fn status_icon() -> Option<Retained<NSImage>> {
+fn status_icon(size: f64) -> Option<Retained<NSImage>> {
     let data = unsafe {
         NSData::dataWithBytes_length(STATUS_ICON_PNG.as_ptr().cast(), STATUS_ICON_PNG.len())
     };
     let image = NSImage::initWithData(NSImage::alloc(), &data)?;
-    image.setSize(NSSize::new(STATUS_ICON_SIZE, STATUS_ICON_SIZE));
+    image.setSize(NSSize::new(size, size));
     image.setTemplate(false);
     image.setAccessibilityDescription(Some(&NSString::from_str("KeySteer")));
     Some(image)

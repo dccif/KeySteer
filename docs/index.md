@@ -4,7 +4,7 @@ title: KeySteer
 hero:
   name: KeySteer
   text: 把鼠标交给键盘
-  tagline: 告别腱鞘炎，不用伸手找鼠标。快、轻量、原生Rust，按你的习惯定制一切。
+  tagline: 告别腱鞘炎，不用伸手找鼠标。快、轻量、原生Rust，按习惯定制一切。
   image:
     src: /generated/keysteer-icon.png
     alt: KeySteer

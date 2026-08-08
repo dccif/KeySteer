@@ -9,7 +9,7 @@ export default defineComponent({
     return () => (
       <main class="ks-standalone">
         <header class="ks-standalone-header">
-          <a href={withBase('/editor/')}>← 返回文档</a>
+          <a href={withBase('/')}>← 返回文档</a>
           <span>KeySteer 配置与模拟器(Beta)</span>
           <a href={withBase('/generated/keysteer.default.toml')} download="keysteer.default.toml">
             默认配置

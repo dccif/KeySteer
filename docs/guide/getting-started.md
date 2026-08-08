@@ -10,7 +10,7 @@ KeySteer 可以不需要配置文件。启动后它会停留在托盘或菜单�
 4. 按 `g` 进入 Grid，按 `f` 进入 Recursive Grid，按 `Primary+F` 进入 UI Hint。
 5. 按 `q` 或 `Esc` 返回 Idle。
 
-`Primary` 是跨平台写法：macOS 为 Command，Windows/Linux 为Alt， 为保持键盘位置的一致性。
+`Primary` 是跨平台写法：macOS 为 `Command`，Windows 为 `Alt`，为保持键盘位置的一致性。
 
 它可以在 `[key_aliases]` 中改成你习惯的实体按键；如果使用发布的完整 TOML，请留意其中可能包含平台专属别名覆盖。
 

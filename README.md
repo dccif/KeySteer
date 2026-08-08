@@ -25,12 +25,14 @@ KeySteer 是 Windows 和 macOS 上使用键盘操控鼠标的工具。
 ## 功能
 
 - **Normal**：`hjkl` vim风格移动鼠标。
-- **点击，长按 Toggle**：普通点击在物理键按下沿立即完成；按住可将左/中/右键转为 Toggle 保持按下，适合拖拽。
+- **长按,拖拽**：可将鼠标左/中/右键转为按下状态，适合拖拽。
 - **Grid**：快速定位二键组合。
 - **Recursive Grid**：区域持续递归细分。
 - **UI Hint**：为按钮、链接、菜单和输入框显示可键入标签；macOS 支持 Accessibility Tree、Vision 和 Hybrid，Windows 使用 UI Automation。
 - **多显示器**：`Primary+S` 切换到下一块显示器；Grid 与 Recursive Grid 可保留当前定位路径。
 - **外观与配置**：Grid/Hint 标签样式、光标旁模式和点击指示器等可通过 TOML 调整。
+
+`Primary` 是跨平台写法：macOS 为 `Command`，Windows 为 `Alt`，为保持键盘位置的一致性。 它可以在 `[key_aliases]` 中改成你习惯的实体按键。
 
 ## 视频演示
 

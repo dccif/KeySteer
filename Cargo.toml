@@ -1,6 +1,6 @@
 [package]
 name = "keysteer"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.97"
 license = "GPL-3.0-or-later"
@@ -68,11 +68,12 @@ objc2-core-text = { version = "0.3", features = [
 objc2-app-kit = { version = "0.3", features = [
     "objc2-quartz-core",
     "NSApplication",
-    "NSAlert",
     "NSButton",
     "NSColor",
     "NSControl",
     "NSEvent",
+    "NSFont",
+    "NSImageView",
     "NSMenu",
     "NSMenuItem",
     "NSGraphics",
@@ -83,9 +84,11 @@ objc2-app-kit = { version = "0.3", features = [
     "NSStatusBar",
     "NSStatusBarButton",
     "NSStatusItem",
+    "NSTextField",
     "NSView",
     "NSWindow",
     "NSWorkspace",
+    "objc2-core-foundation",
     "objc2-core-graphics",
 ] }
 foreign-types = "0.5"
