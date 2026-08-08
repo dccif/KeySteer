@@ -1,0 +1,66 @@
+# UI Hint 标签模式
+
+UI Hint 会为屏幕上的可交互元素显示短标签。它适合按钮、链接、菜单、复选框、输入框、滑块和列表项；输入标签即可定位，不必估算坐标。
+
+从 Normal 按 `Primary+F` 进入。默认只定位，不自动点击：标签命中后先移动鼠标，再用 `Normal`状态的点击键确认。
+
+## 默认操作
+
+| 按键 | 作用 |
+| --- | --- |
+| 标签字符 | 筛选候选元素；完整匹配后定位 |
+| `Shift` | 在重叠元素之间切换 |
+| `Primary+R` | 重新扫描 |
+| `Primary` | 临时使用 Normal 的移动、滚动和点击 |
+| `Primary+Q` / `Esc` | 返回 Normal |
+
+## 扫描方式
+
+- Windows 使用 UI Automation。
+- macOS 支持 `axtree`、`vision` 和 `hybrid`。
+- 扫描结果会分批显示，先发现的元素可以先使用，不必等待整棵树完成。
+
+Vision 需要 macOS 的“屏幕录制”权限；键盘捕获仍需要“辅助功能”权限。Windows 配置 `vision` 或 `hybrid` 时会回退到 UI Automation，因此同一份配置可以跨平台使用。
+
+## 常用配置
+
+```toml
+[ui_hint]
+strategy = "vision"
+hint_characters = "asdfghjkl"
+scan_timeout_ms = 2500
+scan_retry_count = 1
+scan_retry_delay_ms = 200
+visible_check_enabled = false
+placement = "bottom"
+label_x_offset = 0
+label_y_offset = -4
+clickable_roles = ["button", "link", "checkbox", "text_field", "menu_item"]
+
+[ui_hint.lifecycle]
+after_finish = "normal"
+after_click = "normal"
+```
+
+`scan_timeout_ms`：扫描超时设置，已经出现的标签仍然有效。只有一个标签都没有出现时，有的程序或者界面可能扫描不到任何元素，程序才会按 `scan_retry_count` 重试。大型或刚打开的页面可以适当提高超时和重试次数。
+
+
+## 视觉样式
+
+```toml
+[ui_hint.ui]
+font_size = 15
+border_width = 1
+
+[ui_hint.boundary_highlight]
+enabled = false
+border_width = 1
+
+[ui_hint.search_input_ui]
+position = "bottom_center"
+width = 320
+```
+
+## macOS 特有功能
+
+如果页面没有可用无障碍信息，优先尝试 `strategy = "vision"` 或 `"hybrid"`；如果标签太多，可以尝试缩小 `clickable_roles` 范围。

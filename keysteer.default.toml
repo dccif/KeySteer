@@ -1,0 +1,566 @@
+# KeySteer portable configuration
+#
+# Every section and field is optional: omitted values fall back to the
+# defaults shown here, so you can delete anything you do not want to change.
+#
+# Windows portable builds and bare binaries read this beside the executable.
+# A packaged macOS app reads it from:
+#   ~/Library/Application Support/KeySteer/
+# Its name must match:
+#   keysteer.<any-profile-name>.toml
+#
+# Validate with:  keysteer --check -c keysteer.default.toml
+# Inspect with:   keysteer --dump-config
+# This annotated file mirrors the built-in defaults; it is not required at
+# runtime. Starting KeySteer without a config uses the same settings. During
+# automatic discovery, any other keysteer.<profile>.toml takes priority over it.
+#
+# ---------------------------------------------------------------------------
+# BINDINGS
+#
+# Every binding is `<chord> = "<what it does>"`. There is no `action` prefix:
+# the same vocabulary is used by the program internally, by this file, and by
+# plugins, so a verb, a mode and a plugin mode all read the same way.
+#
+#   h        = "move_left"            a verb, handled by the active mode
+#   g        = "grid"                 enter a mode (built-in or plugin)
+#   t        = "home"                 send a keystroke to the focused app
+#   "ctrl+c" = "send ctrl+c"          explicit form, needed for chords
+#   f5       = "exec make -j8"        run a command
+#   q        = "none"                 remove an inherited binding
+#
+# Verbs:
+#   move_left move_down move_up move_right
+#   scroll_left scroll_down scroll_up scroll_right
+#   scroll_half_down scroll_half_up scroll_full_down scroll_full_up
+#   left_click right_click middle_click double_click
+#   press <keys/buttons...>            hold inputs, e.g. `press shift mouse_left`
+#   release <keys/buttons...>          release inputs held by press/toggle
+#   toggle [keys/buttons...]           toggle each input; no args makes its
+#                                      binding key modify any companion action
+#   wait [max_ms] | wait <min_ms> <max_ms>
+#                                      pause a sequence; wait/wait 0 use 100ms
+#   left_press/left_release/toggle_left and right_* remain compatible aliases
+#   slow fast                         held alongside a direction
+#   escape quit
+#
+# Mouse target names are mouse_left, mouse_right, and mouse_middle. Keyboard
+# targets accept every key name and alias listed below. For example:
+#   n = "toggle"                      N+key toggles that action's input target;
+#                                      bare N releases all latched inputs
+#   x = ["press shift", "left_click", "release shift"]
+#   h = ["home", "wait 50 100", "home"]
+#
+# Bindings are scoped to the mode that declares them, so `g` only enters the
+# grid while `normal` is active and never while you are typing.
+#
+# ---------------------------------------------------------------------------
+# KEY NAMES
+#
+# Modifiers      Aliases
+#   primary      Cmd on macOS, Ctrl on Windows and Linux — prefer this
+#   cmd          command, super, meta
+#   ctrl         control
+#   alt          option, opt
+#   shift
+#
+# Prefix with left_/right_ (`left_shift`) to require one physical side.
+# A generic modifier (`alt`, `shift`, `ctrl`, `cmd`) matches either side.
+# User aliases are case-insensitive and may override built-ins. For example,
+# this makes every `Primary` binding require only the physical left Alt key:
+#
+# [key_aliases]
+# Hyper = "right_ctrl"
+#
+# [key_aliases.windows]
+# Primary = "left_alt"
+#
+# [key_aliases.macos]
+# Primary = "left_cmd"
+#
+# The top-level table applies everywhere. The current platform subtable
+# (`windows`, `macos`, or `linux`) overrides matching global aliases. Alias
+# values must be one known key, not a chord. Chains are allowed.
+#
+# Keys           a-z, 0-9
+#   symbols      ` - = [ ] \ ; ' , . /
+#   named        space, enter (return), esc (escape), tab, delete, backspace
+#   navigation   up, down, left, right, home, end, page_up, page_down
+#   function     f1-f20 everywhere; f21-f24 on Windows and Linux only
+#   numpad       numpad_0 - numpad_9
+#
+# Avoid platform-specific traps — the program warns about these at startup:
+#   * On macOS, Option+<letter> types a special character (Option+E is a
+#     dead-key accent) and never reaches this program. Use `primary+shift+…`.
+#   * On macOS, Cmd+Space / Cmd+Tab / Cmd+Q belong to the system.
+#   * In terminals, Ctrl+Shift+C and Ctrl+Shift+V are copy and paste.
+# ---------------------------------------------------------------------------
+
+[general]
+# Applications where the engine never activates.
+excluded_apps = []
+
+# Optional key-name overrides. Keep this table commented unless needed.
+# [key_aliases]
+# Hyper = "right_ctrl"
+[key_aliases.windows]
+Primary = "left_alt"
+
+# ---------------------------------------------------------------------------
+# Theme
+#
+# Five base colors per appearance. Every component color is derived from these
+# unless you override it in that component's `ui` table.
+#
+#   surface        translucent fills, badges, label backgrounds
+#   accent         borders, grid lines, primary chrome
+#   accent_alt     active/emphasis states and highlights
+#   on_accent_alt  foreground on accent_alt surfaces
+#   text           foreground on surface backgrounds
+#
+# Colors use "#RRGGBBAA" and may be written as
+# { light = "...", dark = "..." } anywhere a color is expected.
+# ---------------------------------------------------------------------------
+
+[theme.dark]
+surface = "#0A1338FF"
+accent = "#6E82D6FF"
+accent_alt = "#8FA2F0FF"
+on_accent_alt = "#081022FF"
+text = "#E8EEFFFF"
+
+[theme.light]
+surface = "#EEF2FFFF"
+accent = "#465FBCFF"
+accent_alt = "#0B2377FF"
+on_accent_alt = "#F8FAFFFF"
+text = "#17327AFF"
+
+# ---------------------------------------------------------------------------
+# idle — the silent resting state
+#
+# Idle does nothing but wait, and never swallows a keystroke, so the program is
+# invisible until you ask for it. Keep this table to just the launchers.
+#
+# `primary` is Cmd on macOS and Ctrl on Windows/Linux, so this section is
+# portable as written. `primary+shift` is used rather than a bare modifier
+# because Option+<letter> composes text on macOS and Ctrl+Shift+C/V are taken
+# by terminals.
+# ---------------------------------------------------------------------------
+
+[hotkeys]
+"primary+e" = "normal"
+
+[normal]
+inherits = ["hotkeys"]
+# A click key still clicks immediately. Holding it this long then toggles the
+# same mouse button; releasing the key does not release the toggled button.
+# Set to 0 to disable long-press toggles.
+long_press_toggle_ms = 500
+
+# ---------------------------------------------------------------------------
+# normal — the working mode
+#
+# Move the pointer, click, scroll, and enter the targeting modes. This mode
+# captures the keyboard, so `hjkl` moves instead of typing; bind a key
+# explicitly (`y = "home"`) to send a keystroke through to the application.
+# ---------------------------------------------------------------------------
+
+[normal.bindings]
+# Movement, vim style.
+h = "move_left"
+j = "move_down"
+k = "move_up"
+l = "move_right"
+# Hold shift to slow the pointer; either v or b makes it fast.
+caps_lock = "precision"
+left_shift = "slow"
+"v b" = "fast"
+
+# Scrolling. A tap takes effect immediately; hold to repeat.
+m = "wheel_down"
+"," = "wheel_up"
+
+# Pointer buttons.
+";" = "left_click"
+"'" = "right_click"
+right_shift = "middle_click"
+n = "toggle"
+
+# Targeting modes available directly after entering normal.
+g = "grid"
+f = "recursive_grid"
+"primary+f" = "ui_hint"
+# Screen Selector plugin: `screen next`, `screen previous`, `screen 2`, or
+# `call screen` to show numbered displays. The manifest also supplies this
+# default when the chord is not claimed here.
+"primary+s" = "screen next"
+
+# Optional Vim-style arrow keys sent to the focused application. Bare hjkl
+# continue to move the pointer; the more specific Primary chords send arrows.
+# "primary+h" = "arrow_left"
+# "primary+j" = "arrow_down"
+# "primary+k" = "arrow_up"
+# "primary+l" = "arrow_right"
+
+# Navigation keys sent to the focused application.
+u = "page_down"
+i = "page_up"
+t = "home"
+y = "end"
+
+# Bare q is safe in normal, which has no q-labelled cells.
+"q esc" = "idle"
+
+# ---------------------------------------------------------------------------
+# ui_hint — label every clickable element
+#
+# Type a label to click it. `/` filters elements by name instead.
+# ---------------------------------------------------------------------------
+
+[ui_hint]
+enabled = true
+# Element detection: macOS supports "axtree", "vision", and "hybrid".
+# Windows uses UI Automation; "vision"/"hybrid" safely fall back to UIA so
+# this same configuration file remains portable across platforms.
+strategy = "vision"
+# Characters used to build hint labels.
+hint_characters = "asdfghjkl"
+# Keep label keys available; hold either modifier for normal pointer controls.
+inherits = ["hotkeys", "normal"]
+temporary_mode = "normal"
+temporary_mode_keys = ["primary"]
+# Hold to raise the next label in every overlapping group; release to restore.
+# If this is also listed in temporary_mode_keys, overlap cycling wins in UI Hint.
+overlap_cycle_key = "shift"
+# "normal"  keeps single-character labels as long as possible
+# "reverse" fills the two-character tier uniformly
+label_direction = "normal"
+# Accessibility tree depth limit; 0 means unlimited.
+max_depth = 50
+# Soft scan budget. Results stream onto the screen before this expires.
+scan_timeout_ms = 2500
+# Retry only when no labels appeared; each retry gets a progressively longer budget.
+scan_retry_count = 1
+scan_retry_delay_ms = 200
+# Skip the clickability heuristic and hint every matching role.
+ignore_clickable_check = false
+# Hit-test each element; slower, but removes hints for occluded controls.
+visible_check_enabled = false
+# Where labels sit relative to their element: "top", "center" or "bottom".
+placement = "bottom"
+# Fine adjustment after placement. Negative y moves labels upward.
+label_x_offset = 0
+label_y_offset = -4
+# Semantic roles that receive a hint. These are platform-independent; the
+# backend maps them to AX roles or UIA control types. Prefix with `ax:` or
+# `uia:` to name a native role directly.
+clickable_roles = [
+  "button",
+  "menu_button",
+  "popup_button",
+  "combo_box",
+  "link",
+  "checkbox",
+  "radio",
+  "switch",
+  "text_field",
+  "text_area",
+  "search_field",
+  "slider",
+  "stepper",
+  "tab",
+  "menu_item",
+  "cell",
+  "list_item",
+]
+
+# Finish marks this targeting session complete without re-entering the mode.
+# Actions: keep, restart, return, any built-in/plugin mode, or a click action.
+# after_click additionally accepts finish, but never another click action.
+[ui_hint.lifecycle]
+after_finish = "normal"
+after_click = "normal"
+
+[ui_hint.bindings]
+"primary+r" = "rescan"
+"primary+q" = "normal"
+
+[ui_hint.vision]
+detect_text = true
+detect_rectangles = true
+request_timeout_ms = 5000
+minimum_confidence = 0.0
+merge_iou_threshold = 0.5
+rectangle_max_candidates = 100
+rectangle_min_size = 0.01
+rectangle_min_aspect = 0.3
+rectangle_max_aspect = 10.0
+button_min_confidence = 0.3
+button_min_aspect = 0.8
+button_max_aspect = 8.0
+button_icon_max_size = 48
+link_min_aspect = 5.0
+link_max_height = 40
+link_min_width = 50
+image_min_size = 48
+checkbox_max_size = 32
+generic_clickable_min_confidence = 0.5
+
+[ui_hint.ui]
+font_size = 15
+# Empty means the platform default UI font.
+font_family = ""
+border_width = 1
+# -1 means "auto": derived from font_size.
+border_radius = -1
+padding_x = -1
+padding_y = -1
+# Uncomment to override the theme-derived defaults. Colors use #RRGGBBAA.
+# `matched_text_color` highlights the already typed label prefix.
+# background_color   = "#0A1338F2"
+# text_color         = "#E8EEFFFF"
+# matched_text_color = "#E4B400FF"
+# border_color       = "#6E82D6FF"
+
+# Outline each hinted element.
+[ui_hint.boundary_highlight]
+enabled = false
+border_width = 1
+border_radius = -1
+# background_color = "#8FA2F033"
+# border_color     = "#8FA2F0FF"
+
+# The `/` search box, which filters elements by accessible name.
+[ui_hint.search_input_ui]
+position = "bottom_center"
+x_offset = 0
+y_offset = 24
+width = 320
+font_size = 14
+
+# ---------------------------------------------------------------------------
+# grid — a full-screen labelled coordinate grid
+# ---------------------------------------------------------------------------
+
+[grid]
+enabled = true
+# A Mousemaster-style keyboard layout, read left-to-right then top-to-bottom:
+# qwert / asdfg / zxcvb / yuiop / hjkl; / nm,./
+grid_cols = 5
+grid_rows = 4
+keys = "12345qwertasdfgzxcvb"
+# Select this many nested cells before the target is confirmed.
+max_depth = 3
+# Grid labels own most keys; hold a temporary-normal modifier to move/click.
+inherits = ["hotkeys", "normal"]
+temporary_mode = "normal"
+temporary_mode_keys = ["primary"]
+# Move to each selected cell centre while narrowing the grid.
+cursor_follow_selection = true
+
+# Selecting max_depth finishes and returns to normal. Clicking early first
+# finishes the current grid, then after_finish chooses where to go.
+[grid.lifecycle]
+after_finish = "normal"
+after_click = "finish"
+
+[grid.bindings]
+# Toggle cursor following for only the active grid session.
+"`" = "follow"
+"primary+q" = "normal"
+
+[grid.ui]
+# Maximum font size; nested layers shrink automatically to stay inside cells.
+# Grid keeps all labels visible, including the third layer.
+# The initial screen overlays a large first key on a faint grid of second keys.
+# matched_text_color tints the large key; matched_border_color tints inner lines.
+font_size = 20
+border_width = 1
+# matched_text_color       = "#8FA2F0FF"
+# matched_background_color = "#8FA2F0FF"
+# matched_border_color     = "#8FA2F0FF"
+
+# ---------------------------------------------------------------------------
+# recursive_grid — each keystroke subdivides the previous cell
+#
+# backspace widens back out, space resets, enter clicks the current centre.
+# ---------------------------------------------------------------------------
+
+[recursive_grid]
+enabled = true
+# A classic nine-cell recursive grid.
+grid_cols = 3
+grid_rows = 3
+# Must hold exactly grid_cols * grid_rows characters, in row-major order.
+keys = "qweasdzxc"
+# Stop subdividing once a cell would be smaller than this.
+min_size_width = 1
+min_size_height = 1
+# Recursion limit, 1..=20.
+max_depth = 10
+# Move to each selected cell centre while narrowing the grid.
+cursor_follow_selection = true
+inherits = ["hotkeys", "normal"]
+temporary_mode = "normal"
+temporary_mode_keys = ["primary"]
+
+# A click keeps the current recursive grid live, so more letters can continue
+# subdividing it. Natural endpoints and explicit Finish keep their final state.
+[recursive_grid.lifecycle]
+after_finish = "keep"
+after_click = "keep"
+
+[recursive_grid.bindings]
+# Toggle cursor following for only the active recursive-grid session.
+"`" = "follow"
+"primary+q" = "normal"
+
+# Per-depth shape overrides. Any omitted field inherits from above.
+# layers = [
+#   { depth = 0, grid_cols = 2, grid_rows = 2, keys = "crtn" },
+# ]
+
+[recursive_grid.ui]
+# Maximum font size; labels shrink with cells and disappear below this size.
+font_size = 20
+label_min_font_size = 6
+line_width = 1
+# line_color      = "#6E82D6FF"
+# highlight_color = "#8FA2F0FF"
+# Draw a filled pill behind each cell key.
+label_background = false
+# Replace every cell label with a single character, e.g. "·".
+label_char = ""
+# Additional hide threshold based on the fitted font size. 0 disables it.
+label_autohide_multiplier = 1.5
+# Preview the next level's keys inside each cell.
+sub_key_preview = false
+sub_key_preview_font_size = 8
+sub_key_preview_autohide_multiplier = 1.5
+
+# ---------------------------------------------------------------------------
+# Scrolling and pointer tuning
+#
+# These are parameters, not modes: scrolling is a set of bindings any mode can
+# use, so there is no scroll mode to enter.
+# ---------------------------------------------------------------------------
+
+[scroll]
+# Cross-platform distances for scroll bindings.
+# Pixels for scroll_up / scroll_down / scroll_left / scroll_right.
+scroll_step = 50
+# Pixels for scroll_half_*.
+scroll_step_half = 500
+# Pixels for scroll_full_*.
+scroll_step_full = 1000000
+
+# ---------------------------------------------------------------------------
+# Platform-specific behavior
+#
+# Keep operating-system integration choices here rather than mixing them with
+# portable scroll distances and pointer acceleration.
+# ---------------------------------------------------------------------------
+
+[platform.macos.scroll]
+# macOS users commonly reverse vertical wheel direction but keep horizontal.
+invert_horizontal = false
+invert_vertical = true
+
+[pointer]
+# Velocities are pixels/second; acceleration is pixels/second², independent
+# of display refresh rate. `tap_distance` keeps short taps responsive.
+initial_speed = 1000.0
+max_speed = 2200.0
+acceleration = 3000.0
+# Ease into and out of acceleration. Set false for linear acceleration.
+smooth_acceleration = true
+tap_distance = 2.5
+slow_multiplier = 0.35
+precision_multiplier = 0.12
+fast_multiplier = 2.0
+
+# ---------------------------------------------------------------------------
+# Mode indicator — a badge pinned near the cursor
+#
+# Every non-idle mode shows its name at the pointer's lower-right by default.
+# Disable or rename one with `[mode_indicator.modes.<mode_id>]`.
+# ---------------------------------------------------------------------------
+
+[mode_indicator.cursor]
+enabled = true
+radius = 13
+stroke_width = 2
+# fill_color = "#8FA2F022"
+# stroke_color = "#8FA2F0D2"
+# Synthetic press/toggle states and physically held click keys use a
+# 20%-opaque fill and an opaque stroke. Atomic clicks still run on key-down.
+left_pressed_color = "#00FF00FF"
+middle_pressed_color = "#FF00FFFF"
+right_pressed_color = "#00FFFFFF"
+
+[mode_indicator.ui]
+font_size = 11
+indicator_x_offset = -12
+indicator_y_offset = 18
+
+# Recommended: show a badge in `normal`, where nothing else marks the mode.
+[mode_indicator.modes.normal]
+enabled = true
+text = "Normal"
+
+# Optional per-mode visual overrides:
+# [mode_indicator.modes.normal.cursor]
+# radius = 15
+# fill_color = "#8FA2F033"
+# stroke_color = "#8FA2F0FF"
+# left_pressed_color = "#34C759FF"
+#
+# [mode_indicator.modes.normal.ui]
+# background_color = "#0A1338FF"
+# text_color = "#E8EEFFFF"
+# border_color = "#6E82D6FF"
+
+# ---------------------------------------------------------------------------
+# Plugin modes
+#
+# Plugins can expose parameterized verbs and mode-local settings.
+# Screen Selector defaults to preserving Grid/Recursive Grid selection paths.
+# Set false to restart those modes from the root on the target display.
+# ---------------------------------------------------------------------------
+
+[plugin_modes."plugin:screen-selector".settings]
+preserve = true
+
+# Additional examples for [normal.bindings]:
+# "primary+shift+s" = "call screen"       # numbered interactive selector
+# "primary+alt+s" = "screen previous"
+# "primary+1" = "screen 1"
+# "primary+2" = "screen 2"
+
+# ---------------------------------------------------------------------------
+# Per-application overrides
+#
+# `bundle_id` matches a macOS bundle id, a Linux WM_CLASS/app_id, a Windows
+# executable name, or a substring of the window title.
+# ---------------------------------------------------------------------------
+
+# [[app_configs]]
+# bundle_id = "com.apple.Terminal"
+# bindings = { "primary+shift+e" = "none" }
+#
+# [[normal.app_configs]]
+# bundle_id = "Figma"
+# bindings = { v = "none" }
+
+# [debug]
+# # Print the complete input -> binding -> action -> backend pipeline to stderr.
+# enabled = false
+# keys = true
+# actions = true
+# modes = true
+# backend = true
+# pointer = false
+# motion = false
+# overlay = true
+# timers = true

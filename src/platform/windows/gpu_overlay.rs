@@ -1,0 +1,934 @@
+//! DirectComposition/Direct2D overlay renderer.
+//!
+//! All COM interfaces and the HWND are owned by the render thread. Direct2D
+//! draws straight into a DirectComposition surface, so this backend never
+//! allocates a display-sized CPU pixel buffer.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use windows::Win32::Foundation::{COLORREF, HMODULE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Graphics::Direct2D::Common::{
+    D2D_RECT_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
+};
+use windows::Win32::Graphics::Direct2D::{
+    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_TARGET,
+    D2D1_BITMAP_PROPERTIES1, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_NONE,
+    D2D1_ROUNDED_RECT, D2D1CreateDevice, ID2D1DeviceContext, ID2D1SolidColorBrush,
+};
+use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device,
+};
+use windows::Win32::Graphics::DirectComposition::{
+    DCompositionCreateDevice, IDCompositionDevice, IDCompositionSurface, IDCompositionTarget,
+    IDCompositionVisual,
+};
+use windows::Win32::Graphics::DirectWrite::{
+    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+    DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_MEASURING_MODE_NATURAL,
+    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
+};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM,
+};
+use windows::Win32::Graphics::Dxgi::{IDXGIDevice, IDXGISurface};
+use windows::Win32::Graphics::Gdi::HBRUSH;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::WindowsAndMessaging::{
+    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, HCURSOR, HICON,
+    HWND_TOPMOST, LWA_ALPHA, RegisterClassExW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
+    SetLayeredWindowAttributes, SetWindowPos, ShowWindow, WNDCLASSEXW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+};
+use windows::core::{Interface, PCWSTR, w};
+use windows_numerics::Vector2;
+
+use crate::api::geometry::{Point, Rect};
+use crate::api::overlay::{Color, LabelStyle, OverlayLabel, OverlayScene, OverlayShape};
+
+use super::native::OwnedWindow;
+
+const MAX_BRUSHES: usize = 64;
+const MAX_TEXT_FORMATS: usize = 32;
+
+/// A GPU-rendered overlay. COM interface wrappers release themselves; the
+/// window wrapper below provides the same single-owner rule for HWND.
+pub(super) struct GpuOverlay {
+    class_registered: bool,
+    d2d: ID2D1DeviceContext,
+    dcomp: IDCompositionDevice,
+    dwrite: IDWriteFactory,
+    content: Option<WindowContent>,
+    brushes: HashMap<u32, ID2D1SolidColorBrush>,
+    formats: Vec<FontEntry>,
+    utf16: Vec<u16>,
+}
+
+struct WindowContent {
+    window: OwnedWindow,
+    _target: IDCompositionTarget,
+    _root: IDCompositionVisual,
+    _static_visual: IDCompositionVisual,
+    cursor_visual: IDCompositionVisual,
+    indicator_visual: IDCompositionVisual,
+    static_surface: IDCompositionSurface,
+    cursor_surface: Option<LayerSurface>,
+    indicator_surface: Option<LayerSurface>,
+    static_scene: Option<Arc<OverlayScene>>,
+    area: Rect,
+    width: u32,
+    height: u32,
+}
+
+struct LayerSurface {
+    surface: IDCompositionSurface,
+    width: u32,
+    height: u32,
+}
+
+struct FontEntry {
+    family: String,
+    size_bits: u64,
+    bold: bool,
+    format: IDWriteTextFormat,
+}
+
+impl GpuOverlay {
+    pub(super) const CLASS_NAME: PCWSTR = w!("KeySteerGpuOverlay");
+
+    pub(super) fn new() -> Result<Self, String> {
+        let mut d3d = None;
+        // SAFETY: all out-pointers refer to initialized Options and the default
+        // adapter is requested with a null module handle.
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut d3d),
+                None,
+                None,
+            )
+        }
+        .map_err(|error| format!("D3D11CreateDevice failed: {error}"))?;
+        let d3d: ID3D11Device = d3d.ok_or("D3D11 returned no device")?;
+        let dxgi: IDXGIDevice = d3d
+            .cast()
+            .map_err(|error| format!("D3D11 device has no IDXGIDevice: {error}"))?;
+        // SAFETY: `dxgi` is a live device owned for the renderer's lifetime.
+        let d2d_device = unsafe { D2D1CreateDevice(&dxgi, None) }
+            .map_err(|error| format!("D2D1CreateDevice failed: {error}"))?;
+        // SAFETY: device creation is thread-affine and occurs on the renderer.
+        let d2d = unsafe { d2d_device.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE) }
+            .map_err(|error| format!("CreateDeviceContext failed: {error}"))?;
+        // SAFETY: DirectComposition accepts the same live DXGI device.
+        let dcomp: IDCompositionDevice = unsafe { DCompositionCreateDevice(&dxgi) }
+            .map_err(|error| format!("DCompositionCreateDevice failed: {error}"))?;
+        // SAFETY: the requested interface matches the generic return type.
+        let dwrite: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }
+            .map_err(|error| format!("DWriteCreateFactory failed: {error}"))?;
+        Ok(Self {
+            class_registered: false,
+            d2d,
+            dcomp,
+            dwrite,
+            content: None,
+            brushes: HashMap::with_capacity(16),
+            formats: Vec::with_capacity(8),
+            utf16: Vec::with_capacity(32),
+        })
+    }
+
+    pub(super) fn present(&mut self, scene: Arc<OverlayScene>, area: Rect) -> Result<(), String> {
+        let width = dimension(area.width)?;
+        let height = dimension(area.height)?;
+        self.ensure_content(area, width, height)?;
+        let (static_surface, hwnd, static_changed) = self
+            .content
+            .as_ref()
+            .map(|content| {
+                (
+                    content.static_surface.clone(),
+                    content.window.raw(),
+                    content
+                        .static_scene
+                        .as_deref()
+                        .is_none_or(|previous| !static_scene_eq(previous, scene.as_ref())),
+                )
+            })
+            .ok_or("DirectComposition content was not retained")?;
+        if static_changed {
+            self.draw_static(&static_surface, scene.as_ref(), area)?;
+        }
+        self.draw_cursor(scene.cursor_marker.as_ref(), area)?;
+        self.draw_indicator(scene.indicator.as_ref(), area)?;
+        if let Some(content) = self.content.as_mut()
+            && static_changed
+        {
+            content.static_scene = Some(scene);
+        }
+        // SAFETY: all mutations were recorded on `self.dcomp`; the HWND stays
+        // owned by `self.content` and SW_SHOWNOACTIVATE cannot activate it.
+        unsafe {
+            self.dcomp
+                .Commit()
+                .map_err(|error| format!("DirectComposition commit failed: {error}"))?;
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+        Ok(())
+    }
+
+    /// Release all screen-sized GPU resources immediately. Device and compact
+    /// brush/font caches remain warm for the next mode entry.
+    pub(super) fn dismiss(&mut self) -> Result<(), String> {
+        // SAFETY: detaching a target is valid outside BeginDraw. Clearing the
+        // owned tree before Commit releases every compositor reference.
+        unsafe {
+            self.d2d.SetTarget(None);
+            self.content = None;
+            self.dcomp
+                .Commit()
+                .map_err(|error| format!("DirectComposition dismiss commit failed: {error}"))
+        }
+    }
+
+    fn ensure_content(&mut self, area: Rect, width: u32, height: u32) -> Result<(), String> {
+        if let Some(content) = self.content.as_mut()
+            && content.width == width
+            && content.height == height
+        {
+            reposition(content.window.raw(), area)?;
+            content.area = area;
+            return Ok(());
+        }
+
+        self.ensure_class()?;
+        let window = OwnedWindow::new(create_window(area)?);
+        // SAFETY: the HWND and DirectComposition device are both live and
+        // owned by this render thread.
+        let target = unsafe { self.dcomp.CreateTargetForHwnd(window.raw(), true) }
+            .map_err(|error| format!("CreateTargetForHwnd failed: {error}"))?;
+        // SAFETY: device methods return owned COM interfaces.
+        let visual = unsafe { self.dcomp.CreateVisual() }
+            .map_err(|error| format!("CreateVisual failed: {error}"))?;
+        // SAFETY: dimensions are positive and the pixel/alpha formats are the
+        // formats required by Direct2D and DirectComposition.
+        let static_surface = unsafe {
+            self.dcomp.CreateSurface(
+                width,
+                height,
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                DXGI_ALPHA_MODE_PREMULTIPLIED,
+            )
+        }
+        .map_err(|error| format!("CreateSurface failed: {error}"))?;
+        // SAFETY: every interface belongs to this device and stays alive in
+        // WindowContent. Null reference visuals place static at the bottom and
+        // dynamic visuals successively above it.
+        let static_visual = unsafe { self.dcomp.CreateVisual() }
+            .map_err(|error| format!("Create static visual failed: {error}"))?;
+        let cursor_visual = unsafe { self.dcomp.CreateVisual() }
+            .map_err(|error| format!("Create cursor visual failed: {error}"))?;
+        let indicator_visual = unsafe { self.dcomp.CreateVisual() }
+            .map_err(|error| format!("Create indicator visual failed: {error}"))?;
+        unsafe {
+            static_visual
+                .SetContent(&static_surface)
+                .and_then(|()| visual.AddVisual(&static_visual, false, None))
+                .and_then(|()| visual.AddVisual(&cursor_visual, true, None))
+                .and_then(|()| visual.AddVisual(&indicator_visual, true, None))
+                .and_then(|()| target.SetRoot(&visual))
+                .and_then(|()| self.dcomp.Commit())
+        }
+        .map_err(|error| format!("cannot attach DirectComposition visual: {error}"))?;
+        self.content = Some(WindowContent {
+            window,
+            _target: target,
+            _root: visual,
+            _static_visual: static_visual,
+            cursor_visual,
+            indicator_visual,
+            static_surface,
+            cursor_surface: None,
+            indicator_surface: None,
+            static_scene: None,
+            area,
+            width,
+            height,
+        });
+        Ok(())
+    }
+
+    fn ensure_class(&mut self) -> Result<(), String> {
+        if self.class_registered {
+            return Ok(());
+        }
+        // SAFETY: a null module name asks for the current executable.
+        let instance = unsafe { GetModuleHandleW(None) }
+            .map_err(|error| format!("GetModuleHandleW failed: {error}"))?;
+        let class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(window_proc),
+            hInstance: instance.into(),
+            lpszClassName: Self::CLASS_NAME,
+            hIcon: HICON::default(),
+            hCursor: HCURSOR::default(),
+            hbrBackground: HBRUSH::default(),
+            ..Default::default()
+        };
+        // SAFETY: all fields above are initialized and the callback obeys the
+        // Win32 ABI without allowing a Rust panic to cross it.
+        if unsafe { RegisterClassExW(&class) } == 0 {
+            // SAFETY: GetLastError has no preconditions.
+            let last = unsafe { windows::Win32::Foundation::GetLastError() };
+            if last.0 != 1410 {
+                return Err(format!(
+                    "RegisterClassExW failed: {}",
+                    windows::core::Error::from_hresult(last.to_hresult())
+                ));
+            }
+        }
+        self.class_registered = true;
+        Ok(())
+    }
+
+    fn draw_surface(
+        &mut self,
+        surface: &IDCompositionSurface,
+        coordinate_origin: Point,
+        clear: Option<Color>,
+        draw: impl FnOnce(&mut Self, Point) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut offset = POINT::default();
+        // SAFETY: the update offset is a valid out-parameter and the returned
+        // interface is explicitly requested as IDXGISurface.
+        let dxgi: IDXGISurface = unsafe { surface.BeginDraw(None, &mut offset) }
+            .map_err(|error| format!("DirectComposition BeginDraw failed: {error}"))?;
+        let properties = D2D1_BITMAP_PROPERTIES1 {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+            ..Default::default()
+        };
+        // SAFETY: `dxgi` is the surface returned by BeginDraw and properties
+        // describe that surface's exact format.
+        let bitmap = match unsafe {
+            self.d2d
+                .CreateBitmapFromDxgiSurface(&dxgi, Some(&properties))
+        } {
+            Ok(bitmap) => bitmap,
+            Err(error) => {
+                // SAFETY: every successful BeginDraw is paired with EndDraw.
+                let _ = unsafe { surface.EndDraw() };
+                return Err(format!("CreateBitmapFromDxgiSurface failed: {error}"));
+            }
+        };
+        // SAFETY: the bitmap belongs to the same D2D device context.
+        unsafe {
+            self.d2d.SetTarget(&bitmap);
+            self.d2d.BeginDraw();
+        }
+        let origin = Point::new(
+            coordinate_origin.x - f64::from(offset.x),
+            coordinate_origin.y - f64::from(offset.y),
+        );
+        let clear = clear.map(d2d_color);
+        // SAFETY: drawing is active and the optional local color stays live
+        // for the duration of the call.
+        unsafe { self.d2d.Clear(clear.as_ref().map(std::ptr::from_ref)) };
+        let draw_result = draw(self, origin);
+        // SAFETY: BeginDraw above is paired exactly once. Dropping `bitmap`
+        // after detaching it cannot leave a target reference behind.
+        let d2d_result = unsafe { self.d2d.EndDraw(None, None) }
+            .map_err(|error| format!("Direct2D EndDraw failed: {error}"));
+        // SAFETY: EndDraw completed and detaching releases the bitmap target.
+        unsafe { self.d2d.SetTarget(None) };
+        // SAFETY: BeginDraw on the DirectComposition surface succeeded once.
+        let surface_result = unsafe { surface.EndDraw() }
+            .map_err(|error| format!("DirectComposition EndDraw failed: {error}"));
+        draw_result.and(d2d_result).and(surface_result)
+    }
+
+    fn draw_static(
+        &mut self,
+        surface: &IDCompositionSurface,
+        scene: &OverlayScene,
+        area: Rect,
+    ) -> Result<(), String> {
+        self.draw_surface(
+            surface,
+            Point::new(area.x, area.y),
+            scene.backdrop,
+            |renderer, origin| {
+                for shape in &scene.shapes {
+                    renderer.draw_shape(shape, origin)?;
+                }
+                for label in &scene.labels {
+                    renderer.draw_label(label, origin)?;
+                }
+                Ok(())
+            },
+        )
+    }
+
+    fn draw_cursor(
+        &mut self,
+        marker: Option<&crate::api::overlay::CursorMarker>,
+        area: Rect,
+    ) -> Result<(), String> {
+        let dcomp = self.dcomp.clone();
+        let Some(marker) = marker else {
+            if let Some(content) = self.content.as_mut() {
+                // SAFETY: clearing content releases the visual's surface.
+                unsafe { content.cursor_visual.SetContent(None) }
+                    .map_err(|error| format!("cannot clear cursor visual: {error}"))?;
+                content.cursor_surface = None;
+            }
+            return Ok(());
+        };
+        let padding = (marker.stroke_width.max(0.0) / 2.0).ceil() + 1.0;
+        let bounds = Rect::new(
+            marker.center.x - marker.radius - padding,
+            marker.center.y - marker.radius - padding,
+            marker.radius * 2.0 + padding * 2.0,
+            marker.radius * 2.0 + padding * 2.0,
+        );
+        let width = dimension(bounds.width)?;
+        let height = dimension(bounds.height)?;
+        let (surface, visual) = {
+            let content = self
+                .content
+                .as_mut()
+                .ok_or("DirectComposition content is unavailable")?;
+            (
+                ensure_layer_surface(&dcomp, &mut content.cursor_surface, width, height)?,
+                content.cursor_visual.clone(),
+            )
+        };
+        // SAFETY: the interfaces share a DComp device and offsets are local to
+        // the owned overlay window.
+        unsafe {
+            visual
+                .SetContent(&surface)
+                .and_then(|()| visual.SetOffsetX2((bounds.x - area.x) as f32))
+                .and_then(|()| visual.SetOffsetY2((bounds.y - area.y) as f32))
+        }
+        .map_err(|error| format!("cannot configure cursor visual: {error}"))?;
+        self.draw_surface(
+            &surface,
+            Point::new(bounds.x, bounds.y),
+            None,
+            |renderer, origin| {
+                renderer.draw_shape(
+                    &OverlayShape::Rect {
+                        rect: Rect::new(
+                            marker.center.x - marker.radius,
+                            marker.center.y - marker.radius,
+                            marker.radius * 2.0,
+                            marker.radius * 2.0,
+                        ),
+                        fill: marker.fill,
+                        stroke: marker.stroke,
+                        stroke_width: marker.stroke_width,
+                        corner_radius: marker.radius,
+                        z_index: i32::MAX,
+                    },
+                    origin,
+                )
+            },
+        )
+    }
+
+    fn draw_indicator(
+        &mut self,
+        indicator: Option<&crate::api::overlay::Indicator>,
+        area: Rect,
+    ) -> Result<(), String> {
+        let dcomp = self.dcomp.clone();
+        let Some(indicator) = indicator else {
+            if let Some(content) = self.content.as_mut() {
+                // SAFETY: clearing content releases the visual's surface.
+                unsafe { content.indicator_visual.SetContent(None) }
+                    .map_err(|error| format!("cannot clear indicator visual: {error}"))?;
+                content.indicator_surface = None;
+            }
+            return Ok(());
+        };
+        let first = indicator_rect(&indicator.text, indicator.position, &indicator.style);
+        let held = indicator.held_text.as_deref().map(|text| {
+            indicator_rect(
+                text,
+                Point::new(indicator.position.x, first.bottom() + 4.0),
+                &indicator.style,
+            )
+        });
+        let bounds = held
+            .map_or(first, |held| first.union(&held))
+            .inset(-1.0, -1.0);
+        let width = dimension(bounds.width)?;
+        let height = dimension(bounds.height)?;
+        let (surface, visual) = {
+            let content = self
+                .content
+                .as_mut()
+                .ok_or("DirectComposition content is unavailable")?;
+            (
+                ensure_layer_surface(&dcomp, &mut content.indicator_surface, width, height)?,
+                content.indicator_visual.clone(),
+            )
+        };
+        // SAFETY: the interfaces share a DComp device and offsets are local to
+        // the owned overlay window.
+        unsafe {
+            visual
+                .SetContent(&surface)
+                .and_then(|()| visual.SetOffsetX2((bounds.x - area.x) as f32))
+                .and_then(|()| visual.SetOffsetY2((bounds.y - area.y) as f32))
+        }
+        .map_err(|error| format!("cannot configure indicator visual: {error}"))?;
+        self.draw_surface(
+            &surface,
+            Point::new(bounds.x, bounds.y),
+            None,
+            |renderer, origin| {
+                renderer.draw_label_parts(&indicator.text, first, &indicator.style, 0, origin)?;
+                if let (Some(text), Some(rect)) = (&indicator.held_text, held) {
+                    renderer.draw_label_parts(text, rect, &indicator.style, 0, origin)?;
+                }
+                Ok(())
+            },
+        )
+    }
+
+    fn draw_shape(&mut self, shape: &OverlayShape, origin: Point) -> Result<(), String> {
+        match shape {
+            OverlayShape::Rect {
+                rect,
+                fill,
+                stroke,
+                stroke_width,
+                corner_radius,
+                ..
+            } => {
+                let rect = local_rect(*rect, origin);
+                let rounded = D2D1_ROUNDED_RECT {
+                    rect,
+                    radiusX: *corner_radius as f32,
+                    radiusY: *corner_radius as f32,
+                };
+                if !fill.is_transparent() {
+                    let brush = self.brush(*fill)?;
+                    // SAFETY: drawing is active and both pointers are live.
+                    unsafe { self.d2d.FillRoundedRectangle(&rounded, &brush) };
+                }
+                if !stroke.is_transparent() && *stroke_width > 0.0 {
+                    let brush = self.brush(*stroke)?;
+                    // SAFETY: drawing is active and both pointers are live.
+                    unsafe {
+                        self.d2d
+                            .DrawRoundedRectangle(&rounded, &brush, *stroke_width as f32, None)
+                    };
+                }
+            }
+            OverlayShape::Line {
+                from,
+                to,
+                color,
+                width,
+                ..
+            } if !color.is_transparent() && *width > 0.0 => {
+                let brush = self.brush(*color)?;
+                let from = local_point(*from, origin);
+                let to = local_point(*to, origin);
+                // SAFETY: drawing is active and the brush belongs to this
+                // device context.
+                unsafe { self.d2d.DrawLine(from, to, &brush, *width as f32, None) };
+            }
+            OverlayShape::Line { .. } => {}
+        }
+        Ok(())
+    }
+
+    fn draw_label(&mut self, label: &OverlayLabel, origin: Point) -> Result<(), String> {
+        self.draw_label_parts(
+            &label.text,
+            label.rect,
+            &label.style,
+            label.matched_prefix_len,
+            origin,
+        )
+    }
+
+    fn draw_label_parts(
+        &mut self,
+        text: &str,
+        label_rect: Rect,
+        style: &LabelStyle,
+        matched_prefix_len: usize,
+        origin: Point,
+    ) -> Result<(), String> {
+        let rect = local_rect(label_rect, origin);
+        let rounded = D2D1_ROUNDED_RECT {
+            rect,
+            radiusX: style.border_radius as f32,
+            radiusY: style.border_radius as f32,
+        };
+        if !style.background.is_transparent() {
+            let brush = self.brush(style.background)?;
+            // SAFETY: drawing is active and both objects are live.
+            unsafe { self.d2d.FillRoundedRectangle(&rounded, &brush) };
+        }
+        if !style.border_color.is_transparent() && style.border_width > 0.0 {
+            let brush = self.brush(style.border_color)?;
+            // SAFETY: drawing is active and both objects are live.
+            unsafe {
+                self.d2d
+                    .DrawRoundedRectangle(&rounded, &brush, style.border_width as f32, None)
+            };
+        }
+        let format = self.text_format(style)?;
+        let normal = self.brush(style.text_color)?;
+        self.utf16.clear();
+        self.utf16.extend(text.encode_utf16());
+        // SAFETY: UTF-16 data, format, brush and layout rectangle remain live
+        // for the complete call.
+        unsafe {
+            self.d2d.DrawText(
+                &self.utf16,
+                &format,
+                &rect,
+                &normal,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
+            )
+        };
+        if matched_prefix_len > 0 && !style.matched_text_color.is_transparent() {
+            let total = text.chars().count().max(1);
+            let matched = matched_prefix_len.min(total);
+            let mut clip = rect;
+            clip.right = clip.left + (clip.right - clip.left) * matched as f32 / total as f32;
+            let matched_brush = self.brush(style.matched_text_color)?;
+            // SAFETY: the clip is finite and Push/Pop are balanced.
+            unsafe {
+                self.d2d
+                    .PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                self.d2d.DrawText(
+                    &self.utf16,
+                    &format,
+                    &rect,
+                    &matched_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+                self.d2d.PopAxisAlignedClip();
+            }
+        }
+        Ok(())
+    }
+
+    fn brush(&mut self, color: Color) -> Result<ID2D1SolidColorBrush, String> {
+        let key = color_key(color);
+        if let Some(brush) = self.brushes.get(&key) {
+            return Ok(brush.clone());
+        }
+        if self.brushes.len() >= MAX_BRUSHES {
+            self.brushes.clear();
+        }
+        let color = d2d_color(color);
+        // SAFETY: the color pointer is valid and default brush properties are
+        // requested. The returned COM interface is owned.
+        let brush = unsafe { self.d2d.CreateSolidColorBrush(&color, None) }
+            .map_err(|error| format!("CreateSolidColorBrush failed: {error}"))?;
+        self.brushes.insert(key, brush.clone());
+        Ok(brush)
+    }
+
+    fn text_format(&mut self, style: &LabelStyle) -> Result<IDWriteTextFormat, String> {
+        let size_bits = style.font_size.to_bits();
+        if let Some(entry) = self.formats.iter().find(|entry| {
+            entry.family == style.font_family
+                && entry.size_bits == size_bits
+                && entry.bold == style.bold
+        }) {
+            return Ok(entry.format.clone());
+        }
+        if self.formats.len() >= MAX_TEXT_FORMATS {
+            self.formats.clear();
+        }
+        let family = if style.font_family.is_empty() {
+            "Segoe UI"
+        } else {
+            &style.font_family
+        };
+        let mut family_wide: Vec<u16> = family.encode_utf16().chain([0]).collect();
+        let locale = w!("en-us");
+        // SAFETY: both strings are NUL-terminated and live through the call;
+        // the shared factory retains all data it needs.
+        let format = unsafe {
+            self.dwrite.CreateTextFormat(
+                PCWSTR(family_wide.as_mut_ptr()),
+                None,
+                if style.bold {
+                    DWRITE_FONT_WEIGHT_BOLD
+                } else {
+                    DWRITE_FONT_WEIGHT_NORMAL
+                },
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                style.font_size.max(1.0) as f32,
+                locale,
+            )
+        }
+        .map_err(|error| format!("CreateTextFormat failed: {error}"))?;
+        // SAFETY: the format is newly owned and all enum values are valid.
+        unsafe {
+            format
+                .SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)
+                .and_then(|()| format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER))
+                .and_then(|()| format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP))
+        }
+        .map_err(|error| format!("cannot configure DirectWrite format: {error}"))?;
+        self.formats.push(FontEntry {
+            family: style.font_family.clone(),
+            size_bits,
+            bold: style.bold,
+            format: format.clone(),
+        });
+        Ok(format)
+    }
+}
+
+fn ensure_layer_surface(
+    device: &IDCompositionDevice,
+    slot: &mut Option<LayerSurface>,
+    width: u32,
+    height: u32,
+) -> Result<IDCompositionSurface, String> {
+    if let Some(layer) = slot
+        && layer.width == width
+        && layer.height == height
+    {
+        return Ok(layer.surface.clone());
+    }
+    // SAFETY: dimensions are positive and the format matches the renderer's
+    // Direct2D bitmap target.
+    let surface = unsafe {
+        device.CreateSurface(
+            width,
+            height,
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            DXGI_ALPHA_MODE_PREMULTIPLIED,
+        )
+    }
+    .map_err(|error| format!("cannot create tight DirectComposition surface: {error}"))?;
+    *slot = Some(LayerSurface {
+        surface: surface.clone(),
+        width,
+        height,
+    });
+    Ok(surface)
+}
+
+fn static_scene_eq(left: &OverlayScene, right: &OverlayScene) -> bool {
+    left.backdrop == right.backdrop
+        && left.clip == right.clip
+        && left.shapes == right.shapes
+        && left.labels == right.labels
+}
+
+fn create_window(area: Rect) -> Result<HWND, String> {
+    let x = area.x.round() as i32;
+    let y = area.y.round() as i32;
+    let width = dimension(area.width)? as i32;
+    let height = dimension(area.height)? as i32;
+    // SAFETY: the class is registered before this function is called. A
+    // successfully created HWND belongs to this thread; initialization either
+    // completes or destroys it before returning the error.
+    let hwnd = unsafe {
+        let hwnd = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            GpuOverlay::CLASS_NAME,
+            w!("KeySteer"),
+            WS_POPUP,
+            x,
+            y,
+            width,
+            height,
+            None,
+            None,
+            None,
+            None,
+        )
+        .map_err(|error| format!("CreateWindowExW failed: {error}"))?;
+        // A fully opaque global alpha enables the layered HWND while
+        // DirectComposition supplies per-pixel alpha. WS_EX_TRANSPARENT then
+        // routes mouse input to windows underneath.
+        if let Err(error) = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA) {
+            let _ = DestroyWindow(hwnd);
+            return Err(format!("SetLayeredWindowAttributes failed: {error}"));
+        }
+        hwnd
+    };
+    Ok(hwnd)
+}
+
+fn reposition(hwnd: HWND, area: Rect) -> Result<(), String> {
+    // SAFETY: `hwnd` is owned by the current render thread.
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            area.x.round() as i32,
+            area.y.round() as i32,
+            dimension(area.width)? as i32,
+            dimension(area.height)? as i32,
+            SWP_NOACTIVATE,
+        )
+    }
+    .map_err(|error| format!("SetWindowPos failed: {error}"))
+}
+
+fn dimension(value: f64) -> Result<u32, String> {
+    if !value.is_finite() || value <= 0.0 || value > u32::MAX as f64 {
+        return Err(format!("invalid overlay dimension {value}"));
+    }
+    Ok(value.round().max(1.0) as u32)
+}
+
+fn d2d_color(color: Color) -> D2D1_COLOR_F {
+    D2D1_COLOR_F {
+        r: f32::from(color.r) / 255.0,
+        g: f32::from(color.g) / 255.0,
+        b: f32::from(color.b) / 255.0,
+        a: f32::from(color.a) / 255.0,
+    }
+}
+
+const fn color_key(color: Color) -> u32 {
+    u32::from_be_bytes([color.r, color.g, color.b, color.a])
+}
+
+fn local_rect(rect: Rect, origin: Point) -> D2D_RECT_F {
+    D2D_RECT_F {
+        left: (rect.x - origin.x) as f32,
+        top: (rect.y - origin.y) as f32,
+        right: (rect.right() - origin.x) as f32,
+        bottom: (rect.bottom() - origin.y) as f32,
+    }
+}
+
+fn local_point(point: Point, origin: Point) -> Vector2 {
+    Vector2 {
+        X: (point.x - origin.x) as f32,
+        Y: (point.y - origin.y) as f32,
+    }
+}
+
+fn indicator_rect(text: &str, position: Point, style: &LabelStyle) -> Rect {
+    let width = (text.chars().count() as f64 * style.font_size * 0.7 + style.padding_x * 2.0)
+        .max(style.font_size * 2.0);
+    let height = style.font_size + style.padding_y * 2.0;
+    Rect::new(position.x - width, position.y, width, height)
+}
+
+unsafe extern "system" fn window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if let Some(result) = super::native::click_through_hit_test(message) {
+        return result;
+    }
+    // No Rust state is accessed and `DefWindowProcW` cannot unwind into Rust.
+    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn static_cache_ignores_cursor_only_changes() {
+        let mut first = OverlayScene::new();
+        first.shapes.push(OverlayShape::fill(
+            Rect::new(0.0, 0.0, 100.0, 100.0),
+            Color::rgb(1, 2, 3),
+        ));
+        first.cursor_marker = Some(crate::api::overlay::CursorMarker {
+            center: Point::new(10.0, 20.0),
+            radius: 8.0,
+            fill: Color::rgb(4, 5, 6),
+            stroke: Color::rgb(7, 8, 9),
+            stroke_width: 1.0,
+        });
+        let mut second = first.clone();
+        if let Some(marker) = second.cursor_marker.as_mut() {
+            marker.center = Point::new(900.0, 700.0);
+        }
+        assert!(static_scene_eq(&first, &second));
+        second.shapes.push(OverlayShape::fill(
+            Rect::new(5.0, 5.0, 10.0, 10.0),
+            Color::rgb(10, 11, 12),
+        ));
+        assert!(!static_scene_eq(&first, &second));
+    }
+
+    #[test]
+    fn native_surface_dimensions_are_validated() {
+        assert_eq!(dimension(1.4), Ok(1));
+        assert!(dimension(0.0).is_err());
+        assert!(dimension(f64::NAN).is_err());
+        assert!(dimension(f64::INFINITY).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows compositor"]
+    fn directcomposition_smoke() -> Result<(), String> {
+        let mut renderer = GpuOverlay::new()?;
+        let mut scene = OverlayScene::new();
+        let area = Rect::new(0.0, 0.0, 256.0, 128.0);
+        scene.clip = Some(area);
+        scene.backdrop = Some(Color::rgba(0, 0, 0, 8));
+        scene.shapes.push(OverlayShape::fill(
+            Rect::new(8.0, 8.0, 64.0, 48.0),
+            Color::rgba(20, 40, 80, 128),
+        ));
+        scene.shapes.push(OverlayShape::line(
+            Point::new(8.0, 64.0),
+            Point::new(240.0, 64.0),
+            Color::rgb(255, 255, 255),
+            1.0,
+        ));
+        scene.labels.push(OverlayLabel::new(
+            "GPU",
+            Rect::new(80.0, 8.0, 64.0, 32.0),
+            LabelStyle::default(),
+        ));
+        scene.cursor_marker = Some(crate::api::overlay::CursorMarker {
+            center: Point::new(180.0, 32.0),
+            radius: 8.0,
+            fill: Color::rgba(255, 255, 255, 32),
+            stroke: Color::rgb(255, 255, 255),
+            stroke_width: 1.0,
+        });
+        scene.indicator = Some(crate::api::overlay::Indicator {
+            text: "DComp".into(),
+            held_text: Some("GPU".into()),
+            position: Point::new(248.0, 72.0),
+            style: LabelStyle::default(),
+        });
+        renderer.present(Arc::new(scene), area)?;
+        renderer.dismiss()
+    }
+}

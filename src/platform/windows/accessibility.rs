@@ -1,0 +1,1239 @@
+//! Incremental Windows UI Automation scanning.
+//!
+//! A backend-owned worker keeps COM and UIA on one MTA thread. Traversal is
+//! deliberately incremental: usable targets are published before the full tree
+//! has been visited, while input and tray handling remain responsive.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use windows::Win32::Foundation::{HWND, LPARAM, RECT, VARIANT_FALSE, VARIANT_TRUE};
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
+};
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, HDC, HMONITOR, MONITOR_DEFAULTTONULL, MonitorFromRect,
+};
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCancelCall, CoCreateInstance,
+    CoDisableCallCancellation, CoEnableCallCancellation, CoInitializeEx, CoUninitialize,
+};
+use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
+use windows::Win32::System::Variant::{VARIANT, VT_BOOL, VT_I4};
+use windows::Win32::UI::Accessibility::{
+    CUIAutomation, IUIAutomation, IUIAutomation2, IUIAutomationCacheRequest, IUIAutomationElement,
+    TreeScope_Descendants, UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId,
+    UIA_IsEnabledPropertyId, UIA_IsExpandCollapsePatternAvailablePropertyId,
+    UIA_IsInvokePatternAvailablePropertyId, UIA_IsKeyboardFocusablePropertyId,
+    UIA_IsOffscreenPropertyId, UIA_IsSelectionItemPatternAvailablePropertyId,
+    UIA_IsTogglePatternAvailablePropertyId, UIA_NamePropertyId,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumThreadWindows, EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetForegroundWindow,
+    GetWindow, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+    WS_EX_TRANSPARENT, WS_POPUP,
+};
+use windows::core::{BOOL, Interface};
+
+use crate::api::backend::BackendEvent;
+use crate::api::command::{UiScanRequest, UiScanResult, UiScanStatus, UiScanStrategy};
+use crate::api::geometry::{Rect, UiTarget};
+
+use super::EventSender;
+
+const PARTIAL_BATCH_SIZE: usize = 24;
+const MAX_TARGETS: usize = 2_000;
+const MAX_VISITED_ELEMENTS: usize = 20_000;
+const MAX_SCAN_WINDOWS: usize = 16;
+const MINIMUM_SPACING: f64 = 8.0;
+const MIN_SCAN_TIMEOUT_MS: u64 = 250;
+const MAX_SCAN_TIMEOUT_MS: u64 = 30_000;
+const UIA_CANCEL_TIMEOUT_MS: u32 = 500;
+const UIA_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
+
+static STRATEGY_FALLBACK_REPORTED: AtomicBool = AtomicBool::new(false);
+
+struct ScanJob {
+    request: UiScanRequest,
+    sender: EventSender,
+}
+
+#[derive(Default)]
+struct QueueState {
+    pending: Option<ScanJob>,
+    active_id: Option<u64>,
+    latest_id: u64,
+    stopping: bool,
+}
+
+struct SharedQueue {
+    state: Mutex<QueueState>,
+    ready: Condvar,
+}
+
+/// Backend-owned UIA worker. `stop` is idempotent and joins the COM thread.
+pub struct UiAutomationWorker {
+    shared: Arc<SharedQueue>,
+    thread_id: Arc<AtomicU32>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl UiAutomationWorker {
+    pub fn start() -> Result<Self, String> {
+        let shared = Arc::new(SharedQueue {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        });
+        let worker_shared = Arc::clone(&shared);
+        let thread_id = Arc::new(AtomicU32::new(0));
+        let worker_thread_id = Arc::clone(&thread_id);
+        let join = std::thread::Builder::new()
+            .name("keysteer-uia".into())
+            .spawn(move || worker_main(worker_shared, worker_thread_id))
+            .map_err(|error| format!("Cannot start the UIA worker: {error}"))?;
+        Ok(Self {
+            shared,
+            thread_id,
+            join: Some(join),
+        })
+    }
+
+    pub fn submit(&self, request: UiScanRequest, sender: EventSender) -> Result<(), String> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.stopping {
+            return Err("UI Automation worker is stopping".into());
+        }
+        let request_id = request.id;
+        state.latest_id = request_id;
+        let replaced = state.pending.replace(ScanJob { request, sender });
+        let cancel_active = state.active_id.is_some_and(|id| id != request_id);
+        if cancel_active {
+            // Keep the queue lock until cancellation has been requested. The
+            // worker cannot finish the old job and pick up this new one in the
+            // small interval before CoCancelCall, so the new call can never be
+            // cancelled by mistake.
+            let thread_id = self.thread_id.load(Ordering::Acquire);
+            if thread_id != 0 {
+                let _ = unsafe { CoCancelCall(thread_id, 0) };
+            }
+        }
+        self.shared.ready.notify_one();
+        drop(state);
+        if let Some(replaced) = replaced {
+            let _ = replaced.sender.send(scan_result(
+                replaced.request.id,
+                Vec::new(),
+                UiScanStatus::ContextChanged,
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn stop(&mut self) {
+        if self.join.is_none() {
+            return;
+        }
+        let pending = {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.stopping = true;
+            let pending = state.pending.take();
+            self.shared.ready.notify_all();
+            pending
+        };
+        if let Some(pending) = pending {
+            let _ = pending.sender.send(scan_result(
+                pending.request.id,
+                Vec::new(),
+                UiScanStatus::ContextChanged,
+            ));
+        }
+        let thread_id = self.thread_id.load(Ordering::Acquire);
+        if thread_id != 0 {
+            let _ = unsafe { CoCancelCall(thread_id, UIA_CANCEL_TIMEOUT_MS) };
+        }
+        if let Some(join) = self.join.take() {
+            let deadline = Instant::now() + UIA_SHUTDOWN_WAIT;
+            while !join.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if join.is_finished() {
+                if join.join().is_err() {
+                    crate::app::logging::report_error(
+                        "windows-uia",
+                        "UI Automation worker panicked",
+                    );
+                }
+            } else {
+                // A broken out-of-process provider may ignore cancellation.
+                // Never block input/overlay shutdown indefinitely; process exit
+                // reclaims the detached COM thread and all of its handles.
+                crate::log_warning!(
+                    "windows-uia",
+                    "UI Automation worker did not stop within 2 seconds; detaching it"
+                );
+                drop(join);
+            }
+        }
+    }
+}
+
+impl Drop for UiAutomationWorker {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+struct ComApartment;
+
+impl ComApartment {
+    fn initialise() -> Result<Self, String> {
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+            .ok()
+            .map_err(|error| format!("CoInitializeEx failed: {error}"))?;
+        if let Err(error) = unsafe { CoEnableCallCancellation(None) } {
+            unsafe { CoUninitialize() };
+            return Err(format!("CoEnableCallCancellation failed: {error}"));
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        let _ = unsafe { CoDisableCallCancellation(None) };
+        unsafe { CoUninitialize() };
+    }
+}
+
+fn worker_main(shared: Arc<SharedQueue>, thread_id: Arc<AtomicU32>) {
+    thread_id.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+    let apartment = match ComApartment::initialise() {
+        Ok(apartment) => apartment,
+        Err(error) => {
+            fail_jobs_until_stopped(&shared, error);
+            thread_id.store(0, Ordering::Release);
+            return;
+        }
+    };
+    let automation: IUIAutomation =
+        match unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) } {
+            Ok(automation) => automation,
+            Err(error) => {
+                fail_jobs_until_stopped(&shared, format!("cannot create UI Automation: {error}"));
+                drop(apartment);
+                thread_id.store(0, Ordering::Release);
+                return;
+            }
+        };
+    // IUIAutomation2 is optional. Keep its interface when available so every
+    // request can install its own adaptive timeout before querying providers.
+    let automation2 = match automation.cast::<IUIAutomation2>() {
+        Ok(automation2) => Some(automation2),
+        Err(error) => {
+            crate::log_warning!(
+                "windows-uia",
+                "IUIAutomation2 is unavailable; continuing with base UI Automation: {error}"
+            );
+            None
+        }
+    };
+
+    while let Some(job) = next_job(&shared) {
+        let id = job.request.id;
+        run_scan(job, &automation, automation2.as_ref(), &shared);
+        finish_job(&shared, id);
+    }
+    // COM interfaces must be released before the apartment is uninitialised.
+    drop(automation2);
+    drop(automation);
+    drop(apartment);
+    thread_id.store(0, Ordering::Release);
+}
+
+fn next_job(shared: &SharedQueue) -> Option<ScanJob> {
+    let mut state = shared
+        .state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    while state.pending.is_none() && !state.stopping {
+        state = shared
+            .ready
+            .wait(state)
+            .unwrap_or_else(|error| error.into_inner());
+    }
+    if state.stopping {
+        None
+    } else {
+        let job = state.pending.take();
+        state.active_id = job.as_ref().map(|job| job.request.id);
+        job
+    }
+}
+
+fn finish_job(shared: &SharedQueue, id: u64) {
+    let mut state = shared
+        .state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if state.active_id == Some(id) {
+        state.active_id = None;
+    }
+}
+
+fn fail_jobs_until_stopped(shared: &SharedQueue, error: String) {
+    while let Some(job) = next_job(shared) {
+        let _ = job.sender.send(scan_result(
+            job.request.id,
+            Vec::new(),
+            UiScanStatus::Failed(error.clone()),
+        ));
+    }
+}
+
+fn is_current(shared: &SharedQueue, id: u64) -> bool {
+    let state = shared
+        .state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    !state.stopping && state.latest_id == id
+}
+
+fn run_scan(
+    job: ScanJob,
+    automation: &IUIAutomation,
+    automation2: Option<&IUIAutomation2>,
+    shared: &SharedQueue,
+) {
+    if matches!(
+        job.request.strategy,
+        UiScanStrategy::Vision | UiScanStrategy::Hybrid
+    ) && !STRATEGY_FALLBACK_REPORTED.swap(true, Ordering::AcqRel)
+    {
+        crate::log_warning!(
+            "windows-uia",
+            "Vision/Hybrid UI hints are using Windows UI Automation for this configuration"
+        );
+    }
+
+    let timeout_ms = scan_timeout_ms(job.request.timeout_ms);
+    if let Some(automation2) = automation2 {
+        if let Err(error) = unsafe { automation2.SetConnectionTimeout(timeout_ms) } {
+            crate::log_warning!(
+                "windows-uia",
+                "cannot set UIA connection timeout; continuing with provider defaults: {error}"
+            );
+        }
+        if let Err(error) = unsafe { automation2.SetTransactionTimeout(timeout_ms) } {
+            crate::log_warning!(
+                "windows-uia",
+                "cannot set UIA transaction timeout; continuing with provider defaults: {error}"
+            );
+        }
+    }
+
+    let original = foreground_context();
+    let request_context_changed = job
+        .request
+        .app
+        .as_ref()
+        .is_some_and(|app| original.is_none_or(|(_, pid)| pid != app.process_id));
+    if request_context_changed {
+        let _ = job.sender.send(scan_result(
+            job.request.id,
+            Vec::new(),
+            UiScanStatus::ContextChanged,
+        ));
+        return;
+    }
+    let Some((hwnd, _)) = original else {
+        let _ = job.sender.send(scan_result(
+            job.request.id,
+            Vec::new(),
+            UiScanStatus::Failed("No foreground window is available".into()),
+        ));
+        return;
+    };
+
+    let status = match stream_scan(automation, hwnd, &job, shared, original) {
+        Ok(status) => status,
+        Err(error) => UiScanStatus::Failed(format!("UI Automation scan failed: {error}")),
+    };
+    let _ = job
+        .sender
+        .send(scan_result(job.request.id, Vec::new(), status));
+}
+
+fn scan_timeout_ms(requested: u64) -> u32 {
+    requested.clamp(MIN_SCAN_TIMEOUT_MS, MAX_SCAN_TIMEOUT_MS) as u32
+}
+
+fn is_timeout_hresult(code: i32) -> bool {
+    matches!(code as u32, 0x8013_1505 | 0x8007_05B4 | 0x8001_011F)
+}
+
+fn is_timeout_error(error: &windows::core::Error) -> bool {
+    is_timeout_hresult(error.code().0)
+}
+
+#[derive(Clone)]
+struct ScanWindow {
+    hwnd: HWND,
+    bounds: Rect,
+    /// Visible, click-receiving top-level windows above this HWND in Z-order.
+    occluders: Vec<Rect>,
+}
+
+fn rect_from_native(rect: RECT) -> Option<Rect> {
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    (width > 0 && height > 0).then(|| {
+        Rect::new(
+            rect.left as f64,
+            rect.top as f64,
+            width as f64,
+            height as f64,
+        )
+    })
+}
+
+fn native_rect(rect: Rect) -> RECT {
+    RECT {
+        left: rect.left().floor() as i32,
+        top: rect.top().floor() as i32,
+        right: rect.right().ceil() as i32,
+        bottom: rect.bottom().ceil() as i32,
+    }
+}
+
+/// DWM's extended frame excludes the invisible resize border and drop shadow.
+/// Fall back to GetWindowRect for classic controls and windows without DWM.
+fn window_bounds(hwnd: HWND) -> Option<Rect> {
+    let mut rect = RECT::default();
+    let dwm_rect = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            (&mut rect as *mut RECT).cast(),
+            std::mem::size_of::<RECT>() as u32,
+        )
+    };
+    if dwm_rect.is_err() && unsafe { GetWindowRect(hwnd, &mut rect) }.is_err() {
+        return None;
+    }
+    rect_from_native(rect)
+}
+
+fn is_cloaked(hwnd: HWND) -> bool {
+    let mut cloaked = 0u32;
+    unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            (&mut cloaked as *mut u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+        )
+    }
+    .is_ok_and(|_| cloaked != 0)
+}
+
+struct MonitorCollector {
+    monitors: Vec<HMONITOR>,
+}
+
+unsafe extern "system" fn collect_monitor(
+    monitor: HMONITOR,
+    _dc: HDC,
+    _rect: *mut RECT,
+    data: LPARAM,
+) -> BOOL {
+    let collector = unsafe { &mut *(data.0 as *mut MonitorCollector) };
+    collector.monitors.push(monitor);
+    BOOL(1)
+}
+
+fn monitors_intersecting(hwnd: HWND) -> Vec<HMONITOR> {
+    let Some(bounds) = window_bounds(hwnd) else {
+        return Vec::new();
+    };
+    let clip = native_rect(bounds);
+    let mut collector = MonitorCollector {
+        monitors: Vec::new(),
+    };
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            Some(&clip),
+            Some(collect_monitor),
+            LPARAM((&mut collector as *mut MonitorCollector) as isize),
+        );
+    };
+    collector.monitors
+}
+
+fn is_owned_by(mut hwnd: HWND, foreground: HWND) -> bool {
+    // Owner chains are normally one link, but nested modal dialogs exist.
+    for _ in 0..16 {
+        let Ok(owner) = (unsafe { GetWindow(hwnd, GW_OWNER) }) else {
+            return false;
+        };
+        if owner == foreground {
+            return true;
+        }
+        if owner.is_invalid() || owner == hwnd {
+            return false;
+        }
+        hwnd = owner;
+    }
+    false
+}
+
+fn popup_relationship_is_scannable(
+    has_popup_style: bool,
+    owned_by_foreground: bool,
+    shares_foreground_monitor: bool,
+) -> bool {
+    has_popup_style && (owned_by_foreground || shares_foreground_monitor)
+}
+
+struct ThreadWindowCollector {
+    foreground: HWND,
+    foreground_monitors: Vec<HMONITOR>,
+    windows: Vec<HWND>,
+}
+
+unsafe extern "system" fn collect_thread_window(hwnd: HWND, data: LPARAM) -> BOOL {
+    let collector = unsafe { &mut *(data.0 as *mut ThreadWindowCollector) };
+    if hwnd == collector.foreground
+        || !unsafe { IsWindowVisible(hwnd) }.as_bool()
+        || unsafe { IsIconic(hwnd) }.as_bool()
+        || is_cloaked(hwnd)
+    {
+        return BOOL(1);
+    }
+
+    let has_popup_style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32 & WS_POPUP.0 != 0;
+    let owned = is_owned_by(hwnd, collector.foreground);
+    let shares_monitor = window_bounds(hwnd).is_some_and(|bounds| {
+        let rect = native_rect(bounds);
+        let monitor = unsafe { MonitorFromRect(&rect, MONITOR_DEFAULTTONULL) };
+        !monitor.is_invalid() && collector.foreground_monitors.contains(&monitor)
+    });
+    if collector.windows.len() < MAX_SCAN_WINDOWS
+        && popup_relationship_is_scannable(has_popup_style, owned, shares_monitor)
+    {
+        collector.windows.push(hwnd);
+    }
+    BOOL(1)
+}
+
+fn foreground_and_popup_windows(foreground: HWND) -> Vec<HWND> {
+    let mut collector = ThreadWindowCollector {
+        foreground,
+        foreground_monitors: monitors_intersecting(foreground),
+        windows: vec![foreground],
+    };
+    let thread_id = unsafe { GetWindowThreadProcessId(foreground, None) };
+    if thread_id != 0 {
+        unsafe {
+            let _ = EnumThreadWindows(
+                thread_id,
+                Some(collect_thread_window),
+                LPARAM((&mut collector as *mut ThreadWindowCollector) as isize),
+            );
+        };
+    }
+    collector.windows
+}
+
+struct ZOrderCollector {
+    candidates: Vec<HWND>,
+    scan_bounds: Rect,
+    own_process_id: u32,
+    scan_windows: Vec<ScanWindow>,
+    occluders: Vec<Rect>,
+}
+
+unsafe extern "system" fn collect_z_order_window(hwnd: HWND, data: LPARAM) -> BOOL {
+    let collector = unsafe { &mut *(data.0 as *mut ZOrderCollector) };
+    if !unsafe { IsWindowVisible(hwnd) }.as_bool()
+        || unsafe { IsIconic(hwnd) }.as_bool()
+        || is_cloaked(hwnd)
+    {
+        return BOOL(1);
+    }
+    let click_through =
+        unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32 & WS_EX_TRANSPARENT.0 != 0;
+    if click_through {
+        return BOOL(1);
+    }
+    let Some(bounds) = window_bounds(hwnd) else {
+        return BOOL(1);
+    };
+    let Some(bounds_in_scan) = bounds.intersect(&collector.scan_bounds) else {
+        return BOOL(1);
+    };
+
+    let candidate = collector.candidates.contains(&hwnd);
+    if candidate {
+        collector.scan_windows.push(ScanWindow {
+            hwnd,
+            bounds: bounds_in_scan,
+            occluders: collector.occluders.clone(),
+        });
+    }
+
+    let mut process_id = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
+    // Our click-through overlay was already skipped above. Ignore any other
+    // helper/tray HWND owned by this process so it cannot hide application UI.
+    if candidate || process_id != collector.own_process_id {
+        collector.occluders.push(bounds_in_scan);
+    }
+    BOOL(1)
+}
+
+fn scan_windows_in_z_order(foreground: HWND, scan_bounds: Rect) -> Result<Vec<ScanWindow>, String> {
+    let candidates = foreground_and_popup_windows(foreground);
+    let mut collector = ZOrderCollector {
+        candidates,
+        scan_bounds,
+        own_process_id: unsafe { GetCurrentProcessId() },
+        scan_windows: Vec::new(),
+        occluders: Vec::new(),
+    };
+    unsafe {
+        EnumWindows(
+            Some(collect_z_order_window),
+            LPARAM((&mut collector as *mut ZOrderCollector) as isize),
+        )
+    }
+    .map_err(|error| format!("cannot enumerate top-level windows: {error}"))?;
+    Ok(collector.scan_windows)
+}
+
+fn target_center_is_visible(target: &UiTarget, bounds: Rect, occluders: &[Rect]) -> bool {
+    let center = target.rect.center();
+    bounds.contains(&center) && !occluders.iter().any(|rect| rect.contains(&center))
+}
+
+fn stream_scan(
+    automation: &IUIAutomation,
+    hwnd: HWND,
+    job: &ScanJob,
+    shared: &SharedQueue,
+    original: Option<(HWND, u32)>,
+) -> Result<UiScanStatus, String> {
+    if hwnd.is_invalid() {
+        return Ok(UiScanStatus::Success);
+    }
+    let cache = create_cache_request(automation)?;
+    let (condition, provider_filters_interactive) = if job.request.clickable_only {
+        match create_interactive_condition(automation) {
+            Ok(condition) => (condition, true),
+            Err(error) => {
+                crate::log_warning!(
+                    "windows-uia",
+                    "cannot create interactive UIA condition; scanning all descendants: {error}"
+                );
+                (
+                    unsafe { automation.CreateTrueCondition() }.map_err(|fallback| {
+                        format!("cannot create fallback UIA condition: {fallback}")
+                    })?,
+                    false,
+                )
+            }
+        }
+    } else {
+        (
+            unsafe { automation.CreateTrueCondition() }
+                .map_err(|error| format!("cannot create the UIA scan condition: {error}"))?,
+            false,
+        )
+    };
+    let mut allowed = control_types_for(&job.request.roles);
+    if allowed.is_empty() {
+        allowed.extend(DEFAULT_CONTROL_TYPES);
+    }
+    let scan_bounds = job
+        .request
+        .bounds
+        .or_else(|| window_bounds(hwnd))
+        .unwrap_or_default();
+    let mut windows = scan_windows_in_z_order(hwnd, scan_bounds)?;
+    // EnumWindows can transiently omit a window that is being activated. Keep
+    // the foreground UIA root as a safe fallback instead of returning no hints.
+    if windows.is_empty()
+        && let Some(bounds) = window_bounds(hwnd).and_then(|rect| rect.intersect(&scan_bounds))
+    {
+        windows.push(ScanWindow {
+            hwnd,
+            bounds,
+            occluders: Vec::new(),
+        });
+    }
+    let deadline =
+        Instant::now() + Duration::from_millis(u64::from(scan_timeout_ms(job.request.timeout_ms)));
+    let mut deduper = SpatialDeduper::new(MINIMUM_SPACING);
+    let mut batch = Vec::with_capacity(PARTIAL_BATCH_SIZE);
+    let mut target_count = 0usize;
+    let mut visited_count = 0usize;
+    let mut queried_window = false;
+    let mut provider_timed_out = false;
+    let mut terminal_status = UiScanStatus::Success;
+
+    // Windows are ordered front-to-back. Popup/menu targets are therefore
+    // published before their owner, and every lower window carries the bounds
+    // of higher click-receiving windows as occluders.
+    for window in windows {
+        if !is_current(shared, job.request.id) || original != foreground_context() {
+            return Ok(UiScanStatus::ContextChanged);
+        }
+        if Instant::now() >= deadline {
+            terminal_status = UiScanStatus::TimedOut;
+            break;
+        }
+        if visited_count >= MAX_VISITED_ELEMENTS {
+            terminal_status = UiScanStatus::TimedOut;
+            break;
+        }
+        if target_count >= MAX_TARGETS {
+            break;
+        }
+
+        let root = match unsafe { automation.ElementFromHandleBuildCache(window.hwnd, &cache) } {
+            Ok(root) => root,
+            Err(error) => {
+                provider_timed_out |= is_timeout_error(&error);
+                crate::log_warning!(
+                    "windows-uia",
+                    "cannot inspect popup/top-level window {:?}; continuing: {error}",
+                    window.hwnd
+                );
+                continue;
+            }
+        };
+        // A bulk descendant query is substantially more reliable for Chromium,
+        // WebView2 and other virtualized trees than walking only Control View.
+        let elements =
+            match unsafe { root.FindAllBuildCache(TreeScope_Descendants, &condition, &cache) } {
+                Ok(elements) => elements,
+                Err(error) => {
+                    provider_timed_out |= is_timeout_error(&error);
+                    crate::log_warning!(
+                        "windows-uia",
+                        "cannot query UIA descendants for {:?}; continuing: {error}",
+                        window.hwnd
+                    );
+                    continue;
+                }
+            };
+        queried_window = true;
+        let element_count = unsafe { elements.Length() }
+            .map_err(|error| format!("cannot read UIA descendant count: {error}"))?
+            .max(0) as usize;
+        let remaining = MAX_VISITED_ELEMENTS - visited_count;
+
+        for index in 0..element_count.min(remaining) {
+            let element = unsafe { elements.GetElement(index as i32) }
+                .map_err(|error| format!("cannot read UIA descendant {index}: {error}"))?;
+            visited_count += 1;
+            if !is_current(shared, job.request.id) || original != foreground_context() {
+                return Ok(UiScanStatus::ContextChanged);
+            }
+            if Instant::now() >= deadline {
+                terminal_status = UiScanStatus::TimedOut;
+                break;
+            }
+            if target_count >= MAX_TARGETS {
+                break;
+            }
+
+            if let Some(target) = target_from_element(
+                &element,
+                &job.request,
+                &allowed,
+                scan_bounds,
+                provider_filters_interactive,
+            ) && target_center_is_visible(&target, window.bounds, &window.occluders)
+                && deduper.insert(&target)
+            {
+                batch.push(target);
+                target_count += 1;
+                if batch.len() >= PARTIAL_BATCH_SIZE {
+                    send_partial(job, std::mem::take(&mut batch));
+                }
+            }
+        }
+        // Do not wait for the next HWND to fill a 24-item batch. A small menu
+        // or dropdown should become usable as soon as its own provider query
+        // completes, while the worker continues with windows underneath it.
+        if !batch.is_empty()
+            && is_current(shared, job.request.id)
+            && original == foreground_context()
+        {
+            send_partial(job, std::mem::take(&mut batch));
+        }
+        if element_count > remaining {
+            terminal_status = UiScanStatus::TimedOut;
+        }
+        if terminal_status == UiScanStatus::TimedOut || target_count >= MAX_TARGETS {
+            break;
+        }
+    }
+    if !queried_window {
+        if provider_timed_out {
+            return Ok(UiScanStatus::TimedOut);
+        }
+        return Err("cannot inspect any foreground or popup UIA window".into());
+    }
+    if provider_timed_out && terminal_status == UiScanStatus::Success {
+        terminal_status = UiScanStatus::TimedOut;
+    }
+    if !batch.is_empty() && is_current(shared, job.request.id) && original == foreground_context() {
+        send_partial(job, batch);
+    }
+    Ok(terminal_status)
+}
+
+fn send_partial(job: &ScanJob, targets: Vec<UiTarget>) {
+    let _ = job
+        .sender
+        .send(scan_result(job.request.id, targets, UiScanStatus::Partial));
+}
+
+fn create_cache_request(automation: &IUIAutomation) -> Result<IUIAutomationCacheRequest, String> {
+    let cache = unsafe { automation.CreateCacheRequest() }
+        .map_err(|error| format!("cannot create UIA cache request: {error}"))?;
+    for property in [
+        UIA_BoundingRectanglePropertyId,
+        UIA_ControlTypePropertyId,
+        UIA_IsEnabledPropertyId,
+        UIA_IsKeyboardFocusablePropertyId,
+        UIA_IsOffscreenPropertyId,
+        UIA_NamePropertyId,
+    ] {
+        unsafe { cache.AddProperty(property) }
+            .map_err(|error| format!("cannot configure UIA property cache: {error}"))?;
+    }
+    Ok(cache)
+}
+
+fn variant_bool(value: bool) -> VARIANT {
+    let mut variant = VARIANT::default();
+    unsafe {
+        let inner = &mut variant.Anonymous.Anonymous;
+        inner.vt = VT_BOOL;
+        inner.Anonymous.boolVal = if value { VARIANT_TRUE } else { VARIANT_FALSE };
+    }
+    variant
+}
+
+fn variant_i32(value: i32) -> VARIANT {
+    let mut variant = VARIANT::default();
+    unsafe {
+        let inner = &mut variant.Anonymous.Anonymous;
+        inner.vt = VT_I4;
+        inner.Anonymous.lVal = value;
+    }
+    variant
+}
+
+/// Mirrors mousemaster's provider-side filter: visible and enabled elements
+/// which expose at least one interaction affordance. Keeping this condition
+/// in UIA avoids materializing every static text/container in large WebView
+/// trees, while the Rust-side role filter still honours user configuration.
+fn create_interactive_condition(
+    automation: &IUIAutomation,
+) -> Result<windows::Win32::UI::Accessibility::IUIAutomationCondition, String> {
+    let true_value = variant_bool(true);
+    let false_value = variant_bool(false);
+    let focusable = unsafe {
+        automation.CreatePropertyCondition(UIA_IsKeyboardFocusablePropertyId, &true_value)
+    }
+    .map_err(|error| format!("keyboard-focusable condition failed: {error}"))?;
+    let invokable = unsafe {
+        automation.CreatePropertyCondition(UIA_IsInvokePatternAvailablePropertyId, &true_value)
+    }
+    .map_err(|error| format!("invoke condition failed: {error}"))?;
+    let button = unsafe {
+        automation.CreatePropertyCondition(UIA_ControlTypePropertyId, &variant_i32(50000))
+    }
+    .map_err(|error| format!("button condition failed: {error}"))?;
+    let expandable = unsafe {
+        automation
+            .CreatePropertyCondition(UIA_IsExpandCollapsePatternAvailablePropertyId, &true_value)
+    }
+    .map_err(|error| format!("expand/collapse condition failed: {error}"))?;
+    let toggle = unsafe {
+        automation.CreatePropertyCondition(UIA_IsTogglePatternAvailablePropertyId, &true_value)
+    }
+    .map_err(|error| format!("toggle condition failed: {error}"))?;
+    let selection = unsafe {
+        automation
+            .CreatePropertyCondition(UIA_IsSelectionItemPatternAvailablePropertyId, &true_value)
+    }
+    .map_err(|error| format!("selection condition failed: {error}"))?;
+    let enabled =
+        unsafe { automation.CreatePropertyCondition(UIA_IsEnabledPropertyId, &true_value) }
+            .map_err(|error| format!("enabled condition failed: {error}"))?;
+    let onscreen =
+        unsafe { automation.CreatePropertyCondition(UIA_IsOffscreenPropertyId, &false_value) }
+            .map_err(|error| format!("onscreen condition failed: {error}"))?;
+
+    let mut interactive = unsafe { automation.CreateOrCondition(&focusable, &invokable) }
+        .map_err(|error| format!("interactive condition failed: {error}"))?;
+    for extra in [&button, &expandable, &toggle, &selection] {
+        interactive = unsafe { automation.CreateOrCondition(&interactive, extra) }
+            .map_err(|error| format!("interactive condition failed: {error}"))?;
+    }
+    let enabled_and_visible = unsafe { automation.CreateAndCondition(&enabled, &onscreen) }
+        .map_err(|error| format!("visibility condition failed: {error}"))?;
+    unsafe { automation.CreateAndCondition(&enabled_and_visible, &interactive) }
+        .map_err(|error| format!("final UIA condition failed: {error}"))
+}
+
+const DEFAULT_CONTROL_TYPES: [i32; 17] = [
+    50000, 50002, 50003, 50004, 50005, 50006, 50007, 50011, 50013, 50015, 50016, 50019, 50020,
+    50024, 50029, 50031, 50035,
+];
+
+fn target_from_element(
+    element: &IUIAutomationElement,
+    request: &UiScanRequest,
+    allowed: &[i32],
+    within: Rect,
+    provider_filters_interactive: bool,
+) -> Option<UiTarget> {
+    // FindAllBuildCache already populated this element. Reading cached
+    // properties directly avoids a second provider call, which is important
+    // for WebView2/Chromium providers where BuildUpdatedCache may time out or
+    // return E_ELEMENTNOTAVAILABLE after the bulk query.
+    let control_type = unsafe { element.CachedControlType() }.ok()?.0;
+    // Windows applications often expose custom controls with a generic UIA
+    // control type. Their interaction pattern is more reliable than the type,
+    // and also lets shared macOS-oriented role lists work on Windows.
+    let role_matches = allowed.contains(&control_type);
+    // When FindAllBuildCache used mousemaster's provider-side interaction
+    // condition, the returned set is already interactive even if the cached
+    // keyboard-focus property is false (common for WebView buttons).
+    let interactive = provider_filters_interactive || is_interactive(element);
+    if !role_matches && !interactive {
+        return None;
+    }
+    let visible = unsafe { element.CachedIsOffscreen() }
+        .ok()
+        .is_none_or(|offscreen| !offscreen.as_bool());
+    let enabled = unsafe { element.CachedIsEnabled() }
+        .ok()
+        .is_none_or(|value| value.as_bool());
+    if (request.visible_only && !visible)
+        || (request.clickable_only && (!enabled || (!role_matches && !interactive)))
+    {
+        return None;
+    }
+    let raw_rect = unsafe { element.CachedBoundingRectangle() }.ok()?;
+    let rect = Rect::new(
+        raw_rect.left as f64,
+        raw_rect.top as f64,
+        (raw_rect.right - raw_rect.left) as f64,
+        (raw_rect.bottom - raw_rect.top) as f64,
+    );
+    let name = unsafe { element.CachedName() }
+        .map(|name| name.to_string())
+        .unwrap_or_default();
+    let target = to_target(rect, name, control_type);
+    is_usable(&target, within).then_some(target)
+}
+
+fn is_interactive(element: &IUIAutomationElement) -> bool {
+    unsafe { element.CachedIsKeyboardFocusable() }.is_ok_and(|value| value.as_bool())
+}
+
+/// Map semantic roles to UIA control type ids.
+pub fn control_types_for(semantic_roles: &[String]) -> Vec<i32> {
+    let mut out = Vec::new();
+    for role in semantic_roles {
+        let normalized = role.trim().to_ascii_lowercase();
+        if let Some(raw) = normalized.strip_prefix("uia:") {
+            if let Ok(id) = raw.parse::<i32>() {
+                out.push(id);
+            }
+            continue;
+        }
+        // AX/AT-SPI entries belong to other platforms. Ignoring them here is
+        // intentional; an all-native foreign list falls back to Windows's
+        // default control set in stream_scan.
+        if normalized.starts_with("ax:") || normalized.starts_with("atspi:") {
+            continue;
+        }
+        if normalized.contains(':') {
+            continue;
+        }
+        out.extend(match normalized.as_str() {
+            "button" | "toolbar_button" => &[50000][..],
+            "menu_button" | "popup_button" => &[50031, 50000],
+            "combo_box" => &[50003],
+            "link" => &[50005],
+            "checkbox" | "switch" => &[50002],
+            "radio" => &[50013],
+            "text_field" | "text_area" | "search_field" => &[50004],
+            "slider" => &[50015],
+            "stepper" => &[50016],
+            "tab" => &[50019],
+            "menu_item" => &[50011],
+            "menubar_item" => &[50010],
+            "cell" => &[50029, 50035],
+            "list_item" => &[50007],
+            "row" => &[50029],
+            "tree_item" => &[50024],
+            "image" => &[50006],
+            "static_text" | "heading" => &[50020],
+            "calendar" => &[50001],
+            _ => &[],
+        });
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+pub fn semantic_role_for(control_type: i32) -> &'static str {
+    match control_type {
+        50000 => "button",
+        50001 => "calendar",
+        50002 => "checkbox",
+        50003 => "combo_box",
+        50004 => "text_field",
+        50005 => "link",
+        50006 => "image",
+        50007 => "list_item",
+        50010 => "menubar_item",
+        50011 => "menu_item",
+        50013 => "radio",
+        50015 => "slider",
+        50016 => "stepper",
+        50019 => "tab",
+        50020 => "static_text",
+        50024 => "tree_item",
+        50029 => "row",
+        50031 => "menu_button",
+        50035 => "cell",
+        _ => "unknown",
+    }
+}
+
+pub fn to_target(rect: Rect, name: String, control_type: i32) -> UiTarget {
+    UiTarget {
+        rect,
+        name,
+        role: semantic_role_for(control_type).to_string(),
+        native_role: Some(control_type.to_string()),
+    }
+}
+
+pub fn is_usable(target: &UiTarget, within: Rect) -> bool {
+    target.rect.width >= 2.0
+        && target.rect.height >= 2.0
+        && !(target.rect.width >= within.width && target.rect.height >= within.height)
+        && within.intersect(&target.rect).is_some()
+}
+
+struct DedupEntry {
+    x: f64,
+    y: f64,
+    name: String,
+    role: String,
+}
+
+struct SpatialDeduper {
+    cell_size: f64,
+    cells: HashMap<(i32, i32), Vec<DedupEntry>>,
+}
+
+impl SpatialDeduper {
+    fn new(minimum_spacing: f64) -> Self {
+        Self {
+            cell_size: minimum_spacing.max(1.0),
+            cells: HashMap::new(),
+        }
+    }
+
+    fn insert(&mut self, target: &UiTarget) -> bool {
+        let center = target.rect.center();
+        let cell = (
+            (center.x / self.cell_size).floor() as i32,
+            (center.y / self.cell_size).floor() as i32,
+        );
+        for y in cell.1 - 1..=cell.1 + 1 {
+            for x in cell.0 - 1..=cell.0 + 1 {
+                if self.cells.get(&(x, y)).is_some_and(|entries| {
+                    entries.iter().any(|entry| {
+                        (entry.x - center.x).abs() < self.cell_size
+                            && (entry.y - center.y).abs() < self.cell_size
+                            && entry.name == target.name
+                            && entry.role == target.role
+                    })
+                }) {
+                    return false;
+                }
+            }
+        }
+        self.cells.entry(cell).or_default().push(DedupEntry {
+            x: center.x,
+            y: center.y,
+            name: target.name.clone(),
+            role: target.role.clone(),
+        });
+        true
+    }
+}
+
+fn foreground_context() -> Option<(HWND, u32)> {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_invalid() {
+        return None;
+    }
+    let mut process_id = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
+    Some((hwnd, process_id))
+}
+
+fn scan_result(id: u64, targets: Vec<UiTarget>, status: UiScanStatus) -> BackendEvent {
+    BackendEvent::UiScanned(UiScanResult {
+        id,
+        targets,
+        status,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target(x: f64, y: f64, name: &str, role: &str) -> UiTarget {
+        UiTarget {
+            rect: Rect::new(x, y, 40.0, 20.0),
+            name: name.into(),
+            role: role.into(),
+            native_role: None,
+        }
+    }
+
+    #[test]
+    fn semantic_roles_map_to_control_types() {
+        assert_eq!(control_types_for(&["button".into()]), [50000]);
+        assert_eq!(control_types_for(&["link".into()]), [50005]);
+    }
+
+    #[test]
+    fn raw_ids_pass_through_and_foreign_prefixes_are_dropped() {
+        assert_eq!(
+            control_types_for(&[
+                "uia:50042".into(),
+                "ax:AXButton".into(),
+                "atspi:push button".into(),
+            ]),
+            [50042]
+        );
+    }
+
+    #[test]
+    fn foreign_only_roles_trigger_windows_default_fallback() {
+        let roles = vec!["ax:AXButton".into(), "atspi:push button".into()];
+        assert!(control_types_for(&roles).is_empty());
+        assert!(DEFAULT_CONTROL_TYPES.contains(&50000));
+        assert!(DEFAULT_CONTROL_TYPES.contains(&50005));
+        assert!(DEFAULT_CONTROL_TYPES.contains(&50019));
+    }
+
+    #[test]
+    fn semantic_roles_are_case_and_whitespace_tolerant() {
+        assert_eq!(control_types_for(&["  BUTTON  ".into()]), [50000]);
+        assert_eq!(control_types_for(&["UIA:50042".into()]), [50042]);
+    }
+
+    #[test]
+    fn spatial_deduper_keeps_overlapping_distinct_controls() {
+        let mut deduper = SpatialDeduper::new(8.0);
+        assert!(deduper.insert(&target(10.0, 10.0, "Save", "button")));
+        assert!(!deduper.insert(&target(11.0, 11.0, "Save", "button")));
+        assert!(deduper.insert(&target(11.0, 11.0, "Cancel", "button")));
+        assert!(deduper.insert(&target(11.0, 11.0, "Save", "link")));
+    }
+
+    #[test]
+    fn popup_requires_an_owner_or_a_foreground_monitor() {
+        assert!(popup_relationship_is_scannable(true, true, false));
+        assert!(popup_relationship_is_scannable(true, false, true));
+        assert!(!popup_relationship_is_scannable(true, false, false));
+        assert!(!popup_relationship_is_scannable(false, true, true));
+    }
+
+    #[test]
+    fn scan_timeout_is_bounded_for_plugin_requests() {
+        assert_eq!(scan_timeout_ms(0), 250);
+        assert_eq!(scan_timeout_ms(2_500), 2_500);
+        assert_eq!(scan_timeout_ms(u64::MAX), 30_000);
+    }
+
+    #[test]
+    fn native_provider_timeout_codes_are_retryable() {
+        assert!(is_timeout_hresult(0x8013_1505_u32 as i32));
+        assert!(is_timeout_hresult(0x8007_05B4_u32 as i32));
+        assert!(is_timeout_hresult(0x8001_011F_u32 as i32));
+        assert!(!is_timeout_hresult(0x8000_4005_u32 as i32));
+    }
+
+    #[test]
+    fn higher_z_order_windows_hide_only_covered_target_centres() {
+        let bounds = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let item = target(20.0, 20.0, "Save", "button");
+        assert!(target_center_is_visible(&item, bounds, &[]));
+        assert!(!target_center_is_visible(
+            &item,
+            bounds,
+            &[Rect::new(30.0, 25.0, 20.0, 20.0)]
+        ));
+        assert!(target_center_is_visible(
+            &item,
+            bounds,
+            &[Rect::new(0.0, 0.0, 20.0, 20.0)]
+        ));
+    }
+
+    #[test]
+    fn window_bounds_conversion_rejects_empty_rectangles() {
+        assert_eq!(
+            rect_from_native(RECT {
+                left: -100,
+                top: 20,
+                right: 300,
+                bottom: 220,
+            }),
+            Some(Rect::new(-100.0, 20.0, 400.0, 200.0))
+        );
+        assert!(rect_from_native(RECT::default()).is_none());
+    }
+
+    #[test]
+    fn rejects_degenerate_and_container_targets() {
+        let window = Rect::new(0.0, 0.0, 1000.0, 800.0);
+        let mut item = target(10.0, 10.0, "Save", "button");
+        assert!(is_usable(&item, window));
+        item.rect.width = 1.0;
+        assert!(!is_usable(&item, window));
+        item.rect = window;
+        assert!(!is_usable(&item, window));
+    }
+}
