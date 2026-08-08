@@ -1,0 +1,58 @@
+name: 配置或按键问题
+description: 反馈 TOML、配置发现、按键绑定或模式行为的使用问题。
+title: "[Config]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        适用于默认配置无法满足、按键未按预期触发、配置加载/继承有疑问等情况。
+        请勿粘贴包含私密路径、命令或凭据的完整配置。
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 操作系统
+      options: [Windows, macOS, 其他]
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: KeySteer 版本
+      placeholder: 例如 0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: 问题类型
+      options:
+        - 配置文件发现或优先级
+        - 按键、primary 修饰键或键盘布局
+        - Normal 模式鼠标控制
+        - Grid / Recursive Grid / UI Hint
+        - 主题、指示器或覆盖层
+        - 配置重载、保存或 `set_config`
+        - 其他
+    validations:
+      required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: 目标与当前行为
+      description: 请说明想实现的操作，以及现在实际发生了什么。
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: 最小可复现配置（脱敏）
+      description: 请粘贴相关 TOML 片段，并说明文件名（如 `keysteer.user.toml`）。
+      render: toml
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: 诊断信息
+      description: 可选：`keysteer --doctor` 输出、日志或截图。
+      render: text

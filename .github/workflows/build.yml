@@ -29,6 +29,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Install required Rust toolchain
+        run: rustup toolchain install 1.97 --profile minimal
+
+      - name: Verify Rust toolchain
+        run: rustc --version
+
       - name: Install Rust targets
         run: rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc
 
@@ -70,6 +76,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+
+      - name: Install required Rust toolchain
+        run: rustup toolchain install 1.97 --profile minimal
+
+      - name: Verify Rust toolchain
+        run: rustc --version
 
       - name: Install Rust targets
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin

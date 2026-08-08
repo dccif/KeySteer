@@ -1,10 +1,11 @@
 [toolchain]
 # Host-agnostic on purpose: pinning a `targets` tuple here makes the toolchain
 # unusable on other platforms, and pinning `components` can trigger a partial
-# reinstall. Cargo picks the host target automatically and `--target` still
-# works for cross builds:
+# reinstall. Keep this in sync with Cargo's MSRV so Actions does not silently
+# use an older preinstalled `stable` toolchain. Cargo picks the host target
+# automatically and `--target` still works for cross builds:
 #
 #   cargo build                                   # host
 #   cargo build --target x86_64-pc-windows-msvc   # Windows
 #   cargo build --target aarch64-apple-darwin     # macOS
-channel = "stable"
+channel = "1.97"

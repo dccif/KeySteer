@@ -1,17 +1,6 @@
 name: Deploy documentation
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "docs/**"
-      - "scripts/sync-doc-assets.mjs"
-      - "assets/icons/**"
-      - "keysteer.default.toml"
-      - "package.json"
-      - "pnpm-lock.yaml"
-      - "pnpm-workspace.yaml"
-      - ".github/workflows/pages.yml"
   workflow_dispatch:
 
 permissions:

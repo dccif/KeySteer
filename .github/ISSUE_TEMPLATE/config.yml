@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: KeySteer 文档
+    url: https://dccif.github.io/KeySteer/
+    about: 使用说明、模式说明与完整默认配置参考。

@@ -11,6 +11,10 @@
 release profile：`opt-level=3`、fat LTO、`codegen-units=1`、abort panic、strip symbols、
 关闭 incremental/debug/overflow checks，目标是发布体积和运行性能。
 
+`Cargo.toml` 的 `rust-version` 是最低 Rust 版本；`rust-toolchain.toml` 固定同一
+`1.97` toolchain。发布工作流在每个原生 job 显式安装它，不能依赖 GitHub runner 预装
+的 `stable` 版本。
+
 ## build.rs
 
 - Windows host 构建 Windows target 时，将 `assets/icons/keysteer.ico` 和版本资源嵌入 exe。
@@ -75,6 +79,13 @@ notarization 通过 secrets 注入。
 
 每个 target 的 workflow artifact 也独立上传：Windows x64/ARM64、macOS Apple
 Silicon/Intel 各一份；不会把不同架构放入同一个 ZIP 或 artifact。
+
+`.github/workflows/pages.yml` 仅由 `workflow_dispatch` 手动触发；push 不会自动部署
+GitHub Pages。需要更新线上文档时，在 Actions 页面运行 `Deploy documentation`。
+
+`.github/ISSUE_TEMPLATE/` 提供错误报告、功能建议和配置/按键问题三种 Issue Form；错误
+报告收集平台、架构、版本、受影响功能、复现步骤和脱敏 TOML，避免把不完整的环境信息留给
+维护者猜测。不要在模板中预设 labels，因为 GitHub 只会添加仓库中已经存在的 labels。
 
 ## VitePress 文档与模拟器
 

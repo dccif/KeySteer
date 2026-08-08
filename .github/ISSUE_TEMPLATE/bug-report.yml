@@ -1,0 +1,87 @@
+name: 错误报告
+description: 报告可复现的 KeySteer 行为、输入或覆盖层问题。
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。请先搜索现有 issue。
+  - type: checkboxes
+    id: searched
+    attributes:
+      label: 提交前检查
+      options:
+        - label: 我已搜索现有 issue，确认没有重复报告。
+          required: true
+        - label: 我使用的是最新发布版或当前 main 构建。
+          required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 操作系统
+      options: [Windows, macOS, 其他]
+    validations:
+      required: true
+  - type: dropdown
+    id: architecture
+    attributes:
+      label: 处理器架构
+      options: [x86_64 / x64, ARM64 / Apple Silicon, 不确定]
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: KeySteer 版本
+      description: 请填写 `keysteer --version` 输出或 Release 文件名中的版本。
+      placeholder: 例如 1.0.0
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: 受影响的功能
+      options:
+        - Normal 鼠标移动、滚动或点击
+        - Grid / Recursive Grid
+        - UI Hint
+        - 配置加载、保存或重载
+        - 光标指示器、覆盖层或状态栏
+        - 原生权限、输入 Hook 或跨屏幕行为
+        - 其他
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 使用以下配置或默认配置启动……
+        2. 按下……
+        3. 观察到……
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: 相关配置
+      description: 请只粘贴能复现问题的相关 TOML 片段；删除任何路径、命令或私密内容。
+      render: toml
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: 诊断信息、日志或截图
+      description: 如可行，请附上 `keysteer --doctor`、错误日志或截图。
+      render: text

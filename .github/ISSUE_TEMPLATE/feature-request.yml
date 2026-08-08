@@ -1,0 +1,54 @@
+name: 功能建议
+description: 提议新的操作、模式、配置能力或体验改进。
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢建议。请描述要解决的问题，而不只描述实现方案。
+  - type: checkboxes
+    id: searched
+    attributes:
+      label: 提交前检查
+      options:
+        - label: 我已搜索现有 issue，确认没有相同建议。
+          required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: 相关区域
+      options:
+        - Normal 鼠标控制
+        - Grid / Recursive Grid
+        - UI Hint
+        - 配置、按键绑定或插件
+        - 覆盖层、指示器或主题
+        - Windows / macOS 平台集成
+        - 文档、模拟器或发布流程
+        - 其他
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: 想解决的问题
+      description: 哪个工作流目前不方便？请给出具体场景。
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议的体验
+      description: 描述理想操作方式、按键或界面反馈；欢迎附上示例配置或草图。
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 已考虑的替代方案
+      description: 可选：现有配置、其他软件或变通方式为何不足。
+  - type: textarea
+    id: context
+    attributes:
+      label: 补充信息
+      description: 可附截图、参考链接、平台差异或可接受的取舍。
