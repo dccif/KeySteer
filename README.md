@@ -1,7 +1,14 @@
 # KeySteer
 
-[![文档部署](https://github.com/dccif/KeySteer/actions/workflows/pages.yml/badge.svg)](https://github.com/dccif/KeySteer/actions/workflows/pages.yml)
-[![手动构建](https://github.com/dccif/KeySteer/actions/workflows/build.yml/badge.svg)](https://github.com/dccif/KeySteer/actions/workflows/build.yml)
+<p align="center">
+  <a href="https://github.com/dccif/KeySteer/actions/workflows/pages.yml"><img alt="Page status" src="https://img.shields.io/github/actions/workflow/status/dccif/KeySteer/pages.yml?branch=main&amp;label=Page&amp;style=flat-square&amp;logo=githubactions&amp;logoColor=white"></a>
+  <a href="https://github.com/dccif/KeySteer/actions/workflows/build.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/dccif/KeySteer/build.yml?branch=main&amp;label=Build&amp;style=flat-square&amp;logo=githubactions&amp;logoColor=white"></a>
+  <a href="https://github.com/dccif/KeySteer/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/dccif/KeySteer?display_name=tag&amp;sort=semver&amp;label=Release&amp;style=flat-square"></a>
+  <a href="rust-toolchain.toml"><img alt="Rust 1.97" src="https://img.shields.io/badge/Rust-1.97-dea584?style=flat-square&amp;logo=rust&amp;logoColor=white"></a>
+  <img alt="Windows 10 and 11" src="https://img.shields.io/badge/Windows-10%2F11-0078D4?style=flat-square&amp;logo=windows11&amp;logoColor=white">
+  <img alt="macOS 14 or later" src="https://img.shields.io/badge/macOS-14%2B-000000?style=flat-square&amp;logo=apple&amp;logoColor=white">
+  <a href="LICENSE"><img alt="License: GPL-3.0-or-later" src="https://img.shields.io/github/license/dccif/KeySteer?label=License&amp;style=flat-square"></a>
+</p>
 
 <p align="center">
   <img src="assets/brand/keysteer-wordmark.webp" alt="KeySteer" width="760">
@@ -13,7 +20,7 @@
 
 KeySteer 是 Windows 和 macOS 上的使用键盘操控鼠标工具。 
 
-[在线文档](https://dccif.github.io/KeySteer/)。
+[在线文档](https://dccif.github.io/KeySteer/)
 
 ## 功能
 
