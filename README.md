@@ -29,8 +29,8 @@ KeySteer 是 Windows 和 macOS 上使用键盘操控鼠标的工具。
 - **Grid**：快速定位二键组合。
 - **Recursive Grid**：区域持续递归细分。
 - **UI Hint**：为按钮、链接、菜单和输入框显示可键入标签；macOS 支持 Accessibility Tree、Vision 和 Hybrid，Windows 使用 UI Automation。
-- **多显示器**：`Primary+S` 切换到下一块显示器；Grid 与 Recursive Grid 可保留当前定位路径。
-- **外观与配置**：Grid/Hint 标签样式、光标旁模式和点击指示器等可通过 TOML 调整。
+- **多显示器**：`Primary+S` 切换到下一块显示器。
+- **外观与配置**：`Grid`/`Hint` 标签样式、指示器等可通过 TOML 调整。
 
 `Primary` 是跨平台写法：macOS 为 `Command`，Windows 为 `Alt`，为保持键盘位置的一致性。 它可以在 `[key_aliases]` 中改成你习惯的实体按键。
 
@@ -40,29 +40,29 @@ KeySteer 是 Windows 和 macOS 上使用键盘操控鼠标的工具。
 
 键盘移动、速度修饰、滚动与点击。
 
-https://github.com/user-attachments/assets/255ba0b5-57c6-4a2b-ae68-ffc1bf06ad6c
+https://github.com/user-attachments/assets/10c990c4-903c-49fb-b8d7-5441430d3496
 
 ### Grid
 
 一级大标签、二级预览与二键快速定位。
 
-https://github.com/user-attachments/assets/98e63544-89d2-464d-823b-3a0d5712b49a
+https://github.com/user-attachments/assets/4ecb749e-d770-43c1-907a-e55a4144a9ca
 
 ### Recursive Grid
 
 逐层细分、回退与精确定位。
 
-https://github.com/user-attachments/assets/874ed096-1ab0-4228-879e-e53efb0b1a55
+https://github.com/user-attachments/assets/cb399755-5cde-40a0-ba64-d00c7e581cc6
 
 ### UI Hint
 
 扫描界面元素、标签筛选与控件定位。
 
-https://github.com/user-attachments/assets/11aff61b-acd3-4e2b-bf27-f089b79f430b
+https://github.com/user-attachments/assets/71efcae3-eb11-46d0-aba4-0a5df5e9c80c
 
 ## 默认按键
 
-先按 `Primary+E` 进入 Normal。默认配置中的 `Primary` 为：macOS Command、Windows 左 Alt、Linux Ctrl；可在 `[key_aliases]` 改成自己的习惯。
+先按 `Primary+E` 进入 `Normal`。默认配置中的 `Primary` 为：macOS `Command`、Windows 左 `Alt`；可在 `[key_aliases]` 改成自己的习惯。
 
 | 按键 | 作用 |
 | --- | --- |
@@ -71,15 +71,15 @@ https://github.com/user-attachments/assets/11aff61b-acd3-4e2b-bf27-f089b79f430b
 | `m` / `,` | 向下 / 向上滚动 |
 | `;` / `'` / `Right Shift` | 左 / 右 / 中键点击 |
 | `n` | Toggle 鼠标按住状态，用于拖拽 |
-| `g` / `f` / `Primary+F` | Grid / Recursive Grid / UI Hint |
+| `g` / `f` / `Primary+F` | `Grid` / `Recursive Grid` / `UI Hint` |
 | `Primary+S` | 切换到下一块显示器 |
 | `q` 或 `Esc` | 返回 Idle |
 
 ## 配置
 
-无需配置文件即可运行：内置 `Config::default()` 与发布的 [`keysteer.default.toml`](keysteer.default.toml) 完全一致，后者只是带注释的可复制示例。
+无需配置文件即可运行：内置 `Config::default()` 与发布的 [`keysteer.default.toml`](keysteer.default.toml) 一致。
 
-自动发现配置时，程序优先选择数据目录中按文件名排序的 `keysteer.<名称>.toml` 用户配置（排除 `keysteer.default.toml`）；不存在用户配置时才读取默认 TOML，仍不存在则使用内置默认值。显式 `--config`/`-c` 始终优先。
+程序优先选择数据目录中的 `keysteer.<名称>.toml` 用户配置（排除 `keysteer.default.toml`）；不存在用户配置时才读取默认 TOML，仍不存在则使用内置默认值。显式 `--config`/`-c` 始终优先。
 
 ```bash
 # 校验仓库中的默认示例；带 ./ 表示当前目录的确切路径
@@ -103,8 +103,7 @@ cargo run -- --doctor
 ```bash
 sudo xattr -cr /Applications/KeySteer.app
 ```
-
-该命令会递归清除应用包的扩展属性；不要对来源不明的应用使用。随后重新打开 KeySteer，并按系统提示授予“辅助功能”和“屏幕录制”权限。
+建议先授予“辅助功能”和“屏幕录制”权限后再打开
 
 ## 运行与打包
 
@@ -123,7 +122,6 @@ pnpm docs:build
 
 - Windows 10/11：x64、ARM64
 - macOS 14+：Apple Silicon、Intel
-- Linux：暂未支持
 
 ## 许可证与版权
 

@@ -1,17 +1,21 @@
 # 配置文件
 
-KeySteer 不要求配置文件。没有配置时直接使用内置默认值，其行为与发布的 `keysteer.default.toml` 完全一致；该文件只是带注释的可复制示例。标量、开关和独立配置段可以只写需要改变的项；绑定表见下面的“绑定、数组和继承”。
+KeySteer 不要求配置文件。没有配置时直接使用内置默认值，其行为与发布的 `keysteer.default.toml` 一致。
 
-配置格式是 TOML，发布的完整示例可[直接下载](/generated/keysteer.default.toml)。本文按“先能用、再定制、最后排错”的顺序介绍配置。
+配置格式是 TOML，发布的完整示例可 [直接下载](/generated/keysteer.default.toml)。本文按“先能用、再定制、最后排错”的顺序介绍配置。
 
-> 只想改快捷键：从[快速上手](/guide/getting-started)开始。想了解动作参数、数组、`exec` 和插件动词：直接看[模式与动作参考](/reference/modes-and-actions)。
+::: tip
+只想改快捷键：[快速上手](/guide/getting-started) 中有介绍
+
+想了解动作参数、数组、`exec` 和插件动词等高级配置：请参阅 [模式与动作参考](/reference/modes-and-actions)。
+:::
 
 ## 配置文件位置
 
-自动发现时，程序会在数据目录中查找 `keysteer.<名称>.toml`：非 `default` 的用户配置优先并按文件名排序；只有不存在用户配置时，才读取 `keysteer.default.toml`。如果连它也不存在，则直接使用内置默认值：
+程序会在当前目录中查找 `keysteer.<名称>.toml`：不存在用户配置时，会尝试读取 `keysteer.default.toml`。如果连它也不存在，则直接使用内置默认值：
 
-- Windows portable 或裸二进制：可执行文件所在目录。
-- 打包的 macOS `.app`：`~/Library/Application Support/KeySteer/`。
+- Windows：可执行文件所在目录。
+- macOS `.app`：`~/Library/Application Support/KeySteer/`。
 
 文件名必须是 `keysteer.<名称>.toml`，例如 `keysteer.user.toml`。也可以显式指定：
 
@@ -38,7 +42,7 @@ keysteer --check --config keysteer.user.toml
 space = "idle"
 ```
 
-所有未写的**非表项**字段都会保留默认值。`[normal.bindings]` 这类映射一旦写出，会成为该 Mode 的本地绑定表：想保留默认绑定时，请从 `--dump-config` 或默认 TOML 复制需要的条目，再做修改。配置字段拼写错误不会被静默忽略，程序会在加载时报告错误。
+所有未写的字段都会保留默认值。建议在默认配置的基础上进行修改。
 
 ## 配置结构
 
@@ -48,7 +52,7 @@ space = "idle"
 | --- | --- |
 | `[general]` | 排除应用。 |
 | `[key_aliases]` | 自定义键名和跨平台修饰键。 |
-| `[hotkeys]` | Idle 中可触发 Mode 的入口。 |
+| `[hotkeys]` | `Idle` 中可触发 Mode 的入口。 |
 | `[normal]`、`[grid]`、`[recursive_grid]`、`[ui_hint]` | 各 Mode 的继承、绑定和参数。 |
 | `[pointer]`、`[scroll]` | 鼠标速度和滚动距离。 |
 | `[theme]`、`[mode_indicator]` | 颜色和模式提示。 |
@@ -73,9 +77,9 @@ h = "move_left"
 ```
 
 - `+` 表示同一个组合键。
-- 空格表示多个独立按键绑定到同一个动作，不是顺序按键。
-- 发布默认配置中，`primary` 在 macOS 是 Command、Windows 是左 Alt、Linux 是 Ctrl。它是别名；若你要在 Windows 使用 Ctrl，请在 `[key_aliases.windows]` 覆盖它。
-- `ctrl`、`alt`、`shift` 等通用修饰键匹配左右两侧；`left_`/`right_` 只匹配指定一侧。
+- `空格` 表示多个独立按键绑定到同一个动作，不是顺序按键。
+- 发布默认配置中，`primary` 在 macOS 是 `Command`、Windows 是左 `Alt` 。它是别名；若你要在 Windows 使用 `Ctrl`，可以在 `[key_aliases.windows]` 注释掉 。
+- `ctrl`、`alt`、`shift` 等通用修饰键匹配左右两侧；`left_`/`right_` 前缀 只匹配指定一侧。
 
 常用键名包括 `a-z`、`0-9`、`space`、`enter`、`esc`、`tab`、`delete`、`backspace`、`up`、`down`、`left`、`right`、`home`、`end`、`page_up`、`page_down`、`f1-f20` 和 `numpad_0-numpad_9`。
 
@@ -92,11 +96,11 @@ Primary = "left_alt"
 Primary = "left_cmd"
 ```
 
-顶层别名在所有平台生效；当前平台的子表覆盖同名值。别名值必须是一个键，不能是组合键；别名可以链式引用。别名不区分大小写。
+顶层别名在所有平台生效；别名值必须是一个键，不能是组合键；不区分大小写。
 
-`Primary` 只是一个可解析的别名，不是永远固定的物理键。发布默认值是 macOS Command、Windows `Alt`、Linux Ctrl；上例正是把 Windows 的 `Primary` 显式设为 `Alt`。大小写不同的 `primary`/`Primary` 指向同一个别名。
+`Primary` 只是一个 **可解析** 的跨平台别名，不是固定的物理键。发布默认值是 macOS Command、Windows `Alt`；上例正是把 Windows 的 `Primary` 显式设为 `Alt`。大小写不同的 `primary`/`Primary` 指向同一个别名。
 
-## 绑定、数组和继承
+### 绑定、数组和继承
 
 右值可以是字符串，也可以是字符串数组：
 
@@ -116,7 +120,7 @@ x = ["press shift", "left_click", "release shift"]
 3. 当前应用匹配的 `app_configs` 覆盖合并结果。
 4. 插件的建议绑定只填补空位，不覆盖用户设置。
 
-这里的“合并”指运行时的**有效按键表**。程序不会把你写出的 `[normal.bindings]` 与内置的本地 Normal 表逐键深合并；它会替换该 Mode 的本地表，再按上述继承规则取得父表和插件建议绑定。因此，下面的最小示例只保留 `space` 作为 Normal 的本地绑定；需要 `hjkl`、点击或进入 Grid 的默认键时应一并写出。
+这里的“合并”指运行时的**有效按键表**。程序只会进行覆盖替换。
 
 ```toml
 [grid]
@@ -128,19 +132,20 @@ q = "none" # 屏蔽从 normal 继承的 q
 
 `none` 和 `__disabled__` 都表示明确禁用。建议保留至少一个 `[hotkeys]` 入口，否则程序仍会运行，但无法从 Idle 进入其他 Mode。
 
-## 动作序列
+### 动作序列
 ```toml
 [normal.bindings]
 x = ["press shift", "left_click", "release shift"]
 "primary+shift+b" = ["exec say start", "wait 300", "exec say done"]
 ```
 
-完整动作、参数和 `exec` 规则见[模式与动作参考](/reference/modes-and-actions)。
+完整动作、参数和 `exec` 规则见 [模式与动作](/reference/modes-and-actions)。
+
 ## Normal 和定位 Mode
 
 ### Normal
 
-Normal 是直接移动、点击、滚动和进入其他 Mode 的工作台：
+`Normal` 是控制鼠标直接移动、点击、滚动和进入其他 Mode 的平台：
 
 ```toml
 [normal.bindings]
@@ -161,7 +166,7 @@ f = "recursive_grid"
 # "primary+l" = "right"
 ```
 
-`long_press_toggle_ms` 只作用于绑定为 鼠标键。持续按住达到阈值后，将对应鼠标按钮保持按下，松开物理键不会释放。再次长按同一点击键或使用无参数 `toggle` 组合可释放。设为 `0` 禁用，允许范围为 `0..=60000` 毫秒。
+`long_press_toggle_ms` 只作用于绑定为 `鼠标键`。持续按住达到阈值后，将对应鼠标按钮保持按下，松开物理键不会释放。再次长按 `鼠标键` 或使用无参数 `n = toggle` 键可释放。设为 `0` 禁用，允许范围为 `0..=60000` 毫秒。
 
 ### Grid
 
@@ -247,7 +252,9 @@ invert_horizontal = false
 invert_vertical = true
 ```
 
-速度单位是像素/秒，加速度单位是像素/秒²，与显示器刷新率无关。`smooth_acceleration = true` 使用起步和收尾更柔和的 S 曲线，同时保持相同的加速时长和总行程；设为 `false` 使用线性加速。释放最后一个方向键后两种模式都会立即停止。主题颜色使用 `#RRGGBBAA`，可以为浅色和深色外观分别设置：
+速度单位是像素/秒，加速度单位是像素/秒²，与显示器刷新率无关。`smooth_acceleration = true` 使用起步和收尾更柔和的 S 曲线；设为 `false` 使用线性加速。
+
+主题颜色使用 `#RRGGBBAA`，可以为浅色和深色外观分别设置：
 
 ```toml
 [theme.dark]
@@ -263,7 +270,7 @@ middle_pressed_color = "#FF00FFFF"
 right_pressed_color = "#00FFFFFF"
 ```
 
-鼠标按钮通过 `press` 或 `toggle` 保持按下时，透明圆形指示器使用对应的 `*_pressed_color`：填充使用配置颜色 20% 的不透明度，轮廓使用配置颜色本身。普通 `click`/`double-click` 在物理触发键释放前也使用对应颜色，但点击本身仍在按下沿立即完整执行。真实的 `press`/`toggle` 状态优先；否则显示最近仍按住的点击键颜色。这个提示不使用定时器，也不表示普通点击正在保持鼠标按钮。
+鼠标按钮通过 `press` 或 `toggle` 保持按下时，透明圆形指示器使用对应的 `*_pressed_color`：填充使用配置颜色 20% 的不透明度。
 
 ## 应用覆盖：`[[app_configs]]`
 
@@ -279,7 +286,7 @@ bundle_id = "Figma"
 bindings = { v = "none", "primary+f" = "grid" }
 ```
 
-根级 `[[app_configs]]` 对所有 Mode 生效；`[[normal.app_configs]]` 只在 Normal 生效。匹配值可以是 macOS bundle id、Windows 可执行文件名、Linux WM_CLASS/app_id，或窗口标题的子串。
+根级 `[[app_configs]]` 对所有 Mode 生效；`[[normal.app_configs]]` 只在 Normal 生效。匹配值可以是 macOS bundle id、Windows 可执行文件名、或窗口标题的子串。
 
 ## 插件设置
 
@@ -293,7 +300,7 @@ preserve = true
 inherits = ["hotkeys", "normal"]
 ```
 
-自带 Screen Selector 的 `preserve = true` 会在切屏时保留 Grid/Recursive Grid 的选择路径；设为 `false` 则从目标显示器重新开始。
+自带 Screen Selector 的 `preserve = true` 会在切屏时保留 `Grid`/`Recursive Grid` 的选择路径；设为 `false` 则从目标显示器重新开始。
 
 ## 运行时修改与调试
 
@@ -305,7 +312,7 @@ inherits = ["hotkeys", "normal"]
 "primary+2" = "set_config theme.dark.accent \"#FF8800FF\""
 ```
 
-无效修改不会替换当前有效配置。状态栏的 Reload Configuration 会重新加载配置，并通知所有 Mode 刷新缓存。
+无效修改不会替换当前有效配置。状态栏的 Reload Configuration 会重新加载配置。
 
 ```toml
 [debug]

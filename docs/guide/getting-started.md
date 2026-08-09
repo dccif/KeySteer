@@ -1,9 +1,15 @@
 # 快速上手
 
+<script setup>
+import KeyLayout from '../.vitepress/components/KeyLayout'
+</script>
+
 KeySteer 启动后默认安静地待在托盘或菜单栏，不会影响正常打字。第一次使用时，**可以先不去记操作 ，也不需要创建配置文件**。
 
-::: tip 先记住这一行
+::: tip 简单的一次启动
 `Primary+E` 开始 → `h j k l` 移动 → `;` 点击 → `Esc` 结束
+
+`Primary` 是跨平台名称：发布默认值在 Windows 上是左 `Alt`，在 macOS 上是 `Command`。尽可能保持手感一致
 :::
 
 ## 第一次使用
@@ -37,7 +43,7 @@ KeySteer 启动后默认安静地待在托盘或菜单栏，不会影响正常�
 flowchart LR
     idle["待机<br/>正常打字"]
     normal["Normal<br/>移动、点击、滚动"]
-    target["快速定位<br/>Grid / Recursive Grid / UI Hint"]
+    target["快速定位<br/>Grid<br/>Recursive Grid<br/>UI Hint"]
 
     idle -->|"Primary+E"| normal
     normal -->|"需要时再进入"| target
@@ -45,7 +51,9 @@ flowchart LR
     normal -->|"Esc / q"| idle
 ```
 
-平时只需在“待机”和 “Normal” 之间切换。三个定位模式是加速工具，不需要一开始全部记住。
+平时只需在“待机”和 “Normal” 之间切换。三种定位模式是可选的，不需要一开始全部记住。
+
+
 
 ## 鼠标移动太远时
 
@@ -58,6 +66,19 @@ flowchart LR
 进入定位模式后按 `Esc` 返回 Normal；再按一次 `Esc` 返回待机。
 
 ## 常用操作
+
+<KeyLayout
+  layout="q w e r t y u i o p/Caps a s d f g h j k l ; '/Shift z x c v b n m , . Slash RShift/Ctrl Primary Alt Space"
+  move="h j k l"
+  click="; ' RShift"
+  speed="Caps Shift v b"
+  scroll="m ,"
+  state="n"
+  navigation="t y u i"
+  mode="e f g q Primary"
+  label="常用键位速记"
+  hint="先认颜色，再按需记住其他键"
+/>
 
 | 按键 | 作用 | 记忆方式 |
 | --- | --- | --- |
@@ -78,15 +99,15 @@ flowchart LR
 | `;` / `'` / `右 Shift` | 左键 / 右键 / 中键点击 |
 | `n` | 切换左键持续按下，用于拖拽 |
 | `t` / `y` / `i` / `u` | 发送 `Home` / `End` / `Page Up` / `Page Down` |
-| `g` / `f` / `Primary+F` | Grid / Recursive Grid / UI Hint |
+| `g` / `f` / `Primary+F` | `Grid` / `Recursive Grid` / `UI Hint` |
 | `Primary+S` | 切换到下一块显示器 |
-| `q` 或 `Esc` | 返回待机 |
+| `q` 或 `Esc` | 返回`Idle`待机 |
 
 </details>
 
 ## 按键不顺手？
 
-打开[配置工作室](/editor/)直接查看键盘、修改绑定和颜色，然后下载自己的 TOML。KeySteer 不依赖配置文件；只有需要自定义时才创建它。
+打开 [配置与模拟器](/editor/) 直接查看键盘、修改绑定和颜色，然后下载自己的 TOML。KeySteer 不依赖配置文件；建议在 [默认文件](/generated/keysteer.default.toml) 的基础之上修改。
 
 `Primary` 是跨平台名称：发布默认值在 Windows 上是左 `Alt`，在 macOS 上是 `Command`。高级用户可以通过 `[key_aliases]` 改成其他实体键。
 
@@ -106,6 +127,6 @@ keysteer --dump-config
 - Windows 便携版的配置和日志通常在程序旁边。
 - macOS `.app` 的配置和日志在 `~/Library/Application Support/KeySteer/`。
 
-完整默认配置可[下载](/generated/keysteer.default.toml)。更多内容见[配置参考](/reference/configuration)和[模式与动作参考](/reference/modes-and-actions)。
+完整默认配置可 [下载](/generated/keysteer.default.toml)。更多内容见 [配置文件](/reference/configuration) 和 [模式与动作](/reference/modes-and-actions)。
 
 </details>

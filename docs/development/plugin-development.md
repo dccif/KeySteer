@@ -1,8 +1,8 @@
 # 插件开发
 
-KeySteer 没有一套"专属插件 API"：**一个插件就是一个 `Mode`，外加一份说明自己的 `Manifest`**。插件与内置模式共享完全相同的词汇——同样的 `Command`（你能让宿主做什么）、同样的 `ModeEvent`（宿主会告诉你什么）、同样的 `HostContext`（只读的运行现场）。
+KeySteer 暂时没有一套"专属插件 API"：**一个插件就是一个 `Mode`，外加一份说明自己的 `Manifest`**。插件与内置模式共享完全相同的词汇——同样的 `Command`（你能让宿主做什么）、同样的 `ModeEvent`（宿主会告诉你什么）、同样的 `HostContext`（只读的运行现场）。
 
-这意味着内置的 Grid 或 UI 标签能做到的任何事——全屏覆盖层、自定义网格、指针移动、按键注入——插件都能做到，不需要宿主开任何后门。
+这意味着内置的 `Grid` 或 `UI Hint` 能做到的任何事——全屏覆盖层、自定义网格、指针移动、按键注入插件都能做到。
 
 ## 核心概念
 
@@ -12,7 +12,7 @@ KeySteer 没有一套"专属插件 API"：**一个插件就是一个 `Mode`，�
 
 ```rust
 pub trait Mode: Send {
-    fn id(&self) -> ModeId;                                   // 稳定标识，用于配置与唤醒
+    fn id(&self) -> ModeId;            // 稳定标识，用于配置与唤醒
     fn display_name(&self) -> String { /* 默认: id 中的下划线替换为空格 */ }
     fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> Vec<Command>;
     fn captures_keyboard(&self) -> bool { true }              // 是否独占键盘
@@ -178,7 +178,7 @@ fn preserve(ctx: &HostContext<'_>) -> bool {
 }
 ```
 
-它用自己的 `OverlayScene` 画出显示器编号、处理按键筛选，并最终发出 `WarpPointer` 与 `RetargetScreen`。默认 `preserve = true` 会让 Grid / Recursive Grid 的当前选择路径在切屏后保留。
+它用自己的 `OverlayScene` 画出显示器编号、处理按键筛选，并最终发出 `WarpPointer` 与 `RetargetScreen`。默认 `preserve = true` 会让 `Grid` / `Recursive Grid` 的当前选择路径在切屏后保留。
 
 ## 规范与建议
 

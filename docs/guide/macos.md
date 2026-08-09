@@ -4,7 +4,7 @@ KeySteer 支持 macOS 14 及以上。将 `KeySteer.app` 移动到程序目录即
 
 ## GitHub Release 手动安装
 
-从[官方 GitHub Releases](https://github.com/dccif/KeySteer/releases/latest)下载对应架构的 ZIP，解压后将 `KeySteer.app` 移入 `/Applications`。如果 Gatekeeper 提示应用无法打开，请先确认下载来源，然后运行：
+从 [官方 GitHub Releases](https://github.com/dccif/KeySteer/releases/latest) 下载对应架构的 ZIP，解压后将 `KeySteer.app` 移入 `/Applications`。如果 Gatekeeper 提示应用无法打开，请先确认下载来源，然后运行：
 
 ```bash
 sudo xattr -cr /Applications/KeySteer.app
@@ -54,4 +54,4 @@ invert_vertical = true
 3. 运行 `keysteer --doctor` 查看键盘是否可用。
 4. 仍有问题时查看数据目录中的 `keysteer.log`。
 
-因为没开发者签名，未来的升级可能都需要**重新授权**。
+因为没开发者签名，未来的升级可能都需要 **重新授权**。

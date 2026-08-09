@@ -38,16 +38,17 @@ const CMD_TOGGLE: i32 = 1;
 const CMD_RELOAD: i32 = 2;
 const CMD_AUTOSTART: i32 = 3;
 const CMD_CHECK_UPDATES: i32 = 4;
-const CMD_QUIT: i32 = 5;
+const CMD_ABOUT: i32 = 5;
+const CMD_QUIT: i32 = 6;
 
 static SENDER: OnceLock<Mutex<Option<EventSender>>> = OnceLock::new();
 static ENABLED: AtomicBool = AtomicBool::new(true);
 static DISPLAY_CHANGED: AtomicBool = AtomicBool::new(false);
 static APPEARANCE_CHANGED: AtomicBool = AtomicBool::new(false);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
-static UPDATE_UI_VISIBLE: AtomicBool = AtomicBool::new(false);
+static NATIVE_DIALOG_VISIBLE: AtomicBool = AtomicBool::new(false);
 static UPDATE_MENU_STATE: OnceLock<Mutex<UpdateMenuState>> = OnceLock::new();
-const UPDATE_UI_THREAD_STACK_BYTES: usize = 256 * 1024;
+const NATIVE_DIALOG_THREAD_STACK_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 enum UpdateMenuState {
@@ -67,20 +68,20 @@ enum UpdateMenuState {
     Failed,
 }
 
-struct UpdateUiGuard;
+struct NativeDialogGuard;
 
-impl UpdateUiGuard {
+impl NativeDialogGuard {
     fn acquire() -> Option<Self> {
-        UPDATE_UI_VISIBLE
+        NATIVE_DIALOG_VISIBLE
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
             .then_some(Self)
     }
 }
 
-impl Drop for UpdateUiGuard {
+impl Drop for NativeDialogGuard {
     fn drop(&mut self) {
-        UPDATE_UI_VISIBLE.store(false, Ordering::Release);
+        NATIVE_DIALOG_VISIBLE.store(false, Ordering::Release);
     }
 }
 
@@ -389,6 +390,7 @@ fn show_menu(hwnd: HWND) {
                     PCWSTR(update_title.as_ptr()),
                 )
             })
+            .and_then(|_| AppendMenuW(menu, MF_STRING, CMD_ABOUT as usize, w!("About KeySteer...")))
             .and_then(|_| AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()))
             .and_then(|_| AppendMenuW(menu, MF_STRING, CMD_QUIT as usize, w!("Quit KeySteer")))
     };
@@ -433,6 +435,7 @@ fn show_menu(hwnd: HWND) {
         CMD_RELOAD => emit(BackendEvent::ReloadConfig),
         CMD_AUTOSTART => emit(BackendEvent::ToggleAutostart),
         CMD_CHECK_UPDATES => emit(BackendEvent::CheckForUpdates),
+        CMD_ABOUT => present_about(),
         CMD_QUIT => emit(BackendEvent::Quit),
         _ => {}
     }
@@ -440,13 +443,13 @@ fn show_menu(hwnd: HWND) {
 
 pub(super) fn present_update_result(result: &UpdateCheckResult) -> Result<(), String> {
     set_update_result(result);
-    let Some(guard) = UpdateUiGuard::acquire() else {
+    let Some(guard) = NativeDialogGuard::acquire() else {
         return Ok(());
     };
     let result = result.clone();
     std::thread::Builder::new()
         .name("keysteer-update-ui".into())
-        .stack_size(UPDATE_UI_THREAD_STACK_BYTES)
+        .stack_size(NATIVE_DIALOG_THREAD_STACK_BYTES)
         .spawn(move || {
             let _guard = guard;
             let presentation = match result {
@@ -455,6 +458,7 @@ pub(super) fn present_update_result(result: &UpdateCheckResult) -> Result<(), St
                     latest,
                     path,
                 } => show_message(
+                        "KeySteer Update",
                         &format!(
                             "KeySteer {latest} was downloaded successfully.\n\nSaved to:\n{}\n\nQuit KeySteer, extract the ZIP, and replace version {current} when ready.\n\nOpen the download folder now?",
                             path.display()
@@ -470,13 +474,15 @@ pub(super) fn present_update_result(result: &UpdateCheckResult) -> Result<(), St
                         }
                     }),
                 UpdateCheckResult::UpToDate { current } => show_message(
-                    &format!("KeySteer {current} is already the latest version."),
-                    false,
-                    false,
-                )
+                        "KeySteer Update",
+                        &format!("KeySteer {current} is already the latest version."),
+                        false,
+                        false,
+                    )
                 .map(|_| ()),
                 UpdateCheckResult::Failed(error) => {
                     show_message(
+                        "KeySteer Update",
                         &format!("Could not check for updates.\n\n{error}"),
                         true,
                         false,
@@ -490,6 +496,32 @@ pub(super) fn present_update_result(result: &UpdateCheckResult) -> Result<(), St
         })
         .map(|_| ())
         .map_err(|error| format!("cannot start Windows update UI: {error}"))
+}
+
+fn present_about() {
+    let Some(guard) = NativeDialogGuard::acquire() else {
+        return;
+    };
+    if let Err(error) = std::thread::Builder::new()
+        .name("keysteer-about-ui".into())
+        .stack_size(NATIVE_DIALOG_THREAD_STACK_BYTES)
+        .spawn(move || {
+            let _guard = guard;
+            if let Err(error) = show_message(
+                "About KeySteer",
+                &crate::app::about::details(),
+                false,
+                false,
+            ) {
+                crate::app::logging::report_error("windows-about", error);
+            }
+        })
+    {
+        crate::app::logging::report_error(
+            "windows-about",
+            format!("cannot start Windows About UI: {error}"),
+        );
+    }
 }
 
 fn update_menu_state() -> &'static Mutex<UpdateMenuState> {
@@ -534,7 +566,12 @@ fn update_menu_entry() -> (String, bool) {
     }
 }
 
-fn show_message(message: &str, is_error: bool, offer_open: bool) -> Result<bool, String> {
+fn show_message(
+    title: &str,
+    message: &str,
+    is_error: bool,
+    offer_open: bool,
+) -> Result<bool, String> {
     // A detached MessageBox without an owner can remain inactive. This hidden
     // same-thread owner gives the dialog a complete native modal lifetime while
     // keeping the engine and tray threads unblocked.
@@ -542,7 +579,7 @@ fn show_message(message: &str, is_error: bool, offer_open: bool) -> Result<bool,
         let owner = CreateWindowExW(
             WS_EX_TOOLWINDOW,
             w!("STATIC"),
-            w!("KeySteer Update"),
+            w!("KeySteer Dialog"),
             WS_POPUP,
             0,
             0,
@@ -553,7 +590,8 @@ fn show_message(message: &str, is_error: bool, offer_open: bool) -> Result<bool,
             None,
             None,
         )
-        .map_err(|error| format!("cannot create Windows update dialog owner: {error}"))?;
+        .map_err(|error| format!("cannot create Windows dialog owner: {error}"))?;
+        let title = wide(title);
         let message = wide(message);
         let flags = (if offer_open { MB_YESNO } else { MB_OK })
             | MB_SETFOREGROUND
@@ -565,7 +603,7 @@ fn show_message(message: &str, is_error: bool, offer_open: bool) -> Result<bool,
         let response = MessageBoxW(
             Some(owner),
             PCWSTR(message.as_ptr()),
-            w!("KeySteer Update"),
+            PCWSTR(title.as_ptr()),
             flags,
         );
         let destroy = DestroyWindow(owner)
@@ -573,7 +611,7 @@ fn show_message(message: &str, is_error: bool, offer_open: bool) -> Result<bool,
         (response, destroy)
     };
     if response.0 == 0 {
-        return Err("MessageBoxW could not present the update result".into());
+        return Err("MessageBoxW could not present the dialog".into());
     }
     destroy?;
     Ok(offer_open && response == IDYES)
@@ -663,12 +701,12 @@ mod tests {
     }
 
     #[test]
-    fn update_ui_is_single_instance_and_releases_its_guard() {
-        let first = UpdateUiGuard::acquire().expect("first dialog should acquire the guard");
-        assert!(UpdateUiGuard::acquire().is_none());
+    fn native_dialog_is_single_instance_and_releases_its_guard() {
+        let first = NativeDialogGuard::acquire().expect("first dialog should acquire the guard");
+        assert!(NativeDialogGuard::acquire().is_none());
 
         drop(first);
-        assert!(UpdateUiGuard::acquire().is_some());
+        assert!(NativeDialogGuard::acquire().is_some());
     }
 
     #[test]

@@ -17,6 +17,70 @@
   filter: drop-shadow(0 22px 36px rgba(30, 45, 105, 0.3));
 }
 
+/* Mermaid measures labels before every platform font has settled. Prevent a
+   second automatic wrap from clipping node and edge text at the SVG bounds. */
+.vp-doc .mermaid { overflow-x: auto; padding-block: 8px; }
+.vp-doc .mermaid svg,
+.vp-doc .mermaid foreignObject { overflow: visible !important; }
+.vp-doc .mermaid .nodeLabel,
+.vp-doc .mermaid .edgeLabel { white-space: nowrap; }
+.vp-doc .mermaid foreignObject p { margin: 0; line-height: inherit; }
+
+.key-layout {
+  width: min(100%, 540px);
+  margin: 20px 0 24px;
+  overflow: hidden;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--vp-c-bg-soft) 88%, var(--vp-c-brand-soft));
+  box-shadow: 0 12px 30px rgba(30, 45, 105, .07);
+}
+.key-layout.wide { width: 100%; }
+.key-layout figcaption { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--vp-c-divider); }
+.key-layout figcaption span { color: var(--vp-c-text-1); font-size: 13px; font-weight: 700; }
+.key-layout figcaption small { color: var(--vp-c-text-3); font-size: 10px; }
+.key-layout-board { padding: 16px 18px 20px; overflow-x: auto; }
+.key-layout-row { display: flex; width: max-content; gap: 7px; margin-top: 7px; margin-left: calc(var(--key-row) * 12px); }
+.key-layout-row:first-child { margin-top: 0; }
+.key-layout-row kbd {
+  display: grid;
+  place-items: center;
+  width: 54px;
+  height: 50px;
+  margin: 0;
+  border: 1px solid var(--key-tone-border, var(--vp-c-divider));
+  border-bottom-width: 3px;
+  border-radius: 10px;
+  background: var(--key-tone-bg, color-mix(in srgb, var(--vp-c-bg-alt) 78%, var(--vp-c-bg)));
+  box-shadow: 0 2px 0 var(--key-tone-shadow, color-mix(in srgb, var(--vp-c-divider) 60%, transparent));
+  color: var(--key-tone-text, var(--vp-c-text-1));
+  font: 700 16px/1 var(--vp-font-family-mono);
+  text-transform: uppercase;
+}
+.key-layout.wide .key-layout-row { gap: 5px; margin-left: calc(var(--key-row) * 9px); }
+.key-layout.wide .key-layout-row kbd { width: 41px; height: 44px; font-size: 12px; }
+.key-layout .tone-move { --key-tone-border: #53a878; --key-tone-bg: #ddf5e7; --key-tone-text: #174d32; --key-tone-shadow: #b8dec8; }
+.key-layout .tone-click { --key-tone-border: #d85c70; --key-tone-bg: #ffe0e4; --key-tone-text: #6f1d2d; --key-tone-shadow: #efb8c0; }
+.key-layout .tone-speed { --key-tone-border: #d79b2e; --key-tone-bg: #fff1c7; --key-tone-text: #684600; --key-tone-shadow: #ead394; }
+.key-layout .tone-scroll { --key-tone-border: #4d9fc3; --key-tone-bg: #ddf2fa; --key-tone-text: #15465b; --key-tone-shadow: #b3dbe9; }
+.key-layout .tone-state { --key-tone-border: #c87935; --key-tone-bg: #fbe7d3; --key-tone-text: #673a12; --key-tone-shadow: #e4c3a3; }
+.key-layout .tone-navigation { --key-tone-border: #7b879f; --key-tone-bg: #e8ecf4; --key-tone-text: #283248; --key-tone-shadow: #c8cfdd; }
+.key-layout .tone-mode { --key-tone-border: #7d6fce; --key-tone-bg: #e7e2ff; --key-tone-text: #352b74; --key-tone-shadow: #c8c0ed; }
+.key-layout .tone-target { --key-tone-border: #7665d8; --key-tone-bg: #ece8ff; --key-tone-text: #342776; --key-tone-shadow: #cbc3f4; }
+.key-layout-legend { display: flex; flex-wrap: wrap; gap: 7px 14px; margin: 0; padding: 10px 16px 12px; border-top: 1px solid var(--vp-c-divider); list-style: none; }
+.key-layout-legend li { display: inline-flex; align-items: center; gap: 5px; margin: 0; color: var(--vp-c-text-2); font-size: 10px; }
+.vp-doc .key-layout-legend li + li { margin-top: 0; }
+.key-layout-legend i { width: 9px; height: 9px; border: 1px solid var(--key-tone-border); border-radius: 3px; background: var(--key-tone-bg); }
+
+@media (max-width: 640px) {
+  .key-layout figcaption { align-items: flex-start; flex-direction: column; gap: 2px; }
+  .key-layout-board { padding-inline: 12px; }
+  .key-layout-row { gap: 5px; margin-left: calc(var(--key-row) * 7px); }
+  .key-layout-row kbd { width: 42px; height: 40px; border-radius: 8px; font-size: 14px; }
+  .key-layout.wide .key-layout-row { margin-left: calc(var(--key-row) * 7px); }
+  .key-layout.wide .key-layout-row kbd { width: 34px; height: 38px; font-size: 10px; }
+}
+
 .ks-studio {
   display: grid;
   grid-template-columns: minmax(0, 1fr);

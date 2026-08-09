@@ -2,6 +2,7 @@
 
 //! Application assembly and runtime orchestration.
 
+pub(crate) mod about;
 mod bootstrap;
 mod cli;
 pub(crate) mod logging;

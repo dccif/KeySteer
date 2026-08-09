@@ -1,6 +1,6 @@
 # 扩展 KeySteer
 
-先判断你要解决的问题，再选择扩展点。大多数需求不需要改 Rust：能用 TOML 配置完成，就不要把配置问题做成代码问题。
+先判断你要解决的问题，再选择扩展点。大多数需求不需要改 Rust，能用 TOML 配置完成，就不要把配置问题做成代码问题。
 
 ## 先选合适的方式
 
@@ -26,7 +26,7 @@ Mode 或插件需求
   └─ api trait → Windows/macOS/unsupported 实现 → 实机测试
 ```
 
-推荐先读[架构](/development/architecture)，再按改动类型阅读[开发流程与测试](/development/workflow)。
+推荐先读 [架构](/development/architecture)，再按改动类型阅读 [开发流程与测试](/development/workflow)。
 
 ## 新增一个 Mode
 
@@ -56,7 +56,7 @@ impl Mode for MyMode {
 
 不要在 Mode 里直接操作鼠标、线程、窗口或平台权限。这样才能复用同一套状态机测试，也不会让 Windows 和 macOS 逻辑互相污染。
 
-## 新增一个内置插件
+## 新增一个插件
 
 当前插件是**编译进程序并在启动时注册的 bundled plugin**，不是从目录动态加载的 DLL、dylib 或脚本。完整接口见[插件开发](/development/plugin-development)。
 
@@ -84,7 +84,7 @@ ModeEvent + HostContext → Plugin 状态机 → Vec<Command>
 1. **解析**：在 `src/api/binding.rs` 添加语法、参数数量和错误信息。
 2. **公共命令**：在 `src/api/command.rs` 添加平台无关的 `Command` 变体。
 3. **执行**：在 `src/app/runtime/mod.rs` 的运行时命令执行路径处理该命令；涉及原生能力时调用 `Backend`。
-4. **验证和文档**：增加单元/集成测试，更新 `keysteer.default.toml`、[模式与动作参考](/reference/modes-and-actions)、模拟器动作列表和 AI 手册。
+4. **验证和文档**：增加单元/集成测试，更新 `keysteer.default.toml`、[模式与动作](/reference/modes-and-actions)、模拟器动作列表和 AI 手册。
 
 绑定解析有意在加载阶段拒绝拼写错误。不要把未知输入静默当成“什么都不做”，否则用户只能在运行时猜原因。
 
@@ -97,8 +97,6 @@ ModeEvent + HostContext → Plugin 状态机 → Vec<Command>
 3. 同步检查 `unsupported` 实现，确保未支持平台仍能编译并返回清晰错误。
 4. 让 Engine 负责调度、超时和失败清理；不要让 Mode 直接持有平台对象。
 5. 在目标系统实测权限、Hook、输入注入、覆盖层和多显示器行为。
-
-耗时的 UIA、AX 或 Vision 扫描应放到 worker，通过 `BackendEvent::UiScanned` 返回。结果必须带 owner、scan id 或 generation，避免旧会话的结果污染新会话。
 
 ## 提交前检查
 
@@ -117,4 +115,4 @@ pnpm docs:check
 pnpm docs:build
 ```
 
-最后检查三件事：配置示例能否复制、默认行为是否与源码一致、失败时是否释放按键/鼠标/覆盖层/timer。
+最后检查三件事：配置示例能否复制、默认行为是否与源码一致、失败时是否释放按键/鼠标/覆盖层/timer/等占用资源。

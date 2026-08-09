@@ -59,6 +59,19 @@ define_class!(
             emit(BackendEvent::CheckForUpdates);
         }
 
+        #[unsafe(method(showAbout:))]
+        fn show_about(&self, _sender: Option<&AnyObject>) {
+            if let Err(error) = show_panel(
+                self.mtm(),
+                self,
+                "About KeySteer",
+                &crate::app::about::details(),
+                None,
+            ) {
+                crate::app::logging::report_error("macos-about", error);
+            }
+        }
+
         #[unsafe(method(dismissUpdateAlert:))]
         fn dismiss_update_alert_action(&self, _sender: Option<&AnyObject>) {
             self.dismiss_update_alert();
@@ -153,6 +166,7 @@ impl StatusItem {
         let reload_item = menu_item(mtm, "Reload Configuration", sel!(reloadConfig:), &target);
         let autostart_item = menu_item(mtm, "Start at Login", sel!(toggleAutostart:), &target);
         let update_item = menu_item(mtm, "Check for Updates...", sel!(checkForUpdates:), &target);
+        let about_item = menu_item(mtm, "About KeySteer...", sel!(showAbout:), &target);
         let autostart_enabled = match super::autostart::MacosAutostart::new().is_enabled() {
             Ok(enabled) => enabled,
             Err(error) => {
@@ -166,6 +180,7 @@ impl StatusItem {
         menu.addItem(&reload_item);
         menu.addItem(&autostart_item);
         menu.addItem(&update_item);
+        menu.addItem(&about_item);
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         menu.addItem(&quit_item);
 
@@ -268,7 +283,7 @@ impl StatusItem {
     }
 
     fn show_alert(
-        &mut self,
+        &self,
         title: &str,
         details: &str,
         downloaded_update: Option<&Path>,
@@ -276,93 +291,101 @@ impl StatusItem {
         let mtm = MainThreadMarker::new().ok_or_else(|| {
             "update result must be presented on the macOS main thread".to_string()
         })?;
-        autoreleasepool(|_| {
-            const WIDTH: f64 = 520.0;
-            const HEIGHT: f64 = 210.0;
-            let content_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WIDTH, HEIGHT));
-            let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
-                NSPanel::alloc(mtm),
-                content_rect,
-                NSWindowStyleMask::Titled,
-                NSBackingStoreType::Buffered,
-                false,
-            );
-            if panel.isReleasedWhenClosed() {
-                return Err(
-                    "macOS update panel unexpectedly releases itself when closed; refusing ambiguous ownership"
-                        .into(),
-                );
-            }
-
-            panel.setTitle(&NSString::from_str("KeySteer"));
-            panel.setFloatingPanel(true);
-            panel.setHidesOnDeactivate(false);
-            panel.setBecomesKeyOnlyIfNeeded(false);
-
-            let content = NSView::initWithFrame(NSView::alloc(mtm), content_rect);
-            if let Some(icon) = status_icon(64.0) {
-                let image_view = NSImageView::imageViewWithImage(&icon, mtm);
-                image_view.setFrame(NSRect::new(
-                    NSPoint::new(28.0, 118.0),
-                    NSSize::new(64.0, 64.0),
-                ));
-                content.addSubview(&image_view);
-            }
-
-            let title_label = NSTextField::labelWithString(&NSString::from_str(title), mtm);
-            title_label.setFont(Some(&NSFont::boldSystemFontOfSize(17.0)));
-            title_label.setFrame(NSRect::new(
-                NSPoint::new(112.0, 158.0),
-                NSSize::new(380.0, 24.0),
-            ));
-            content.addSubview(&title_label);
-
-            let details_label =
-                NSTextField::wrappingLabelWithString(&NSString::from_str(details), mtm);
-            details_label.setFrame(NSRect::new(
-                NSPoint::new(112.0, 58.0),
-                NSSize::new(380.0, 88.0),
-            ));
-            content.addSubview(&details_label);
-
-            let (button, reveal_button) = unsafe {
-                let button = NSButton::buttonWithTitle_target_action(
-                    &NSString::from_str("OK"),
-                    Some(&self._target),
-                    Some(sel!(dismissUpdateAlert:)),
-                    mtm,
-                );
-                let reveal_button = downloaded_update.is_some().then(|| {
-                    NSButton::buttonWithTitle_target_action(
-                        &NSString::from_str("Show in Finder"),
-                        Some(&self._target),
-                        Some(sel!(showDownloadedUpdate:)),
-                        mtm,
-                    )
-                });
-                (button, reveal_button)
-            };
-            button.setFrame(NSRect::new(
-                NSPoint::new(412.0, 16.0),
-                NSSize::new(80.0, 32.0),
-            ));
-            button.setKeyEquivalent(&NSString::from_str("\r"));
-            content.addSubview(&button);
-
-            if let Some(reveal_button) = reveal_button {
-                reveal_button.setFrame(NSRect::new(
-                    NSPoint::new(276.0, 16.0),
-                    NSSize::new(124.0, 32.0),
-                ));
-                content.addSubview(&reveal_button);
-            }
-
-            panel.setContentView(Some(&content));
-            self._target
-                .show_update_alert(panel, downloaded_update.map(Path::to_path_buf));
-            Ok(())
-        })
+        show_panel(mtm, &self._target, title, details, downloaded_update)
     }
+}
+
+fn show_panel(
+    mtm: MainThreadMarker,
+    target: &StatusTarget,
+    title: &str,
+    details: &str,
+    downloaded_update: Option<&Path>,
+) -> Result<(), String> {
+    autoreleasepool(|_| {
+        const WIDTH: f64 = 520.0;
+        const HEIGHT: f64 = 210.0;
+        let content_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WIDTH, HEIGHT));
+        let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
+            NSPanel::alloc(mtm),
+            content_rect,
+            NSWindowStyleMask::Titled,
+            NSBackingStoreType::Buffered,
+            false,
+        );
+        if panel.isReleasedWhenClosed() {
+            return Err(
+                "macOS panel unexpectedly releases itself when closed; refusing ambiguous ownership"
+                    .into(),
+            );
+        }
+
+        panel.setTitle(&NSString::from_str("KeySteer"));
+        panel.setFloatingPanel(true);
+        panel.setHidesOnDeactivate(false);
+        panel.setBecomesKeyOnlyIfNeeded(false);
+
+        let content = NSView::initWithFrame(NSView::alloc(mtm), content_rect);
+        if let Some(icon) = status_icon(64.0) {
+            let image_view = NSImageView::imageViewWithImage(&icon, mtm);
+            image_view.setFrame(NSRect::new(
+                NSPoint::new(28.0, 118.0),
+                NSSize::new(64.0, 64.0),
+            ));
+            content.addSubview(&image_view);
+        }
+
+        let title_label = NSTextField::labelWithString(&NSString::from_str(title), mtm);
+        title_label.setFont(Some(&NSFont::boldSystemFontOfSize(17.0)));
+        title_label.setFrame(NSRect::new(
+            NSPoint::new(112.0, 158.0),
+            NSSize::new(380.0, 24.0),
+        ));
+        content.addSubview(&title_label);
+
+        let details_label = NSTextField::wrappingLabelWithString(&NSString::from_str(details), mtm);
+        details_label.setFrame(NSRect::new(
+            NSPoint::new(112.0, 58.0),
+            NSSize::new(380.0, 88.0),
+        ));
+        content.addSubview(&details_label);
+
+        let (button, reveal_button) = unsafe {
+            let button = NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("OK"),
+                Some(target),
+                Some(sel!(dismissUpdateAlert:)),
+                mtm,
+            );
+            let reveal_button = downloaded_update.is_some().then(|| {
+                NSButton::buttonWithTitle_target_action(
+                    &NSString::from_str("Show in Finder"),
+                    Some(target),
+                    Some(sel!(showDownloadedUpdate:)),
+                    mtm,
+                )
+            });
+            (button, reveal_button)
+        };
+        button.setFrame(NSRect::new(
+            NSPoint::new(412.0, 16.0),
+            NSSize::new(80.0, 32.0),
+        ));
+        button.setKeyEquivalent(&NSString::from_str("\r"));
+        content.addSubview(&button);
+
+        if let Some(reveal_button) = reveal_button {
+            reveal_button.setFrame(NSRect::new(
+                NSPoint::new(276.0, 16.0),
+                NSSize::new(124.0, 32.0),
+            ));
+            content.addSubview(&reveal_button);
+        }
+
+        panel.setContentView(Some(&content));
+        target.show_update_alert(panel, downloaded_update.map(Path::to_path_buf));
+        Ok(())
+    })
 }
 
 fn status_icon(size: f64) -> Option<Retained<NSImage>> {

@@ -179,4 +179,4 @@ x = "exec cmd /C start notepad"
 5. `+` 组合键或已知裸键，作为发送给当前应用的按键。
 6. 内置模式名或命名空间插件模式名。
 
-完整默认示例见[默认配置文件](/generated/keysteer.default.toml)。
+完整默认示例见 [默认配置文件](/generated/keysteer.default.toml)。

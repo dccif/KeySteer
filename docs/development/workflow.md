@@ -58,7 +58,7 @@ pnpm docs:build
 - `docs:check`：运行 Vue/TypeScript 类型检查。
 - `docs:build`：生成静态文档站。
 
-配置模拟器只负责浏览器端预览、编辑和轻量继承模拟，不是 Rust 校验器。最终合法性仍以程序的 `--check` 和 Rust 测试为准。
+配置模拟器只负责浏览器端预览、编辑和轻量继承模拟，最终合法性仍以程序的 `--check` 和 Rust 测试为准。
 
 ## 先判断改哪里
 
@@ -71,7 +71,7 @@ pnpm docs:build
 | 调用操作系统能力 | `api::Backend` 与平台实现 |
 | 新增配置动作语法 | `Binding`、`Command`、执行器、测试和文档一起改 |
 
-详细步骤见[扩展 KeySteer](/development/extension-guide)。
+详细步骤见 [扩展指南](/development/extension-guide)。
 
 ## 改动建议
 
@@ -79,7 +79,7 @@ pnpm docs:build
 
 1. 在 `src/api/binding.rs` 修改解析、规范化和序列化。
 2. 为合法输入、错误输入和数组顺序增加测试。
-3. 更新 `keysteer.default.toml`、[模式与动作参考](/reference/modes-and-actions)和配置模拟器需要展示的动作分类。
+3. 更新 `keysteer.default.toml`、[模式与动作](/reference/modes-and-actions) 和配置模拟器需要展示的动作分类。
 4. 检查 `src/app/runtime/mod.rs` 中的命令执行分支、配置校验和集成测试。
 
 ### 改 Mode
@@ -115,7 +115,5 @@ pnpm docs:build
 
 ## 文档维护规则
 
-- 默认行为以 `Config::default()`、配置校验和 `keysteer.default.toml` 的一致性测试为准；默认 TOML 是人可读的发行副本，不是运行所必需的文件。
-- 新模块更新[项目地图](/ai/01-project-map)和[架构](/development/architecture)。
+- 默认行为以 `Config::default()`、配置校验和 `keysteer.default.toml` 的一致性测试为准。
 - 改变运行时数据流更新架构文档；改变配置语法同时更新用户参考和 AI 手册。
-- 面向用户的页面先给结论和可复制示例，再补充原理；不要让用户必须阅读源码才能完成常见操作。

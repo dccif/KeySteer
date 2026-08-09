@@ -67,13 +67,13 @@ after_finish = "normal"
 after_click = "finish"
 ```
 
-after_finish 可配置
+after_finish `完成态` 可配置
 - `keep`：保留状态。
 - `restart`：重新开始。
-- `Mode` 名：切换到指定 Mode。
+- `Mode名`：切换到指定 Mode。(如 `Idle`, `Normal`)
 - `任意内置verb`： 比如`left_click`：实现完成后直接进行点击，不需要确认。
 
-`完成态` 指的是 定位完成后再无便签或字母可选的状态，一般在 `Grid` 或 `UI Hint` 中常见。
+`完成态` 指的是 再无便签或字母可选的状态，一般在 `Grid` 或 `UI Hint` 中常见。
 
 `点击态` 指的是 进入状态后鼠标任意点击后进入的状态，一般在 `Recursive Grid` 中常见。
 
@@ -81,12 +81,14 @@ after_finish 可配置
 
 `UI Hint`，`Grid` 完成或点击后回 `Normal`
 
-`Recursive Grid` 完成或点击后保留会话。
+`Recursive Grid` 完成或点击后保留状态。
 
-## 多显示器和恢复
+## 多显示器
 
-`Grid` 与 `Recursive Grid` 默认定位鼠标所在的显示器。Screen Selector 可以切换到其他显示器，并可选择保留当前定位路径。
+`Grid` 与 `Recursive Grid` 默认定位鼠标所在的显示器。
+
+内置插件 Screen Selector 默认按键 `Primary+S` 可以切换到其他显示器，并可选择是否保留`Grid`，`Recursive Grid` 当前定位。
 
 ## 特别注意
 
-如果 Windows 高权限窗口拒绝合成输入，比如**任务管理器**，KeySteer 会清理输入，退回到 Idle，避免留下无法继续的状态。
+如果 Windows 高权限窗口拒绝合成输入，比如**任务管理器**，KeySteer 会清理输入，退回到 `Idle`，避免留下无法继续的状态。
