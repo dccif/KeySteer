@@ -1,6 +1,6 @@
 import { computed, defineComponent, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { withBase } from 'vitepress'
-import { parse, stringify } from 'smol-toml'
+import { stringify } from 'smol-toml'
 import {
   MOVEMENT_ACTIONS,
   applyModeAction,
@@ -9,11 +9,18 @@ import {
   toggleButton,
 } from '../simulator/state'
 import { effectiveBindings, resolveBinding } from '../simulator/bindings'
+import CommonConfigControls from '../config-studio/CommonConfigControls'
 import ModeStyleControls from '../config-studio/ModeStyleControls'
+import {
+  cloneConfigDocument,
+  parseConfigDocument,
+  resolveConfigDocument,
+  type ConfigDocument,
+} from '../config-studio/document'
 
-type ConfigDocument = Record<string, any>
 type EditorMode = 'hotkeys' | 'normal' | 'grid' | 'recursive_grid' | 'ui_hint'
 type Modifier = 'primary' | 'shift' | 'alt'
+type Appearance = 'dark' | 'light'
 
 interface KeySpec {
   key: string
@@ -140,8 +147,12 @@ export default defineComponent({
   name: 'ConfigStudio',
   setup() {
     const document = ref<ConfigDocument | null>(null)
+    const defaultDocument = ref<ConfigDocument | null>(null)
     const defaultSource = ref('')
+    const sourceName = ref('generated/keysteer.default.toml')
+    const sourceStats = ref({ bytes: 0, sections: 0, values: 0 })
     const activeMode = ref<EditorMode>('normal')
+    const appearance = ref<Appearance>('light')
     const modifiers = reactive<Record<Modifier, boolean>>({ primary: false, shift: false, alt: false })
     const selectedChord = ref('')
     const customAction = ref('')
@@ -157,6 +168,11 @@ export default defineComponent({
     let animationFrame = 0
     let previousFrame = 0
 
+    const effectiveDocument = computed<ConfigDocument | null>(() => {
+      if (!document.value || !defaultDocument.value) return document.value
+      return resolveConfigDocument(defaultDocument.value, document.value)
+    })
+
     const tomlPreview = computed(() => {
       if (!document.value) return ''
       try {
@@ -167,21 +183,25 @@ export default defineComponent({
     })
 
     const selectedAction = computed(() => {
-      if (!document.value || !selectedChord.value) return ''
-      const value = resolveBinding(document.value, activeMode.value, selectedChord.value)?.value
+      if (!effectiveDocument.value || !selectedChord.value) return ''
+      const value = resolveBinding(effectiveDocument.value, activeMode.value, selectedChord.value)?.value
       return Array.isArray(value) ? value.join(' → ') : String(value ?? '')
     })
 
-    const targetingVisual = computed(() => targetingAppearance(document.value, simulator.mode))
-    const targetingSettings = computed(() => document.value?.[simulator.mode] ?? {})
-    const editorVisual = computed(() => editorAppearance(document.value))
+    const targetingVisual = computed(() => targetingAppearance(effectiveDocument.value, simulator.mode, appearance.value))
+    const targetingSettings = computed(() => effectiveDocument.value?.[simulator.mode] ?? {})
+    const editorVisual = computed(() => editorAppearance(effectiveDocument.value, appearance.value))
 
     async function loadDefault(): Promise<void> {
       try {
         const response = await fetch(withBase('/generated/keysteer.default.toml'))
         if (!response.ok) throw new Error(`HTTP ${response.status}`)
         defaultSource.value = await response.text()
-        document.value = parse(defaultSource.value) as ConfigDocument
+        const parsed = parseConfigDocument(defaultSource.value)
+        defaultDocument.value = parsed.document
+        document.value = cloneConfigDocument(parsed.document)
+        sourceName.value = 'generated/keysteer.default.toml'
+        sourceStats.value = { bytes: parsed.bytes, sections: parsed.sections, values: parsed.values }
         message.value = '已载入默认配置'
       } catch (error) {
         message.value = `无法载入默认配置：${formatError(error)}`
@@ -197,8 +217,8 @@ export default defineComponent({
     }
 
     function setAction(action: string): void {
-      if (!document.value || !selectedChord.value) return
-      const table = bindingTable(document.value, activeMode.value)
+      if (!document.value || !effectiveDocument.value || !selectedChord.value) return
+      const table = bindingTable(document.value, activeMode.value, true, effectiveDocument.value)
       expandConfiguredBinding(table, selectedChord.value)
       table[selectedChord.value] = action
       document.value = { ...document.value }
@@ -207,8 +227,8 @@ export default defineComponent({
     }
 
     function removeBinding(): void {
-      if (!document.value || !selectedChord.value) return
-      const table = bindingTable(document.value, activeMode.value)
+      if (!document.value || !effectiveDocument.value || !selectedChord.value) return
+      const table = bindingTable(document.value, activeMode.value, true, effectiveDocument.value)
       expandConfiguredBinding(table, selectedChord.value)
       delete table[selectedChord.value]
       document.value = { ...document.value }
@@ -217,8 +237,8 @@ export default defineComponent({
     }
 
     function keyBindingInfo(spec: KeySpec): KeyBindingInfo | undefined {
-      if (!document.value || !spec.key) return undefined
-      const entries = [...effectiveBindings(document.value, activeMode.value)]
+      if (!effectiveDocument.value || !spec.key) return undefined
+      const entries = [...effectiveBindings(effectiveDocument.value, activeMode.value)]
         .filter(([chord]) => chord === spec.key || chord.split('+').at(-1) === spec.key)
       if (entries.length === 0) return undefined
       const [chord, binding] = entries[0]
@@ -234,8 +254,11 @@ export default defineComponent({
       if (!file) return
       file.text().then((source) => {
         try {
-          document.value = parse(source) as ConfigDocument
-          message.value = `已导入 ${file.name}`
+          const parsed = parseConfigDocument(source)
+          document.value = parsed.document
+          sourceName.value = file.name
+          sourceStats.value = { bytes: parsed.bytes, sections: parsed.sections, values: parsed.values }
+          message.value = `已导入 ${file.name}；配置值已解析，原注释不会写入生成文件`
         } catch (error) {
           message.value = `TOML 解析失败：${formatError(error)}`
         } finally {
@@ -259,9 +282,9 @@ export default defineComponent({
     }
 
     function resolveAction(chord: string): string[] {
-      if (!document.value) return []
+      if (!effectiveDocument.value) return []
       const lookupMode = simulator.mode === 'idle' ? 'hotkeys' : simulator.mode
-      const binding = resolveBinding(document.value, lookupMode, chord)?.value
+      const binding = resolveBinding(effectiveDocument.value, lookupMode, chord)?.value
       if (Array.isArray(binding)) return binding.map(String)
       return typeof binding === 'string' ? [binding] : []
     }
@@ -335,7 +358,7 @@ export default defineComponent({
 
     function handleTargetingKey(keyName: string): boolean {
       if (simulator.mode !== 'grid' && simulator.mode !== 'recursive_grid') return false
-      const settings = document.value?.[simulator.mode]
+      const settings = effectiveDocument.value?.[simulator.mode]
       if (!settings) return false
       const path = simulator.mode === 'grid'
         ? simulator.targeting.grid.path
@@ -387,12 +410,6 @@ export default defineComponent({
             <div>
               <h2>键位编辑器</h2>
               <p>{message.value}</p>
-            </div>
-            <div class="ks-toolbar-actions">
-              <button class="ks-button" onClick={() => importInput.value?.click()}>导入 TOML</button>
-              <button class="ks-button" onClick={downloadDefault}>默认配置</button>
-              <button class="ks-button ks-button-primary" onClick={downloadConfig}>下载配置</button>
-              <input ref={importInput} class="ks-file-input" type="file" accept=".toml,text/plain" onChange={onImport} />
             </div>
           </div>
           <div class="ks-keyboard-tools">
@@ -483,8 +500,15 @@ export default defineComponent({
                 {scrollPulse.value && <div class="ks-scroll-pulse">{scrollPulse.value}</div>}
                 <div class="ks-event-log">{simulator.lastEvent}</div>
               </div>
-              {document.value && (simulator.mode === 'grid' || simulator.mode === 'recursive_grid' || simulator.mode === 'ui_hint') && (
-                <ModeStyleControls document={document.value} mode={simulator.mode} onChange={(next) => { document.value = next }} />
+              {document.value && effectiveDocument.value && (simulator.mode === 'grid' || simulator.mode === 'recursive_grid' || simulator.mode === 'ui_hint') && (
+                <ModeStyleControls
+                  document={document.value}
+                  effectiveDocument={effectiveDocument.value}
+                  mode={simulator.mode}
+                  appearance={appearance.value}
+                  onChange={(next) => { document.value = next }}
+                  onAppearanceChange={(next) => { appearance.value = next }}
+                />
               )}
               {(simulator.mode === 'normal' || simulator.mode === 'idle') && <p class="ks-normal-note">Normal 没有网格覆盖层，请选择 Grid、Recursive Grid 或 UI Hint 调整样式。</p>}
             </section>
@@ -492,12 +516,42 @@ export default defineComponent({
 
           <section class="ks-card ks-preview-card">
             <div class="ks-toolbar ks-compact-toolbar ks-preview-toolbar">
-              <div><h2>TOML</h2><p>随键位和样式实时生成</p></div>
-              <button class="ks-button" onClick={copyToml}>复制</button>
+              <div class="ks-toml-source">
+                <span class="ks-source-kicker">配置源</span>
+                <h2>{sourceName.value}</h2>
+                <p>{message.value}</p>
+                <div class="ks-source-metrics">
+                  <span>{sourceStats.value.sections} 个顶层配置段</span>
+                  <span>{sourceStats.value.values} 个值</span>
+                  <span>{formatBytes(sourceStats.value.bytes)}</span>
+                </div>
+              </div>
+              <div class="ks-source-actions">
+                <button class="ks-button" onClick={() => importInput.value?.click()}>导入 TOML</button>
+                <button class="ks-button" onClick={downloadDefault}>默认配置</button>
+                <button class="ks-button ks-button-primary" onClick={downloadConfig}>下载用户配置</button>
+                <button class="ks-button" onClick={copyToml}>复制</button>
+                <input ref={importInput} class="ks-file-input" type="file" accept=".toml,text/plain" onChange={onImport} />
+              </div>
             </div>
-            <pre class="ks-toml"><code innerHTML={highlightToml(tomlPreview.value)} /></pre>
+            <div class="ks-toml-sync-note">
+              <strong>与程序默认配置同步</strong>
+              <p>页面构建前会从仓库根目录复制 <code>keysteer.default.toml</code>。导入局部配置时，预览按 Rust 缺省规则补全，下载仍保持局部文件。</p>
+              <small>浏览器会验证 TOML 结构，但不会替代 <code>keysteer --check</code>；解析后注释不会保留。</small>
+            </div>
+            <details class="ks-toml-details">
+              <summary>查看并检查生成的 TOML</summary>
+              <pre class="ks-toml"><code innerHTML={highlightToml(tomlPreview.value)} /></pre>
+            </details>
           </section>
         </div>
+        {document.value && effectiveDocument.value && (
+          <CommonConfigControls
+            document={document.value}
+            effectiveDocument={effectiveDocument.value}
+            onChange={(next) => { document.value = next }}
+          />
+        )}
       </div>
     )
   },
@@ -738,13 +792,20 @@ function hintLabel(characters: string, index: number): string {
   return `${keys[Math.floor(offset / keys.length) % keys.length]}${keys[offset % keys.length]}`
 }
 
-function bindingTable(document: ConfigDocument, mode: EditorMode, create = true): Record<string, any> {
+function bindingTable(
+  document: ConfigDocument,
+  mode: EditorMode,
+  create = true,
+  effectiveDocument?: ConfigDocument,
+): Record<string, any> {
   if (mode === 'hotkeys') {
-    if (create && !document.hotkeys) document.hotkeys = {}
+    if (create && !document.hotkeys) document.hotkeys = structuredClone(effectiveDocument?.hotkeys ?? {})
     return document.hotkeys ?? {}
   }
   if (create && !document[mode]) document[mode] = {}
-  if (create && !document[mode].bindings) document[mode].bindings = {}
+  if (create && !document[mode].bindings) {
+    document[mode].bindings = structuredClone(effectiveDocument?.[mode]?.bindings ?? {})
+  }
   return document[mode]?.bindings ?? {}
 }
 
@@ -782,42 +843,43 @@ function browserKeyName(value: string, code: string): string {
   return value.length === 1 ? value.toLowerCase() : value.toLowerCase()
 }
 
-function editorAppearance(document: ConfigDocument | null): Record<string, string> {
-  const theme = document?.theme?.dark ?? {}
+function editorAppearance(document: ConfigDocument | null, appearance: Appearance): Record<string, string> {
+  const theme = document?.theme?.[appearance] ?? {}
   return {
-    '--ks-config-accent': colorSetting(theme.accent, '#6E82D6FF'),
-    '--ks-config-accent-alt': colorSetting(theme.accent_alt, '#8FA2F0FF'),
-    '--ks-config-surface': colorSetting(theme.surface, '#0A1338FF'),
-    '--ks-config-text': colorSetting(theme.text, '#E8EEFFFF'),
+    '--ks-config-accent': colorSetting(theme.accent, appearance === 'dark' ? '#6E82D6FF' : '#465FBCFF'),
+    '--ks-config-accent-alt': colorSetting(theme.accent_alt, appearance === 'dark' ? '#8FA2F0FF' : '#6477D4FF'),
+    '--ks-config-surface': colorSetting(theme.surface, appearance === 'dark' ? '#0A1338FF' : '#EEF2FFFF'),
+    '--ks-config-text': colorSetting(theme.text, appearance === 'dark' ? '#E8EEFFFF' : '#10172DFF'),
   }
 }
 
-function targetingAppearance(document: ConfigDocument | null, mode: string): Record<string, string> {
-  const theme = document?.theme?.dark ?? {}
+function targetingAppearance(document: ConfigDocument | null, mode: string, appearance: Appearance): Record<string, string> {
+  const theme = document?.theme?.[appearance] ?? {}
   const settings = document?.[mode] ?? {}
   const ui = settings.ui ?? {}
   const boundaries = settings.boundary_highlight ?? {}
-  const surface = colorSetting(theme.surface, '#0A1338FF')
-  const accent = colorSetting(theme.accent, '#6E82D6FF')
-  const accentAlt = colorSetting(theme.accent_alt, '#8FA2F0FF')
-  const text = colorSetting(theme.text, '#E8EEFFFF')
-  const configuredBackground = colorSetting(ui.background_color, surface)
+  const themedColor = (value: unknown, fallback: string) => colorSetting(value, fallback, appearance)
+  const surface = themedColor(theme.surface, appearance === 'dark' ? '#0A1338FF' : '#EEF2FFFF')
+  const accent = themedColor(theme.accent, appearance === 'dark' ? '#6E82D6FF' : '#465FBCFF')
+  const accentAlt = themedColor(theme.accent_alt, appearance === 'dark' ? '#8FA2F0FF' : '#6477D4FF')
+  const text = themedColor(theme.text, appearance === 'dark' ? '#E8EEFFFF' : '#10172DFF')
+  const configuredBackground = themedColor(ui.background_color, surface)
   const labelBackground = mode === 'ui_hint'
-    ? colorSetting(ui.background_color, translucent(surface, 95))
+    ? themedColor(ui.background_color, translucent(surface, 95))
     : configuredBackground
   const borderOverride = ui.line_color ?? ui.border_color ?? ui.matched_border_color
-  const configuredBorder = colorSetting(borderOverride, accent)
+  const configuredBorder = themedColor(borderOverride, accent)
   const border = borderOverride ? configuredBorder : translucent(accent, 60)
   return {
     '--ks-target-accent': border,
     '--ks-target-preview-border': translucent(configuredBorder, 35),
-    '--ks-target-highlight': colorSetting(ui.highlight_color ?? ui.matched_background_color, accentAlt),
+    '--ks-target-highlight': themedColor(ui.highlight_color ?? ui.matched_background_color, accentAlt),
     '--ks-target-surface': labelBackground,
     '--ks-target-grid-fill': translucent(configuredBackground, 55),
-    '--ks-target-text': colorSetting(ui.text_color, text),
-    '--ks-target-matched-text': colorSetting(ui.matched_text_color, accentAlt),
-    '--ks-target-boundary': colorSetting(boundaries.border_color, translucent(accent, 60)),
-    '--ks-target-boundary-fill': colorSetting(boundaries.background_color, 'transparent'),
+    '--ks-target-text': themedColor(ui.text_color, text),
+    '--ks-target-matched-text': themedColor(ui.matched_text_color, accentAlt),
+    '--ks-target-boundary': themedColor(boundaries.border_color, translucent(accent, 60)),
+    '--ks-target-boundary-fill': themedColor(boundaries.background_color, 'transparent'),
     '--ks-target-line-width': `${numberSetting(ui.line_width ?? ui.border_width, 1)}px`,
     '--ks-target-boundary-width': `${numberSetting(boundaries.border_width, 1)}px`,
     '--ks-target-boundary-radius': `${autoSetting(boundaries.border_radius, 2)}px`,
@@ -828,8 +890,8 @@ function targetingAppearance(document: ConfigDocument | null, mode: string): Rec
     '--ks-target-padding-y': `${autoSetting(ui.padding_y, numberSetting(ui.font_size, 12) * 0.34)}px`,
     '--ks-target-offset-x': `${finiteSetting(settings.label_x_offset, 0)}px`,
     '--ks-target-offset-y': `${finiteSetting(settings.label_y_offset, 0)}px`,
-    '--ks-target-label-background': colorSetting(ui.label_background_color, colorSetting(theme.surface, '#0A1338F2')),
-    '--ks-target-sub-key': colorSetting(ui.sub_key_preview_text_color, colorSetting(theme.accent_alt, '#8FA2F0FF')),
+    '--ks-target-label-background': themedColor(ui.label_background_color, themedColor(theme.surface, surface)),
+    '--ks-target-sub-key': themedColor(ui.sub_key_preview_text_color, themedColor(theme.accent_alt, accentAlt)),
     '--ks-target-sub-key-size': `${numberSetting(ui.sub_key_preview_font_size, 8)}px`,
   }
 }
@@ -838,10 +900,11 @@ function translucent(color: string, opacity: number): string {
   return `color-mix(in srgb, ${color} ${opacity}%, transparent)`
 }
 
-function colorSetting(value: unknown, fallback: string): string {
+function colorSetting(value: unknown, fallback: string, appearance: Appearance = 'light'): string {
   if (typeof value === 'string' && value) return value
   if (value && typeof value === 'object') {
     const variants = value as Record<string, unknown>
+    if (typeof variants[appearance] === 'string') return variants[appearance] as string
     if (typeof variants.dark === 'string') return variants.dark
     if (typeof variants.light === 'string') return variants.light
   }
@@ -932,4 +995,9 @@ function downloadText(source: string, fileName: string): void {
 
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  return `${(bytes / 1024).toFixed(1)} KiB`
 }

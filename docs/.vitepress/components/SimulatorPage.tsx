@@ -10,9 +10,11 @@ export default defineComponent({
       <main class="ks-standalone">
         <header class="ks-standalone-header">
           <a href={withBase('/')}>← 返回文档</a>
-          <span>KeySteer 配置与模拟器(Beta)</span>
+          <div>
+            <strong>KeySteer 配置与模拟器（beta）</strong>
+          </div>
           <a href={withBase('/generated/keysteer.default.toml')} download="keysteer.default.toml">
-            默认配置
+            查看默认 TOML
           </a>
         </header>
         <ConfigStudio />

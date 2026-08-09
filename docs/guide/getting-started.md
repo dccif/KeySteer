@@ -1,68 +1,101 @@
 # 快速上手
 
-KeySteer 可以不需要配置文件。启动后它会停留在托盘或菜单栏，并默认处于 `idle`：普通键盘输入不会被拦截。
+KeySteer 启动后默认安静地待在托盘或菜单栏，不会影响正常打字。第一次使用时，**可以先不去记操作 ，也不需要创建配置文件**。
 
-## 第一次操作
+::: tip 先记住这一行
+`Primary+E` 开始 → `h j k l` 移动 → `;` 点击 → `Esc` 结束
+:::
+
+## 第一次使用
 
 1. 启动 KeySteer。
-2. 按 `Primary+E` 进入 Normal。
-3. 用 `h/j/k/l` 移动鼠标，用 `;` 左键点击。
-4. 按 `g` 进入 Grid，按 `f` 进入 Recursive Grid，按 `Primary+F` 进入 UI Hint。
-5. 按 `q` 或 `Esc` 返回 Idle。
+2. 按进入键：
 
-`Primary` 是跨平台写法：macOS 为 `Command`，Windows 为 `Alt`，为保持键盘位置的一致性。
+   | Windows | macOS |
+   | --- | --- |
+   | `左 Alt + E` | `Command + E` |
 
-它可以在 `[key_aliases]` 中改成你习惯的实体按键；如果使用发布的完整 TOML，请留意其中可能包含平台专属别名覆盖。
+3. 按住下面四个键移动鼠标：
 
-## 默认按键
+   ```text
+          K  上
+   H  左  J  下  L  右
+   ```
+
+4. 按 `;` 左键点击。
+5. 按 `Esc` 返回待机，键盘恢复正常输入。
+
+看到鼠标移动并完成一次点击，就已经学会 KeySteer 最常用的操作了。
+
+::: warning macOS 第一次没有反应？
+需要先授予辅助功能权限，参见 [macOS 安装与授权](/guide/macos)。
+:::
+
+## 一张图记住工作方式
+
+```mermaid
+flowchart LR
+    idle["待机<br/>正常打字"]
+    normal["Normal<br/>移动、点击、滚动"]
+    target["快速定位<br/>Grid / Recursive Grid / UI Hint"]
+
+    idle -->|"Primary+E"| normal
+    normal -->|"需要时再进入"| target
+    target -->|"Esc"| normal
+    normal -->|"Esc / q"| idle
+```
+
+平时只需在“待机”和 “Normal” 之间切换。三个定位模式是加速工具，不需要一开始全部记住。
+
+## 鼠标移动太远时
+
+| 你想做什么 | 按键 | 模式 |
+| --- | --- | --- |
+| 快速到达屏幕的大致区域 | `g` | [Grid](/modes/grid) |
+| 精确定位很小的目标 | `f` | [Recursive Grid](/modes/recursive-grid) |
+| 直接选择按钮、链接或输入框 | `Primary+F` | [UI Hint](/modes/ui-hint) |
+
+进入定位模式后按 `Esc` 返回 Normal；再按一次 `Esc` 返回待机。
+
+## 常用操作
+
+| 按键 | 作用 | 记忆方式 |
+| --- | --- | --- |
+| `m` / `,` | 向下 / 向上滚动 | 在主键区直接滚动 |
+| `Caps Lock` / `左 Shift` | 精确 / 慢速移动 | 按住后再按 `h j k l` |
+| `v` 或 `b` | 快速移动 | 按住后再移动 |
+| `'` / `右 Shift` | 右键 / 中键点击 | 与 `;` 左键相邻 |
+
+<details open>
+<summary><strong>查看完整默认键位</strong>（熟悉以后再看）</summary>
 
 | 按键 | 作用 |
 | --- | --- |
-| `h j k l` | (vim风格）左、下、上、右移动 |
-| `Caps Lock` / `Left Shift` | 精确 / 慢速模式，对移动，滚动生效 |
-| `v` 或 `b` | 快速模式，对移动，滚动生效 |
+| `h j k l` | 左、下、上、右移动 |
+| `Caps Lock` / `左 Shift` | 精确 / 慢速模式，对移动和滚动生效 |
+| `v` 或 `b` | 快速模式，对移动和滚动生效 |
 | `m` / `,` | 向下 / 向上滚动 |
-| `;` / `'` / `Right Shift` | 左键 / 右键 / 中键点击 |
-| `n` | 切换左键按住状态，用于拖拽 |
+| `;` / `'` / `右 Shift` | 左键 / 右键 / 中键点击 |
+| `n` | 切换左键持续按下，用于拖拽 |
 | `t` / `y` / `i` / `u` | 发送 `Home` / `End` / `Page Up` / `Page Down` |
 | `g` / `f` / `Primary+F` | Grid / Recursive Grid / UI Hint |
 | `Primary+S` | 切换到下一块显示器 |
-| `q` 或 `Esc` | 返回 Idle |
+| `q` 或 `Esc` | 返回待机 |
 
-按键不顺手时，不必修改源码：直接编辑 TOML，或打开[配置与模拟器](/editor/)可视化修改。
+</details>
 
-## 如何定位？
+## 按键不顺手？
 
-| 目标 | 推荐模式 |
-| --- | --- |
-| 日常移动、滚动、点击、拖拽 | [Normal](/modes/normal) |
-| 快速到达屏幕某个区域 | [Grid](/modes/grid) |
-| 精确定位细小目标 | [Recursive Grid](/modes/recursive-grid) |
-| 找按钮、链接、菜单或输入框 | [UI Hint](/modes/ui-hint) |
+打开[配置工作室](/editor/)直接查看键盘、修改绑定和颜色，然后下载自己的 TOML。KeySteer 不依赖配置文件；只有需要自定义时才创建它。
 
-## 状态栏菜单
+`Primary` 是跨平台名称：发布默认值在 Windows 上是左 `Alt`，在 macOS 上是 `Command`。高级用户可以通过 `[key_aliases]` 改成其他实体键。
 
-右键托盘/菜单栏图标可以：
+<details>
+<summary><strong>状态栏、诊断和配置位置</strong></summary>
 
-- 暂停或恢复 KeySteer。
-- 重载配置。
-- 设置或取消开机启动。
-- 手动检查 GitHub Release 更新；有新版时自动下载当前系统和架构对应的 ZIP，无新版时显示当前已是最新。
-- 退出程序。
+右键托盘或菜单栏图标可以暂停、重载配置、设置开机启动、检查更新或退出。
 
-更新检查仅在点击 **Check for Updates...** 时执行，不会在启动时或后台定期联网。GitHub
-请求超过 3 秒后会通过 jsDelivr CDN 重试版本发现；CDN 仍超时时会明确提示。新版 ZIP
-优先从 GitHub Release 直连下载，连接或响应超时后改用 `gh-proxy.com/<原始链接>` 重试；
-代理仍失败或超时时会明确提示。下载采用固定 32 KiB 缓冲区流式写入，最大接受 10 MiB，
-有 GitHub 资产摘要时还会校验文件大小和 SHA-256。ZIP 保存到系统“下载”文件夹，并替换
-同名的旧下载文件；Windows 和 macOS 都不会在程序运行中直接覆盖已安装版本，避免权限、
-文件占用、签名和损坏现有安装的问题。
-
-支持自动发现配置，运行中把 `keysteer.<名称>.toml` 放入数据目录后点击 Reload 即可
-
-也可以命令行参数，使用 `-c --config` 时只会重载指定文件。
-
-## 配置和诊断
+需要检查配置或诊断环境时运行：
 
 ```bash
 keysteer --check -c keysteer.user.toml
@@ -70,11 +103,9 @@ keysteer --doctor
 keysteer --dump-config
 ```
 
-完整默认配置可 [下载](/generated/keysteer.default.toml)，配置语法见 [配置文件](/reference/configuration)，动作参数见 [模式与动作参考](/reference/modes-and-actions)。
+- Windows 便携版的配置和日志通常在程序旁边。
+- macOS `.app` 的配置和日志在 `~/Library/Application Support/KeySteer/`。
 
-## 安装位置
+完整默认配置可[下载](/generated/keysteer.default.toml)。更多内容见[配置参考](/reference/configuration)和[模式与动作参考](/reference/modes-and-actions)。
 
-- Windows ：只有portable版本，配置和日志通常在程序旁边。
-- macOS ：`.app`：配置和日志在 `~/Library/Application Support/KeySteer/`。
-
-macOS 首次使用还需要授权辅助功能，请阅读 [macOS 指南](/guide/macos)。
+</details>

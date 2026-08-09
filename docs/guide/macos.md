@@ -10,8 +10,6 @@ KeySteer 支持 macOS 14 及以上。将 `KeySteer.app` 移动到程序目录即
 sudo xattr -cr /Applications/KeySteer.app
 ```
 
-该命令会递归清除应用包的扩展属性，只应对从 KeySteer 官方发布页下载的应用使用。运行后重新打开 KeySteer，再完成下面的系统授权。
-
 ## 首次授权（推荐）
 
 1. 打开 `KeySteer.app` 之前。
@@ -19,7 +17,7 @@ sudo xattr -cr /Applications/KeySteer.app
 3. 允许 KeySteer 控制电脑。
 4. 重新启动 KeySteer，并按 `Primary+E` 测试。
 
-UI Hint 的 Vision 检测还需要“屏幕录制”权限。只使用 Grid 或 Recursive Grid 时不依赖屏幕内容识别，但键盘捕获仍需要辅助功能权限。
+`UI Hint` 的 Vision 检测还需要“屏幕录制”权限。只使用 `Grid` 或 `Recursive Grid` 时不依赖屏幕内容识别，但键盘捕获仍需要辅助功能权限。
 
 建议一次性就两个授权都完成，避免后续权限问题。
 
@@ -36,8 +34,6 @@ UI Hint 的 Vision 检测还需要“屏幕录制”权限。只使用 Grid 或 
 - `keysteer.<名称>.toml`：配置文件。
 - `keysteer.log`：运行日志。
 - `keysteer.log.1`、`.2`、`.3`：轮换日志。
-
-裸二进制保持 portable 行为，把配置和日志放在可执行文件旁边。
 
 ## 滚动方向
 
