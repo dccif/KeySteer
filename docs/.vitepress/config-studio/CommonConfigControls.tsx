@@ -25,6 +25,7 @@ const frequentFields: ConfigField[] = [
   { path: 'pointer.max_speed', label: '最高速度', description: '持续移动达到的像素/秒', kind: 'number', min: 0, max: 20000, step: 50 },
   { path: 'pointer.acceleration', label: '加速度', description: '每秒增加的速度；0 表示保持初速', kind: 'number', min: 0, max: 30000, step: 100 },
   { path: 'pointer.smooth_acceleration', label: '平滑加速', description: '开启 smootherstep S 曲线；关闭为线性', kind: 'boolean' },
+  { path: 'normal.passthrough_unbound_keys', label: '未绑定键透传', description: '仅接管完整命中的 KeySteer 绑定；关闭后 Normal 键盘独占', kind: 'boolean' },
   { path: 'normal.long_press_toggle_ms', label: '长按切换', description: '点击键长按多少毫秒后切换持续按下；0 为关闭', kind: 'number', min: 0, max: 5000, step: 50 },
   { path: 'grid.max_depth', label: 'Grid 层数', description: '确认目标前需要输入的网格层数', kind: 'number', min: 1, max: 20, step: 1 },
   { path: 'recursive_grid.max_depth', label: '递归上限', description: 'Recursive Grid 最大递归次数', kind: 'number', min: 1, max: 20, step: 1 },

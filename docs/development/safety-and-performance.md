@@ -4,7 +4,7 @@ KeySteer 的高优先级路径是“原生键盘回调必须立即决定这个�
 
 ## 关键不变量
 
-- 输入 Hook 不做 UI 扫描、配置 I/O、外部进程等待或固定间隔 sleep。它只把输入交给 Engine，并得到 `Consume`、`Defer` 或 `Forward` 的处置结果。
+- 输入 Hook 不做 UI 扫描、配置 I/O、外部进程等待或固定间隔 sleep。它只把输入交给 Engine，并得到 `Consume` 或 `Forward` 的处置结果；`Defer` 只为 API 兼容保留，内置运行时按 `Forward` 处理。
 - 每个物理键的 key-down 与 key-up 必须保持同一归属；Mode 切换后，持续移动、滚动、速度修饰和临时模式键仍由最初 owner 收尾。
 - 鼠标按住、长按点击 Toggle、普通点击指示颜色、定时序列、扫描 owner、覆盖层和帧时钟都有明确的清理点：模式结束/切换、配置重载失败、禁用与进程退出。
 - Mode 和 plugin 不直接调用 Win32、AppKit、UIA 或 AX。它们只产生公共 `Command`，由 Engine 和 Backend 处理平台细节。
@@ -34,6 +34,9 @@ UIA、AX 与 Vision 扫描放在 worker；结果带 scan id 与 owner，Engine �
 - 低刷新率、高刷新率、切屏和短暂掉帧下连续移动没有按帧数计算的距离误差；
 - 配置或输入错误恢复后，不残留覆盖层、普通点击颜色、timer、扫描或帧 worker；
 - Windows 和 macOS 都有对应 Backend 行为，未支持平台返回清晰错误。
+- Windows `SendInput` 失败日志必须保留实际返回数量和即时 `GetLastError`，并只在失败路径
+  查询当前/前台进程的 session、integrity、elevation 与 UIAccess。UIPI 可能不设置错误码，
+  因此日志报告证据而不把所有零返回都断言为权限问题。
 
 发布前运行：
 

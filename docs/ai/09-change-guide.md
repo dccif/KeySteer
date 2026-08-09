@@ -45,6 +45,8 @@
 ### Mode
 
 - Idle 永不捕获普通键盘。
+- Normal 默认只捕获完整命中的绑定；`passthrough_unbound_keys = false` 才捕获未绑定键。
+- Idle 和默认 Normal 的额外物理修饰键必须属于 chord，或已经被 KeySteer 绑定消费。
 - targeting `keep` 不调用 Activated/Restarted，不丢路径。
 - Finish 幂等；`after_click` 禁止 click action 递归。
 - modal plugin Pop 后下层收到 Resumed 并重画原状态。

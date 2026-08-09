@@ -148,6 +148,9 @@ x = ["press shift", "left_click", "release shift"]
 `Normal` 是控制鼠标直接移动、点击、滚动和进入其他 Mode 的平台：
 
 ```toml
+[normal]
+long_press_toggle_ms = 500
+
 [normal.bindings]
 h = "move_left"
 j = "move_down"
@@ -165,6 +168,10 @@ f = "recursive_grid"
 # "primary+k" = "up"
 # "primary+l" = "right"
 ```
+
+`passthrough_unbound_keys = true` 是默认行为：Normal 只吞掉命中完整 KeySteer 绑定的输入，未绑定键及未配置的修饰组合会保持原始 down/up 生命周期并透传。
+
+设为 `false` 时，Normal 恢复键盘独占，并保留旧的宽松组合匹配；`Grid`、`Recursive Grid` 和 `UI Hint` 始终保持独占。`Idle` 始终透传未命中的输入，并同样采用完整修饰组合匹配。
 
 `long_press_toggle_ms` 只作用于绑定为 `鼠标键`。持续按住达到阈值后，将对应鼠标按钮保持按下，松开物理键不会释放。再次长按 `鼠标键` 或使用无参数 `n = toggle` 键可释放。设为 `0` 禁用，允许范围为 `0..=60000` 毫秒。
 

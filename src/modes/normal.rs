@@ -177,6 +177,7 @@ impl Motion {
 pub struct NormalMode {
     profile: Pointer,
     scroll: Scroll,
+    passthrough_unbound_keys: bool,
 
     /// Directions currently held, keyed by the key holding them so releasing
     /// the right key stops the right direction.
@@ -199,6 +200,7 @@ impl NormalMode {
         Self {
             profile: config.pointer.clone(),
             scroll: config.scroll.clone(),
+            passthrough_unbound_keys: config.normal.passthrough_unbound_keys,
             moving: BTreeMap::new(),
             scrolling: BTreeMap::new(),
             speeds: BTreeMap::new(),
@@ -341,9 +343,10 @@ impl Mode for NormalMode {
         "Normal".into()
     }
 
-    /// Normal owns the keyboard: `hjkl` must move rather than type.
+    /// Bound keys are consumed by the engine. This controls only what happens
+    /// to keys that do not match a complete binding.
     fn captures_keyboard(&self) -> bool {
-        true
+        !self.passthrough_unbound_keys
     }
 
     fn indicator_color(&self, palette: &Palette) -> Option<Color> {
@@ -460,8 +463,23 @@ mod tests {
     }
 
     #[test]
-    fn normal_captures_the_keyboard() {
-        assert!(NormalMode::new(&Config::default()).captures_keyboard());
+    fn normal_capture_policy_follows_unbound_passthrough() {
+        let mut config = Config::default();
+        assert!(!NormalMode::new(&config).captures_keyboard());
+        config.normal.passthrough_unbound_keys = false;
+        assert!(NormalMode::new(&config).captures_keyboard());
+    }
+
+    #[test]
+    fn config_reload_updates_normal_capture_policy() {
+        let mut mode = NormalMode::new(&Config::default());
+        let mut config = Config::default();
+        config.normal.passthrough_unbound_keys = false;
+        let env = Env::with(config);
+
+        let _ = mode.handle(&ModeEvent::ConfigReloaded, &env.ctx());
+
+        assert!(mode.captures_keyboard());
     }
 
     #[test]

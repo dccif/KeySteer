@@ -77,9 +77,8 @@ pub enum UpdateCheckResult {
 pub enum KeyDisposition {
     /// Swallow it: the active mode consumed it.
     Consume,
-    /// Temporarily suppress a possible chord modifier. Native backends that
-    /// support replay keep it hidden until the chord either matches or fails;
-    /// other backends must fail open.
+    /// Retained for backend API compatibility. The engine no longer defers or
+    /// replays physical modifiers; built-in backends treat this as `Forward`.
     Defer,
     /// Let it through to the focused application.
     Forward,

@@ -44,16 +44,32 @@ pub fn move_cursor_relative(from: Point, dx: f64, dy: f64) -> Result<(), String>
 
 fn send(inputs: &[INPUT]) -> Result<(), String> {
     // SAFETY: the slice is valid for the call and INPUT's size is passed
-    // explicitly, as SendInput requires.
-    let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
+    // explicitly, as SendInput requires. Last-error is captured in the same
+    // block before any diagnostic API can overwrite it.
+    let (sent, last_error) = unsafe {
+        let sent = SendInput(inputs, std::mem::size_of::<INPUT>() as i32);
+        let last_error = if sent as usize != inputs.len() {
+            windows::Win32::Foundation::GetLastError().0
+        } else {
+            0
+        };
+        (sent, last_error)
+    };
     if sent as usize == inputs.len() {
         Ok(())
     } else {
-        Err(format!(
-            "SendInput sent {sent} of {} events; Windows UIPI may be blocking input to a higher-integrity window",
-            inputs.len()
-        ))
+        Err(send_input_failure(sent as usize, inputs.len(), last_error))
     }
+}
+
+fn send_input_failure(sent: usize, expected: usize, last_error: u32) -> String {
+    let context =
+        super::native::send_input_failure_context(last_error, std::mem::size_of::<INPUT>());
+    format_send_input_failure(sent, expected, &context)
+}
+
+fn format_send_input_failure(sent: usize, expected: usize, context: &str) -> String {
+    format!("SendInput inserted {sent} of {expected} events; {context}")
 }
 
 fn mouse_input(flags: MOUSE_EVENT_FLAGS, mouse_data: i32) -> INPUT {
@@ -172,17 +188,15 @@ pub fn send_key(key: &Key, state: KeyState) -> Result<(), String> {
     send(&[key_input(key, state)?])
 }
 
-/// Replay a short keyboard prefix from the low-level hook without allocating.
-pub(super) fn send_virtual_keys(events: &[(u16, KeyState)]) -> Result<(), String> {
-    if events.len() > 5 {
-        return Err("deferred keyboard replay exceeds its fixed capacity".into());
-    }
-    let inputs: [INPUT; 5] = std::array::from_fn(|index| {
-        events
-            .get(index)
-            .map_or_else(INPUT::default, |(vk, state)| virtual_key_input(*vk, *state))
-    });
-    send(&inputs[..events.len()])
+/// Tell Windows that a forwarded Alt participated in a shortcut whose action
+/// KeySteer consumed. `0xE8` is unassigned, so the tagged pair cannot type or
+/// recursively enter our hook, but it prevents Alt-up from opening a menu.
+pub(super) fn send_menu_mask() -> Result<(), String> {
+    const VK_UNASSIGNED_E8: u16 = 0xE8;
+    send(&[
+        virtual_key_input(VK_UNASSIGNED_E8, KeyState::Down),
+        virtual_key_input(VK_UNASSIGNED_E8, KeyState::Up),
+    ])
 }
 
 /// Submit a complete chord in one native call. If Windows accepts only a
@@ -195,7 +209,17 @@ pub fn send_keys(events: &[(Key, KeyState)]) -> Result<(), String> {
         .iter()
         .map(|(key, state)| key_input(key, *state))
         .collect::<Result<Vec<_>, _>>()?;
-    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) } as usize;
+    // SAFETY: the slice remains live for the call. Last-error is read before
+    // cleanup attempts below can replace the calling thread's error slot.
+    let (sent, last_error) = unsafe {
+        let sent = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) as usize;
+        let last_error = if sent != inputs.len() {
+            windows::Win32::Foundation::GetLastError().0
+        } else {
+            0
+        };
+        (sent, last_error)
+    };
     if sent == inputs.len() {
         return Ok(());
     }
@@ -219,10 +243,7 @@ pub fn send_keys(events: &[(Key, KeyState)]) -> Result<(), String> {
     if !releases.is_empty() {
         let _ = send(&releases);
     }
-    Err(format!(
-        "SendInput sent {sent} of {} keyboard events; Windows UIPI may be blocking input to a higher-integrity window",
-        inputs.len()
-    ))
+    Err(send_input_failure(sent, inputs.len(), last_error))
 }
 
 /// Keys that require `KEYEVENTF_EXTENDEDKEY` to be delivered correctly.
@@ -416,6 +437,15 @@ mod tests {
         assert!(is_extended(0x25), "arrow_left");
         assert!(is_extended(0xA3), "right_ctrl");
         assert!(!is_extended(0x41), "a");
+    }
+
+    #[test]
+    fn send_input_failure_message_reports_evidence_without_guessing_uipi() {
+        let message =
+            format_send_input_failure(0, 2, "last_error=0x00000000, current={integrity=high}");
+        assert!(message.contains("inserted 0 of 2"));
+        assert!(message.contains("last_error=0x00000000"));
+        assert!(!message.contains("may be blocking"));
     }
 
     #[test]

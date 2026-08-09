@@ -324,32 +324,180 @@ pub(crate) fn process_executable_name(process_id: u32) -> Option<String> {
     };
     use windows::core::PWSTR;
 
-    // SAFETY: the requested access is query-only and the numeric process id is
-    // supplied by Windows.
-    let process = OwnedHandle::new(
-        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }.ok()?,
-    );
-    for capacity in [512usize, 32_768] {
-        let mut path = vec![0u16; capacity];
-        let mut length = capacity as u32;
-        // SAFETY: the buffer is writable for `capacity` UTF-16 units and
-        // `length` is a valid in/out parameter.
-        if unsafe {
-            QueryFullProcessImageNameW(
+    // SAFETY: access is query-only. Every UTF-16 buffer is writable for its
+    // advertised length, and OwnedHandle closes the successful process handle.
+    unsafe {
+        let process = OwnedHandle::new(
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id).ok()?,
+        );
+        for capacity in [512usize, 32_768] {
+            let mut path = vec![0u16; capacity];
+            let mut length = capacity as u32;
+            if QueryFullProcessImageNameW(
                 process.raw(),
                 Default::default(),
                 PWSTR(path.as_mut_ptr()),
                 &mut length,
             )
+            .is_ok()
+            {
+                return std::path::Path::new(&String::from_utf16_lossy(&path[..length as usize]))
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned());
+            }
         }
-        .is_ok()
-        {
-            return std::path::Path::new(&String::from_utf16_lossy(&path[..length as usize]))
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned());
-        }
+        None
     }
-    None
+}
+
+fn integrity_name(rid: u32) -> &'static str {
+    match rid {
+        0x0000..=0x0FFF => "untrusted",
+        0x1000..=0x1FFF => "low",
+        0x2000..=0x20FF => "medium",
+        0x2100..=0x2FFF => "medium-plus",
+        0x3000..=0x3FFF => "high",
+        0x4000..=0x4FFF => "system",
+        0x5000.. => "protected",
+    }
+}
+
+/// Expensive context captured only after `SendInput` has already failed.
+/// This deliberately lives in the native boundary so token handles and
+/// read-only process handles cannot leak into the portable input code.
+pub(crate) fn send_input_failure_context(last_error: u32, input_size: usize) -> String {
+    use windows::Win32::Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_MANDATORY_LABEL,
+        TOKEN_QUERY, TokenElevation, TokenIntegrityLevel, TokenUIAccess,
+    };
+    use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows::Win32::System::Threading::{
+        OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let error = if last_error == 0 {
+        "not set (UIPI may leave it unset)".into()
+    } else {
+        format!("{}", std::io::Error::from_raw_os_error(last_error as i32))
+    };
+    let current_pid = current_process_id();
+    let foreground = foreground_window();
+    let mut foreground_pid = 0u32;
+    let foreground_thread = window_thread_process_id(foreground, Some(&mut foreground_pid));
+
+    // SAFETY: every native call below is read-only. Out-parameters point to
+    // correctly sized live storage; query handles are immediately wrapped and
+    // closed once this failure-only diagnostic snapshot is formatted. The SID
+    // pointers originate from a successful TOKEN_MANDATORY_LABEL query and do
+    // not outlive its aligned backing allocation.
+    let (current_session, current_security, foreground_session, foreground_security) = unsafe {
+        let process_session = |process_id: u32| -> Option<u32> {
+            let mut session_id = 0;
+            ProcessIdToSessionId(process_id, &mut session_id)
+                .ok()
+                .map(|()| session_id)
+        };
+        let token_u32 = |token: HANDLE,
+                         class: windows::Win32::Security::TOKEN_INFORMATION_CLASS|
+         -> Option<u32> {
+            let mut value = 0u32;
+            let mut returned = 0u32;
+            GetTokenInformation(
+                token,
+                class,
+                Some((&mut value as *mut u32).cast()),
+                std::mem::size_of::<u32>() as u32,
+                &mut returned,
+            )
+            .ok()
+            .map(|()| value)
+        };
+        let token_integrity = |token: HANDLE| -> Option<u32> {
+            let mut required = 0u32;
+            let _ = GetTokenInformation(token, TokenIntegrityLevel, None, 0, &mut required);
+            if required < std::mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32 {
+                return None;
+            }
+            let words = (required as usize).div_ceil(std::mem::size_of::<usize>());
+            let mut storage = vec![0usize; words];
+            let mut returned = 0u32;
+            GetTokenInformation(
+                token,
+                TokenIntegrityLevel,
+                Some(storage.as_mut_ptr().cast()),
+                required,
+                &mut returned,
+            )
+            .ok()?;
+            if returned < std::mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32 {
+                return None;
+            }
+            let sid = (*(storage.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()))
+                .Label
+                .Sid;
+            if sid.is_invalid() {
+                return None;
+            }
+            let count = GetSidSubAuthorityCount(sid).as_ref().copied()?;
+            if count == 0 {
+                return None;
+            }
+            GetSidSubAuthority(sid, u32::from(count - 1))
+                .as_ref()
+                .copied()
+        };
+        let process_security = |process_id: u32| -> String {
+            let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id)
+            else {
+                return "security=unavailable".into();
+            };
+            let process = OwnedHandle::new(process);
+            let mut token = HANDLE::default();
+            if OpenProcessToken(process.raw(), TOKEN_QUERY, &mut token).is_err() {
+                return "security=unavailable".into();
+            }
+            let token = OwnedHandle::new(token);
+            let integrity = token_integrity(token.raw())
+                .map(|rid| format!("{}(0x{rid:04X})", integrity_name(rid)))
+                .unwrap_or_else(|| "unknown".into());
+            let elevated = token_u32(token.raw(), TokenElevation)
+                .map(|value| value != 0)
+                .map_or_else(|| "unknown".into(), |value| value.to_string());
+            let ui_access = token_u32(token.raw(), TokenUIAccess)
+                .map(|value| value != 0)
+                .map_or_else(|| "unknown".into(), |value| value.to_string());
+            format!("integrity={integrity}, elevated={elevated}, ui_access={ui_access}")
+        };
+
+        (
+            process_session(current_pid),
+            process_security(current_pid),
+            (foreground_pid != 0)
+                .then(|| process_session(foreground_pid))
+                .flatten(),
+            (foreground_pid != 0).then(|| process_security(foreground_pid)),
+        )
+    };
+    let current_session =
+        current_session.map_or_else(|| "unknown".into(), |value| value.to_string());
+    let foreground_context = if foreground.is_invalid() || foreground_pid == 0 {
+        "foreground=none".into()
+    } else {
+        let executable =
+            process_executable_name(foreground_pid).unwrap_or_else(|| "unknown".into());
+        let session =
+            foreground_session.map_or_else(|| "unknown".into(), |value| value.to_string());
+        let security = foreground_security.unwrap_or_else(|| "security=unavailable".into());
+        format!(
+            "foreground={{hwnd=0x{:X}, thread={}, pid={}, exe={:?}, session={}, {}}}",
+            foreground.0 as usize, foreground_thread, foreground_pid, executable, session, security
+        )
+    };
+
+    format!(
+        "last_error=0x{last_error:08X} ({error}), input_size={input_size}, pointer_width={}, current={{pid={current_pid}, session={current_session}, {current_security}}}, {foreground_context}",
+        usize::BITS
+    )
 }
 
 #[inline(always)]
@@ -566,6 +714,16 @@ mod tests {
             Some(windows::Win32::Foundation::LRESULT(HTTRANSPARENT as isize))
         );
         assert_eq!(click_through_hit_test(WM_PAINT), None);
+    }
+
+    #[test]
+    fn integrity_rids_are_labeled_for_input_diagnostics() {
+        assert_eq!(integrity_name(0x1000), "low");
+        assert_eq!(integrity_name(0x2000), "medium");
+        assert_eq!(integrity_name(0x2100), "medium-plus");
+        assert_eq!(integrity_name(0x3000), "high");
+        assert_eq!(integrity_name(0x4000), "system");
+        assert_eq!(integrity_name(0x5000), "protected");
     }
 
     #[test]

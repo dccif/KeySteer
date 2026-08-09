@@ -74,12 +74,15 @@ Windows `WH_KEYBOARD_LL` 和 macOS `CGEventTap` 都必须在原生回调返回�
 
 ```text
 native callback -> BackendEvent::Input -> Engine::handle_key
-                <- Backend::dispose_key(Consume | Defer | Forward)
+                <- Backend::dispose_key(Consume | Forward)
 ```
 
 Engine 为每个物理键保存 disposition，确保 key-up 与 key-down 使用同一决定；模式切换
 不能造成 down 被吞、up 被放行。held binding 还保存其 owner，松开时不会重新查找一个
 已经不匹配的 chord。
+
+`KeyDisposition::Defer` 仅保留公开 API 兼容性，Engine 不再产生它，内置后端按
+`Forward` 处理。Windows 不再延迟或重放 Alt。
 
 ## 绑定处理分工
 

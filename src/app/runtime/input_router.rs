@@ -53,21 +53,7 @@ impl CompiledKeymap {
             .any(|entry| entry.chord.canonical() == chord.canonical())
     }
 
-    /// Whether `key` is a modifier prefix of any chord in this table.
-    /// Generic modifiers match either physical side.
-    pub fn contains_modifier_prefix(&self, key: &Key) -> bool {
-        key.is_modifier()
-            && self.by_activation.values().flatten().any(|entry| {
-                entry.chord.keys().len() > 1
-                    && entry
-                        .chord
-                        .keys()
-                        .iter()
-                        .filter(|candidate| candidate.is_modifier())
-                        .any(|candidate| modifier_matches(candidate, key))
-            })
-    }
-
+    #[cfg(test)]
     pub fn lookup(&self, key: &Key, pressed: &[Key]) -> Option<Arc<Binding>> {
         self.lookup_with_specificity(key, pressed)
             .map(|(binding, _)| binding)
@@ -77,6 +63,37 @@ impl CompiledKeymap {
         &self,
         key: &Key,
         pressed: &[Key],
+    ) -> Option<(Arc<Binding>, usize)> {
+        self.lookup_with_modifier_filter(key, pressed, |_| true)
+    }
+
+    /// Match a chord while requiring every held modifier outside that chord
+    /// to be owned by KeySteer already. This prevents a bare `h` binding from
+    /// stealing an external `Alt+H` shortcut, while a consumed `left_shift`
+    /// speed binding can still modify `h`.
+    pub fn lookup_with_specificity_strict(
+        &self,
+        key: &Key,
+        pressed: &[Key],
+        modifier_is_owned: impl Fn(&Key) -> bool,
+    ) -> Option<(Arc<Binding>, usize)> {
+        self.lookup_with_modifier_filter(key, pressed, |entry| {
+            pressed
+                .iter()
+                .filter(|pressed| pressed.is_modifier())
+                .all(|pressed_modifier| {
+                    entry.chord.keys().iter().any(|configured| {
+                        configured.is_modifier() && modifier_matches(configured, pressed_modifier)
+                    }) || modifier_is_owned(pressed_modifier)
+                })
+        })
+    }
+
+    fn lookup_with_modifier_filter(
+        &self,
+        key: &Key,
+        pressed: &[Key],
+        modifier_filter: impl Fn(&CompiledBinding) -> bool,
     ) -> Option<(Arc<Binding>, usize)> {
         let generic = match key.as_str() {
             "left_alt" | "right_alt" => Some("alt"),
@@ -95,7 +112,9 @@ impl CompiledKeymap {
             )
             .flatten()
             .find(|entry| {
-                entry.chord.activation_matches(key) && entry.chord.matches_pressed(pressed)
+                entry.chord.activation_matches(key)
+                    && entry.chord.matches_pressed(pressed)
+                    && modifier_filter(entry)
             })
             .map(|entry| (Arc::clone(&entry.binding), entry.chord.keys().len()))
     }
@@ -161,18 +180,29 @@ mod tests {
     }
 
     #[test]
-    fn modifier_prefix_lookup_respects_generic_and_specific_sides() {
+    fn strict_lookup_rejects_foreign_modifiers_but_accepts_owned_ones() {
         let map = CompiledKeymap::compile(
-            vec![
-                ("alt+e".into(), mode("normal")),
-                ("left_ctrl+g".into(), mode("grid")),
-            ],
+            vec![("h".into(), mode("normal")), ("alt+h".into(), mode("grid"))],
             &BTreeMap::new(),
         );
+        let h = Key::new("h").unwrap();
+        let alt = Key::new("left_alt").unwrap();
+        let shift = Key::new("left_shift").unwrap();
 
-        assert!(map.contains_modifier_prefix(&Key::new("left_alt").unwrap()));
-        assert!(map.contains_modifier_prefix(&Key::new("right_alt").unwrap()));
-        assert!(map.contains_modifier_prefix(&Key::new("left_ctrl").unwrap()));
-        assert!(!map.contains_modifier_prefix(&Key::new("right_ctrl").unwrap()));
+        let alt_h = vec![alt.clone(), h.clone()];
+        assert_eq!(
+            map.lookup_with_specificity_strict(&h, &alt_h, |_| false),
+            Some((Arc::new(mode("grid")), 2))
+        );
+
+        let shift_h = vec![shift.clone(), h.clone()];
+        assert_eq!(
+            map.lookup_with_specificity_strict(&h, &shift_h, |_| false),
+            None
+        );
+        assert_eq!(
+            map.lookup_with_specificity_strict(&h, &shift_h, |key| key == &shift),
+            Some((Arc::new(mode("normal")), 1))
+        );
     }
 }

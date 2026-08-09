@@ -1,6 +1,6 @@
 //! Dedicated low-level keyboard hook with per-event disposition handshakes.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -44,123 +44,47 @@ static LATEST_POINTER: AtomicU64 = AtomicU64::new(0);
 const WAKE_MESSAGE: u32 = WM_APP + 0x4D;
 const RESET_PRESSED_MESSAGE: u32 = WM_APP + 0x4F;
 
-const MAX_DEFERRED_MODIFIERS: usize = 4;
-const MAX_REPLAY_EVENTS: usize = MAX_DEFERRED_MODIFIERS + 1;
+const VK_LMENU_VALUE: u16 = 0xA4;
+const VK_RMENU_VALUE: u16 = 0xA5;
 
-#[derive(Clone, Copy)]
-struct ReplayBatch {
-    events: [(u16, KeyState); MAX_REPLAY_EVENTS],
-    len: usize,
-}
+/// Which physical Alt keys have already been forwarded to Windows. Keeping
+/// this as two bits avoids allocation and lets physical Alt remain visible to
+/// the foreground application, mouse shortcuts, AHK and Quicker.
+#[derive(Clone, Copy, Default)]
+struct ForwardedAlt(u8);
 
-impl ReplayBatch {
-    fn empty() -> Self {
-        Self {
-            events: [(0, KeyState::Down); MAX_REPLAY_EVENTS],
-            len: 0,
-        }
-    }
-
-    fn push(&mut self, virtual_key: u16, state: KeyState) {
-        if self.len < self.events.len() {
-            self.events[self.len] = (virtual_key, state);
-            self.len += 1;
-        }
-    }
-
-    fn as_slice(&self) -> &[(u16, KeyState)] {
-        &self.events[..self.len]
-    }
-}
-
-enum DeferredDecision {
-    Forward,
-    Suppress,
-    Replay(ReplayBatch),
-}
-
-#[derive(Default)]
-struct DeferredModifiers {
-    virtual_keys: [u16; MAX_DEFERRED_MODIFIERS],
-    len: usize,
-    chord_claimed: bool,
-}
-
-impl DeferredModifiers {
-    fn clear(&mut self) {
-        *self = Self::default();
-    }
-
-    fn contains(&self, virtual_key: u16) -> bool {
-        self.virtual_keys[..self.len].contains(&virtual_key)
-    }
-
-    fn defer(&mut self, virtual_key: u16) {
-        if !self.contains(virtual_key) && self.len < self.virtual_keys.len() {
-            self.virtual_keys[self.len] = virtual_key;
-            self.len += 1;
-        }
-    }
-
-    fn remove(&mut self, virtual_key: u16) -> bool {
-        let Some(index) = self.virtual_keys[..self.len]
-            .iter()
-            .position(|candidate| *candidate == virtual_key)
-        else {
-            return false;
-        };
-        self.len -= 1;
-        self.virtual_keys[index] = self.virtual_keys[self.len];
-        if self.len == 0 {
-            self.chord_claimed = false;
-        }
-        true
-    }
-
-    fn decide(
+impl ForwardedAlt {
+    fn observe(
         &mut self,
         virtual_key: u16,
         state: KeyState,
+        repeat: bool,
         is_modifier: bool,
         disposition: KeyDisposition,
-    ) -> DeferredDecision {
-        match disposition {
-            KeyDisposition::Defer => match state {
-                KeyState::Down => {
-                    self.defer(virtual_key);
-                    DeferredDecision::Suppress
-                }
-                KeyState::Up if self.contains(virtual_key) => {
-                    let claimed = self.chord_claimed;
-                    self.remove(virtual_key);
-                    if claimed {
-                        DeferredDecision::Suppress
-                    } else {
-                        let mut replay = ReplayBatch::empty();
-                        replay.push(virtual_key, KeyState::Down);
-                        replay.push(virtual_key, KeyState::Up);
-                        DeferredDecision::Replay(replay)
-                    }
-                }
-                KeyState::Up => DeferredDecision::Forward,
-            },
-            KeyDisposition::Consume => {
-                if !is_modifier && self.len > 0 {
-                    self.chord_claimed = true;
-                }
-                DeferredDecision::Suppress
+    ) -> bool {
+        let disposition = match disposition {
+            KeyDisposition::Defer => KeyDisposition::Forward,
+            other => other,
+        };
+        let alt_mask = match virtual_key {
+            VK_LMENU_VALUE => 1,
+            VK_RMENU_VALUE => 2,
+            _ => 0,
+        };
+        if alt_mask != 0 {
+            match (state, disposition) {
+                (KeyState::Down, KeyDisposition::Forward) => self.0 |= alt_mask,
+                (KeyState::Up, _) => self.0 &= !alt_mask,
+                _ => {}
             }
-            KeyDisposition::Forward if self.len > 0 && !self.chord_claimed => {
-                let mut replay = ReplayBatch::empty();
-                for deferred in &self.virtual_keys[..self.len] {
-                    replay.push(*deferred, KeyState::Down);
-                }
-                replay.push(virtual_key, state);
-                self.clear();
-                DeferredDecision::Replay(replay)
-            }
-            KeyDisposition::Forward => DeferredDecision::Forward,
+            return false;
         }
+
+        state == KeyState::Down
+            && !repeat
+            && !is_modifier
+            && disposition == KeyDisposition::Consume
+            && self.0 != 0
     }
 }
 
@@ -168,8 +92,8 @@ thread_local! {
     /// Virtual keys are one byte. A fixed bitset avoids allocating a tree node
     /// for every held key inside the latency-sensitive hook callback.
     static PRESSED: Cell<[u64; 4]> = const { Cell::new([0; 4]) };
-    /// Alt prefixes hidden until the engine decides whether a chord matched.
-    static DEFERRED_MODIFIERS: RefCell<DeferredModifiers> = RefCell::new(DeferredModifiers::default());
+    /// Physical Alt state that has already reached the rest of Windows.
+    static FORWARDED_ALT: Cell<ForwardedAlt> = const { Cell::new(ForwardedAlt(0)) };
 }
 
 pub struct HookThread {
@@ -344,7 +268,7 @@ fn hook_thread(
         }
         if message.message == RESET_PRESSED_MESSAGE {
             PRESSED.with(|pressed| pressed.set([0; 4]));
-            DEFERRED_MODIFIERS.with(|deferred| deferred.borrow_mut().clear());
+            FORWARDED_ALT.with(|alt| alt.set(ForwardedAlt::default()));
             continue;
         }
         unsafe {
@@ -515,8 +439,8 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         injected: false,
         timestamp_millis: info.time as u64,
     });
-    if let Some((mailbox, generation)) = begin_disposition(event) {
-        let disposition = match mailbox.wait(generation, Duration::from_millis(100)) {
+    let disposition = if let Some((mailbox, generation)) = begin_disposition(event) {
+        match mailbox.wait(generation, Duration::from_millis(100)) {
             Some(disposition) => disposition,
             None => {
                 let _ = send_envelope(Envelope {
@@ -525,22 +449,28 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                 });
                 KeyDisposition::Forward
             }
-        };
-        let virtual_key = info.vkCode as u16;
-        let decision = DEFERRED_MODIFIERS.with(|deferred| {
-            deferred
-                .borrow_mut()
-                .decide(virtual_key, state, is_modifier, disposition)
-        });
-        match decision {
-            DeferredDecision::Forward => {}
-            DeferredDecision::Suppress => return LRESULT(1),
-            DeferredDecision::Replay(batch) => {
-                if input::send_virtual_keys(batch.as_slice()).is_ok() {
-                    return LRESULT(1);
-                }
-            }
         }
+    } else {
+        KeyDisposition::Forward
+    };
+    let virtual_key = info.vkCode as u16;
+    let mask_menu = FORWARDED_ALT.with(|alt| {
+        let mut alt_state = alt.get();
+        let mask = alt_state.observe(virtual_key, state, repeat, is_modifier, disposition);
+        alt.set(alt_state);
+        mask
+    });
+    if mask_menu && let Err(error) = input::send_menu_mask() {
+        let _ = send_envelope(Envelope {
+            event: BackendEvent::Warning(format!(
+                "could not mask the Windows Alt menu after a consumed shortcut: {error}"
+            )),
+            generation: None,
+        });
+    }
+    match disposition {
+        KeyDisposition::Consume => return LRESULT(1),
+        KeyDisposition::Defer | KeyDisposition::Forward => {}
     }
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
@@ -557,56 +487,41 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
 mod tests {
     use super::*;
 
-    fn replay_events(decision: DeferredDecision) -> Vec<(u16, KeyState)> {
-        match decision {
-            DeferredDecision::Replay(batch) => batch.as_slice().to_vec(),
-            DeferredDecision::Forward | DeferredDecision::Suppress => Vec::new(),
-        }
+    #[test]
+    fn menu_mask_is_needed_only_for_consumed_non_modifier_down_with_forwarded_alt() {
+        let mut alt = ForwardedAlt::default();
+        assert!(!alt.observe(
+            VK_LMENU_VALUE,
+            KeyState::Down,
+            false,
+            true,
+            KeyDisposition::Forward
+        ));
+        assert!(!alt.observe(0x48, KeyState::Down, false, false, KeyDisposition::Forward));
+        assert!(!alt.observe(0x45, KeyState::Down, true, false, KeyDisposition::Consume));
+        assert!(alt.observe(0x45, KeyState::Down, false, false, KeyDisposition::Consume));
+        assert!(!alt.observe(0x45, KeyState::Up, false, false, KeyDisposition::Consume));
+        assert!(!alt.observe(
+            VK_LMENU_VALUE,
+            KeyState::Up,
+            false,
+            true,
+            KeyDisposition::Forward
+        ));
+        assert!(!alt.observe(0x45, KeyState::Down, false, false, KeyDisposition::Consume));
     }
 
     #[test]
-    fn matched_alt_chord_never_reaches_the_foreground_app() {
-        let mut deferred = DeferredModifiers::default();
-        assert!(matches!(
-            deferred.decide(0xA4, KeyState::Down, true, KeyDisposition::Defer),
-            DeferredDecision::Suppress
+    fn deferred_compatibility_disposition_is_treated_as_forwarded_alt() {
+        let mut alt = ForwardedAlt::default();
+        assert!(!alt.observe(
+            VK_RMENU_VALUE,
+            KeyState::Down,
+            false,
+            true,
+            KeyDisposition::Defer
         ));
-        assert!(matches!(
-            deferred.decide(0x45, KeyState::Down, false, KeyDisposition::Consume),
-            DeferredDecision::Suppress
-        ));
-        assert!(matches!(
-            deferred.decide(0x45, KeyState::Up, false, KeyDisposition::Consume),
-            DeferredDecision::Suppress
-        ));
-        assert!(matches!(
-            deferred.decide(0xA4, KeyState::Up, true, KeyDisposition::Defer),
-            DeferredDecision::Suppress
-        ));
-        assert_eq!(deferred.len, 0);
-    }
-
-    #[test]
-    fn unmatched_alt_chord_is_replayed_in_original_order() {
-        let mut deferred = DeferredModifiers::default();
-        let _ = deferred.decide(0xA4, KeyState::Down, true, KeyDisposition::Defer);
-        let replay =
-            replay_events(deferred.decide(0x58, KeyState::Down, false, KeyDisposition::Forward));
-        assert_eq!(replay, [(0xA4, KeyState::Down), (0x58, KeyState::Down)]);
-        assert_eq!(deferred.len, 0);
-        assert!(matches!(
-            deferred.decide(0xA4, KeyState::Up, true, KeyDisposition::Defer),
-            DeferredDecision::Forward
-        ));
-    }
-
-    #[test]
-    fn tapping_alt_without_a_chord_replays_a_complete_tap() {
-        let mut deferred = DeferredModifiers::default();
-        let _ = deferred.decide(0xA4, KeyState::Down, true, KeyDisposition::Defer);
-        let replay =
-            replay_events(deferred.decide(0xA4, KeyState::Up, true, KeyDisposition::Defer));
-        assert_eq!(replay, [(0xA4, KeyState::Down), (0xA4, KeyState::Up)]);
+        assert!(alt.observe(0x45, KeyState::Down, false, false, KeyDisposition::Consume));
     }
 
     #[test]

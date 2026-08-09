@@ -112,10 +112,9 @@ mod tests {
     }
 
     #[test]
-    fn only_idle_lets_keystrokes_through() {
-        // Every mode except idle owns the keyboard while it is active.
+    fn idle_and_default_normal_let_unbound_keystrokes_through() {
         for mode in built_in(&Config::default()) {
-            let expected = mode.id() != ModeId::idle();
+            let expected = !matches!(mode.id().as_str(), "idle" | "normal");
             assert_eq!(
                 mode.captures_keyboard(),
                 expected,

@@ -163,7 +163,10 @@ impl Engine {
                 }
                 Command::MouseButton { button, action } => {
                     if let Err(error) = backend.mouse_button(button, action) {
-                        return Err(Self::recoverable_input_error("mouse button action", error));
+                        return Err(Self::recoverable_input_error(
+                            &format!("mouse button {button:?} {action:?}"),
+                            error,
+                        ));
                     }
                     self.recoverable_input_succeeded();
                     if matches!(action, ButtonAction::Click | ButtonAction::DoubleClick) {

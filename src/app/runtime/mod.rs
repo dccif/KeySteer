@@ -64,7 +64,6 @@ struct PendingLongPressToggle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyOutcome {
     Consumed,
-    Deferred,
     Forwarded,
 }
 
@@ -416,9 +415,7 @@ impl Engine {
         if !self.input_failure_active {
             crate::app::logging::report_error(
                 "input",
-                format!(
-                    "{message}; action ignored because synthetic input is temporarily unavailable"
-                ),
+                format!("{message}; this action was rejected and runtime input state was reset"),
             );
             self.input_failure_active = true;
         }
@@ -1275,8 +1272,6 @@ impl Engine {
 
         let outcome = if captures {
             KeyOutcome::Consumed
-        } else if self.should_defer_windows_alt_prefix(&input) {
-            KeyOutcome::Deferred
         } else {
             KeyOutcome::Forwarded
         };
@@ -1318,7 +1313,6 @@ impl Engine {
     ) -> Result<(), String> {
         let disposition = match outcome {
             KeyOutcome::Consumed => KeyDisposition::Consume,
-            KeyOutcome::Deferred => KeyDisposition::Defer,
             KeyOutcome::Forwarded => KeyDisposition::Forward,
         };
         backend.dispose_key(disposition)?;
@@ -1376,13 +1370,11 @@ impl Engine {
                 if let Some(disposition) = self.key_dispositions.get(&input.key) {
                     return match disposition {
                         KeyDisposition::Consume => KeyOutcome::Consumed,
-                        KeyDisposition::Defer => KeyOutcome::Deferred,
-                        KeyDisposition::Forward => KeyOutcome::Forwarded,
+                        KeyDisposition::Defer | KeyDisposition::Forward => KeyOutcome::Forwarded,
                     };
                 }
                 let disposition = match current {
                     KeyOutcome::Consumed => KeyDisposition::Consume,
-                    KeyOutcome::Deferred => KeyDisposition::Defer,
                     KeyOutcome::Forwarded => KeyDisposition::Forward,
                 };
                 self.key_dispositions.insert(input.key.clone(), disposition);
@@ -1390,26 +1382,10 @@ impl Engine {
             }
             KeyState::Up => match self.key_dispositions.remove(&input.key) {
                 Some(KeyDisposition::Consume) => KeyOutcome::Consumed,
-                Some(KeyDisposition::Defer) => KeyOutcome::Deferred,
-                Some(KeyDisposition::Forward) => KeyOutcome::Forwarded,
+                Some(KeyDisposition::Defer | KeyDisposition::Forward) => KeyOutcome::Forwarded,
                 None => current,
             },
         }
-    }
-
-    /// Windows delivers a bare Alt press before a later activation key can
-    /// complete a global chord. Defer only Alt prefixes; Ctrl/Shift/Win remain
-    /// immediate so ordinary shortcuts keep their zero-delay behaviour. The
-    /// Windows hook replays an unmatched Alt without exposing a matched chord.
-    fn should_defer_windows_alt_prefix(&self, input: &crate::api::input::InputEvent) -> bool {
-        cfg!(target_os = "windows")
-            && input.state == KeyState::Down
-            && !input.repeat
-            && matches!(input.key.as_str(), "left_alt" | "right_alt")
-            && self
-                .tables
-                .get(&self.active)
-                .is_some_and(|table| table.contains_modifier_prefix(&input.key))
     }
 
     fn temporary_mode_is_active(&self, temporary_keys: &[String]) -> bool {
@@ -1556,7 +1532,8 @@ impl Engine {
     }
 
     fn lookup_in(&self, mode: &ModeId, key: &Key) -> Option<Arc<Binding>> {
-        self.tables.get(mode)?.lookup(key, &self.pressed)
+        self.lookup_with_specificity_in(mode, key)
+            .map(|(binding, _)| binding)
     }
 
     fn lookup_with_specificity_in(
@@ -1564,9 +1541,22 @@ impl Engine {
         mode: &ModeId,
         key: &Key,
     ) -> Option<(Arc<Binding>, usize)> {
-        self.tables
-            .get(mode)?
-            .lookup_with_specificity(key, &self.pressed)
+        let table = self.tables.get(mode)?;
+        if self.strict_modifier_matching_enabled() {
+            table.lookup_with_specificity_strict(key, &self.pressed, |modifier| {
+                matches!(
+                    self.key_dispositions.get(modifier),
+                    Some(KeyDisposition::Consume)
+                )
+            })
+        } else {
+            table.lookup_with_specificity(key, &self.pressed)
+        }
+    }
+
+    fn strict_modifier_matching_enabled(&self) -> bool {
+        self.active == ModeId::idle()
+            || (self.active == ModeId::normal() && self.config.normal.passthrough_unbound_keys)
     }
 
     fn injected_key(key: &Key) -> Key {
@@ -2927,29 +2917,20 @@ mod tests {
         let (mut backend, log) = FakeBackend::new(enter_normal());
         engine.run(&mut backend).unwrap();
 
-        let modifier = KeyChord::parse(&normal_launcher()).unwrap().keys()[0].clone();
-        let expected_modifier = if cfg!(target_os = "windows")
-            && matches!(modifier.as_str(), "alt" | "left_alt" | "right_alt")
-        {
-            KeyDisposition::Defer
-        } else {
-            KeyDisposition::Forward
-        };
-
         assert_eq!(
             log.lock().unwrap().dispositions,
             [
-                expected_modifier,
+                KeyDisposition::Forward,
                 KeyDisposition::Consume,
                 KeyDisposition::Consume,
-                expected_modifier,
+                KeyDisposition::Forward,
             ]
         );
         assert!(engine.key_dispositions.is_empty());
     }
 
     #[test]
-    fn windows_alt_launcher_defers_both_modifier_edges() {
+    fn alt_launcher_forwards_both_modifier_edges_without_replay() {
         let mut config = Config::default();
         config.hotkeys.clear();
         config
@@ -2964,22 +2945,154 @@ mod tests {
         let (mut backend, log) = FakeBackend::new(tap_chord("left_alt+e"));
         engine.run(&mut backend).unwrap();
 
-        let expected_modifier = if cfg!(target_os = "windows") {
-            KeyDisposition::Defer
-        } else {
-            KeyDisposition::Forward
-        };
         assert_eq!(
             log.lock().unwrap().dispositions,
             [
-                expected_modifier,
+                KeyDisposition::Forward,
                 KeyDisposition::Consume,
                 KeyDisposition::Consume,
-                expected_modifier,
+                KeyDisposition::Forward,
             ]
         );
         assert_eq!(engine.active_mode(), &ModeId::normal());
         assert!(engine.key_dispositions.is_empty());
+    }
+
+    #[test]
+    fn idle_bare_binding_does_not_claim_an_external_alt_chord() {
+        let mut config = Config::default();
+        config.hotkeys.clear();
+        config
+            .hotkeys
+            .insert("h".into(), Binding::Mode(ModeId::normal()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = Engine::new(config, Appearance::Dark);
+        let mut idle = ProbeMode::new("idle", seen.clone());
+        idle.captures = false;
+        engine.register(Box::new(idle));
+        engine.register(Box::new(ProbeMode::new("normal", seen)));
+        let (mut backend, log) = FakeBackend::new(tap_chord("left_alt+h"));
+        engine.run(&mut backend).unwrap();
+
+        assert_eq!(
+            log.lock().unwrap().dispositions,
+            [
+                KeyDisposition::Forward,
+                KeyDisposition::Forward,
+                KeyDisposition::Forward,
+                KeyDisposition::Forward,
+            ]
+        );
+        assert_eq!(engine.active_mode(), &ModeId::idle());
+    }
+
+    #[test]
+    fn normal_passthrough_uses_complete_modifier_combinations() {
+        let mut config = Config::default();
+        config.normal.bindings.clear();
+        config
+            .normal
+            .bindings
+            .insert("h".into(), Binding::Move(Direction::Left));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = Engine::new(config, Appearance::Dark);
+        let mut idle = ProbeMode::new("idle", seen.clone());
+        idle.captures = false;
+        let mut normal = ProbeMode::new("normal", seen.clone());
+        normal.captures = false;
+        engine.register(Box::new(idle));
+        engine.register(Box::new(normal));
+
+        let log = run_in_normal(&mut engine, tap_chord("left_alt+h"));
+        let recorded = log.lock().unwrap();
+        let dispositions = &recorded.dispositions;
+        assert_eq!(
+            &dispositions[dispositions.len() - 4..],
+            [
+                KeyDisposition::Forward,
+                KeyDisposition::Forward,
+                KeyDisposition::Forward,
+                KeyDisposition::Forward,
+            ]
+        );
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .all(|event| event != "normal:binding(move_left)"),
+            "Alt+H must not fall back to bare h"
+        );
+    }
+
+    #[test]
+    fn consumed_normal_modifier_can_still_modify_a_bare_binding() {
+        let mut config = Config::default();
+        config.normal.bindings.clear();
+        config
+            .normal
+            .bindings
+            .insert("left_shift".into(), Binding::Speed(crate::api::Speed::Slow));
+        config
+            .normal
+            .bindings
+            .insert("h".into(), Binding::Move(Direction::Left));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = Engine::new(config, Appearance::Dark);
+        let mut idle = ProbeMode::new("idle", seen.clone());
+        idle.captures = false;
+        let mut normal = ProbeMode::new("normal", seen.clone());
+        normal.captures = false;
+        engine.register(Box::new(idle));
+        engine.register(Box::new(normal));
+
+        let log = run_in_normal(&mut engine, tap_chord("left_shift+h"));
+        let recorded = log.lock().unwrap();
+        let dispositions = &recorded.dispositions;
+        assert_eq!(
+            &dispositions[dispositions.len() - 4..],
+            [
+                KeyDisposition::Consume,
+                KeyDisposition::Consume,
+                KeyDisposition::Consume,
+                KeyDisposition::Consume,
+            ]
+        );
+        let seen = seen.lock().unwrap();
+        assert!(seen.iter().any(|event| event == "normal:binding(slow)"));
+        assert!(
+            seen.iter()
+                .any(|event| event == "normal:binding(move_left)")
+        );
+    }
+
+    #[test]
+    fn disabling_normal_passthrough_restores_exclusive_matching() {
+        let mut config = Config::default();
+        config.normal.passthrough_unbound_keys = false;
+        config.normal.bindings.clear();
+        config
+            .normal
+            .bindings
+            .insert("h".into(), Binding::Move(Direction::Left));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = Engine::new(config, Appearance::Dark);
+        let mut idle = ProbeMode::new("idle", seen.clone());
+        idle.captures = false;
+        engine.register(Box::new(idle));
+        engine.register(Box::new(ProbeMode::new("normal", seen)));
+
+        let log = run_in_normal(&mut engine, tap_chord("left_alt+h"));
+        let recorded = log.lock().unwrap();
+        let dispositions = &recorded.dispositions;
+        assert_eq!(
+            &dispositions[dispositions.len() - 4..],
+            [
+                KeyDisposition::Consume,
+                KeyDisposition::Consume,
+                KeyDisposition::Consume,
+                KeyDisposition::Consume,
+            ]
+        );
     }
 
     #[test]

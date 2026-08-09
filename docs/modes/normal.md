@@ -7,7 +7,12 @@ import KeyLayout from '../.vitepress/components/KeyLayout'
 
 `Normal` 可能是最常用和简单上手的：直接移动鼠标、滚动、点击、拖拽，并进入三种定位模式。按 `Primary+E` 从 Idle 进入
 
-在 `Normal` 中，所有按键会被接管，不会输入到当前应用。
+默认只接管已经绑定的按键；未绑定输入仍会到达当前应用、AHK、Quicker 等工具。例如只有 `h = "move_left"` 时，裸 `h` 移动鼠标，而未显式绑定的 `Alt+H` 会完整透传。
+
+```toml
+[normal]
+passthrough_unbound_keys = true # 设为 false 可恢复键盘独占
+```
 
 <ModeVideo
   file="normal.mp4"
@@ -68,6 +73,7 @@ fast_multiplier = 2.0
 如果持续按住 `鼠标按键` 键达到 `long_press_toggle_ms`，鼠标会进入 `Toggle` 状态，也就是按下模式；点击 `n = "toggle"` 可以释放
 ```toml
 [normal]
+passthrough_unbound_keys = true
 long_press_toggle_ms = 500 # 设为 0 可关闭
 ```
 

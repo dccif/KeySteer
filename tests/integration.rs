@@ -215,9 +215,9 @@ fn defaults_and_shipped_config_agree_on_mode_availability() {
 }
 
 #[test]
-fn only_idle_lets_keystrokes_through_to_the_focused_app() {
+fn idle_and_default_normal_let_unbound_keys_reach_the_focused_app() {
     for mode in modes::built_in(&Config::default()) {
-        let expected = mode.id() != ModeId::idle();
+        let expected = !matches!(mode.id().as_str(), "idle" | "normal");
         assert_eq!(
             mode.captures_keyboard(),
             expected,

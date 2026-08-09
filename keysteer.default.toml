@@ -153,6 +153,11 @@ text = "#17327AFF"
 
 [normal]
 inherits = ["hotkeys"]
+# Forward keys that do not match a complete KeySteer binding. Modifier
+# combinations are matched exactly, so Alt+H does not trigger bare h unless
+# Alt is itself held by a KeySteer action. Set false for keyboard-exclusive
+# Normal behaviour.
+passthrough_unbound_keys = true
 # A click key still clicks immediately. Holding it this long then toggles the
 # same mouse button; releasing the key does not release the toggled button.
 # Set to 0 to disable long-press toggles.
@@ -161,9 +166,9 @@ long_press_toggle_ms = 500
 # ---------------------------------------------------------------------------
 # normal — the working mode
 #
-# Move the pointer, click, scroll, and enter the targeting modes. This mode
-# captures the keyboard, so `hjkl` moves instead of typing; bind a key
-# explicitly (`y = "home"`) to send a keystroke through to the application.
+# Move the pointer, click, scroll, and enter the targeting modes. Bound keys
+# such as `hjkl` are captured; unbound keys and unconfigured modifier chords
+# pass through when `passthrough_unbound_keys` is enabled.
 # ---------------------------------------------------------------------------
 
 [normal.bindings]

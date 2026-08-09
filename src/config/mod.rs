@@ -624,6 +624,8 @@ pub struct UiHintAppOverride {
 #[serde(default, deny_unknown_fields)]
 pub struct Normal {
     pub inherits: Vec<String>,
+    /// Forward keyboard input that does not match a complete KeySteer binding.
+    pub passthrough_unbound_keys: bool,
     /// Hold a physical key bound to click/double-click for this many
     /// milliseconds to toggle that mouse button. Zero disables the feature.
     pub long_press_toggle_ms: u64,
@@ -635,6 +637,7 @@ impl Default for Normal {
     fn default() -> Self {
         Self {
             inherits: vec!["hotkeys".into()],
+            passthrough_unbound_keys: true,
             long_press_toggle_ms: 500,
             bindings: default_normal_bindings(),
             app_configs: Vec::new(),
@@ -645,9 +648,9 @@ impl Default for Normal {
 /// Defaults for `normal`: vim-style movement, clicks, scrolling, the three
 /// targeting modes, and the navigation keys.
 ///
-/// Inside `normal` the keyboard is already captured, so bare letters are free
-/// and no platform-specific modifier problem arises. Only the way *out* uses a
-/// chord, and it mirrors the one that got the user in.
+/// Bare letters are free for pointer control, while unbound keys pass through
+/// by default. Complete modifier combinations take precedence over bare-key
+/// bindings so external shortcuts remain usable.
 fn default_normal_bindings() -> Bindings {
     let entries: &[(&str, &str)] = &[
         // Movement and speed modifiers, held alongside a direction.
@@ -2584,6 +2587,25 @@ mod tests {
         let invalid = Config::parse("[normal]\nlong_press_toggle_ms = 60001").unwrap();
         let error = invalid.validate().unwrap_err();
         assert!(error.to_string().contains("normal.long_press_toggle_ms"));
+    }
+
+    #[test]
+    fn normal_unbound_passthrough_defaults_on_and_round_trips() {
+        assert!(Config::default().normal.passthrough_unbound_keys);
+
+        let legacy = Config::parse("[normal]\nlong_press_toggle_ms = 750").unwrap();
+        assert!(legacy.normal.passthrough_unbound_keys);
+
+        let default_dumped = toml::to_string(&Config::default()).unwrap();
+        assert!(default_dumped.contains("passthrough_unbound_keys = true"));
+
+        let exclusive = Config::parse("[normal]\npassthrough_unbound_keys = false").unwrap();
+        assert!(!exclusive.normal.passthrough_unbound_keys);
+
+        let dumped = toml::to_string(&exclusive).unwrap();
+        assert!(dumped.contains("passthrough_unbound_keys = false"));
+        let reparsed = Config::parse(&dumped).unwrap();
+        assert!(!reparsed.normal.passthrough_unbound_keys);
     }
 
     #[test]

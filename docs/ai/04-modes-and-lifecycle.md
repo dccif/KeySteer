@@ -23,6 +23,10 @@ settings；不能注入输入、创建窗口或直接扫描 UI。
 
 ### Normal (`src/modes/normal.rs`)
 
+- `normal.passthrough_unbound_keys` 默认开启，因此只捕获完整命中的绑定；关闭后恢复键盘独占。
+- Idle 和默认 Normal 使用严格修饰匹配：额外修饰键必须属于 chord，或其物理 down 已被
+  KeySteer 自身绑定消费。这样外部 `Alt+H` 不会命中裸 `h`，但 `left_shift=slow` 后的
+  `Shift+H` 仍成立。
 - 持有方向、滚动和速度手势状态。
 - 连续移动优先由原生 frame clock 驱动；第一下有 `tap_distance`，避免极短按键无移动。
 - 使用真实 elapsed time、可配置的 smootherstep/线性加速度和 sub-pixel remainder；曲线按
