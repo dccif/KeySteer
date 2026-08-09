@@ -15,8 +15,11 @@ frame clock、overlay、UI scan、appearance、状态栏开关和 autostart。�
 ### 线程和事件
 
 - 创建 Backend 的线程也是 Win32 message loop、tray、overlay window 的 owner。
-- `hook.rs` 是专用低级键盘 Hook 线程，使用每事件 disposition handshake。
-- 物理左右 Alt 始终立即透传，不延迟也不回放，因此 AHK、Quicker 和 `Alt+物理鼠标键` 能看到真实状态。若随后一个明确绑定的非修饰键被消费，Hook 发送一次带自身标记的未分配 `0xE8` down/up，阻止 Alt 松开时激活菜单；失败只报告非致命 warning。
+- `hook.rs` 是专用低级键盘 Hook 线程，使用每事件 disposition handshake。Engine
+  完成 disposition 只代表回调已被唤醒；点击、滚轮或键盘注入前还要经过一个
+  `WM_APP` 消息屏障，确认回调已经返回消息循环，避免 `SendInput` 被仍在处理物理键的
+  Hook 线程拒绝。连续光标移动不经过该屏障。
+- 物理左右 Alt 始终立即透传，不延迟也不回放，因此 AHK、Quicker 和 `Alt+物理鼠标键` 能看到真实状态。若随后一个明确绑定的非修饰键被消费，Hook 将带自身标记的未分配 `0xE8` down/up 排入自己的消息循环，回调返回后再发送，以阻止 Alt 松开时激活菜单；失败只报告非致命 warning。
 - `accessibility.rs` 是持久 COM MTA UIA worker。
 - `frame_clock.rs` 有 DWM 等待 worker，one-slot channel 合并多余帧。
 - worker 和 tray 通过 `EventSender` 发 channel，并用自定义 `WM_APP` 唤醒 engine thread。

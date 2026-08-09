@@ -250,6 +250,10 @@ impl WindowsBackend {
     }
 
     fn release_held_buttons(&self) -> Result<(), String> {
+        if self.held_buttons.get() == 0 {
+            return Ok(());
+        }
+        self.prepare_input_injection()?;
         let mut first_error = None;
         for button in [
             MouseButton::Left,
@@ -269,6 +273,18 @@ impl WindowsBackend {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    /// A physical key is decided in a synchronous low-level hook callback.
+    /// Completing its disposition wakes that callback but does not prove it
+    /// has returned yet. Flush the hook thread's message queue before entering
+    /// `SendInput`, otherwise Windows can reject the batch as still blocked by
+    /// the callback thread. Pointer warps intentionally bypass this barrier.
+    fn prepare_input_injection(&self) -> Result<(), String> {
+        if let Some(hook) = self.hook.as_ref() {
+            hook.wait_until_idle_for_injection()?;
+        }
+        Ok(())
     }
 
     /// Stop every native resource owned by this backend.
@@ -426,6 +442,7 @@ impl Backend for WindowsBackend {
     }
 
     fn mouse_button(&self, button: MouseButton, action: ButtonAction) -> Result<(), String> {
+        self.prepare_input_injection()?;
         input::mouse_button(button, action)?;
         let bit = input::button_mask(button);
         match action {
@@ -437,14 +454,17 @@ impl Backend for WindowsBackend {
     }
 
     fn scroll(&self, dx: f64, dy: f64) -> Result<(), String> {
+        self.prepare_input_injection()?;
         input::scroll(dx, dy)
     }
 
     fn send_key(&self, key: &Key, state: KeyState) -> Result<(), String> {
+        self.prepare_input_injection()?;
         input::send_key(key, state)
     }
 
     fn send_keys(&self, events: &[(Key, KeyState)]) -> Result<(), String> {
+        self.prepare_input_injection()?;
         input::send_keys(events)
     }
 

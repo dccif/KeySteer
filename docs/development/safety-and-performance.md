@@ -37,6 +37,9 @@ UIA、AX 与 Vision 扫描放在 worker；结果带 scan id 与 owner，Engine �
 - Windows `SendInput` 失败日志必须保留实际返回数量和即时 `GetLastError`，并只在失败路径
   查询当前/前台进程的 session、integrity、elevation 与 UIAccess。UIPI 可能不设置错误码，
   因此日志报告证据而不把所有零返回都断言为权限问题。
+- Windows Engine 完成键盘 disposition 后，不得立即与尚未返回的低级 Hook 回调竞争
+  `SendInput`。鼠标按钮、滚轮和键盘注入先等待 Hook 线程处理一个原生消息屏障；该屏障
+  由事件唤醒且只在注入前执行，不得改成 sleep、轮询或连续移动热路径上的固定等待。
 
 发布前运行：
 

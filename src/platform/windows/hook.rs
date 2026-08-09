@@ -3,7 +3,7 @@
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
@@ -36,6 +36,7 @@ struct EventSink {
 
 static EVENT_SENDER: OnceLock<Mutex<Option<EventSink>>> = OnceLock::new();
 static WAKE_THREAD: AtomicU32 = AtomicU32::new(0);
+static HOOK_THREAD: AtomicU32 = AtomicU32::new(0);
 static WAKE_FAILED: AtomicBool = AtomicBool::new(false);
 static POINTER_PENDING: AtomicBool = AtomicBool::new(false);
 static POINTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -43,6 +44,53 @@ static CONSUMED_POINTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static LATEST_POINTER: AtomicU64 = AtomicU64::new(0);
 const WAKE_MESSAGE: u32 = WM_APP + 0x4D;
 const RESET_PRESSED_MESSAGE: u32 = WM_APP + 0x4F;
+const INJECTION_BARRIER_MESSAGE: u32 = WM_APP + 0x50;
+const MENU_MASK_MESSAGE: u32 = WM_APP + 0x51;
+
+/// Reusable, allocation-free acknowledgement for one hook-thread message.
+/// Processing the message proves that the synchronous low-level callback which
+/// produced the current engine event has returned to the message loop.
+#[derive(Default)]
+struct InjectionBarrier {
+    next_generation: AtomicU64,
+    requested_generation: AtomicU64,
+    completed_generation: Mutex<u64>,
+    ready: Condvar,
+}
+
+impl InjectionBarrier {
+    fn begin(&self) -> u64 {
+        let generation = self
+            .next_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        self.requested_generation
+            .store(generation, Ordering::Release);
+        generation
+    }
+
+    fn complete_requested(&self) {
+        let generation = self.requested_generation.load(Ordering::Acquire);
+        let mut completed = self
+            .completed_generation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *completed = generation;
+        self.ready.notify_all();
+    }
+
+    fn wait(&self, generation: u64, timeout: Duration) -> bool {
+        let completed = self
+            .completed_generation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (completed, _) = self
+            .ready
+            .wait_timeout_while(completed, timeout, |completed| *completed != generation)
+            .unwrap_or_else(|error| error.into_inner());
+        *completed == generation
+    }
+}
 
 const VK_LMENU_VALUE: u16 = 0xA4;
 const VK_RMENU_VALUE: u16 = 0xA5;
@@ -99,6 +147,8 @@ thread_local! {
 pub struct HookThread {
     receiver: Receiver<Envelope>,
     mailbox: Arc<DispositionMailbox>,
+    injection_barrier: Arc<InjectionBarrier>,
+    injection_barrier_pending: Cell<bool>,
     pending: Option<u64>,
     thread_id: u32,
     join: Option<std::thread::JoinHandle<()>>,
@@ -121,11 +171,21 @@ impl HookThread {
         // linked channel on physical key edges.
         let (event_tx, event_rx) = mpsc::sync_channel(32);
         let mailbox = Arc::new(DispositionMailbox::default());
+        let injection_barrier = Arc::new(InjectionBarrier::default());
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let thread_mailbox = Arc::clone(&mailbox);
+        let thread_injection_barrier = Arc::clone(&injection_barrier);
         let join = std::thread::Builder::new()
             .name("keysteer-keyboard-hook".into())
-            .spawn(move || hook_thread(event_tx, thread_mailbox, ready_tx, owner_thread))
+            .spawn(move || {
+                hook_thread(
+                    event_tx,
+                    thread_mailbox,
+                    thread_injection_barrier,
+                    ready_tx,
+                    owner_thread,
+                )
+            })
             .map_err(|e| format!("cannot start keyboard hook thread: {e}"))?;
         let thread_id = ready_rx
             .recv()
@@ -133,6 +193,8 @@ impl HookThread {
         Ok(Self {
             receiver: event_rx,
             mailbox,
+            injection_barrier,
+            injection_barrier_pending: Cell::new(false),
             pending: None,
             thread_id,
             join: Some(join),
@@ -159,7 +221,32 @@ impl HookThread {
             .ok_or_else(|| "no keyboard event is awaiting a disposition".to_string())?;
         // A timed-out callback has already failed open. Generation matching
         // makes its late response harmless if a newer event owns the slot.
-        let _ = self.mailbox.complete(generation, disposition);
+        if self.mailbox.complete(generation, disposition) {
+            self.injection_barrier_pending.set(true);
+        }
+        Ok(())
+    }
+
+    /// Wait until the hook thread has returned from the callback whose event
+    /// the engine just consumed. `SendInput` otherwise races that callback and
+    /// can report that another thread is still blocking the input stream.
+    pub fn wait_until_idle_for_injection(&self) -> Result<(), String> {
+        if !self.injection_barrier_pending.get() {
+            return Ok(());
+        }
+        if self.thread_id == 0 {
+            return Err("keyboard hook stopped before synthetic input could be submitted".into());
+        }
+        let generation = self.injection_barrier.begin();
+        super::native::post_thread_wake(self.thread_id, INJECTION_BARRIER_MESSAGE)
+            .map_err(|error| format!("cannot queue input-hook barrier: {error}"))?;
+        if !self
+            .injection_barrier
+            .wait(generation, Duration::from_millis(100))
+        {
+            return Err("input-hook barrier timed out before synthetic input".into());
+        }
+        self.injection_barrier_pending.set(false);
         Ok(())
     }
 
@@ -200,6 +287,7 @@ impl Drop for HookThread {
 fn hook_thread(
     sender: SyncSender<Envelope>,
     mailbox: Arc<DispositionMailbox>,
+    injection_barrier: Arc<InjectionBarrier>,
     ready: SyncSender<Result<u32, String>>,
     wake_thread: u32,
 ) {
@@ -227,6 +315,7 @@ fn hook_thread(
         }
     };
     let thread_id = unsafe { GetCurrentThreadId() };
+    HOOK_THREAD.store(thread_id, Ordering::Release);
     let mut queue_probe = MSG::default();
     unsafe {
         let _ = PeekMessageW(&mut queue_probe, None, 0, 0, PM_NOREMOVE);
@@ -253,6 +342,7 @@ fn hook_thread(
             *current = None;
         }
         WAKE_THREAD.store(0, Ordering::Release);
+        HOOK_THREAD.store(0, Ordering::Release);
         return;
     }
 
@@ -271,6 +361,21 @@ fn hook_thread(
             FORWARDED_ALT.with(|alt| alt.set(ForwardedAlt::default()));
             continue;
         }
+        if message.message == INJECTION_BARRIER_MESSAGE {
+            injection_barrier.complete_requested();
+            continue;
+        }
+        if message.message == MENU_MASK_MESSAGE {
+            if let Err(error) = input::send_menu_mask() {
+                let _ = send_envelope(Envelope {
+                    event: BackendEvent::Warning(format!(
+                        "could not mask the Windows Alt menu after a consumed shortcut: {error}"
+                    )),
+                    generation: None,
+                });
+            }
+            continue;
+        }
         unsafe {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
@@ -286,6 +391,7 @@ fn hook_thread(
         *current = None;
     }
     WAKE_THREAD.store(0, Ordering::Release);
+    HOOK_THREAD.store(0, Ordering::Release);
     POINTER_PENDING.store(false, Ordering::Release);
 }
 
@@ -460,10 +566,13 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         alt.set(alt_state);
         mask
     });
-    if mask_menu && let Err(error) = input::send_menu_mask() {
+    if mask_menu
+        && let Err(error) =
+            super::native::post_thread_wake(HOOK_THREAD.load(Ordering::Acquire), MENU_MASK_MESSAGE)
+    {
         let _ = send_envelope(Envelope {
             event: BackendEvent::Warning(format!(
-                "could not mask the Windows Alt menu after a consumed shortcut: {error}"
+                "could not queue the Windows Alt menu mask after a consumed shortcut: {error}"
             )),
             generation: None,
         });
@@ -528,10 +637,13 @@ mod tests {
     fn disposition_is_delivered_to_the_exact_waiting_event() {
         let (_event_tx, event_rx) = mpsc::channel();
         let mailbox = Arc::new(DispositionMailbox::default());
+        let injection_barrier = Arc::new(InjectionBarrier::default());
         let generation = mailbox.begin();
         let mut hook = HookThread {
             receiver: event_rx,
             mailbox: Arc::clone(&mailbox),
+            injection_barrier,
+            injection_barrier_pending: Cell::new(false),
             pending: Some(generation),
             thread_id: 0,
             join: None,
@@ -543,17 +655,21 @@ mod tests {
             Some(KeyDisposition::Consume)
         );
         assert!(hook.pending.is_none());
+        assert!(hook.injection_barrier_pending.get());
     }
 
     #[test]
     fn a_timed_out_disposition_is_nonfatal() {
         let (_event_tx, event_rx) = mpsc::channel();
         let mailbox = Arc::new(DispositionMailbox::default());
+        let injection_barrier = Arc::new(InjectionBarrier::default());
         let generation = mailbox.begin();
         let _newer = mailbox.begin();
         let mut hook = HookThread {
             receiver: event_rx,
             mailbox,
+            injection_barrier,
+            injection_barrier_pending: Cell::new(false),
             pending: Some(generation),
             thread_id: 0,
             join: None,
@@ -561,6 +677,21 @@ mod tests {
 
         hook.set_disposition(KeyDisposition::Forward).unwrap();
         assert!(hook.pending.is_none());
+        assert!(!hook.injection_barrier_pending.get());
+    }
+
+    #[test]
+    fn injection_barrier_acknowledges_only_the_current_generation() {
+        let barrier = InjectionBarrier::default();
+        let first = barrier.begin();
+        assert!(!barrier.wait(first, Duration::ZERO));
+        barrier.complete_requested();
+        assert!(barrier.wait(first, Duration::ZERO));
+
+        let second = barrier.begin();
+        assert!(!barrier.wait(second, Duration::ZERO));
+        barrier.complete_requested();
+        assert!(barrier.wait(second, Duration::ZERO));
     }
 
     #[test]

@@ -47,6 +47,10 @@ fn send(inputs: &[INPUT]) -> Result<(), String> {
     // explicitly, as SendInput requires. Last-error is captured in the same
     // block before any diagnostic API can overwrite it.
     let (sent, last_error) = unsafe {
+        // SendInput is documented not to identify UIPI through last-error and
+        // may leave the slot untouched. Clear it so diagnostics never report
+        // an unrelated error left by an earlier API call.
+        windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::WIN32_ERROR(0));
         let sent = SendInput(inputs, std::mem::size_of::<INPUT>() as i32);
         let last_error = if sent as usize != inputs.len() {
             windows::Win32::Foundation::GetLastError().0
@@ -212,6 +216,7 @@ pub fn send_keys(events: &[(Key, KeyState)]) -> Result<(), String> {
     // SAFETY: the slice remains live for the call. Last-error is read before
     // cleanup attempts below can replace the calling thread's error slot.
     let (sent, last_error) = unsafe {
+        windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::WIN32_ERROR(0));
         let sent = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) as usize;
         let last_error = if sent != inputs.len() {
             windows::Win32::Foundation::GetLastError().0
