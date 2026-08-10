@@ -930,6 +930,12 @@ impl Engine {
             BackendEvent::Input(input) => {
                 self.handle_key(input, backend)?;
             }
+            BackendEvent::InputInjectionFailed(message) => {
+                return Err(Self::recoverable_input_error(
+                    "asynchronous native input",
+                    message,
+                ));
+            }
             BackendEvent::PointerMoved(reported) => {
                 let p = self
                     .constrain_absolute_pointer(reported)

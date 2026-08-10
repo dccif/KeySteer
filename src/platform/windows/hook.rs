@@ -1,9 +1,10 @@
 //! Dedicated low-level keyboard hook with per-event disposition handshakes.
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
@@ -70,20 +71,77 @@ pub(super) enum InjectionRequest {
 impl InjectionRequest {
     fn execute(self) -> Result<(), String> {
         match self {
-            Self::MouseButton { button, action } => {
-                input::mouse_button(button, action).map_err(|error| {
-                    format!("request=mouse button={button:?} action={action:?}; {error}")
-                })
-            }
+            Self::MouseButton { button, action } => match input::mouse_button(button, action) {
+                Ok(()) => Ok(()),
+                Err(error) if matches!(action, ButtonAction::Click | ButtonAction::DoubleClick) => {
+                    match input::mouse_button(button, ButtonAction::Release) {
+                        Ok(()) => Err(format!(
+                            "request=mouse button={button:?} action={action:?}; {error}; a defensive {button:?} release completed"
+                        )),
+                        Err(release_error) => Err(format!(
+                            "request=mouse button={button:?} action={action:?}; {error}; defensive {button:?} release also failed: {release_error}"
+                        )),
+                    }
+                }
+                Err(error) if action == ButtonAction::Release => {
+                    match input::mouse_button(button, ButtonAction::Release) {
+                        Ok(()) => Err(format!(
+                            "request=mouse button={button:?} action={action:?}; {error}; a defensive {button:?} release completed"
+                        )),
+                        Err(release_error) => Err(format!(
+                            "request=mouse button={button:?} action={action:?}; {error}; defensive {button:?} release also failed: {release_error}"
+                        )),
+                    }
+                }
+                Err(error) => Err(format!(
+                    "request=mouse button={button:?} action={action:?}; {error}"
+                )),
+            },
             Self::Scroll { dx, dy } => input::scroll(dx, dy)
                 .map_err(|error| format!("request=scroll dx={dx:.3} dy={dy:.3}; {error}")),
-            Self::Key { key, state } => input::send_key(&key, state)
-                .map_err(|error| format!("request=key key={key} state={state:?}; {error}")),
+            Self::Key { key, state } => match input::send_key(&key, state) {
+                Ok(()) => Ok(()),
+                Err(error) if state == KeyState::Up => match input::send_key(&key, KeyState::Up) {
+                    Ok(()) => Err(format!(
+                        "request=key key={key} state={state:?}; {error}; a defensive key release completed"
+                    )),
+                    Err(release_error) => Err(format!(
+                        "request=key key={key} state={state:?}; {error}; defensive key release also failed: {release_error}"
+                    )),
+                },
+                Err(error) => Err(format!("request=key key={key} state={state:?}; {error}")),
+            },
             Self::Keys(events) => {
                 let event_count = events.len();
-                input::send_keys(&events).map_err(|error| {
-                    format!("request=keyboard_chord events={event_count}; {error}")
-                })
+                match input::send_keys(&events) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        // A partially accepted chord may have left one of its
+                        // synthetic Down edges active. Releasing every key
+                        // that had a Down edge is safe even when Windows
+                        // accepted none of them, and keeps late asynchronous
+                        // failures from leaving a modifier latched.
+                        let mut release_failure = None;
+                        for (key, state) in events.iter().rev() {
+                            if *state != KeyState::Down {
+                                continue;
+                            }
+                            if let Err(cleanup_error) = input::send_key(key, KeyState::Up)
+                                && release_failure.is_none()
+                            {
+                                release_failure = Some(cleanup_error);
+                            }
+                        }
+                        match release_failure {
+                            Some(cleanup_error) => Err(format!(
+                                "request=keyboard_chord events={event_count}; {error}; defensive key release also failed: {cleanup_error}"
+                            )),
+                            None => Err(format!(
+                                "request=keyboard_chord events={event_count}; {error}; defensive key releases completed"
+                            )),
+                        }
+                    }
+                }
             }
         }
     }
@@ -95,166 +153,92 @@ struct PendingInjection {
 }
 
 #[derive(Debug)]
-enum InjectionFailure {
-    Wait(String),
-    Execute(String),
+enum InjectionSubmissionFailure {
+    Full,
+    Post(String),
 }
 
-impl InjectionFailure {
+impl InjectionSubmissionFailure {
     fn stage(&self) -> &'static str {
         match self {
-            Self::Wait(_) => "wait",
-            Self::Execute(_) => "execute",
-        }
-    }
-
-    fn into_message(self) -> String {
-        match self {
-            Self::Wait(message) | Self::Execute(message) => message,
+            Self::Full => "reserve",
+            Self::Post(_) => "post",
         }
     }
 }
 
-#[derive(Default)]
-struct InjectionState {
-    pending: Option<PendingInjection>,
-    running: Option<u32>,
-    completed: Option<(u32, Result<(), InjectionFailure>)>,
+const MAX_PENDING_INJECTIONS: usize = 32;
+
+struct InjectionQueueState {
+    pending: VecDeque<PendingInjection>,
+    wake_posted: bool,
 }
 
-/// One reusable request slot keeps injection ordered without an unbounded
-/// queue. The engine submits at most one synchronous backend operation at a
-/// time, so additional allocations are needed only for an existing key chord.
+impl Default for InjectionQueueState {
+    fn default() -> Self {
+        Self {
+            pending: VecDeque::with_capacity(MAX_PENDING_INJECTIONS),
+            wake_posted: false,
+        }
+    }
+}
+
+/// A small bounded queue breaks the hook/engine lock cycle without adding a
+/// worker thread. Submission never waits for the hook: the hook drains the
+/// queue after any physical callbacks that were already in its message queue.
+/// Successful requests are silent; only an execution failure returns to the
+/// engine as a backend event.
 #[derive(Default)]
-struct InjectionSlot {
+struct InjectionQueue {
     next_generation: AtomicU32,
-    state: Mutex<InjectionState>,
-    ready: Condvar,
+    state: Mutex<InjectionQueueState>,
 }
 
-impl InjectionSlot {
-    fn begin(&self, request: InjectionRequest) -> Result<u32, String> {
+impl InjectionQueue {
+    fn submit(
+        &self,
+        request: InjectionRequest,
+        post_wake: impl FnOnce(u32) -> Result<(), String>,
+    ) -> Result<u32, (u32, InjectionSubmissionFailure)> {
         let generation = self
             .next_generation
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1);
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if state.pending.is_some() || state.running.is_some() || state.completed.is_some() {
-            return Err("another native input request is still active".into());
+        if state.pending.len() >= MAX_PENDING_INJECTIONS {
+            return Err((generation, InjectionSubmissionFailure::Full));
         }
-        state.pending = Some(PendingInjection {
+        let needs_wake = !state.wake_posted;
+        state.pending.push_back(PendingInjection {
             generation,
             request,
         });
+        if needs_wake {
+            if let Err(error) = post_wake(generation) {
+                let removed = state.pending.pop_back();
+                debug_assert!(removed.is_some_and(|pending| pending.generation == generation));
+                return Err((generation, InjectionSubmissionFailure::Post(error)));
+            }
+            state.wake_posted = true;
+        }
         Ok(generation)
     }
 
-    fn cancel_pending(&self, generation: u32) {
+    fn take_next(&self) -> Option<PendingInjection> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if state
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.generation == generation)
-        {
-            state.pending = None;
+        let next = state.pending.pop_front();
+        if next.is_none() {
+            state.wake_posted = false;
         }
+        next
     }
 
-    fn take_pending(&self, generation: u32) -> Option<InjectionRequest> {
+    fn abandon_pending(&self) -> usize {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let pending = state.pending.take()?;
-        if pending.generation != generation {
-            state.pending = Some(pending);
-            return None;
-        }
-        state.running = Some(generation);
-        Some(pending.request)
-    }
-
-    fn complete(&self, generation: u32, result: Result<(), String>) {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if state.running == Some(generation) {
-            state.running = None;
-            state.completed = Some((generation, result.map_err(InjectionFailure::Execute)));
-            self.ready.notify_all();
-        }
-    }
-
-    fn fail_pending(&self, message: &str) {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(pending) = state.pending.take() {
-            state.completed = Some((
-                pending.generation,
-                Err(InjectionFailure::Wait(message.into())),
-            ));
-            self.ready.notify_all();
-        }
-    }
-
-    fn take_completed(
-        state: &mut InjectionState,
-        generation: u32,
-    ) -> Option<Result<(), InjectionFailure>> {
-        if state
-            .completed
-            .as_ref()
-            .is_some_and(|(completed, _)| *completed == generation)
-        {
-            return state.completed.take().map(|(_, result)| result);
-        }
-        None
-    }
-
-    fn wait(&self, generation: u32, pending_timeout: Duration) -> Result<(), InjectionFailure> {
-        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let (mut state, _) = self
-            .ready
-            .wait_timeout_while(state, pending_timeout, |state| {
-                state
-                    .pending
-                    .as_ref()
-                    .is_some_and(|pending| pending.generation == generation)
-                    && state
-                        .completed
-                        .as_ref()
-                        .is_none_or(|(completed, _)| *completed != generation)
-            })
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some(result) = Self::take_completed(&mut state, generation) {
-            return result;
-        }
-        if state
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.generation == generation)
-        {
-            state.pending = None;
-            return Err(InjectionFailure::Wait(
-                "input-hook message queue did not start the native input request".into(),
-            ));
-        }
-        if state.running == Some(generation) {
-            // Once SendInput is running it cannot be cancelled. Waiting here
-            // has exactly the same lifetime as the previous direct call and
-            // prevents a delayed click after the engine reports failure.
-            state = self
-                .ready
-                .wait_while(state, |state| {
-                    state
-                        .completed
-                        .as_ref()
-                        .is_none_or(|(completed, _)| *completed != generation)
-                })
-                .unwrap_or_else(|error| error.into_inner());
-            return Self::take_completed(&mut state, generation).unwrap_or_else(|| {
-                Err(InjectionFailure::Wait(
-                    "native input request lost its completion".into(),
-                ))
-            });
-        }
-        Err(InjectionFailure::Wait(
-            "native input request disappeared before execution".into(),
-        ))
+        let count = state.pending.len();
+        state.pending.clear();
+        state.wake_posted = false;
+        count
     }
 }
 
@@ -313,7 +297,7 @@ thread_local! {
 pub struct HookThread {
     receiver: Receiver<Envelope>,
     mailbox: Arc<DispositionMailbox>,
-    injection: Arc<InjectionSlot>,
+    injection: Arc<InjectionQueue>,
     pending: Option<u64>,
     thread_id: u32,
     join: Option<std::thread::JoinHandle<()>>,
@@ -336,7 +320,7 @@ impl HookThread {
         // linked channel on physical key edges.
         let (event_tx, event_rx) = mpsc::sync_channel(32);
         let mailbox = Arc::new(DispositionMailbox::default());
-        let injection = Arc::new(InjectionSlot::default());
+        let injection = Arc::new(InjectionQueue::default());
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let thread_mailbox = Arc::clone(&mailbox);
         let thread_injection = Arc::clone(&injection);
@@ -389,39 +373,37 @@ impl HookThread {
         Ok(())
     }
 
-    /// Queue SendInput work behind the callback currently deciding a physical
-    /// key. Running the native call from that message closes the race in which
-    /// another callback could start after an idle acknowledgement.
+    /// Queue SendInput work without waiting on the hook thread. A synchronous
+    /// wait here can deadlock when the next physical callback is already
+    /// waiting for the engine's disposition. Execution failures return later
+    /// as `BackendEvent::InputInjectionFailed`; successful requests stay
+    /// allocation- and log-free after this bounded enqueue.
     pub fn inject(&self, request: InjectionRequest) -> Result<(), String> {
         if self.thread_id == 0 {
             return Err("keyboard hook stopped before synthetic input could be submitted".into());
         }
-        let generation = self.injection.begin(request).map_err(|error| {
-            format!(
-                "{error}; injection={{route=hook_message, stage=reserve, native_thread={}, version={}}}",
-                self.thread_id,
-                env!("CARGO_PKG_VERSION")
-            )
-        })?;
-        if let Err(error) = super::native::post_thread_message(
-            self.thread_id,
-            INJECTION_MESSAGE,
-            generation as usize,
-        ) {
-            self.injection.cancel_pending(generation);
-            return Err(format!(
-                "cannot queue native input on the hook thread: {error}; injection={{route=hook_message, stage=post, generation={generation}, native_thread={}, version={}}}",
-                self.thread_id,
-                env!("CARGO_PKG_VERSION")
-            ));
-        }
         self.injection
-            .wait(generation, Duration::from_millis(100))
-            .map_err(|failure| {
+            .submit(request, |generation| {
+                super::native::post_thread_message(
+                    self.thread_id,
+                    INJECTION_MESSAGE,
+                    generation as usize,
+                )
+                .map_err(|error| error.to_string())
+            })
+            .map(|_| ())
+            .map_err(|(generation, failure)| {
                 let stage = failure.stage();
-                let error = failure.into_message();
+                let error = match failure {
+                    InjectionSubmissionFailure::Full => {
+                        format!("native input queue reached its {MAX_PENDING_INJECTIONS}-request bound")
+                    }
+                    InjectionSubmissionFailure::Post(error) => {
+                        format!("cannot wake the input hook for native input: {error}")
+                    }
+                };
                 format!(
-                    "{error}; injection={{route=hook_message, stage={stage}, generation={generation}, native_thread={}, version={}}}",
+                    "{error}; injection={{route=hook_queue, stage={stage}, generation={generation}, native_thread={}, version={}}}",
                     self.thread_id,
                     env!("CARGO_PKG_VERSION")
                 )
@@ -465,7 +447,7 @@ impl Drop for HookThread {
 fn hook_thread(
     sender: SyncSender<Envelope>,
     mailbox: Arc<DispositionMailbox>,
-    injection: Arc<InjectionSlot>,
+    injection: Arc<InjectionQueue>,
     ready: SyncSender<Result<u32, String>>,
     wake_thread: u32,
 ) {
@@ -540,10 +522,20 @@ fn hook_thread(
             continue;
         }
         if message.message == INJECTION_MESSAGE {
-            let generation = message.wParam.0 as u32;
-            if let Some(request) = injection.take_pending(generation) {
-                let result = request.execute();
-                injection.complete(generation, result);
+            while let Some(pending) = injection.take_next() {
+                if let Err(error) = pending.request.execute() {
+                    let message = format!(
+                        "{error}; injection={{route=hook_queue, stage=execute, generation={}, native_thread={thread_id}, version={}}}",
+                        pending.generation,
+                        env!("CARGO_PKG_VERSION")
+                    );
+                    if !send_envelope(Envelope {
+                        event: BackendEvent::InputInjectionFailed(message.clone()),
+                        generation: None,
+                    }) {
+                        crate::app::logging::report_error("windows-input", message);
+                    }
+                }
             }
             continue;
         }
@@ -569,10 +561,19 @@ fn hook_thread(
     if let Err(error) = unsafe { UnhookWindowsHookEx(keyboard_hook) } {
         crate::log_warning!("windows-hook", "cannot remove keyboard hook: {error}");
     }
+    let abandoned = injection.abandon_pending();
+    if abandoned != 0 {
+        let _ = send_envelope(Envelope {
+            event: BackendEvent::InputInjectionFailed(format!(
+                "input hook stopped with {abandoned} native input request(s) still queued; injection={{route=hook_queue, stage=shutdown, native_thread={thread_id}, version={}}}",
+                env!("CARGO_PKG_VERSION")
+            )),
+            generation: None,
+        });
+    }
     if let Ok(mut current) = slot.lock() {
         *current = None;
     }
-    injection.fail_pending("input hook stopped before the native input request ran");
     WAKE_THREAD.store(0, Ordering::Release);
     HOOK_THREAD.store(0, Ordering::Release);
     POINTER_PENDING.store(false, Ordering::Release);
@@ -824,7 +825,7 @@ mod tests {
         let mut hook = HookThread {
             receiver: event_rx,
             mailbox: Arc::clone(&mailbox),
-            injection: Arc::new(InjectionSlot::default()),
+            injection: Arc::new(InjectionQueue::default()),
             pending: Some(generation),
             thread_id: 0,
             join: None,
@@ -847,7 +848,7 @@ mod tests {
         let mut hook = HookThread {
             receiver: event_rx,
             mailbox,
-            injection: Arc::new(InjectionSlot::default()),
+            injection: Arc::new(InjectionQueue::default()),
             pending: Some(generation),
             thread_id: 0,
             join: None,
@@ -858,37 +859,54 @@ mod tests {
     }
 
     #[test]
-    fn injection_slot_executes_and_completes_only_its_generation() {
-        let slot = InjectionSlot::default();
+    fn injection_queue_coalesces_wakes_and_preserves_order() {
+        let queue = InjectionQueue::default();
+        let posts = Cell::new(0);
         let request = || InjectionRequest::MouseButton {
             button: MouseButton::Left,
             action: ButtonAction::Click,
         };
 
-        let first = slot.begin(request()).unwrap();
-        assert!(slot.take_pending(first.wrapping_add(1)).is_none());
-        assert!(slot.take_pending(first).is_some());
-        slot.complete(first, Ok(()));
-        assert!(slot.wait(first, Duration::ZERO).is_ok());
-
-        let second = slot.begin(request()).unwrap();
-        assert!(slot.wait(second, Duration::ZERO).is_err());
-        assert!(slot.take_pending(second).is_none());
-
-        let third = slot.begin(request()).unwrap();
-        slot.fail_pending("hook stopped");
-        let Err(InjectionFailure::Wait(message)) = slot.wait(third, Duration::ZERO) else {
-            panic!("stopped hook must report a wait-stage failure");
+        let post = |_| {
+            posts.set(posts.get() + 1);
+            Ok(())
         };
-        assert_eq!(message, "hook stopped");
+        let first = queue.submit(request(), post).unwrap();
+        let second = queue.submit(request(), post).unwrap();
+        assert_eq!(posts.get(), 1, "one wake drains the whole pending burst");
+        assert_eq!(queue.take_next().unwrap().generation, first);
+        assert_eq!(queue.take_next().unwrap().generation, second);
+        assert!(queue.take_next().is_none());
 
-        let fourth = slot.begin(request()).unwrap();
-        assert!(slot.take_pending(fourth).is_some());
-        slot.complete(fourth, Err("send failed".into()));
-        let Err(InjectionFailure::Execute(message)) = slot.wait(fourth, Duration::ZERO) else {
-            panic!("native failure must retain the execute stage");
+        let third = queue.submit(request(), post).unwrap();
+        assert_eq!(posts.get(), 2);
+        assert_eq!(queue.take_next().unwrap().generation, third);
+        assert!(queue.take_next().is_none());
+    }
+
+    #[test]
+    fn injection_queue_is_bounded_and_a_failed_wake_rolls_back() {
+        let queue = InjectionQueue::default();
+        let request = || InjectionRequest::MouseButton {
+            button: MouseButton::Left,
+            action: ButtonAction::Click,
         };
-        assert_eq!(message, "send failed");
+
+        let failed = queue.submit(request(), |_| Err("post failed".into()));
+        assert!(matches!(
+            failed,
+            Err((_, InjectionSubmissionFailure::Post(_)))
+        ));
+        assert_eq!(queue.abandon_pending(), 0);
+
+        for _ in 0..MAX_PENDING_INJECTIONS {
+            queue.submit(request(), |_| Ok(())).unwrap();
+        }
+        assert!(matches!(
+            queue.submit(request(), |_| Ok(())),
+            Err((_, InjectionSubmissionFailure::Full))
+        ));
+        assert_eq!(queue.abandon_pending(), MAX_PENDING_INJECTIONS);
     }
 
     #[test]

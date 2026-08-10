@@ -16,9 +16,11 @@ frame clock、overlay、UI scan、appearance、状态栏开关和 autostart。�
 
 - 创建 Backend 的线程也是 Win32 message loop、tray、overlay window 的 owner。
 - `hook.rs` 是专用低级键盘 Hook 线程，使用每事件 disposition handshake。点击、滚轮和
-  键盘注入写入一个固定容量请求槽，再由 Hook 线程退出当前物理键回调后的下一条
-  `WM_APP` 消息执行 `SendInput`。这样回调返回与注入之间没有跨线程竞争窗口，也没有
-  sleep、轮询或无限队列；连续光标移动仍直接使用 `SetCursorPos`，不经过请求槽。
+  键盘注入写入一个预分配、固定上限为 32 项的 FIFO，再由 Hook 线程退出当前物理键回调
+  后的 `WM_APP` 消息串行执行 `SendInput`。Engine 只入队而不等待 Hook 执行，避免快速
+  key-down/key-up 形成“Engine 等注入、Hook 等下一个 disposition”的锁环；相邻请求共用
+  一次唤醒，不使用 sleep、轮询、额外线程或无限队列。连续光标移动仍直接使用
+  `SetCursorPos`，不经过此队列。
 - 物理左右 Alt 始终立即透传，不延迟也不回放，因此 AHK、Quicker 和 `Alt+物理鼠标键` 能看到真实状态。若随后一个明确绑定的非修饰键被消费，Hook 将带自身标记的未分配 `0xE8` down/up 排入自己的消息循环，回调返回后再发送，以阻止 Alt 松开时激活菜单；失败只报告非致命 warning。
 - `accessibility.rs` 是持久 COM MTA UIA worker。
 - `frame_clock.rs` 有 DWM 等待 worker，one-slot channel 合并多余帧。
@@ -48,13 +50,14 @@ frame clock、overlay、UI scan、appearance、状态栏开关和 autostart。�
 Windows 点击首先以完整 down/up 序列交给一次 `SendInput`；连续单击的双击时间和空间判定
 由系统设置负责，显式 double-click 的两个 down/up 对也优先在同一个原生批次中提交。只有
 整个批次返回零、确认没有任何边沿插入时，才逐个提交原有边沿作为第三方 Hook 兼容降级；
-部分成功的批次绝不重放。降级中途失败时 Backend 保守记录按钮并追加一次 Release，退出时
-仍有统一释放兜底；若防御性 Release 也失败，会在下一次鼠标动作前再次释放。
+部分成功的批次绝不重放。降级中途失败时 Hook 在同一执行上下文立即追加一次 Release；
+键盘和弦失败也会释放其中所有 Down 键，退出时仍有统一释放兜底。
 
-正常注入成功路径不格式化诊断字符串，也不查询进程、令牌或前台窗口。只有请求投递、等待
-或 `SendInput` 失败时，错误才附加请求类型、Hook 消息阶段、generation、原生线程 ID、程序
-版本、原子批次/单边沿位置，以及当前与前台进程的安全上下文。原子批次失败但逐边沿降级
-成功属于异常兼容路径，只在进程内记录一次 warning。
+正常注入成功路径不格式化诊断字符串，也不查询进程、令牌或前台窗口。只有请求投递或
+`SendInput` 执行失败时，错误才附加请求类型、队列阶段、generation、原生线程 ID、程序
+版本、原子批次/单边沿位置，以及当前与前台进程的安全上下文。执行失败通过
+`InputInjectionFailed` 返回 Engine 并触发统一输入状态复位；成功不产生完成事件。原子批次
+失败但逐边沿降级成功属于异常兼容路径，只在进程内记录一次 warning。
 
 ## macOS
 

@@ -18,6 +18,12 @@ use std::time::Duration;
 pub enum BackendEvent {
     /// A key was pressed or released.
     Input(InputEvent),
+    /// A previously accepted native input request failed during execution.
+    ///
+    /// Some backends must submit synthetic input asynchronously so their
+    /// native input callback never waits on the engine while the engine waits
+    /// on that same callback. Successful requests produce no event.
+    InputInjectionFailed(String),
     /// The pointer moved.
     PointerMoved(Point),
     /// The display is ready for another animation frame.

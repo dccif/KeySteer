@@ -97,9 +97,6 @@ pub struct WindowsBackend {
     console_control: Option<console_control::ConsoleControl>,
     ui_automation: Option<accessibility::UiAutomationWorker>,
     held_buttons: Cell<u8>,
-    /// Composite compatibility fallback may have inserted a Down before a
-    /// later edge failed. Retry those releases before the next mouse action.
-    uncertain_buttons: Cell<u8>,
 }
 
 impl WindowsBackend {
@@ -169,7 +166,6 @@ impl WindowsBackend {
             console_control,
             ui_automation: None,
             held_buttons: Cell::new(0),
-            uncertain_buttons: Cell::new(0),
         })
     }
 
@@ -275,8 +271,6 @@ impl WindowsBackend {
             }) {
                 Ok(()) => {
                     self.held_buttons.set(self.held_buttons.get() & !bit);
-                    self.uncertain_buttons
-                        .set(self.uncertain_buttons.get() & !bit);
                 }
                 Err(error) if first_error.is_none() => first_error = Some(error),
                 Err(_) => {}
@@ -289,12 +283,9 @@ impl WindowsBackend {
         self.release_button_mask(self.held_buttons.get())
     }
 
-    fn retry_uncertain_buttons(&self) -> Result<(), String> {
-        self.release_button_mask(self.uncertain_buttons.get())
-    }
-
-    /// Serialize native input behind the physical-key callback on the hook
-    /// thread. Pointer warps intentionally bypass this path.
+    /// Serialize native input behind physical-key callbacks without making
+    /// the engine wait for the hook thread. Pointer warps intentionally bypass
+    /// this bounded queue.
     fn inject_input(&self, request: hook::InjectionRequest) -> Result<(), String> {
         if let Some(hook) = self.hook.as_ref() {
             return hook.inject(request);
@@ -457,56 +448,17 @@ impl Backend for WindowsBackend {
     }
 
     fn mouse_button(&self, button: MouseButton, action: ButtonAction) -> Result<(), String> {
-        self.retry_uncertain_buttons()?;
         let bit = input::button_mask(button);
-        // A zero-result batch is retried as individual edges. Conservatively
-        // remember composite actions before injection so a partially accepted
-        // compatibility retry can always be followed by an explicit release.
-        if matches!(action, ButtonAction::Click | ButtonAction::DoubleClick) {
-            self.held_buttons.set(self.held_buttons.get() | bit);
-        }
-        if let Err(error) =
-            self.inject_input(hook::InjectionRequest::MouseButton { button, action })
-        {
-            if matches!(action, ButtonAction::Click | ButtonAction::DoubleClick) {
-                self.uncertain_buttons
-                    .set(self.uncertain_buttons.get() | bit);
-                let release = self.inject_input(hook::InjectionRequest::MouseButton {
-                    button,
-                    action: ButtonAction::Release,
-                });
-                match release {
-                    Ok(()) => {
-                        self.held_buttons.set(self.held_buttons.get() & !bit);
-                        self.uncertain_buttons
-                            .set(self.uncertain_buttons.get() & !bit);
-                        return Err(format!(
-                            "{error}; a defensive {button:?} release was submitted"
-                        ));
-                    }
-                    Err(release_error) => {
-                        return Err(format!(
-                            "{error}; defensive {button:?} release also failed: {release_error}"
-                        ));
-                    }
-                }
-            }
-            return Err(error);
-        }
+        self.inject_input(hook::InjectionRequest::MouseButton { button, action })?;
         match action {
             ButtonAction::Press => self.held_buttons.set(self.held_buttons.get() | bit),
             ButtonAction::Release => self.held_buttons.set(self.held_buttons.get() & !bit),
-            ButtonAction::Click | ButtonAction::DoubleClick => {
-                self.held_buttons.set(self.held_buttons.get() & !bit);
-                self.uncertain_buttons
-                    .set(self.uncertain_buttons.get() & !bit);
-            }
+            ButtonAction::Click | ButtonAction::DoubleClick => {}
         }
         Ok(())
     }
 
     fn scroll(&self, dx: f64, dy: f64) -> Result<(), String> {
-        self.retry_uncertain_buttons()?;
         self.inject_input(hook::InjectionRequest::Scroll { dx, dy })
     }
 
