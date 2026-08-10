@@ -272,12 +272,22 @@ pub(crate) fn display_output_for_monitor(monitor: isize) -> Result<Option<Displa
 /// Wake a thread whose Win32 message queue has already been initialized.
 #[inline(always)]
 pub(crate) fn post_thread_wake(thread: u32, message: u32) -> windows::core::Result<()> {
+    post_thread_message(thread, message, 0)
+}
+
+/// Post an integer payload to an initialized Win32 thread message queue.
+#[inline(always)]
+pub(crate) fn post_thread_message(
+    thread: u32,
+    message: u32,
+    payload: usize,
+) -> windows::core::Result<()> {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW;
 
     // SAFETY: the payload contains no pointers and the receiver treats this as
-    // a wake-only application message.
-    unsafe { PostThreadMessageW(thread, message, WPARAM(0), LPARAM(0)) }
+    // an integer generation attached to an application-owned message.
+    unsafe { PostThreadMessageW(thread, message, WPARAM(payload), LPARAM(0)) }
 }
 
 /// Return the current foreground window, which may be null while focus changes.

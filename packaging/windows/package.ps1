@@ -34,6 +34,14 @@ if ([string]::IsNullOrWhiteSpace($version)) {
 
 Push-Location $projectRoot
 try {
+    # A release version bump changes the root package entry in Cargo.lock.
+    # Keep third-party dependency versions pinned while synchronizing only
+    # packages that belong to this workspace.
+    & cargo update --workspace
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo workspace lockfile synchronization failed with exit code $LASTEXITCODE"
+    }
+
     & cargo build --locked --release --target $Target
     if ($LASTEXITCODE -ne 0) {
         throw "cargo build failed with exit code $LASTEXITCODE"

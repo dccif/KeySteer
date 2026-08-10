@@ -1,6 +1,7 @@
 //! Windows keycode mapping and `SendInput` injection.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::Win32::Foundation::POINT;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -18,6 +19,7 @@ use crate::api::input::{Key, KeyState};
 
 /// Written to `dwExtraInfo` so the low-level hook can ignore our own input.
 pub const INJECTED_TAG: usize = 0x4E4D_4B31;
+static MOUSE_EDGE_FALLBACK_REPORTED: AtomicBool = AtomicBool::new(false);
 
 pub fn cursor_position() -> Result<Point, String> {
     let mut point = POINT::default();
@@ -42,7 +44,20 @@ pub fn move_cursor_relative(from: Point, dx: f64, dy: f64) -> Result<(), String>
     warp_cursor(Point::new(from.x + dx, from.y + dy))
 }
 
-fn send(inputs: &[INPUT]) -> Result<(), String> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SendFailure {
+    sent: usize,
+    expected: usize,
+    last_error: u32,
+}
+
+impl SendFailure {
+    fn message(self) -> String {
+        send_input_failure(self.sent, self.expected, self.last_error)
+    }
+}
+
+fn try_send(inputs: &[INPUT]) -> Result<(), SendFailure> {
     // SAFETY: the slice is valid for the call and INPUT's size is passed
     // explicitly, as SendInput requires. Last-error is captured in the same
     // block before any diagnostic API can overwrite it.
@@ -62,8 +77,105 @@ fn send(inputs: &[INPUT]) -> Result<(), String> {
     if sent as usize == inputs.len() {
         Ok(())
     } else {
-        Err(send_input_failure(sent as usize, inputs.len(), last_error))
+        Err(SendFailure {
+            sent: sent as usize,
+            expected: inputs.len(),
+            last_error,
+        })
     }
+}
+
+fn send(inputs: &[INPUT]) -> Result<(), String> {
+    try_send(inputs).map_err(SendFailure::message)
+}
+
+enum MouseBatchPath {
+    Atomic,
+    Individual { batch_failure: SendFailure },
+}
+
+enum MouseBatchFailure {
+    Batch(SendFailure),
+    Individual {
+        batch_failure: SendFailure,
+        event_index: usize,
+        event_failure: SendFailure,
+    },
+}
+
+fn send_mouse_batch_with(
+    inputs: &[INPUT],
+    mut attempt: impl FnMut(&[INPUT]) -> Result<(), SendFailure>,
+) -> Result<MouseBatchPath, MouseBatchFailure> {
+    match attempt(inputs) {
+        Ok(()) => Ok(MouseBatchPath::Atomic),
+        Err(batch_failure) if batch_failure.sent == 0 && inputs.len() > 1 => {
+            for (event_index, input) in inputs.iter().enumerate() {
+                if let Err(event_failure) = attempt(std::slice::from_ref(input)) {
+                    return Err(MouseBatchFailure::Individual {
+                        batch_failure,
+                        event_index,
+                        event_failure,
+                    });
+                }
+            }
+            Ok(MouseBatchPath::Individual { batch_failure })
+        }
+        Err(failure) => Err(MouseBatchFailure::Batch(failure)),
+    }
+}
+
+fn send_mouse_batch(
+    inputs: &[INPUT],
+    button: MouseButton,
+    action: ButtonAction,
+) -> Result<(), String> {
+    match send_mouse_batch_with(inputs, try_send) {
+        Ok(MouseBatchPath::Atomic) => Ok(()),
+        Ok(MouseBatchPath::Individual { batch_failure }) => {
+            if !MOUSE_EDGE_FALLBACK_REPORTED.swap(true, Ordering::Relaxed) {
+                crate::log_warning!(
+                    "windows-input",
+                    "SendInput rejected atomic mouse batch button={button:?} action={action:?} events={} with last_error=0x{:08X}; all individual-event compatibility attempts succeeded",
+                    batch_failure.expected,
+                    batch_failure.last_error
+                );
+            }
+            Ok(())
+        }
+        Err(MouseBatchFailure::Batch(failure)) => Err(failure.message()),
+        Err(MouseBatchFailure::Individual {
+            batch_failure,
+            event_index,
+            event_failure,
+        }) => Err(format_mouse_fallback_failure(
+            button,
+            action,
+            batch_failure,
+            event_index,
+            event_failure.message(),
+        )),
+    }
+}
+
+fn format_mouse_fallback_failure(
+    button: MouseButton,
+    action: ButtonAction,
+    batch_failure: SendFailure,
+    event_index: usize,
+    event_failure: String,
+) -> String {
+    let edge = if event_index.is_multiple_of(2) {
+        "down"
+    } else {
+        "up"
+    };
+    format!(
+        "SendInput rejected atomic mouse batch button={button:?} action={action:?} events={} with last_error=0x{:08X}; individual-event compatibility fallback failed at event={} edge={button:?}_{edge}: {event_failure}",
+        batch_failure.expected,
+        batch_failure.last_error,
+        event_index + 1
+    )
 }
 
 fn send_input_failure(sent: usize, expected: usize, last_error: u32) -> String {
@@ -139,7 +251,7 @@ pub fn mouse_button(button: MouseButton, action: ButtonAction) -> Result<(), Str
     // Click calls, while an explicit DoubleClick cannot be split by another
     // producer between its two down/up pairs.
     let (inputs, len) = mouse_button_inputs(button, action);
-    send(&inputs[..len])
+    send_mouse_batch(&inputs[..len], button, action)
 }
 
 /// One wheel notch, in the units `SendInput` expects.
@@ -451,6 +563,86 @@ mod tests {
         assert!(message.contains("inserted 0 of 2"));
         assert!(message.contains("last_error=0x00000000"));
         assert!(!message.contains("may be blocking"));
+    }
+
+    #[test]
+    fn zero_inserted_mouse_batch_retries_each_edge_once() {
+        let inputs = std::array::from_fn::<_, 2, _>(|_| INPUT::default());
+        let mut attempts = Vec::new();
+        let result = send_mouse_batch_with(&inputs, |batch| {
+            attempts.push(batch.len());
+            if attempts.len() == 1 {
+                Err(SendFailure {
+                    sent: 0,
+                    expected: batch.len(),
+                    last_error: 0,
+                })
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Ok(MouseBatchPath::Individual { .. })));
+        assert_eq!(attempts, [2, 1, 1]);
+    }
+
+    #[test]
+    fn partial_mouse_batch_is_never_replayed() {
+        let inputs = std::array::from_fn::<_, 2, _>(|_| INPUT::default());
+        let mut attempts = Vec::new();
+        let result = send_mouse_batch_with(&inputs, |batch| {
+            attempts.push(batch.len());
+            Err(SendFailure {
+                sent: 1,
+                expected: batch.len(),
+                last_error: 0,
+            })
+        });
+
+        assert!(matches!(result, Err(MouseBatchFailure::Batch(_))));
+        assert_eq!(attempts, [2]);
+    }
+
+    #[test]
+    fn individual_mouse_fallback_reports_the_exact_failed_edge() {
+        let inputs = std::array::from_fn::<_, 2, _>(|_| INPUT::default());
+        let mut attempt = 0;
+        let result = send_mouse_batch_with(&inputs, |batch| {
+            attempt += 1;
+            match attempt {
+                1 => Err(SendFailure {
+                    sent: 0,
+                    expected: batch.len(),
+                    last_error: 0,
+                }),
+                2 => Ok(()),
+                _ => Err(SendFailure {
+                    sent: 0,
+                    expected: batch.len(),
+                    last_error: 5,
+                }),
+            }
+        });
+
+        assert!(matches!(
+            result,
+            Err(MouseBatchFailure::Individual { event_index: 1, .. })
+        ));
+
+        let message = format_mouse_fallback_failure(
+            MouseButton::Left,
+            ButtonAction::Click,
+            SendFailure {
+                sent: 0,
+                expected: 2,
+                last_error: 0,
+            },
+            1,
+            "last_error=0x00000005".into(),
+        );
+        assert!(message.contains("button=Left action=Click events=2"));
+        assert!(message.contains("event=2 edge=Left_up"));
+        assert!(message.contains("last_error=0x00000005"));
     }
 
     #[test]

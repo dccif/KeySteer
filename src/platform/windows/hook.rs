@@ -15,8 +15,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::api::backend::{BackendEvent, KeyDisposition};
+use crate::api::command::{ButtonAction, MouseButton};
 use crate::api::geometry::Point;
-use crate::api::input::{InputEvent, KeyState};
+use crate::api::input::{InputEvent, Key, KeyState};
 
 use super::input;
 use crate::platform::disposition_mailbox::DispositionMailbox;
@@ -44,51 +45,216 @@ static CONSUMED_POINTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static LATEST_POINTER: AtomicU64 = AtomicU64::new(0);
 const WAKE_MESSAGE: u32 = WM_APP + 0x4D;
 const RESET_PRESSED_MESSAGE: u32 = WM_APP + 0x4F;
-const INJECTION_BARRIER_MESSAGE: u32 = WM_APP + 0x50;
+const INJECTION_MESSAGE: u32 = WM_APP + 0x50;
 const MENU_MASK_MESSAGE: u32 = WM_APP + 0x51;
 
-/// Reusable, allocation-free acknowledgement for one hook-thread message.
-/// Processing the message proves that the synchronous low-level callback which
-/// produced the current engine event has returned to the message loop.
+/// Native input work executed only from the hook thread's message loop. A
+/// posted request cannot run until the physical-key callback ahead of it has
+/// returned, closing the barrier-to-SendInput race on the engine thread.
+pub(super) enum InjectionRequest {
+    MouseButton {
+        button: MouseButton,
+        action: ButtonAction,
+    },
+    Scroll {
+        dx: f64,
+        dy: f64,
+    },
+    Key {
+        key: Key,
+        state: KeyState,
+    },
+    Keys(Vec<(Key, KeyState)>),
+}
+
+impl InjectionRequest {
+    fn execute(self) -> Result<(), String> {
+        match self {
+            Self::MouseButton { button, action } => {
+                input::mouse_button(button, action).map_err(|error| {
+                    format!("request=mouse button={button:?} action={action:?}; {error}")
+                })
+            }
+            Self::Scroll { dx, dy } => input::scroll(dx, dy)
+                .map_err(|error| format!("request=scroll dx={dx:.3} dy={dy:.3}; {error}")),
+            Self::Key { key, state } => input::send_key(&key, state)
+                .map_err(|error| format!("request=key key={key} state={state:?}; {error}")),
+            Self::Keys(events) => {
+                let event_count = events.len();
+                input::send_keys(&events).map_err(|error| {
+                    format!("request=keyboard_chord events={event_count}; {error}")
+                })
+            }
+        }
+    }
+}
+
+struct PendingInjection {
+    generation: u32,
+    request: InjectionRequest,
+}
+
+#[derive(Debug)]
+enum InjectionFailure {
+    Wait(String),
+    Execute(String),
+}
+
+impl InjectionFailure {
+    fn stage(&self) -> &'static str {
+        match self {
+            Self::Wait(_) => "wait",
+            Self::Execute(_) => "execute",
+        }
+    }
+
+    fn into_message(self) -> String {
+        match self {
+            Self::Wait(message) | Self::Execute(message) => message,
+        }
+    }
+}
+
 #[derive(Default)]
-struct InjectionBarrier {
-    next_generation: AtomicU64,
-    requested_generation: AtomicU64,
-    completed_generation: Mutex<u64>,
+struct InjectionState {
+    pending: Option<PendingInjection>,
+    running: Option<u32>,
+    completed: Option<(u32, Result<(), InjectionFailure>)>,
+}
+
+/// One reusable request slot keeps injection ordered without an unbounded
+/// queue. The engine submits at most one synchronous backend operation at a
+/// time, so additional allocations are needed only for an existing key chord.
+#[derive(Default)]
+struct InjectionSlot {
+    next_generation: AtomicU32,
+    state: Mutex<InjectionState>,
     ready: Condvar,
 }
 
-impl InjectionBarrier {
-    fn begin(&self) -> u64 {
+impl InjectionSlot {
+    fn begin(&self, request: InjectionRequest) -> Result<u32, String> {
         let generation = self
             .next_generation
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1);
-        self.requested_generation
-            .store(generation, Ordering::Release);
-        generation
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.pending.is_some() || state.running.is_some() || state.completed.is_some() {
+            return Err("another native input request is still active".into());
+        }
+        state.pending = Some(PendingInjection {
+            generation,
+            request,
+        });
+        Ok(generation)
     }
 
-    fn complete_requested(&self) {
-        let generation = self.requested_generation.load(Ordering::Acquire);
-        let mut completed = self
-            .completed_generation
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        *completed = generation;
-        self.ready.notify_all();
+    fn cancel_pending(&self, generation: u32) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.generation == generation)
+        {
+            state.pending = None;
+        }
     }
 
-    fn wait(&self, generation: u64, timeout: Duration) -> bool {
-        let completed = self
-            .completed_generation
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let (completed, _) = self
+    fn take_pending(&self, generation: u32) -> Option<InjectionRequest> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let pending = state.pending.take()?;
+        if pending.generation != generation {
+            state.pending = Some(pending);
+            return None;
+        }
+        state.running = Some(generation);
+        Some(pending.request)
+    }
+
+    fn complete(&self, generation: u32, result: Result<(), String>) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.running == Some(generation) {
+            state.running = None;
+            state.completed = Some((generation, result.map_err(InjectionFailure::Execute)));
+            self.ready.notify_all();
+        }
+    }
+
+    fn fail_pending(&self, message: &str) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(pending) = state.pending.take() {
+            state.completed = Some((
+                pending.generation,
+                Err(InjectionFailure::Wait(message.into())),
+            ));
+            self.ready.notify_all();
+        }
+    }
+
+    fn take_completed(
+        state: &mut InjectionState,
+        generation: u32,
+    ) -> Option<Result<(), InjectionFailure>> {
+        if state
+            .completed
+            .as_ref()
+            .is_some_and(|(completed, _)| *completed == generation)
+        {
+            return state.completed.take().map(|(_, result)| result);
+        }
+        None
+    }
+
+    fn wait(&self, generation: u32, pending_timeout: Duration) -> Result<(), InjectionFailure> {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let (mut state, _) = self
             .ready
-            .wait_timeout_while(completed, timeout, |completed| *completed != generation)
+            .wait_timeout_while(state, pending_timeout, |state| {
+                state
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.generation == generation)
+                    && state
+                        .completed
+                        .as_ref()
+                        .is_none_or(|(completed, _)| *completed != generation)
+            })
             .unwrap_or_else(|error| error.into_inner());
-        *completed == generation
+        if let Some(result) = Self::take_completed(&mut state, generation) {
+            return result;
+        }
+        if state
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.generation == generation)
+        {
+            state.pending = None;
+            return Err(InjectionFailure::Wait(
+                "input-hook message queue did not start the native input request".into(),
+            ));
+        }
+        if state.running == Some(generation) {
+            // Once SendInput is running it cannot be cancelled. Waiting here
+            // has exactly the same lifetime as the previous direct call and
+            // prevents a delayed click after the engine reports failure.
+            state = self
+                .ready
+                .wait_while(state, |state| {
+                    state
+                        .completed
+                        .as_ref()
+                        .is_none_or(|(completed, _)| *completed != generation)
+                })
+                .unwrap_or_else(|error| error.into_inner());
+            return Self::take_completed(&mut state, generation).unwrap_or_else(|| {
+                Err(InjectionFailure::Wait(
+                    "native input request lost its completion".into(),
+                ))
+            });
+        }
+        Err(InjectionFailure::Wait(
+            "native input request disappeared before execution".into(),
+        ))
     }
 }
 
@@ -147,8 +313,7 @@ thread_local! {
 pub struct HookThread {
     receiver: Receiver<Envelope>,
     mailbox: Arc<DispositionMailbox>,
-    injection_barrier: Arc<InjectionBarrier>,
-    injection_barrier_pending: Cell<bool>,
+    injection: Arc<InjectionSlot>,
     pending: Option<u64>,
     thread_id: u32,
     join: Option<std::thread::JoinHandle<()>>,
@@ -171,17 +336,17 @@ impl HookThread {
         // linked channel on physical key edges.
         let (event_tx, event_rx) = mpsc::sync_channel(32);
         let mailbox = Arc::new(DispositionMailbox::default());
-        let injection_barrier = Arc::new(InjectionBarrier::default());
+        let injection = Arc::new(InjectionSlot::default());
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let thread_mailbox = Arc::clone(&mailbox);
-        let thread_injection_barrier = Arc::clone(&injection_barrier);
+        let thread_injection = Arc::clone(&injection);
         let join = std::thread::Builder::new()
             .name("keysteer-keyboard-hook".into())
             .spawn(move || {
                 hook_thread(
                     event_tx,
                     thread_mailbox,
-                    thread_injection_barrier,
+                    thread_injection,
                     ready_tx,
                     owner_thread,
                 )
@@ -193,8 +358,7 @@ impl HookThread {
         Ok(Self {
             receiver: event_rx,
             mailbox,
-            injection_barrier,
-            injection_barrier_pending: Cell::new(false),
+            injection,
             pending: None,
             thread_id,
             join: Some(join),
@@ -221,33 +385,47 @@ impl HookThread {
             .ok_or_else(|| "no keyboard event is awaiting a disposition".to_string())?;
         // A timed-out callback has already failed open. Generation matching
         // makes its late response harmless if a newer event owns the slot.
-        if self.mailbox.complete(generation, disposition) {
-            self.injection_barrier_pending.set(true);
-        }
+        let _ = self.mailbox.complete(generation, disposition);
         Ok(())
     }
 
-    /// Wait until the hook thread has returned from the callback whose event
-    /// the engine just consumed. `SendInput` otherwise races that callback and
-    /// can report that another thread is still blocking the input stream.
-    pub fn wait_until_idle_for_injection(&self) -> Result<(), String> {
-        if !self.injection_barrier_pending.get() {
-            return Ok(());
-        }
+    /// Queue SendInput work behind the callback currently deciding a physical
+    /// key. Running the native call from that message closes the race in which
+    /// another callback could start after an idle acknowledgement.
+    pub fn inject(&self, request: InjectionRequest) -> Result<(), String> {
         if self.thread_id == 0 {
             return Err("keyboard hook stopped before synthetic input could be submitted".into());
         }
-        let generation = self.injection_barrier.begin();
-        super::native::post_thread_wake(self.thread_id, INJECTION_BARRIER_MESSAGE)
-            .map_err(|error| format!("cannot queue input-hook barrier: {error}"))?;
-        if !self
-            .injection_barrier
-            .wait(generation, Duration::from_millis(100))
-        {
-            return Err("input-hook barrier timed out before synthetic input".into());
+        let generation = self.injection.begin(request).map_err(|error| {
+            format!(
+                "{error}; injection={{route=hook_message, stage=reserve, native_thread={}, version={}}}",
+                self.thread_id,
+                env!("CARGO_PKG_VERSION")
+            )
+        })?;
+        if let Err(error) = super::native::post_thread_message(
+            self.thread_id,
+            INJECTION_MESSAGE,
+            generation as usize,
+        ) {
+            self.injection.cancel_pending(generation);
+            return Err(format!(
+                "cannot queue native input on the hook thread: {error}; injection={{route=hook_message, stage=post, generation={generation}, native_thread={}, version={}}}",
+                self.thread_id,
+                env!("CARGO_PKG_VERSION")
+            ));
         }
-        self.injection_barrier_pending.set(false);
-        Ok(())
+        self.injection
+            .wait(generation, Duration::from_millis(100))
+            .map_err(|failure| {
+                let stage = failure.stage();
+                let error = failure.into_message();
+                format!(
+                    "{error}; injection={{route=hook_message, stage={stage}, generation={generation}, native_thread={}, version={}}}",
+                    self.thread_id,
+                    env!("CARGO_PKG_VERSION")
+                )
+            })
     }
 
     pub fn stop(&mut self) {
@@ -287,7 +465,7 @@ impl Drop for HookThread {
 fn hook_thread(
     sender: SyncSender<Envelope>,
     mailbox: Arc<DispositionMailbox>,
-    injection_barrier: Arc<InjectionBarrier>,
+    injection: Arc<InjectionSlot>,
     ready: SyncSender<Result<u32, String>>,
     wake_thread: u32,
 ) {
@@ -361,8 +539,12 @@ fn hook_thread(
             FORWARDED_ALT.with(|alt| alt.set(ForwardedAlt::default()));
             continue;
         }
-        if message.message == INJECTION_BARRIER_MESSAGE {
-            injection_barrier.complete_requested();
+        if message.message == INJECTION_MESSAGE {
+            let generation = message.wParam.0 as u32;
+            if let Some(request) = injection.take_pending(generation) {
+                let result = request.execute();
+                injection.complete(generation, result);
+            }
             continue;
         }
         if message.message == MENU_MASK_MESSAGE {
@@ -390,6 +572,7 @@ fn hook_thread(
     if let Ok(mut current) = slot.lock() {
         *current = None;
     }
+    injection.fail_pending("input hook stopped before the native input request ran");
     WAKE_THREAD.store(0, Ordering::Release);
     HOOK_THREAD.store(0, Ordering::Release);
     POINTER_PENDING.store(false, Ordering::Release);
@@ -637,13 +820,11 @@ mod tests {
     fn disposition_is_delivered_to_the_exact_waiting_event() {
         let (_event_tx, event_rx) = mpsc::channel();
         let mailbox = Arc::new(DispositionMailbox::default());
-        let injection_barrier = Arc::new(InjectionBarrier::default());
         let generation = mailbox.begin();
         let mut hook = HookThread {
             receiver: event_rx,
             mailbox: Arc::clone(&mailbox),
-            injection_barrier,
-            injection_barrier_pending: Cell::new(false),
+            injection: Arc::new(InjectionSlot::default()),
             pending: Some(generation),
             thread_id: 0,
             join: None,
@@ -655,21 +836,18 @@ mod tests {
             Some(KeyDisposition::Consume)
         );
         assert!(hook.pending.is_none());
-        assert!(hook.injection_barrier_pending.get());
     }
 
     #[test]
     fn a_timed_out_disposition_is_nonfatal() {
         let (_event_tx, event_rx) = mpsc::channel();
         let mailbox = Arc::new(DispositionMailbox::default());
-        let injection_barrier = Arc::new(InjectionBarrier::default());
         let generation = mailbox.begin();
         let _newer = mailbox.begin();
         let mut hook = HookThread {
             receiver: event_rx,
             mailbox,
-            injection_barrier,
-            injection_barrier_pending: Cell::new(false),
+            injection: Arc::new(InjectionSlot::default()),
             pending: Some(generation),
             thread_id: 0,
             join: None,
@@ -677,21 +855,40 @@ mod tests {
 
         hook.set_disposition(KeyDisposition::Forward).unwrap();
         assert!(hook.pending.is_none());
-        assert!(!hook.injection_barrier_pending.get());
     }
 
     #[test]
-    fn injection_barrier_acknowledges_only_the_current_generation() {
-        let barrier = InjectionBarrier::default();
-        let first = barrier.begin();
-        assert!(!barrier.wait(first, Duration::ZERO));
-        barrier.complete_requested();
-        assert!(barrier.wait(first, Duration::ZERO));
+    fn injection_slot_executes_and_completes_only_its_generation() {
+        let slot = InjectionSlot::default();
+        let request = || InjectionRequest::MouseButton {
+            button: MouseButton::Left,
+            action: ButtonAction::Click,
+        };
 
-        let second = barrier.begin();
-        assert!(!barrier.wait(second, Duration::ZERO));
-        barrier.complete_requested();
-        assert!(barrier.wait(second, Duration::ZERO));
+        let first = slot.begin(request()).unwrap();
+        assert!(slot.take_pending(first.wrapping_add(1)).is_none());
+        assert!(slot.take_pending(first).is_some());
+        slot.complete(first, Ok(()));
+        assert!(slot.wait(first, Duration::ZERO).is_ok());
+
+        let second = slot.begin(request()).unwrap();
+        assert!(slot.wait(second, Duration::ZERO).is_err());
+        assert!(slot.take_pending(second).is_none());
+
+        let third = slot.begin(request()).unwrap();
+        slot.fail_pending("hook stopped");
+        let Err(InjectionFailure::Wait(message)) = slot.wait(third, Duration::ZERO) else {
+            panic!("stopped hook must report a wait-stage failure");
+        };
+        assert_eq!(message, "hook stopped");
+
+        let fourth = slot.begin(request()).unwrap();
+        assert!(slot.take_pending(fourth).is_some());
+        slot.complete(fourth, Err("send failed".into()));
+        let Err(InjectionFailure::Execute(message)) = slot.wait(fourth, Duration::ZERO) else {
+            panic!("native failure must retain the execute stage");
+        };
+        assert_eq!(message, "send failed");
     }
 
     #[test]

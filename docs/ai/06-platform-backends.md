@@ -15,10 +15,10 @@ frame clock、overlay、UI scan、appearance、状态栏开关和 autostart。�
 ### 线程和事件
 
 - 创建 Backend 的线程也是 Win32 message loop、tray、overlay window 的 owner。
-- `hook.rs` 是专用低级键盘 Hook 线程，使用每事件 disposition handshake。Engine
-  完成 disposition 只代表回调已被唤醒；点击、滚轮或键盘注入前还要经过一个
-  `WM_APP` 消息屏障，确认回调已经返回消息循环，避免 `SendInput` 被仍在处理物理键的
-  Hook 线程拒绝。连续光标移动不经过该屏障。
+- `hook.rs` 是专用低级键盘 Hook 线程，使用每事件 disposition handshake。点击、滚轮和
+  键盘注入写入一个固定容量请求槽，再由 Hook 线程退出当前物理键回调后的下一条
+  `WM_APP` 消息执行 `SendInput`。这样回调返回与注入之间没有跨线程竞争窗口，也没有
+  sleep、轮询或无限队列；连续光标移动仍直接使用 `SetCursorPos`，不经过请求槽。
 - 物理左右 Alt 始终立即透传，不延迟也不回放，因此 AHK、Quicker 和 `Alt+物理鼠标键` 能看到真实状态。若随后一个明确绑定的非修饰键被消费，Hook 将带自身标记的未分配 `0xE8` down/up 排入自己的消息循环，回调返回后再发送，以阻止 Alt 松开时激活菜单；失败只报告非致命 warning。
 - `accessibility.rs` 是持久 COM MTA UIA worker。
 - `frame_clock.rs` 有 DWM 等待 worker，one-slot channel 合并多余帧。
@@ -29,7 +29,7 @@ frame clock、overlay、UI scan、appearance、状态栏开关和 autostart。�
 
 | 文件 | 原生职责 |
 | --- | --- |
-| `hook.rs` | `WH_KEYBOARD_LL`，过滤自身注入事件，同步消费决定 |
+| `hook.rs` | `WH_KEYBOARD_LL`、同步消费决定及回调后的串行输入注入 |
 | `input.rs` | `SendInput`、相对/绝对鼠标、滚轮、键盘和按钮状态 |
 | `screens.rs` | per-monitor DPI awareness、显示器与 work area |
 | `overlay.rs` | topmost layered click-through HWND、RGBA DIB、文字栅格化 |
@@ -45,8 +45,16 @@ frame clock、overlay、UI scan、appearance、状态栏开关和 autostart。�
 普通进程不能可靠注入管理员/UIPI 保护窗口。此时 Backend 抛出可恢复输入错误，Engine
 清理状态并回到 Idle；不要在 Windows Backend 里伪造成功。
 
-Windows 点击以完整 down/up 序列交给 `SendInput`；连续单击的双击时间和空间判定由系统
-设置负责，显式 double-click 的两个 down/up 对则在同一个原生批次中提交。
+Windows 点击首先以完整 down/up 序列交给一次 `SendInput`；连续单击的双击时间和空间判定
+由系统设置负责，显式 double-click 的两个 down/up 对也优先在同一个原生批次中提交。只有
+整个批次返回零、确认没有任何边沿插入时，才逐个提交原有边沿作为第三方 Hook 兼容降级；
+部分成功的批次绝不重放。降级中途失败时 Backend 保守记录按钮并追加一次 Release，退出时
+仍有统一释放兜底；若防御性 Release 也失败，会在下一次鼠标动作前再次释放。
+
+正常注入成功路径不格式化诊断字符串，也不查询进程、令牌或前台窗口。只有请求投递、等待
+或 `SendInput` 失败时，错误才附加请求类型、Hook 消息阶段、generation、原生线程 ID、程序
+版本、原子批次/单边沿位置，以及当前与前台进程的安全上下文。原子批次失败但逐边沿降级
+成功属于异常兼容路径，只在进程内记录一次 warning。
 
 ## macOS
 

@@ -36,10 +36,14 @@ UIA、AX 与 Vision 扫描放在 worker；结果带 scan id 与 owner，Engine �
 - Windows 和 macOS 都有对应 Backend 行为，未支持平台返回清晰错误。
 - Windows `SendInput` 失败日志必须保留实际返回数量和即时 `GetLastError`，并只在失败路径
   查询当前/前台进程的 session、integrity、elevation 与 UIAccess。UIPI 可能不设置错误码，
-  因此日志报告证据而不把所有零返回都断言为权限问题。
-- Windows Engine 完成键盘 disposition 后，不得立即与尚未返回的低级 Hook 回调竞争
-  `SendInput`。鼠标按钮、滚轮和键盘注入先等待 Hook 线程处理一个原生消息屏障；该屏障
-  由事件唤醒且只在注入前执行，不得改成 sleep、轮询或连续移动热路径上的固定等待。
+  因此日志报告证据而不把所有零返回都断言为权限问题。Hook route、stage、generation、原生
+  线程、版本和单边沿位置也只能在 `Err` 分支格式化；正常注入不得为诊断维护回调计数、分配
+  字符串或执行额外系统查询。
+- Windows Engine 完成键盘 disposition 后，不得从自己的线程与低级 Hook 回调竞争
+  `SendInput`。鼠标按钮、滚轮和键盘注入进入固定容量请求槽，由 Hook 线程返回消息循环后
+  在下一条原生消息中串行执行；不得改成 sleep、轮询、无限队列或连续移动热路径上的等待。
+- 鼠标点击保持完整批次优先。仅当批次插入数为零时才允许逐边沿降级；部分插入不得重放，
+  降级失败必须保守执行 Release，并保留进程退出时的按钮释放兜底。
 
 发布前运行：
 

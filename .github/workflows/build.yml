@@ -38,6 +38,9 @@ jobs:
       - name: Install Rust targets
         run: rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc
 
+      - name: Synchronize workspace version in Cargo.lock
+        run: cargo update --workspace
+
       - name: Test
         if: ${{ inputs.run_tests }}
         run: cargo test --locked --all-features
@@ -81,6 +84,9 @@ jobs:
 
       - name: Install Rust targets
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Synchronize workspace version in Cargo.lock
+        run: cargo update --workspace
 
       - name: Test
         if: ${{ inputs.run_tests }}
