@@ -10,7 +10,7 @@
 //! the current area without clicking.
 
 use crate::api::binding::Binding;
-use crate::api::command::{Command, FinishCause, HostContext, Mode, ModeEvent};
+use crate::api::command::{Command, CommandBatch, FinishCause, HostContext, Mode, ModeEvent};
 use crate::api::geometry::{Point, Rect};
 use crate::api::input::{Key, KeyState, ModeId};
 use crate::api::overlay::{Color, LabelStyle, OverlayLabel, OverlayScene, OverlayShape};
@@ -326,14 +326,14 @@ impl RecursiveGridMode {
     }
 
     fn redraw(&self, palette: &Palette) -> Vec<Command> {
-        vec![Command::ShowOverlay(self.scene(palette))]
+        vec![Command::show_overlay(self.scene(palette))]
     }
 
     /// Complete selection by moving only; lifecycle configuration decides what follows.
     fn commit(&self, point: Point, palette: &Palette) -> Vec<Command> {
         vec![
             Command::warp_to(point),
-            Command::ShowOverlay(self.scene(palette)),
+            Command::show_overlay(self.scene(palette)),
             Command::FinishMode {
                 cause: FinishCause::Selection,
             },
@@ -502,8 +502,8 @@ impl Mode for RecursiveGridMode {
         Some(palette.accent_alt)
     }
 
-    fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> Vec<Command> {
-        match event {
+    fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
+        CommandBatch::from(match event {
             ModeEvent::Activated { previous } => {
                 self.return_mode = previous.clone().unwrap_or_else(ModeId::idle);
                 self.reset(ctx.active_bounds());
@@ -550,7 +550,7 @@ impl Mode for RecursiveGridMode {
             ModeEvent::ConfigReloaded => {
                 let return_mode = self.return_mode.clone();
                 let Some(config) = ctx.config.downcast_ref::<Config>() else {
-                    return Vec::new();
+                    return CommandBatch::new();
                 };
                 *self = Self::new(config);
                 self.return_mode = return_mode;
@@ -558,17 +558,19 @@ impl Mode for RecursiveGridMode {
                 self.redraw(ctx.palette)
             }
             ModeEvent::Binding {
-                binding: Binding::ToggleCursorFollowSelection,
+                binding,
                 state: KeyState::Down,
                 ..
-            } => self.toggle_cursor_follow(ctx.palette),
+            } if matches!(binding.as_ref(), Binding::ToggleCursorFollowSelection) => {
+                self.toggle_cursor_follow(ctx.palette)
+            }
             ModeEvent::Key {
                 key,
                 state: KeyState::Down,
                 ..
             } => self.key_down(key, ctx),
             _ => Vec::new(),
-        }
+        })
     }
 }
 
@@ -624,6 +626,8 @@ mod tests {
 
     fn activate(mode: &mut RecursiveGridMode, env: &Env) -> Vec<Command> {
         mode.handle(&ModeEvent::Activated { previous: None }, &env.ctx())
+            .into_iter()
+            .collect()
     }
 
     fn press(mode: &mut RecursiveGridMode, env: &Env, name: &str) -> Vec<Command> {
@@ -635,22 +639,26 @@ mod tests {
             },
             &env.ctx(),
         )
+        .into_iter()
+        .collect()
     }
 
     fn toggle_follow(mode: &mut RecursiveGridMode, env: &Env) -> Vec<Command> {
         mode.handle(
             &ModeEvent::Binding {
-                binding: Binding::ToggleCursorFollowSelection,
+                binding: Binding::ToggleCursorFollowSelection.into(),
                 state: KeyState::Down,
                 key: Key::new("`").unwrap(),
             },
             &env.ctx(),
         )
+        .into_iter()
+        .collect()
     }
 
-    fn scene_of(commands: &[Command]) -> &OverlayScene {
+    fn scene_of<'a>(commands: impl IntoIterator<Item = &'a Command>) -> &'a OverlayScene {
         commands
-            .iter()
+            .into_iter()
             .find_map(|c| match c {
                 Command::ShowOverlay(s) => Some(s),
                 _ => None,

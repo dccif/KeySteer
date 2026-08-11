@@ -15,6 +15,12 @@ Normal 的活动方向使用四位 mask，而不是每个显示帧收集一个 `
 真实 elapsed 的解析积分决定；这个优化只消除逐帧堆分配，不改变对向抵消、对角线归一化
 或多物理键绑定到同一方向时的去重语义。
 
+Mode 热路径返回 `CommandBatch`：0/1/2 个命令不分配，第三个命令才 spill 到 `Vec`。
+64 位布局测试限制 `Command <= 64 B`、`CommandBatch <= 128 B`、`ModeEvent <= 112 B`；
+`tests/performance.rs` 用 instrumented allocator 锁定预热后的 Normal frame 为零分配，
+`cargo bench --bench core_hot_paths` 报告其 p50/p95/p99。temporary-mode chord 与 keymap 一起
+预编译，物理修饰键查通用别名时使用借用查表，不在按键路径构造临时 `Key`。
+
 cursor marker 由 Engine 在 mode scene 之上装饰；合成鼠标按钮进入 latched 状态，或普通
 click 的物理触发键仍按住时，仅替换 marker 的填充/轮廓颜色并刷新动态 overlay，不改变
 mode scene，也不重建静态 Grid/Hint 内容。latched 的真实按钮状态优先；普通 click 使用
@@ -69,9 +75,10 @@ mode scene，也不重建静态 Grid/Hint 内容。latched 的真实按钮状态
 
 窗口仍在 AppKit 主线程创建和更新。Engine、输入 Hook 与扫描工作不通过原生对象共享状态，只通过有界队列/安全 mailbox 通信。
 
-UI Hint 在活动扫描和重试期间复用 `scanned`/`hints` 容量；离开模式时若容量超过小型扫描
-上限则直接释放 backing allocation。`BTreeSet` 的节点在 `clear` 时本来就会逐项释放，
-无需伪造 shrink 操作。这样常见小扫描不反复分配，而 2000 目标级扫描不会成为 Idle 常驻内存。
+UI Hint 在活动扫描和重试期间复用 `scanned`/`hints` 容量，并为目标名缓存一次 lowercase
+结果；搜索重标记不得逐目标重新分配小写字符串。目标去重使用 `HashSet`，标签重叠分组使用
+按左边界排序的扫描线与并查集，常见稀疏布局不再全量执行 n² 比较。离开模式时若容量超过
+小型扫描上限则直接释放 backing allocation，因此 2000 目标级扫描不会成为 Idle 常驻内存。
 
 ## 帧时钟
 

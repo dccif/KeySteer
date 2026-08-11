@@ -7,12 +7,12 @@
 //! `/` enters search mode, where typing filters elements by their accessible
 //! name instead of matching labels.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::time::Duration;
 
 use crate::api::binding::Binding;
 use crate::api::command::{
-    Command, FinishCause, HostContext, Mode, ModeEvent, UiScanRequest, UiScanStatus,
+    Command, CommandBatch, FinishCause, HostContext, Mode, ModeEvent, UiScanRequest, UiScanStatus,
 };
 use crate::api::geometry::{Rect, UiTarget};
 use crate::api::input::{Key, KeyState, ModeId};
@@ -50,7 +50,8 @@ pub struct HintMode {
 
     /// Everything the current scan has returned so far.
     scanned: Vec<UiTarget>,
-    seen_targets: BTreeSet<(i64, i64, i64, i64, String, String)>,
+    scanned_names_lower: Vec<String>,
+    seen_targets: HashSet<(i64, i64, i64, i64, String, String)>,
     /// Labelled subset currently on screen; the value is an index into
     /// `scanned`.
     hints: Vec<Hint<usize>>,
@@ -76,7 +77,8 @@ impl HintMode {
             config: config.ui_hint.clone(),
             alphabet: config.ui_hint.hint_characters.chars().collect(),
             scanned: Vec::new(),
-            seen_targets: BTreeSet::new(),
+            scanned_names_lower: Vec::new(),
+            seen_targets: HashSet::new(),
             hints: Vec::new(),
             input: Input::Labels(String::new()),
             scanning: false,
@@ -95,14 +97,21 @@ impl HintMode {
 
     fn clear_scan_results(&mut self, release_large_buffers: bool) {
         self.scanned.clear();
+        self.scanned_names_lower.clear();
         self.seen_targets.clear();
         self.hints.clear();
         if release_large_buffers {
             if self.scanned.capacity() > MAX_IDLE_RETAINED_TARGETS {
                 self.scanned = Vec::new();
             }
+            if self.scanned_names_lower.capacity() > MAX_IDLE_RETAINED_TARGETS {
+                self.scanned_names_lower = Vec::new();
+            }
             if self.hints.capacity() > MAX_IDLE_RETAINED_TARGETS {
                 self.hints = Vec::new();
+            }
+            if self.seen_targets.capacity() > MAX_IDLE_RETAINED_TARGETS {
+                self.seen_targets = HashSet::new();
             }
         }
     }
@@ -143,7 +152,7 @@ impl HintMode {
             .scan_timeout_ms
             .saturating_mul(timeout_multiplier)
             .min(MAX_SCAN_TIMEOUT_MS);
-        Command::ScanUi(UiScanRequest {
+        Command::scan_ui(UiScanRequest {
             id: self.scan_id,
             timeout_ms,
             bounds: Some(bounds),
@@ -176,6 +185,7 @@ impl HintMode {
                 target.role.clone(),
             );
             if self.seen_targets.insert(key) {
+                self.scanned_names_lower.push(target.name.to_lowercase());
                 self.scanned.push(target.clone());
             }
         }
@@ -189,13 +199,13 @@ impl HintMode {
             Input::Labels(_) => String::new(),
         };
 
-        let candidates: Vec<(Rect, usize)> = self
+        let candidates = self
             .scanned
             .iter()
+            .zip(&self.scanned_names_lower)
             .enumerate()
-            .filter(|(_, t)| query.is_empty() || t.name.to_lowercase().contains(&query))
-            .map(|(i, t)| (t.rect, i))
-            .collect();
+            .filter(|(_, (_, name_lower))| query.is_empty() || name_lower.contains(&query))
+            .map(|(i, (target, _))| (target.rect, i));
 
         self.hints = hints::assign(candidates, &self.alphabet, self.config.label_direction)
             .unwrap_or_default();
@@ -323,7 +333,7 @@ impl HintMode {
     }
 
     fn redraw(&self, ctx: &HostContext<'_>) -> Vec<Command> {
-        vec![Command::ShowOverlay(if self.finished {
+        vec![Command::show_overlay(if self.finished {
             self.finished_scene(ctx)
         } else {
             self.scene(ctx)
@@ -372,7 +382,7 @@ impl HintMode {
         let mut scene = OverlayScene::new();
         scene.clip = self.scan_bounds.or(Some(bounds));
         scene.push_label(OverlayLabel::new(text, rect, style).with_z_index(10));
-        vec![Command::ShowOverlay(scene)]
+        vec![Command::show_overlay(scene)]
     }
 
     fn select(&mut self, index: usize) -> Vec<Command> {
@@ -511,30 +521,65 @@ impl HintMode {
 /// the configured cycle modifier is held, one member of each group is raised.
 /// The stable default order is untouched, so releasing it restores that order.
 fn rotate_overlapping_labels(labels: &mut [OverlayLabel], cycle: usize) {
-    let mut visited = vec![false; labels.len()];
-    for start in 0..labels.len() {
-        if visited[start] {
-            continue;
+    fn root(parents: &mut [usize], mut index: usize) -> usize {
+        while parents[index] != index {
+            parents[index] = parents[parents[index]];
+            index = parents[index];
         }
-        visited[start] = true;
-        let mut stack = vec![start];
-        let mut component = Vec::new();
-        while let Some(index) = stack.pop() {
-            component.push(index);
-            for other in 0..labels.len() {
-                if !visited[other] && labels[index].rect.intersect(&labels[other].rect).is_some() {
-                    visited[other] = true;
-                    stack.push(other);
-                }
+        index
+    }
+
+    let count = labels.len();
+    let mut parents: Vec<usize> = (0..count).collect();
+    let mut ranks = vec![0u8; count];
+    let mut order: Vec<usize> = (0..count).collect();
+    order.sort_unstable_by(|left, right| {
+        labels[*left]
+            .rect
+            .left()
+            .total_cmp(&labels[*right].rect.left())
+    });
+
+    // Sweep from left to right. Only rectangles whose right edge still
+    // reaches the current label can intersect it, avoiding the previous full
+    // n-by-n scan for ordinary sparse UI layouts.
+    let mut active: Vec<usize> = Vec::new();
+    for index in order {
+        let left = labels[index].rect.left();
+        active.retain(|other| labels[*other].rect.right() >= left);
+        for &other in &active {
+            if labels[index].rect.intersect(&labels[other].rect).is_none() {
+                continue;
+            }
+            let mut left_root = root(&mut parents, index);
+            let mut right_root = root(&mut parents, other);
+            if left_root == right_root {
+                continue;
+            }
+            if ranks[left_root] < ranks[right_root] {
+                std::mem::swap(&mut left_root, &mut right_root);
+            }
+            parents[right_root] = left_root;
+            if ranks[left_root] == ranks[right_root] {
+                ranks[left_root] = ranks[left_root].saturating_add(1);
             }
         }
-        if component.len() > 1 {
-            component.sort_unstable();
-            // The final member is on top by default. Cycle 1 raises the first,
-            // cycle 2 the second, eventually returning to the default member.
-            let selected = component[(cycle + component.len() - 1) % component.len()];
-            labels[selected].z_index = 3;
+        active.push(index);
+    }
+
+    let mut sizes = vec![0usize; count];
+    for index in 0..count {
+        let component = root(&mut parents, index);
+        sizes[component] += 1;
+    }
+    let mut positions = vec![0usize; count];
+    for (index, label) in labels.iter_mut().enumerate() {
+        let component = root(&mut parents, index);
+        let size = sizes[component];
+        if size > 1 && positions[component] == (cycle + size - 1) % size {
+            label.z_index = 3;
         }
+        positions[component] += 1;
     }
 }
 
@@ -551,8 +596,8 @@ impl Mode for HintMode {
         Some(palette.accent)
     }
 
-    fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> Vec<Command> {
-        match event {
+    fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
+        CommandBatch::from(match event {
             ModeEvent::Activated { previous } => {
                 self.return_mode = previous.clone().unwrap_or_else(ModeId::idle);
                 self.request_scan(ctx)
@@ -591,7 +636,7 @@ impl Mode for HintMode {
                     self.scanning = false;
                     self.clear_scan_results(false);
                     self.status = Some("Focused window changed — Esc to exit".into());
-                    return self.status_scene(ctx);
+                    return self.status_scene(ctx).into();
                 }
 
                 let added = self.append_targets(&result.targets);
@@ -604,7 +649,11 @@ impl Mode for HintMode {
 
                 if result.status == UiScanStatus::Partial {
                     self.status = None;
-                    return if added { self.redraw(ctx) } else { Vec::new() };
+                    return if added {
+                        self.redraw(ctx).into()
+                    } else {
+                        CommandBatch::new()
+                    };
                 }
 
                 let retryable_empty = self.hints.is_empty()
@@ -627,7 +676,7 @@ impl Mode for HintMode {
                         delay: Duration::from_millis(self.config.scan_retry_delay_ms),
                         repeating: false,
                     });
-                    return commands;
+                    return commands.into();
                 }
 
                 self.scanning = false;
@@ -643,7 +692,7 @@ impl Mode for HintMode {
                     UiScanStatus::Partial | UiScanStatus::ContextChanged => unreachable!(),
                 };
                 if self.hints.is_empty() {
-                    return self.status_scene(ctx);
+                    return self.status_scene(ctx).into();
                 }
                 self.redraw(ctx)
             }
@@ -656,10 +705,10 @@ impl Mode for HintMode {
                 self.retry_scan(ctx)
             }
             ModeEvent::Binding {
-                binding: Binding::RescanUi,
+                binding,
                 state: KeyState::Down,
                 ..
-            } => self.request_scan(ctx),
+            } if matches!(binding.as_ref(), Binding::RescanUi) => self.request_scan(ctx),
             // The tree we labelled belongs to the old window/geometry.
             ModeEvent::FocusChanged(_) | ModeEvent::ScreensChanged(_) if !self.finished => {
                 self.request_scan(ctx)
@@ -686,7 +735,7 @@ impl Mode for HintMode {
                 let scan_id = self.scan_id;
                 let scan_bounds = self.scan_bounds;
                 let Some(config) = ctx.config.downcast_ref::<Config>() else {
-                    return Vec::new();
+                    return CommandBatch::new();
                 };
                 *self = Self::new(config);
                 self.return_mode = return_mode;
@@ -708,7 +757,7 @@ impl Mode for HintMode {
             // Primary+F activation chord as an `f` hint selection.
             ModeEvent::Key { repeat: true, .. } => Vec::new(),
             _ => Vec::new(),
-        }
+        })
     }
 }
 
@@ -764,6 +813,8 @@ mod tests {
 
     fn activate(mode: &mut HintMode, env: &Env) -> Vec<Command> {
         mode.handle(&ModeEvent::Activated { previous: None }, &env.ctx())
+            .into_iter()
+            .collect()
     }
 
     fn deliver(mode: &mut HintMode, env: &Env, targets: Vec<UiTarget>) -> Vec<Command> {
@@ -775,6 +826,8 @@ mod tests {
             }),
             &env.ctx(),
         )
+        .into_iter()
+        .collect()
     }
 
     fn press(mode: &mut HintMode, env: &Env, name: &str) -> Vec<Command> {
@@ -786,6 +839,8 @@ mod tests {
             },
             &env.ctx(),
         )
+        .into_iter()
+        .collect()
     }
 
     fn release(mode: &mut HintMode, env: &Env, name: &str) -> Vec<Command> {
@@ -797,11 +852,13 @@ mod tests {
             },
             &env.ctx(),
         )
+        .into_iter()
+        .collect()
     }
 
-    fn scene_of(commands: &[Command]) -> &OverlayScene {
+    fn scene_of<'a>(commands: impl IntoIterator<Item = &'a Command>) -> &'a OverlayScene {
         commands
-            .iter()
+            .into_iter()
             .find_map(|c| match c {
                 Command::ShowOverlay(s) => Some(s),
                 _ => None,
@@ -814,13 +871,19 @@ mod tests {
         let env = Env::new();
         let mut mode = HintMode::new(&env.config);
         mode.scanned.reserve(1_024);
+        mode.scanned_names_lower.reserve(1_024);
+        mode.seen_targets.reserve(1_024);
         mode.hints.reserve(1_024);
         assert!(mode.scanned.capacity() > MAX_IDLE_RETAINED_TARGETS);
+        assert!(mode.scanned_names_lower.capacity() > MAX_IDLE_RETAINED_TARGETS);
+        assert!(mode.seen_targets.capacity() > MAX_IDLE_RETAINED_TARGETS);
         assert!(mode.hints.capacity() > MAX_IDLE_RETAINED_TARGETS);
 
         mode.handle(&ModeEvent::Deactivated, &env.ctx());
 
         assert_eq!(mode.scanned.capacity(), 0);
+        assert_eq!(mode.scanned_names_lower.capacity(), 0);
+        assert_eq!(mode.seen_targets.capacity(), 0);
         assert_eq!(mode.hints.capacity(), 0);
     }
 
@@ -1187,7 +1250,7 @@ mod tests {
         );
         let rescanned = mode.handle(
             &ModeEvent::Binding {
-                binding: Binding::RescanUi,
+                binding: Binding::RescanUi.into(),
                 state: KeyState::Down,
                 key: Key::new("r").unwrap(),
             },

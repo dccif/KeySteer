@@ -4,6 +4,7 @@
 //! elsewhere, so one configuration file works everywhere, and the aliases match
 //! what users already write (`Cmd`, `Super`, `Option`, `Return`, `PageUp`, …).
 
+use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -50,6 +51,12 @@ pub const fn primary_modifier() -> &'static str {
 /// A normalized key name (lowercase, `_`-separated).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Key(Arc<str>);
+
+impl Borrow<str> for Key {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
 
 impl Key {
     pub fn new(value: impl AsRef<str>) -> Result<Self, String> {

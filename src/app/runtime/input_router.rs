@@ -20,9 +20,6 @@ impl CompiledKeymap {
     pub fn compile(bindings: Vec<(String, Binding)>, aliases: &BTreeMap<String, String>) -> Self {
         let mut map = Self::default();
         for (text, binding) in bindings {
-            if binding == Binding::Disabled {
-                continue;
-            }
             if let Ok(chord) = KeyChord::parse_with_aliases(&text, aliases) {
                 map.insert(chord, binding);
             }
@@ -105,11 +102,7 @@ impl CompiledKeymap {
         self.by_activation
             .get(key)
             .into_iter()
-            .chain(
-                generic
-                    .and_then(|name| Key::new(name).ok())
-                    .and_then(|key| self.by_activation.get(&key)),
-            )
+            .chain(generic.and_then(|name| self.by_activation.get(name)))
             .flatten()
             .find(|entry| {
                 entry.chord.activation_matches(key)
@@ -203,6 +196,16 @@ mod tests {
         assert_eq!(
             map.lookup_with_specificity_strict(&h, &shift_h, |key| key == &shift),
             Some((Arc::new(mode("normal")), 1))
+        );
+    }
+
+    #[test]
+    fn disabled_binding_is_compiled_so_it_can_block_inheritance() {
+        let map = CompiledKeymap::compile(vec![("h".into(), Binding::Disabled)], &BTreeMap::new());
+        let h = Key::new("h").unwrap();
+        assert_eq!(
+            map.lookup(&h, std::slice::from_ref(&h)),
+            Some(Arc::new(Binding::Disabled))
         );
     }
 }

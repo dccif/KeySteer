@@ -30,14 +30,14 @@
 ## 一句话架构
 
 ```text
-TOML -> Config -> Engine -> ModeEvent -> Mode/Plugin -> Command -> Backend -> OS
-                    ^                                      |
-                    +-------------- BackendEvent <---------+
+TOML -> Config -> Engine -> ModeEvent -> Mode/Plugin -> CommandBatch<Command> -> Backend -> OS
+                    ^                                                    |
+                    +-------------------- BackendEvent <-----------------+
 ```
 
 - `api` 是跨层共享的唯一词汇。
 - `Engine` 负责编译按键、维护运行状态、切换模式和执行命令。
-- `Mode` 是平台无关状态机，只返回 `Command`。
+- `Mode` 是平台无关状态机，只返回内含 `Command` 的 `CommandBatch`。
 - `Backend` 是原生边界，负责 Hook、输入注入、屏幕、覆盖层、UI 扫描和状态栏。
 - Windows/macOS 由 `cfg(target_os)` 在编译期选择。
 

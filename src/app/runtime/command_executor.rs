@@ -55,7 +55,7 @@ impl Engine {
 
     pub(super) fn execute(
         &mut self,
-        commands: Vec<Command>,
+        commands: impl IntoIterator<Item = Command>,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
         let owner = self.active.clone();
@@ -65,7 +65,7 @@ impl Engine {
     pub(super) fn execute_for(
         &mut self,
         owner: &ModeId,
-        commands: Vec<Command>,
+        commands: impl IntoIterator<Item = Command>,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
         self.command_batch_depth += 1;
@@ -85,7 +85,7 @@ impl Engine {
     fn execute_commands(
         &mut self,
         owner: &ModeId,
-        commands: Vec<Command>,
+        commands: impl IntoIterator<Item = Command>,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
         for command in commands {
@@ -226,6 +226,7 @@ impl Engine {
                 }
 
                 Command::ScanUi(request) => {
+                    let request = *request;
                     let bounds = request
                         .bounds
                         .unwrap_or_else(|| self.context().active_bounds());

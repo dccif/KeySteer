@@ -487,9 +487,13 @@ impl OverlayScene {
 
     /// Sort primitives by z-index so backends may draw them in order.
     pub fn sorted(mut self) -> Self {
+        self.sort_in_place();
+        self
+    }
+
+    pub(crate) fn sort_in_place(&mut self) {
         self.shapes.sort_by_key(OverlayShape::z_index);
         self.labels.sort_by_key(|l| l.z_index);
-        self
     }
 }
 

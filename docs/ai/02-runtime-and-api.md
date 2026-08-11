@@ -31,11 +31,16 @@ Windows 二进制默认无控制台；只有携带 CLI 参数时才尝试附加�
 
 - 原生层向上只产生 `BackendEvent`。
 - Engine 向 Mode 只发送 `ModeEvent` 和只读 `HostContext`。
-- Mode/Plugin 向外只返回 `Command`。
+- Mode/Plugin 向外只返回 `CommandBatch`；批次只包含 `Command`。
 - Engine 将 `Command` 翻译成 `Backend` 调用或新的 Mode 事件。
 
 Mode 不持有 Backend，也不能访问 HWND、NSWindow、UIA 或 AX。Backend 不理解 Grid、
 生命周期或绑定继承。
+
+`CommandBatch` 用 safe Rust 内联保存 0、1、2 个命令，第 3 个命令才退化为 `Vec`。大型
+`ShowOverlay` 和 `ScanUi` 载荷分别使用 `Arc<OverlayScene>` 与 `Box<UiScanRequest>`，避免
+把每个 `Command` 枚举值撑大。调用方优先用 `Command::show_overlay`、`Command::scan_ui`
+构造这两个变体。`ModeEvent::Binding` 共享 Engine 已编译的 `Arc<Binding>`，不复制绑定树。
 
 ## Engine 拥有什么
 
@@ -44,7 +49,8 @@ Mode 不持有 Backend，也不能访问 HWND、NSWindow、UIA 或 AX。Backend 
 - 配置/主题：`Config`、`Palette`、当前 `Appearance`。
 - 模式：注册表、活动 Mode、modal stack、插件默认绑定和 verb 所有者。
 - 输入：当前物理按键、每键 consume/forward disposition、held gesture、合成输入 latch。
-- 路由：每个 Mode 的 `CompiledKeymap` 和当前应用对应的 override profile key。
+- 路由：每个 Mode 的 `CompiledKeymap`、预解析的 temporary-mode chord 和当前应用对应的
+  override profile key。
 - 异步：动作序列、Mode timer、UI scan id -> owner、frame clock owner。
 - 环境：屏幕、权威光标坐标、当前应用。
 - 绘制：Mode 原始 scene、加装饰后的最后 scene、可见状态。

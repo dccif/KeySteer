@@ -15,7 +15,7 @@
 //! ever reach here, and identically for plugins.
 
 use crate::api::binding::{Binding, Direction, ScrollAmount, Speed};
-use crate::api::command::{Command, HostContext, Mode, ModeEvent};
+use crate::api::command::{Command, CommandBatch, HostContext, Mode, ModeEvent};
 use crate::api::input::{Key, KeyState, ModeId};
 use crate::api::overlay::Color;
 use crate::config::{Config, Palette, Pointer, Scroll};
@@ -227,8 +227,8 @@ impl NormalMode {
         self.moving.values().copied().collect()
     }
 
-    fn binding(&mut self, binding: &Binding, state: KeyState, key: &Key) -> Vec<Command> {
-        let mut out = Vec::new();
+    fn binding(&mut self, binding: &Binding, state: KeyState, key: &Key) -> CommandBatch {
+        let mut out = CommandBatch::new();
         let pressed = state == KeyState::Down;
 
         match binding {
@@ -316,20 +316,20 @@ impl NormalMode {
         was_moving
     }
 
-    fn frame(&mut self, elapsed: Duration) -> Vec<Command> {
+    fn frame(&mut self, elapsed: Duration) -> CommandBatch {
         self.frame_driven = true;
         self.fallback_tick = None;
         if self.moving.is_empty() {
-            return vec![Command::SetFrameClock(false)];
+            return Command::SetFrameClock(false).into();
         }
         let directions = self.directions();
         let (dx, dy) = self
             .motion
             .step(directions, &self.profile, self.multiplier(), elapsed);
         if dx == 0.0 && dy == 0.0 {
-            Vec::new()
+            CommandBatch::new()
         } else {
-            vec![Command::MovePointer { dx, dy }]
+            Command::MovePointer { dx, dy }.into()
         }
     }
 }
@@ -353,18 +353,16 @@ impl Mode for NormalMode {
         Some(palette.accent)
     }
 
-    fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> Vec<Command> {
+    fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
         match event {
             ModeEvent::Activated { .. } => {
                 self.release_all();
                 // Draw an empty scene so the engine can attach the indicator.
-                vec![Command::ShowOverlay(
-                    crate::api::overlay::OverlayScene::new(),
-                )]
+                Command::show_overlay(crate::api::overlay::OverlayScene::new()).into()
             }
             ModeEvent::Deactivated => {
                 self.release_all();
-                Vec::new()
+                CommandBatch::new()
             }
             ModeEvent::Binding {
                 binding,
@@ -373,19 +371,19 @@ impl Mode for NormalMode {
             } => self.binding(binding, *state, key),
             ModeEvent::Frame { elapsed } => self.frame(*elapsed),
             ModeEvent::ScreenRetargeted { screen, .. } => {
-                vec![Command::warp_to(screen.bounds.center())]
+                Command::warp_to(screen.bounds.center()).into()
             }
-            ModeEvent::Resumed => vec![Command::ShowOverlay(
-                crate::api::overlay::OverlayScene::new(),
-            )],
+            ModeEvent::Resumed => {
+                Command::show_overlay(crate::api::overlay::OverlayScene::new()).into()
+            }
             ModeEvent::ConfigReloaded => {
                 let Some(config) = ctx.config.downcast_ref::<Config>() else {
-                    return Vec::new();
+                    return CommandBatch::new();
                 };
                 *self = Self::new(config);
-                Vec::new()
+                CommandBatch::new()
             }
-            _ => Vec::new(),
+            _ => CommandBatch::new(),
         }
     }
 }
@@ -439,12 +437,14 @@ mod tests {
     ) -> Vec<Command> {
         mode.handle(
             &ModeEvent::Binding {
-                binding,
+                binding: binding.into(),
                 state,
                 key: Key::new(key).unwrap(),
             },
             &env.ctx(),
         )
+        .into_iter()
+        .collect()
     }
 
     fn down(mode: &mut NormalMode, env: &Env, binding: Binding, key: &str) -> Vec<Command> {
@@ -455,8 +455,8 @@ mod tests {
         send(mode, env, binding, KeyState::Up, key)
     }
 
-    fn horizontal(commands: &[Command]) -> Option<f64> {
-        commands.iter().find_map(|command| match command {
+    fn horizontal<'a>(commands: impl IntoIterator<Item = &'a Command>) -> Option<f64> {
+        commands.into_iter().find_map(|command| match command {
             Command::MovePointer { dx, .. } => Some(*dx),
             _ => None,
         })
@@ -621,9 +621,11 @@ mod tests {
                 },
                 &env.ctx(),
             );
-            if let [Command::MovePointer { dx, dy }] = out.as_slice() {
-                x += dx;
-                y += dy;
+            if out.len() == 1
+                && let Command::MovePointer { dx, dy } = &out[0]
+            {
+                x += *dx;
+                y += *dy;
             }
         }
         assert!(x > 0.0 && y > 0.0, "expected diagonal motion: {x},{y}");
@@ -663,12 +665,12 @@ mod tests {
             },
             &env.ctx(),
         );
-        match out.as_slice() {
-            [Command::MovePointer { dx, dy }] => {
+        match (out.len(), out.iter().next()) {
+            (1, Some(Command::MovePointer { dx, dy })) => {
                 assert_eq!(*dx, 0.0, "horizontal motion should have stopped");
                 assert!(*dy > 0.0, "vertical motion should continue");
             }
-            other => panic!("expected downward motion, got {other:?}"),
+            _ => panic!("expected downward motion, got {out:?}"),
         }
     }
 

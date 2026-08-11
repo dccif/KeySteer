@@ -1,6 +1,6 @@
 [package]
 name = "keysteer"
-version = "0.8.4"
+version = "0.8.5"
 authors = ["dccif"]
 edition = "2024"
 rust-version = "1.97"
@@ -132,6 +132,13 @@ version = "0.3.1"
 [build-dependencies]
 cc = "1.2"
 winresource = "0.1.31"
+
+[dev-dependencies]
+stats_alloc = "0.1.10"
+
+[[bench]]
+name = "core_hot_paths"
+harness = false
 
 [profile.release]
 opt-level = 3

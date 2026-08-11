@@ -28,8 +28,9 @@ pub use binding::{
     ScrollAmount, Speed,
 };
 pub use command::{
-    ButtonAction, Command, FinishCause, FocusedApp, HostContext, HostSettings, Mode, ModeEvent,
-    MouseButton, UiScanRequest, UiScanResult, UiScanStatus, UiScanStrategy, VisionOptions,
+    ButtonAction, Command, CommandBatch, FinishCause, FocusedApp, HostContext, HostSettings, Mode,
+    ModeEvent, MouseButton, UiScanRequest, UiScanResult, UiScanStatus, UiScanStrategy,
+    VisionOptions,
 };
 pub use geometry::{Point, Rect, Screen, UiTarget};
 pub use hint::LabelDirection;

@@ -2,7 +2,7 @@
 //! command, geometry, overlay and plugin APIs.
 
 use crate::api::binding::Binding;
-use crate::api::command::{Command, HostContext, Mode, ModeEvent};
+use crate::api::command::{Command, CommandBatch, HostContext, Mode, ModeEvent};
 use crate::api::geometry::Rect;
 use crate::api::input::{KeyChord, KeyState, ModeId};
 use crate::api::overlay::{Color, LabelStyle, OverlayLabel, OverlayScene, OverlayShape, Placement};
@@ -178,12 +178,12 @@ impl ScreenSelector {
             .collect();
         if matches.is_empty() {
             self.input.clear();
-            return vec![Command::ShowOverlay(self.scene(ctx))];
+            return vec![Command::show_overlay(self.scene(ctx))];
         }
         if matches.len() == 1 && matches[0].0 == self.input {
             return self.close_and_retarget(matches[0].1, ctx);
         }
-        vec![Command::ShowOverlay(self.scene(ctx))]
+        vec![Command::show_overlay(self.scene(ctx))]
     }
 }
 
@@ -196,8 +196,8 @@ impl Mode for ScreenSelector {
         "Screen".into()
     }
 
-    fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> Vec<Command> {
-        match event {
+    fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
+        CommandBatch::from(match event {
             ModeEvent::Invoked { verb, args } if verb == VERB => {
                 if args.is_empty() {
                     vec![Command::PushMode(self.id.clone())]
@@ -211,17 +211,17 @@ impl Mode for ScreenSelector {
                 self.modal = true;
                 self.return_mode = previous.clone();
                 self.build(ctx);
-                vec![Command::ShowOverlay(self.scene(ctx))]
+                vec![Command::show_overlay(self.scene(ctx))]
             }
             ModeEvent::Activated { previous } => {
                 self.modal = false;
                 self.return_mode = previous.clone().unwrap_or_else(ModeId::idle);
                 self.build(ctx);
-                vec![Command::ShowOverlay(self.scene(ctx))]
+                vec![Command::show_overlay(self.scene(ctx))]
             }
             ModeEvent::ScreensChanged(_) => {
                 self.build(ctx);
-                vec![Command::ShowOverlay(self.scene(ctx))]
+                vec![Command::show_overlay(self.scene(ctx))]
             }
             ModeEvent::Deactivated => {
                 self.cells.clear();
@@ -236,7 +236,7 @@ impl Mode for ScreenSelector {
                 "esc" => self.cancel(),
                 "backspace" => {
                     self.input.pop();
-                    vec![Command::ShowOverlay(self.scene(ctx))]
+                    vec![Command::show_overlay(self.scene(ctx))]
                 }
                 "enter" => self
                     .cells
@@ -253,7 +253,7 @@ impl Mode for ScreenSelector {
                 },
             },
             _ => Vec::new(),
-        }
+        })
     }
 }
 
@@ -306,13 +306,16 @@ mod tests {
     }
 
     fn invoke(plugin: &mut ScreenSelector, env: &Env, args: &[&str]) -> Vec<Command> {
-        plugin.handle(
-            &ModeEvent::Invoked {
-                verb: VERB.into(),
-                args: args.iter().map(|arg| (*arg).into()).collect(),
-            },
-            &env.ctx(),
-        )
+        plugin
+            .handle(
+                &ModeEvent::Invoked {
+                    verb: VERB.into(),
+                    args: args.iter().map(|arg| (*arg).into()).collect(),
+                },
+                &env.ctx(),
+            )
+            .into_iter()
+            .collect()
     }
 
     #[test]

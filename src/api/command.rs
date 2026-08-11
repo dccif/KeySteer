@@ -6,6 +6,9 @@
 //! built-in modes and third-party plugins interchangeable.
 
 use std::any::Any;
+use std::iter::FusedIterator;
+use std::ops::Index;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -84,7 +87,7 @@ pub enum Command {
     SetFrameClock(bool),
 
     /// Present a frame. Replaces whatever was on screen.
-    ShowOverlay(OverlayScene),
+    ShowOverlay(Arc<OverlayScene>),
     /// Tear down the overlay.
     HideOverlay,
 
@@ -100,7 +103,7 @@ pub enum Command {
 
     /// Ask the platform to walk the accessibility tree. The result arrives as
     /// [`ModeEvent::UiScanned`]. `bounds` of `None` means the focused window.
-    ScanUi(UiScanRequest),
+    ScanUi(Box<UiScanRequest>),
 
     /// Activate another mode. The engine deactivates the current one first.
     /// Plugins use this to hand control back to `idle` or to chain modes.
@@ -149,8 +152,8 @@ pub enum Command {
 
 impl Command {
     /// Convenience for the overwhelmingly common exit path.
-    pub fn dismiss_to_idle() -> Vec<Command> {
-        vec![Command::HideOverlay, Command::SwitchMode(ModeId::idle())]
+    pub fn dismiss_to_idle() -> CommandBatch {
+        CommandBatch::two(Command::HideOverlay, Command::SwitchMode(ModeId::idle()))
     }
 
     pub fn click(button: MouseButton) -> Command {
@@ -162,6 +165,255 @@ impl Command {
 
     pub fn warp_to(p: Point) -> Command {
         Command::WarpPointer { x: p.x, y: p.y }
+    }
+
+    pub fn show_overlay(scene: OverlayScene) -> Command {
+        Command::ShowOverlay(Arc::new(scene))
+    }
+
+    pub fn scan_ui(request: UiScanRequest) -> Command {
+        Command::ScanUi(Box::new(request))
+    }
+}
+
+/// A small, allocation-free command collection for mode hot paths.
+///
+/// Most mode events produce zero, one or two commands. Keeping those cases
+/// inline avoids a heap allocation while a `Vec` spill preserves an unbounded
+/// public API for uncommon larger batches. The implementation is entirely
+/// safe Rust.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommandBatch {
+    Empty,
+    One(Command),
+    Two(Command, Command),
+    Many(Vec<Command>),
+}
+
+impl CommandBatch {
+    pub const fn new() -> Self {
+        Self::Empty
+    }
+
+    pub const fn one(command: Command) -> Self {
+        Self::One(command)
+    }
+
+    pub const fn two(first: Command, second: Command) -> Self {
+        Self::Two(first, second)
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::One(_) => 1,
+            Self::Two(_, _) => 2,
+            Self::Many(commands) => commands.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    pub fn contains(&self, command: &Command) -> bool {
+        self.iter().any(|candidate| candidate == command)
+    }
+
+    pub fn push(&mut self, command: Command) {
+        *self = match std::mem::replace(self, Self::Empty) {
+            Self::Empty => Self::One(command),
+            Self::One(first) => Self::Two(first, command),
+            Self::Two(first, second) => Self::Many(vec![first, second, command]),
+            Self::Many(mut commands) => {
+                commands.push(command);
+                Self::Many(commands)
+            }
+        };
+    }
+
+    pub fn iter(&self) -> CommandBatchIter<'_> {
+        match self {
+            Self::Empty => CommandBatchIter::Empty,
+            Self::One(command) => CommandBatchIter::One(std::slice::from_ref(command).iter()),
+            Self::Two(first, second) => CommandBatchIter::Two([first, second].into_iter()),
+            Self::Many(commands) => CommandBatchIter::Many(commands.iter()),
+        }
+    }
+}
+
+impl Default for CommandBatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl From<Command> for CommandBatch {
+    fn from(command: Command) -> Self {
+        Self::one(command)
+    }
+}
+
+impl From<[Command; 2]> for CommandBatch {
+    fn from([first, second]: [Command; 2]) -> Self {
+        Self::two(first, second)
+    }
+}
+
+impl From<Vec<Command>> for CommandBatch {
+    fn from(commands: Vec<Command>) -> Self {
+        let mut commands = commands.into_iter();
+        let Some(first) = commands.next() else {
+            return Self::Empty;
+        };
+        let Some(second) = commands.next() else {
+            return Self::One(first);
+        };
+        let Some(third) = commands.next() else {
+            return Self::Two(first, second);
+        };
+        let mut many = Vec::with_capacity(commands.size_hint().0.saturating_add(3));
+        many.extend([first, second, third]);
+        many.extend(commands);
+        Self::Many(many)
+    }
+}
+
+impl FromIterator<Command> for CommandBatch {
+    fn from_iter<T: IntoIterator<Item = Command>>(iter: T) -> Self {
+        let mut batch = Self::new();
+        batch.extend(iter);
+        batch
+    }
+}
+
+impl Extend<Command> for CommandBatch {
+    fn extend<T: IntoIterator<Item = Command>>(&mut self, iter: T) {
+        for command in iter {
+            self.push(command);
+        }
+    }
+}
+
+impl Index<usize> for CommandBatch {
+    type Output = Command;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.iter().nth(index).unwrap_or_else(|| {
+            panic!(
+                "command index {index} out of bounds for length {}",
+                self.len()
+            )
+        })
+    }
+}
+
+impl PartialEq<Vec<Command>> for CommandBatch {
+    fn eq(&self, other: &Vec<Command>) -> bool {
+        self.iter().eq(other)
+    }
+}
+
+impl PartialEq<CommandBatch> for Vec<Command> {
+    fn eq(&self, other: &CommandBatch) -> bool {
+        self.iter().eq(other.iter())
+    }
+}
+
+pub enum CommandBatchIter<'a> {
+    Empty,
+    One(std::slice::Iter<'a, Command>),
+    Two(std::array::IntoIter<&'a Command, 2>),
+    Many(std::slice::Iter<'a, Command>),
+}
+
+impl<'a> Iterator for CommandBatchIter<'a> {
+    type Item = &'a Command;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Empty => None,
+            Self::One(iter) | Self::Many(iter) => iter.next(),
+            Self::Two(iter) => iter.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for CommandBatchIter<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::One(iter) | Self::Many(iter) => iter.len(),
+            Self::Two(iter) => iter.len(),
+        }
+    }
+}
+
+impl FusedIterator for CommandBatchIter<'_> {}
+
+pub enum CommandBatchIntoIter {
+    Empty,
+    One(std::option::IntoIter<Command>),
+    Two(std::array::IntoIter<Command, 2>),
+    Many(std::vec::IntoIter<Command>),
+}
+
+impl Iterator for CommandBatchIntoIter {
+    type Item = Command;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Empty => None,
+            Self::One(iter) => iter.next(),
+            Self::Two(iter) => iter.next(),
+            Self::Many(iter) => iter.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for CommandBatchIntoIter {
+    fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::One(iter) => iter.len(),
+            Self::Two(iter) => iter.len(),
+            Self::Many(iter) => iter.len(),
+        }
+    }
+}
+
+impl FusedIterator for CommandBatchIntoIter {}
+
+impl IntoIterator for CommandBatch {
+    type Item = Command;
+    type IntoIter = CommandBatchIntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            Self::Empty => CommandBatchIntoIter::Empty,
+            Self::One(command) => CommandBatchIntoIter::One(Some(command).into_iter()),
+            Self::Two(first, second) => CommandBatchIntoIter::Two([first, second].into_iter()),
+            Self::Many(commands) => CommandBatchIntoIter::Many(commands.into_iter()),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a CommandBatch {
+    type Item = &'a Command;
+    type IntoIter = CommandBatchIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
@@ -213,7 +465,7 @@ pub enum ModeEvent {
     /// This is the same event a plugin receives, which is what lets a plugin
     /// reuse `move_left` and friends rather than inventing its own vocabulary.
     Binding {
-        binding: Binding,
+        binding: Arc<Binding>,
         state: KeyState,
         /// The key that triggered it, for modes that need to track holds.
         key: Key,
@@ -430,7 +682,7 @@ pub trait Mode: Send {
     }
 
     /// Handle one event and return the commands it implies.
-    fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> Vec<Command>;
+    fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch;
 
     /// Whether this mode wants exclusive use of the keyboard. When true the
     /// host swallows keys instead of passing them to the focused app — which
@@ -455,5 +707,27 @@ mod tests {
             Command::dismiss_to_idle(),
             vec![Command::HideOverlay, Command::SwitchMode(ModeId::idle())]
         );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn command_layout_stays_within_the_64_bit_budget() {
+        let command = std::mem::size_of::<Command>();
+        let batch = std::mem::size_of::<CommandBatch>();
+        let event = std::mem::size_of::<ModeEvent>();
+        assert!(command <= 64, "Command grew to {command} bytes");
+        assert!(batch <= 128, "CommandBatch grew to {batch} bytes");
+        assert!(event <= 112, "ModeEvent grew to {event} bytes");
+    }
+
+    #[test]
+    fn command_batch_spills_only_after_two_commands() {
+        let mut batch = CommandBatch::new();
+        batch.push(Command::HideOverlay);
+        assert!(matches!(batch, CommandBatch::One(_)));
+        batch.push(Command::ReloadConfig);
+        assert!(matches!(batch, CommandBatch::Two(_, _)));
+        batch.push(Command::Quit);
+        assert!(matches!(batch, CommandBatch::Many(_)));
     }
 }

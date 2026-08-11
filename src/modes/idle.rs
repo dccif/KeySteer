@@ -5,7 +5,7 @@
 //! is invisible until the user asks for it. That activation key is resolved by
 //! the engine from `[hotkeys]`, so idle itself has no logic.
 
-use crate::api::command::{Command, HostContext, Mode, ModeEvent};
+use crate::api::command::{Command, CommandBatch, HostContext, Mode, ModeEvent};
 use crate::api::input::ModeId;
 use crate::config::Config;
 
@@ -37,11 +37,11 @@ impl Mode for IdleMode {
         false
     }
 
-    fn handle(&mut self, event: &ModeEvent, _ctx: &HostContext<'_>) -> Vec<Command> {
+    fn handle(&mut self, event: &ModeEvent, _ctx: &HostContext<'_>) -> CommandBatch {
         match event {
             // Clear anything the previous mode left on screen.
-            ModeEvent::Activated { .. } => vec![Command::HideOverlay],
-            _ => Vec::new(),
+            ModeEvent::Activated { .. } => Command::HideOverlay.into(),
+            _ => CommandBatch::new(),
         }
     }
 }

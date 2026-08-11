@@ -14,7 +14,7 @@ KeySteer 暂时没有一套"专属插件 API"：**一个插件就是一个 `Mode
 pub trait Mode: Send {
     fn id(&self) -> ModeId;            // 稳定标识，用于配置与唤醒
     fn display_name(&self) -> String { /* 默认: id 中的下划线替换为空格 */ }
-    fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> Vec<Command>;
+    fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch;
     fn captures_keyboard(&self) -> bool { true }              // 是否独占键盘
     fn indicator_color(&self, _palette: &Palette) -> Option<Color> { None }
 }
@@ -29,7 +29,7 @@ pub struct Manifest {
     pub id: String,            // reverse-DNS 风格唯一 id，如 "com.example.zoom"
     pub name: String,          // 人类可读名称
     pub description: String,   // 一句话说明
-    pub api_version: u32,      // 必须等于 API_VERSION（当前 6）
+    pub api_version: u32,      // 必须等于 API_VERSION（当前 7）
     pub default_chords: Vec<KeyChord>,     // 直接激活插件模式的遗留组合键
     pub verbs: Vec<String>,                // 插件导出的带参动词
     pub default_bindings: Vec<(KeyChord, Binding)>, // 建议绑定（见下）
@@ -40,7 +40,7 @@ Manifest 提供链式构造方法：`Manifest::new(id, name).with_description(..
 
 **校验规则**（`Manifest::validate`，注册时宿主会校验）：
 
-- `api_version` 必须等于 `API_VERSION`（当前 `6`），否则整个插件被拒绝
+- `api_version` 必须等于 `API_VERSION`（当前 `7`），否则整个插件被拒绝
 - `id` 只能包含 ASCII 字母、数字以及 `.`、`_`、`-`，不能为空
 - `verbs` 只能包含小写 ASCII 字母、数字和 `_`，不能为空
 
@@ -66,10 +66,10 @@ Manifest 提供链式构造方法：`Manifest::new(id, name).with_description(..
 | `MovePointer { dx, dy }` / `WarpPointer { x, y }` | 移动 / 跳转鼠标 |
 | `MouseButton { button, action }` | 按下、松开或点击鼠标键 |
 | `Scroll { dx, dy }` | 滚动 |
-| `ShowOverlay(OverlayScene)` / `HideOverlay` | 全屏覆盖层（网格、标签都靠它） |
+| `Command::show_overlay(OverlayScene)` / `HideOverlay` | 全屏覆盖层（网格、标签都靠它） |
 | `SetFrameClock(true)` | 用系统帧时钟驱动连续运动（不是普通定时器） |
 | `SendKey` / `SendChord` | 向聚焦应用注入按键 |
-| `ScanUi(UiScanRequest)` | 扫描可访问性树，结果以 `ModeEvent::UiScanned` 返回 |
+| `Command::scan_ui(UiScanRequest)` | 扫描可访问性树，结果以 `ModeEvent::UiScanned` 返回 |
 | `SwitchMode(ModeId)` / `PushMode` / `PopMode` | 切换模式 / 模态压栈 / 弹出 |
 | `RetargetScreen { index, preserve }` | 把会话迁到指定显示器 |
 | `SetTimer` / `CancelTimer` | 自定义延时任务 |

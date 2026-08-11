@@ -5,17 +5,18 @@ use super::*;
 impl Engine {
     pub(super) fn show_overlay(
         &mut self,
-        scene: OverlayScene,
+        mut scene: Arc<OverlayScene>,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
         if self.command_batch_depth > 0 {
-            self.pending_overlay = Some(PendingOverlay::Show(Box::new(scene)));
+            self.pending_overlay = Some(PendingOverlay::Show(scene));
             return Ok(());
         }
         // Static primitives keep their order for the lifetime of the mode
         // scene. Sort once before sharing them instead of sorting (and
         // detaching copy-on-write storage) on every cursor refresh.
-        self.show_shared_overlay_now(Arc::new(scene.sorted()), backend)
+        Arc::make_mut(&mut scene).sort_in_place();
+        self.show_shared_overlay_now(scene, backend)
     }
 
     fn show_shared_overlay_now(
@@ -183,8 +184,9 @@ impl Engine {
     ) -> Result<(), String> {
         match self.pending_overlay.take() {
             Some(PendingOverlay::Refresh) => self.refresh_overlay_now(backend),
-            Some(PendingOverlay::Show(scene)) => {
-                self.show_shared_overlay_now(Arc::new((*scene).sorted()), backend)
+            Some(PendingOverlay::Show(mut scene)) => {
+                Arc::make_mut(&mut scene).sort_in_place();
+                self.show_shared_overlay_now(scene, backend)
             }
             Some(PendingOverlay::Hide) => self.hide_overlay_now(backend),
             None => Ok(()),

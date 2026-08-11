@@ -452,7 +452,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "keysteer"
-version = "0.8.3"
+version = "0.8.5"
 dependencies = [
  "cc",
  "core-foundation",
@@ -469,6 +469,7 @@ dependencies = [
  "semver",
  "serde",
  "sha2",
+ "stats_alloc",
  "toml",
  "toml_edit",
  "ureq",
@@ -961,6 +962,12 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "stats_alloc"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c0e04424e733e69714ca1bbb9204c1a57f09f5493439520f9f68c132ad25eec"
 
 [[package]]
 name = "syn"

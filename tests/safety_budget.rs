@@ -2,13 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
-// Six reviewed native-boundary expressions implement display synchronisation:
-// four Win32/DXGI calls for the compatibility path, plus one C ABI declaration
-// and one consolidated bridge call for the Windows 11 compositor clock.
-// Two more reviewed expressions provide deterministic update-dialog lifetimes:
-// one consolidated Win32 owner/dialog/destroy block and one macOS target/action
-// setup. Both are contained in platform-only modules with typed native handles.
-const MAX_UNSAFE_EXPRESSIONS: usize = 313;
+// Keep the current audited native surface from growing. Portable layers are
+// checked separately below and remain entirely safe Rust.
+const MAX_UNSAFE_EXPRESSIONS: usize = 312;
 const MAX_UNSAFE_FILES: usize = 23;
 
 fn rust_files(directory: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {

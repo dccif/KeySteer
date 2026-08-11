@@ -36,8 +36,9 @@ pub use app::runtime as engine;
 pub use domain::hints;
 
 pub use api::{
-    Action, ActionPhase, ActionSequence, Backend, BackendEvent, Color, Command, FinishCause,
-    HostContext, Key, KeyChord, Mode, ModeEvent, ModeId, OverlayScene, Point, Rect, Screen,
+    Action, ActionPhase, ActionSequence, Backend, BackendEvent, Color, Command, CommandBatch,
+    FinishCause, HostContext, Key, KeyChord, Mode, ModeEvent, ModeId, OverlayScene, Point, Rect,
+    Screen,
 };
 pub use config::{Config, ConfigError, Palette, Theme};
 pub use engine::Engine;

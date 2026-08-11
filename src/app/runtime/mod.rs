@@ -214,7 +214,7 @@ impl<T> IntoIterator for KeyMap<T> {
 /// coalesced until the outermost batch completes.
 enum PendingOverlay {
     Refresh,
-    Show(Box<OverlayScene>),
+    Show(Arc<OverlayScene>),
     Hide,
 }
 
@@ -228,6 +228,9 @@ pub struct Engine {
 
     /// Resolved binding table per mode, rebuilt only when its effective profile changes.
     tables: BTreeMap<ModeId, CompiledKeymap>,
+    /// Parsed temporary-mode chords, rebuilt with the binding tables instead
+    /// of reparsed on every key edge and overlay refresh.
+    temporary_chords: BTreeMap<ModeId, Vec<(String, KeyChord)>>,
     /// Exact per-mode app-override patches used to build `tables`.
     binding_profile_key: Vec<Bindings>,
     #[cfg(test)]
@@ -307,6 +310,7 @@ impl Engine {
             modes: BTreeMap::new(),
             active: ModeId::idle(),
             tables: BTreeMap::new(),
+            temporary_chords: BTreeMap::new(),
             binding_profile_key: Vec::new(),
             #[cfg(test)]
             table_rebuild_count: 0,
@@ -444,21 +448,33 @@ impl Engine {
         }
 
         if previous != ModeId::idle() {
-            if let Some(mut mode) = self.modes.remove(&previous) {
+            let context = HostContext {
+                screens: &self.screens,
+                cursor: self.cursor,
+                focused_app: self.focused_app.as_ref(),
+                palette: &self.palette,
+                config: &self.config,
+            };
+            if let Some(mode) = self.modes.get_mut(&previous) {
                 // Let the mode clear its private session state, but discard
                 // commands: the recovery path must not inject more input.
-                let _ = mode.handle(&ModeEvent::Deactivated, &self.context());
-                self.modes.insert(previous.clone(), mode);
+                let _ = mode.handle(&ModeEvent::Deactivated, &context);
             }
             self.active = ModeId::idle();
-            if let Some(mut idle) = self.modes.remove(&ModeId::idle()) {
+            let context = HostContext {
+                screens: &self.screens,
+                cursor: self.cursor,
+                focused_app: self.focused_app.as_ref(),
+                palette: &self.palette,
+                config: &self.config,
+            };
+            if let Some(idle) = self.modes.get_mut(&ModeId::idle()) {
                 let _ = idle.handle(
                     &ModeEvent::Activated {
                         previous: Some(previous),
                     },
-                    &self.context(),
+                    &context,
                 );
-                self.modes.insert(ModeId::idle(), idle);
             }
         }
 
@@ -537,7 +553,19 @@ impl Engine {
             .binding_profile_key(ids.iter().map(|id| id.as_str()), self.focused_app.as_ref());
 
         let mut tables: BTreeMap<ModeId, CompiledKeymap> = BTreeMap::new();
+        let mut temporary_chords = BTreeMap::new();
         for id in ids {
+            if let Some((_, _, temporary_keys)) = self.config.inheritance_for(id.as_str()) {
+                let parsed = temporary_keys
+                    .iter()
+                    .filter_map(|text| {
+                        KeyChord::parse(text)
+                            .ok()
+                            .map(|chord| (text.clone(), chord))
+                    })
+                    .collect::<Vec<_>>();
+                temporary_chords.insert(id.clone(), parsed);
+            }
             let Some(configured) = self.config.bindings_for(id.as_str()) else {
                 continue;
             };
@@ -563,6 +591,7 @@ impl Engine {
         }
 
         self.tables = tables;
+        self.temporary_chords = temporary_chords;
         self.binding_profile_key = binding_profile_key;
         #[cfg(test)]
         {
@@ -1394,12 +1423,13 @@ impl Engine {
         }
     }
 
-    fn temporary_mode_is_active(&self, temporary_keys: &[String]) -> bool {
-        temporary_keys.iter().any(|name| {
-            let reserved_for_overlap = self.active == ModeId::ui_hint()
-                && self.config.ui_hint.overlap_cycle_conflicts_with(name);
-            !reserved_for_overlap
-                && KeyChord::parse(name).is_ok_and(|chord| chord.matches_pressed(&self.pressed))
+    fn temporary_mode_is_active(&self, mode: &ModeId) -> bool {
+        self.temporary_chords.get(mode).is_some_and(|chords| {
+            chords.iter().any(|(name, chord)| {
+                let reserved_for_overlap = self.active == ModeId::ui_hint()
+                    && self.config.ui_hint.overlap_cycle_conflicts_with(name);
+                !reserved_for_overlap && chord.matches_pressed(&self.pressed)
+            })
         })
     }
 
@@ -1407,12 +1437,10 @@ impl Engine {
         if self.active == ModeId::idle() {
             return self.active.clone();
         }
-        let Some((_, temporary_mode, temporary_keys)) =
-            self.config.inheritance_for(self.active.as_str())
-        else {
+        let Some((_, temporary_mode, _)) = self.config.inheritance_for(self.active.as_str()) else {
             return self.active.clone();
         };
-        let temporary_active = self.temporary_mode_is_active(temporary_keys);
+        let temporary_active = self.temporary_mode_is_active(&self.active);
         if temporary_active
             && let Some(source) = temporary_mode
             && let Ok(target) = Self::source_mode_id(source)
@@ -1437,15 +1465,14 @@ impl Engine {
             return None;
         }
 
-        let Some((inherits, temporary_mode, temporary_keys)) =
-            self.config.inheritance_for(self.active.as_str())
+        let Some((inherits, temporary_mode, _)) = self.config.inheritance_for(self.active.as_str())
         else {
             return active_match.map(|(binding, _)| ResolvedBinding {
                 binding,
                 owner: self.active.clone(),
             });
         };
-        let temporary_active = self.temporary_mode_is_active(temporary_keys);
+        let temporary_active = self.temporary_mode_is_active(&self.active);
         let temporary_match = temporary_active
             .then_some(temporary_mode)
             .flatten()
@@ -2071,7 +2098,7 @@ impl Engine {
                 self.dispatch_to(
                     &resolved.owner,
                     ModeEvent::Binding {
-                        binding: binding.clone(),
+                        binding: Arc::clone(&resolved.binding),
                         state: input.state,
                         key: input.key.clone(),
                     },
@@ -2271,11 +2298,17 @@ impl Engine {
             .collect();
 
         for owner in inactive {
-            let Some(mut mode) = self.modes.remove(&owner) else {
+            let context = HostContext {
+                screens: &self.screens,
+                cursor: self.cursor,
+                focused_app: self.focused_app.as_ref(),
+                palette: &self.palette,
+                config: &self.config,
+            };
+            let Some(mode) = self.modes.get_mut(&owner) else {
                 continue;
             };
-            let _ = mode.handle(&ModeEvent::ConfigReloaded, &self.context());
-            self.modes.insert(owner, mode);
+            let _ = mode.handle(&ModeEvent::ConfigReloaded, &context);
         }
         self.dispatch_to(&active, ModeEvent::ConfigReloaded, backend)
     }
@@ -2288,13 +2321,17 @@ impl Engine {
         event: ModeEvent,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
-        let Some(mut mode) = self.modes.remove(owner) else {
+        let context = HostContext {
+            screens: &self.screens,
+            cursor: self.cursor,
+            focused_app: self.focused_app.as_ref(),
+            palette: &self.palette,
+            config: &self.config,
+        };
+        let Some(mode) = self.modes.get_mut(owner) else {
             return Ok(());
         };
-        // The mode is detached during dispatch so it can hold `&mut self`
-        // state while the engine hands it an immutable context.
-        let commands = mode.handle(&event, &self.context());
-        self.modes.insert(owner.clone(), mode);
+        let commands = mode.handle(&event, &context);
         self.execute_for(owner, commands, backend)
     }
 
@@ -2355,7 +2392,7 @@ impl Engine {
                 self.dispatch_to(
                     &gesture.owner,
                     ModeEvent::Binding {
-                        binding: gesture.binding.as_ref().clone(),
+                        binding: Arc::clone(&gesture.binding),
                         state: KeyState::Up,
                         key,
                     },
@@ -2364,10 +2401,16 @@ impl Engine {
             }
 
             // Tear down the outgoing mode and drop the timers it owned.
-            if let Some(mut old) = self.modes.remove(&self.active) {
-                let commands = old.handle(&ModeEvent::Deactivated, &self.context());
+            let context = HostContext {
+                screens: &self.screens,
+                cursor: self.cursor,
+                focused_app: self.focused_app.as_ref(),
+                palette: &self.palette,
+                config: &self.config,
+            };
+            if let Some(old) = self.modes.get_mut(&self.active) {
+                let commands = old.handle(&ModeEvent::Deactivated, &context);
                 let old_id = old.id();
-                self.modes.insert(old_id.clone(), old);
                 self.execute(commands, backend)?;
                 self.timers.retain(|_, t| t.owner != old_id);
             }
@@ -2435,6 +2478,7 @@ fn map_button(button: crate::api::binding::Button) -> MouseButton {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::CommandBatch;
     use crate::api::binding::Direction;
     use crate::api::geometry::Rect;
     use crate::api::input::InputEvent;
@@ -2639,7 +2683,7 @@ mod tests {
         fn captures_keyboard(&self) -> bool {
             self.captures
         }
-        fn handle(&mut self, event: &ModeEvent, _ctx: &HostContext<'_>) -> Vec<Command> {
+        fn handle(&mut self, event: &ModeEvent, _ctx: &HostContext<'_>) -> CommandBatch {
             let label = match event {
                 ModeEvent::Activated { .. } => "activated",
                 ModeEvent::Pushed { .. } => "pushed",
@@ -2665,11 +2709,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("{}:{label}", self.id));
-            match event {
+            CommandBatch::from(match event {
                 ModeEvent::Key { .. } => self.on_key.clone(),
                 ModeEvent::ConfigReloaded => self.on_reload.clone(),
                 _ => Vec::new(),
-            }
+            })
         }
     }
 
@@ -5056,13 +5100,13 @@ mod tests {
             fn id(&self) -> ModeId {
                 self.0.clone()
             }
-            fn handle(&mut self, event: &ModeEvent, _c: &HostContext<'_>) -> Vec<Command> {
-                match event {
+            fn handle(&mut self, event: &ModeEvent, _c: &HostContext<'_>) -> CommandBatch {
+                CommandBatch::from(match event {
                     ModeEvent::Activated { .. } | ModeEvent::Key { .. } => {
-                        vec![Command::ShowOverlay(OverlayScene::new())]
+                        vec![Command::show_overlay(OverlayScene::new())]
                     }
                     _ => Vec::new(),
-                }
+                })
             }
         }
 
@@ -5089,9 +5133,9 @@ mod tests {
         engine
             .execute(
                 vec![
-                    Command::ShowOverlay(first),
+                    Command::show_overlay(first),
                     Command::warp_to(Point::new(30.0, 40.0)),
-                    Command::ShowOverlay(final_scene),
+                    Command::show_overlay(final_scene),
                 ],
                 &mut backend,
             )
@@ -5113,15 +5157,15 @@ mod tests {
             fn id(&self) -> ModeId {
                 self.0.clone()
             }
-            fn handle(&mut self, event: &ModeEvent, _c: &HostContext<'_>) -> Vec<Command> {
-                match event {
+            fn handle(&mut self, event: &ModeEvent, _c: &HostContext<'_>) -> CommandBatch {
+                CommandBatch::from(match event {
                     ModeEvent::Activated { .. } => vec![Command::SetTimer {
                         id: "tick".into(),
                         delay: Duration::from_millis(1),
                         repeating: true,
                     }],
                     _ => Vec::new(),
-                }
+                })
             }
         }
 
@@ -5143,9 +5187,9 @@ mod tests {
             fn id(&self) -> ModeId {
                 self.0.clone()
             }
-            fn handle(&mut self, event: &ModeEvent, _c: &HostContext<'_>) -> Vec<Command> {
-                match event {
-                    ModeEvent::Activated { .. } => vec![Command::ScanUi(UiScanRequest {
+            fn handle(&mut self, event: &ModeEvent, _c: &HostContext<'_>) -> CommandBatch {
+                CommandBatch::from(match event {
+                    ModeEvent::Activated { .. } => vec![Command::scan_ui(UiScanRequest {
                         id: 1,
                         timeout_ms: 2_500,
                         bounds: None,
@@ -5158,7 +5202,7 @@ mod tests {
                         app: None,
                     })],
                     _ => Vec::new(),
-                }
+                })
             }
         }
 
