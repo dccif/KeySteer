@@ -70,6 +70,7 @@ impl ScanQueue {
 
 pub(super) fn request_scan(request: UiScanRequest, sender: EventSender) {
     LATEST_SCAN.store(request.id, Ordering::Release);
+    vision::mark_latest(request.id);
     let request_id = request.id;
     let queue = match SCAN_QUEUE.get_or_init(ScanQueue::start) {
         Ok(queue) => queue,
@@ -148,17 +149,31 @@ fn scan_sources(strategy: UiScanStrategy) -> (bool, bool) {
 }
 
 fn stream_ax(job: &ScanJob, pid: libc::pid_t) -> UiScanStatus {
-    accessibility::scan_process_stream(pid, &job.request, |batch| {
-        send_partial(job, pid, batch);
-    })
+    accessibility::scan_process_stream(
+        pid,
+        &job.request,
+        || scan_id_is_current(job.request.id),
+        |batch| send_partial(job, pid, batch),
+    )
     .map(|_| UiScanStatus::Success)
     .unwrap_or_else(UiScanStatus::Failed)
 }
 
 fn stream_vision(job: &ScanJob, pid: libc::pid_t) -> UiScanStatus {
     let (targets, status) = scan_vision(pid, &job.request);
-    for batch in targets.chunks(16) {
-        send_partial(job, pid, batch.to_vec());
+    let mut batch = Vec::with_capacity(16);
+    for target in targets {
+        batch.push(target);
+        if batch.len() == 16 {
+            send_partial(
+                job,
+                pid,
+                std::mem::replace(&mut batch, Vec::with_capacity(16)),
+            );
+        }
+    }
+    if !batch.is_empty() {
+        send_partial(job, pid, batch);
     }
     status
 }
@@ -171,7 +186,11 @@ fn combined_status(ax: UiScanStatus, vision: UiScanStatus) -> UiScanStatus {
 }
 
 fn scan_is_current(request_id: u64, pid: libc::pid_t) -> bool {
-    LATEST_SCAN.load(Ordering::Acquire) == request_id && accessibility::frontmost_pid() == Some(pid)
+    scan_id_is_current(request_id) && accessibility::frontmost_pid() == Some(pid)
+}
+
+fn scan_id_is_current(request_id: u64) -> bool {
+    LATEST_SCAN.load(Ordering::Acquire) == request_id
 }
 
 fn send_partial(job: &ScanJob, pid: libc::pid_t, mut targets: Vec<crate::api::UiTarget>) {
@@ -220,7 +239,7 @@ fn scan_vision(
     // Vision is deliberately executed on this one persistent worker. A timed
     // out native capture may finish late, but another full-resolution capture
     // can never overlap it and multiply memory consumption.
-    vision::detect(bounds, &request.vision)
+    vision::detect(request.id, bounds, &request.vision)
 }
 
 #[cfg(test)]
@@ -295,7 +314,7 @@ mod tests {
             ready: Condvar::new(),
         };
         let (sender, _receiver) = std::sync::mpsc::channel();
-        let sender = EventSender::Channel(sender);
+        let sender = EventSender::new(sender);
         assert!(
             queue
                 .submit(ScanJob {

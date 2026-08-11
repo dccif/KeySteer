@@ -65,7 +65,8 @@ Engine 用 scan id 记录 owner；HintMode 也只接受当前 `scan_id`。旧 wo
 
 - 一个持久 worker + 单 pending slot，避免多个全分辨率截图并行扩大内存。
 - 新任务替换等待中的旧任务，并向旧请求发送 `ContextChanged`。
-- 每次发送前检查 `LATEST_SCAN` 和 frontmost pid。
+- 每次发送前检查 `LATEST_SCAN` 和 frontmost pid；新 id 也会让正在遍历的 AX 在节点边界
+  停止，并让 Vision 在 capture/识别阶段边界释放过期结果。
 - AX 和 Vision 都流式分批；Hybrid 在 scoped thread 中并行 AX，同时当前 worker 执行 Vision。
 
 AX：`src/platform/macos/accessibility.rs`。
@@ -73,12 +74,16 @@ AX：`src/platform/macos/accessibility.rs`。
 - 从 frontmost pid 创建 `AXUIElement` application。
 - 设置每节点 messaging timeout，受总 deadline 和 max depth 限制。
 - 读取 role、frame、enabled、actions 和 accessible name，语义 role 映射在本文件。
-- 遍历过程调用 batch callback，不等待整棵树。
+- 一次扫描复用固定的 AX 属性名 `CFString`；矩形去重使用预分配 `HashSet`。
+- 遍历过程把拥有所有权的 8 项 batch 直接交给 callback，不保留完整目标数组或深拷贝
+  已发送的 Partial。
 
 Vision：`src/platform/macos/vision.rs` + `vision_bridge.m`。
 
 - 获取 focused window bounds，与请求屏幕 bounds 取交集。
 - ScreenCaptureKit 截图后使用 Vision text/rectangle requests。
+- Retina 原生分辨率保持不变；Objective-C bridge 直接填充最多 2000 项的 C region 数组，
+  不为每个 observation 创建 `NSDictionary`/`NSNumber` 中间对象。
 - Rust 侧按 confidence、尺寸、宽高比和 IoU 分类/合并候选。
 - 原生请求超时后可能晚结束，但单 worker 保证不会叠加第二次全分辨率 capture。
 

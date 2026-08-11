@@ -44,6 +44,9 @@ struct WindowContent {
     shapes: Vec<Retained<CAShapeLayer>>,
     labels: Vec<LabelLayers>,
     cursor: Retained<CALayer>,
+    indicator_root: Retained<CALayer>,
+    indicator_labels: Vec<LabelLayers>,
+    indicator_size: (f64, f64),
     colors: HashMap<u32, Retained<CGColor>>,
     fonts: Vec<FontEntry>,
     scale: f64,
@@ -71,6 +74,28 @@ struct LabelSpec<'a> {
     z_index: i32,
 }
 
+#[derive(Clone, Copy)]
+enum LabelSlot {
+    Static(usize),
+    Indicator(usize),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WindowChanges {
+    created: bool,
+    geometry: bool,
+    scale: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SceneChanges {
+    static_content: bool,
+    cursor_content: bool,
+    cursor_position: bool,
+    indicator_content: bool,
+    indicator_position: bool,
+}
+
 impl Overlay {
     pub fn new() -> Self {
         Self {
@@ -95,26 +120,34 @@ impl Overlay {
             _ if cfg!(test) => Rect::new(0.0, 0.0, 1920.0, 1080.0),
             _ => render_area()?,
         };
-        let static_changed = self.area != Some(area)
-            || self
-                .scene
-                .as_deref()
-                .is_none_or(|previous| !static_scene_eq(previous, scene.as_ref()));
+        let mut changes = scene_changes(self.scene.as_deref(), scene.as_ref());
+        let area_changed = self.area != Some(area);
+        changes.static_content |= area_changed;
+        changes.cursor_position |= area_changed;
+        changes.indicator_position |= area_changed;
+        let was_visible = self.visible;
 
         if !cfg!(test) {
-            self.ensure_window(area)?;
+            let window_changes = self.ensure_window(area, area_changed)?;
+            changes.static_content |= window_changes.created || window_changes.scale;
+            changes.cursor_content |= window_changes.created || window_changes.scale;
+            changes.cursor_position |= window_changes.created || window_changes.geometry;
+            changes.indicator_content |= window_changes.created || window_changes.scale;
+            changes.indicator_position |= window_changes.created || window_changes.geometry;
             let content = self
                 .content
                 .as_mut()
                 .ok_or("macOS overlay window was not retained after creation")?;
             let _transaction = DisabledActions::begin();
-            if static_changed {
+            if changes.static_content {
                 content.update_static(scene.as_ref(), area);
             }
-            content.update_dynamic(scene.as_ref(), area);
-            content.window.orderFrontRegardless();
+            content.update_dynamic(scene.as_ref(), area, changes);
+            if !was_visible {
+                content.window.orderFrontRegardless();
+            }
         }
-        if static_changed {
+        if changes.static_content {
             self.static_updates = self.static_updates.wrapping_add(1);
         }
         self.area = Some(area);
@@ -156,21 +189,31 @@ impl Overlay {
             .ok_or_else(|| "macOS overlay layer tree is not initialized".to_string())
     }
 
-    fn ensure_window(&mut self, area: Rect) -> Result<(), String> {
-        let frame = cocoa_frame(area)?;
-        let view_frame = NSRect::new(NSPoint::new(0.0, 0.0), frame.size);
+    fn ensure_window(&mut self, area: Rect, area_changed: bool) -> Result<WindowChanges, String> {
         if let Some(content) = self.content.as_mut() {
             // Reassert the WindowServer-level click-through invariant whenever
             // a retained panel is reused. This does not depend on AppKit
             // dispatching a hit-test message while the main thread is busy.
             content.window.setIgnoresMouseEvents(true);
-            content.window.setFrame_display(frame, false);
-            content.root_view.setFrame(view_frame);
-            content.root_layer.setFrame(view_frame);
-            content.scale = content.window.backingScaleFactor().max(1.0);
-            return Ok(());
+            if area_changed {
+                let frame = cocoa_frame(area)?;
+                let view_frame = NSRect::new(NSPoint::new(0.0, 0.0), frame.size);
+                content.window.setFrame_display(frame, false);
+                content.root_view.setFrame(view_frame);
+                content.root_layer.setFrame(view_frame);
+            }
+            let scale = content.window.backingScaleFactor().max(1.0);
+            let scale_changed = content.scale.to_bits() != scale.to_bits();
+            content.scale = scale;
+            return Ok(WindowChanges {
+                created: false,
+                geometry: area_changed,
+                scale: scale_changed,
+            });
         }
 
+        let frame = cocoa_frame(area)?;
+        let view_frame = NSRect::new(NSPoint::new(0.0, 0.0), frame.size);
         let mtm = MainThreadMarker::new()
             .ok_or_else(|| "macOS overlay must be created on the main thread".to_string())?;
         let window = NSPanel::initWithContentRect_styleMask_backing_defer(
@@ -210,6 +253,10 @@ impl Overlay {
         let cursor = CALayer::new();
         cursor.setHidden(true);
         root_layer.addSublayer(&cursor);
+        let indicator_root = CALayer::new();
+        indicator_root.setHidden(true);
+        indicator_root.setZPosition(20_001.0);
+        root_layer.addSublayer(&indicator_root);
         let scale = window.backingScaleFactor().max(1.0);
         self.content = Some(WindowContent {
             window,
@@ -218,11 +265,18 @@ impl Overlay {
             shapes: Vec::new(),
             labels: Vec::new(),
             cursor,
+            indicator_root,
+            indicator_labels: Vec::with_capacity(2),
+            indicator_size: (0.0, 0.0),
             colors: HashMap::with_capacity(16),
             fonts: Vec::with_capacity(8),
             scale,
         });
-        Ok(())
+        Ok(WindowChanges {
+            created: true,
+            geometry: true,
+            scale: true,
+        })
     }
 }
 
@@ -245,6 +299,7 @@ impl WindowContent {
             shape.setHidden(true);
         }
 
+        self.trim_labels(scene.labels.len());
         self.ensure_labels(scene.labels.len());
         for (index, label) in scene.labels.iter().enumerate() {
             let spec = LabelSpec {
@@ -254,59 +309,17 @@ impl WindowContent {
                 matched_prefix_len: label.matched_prefix_len,
                 z_index: label.z_index,
             };
-            self.configure_label(index, spec, area);
+            self.configure_label(LabelSlot::Static(index), spec, area);
         }
     }
 
-    fn update_dynamic(&mut self, scene: &OverlayScene, area: Rect) {
-        self.configure_cursor(scene.cursor_marker.as_ref(), area);
-        let static_labels = scene.labels.len();
-        let dynamic_labels = scene.indicator.as_ref().map_or(0, |indicator| {
-            1 + usize::from(indicator.held_text.is_some())
-        });
-        let required_labels = static_labels + dynamic_labels;
-        self.trim_labels(required_labels);
-        self.ensure_labels(required_labels);
-        let mut used = static_labels;
-        if let Some(indicator) = &scene.indicator {
-            let (width, _, main, held) = indicator_layout(indicator);
-            let translate = |rect: Rect| {
-                Rect::new(
-                    indicator.position.x - width + rect.x,
-                    indicator.position.y + rect.y,
-                    rect.width,
-                    rect.height,
-                )
-            };
-            self.configure_label(
-                used,
-                LabelSpec {
-                    text: &indicator.text,
-                    rect: translate(main),
-                    style: &indicator.style,
-                    matched_prefix_len: 0,
-                    z_index: 20_001,
-                },
-                area,
-            );
-            used += 1;
-            if let (Some(text), Some(rect)) = (&indicator.held_text, held) {
-                self.configure_label(
-                    used,
-                    LabelSpec {
-                        text,
-                        rect: translate(rect),
-                        style: &indicator.style,
-                        matched_prefix_len: 0,
-                        z_index: 20_002,
-                    },
-                    area,
-                );
-                used += 1;
-            }
+    fn update_dynamic(&mut self, scene: &OverlayScene, area: Rect, changes: SceneChanges) {
+        if changes.cursor_content || changes.cursor_position {
+            self.configure_cursor(scene.cursor_marker.as_ref(), area, changes.cursor_content);
         }
-        for label in self.labels.iter().skip(used) {
-            label.base.setHidden(true);
+
+        if changes.indicator_content || changes.indicator_position {
+            self.configure_indicator(scene.indicator.as_ref(), area, changes.indicator_content);
         }
     }
 
@@ -328,32 +341,9 @@ impl WindowContent {
 
     fn ensure_labels(&mut self, count: usize) {
         while self.labels.len() < count {
-            let base = CATextLayer::layer();
-            let matched = CATextLayer::layer();
-            let mask = CALayer::new();
-            // SAFETY: QuartzCore exports this process-lifetime immutable
-            // alignment-mode object on every supported macOS version.
-            let center = unsafe { kCAAlignmentCenter };
-            base.setAlignmentMode(center);
-            matched.setAlignmentMode(center);
-            base.setWrapped(false);
-            matched.setWrapped(false);
-            base.setContentsScale(self.scale);
-            matched.setContentsScale(self.scale);
             let opaque = self.color(Color::rgb(0, 0, 0));
-            mask.setBackgroundColor(Some(&opaque));
-            // SAFETY: `mask` is retained by LabelLayers and Core Animation;
-            // it is a CALayer as required by the property contract.
-            unsafe { matched.setMask(Some(&mask)) };
-            base.addSublayer(&matched);
-            base.setHidden(true);
-            self.root_layer.addSublayer(&base);
-            self.labels.push(LabelLayers {
-                base,
-                matched,
-                mask,
-                text: String::new(),
-            });
+            self.labels
+                .push(LabelLayers::new(&self.root_layer, self.scale, &opaque));
         }
     }
 
@@ -361,11 +351,25 @@ impl WindowContent {
         trim_pool(&mut self.labels, count, LabelLayers::detach);
     }
 
+    fn ensure_indicator_labels(&mut self, count: usize) {
+        while self.indicator_labels.len() < count {
+            let opaque = self.color(Color::rgb(0, 0, 0));
+            let label = LabelLayers::new(&self.indicator_root, self.scale, &opaque);
+            self.indicator_labels.push(label);
+        }
+    }
+
+    fn trim_indicator_labels(&mut self, count: usize) {
+        trim_pool(&mut self.indicator_labels, count, LabelLayers::detach);
+    }
+
     fn teardown(&mut self) {
         self.window.orderOut(None);
         self.trim_shapes(0);
         self.trim_labels(0);
+        self.trim_indicator_labels(0);
         self.cursor.removeFromSuperlayer();
+        self.indicator_root.removeFromSuperlayer();
         self.root_layer.setBackgroundColor(None);
         self.root_view.setLayer(None);
         self.window.setContentView(None);
@@ -445,7 +449,7 @@ impl WindowContent {
         }
     }
 
-    fn configure_label(&mut self, index: usize, spec: LabelSpec<'_>, area: Rect) {
+    fn configure_label(&mut self, slot: LabelSlot, spec: LabelSpec<'_>, area: Rect) {
         let background =
             (!spec.style.background.is_transparent()).then(|| self.color(spec.style.background));
         let border = (!spec.style.border_color.is_transparent() && spec.style.border_width > 0.0)
@@ -453,7 +457,10 @@ impl WindowContent {
         let foreground = self.color(spec.style.text_color);
         let matched_foreground = self.color(spec.style.matched_text_color);
         let font = self.font(spec.style);
-        let layer = &mut self.labels[index];
+        let layer = match slot {
+            LabelSlot::Static(index) => &mut self.labels[index],
+            LabelSlot::Indicator(index) => &mut self.indicator_labels[index],
+        };
         let frame = to_window_rect(spec.rect, area);
         layer.base.setHidden(false);
         layer.base.setFrame(frame);
@@ -511,32 +518,99 @@ impl WindowContent {
         }
     }
 
-    fn configure_cursor(&mut self, marker: Option<&CursorMarker>, area: Rect) {
+    fn configure_cursor(
+        &mut self,
+        marker: Option<&CursorMarker>,
+        area: Rect,
+        content_changed: bool,
+    ) {
         let Some(marker) = marker else {
             self.cursor.setHidden(true);
             return;
         };
-        let fill = (!marker.fill.is_transparent()).then(|| self.color(marker.fill));
-        let stroke = (!marker.stroke.is_transparent() && marker.stroke_width > 0.0)
-            .then(|| self.color(marker.stroke));
         let rect = Rect::new(
             marker.center.x - marker.radius,
             marker.center.y - marker.radius,
             marker.radius * 2.0,
             marker.radius * 2.0,
         );
-        self.cursor.setHidden(false);
         self.cursor.setFrame(to_window_rect(rect, area));
-        self.cursor.setBackgroundColor(fill.as_deref());
-        self.cursor.setBorderColor(stroke.as_deref());
-        self.cursor.setBorderWidth(if stroke.is_some() {
-            marker.stroke_width.max(0.0)
-        } else {
-            0.0
-        });
-        self.cursor.setCornerRadius(marker.radius.max(0.0));
-        self.cursor.setZPosition(20_000.0);
-        self.cursor.setContentsScale(self.scale);
+        if content_changed {
+            self.cursor.setHidden(false);
+            let fill = (!marker.fill.is_transparent()).then(|| self.color(marker.fill));
+            let stroke = (!marker.stroke.is_transparent() && marker.stroke_width > 0.0)
+                .then(|| self.color(marker.stroke));
+            self.cursor.setBackgroundColor(fill.as_deref());
+            self.cursor.setBorderColor(stroke.as_deref());
+            self.cursor.setBorderWidth(if stroke.is_some() {
+                marker.stroke_width.max(0.0)
+            } else {
+                0.0
+            });
+            self.cursor.setCornerRadius(marker.radius.max(0.0));
+            self.cursor.setZPosition(20_000.0);
+            self.cursor.setContentsScale(self.scale);
+        }
+    }
+
+    fn configure_indicator(
+        &mut self,
+        indicator: Option<&Indicator>,
+        area: Rect,
+        content_changed: bool,
+    ) {
+        let Some(indicator) = indicator else {
+            self.indicator_root.setHidden(true);
+            if content_changed {
+                self.trim_indicator_labels(0);
+                self.indicator_size = (0.0, 0.0);
+            }
+            return;
+        };
+
+        if content_changed {
+            let (width, height, main, held) = indicator_layout(indicator);
+            self.indicator_size = (width, height);
+            let required = 1 + usize::from(held.is_some());
+            self.trim_indicator_labels(required);
+            self.ensure_indicator_labels(required);
+            let local_area = Rect::new(0.0, 0.0, width, height);
+            self.configure_label(
+                LabelSlot::Indicator(0),
+                LabelSpec {
+                    text: &indicator.text,
+                    rect: main,
+                    style: &indicator.style,
+                    matched_prefix_len: 0,
+                    z_index: 0,
+                },
+                local_area,
+            );
+            if let (Some(text), Some(rect)) = (&indicator.held_text, held) {
+                self.configure_label(
+                    LabelSlot::Indicator(1),
+                    LabelSpec {
+                        text,
+                        rect,
+                        style: &indicator.style,
+                        matched_prefix_len: 0,
+                        z_index: 1,
+                    },
+                    local_area,
+                );
+            }
+            self.indicator_root.setContentsScale(self.scale);
+            self.indicator_root.setHidden(false);
+        }
+
+        let (width, height) = self.indicator_size;
+        let frame = Rect::new(
+            indicator.position.x - width,
+            indicator.position.y,
+            width,
+            height,
+        );
+        self.indicator_root.setFrame(to_window_rect(frame, area));
     }
 
     fn color(&mut self, color: Color) -> Retained<CGColor> {
@@ -618,6 +692,34 @@ impl WindowContent {
 }
 
 impl LabelLayers {
+    fn new(parent: &CALayer, scale: f64, opaque: &CGColor) -> Self {
+        let base = CATextLayer::layer();
+        let matched = CATextLayer::layer();
+        let mask = CALayer::new();
+        // SAFETY: QuartzCore exports this process-lifetime immutable
+        // alignment-mode object on every supported macOS version.
+        let center = unsafe { kCAAlignmentCenter };
+        base.setAlignmentMode(center);
+        matched.setAlignmentMode(center);
+        base.setWrapped(false);
+        matched.setWrapped(false);
+        base.setContentsScale(scale);
+        matched.setContentsScale(scale);
+        mask.setBackgroundColor(Some(opaque));
+        // SAFETY: `mask` is retained by LabelLayers and Core Animation; it is
+        // a CALayer as required by the property contract.
+        unsafe { matched.setMask(Some(&mask)) };
+        base.addSublayer(&matched);
+        base.setHidden(true);
+        parent.addSublayer(&base);
+        Self {
+            base,
+            matched,
+            mask,
+            text: String::new(),
+        }
+    }
+
     fn detach(self) {
         // Disconnect both parent relationships explicitly. The mask is owned
         // only by `matched` and this value, so it is released with the detached
@@ -655,6 +757,64 @@ fn static_scene_eq(left: &OverlayScene, right: &OverlayScene) -> bool {
         && left.clip == right.clip
         && left.shapes == right.shapes
         && left.labels == right.labels
+}
+
+fn cursor_content_eq(left: Option<&CursorMarker>, right: Option<&CursorMarker>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            left.radius == right.radius
+                && left.fill == right.fill
+                && left.stroke == right.stroke
+                && left.stroke_width == right.stroke_width
+        }
+        _ => false,
+    }
+}
+
+fn indicator_content_eq(left: Option<&Indicator>, right: Option<&Indicator>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            left.text == right.text
+                && left.held_text == right.held_text
+                && left.style == right.style
+        }
+        _ => false,
+    }
+}
+
+fn scene_changes(previous: Option<&OverlayScene>, current: &OverlayScene) -> SceneChanges {
+    let Some(previous) = previous else {
+        return SceneChanges {
+            static_content: true,
+            cursor_content: true,
+            cursor_position: true,
+            indicator_content: true,
+            indicator_position: true,
+        };
+    };
+    SceneChanges {
+        static_content: !static_scene_eq(previous, current),
+        cursor_content: !cursor_content_eq(
+            previous.cursor_marker.as_ref(),
+            current.cursor_marker.as_ref(),
+        ),
+        cursor_position: previous.cursor_marker.as_ref().map(|cursor| cursor.center)
+            != current.cursor_marker.as_ref().map(|cursor| cursor.center),
+        indicator_content: !indicator_content_eq(
+            previous.indicator.as_ref(),
+            current.indicator.as_ref(),
+        ),
+        indicator_position: previous
+            .indicator
+            .as_ref()
+            .map(|indicator| indicator.position)
+            != current
+                .indicator
+                .as_ref()
+                .map(|indicator| indicator.position),
+    }
 }
 
 fn effective_label_rect(label: &OverlayLabel) -> Rect {
@@ -819,6 +979,64 @@ mod tests {
         overlay.present(Arc::new(first)).unwrap();
         overlay.present(Arc::new(second)).unwrap();
         assert_eq!(overlay.static_updates, 1);
+    }
+
+    #[test]
+    fn position_only_changes_do_not_dirty_dynamic_contents() {
+        let mut first = OverlayScene::new();
+        first.cursor_marker = Some(CursorMarker {
+            center: Point::new(8.0, 9.0),
+            radius: 13.0,
+            fill: Color::rgb(4, 5, 6),
+            stroke: Color::rgb(7, 8, 9),
+            stroke_width: 2.0,
+        });
+        first.indicator = Some(Indicator {
+            text: "Normal".into(),
+            held_text: Some("HELD: SHIFT".into()),
+            position: Point::new(10.0, 20.0),
+            style: Default::default(),
+        });
+        let mut second = first.clone();
+        second.cursor_marker.as_mut().unwrap().center = Point::new(30.0, 40.0);
+        second.indicator.as_mut().unwrap().position = Point::new(50.0, 60.0);
+
+        assert_eq!(
+            scene_changes(Some(&first), &second),
+            SceneChanges {
+                cursor_position: true,
+                indicator_position: true,
+                ..SceneChanges::default()
+            }
+        );
+    }
+
+    #[test]
+    fn dynamic_style_and_text_changes_dirty_contents() {
+        let mut first = OverlayScene::new();
+        first.cursor_marker = Some(CursorMarker {
+            center: Point::new(8.0, 9.0),
+            radius: 13.0,
+            fill: Color::rgb(4, 5, 6),
+            stroke: Color::rgb(7, 8, 9),
+            stroke_width: 2.0,
+        });
+        first.indicator = Some(Indicator {
+            text: "Normal".into(),
+            held_text: None,
+            position: Point::new(10.0, 20.0),
+            style: Default::default(),
+        });
+        let mut second = first.clone();
+        second.cursor_marker.as_mut().unwrap().fill = Color::rgb(1, 2, 3);
+        second.indicator.as_mut().unwrap().text = "Grid".into();
+
+        let changes = scene_changes(Some(&first), &second);
+        assert!(changes.cursor_content);
+        assert!(changes.indicator_content);
+        assert!(!changes.cursor_position);
+        assert!(!changes.indicator_position);
+        assert!(!changes.static_content);
     }
 
     #[test]

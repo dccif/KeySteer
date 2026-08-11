@@ -23,7 +23,7 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use objc2::MainThreadMarker;
@@ -36,7 +36,7 @@ use crate::api::geometry::{Point, Screen};
 use crate::api::input::{Key, KeyState};
 use crate::api::overlay::OverlayScene;
 
-use self::hook::HookThread;
+use self::hook::{HookStartup, HookThread};
 use self::overlay::Overlay;
 use crate::platform::multi_click::ClickTracker;
 
@@ -58,16 +58,27 @@ fn app_bundle_for_executable(executable: &Path) -> Option<PathBuf> {
 /// Routes worker and menu events into the hook queue when available. This
 /// gives asynchronous work a real wake-up path instead of polling for it.
 #[derive(Clone)]
-enum EventSender {
-    Hook(hook::EventSender),
-    Channel(Sender<BackendEvent>),
+struct EventSender {
+    hook: Arc<OnceLock<hook::EventSender>>,
+    fallback: Sender<BackendEvent>,
 }
 
 impl EventSender {
+    fn new(fallback: Sender<BackendEvent>) -> Self {
+        Self {
+            hook: Arc::new(OnceLock::new()),
+            fallback,
+        }
+    }
+
+    fn promote(&self, sender: hook::EventSender) {
+        let _ = self.hook.set(sender);
+    }
+
     fn send(&self, event: BackendEvent) -> Result<(), ()> {
-        let result = match self {
-            Self::Hook(sender) => sender.send(event),
-            Self::Channel(sender) => sender.send(event).map_err(|_| ()),
+        let result = match self.hook.get() {
+            Some(sender) => sender.send(event),
+            None => self.fallback.send(event).map_err(|_| ()),
         };
         if result.is_ok() {
             workspace::wake_main_run_loop();
@@ -90,11 +101,13 @@ pub struct MacOsBackend {
     held_buttons: Cell<u8>,
     click_tracker: Arc<Mutex<ClickTracker>>,
     warned_about_permissions: bool,
+    keyboard: input::KeyboardInjector,
 }
 
 impl MacOsBackend {
     pub fn new() -> Result<Self, String> {
         let (async_tx, async_rx) = mpsc::channel();
+        let event_tx = EventSender::new(async_tx);
         let configured_interval = NSEvent::doubleClickInterval();
         let double_click_interval = if configured_interval.is_finite() && configured_interval > 0.0
         {
@@ -108,20 +121,8 @@ impl MacOsBackend {
             permissions::prompt_for_trust();
         }
 
-        let hook = match HookThread::start(Arc::clone(&click_tracker)) {
-            Ok(hook) => Some(hook),
-            Err(error) => {
-                if trusted {
-                    crate::app::logging::report_error("macos-hook", error);
-                }
-                None
-            }
-        };
-
-        let event_tx = hook.as_ref().map_or_else(
-            || EventSender::Channel(async_tx),
-            |hook| EventSender::Hook(hook.event_sender()),
-        );
+        let hook_deadline = Instant::now() + Duration::from_secs(2);
+        let hook_start = HookStartup::spawn(Arc::clone(&click_tracker));
         let mtm = MainThreadMarker::new()
             .ok_or_else(|| "macOS backend must be created on the main thread".to_string())?;
         let status_item = Some(status_item::StatusItem::new(mtm, event_tx.clone()));
@@ -133,6 +134,23 @@ impl MacOsBackend {
             );
             Vec::new()
         });
+        let display_watcher = screens::DisplayWatcher::new();
+        let workspace = workspace::Workspace::new();
+        let keyboard = input::KeyboardInjector::new();
+        let hook = match hook_start.and_then(|startup| {
+            startup.finish(hook_deadline.saturating_duration_since(Instant::now()))
+        }) {
+            Ok(hook) => {
+                event_tx.promote(hook.event_sender());
+                Some(hook)
+            }
+            Err(error) => {
+                if trusted {
+                    crate::app::logging::report_error("macos-hook", error);
+                }
+                None
+            }
+        };
         Ok(Self {
             hook,
             async_rx,
@@ -140,13 +158,14 @@ impl MacOsBackend {
             pending: VecDeque::new(),
             overlay: Overlay::new(),
             screens: initial_screens,
-            display_watcher: screens::DisplayWatcher::new(),
+            display_watcher,
             frame_clock,
-            workspace: workspace::Workspace::new(),
+            workspace,
             status_item,
             held_buttons: Cell::new(0),
             click_tracker,
             warned_about_permissions: false,
+            keyboard,
         })
     }
 
@@ -252,7 +271,11 @@ impl Backend for MacOsBackend {
     }
 
     fn screens(&self) -> Result<Vec<Screen>, String> {
-        screens::list_screens()
+        if self.screens.is_empty() {
+            screens::list_screens()
+        } else {
+            Ok(self.screens.clone())
+        }
     }
 
     fn pointer(&self) -> Result<Point, String> {
@@ -287,7 +310,11 @@ impl Backend for MacOsBackend {
     }
 
     fn send_key(&self, key: &Key, state: KeyState) -> Result<(), String> {
-        input::send_key(key, state)
+        self.keyboard.send_key(key, state)
+    }
+
+    fn send_keys(&self, events: Vec<(Key, KeyState)>) -> Result<(), String> {
+        self.keyboard.send_keys(events)
     }
 
     fn set_frame_clock(&mut self, active: bool) -> Result<(), String> {

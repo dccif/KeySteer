@@ -1,6 +1,6 @@
 //! Bounded asynchronous macOS Accessibility traversal for UI hints.
 
-use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::ffi::{c_double, c_int, c_void};
 use std::ptr;
 use std::time::{Duration, Instant};
@@ -26,6 +26,36 @@ const NODE_TIMEOUT_SECONDS: c_double = 0.05;
 
 type AXUIElementRef = *const c_void;
 type AXValueRef = *const c_void;
+
+struct AxAttributes {
+    role: CFString,
+    enabled: CFString,
+    hidden: CFString,
+    children: CFString,
+    position: CFString,
+    size: CFString,
+    title: CFString,
+    description: CFString,
+    help: CFString,
+    focused_window: CFString,
+}
+
+impl AxAttributes {
+    fn new() -> Self {
+        Self {
+            role: CFString::new("AXRole"),
+            enabled: CFString::new("AXEnabled"),
+            hidden: CFString::new("AXHidden"),
+            children: CFString::new("AXChildren"),
+            position: CFString::new("AXPosition"),
+            size: CFString::new("AXSize"),
+            title: CFString::new("AXTitle"),
+            description: CFString::new("AXDescription"),
+            help: CFString::new("AXHelp"),
+            focused_window: CFString::new("AXFocusedWindow"),
+        }
+    }
+}
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
@@ -96,19 +126,21 @@ pub(crate) fn focused_window_bounds(pid: libc::pid_t) -> Result<Rect, String> {
         return Err("cannot create AX application element".into());
     };
     unsafe { AXUIElementSetMessagingTimeout(application.as_ptr(), NODE_TIMEOUT_SECONDS) };
-    let window = match copy_attribute(application.as_ptr(), "AXFocusedWindow") {
+    let attributes = AxAttributes::new();
+    let window = match copy_attribute(application.as_ptr(), &attributes.focused_window) {
         Some(window) => window,
         None => return Err("frontmost application has no focused window".into()),
     };
-    element_rect(window.as_ptr())
+    element_rect(window.as_ptr(), &attributes)
         .ok_or_else(|| "focused window does not expose valid bounds".to_string())
 }
 
 pub(crate) fn scan_process_stream(
     pid: libc::pid_t,
     request: &UiScanRequest,
+    is_current: impl Fn() -> bool,
     mut on_batch: impl FnMut(Vec<UiTarget>),
-) -> Result<Vec<UiTarget>, String> {
+) -> Result<(), String> {
     let Some(application) =
         (unsafe { OwnedCf::from_create_rule(AXUIElementCreateApplication(pid).cast()) })
     else {
@@ -118,66 +150,77 @@ pub(crate) fn scan_process_stream(
         AXUIElementSetMessagingTimeout(application.as_ptr(), NODE_TIMEOUT_SECONDS);
     }
 
-    let focused_window = copy_attribute(application.as_ptr(), "AXFocusedWindow");
+    let attributes = AxAttributes::new();
+    let focused_window = copy_attribute(application.as_ptr(), &attributes.focused_window);
     let root = focused_window
         .as_ref()
         .map_or(application.as_ptr(), OwnedCf::as_ptr);
-    let allowed_roles = ax_roles_for(&request.roles);
+    let allowed_roles = ax_roles_for(&request.roles).into_iter().collect();
     let mut scan = Scan {
         request,
+        attributes,
         allowed_roles,
         deadline: Instant::now() + SCAN_BUDGET,
-        targets: Vec::new(),
-        emitted: 0,
+        batch: Vec::with_capacity(8),
+        target_count: 0,
         on_batch: &mut on_batch,
-        seen: BTreeSet::new(),
+        is_current: &is_current,
+        seen: HashSet::with_capacity(128),
     };
     scan.visit(root.cast(), 0);
-    scan.flush();
+    if (scan.is_current)() {
+        scan.flush();
+    }
 
-    Ok(scan.targets)
+    Ok(())
 }
 
 struct Scan<'a> {
     request: &'a UiScanRequest,
-    allowed_roles: Vec<String>,
+    attributes: AxAttributes,
+    allowed_roles: HashSet<String>,
     deadline: Instant,
-    targets: Vec<UiTarget>,
-    emitted: usize,
+    batch: Vec<UiTarget>,
+    target_count: usize,
     on_batch: &'a mut dyn FnMut(Vec<UiTarget>),
-    seen: BTreeSet<(i64, i64, i64, i64)>,
+    is_current: &'a dyn Fn() -> bool,
+    seen: HashSet<(i64, i64, i64, i64)>,
 }
 
 impl Scan<'_> {
     fn flush(&mut self) {
-        if self.emitted < self.targets.len() {
-            (self.on_batch)(self.targets[self.emitted..].to_vec());
-            self.emitted = self.targets.len();
+        if !self.batch.is_empty() {
+            let batch = std::mem::replace(&mut self.batch, Vec::with_capacity(8));
+            (self.on_batch)(batch);
         }
     }
 
     fn visit(&mut self, element: AXUIElementRef, depth: u32) {
         if element.is_null()
             || depth > self.request.max_depth
-            || self.targets.len() >= MAX_TARGETS
+            || self.target_count >= MAX_TARGETS
             || Instant::now() >= self.deadline
+            || !(self.is_current)()
         {
             return;
         }
 
-        let role = copy_string_attribute(element, "AXRole").unwrap_or_default();
-        let role_allowed = self.request.roles.is_empty()
-            || self.allowed_roles.iter().any(|allowed| allowed == &role);
-        let rect = role_allowed.then(|| element_rect(element)).flatten();
+        let role = copy_string_attribute(element, &self.attributes.role).unwrap_or_default();
+        let role_allowed =
+            self.request.roles.is_empty() || self.allowed_roles.contains(role.as_str());
+        let rect = role_allowed
+            .then(|| element_rect(element, &self.attributes))
+            .flatten();
         let in_bounds = rect.is_some_and(|rect| {
             self.request
                 .bounds
                 .is_none_or(|bounds| bounds.contains(&rect.center()))
         });
-        let enabled = role_allowed && copy_bool_attribute(element, "AXEnabled").unwrap_or(true);
+        let enabled =
+            role_allowed && copy_bool_attribute(element, &self.attributes.enabled).unwrap_or(true);
         let visible = role_allowed
             && (!self.request.visible_only
-                || !copy_bool_attribute(element, "AXHidden").unwrap_or(false));
+                || !copy_bool_attribute(element, &self.attributes.hidden).unwrap_or(false));
         // Standard controls are mouse-addressable even when an application does
         // not expose AXPress. Action discovery is the slower fallback for custom
         // controls and only runs for an otherwise eligible candidate.
@@ -194,13 +237,14 @@ impl Scan<'_> {
         {
             let key = normalized_rect(rect);
             if self.seen.insert(key) {
-                self.targets.push(UiTarget {
+                self.batch.push(UiTarget {
                     rect,
-                    name: accessible_name(element),
+                    name: accessible_name(element, &self.attributes),
                     role: semantic_role.to_string(),
                     native_role: Some(role.clone()),
                 });
-                if self.targets.len() - self.emitted >= 8 {
+                self.target_count += 1;
+                if self.batch.len() >= 8 {
                     self.flush();
                 }
             }
@@ -209,7 +253,7 @@ impl Scan<'_> {
         if depth == self.request.max_depth {
             return;
         }
-        let Some(children_ref) = copy_attribute(element, "AXChildren") else {
+        let Some(children_ref) = copy_attribute(element, &self.attributes.children) else {
             return;
         };
         let children = unsafe {
@@ -217,15 +261,17 @@ impl Scan<'_> {
         };
         for child in &children {
             self.visit(*child, depth + 1);
-            if self.targets.len() >= MAX_TARGETS || Instant::now() >= self.deadline {
+            if self.target_count >= MAX_TARGETS
+                || Instant::now() >= self.deadline
+                || !(self.is_current)()
+            {
                 break;
             }
         }
     }
 }
 
-fn copy_attribute(element: AXUIElementRef, name: &str) -> Option<OwnedCf> {
-    let name = CFString::new(name);
+fn copy_attribute(element: AXUIElementRef, name: &CFString) -> Option<OwnedCf> {
     let mut value: CFTypeRef = ptr::null();
     let error =
         unsafe { AXUIElementCopyAttributeValue(element, name.as_concrete_TypeRef(), &mut value) };
@@ -236,21 +282,21 @@ fn copy_attribute(element: AXUIElementRef, name: &str) -> Option<OwnedCf> {
     unsafe { OwnedCf::from_create_rule(value.cast()) }
 }
 
-fn copy_string_attribute(element: AXUIElementRef, name: &str) -> Option<String> {
+fn copy_string_attribute(element: AXUIElementRef, name: &CFString) -> Option<String> {
     let value = copy_attribute(element, name)?;
     let value = unsafe { CFString::wrap_under_create_rule(value.into_raw().cast()) };
     Some(value.to_string())
 }
 
-fn copy_bool_attribute(element: AXUIElementRef, name: &str) -> Option<bool> {
+fn copy_bool_attribute(element: AXUIElementRef, name: &CFString) -> Option<bool> {
     let value = copy_attribute(element, name)?;
     let value = unsafe { CFBoolean::wrap_under_create_rule(value.into_raw().cast()) };
     Some(bool::from(value))
 }
 
-fn element_rect(element: AXUIElementRef) -> Option<Rect> {
-    let position = copy_attribute(element, "AXPosition")?;
-    let size = copy_attribute(element, "AXSize")?;
+fn element_rect(element: AXUIElementRef, attributes: &AxAttributes) -> Option<Rect> {
+    let position = copy_attribute(element, &attributes.position)?;
+    let size = copy_attribute(element, &attributes.size)?;
     let mut point = CGPoint::new(0.0, 0.0);
     let mut dimensions = CGSize::new(0.0, 0.0);
     let point_ok = unsafe {
@@ -313,8 +359,8 @@ fn has_actions(element: AXUIElementRef) -> bool {
     !actions.is_empty()
 }
 
-fn accessible_name(element: AXUIElementRef) -> String {
-    ["AXTitle", "AXDescription", "AXHelp"]
+fn accessible_name(element: AXUIElementRef, attributes: &AxAttributes) -> String {
+    [&attributes.title, &attributes.description, &attributes.help]
         .into_iter()
         .find_map(|attribute| {
             copy_string_attribute(element, attribute).filter(|value| !value.trim().is_empty())
@@ -354,6 +400,7 @@ fn normalized_rect(rect: Rect) -> (i64, i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn semantic_roles_expand_without_duplicates() {

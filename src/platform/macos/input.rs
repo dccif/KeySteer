@@ -39,7 +39,6 @@ unsafe extern "C" {
     fn CGEventSetIntegerValueField(event: *mut std::ffi::c_void, field: u32, value: i64);
     fn CGEventSetLocation(event: *mut std::ffi::c_void, location: CGPoint);
     fn CGEventPost(tap: u32, event: *mut std::ffi::c_void);
-    fn CFRelease(value: *const std::ffi::c_void);
 }
 
 /// `kCGScrollEventUnitPixel`.
@@ -48,9 +47,39 @@ const SCROLL_UNIT_PIXEL: u32 = 0;
 /// accessibility-zoom transform, matching neru's reliable native path.
 const SESSION_EVENT_TAP: u32 = 1;
 
-fn source() -> Result<CGEventSource, String> {
-    CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-        .map_err(|_| "cannot create a CoreGraphics event source".to_string())
+pub(super) struct KeyboardInjector {
+    source: Result<CGEventSource, String>,
+}
+
+impl KeyboardInjector {
+    pub(super) fn new() -> Self {
+        Self {
+            source: CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+                .map_err(|_| "cannot create a CoreGraphics event source".to_string()),
+        }
+    }
+
+    fn source(&self) -> Result<&CGEventSource, String> {
+        self.source.as_ref().map_err(Clone::clone)
+    }
+
+    pub(super) fn send_key(&self, key: &Key, state: KeyState) -> Result<(), String> {
+        post_key_event(self.source()?, key, state)
+    }
+
+    pub(super) fn send_keys(&self, events: Vec<(Key, KeyState)>) -> Result<(), String> {
+        // Reject an invalid member before posting any prefix of the batch.
+        for (key, _) in &events {
+            if keycode_for(key).is_none() {
+                return Err(format!("no macOS keycode for {key}"));
+            }
+        }
+        let source = self.source()?;
+        for (key, state) in events {
+            post_key_event(source, &key, state)?;
+        }
+        Ok(())
+    }
 }
 
 pub fn cursor_position() -> Result<Point, String> {
@@ -142,45 +171,45 @@ fn movement_event(held_buttons: u8) -> MouseEventSpec {
     }
 }
 
-fn create_mouse_event(spec: MouseEventSpec, at: Point, click_count: i64) -> *mut std::ffi::c_void {
+fn create_mouse_event(spec: MouseEventSpec, at: Point, click_count: i64) -> Option<OwnedCf> {
     let event = unsafe {
-        CGEventCreateMouseEvent(
+        OwnedCf::from_create_rule(CGEventCreateMouseEvent(
             std::ptr::null(),
             spec.event_type,
             CGPoint::new(at.x, at.y),
             spec.button,
-        )
-    };
-    if !event.is_null() {
-        unsafe {
-            CGEventSetIntegerValueField(event, EventField::EVENT_SOURCE_USER_DATA, INJECTED_TAG);
-            if click_count > 0 {
-                CGEventSetIntegerValueField(
-                    event,
-                    EventField::MOUSE_EVENT_CLICK_STATE,
-                    click_count,
-                );
-            }
-            if spec.button > CGMouseButton::Center as u32 {
-                CGEventSetIntegerValueField(
-                    event,
-                    EventField::MOUSE_EVENT_BUTTON_NUMBER,
-                    spec.button as i64,
-                );
-            }
+        ))
+    }?;
+    unsafe {
+        CGEventSetIntegerValueField(
+            event.as_mut_ptr(),
+            EventField::EVENT_SOURCE_USER_DATA,
+            INJECTED_TAG,
+        );
+        if click_count > 0 {
+            CGEventSetIntegerValueField(
+                event.as_mut_ptr(),
+                EventField::MOUSE_EVENT_CLICK_STATE,
+                click_count,
+            );
+        }
+        if spec.button > CGMouseButton::Center as u32 {
+            CGEventSetIntegerValueField(
+                event.as_mut_ptr(),
+                EventField::MOUSE_EVENT_BUTTON_NUMBER,
+                spec.button as i64,
+            );
         }
     }
-    event
+    Some(event)
 }
 
 fn post_mouse_event(spec: MouseEventSpec, at: Point) -> Result<(), String> {
-    let event = create_mouse_event(spec, at, 0);
-    if event.is_null() {
+    let Some(event) = create_mouse_event(spec, at, 0) else {
         return Err("cannot create a macOS mouse movement event".into());
-    }
+    };
     unsafe {
-        CGEventPost(SESSION_EVENT_TAP, event);
-        CFRelease(event);
+        CGEventPost(SESSION_EVENT_TAP, event.as_mut_ptr());
     }
     Ok(())
 }
@@ -240,24 +269,20 @@ pub fn mouse_button(
     // Create the complete sequence before posting any part of it. If event
     // allocation fails, no partial click can leave a target application with a
     // button held down.
-    let mut events = [std::ptr::null_mut(); 4];
+    let mut events: [Option<OwnedCf>; 4] = std::array::from_fn(|_| None);
     for index in 0..step_count {
         events[index] = create_mouse_event(
             button_event(button, steps[index].down),
             at,
             steps[index].click_count,
         );
-        if events[index].is_null() {
-            for event in events[..index].iter().copied() {
-                unsafe { CFRelease(event) };
-            }
+        if events[index].is_none() {
             return Err("cannot create a macOS mouse button event".into());
         }
     }
-    for event in events[..step_count].iter().copied() {
+    for event in events[..step_count].iter().flatten() {
         unsafe {
-            CGEventPost(SESSION_EVENT_TAP, event);
-            CFRelease(event);
+            CGEventPost(SESSION_EVENT_TAP, event.as_mut_ptr());
         }
     }
     tracker.commit(plan);
@@ -293,9 +318,9 @@ pub fn scroll(dx: f64, dy: f64) -> Result<(), String> {
     Ok(())
 }
 
-pub fn send_key(key: &Key, state: KeyState) -> Result<(), String> {
+fn post_key_event(source: &CGEventSource, key: &Key, state: KeyState) -> Result<(), String> {
     let code = keycode_for(key).ok_or_else(|| format!("no macOS keycode for {key}"))?;
-    let event = CGEvent::new_keyboard_event(source()?, code, state == KeyState::Down)
+    let event = CGEvent::new_keyboard_event(source.clone(), code, state == KeyState::Down)
         .map_err(|_| format!("cannot create a key event for {key}"))?;
     event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, INJECTED_TAG);
     event.post(CGEventTapLocation::HID);
@@ -303,7 +328,20 @@ pub fn send_key(key: &Key, state: KeyState) -> Result<(), String> {
 }
 
 /// Virtual keycode table, ordered to mirror `keycode_for`.
-const KEYCODES: &[(u16, &str)] = &[
+macro_rules! macos_keycodes {
+    ($(($code:expr, $name:literal)),+ $(,)?) => {
+        const KEYCODES: &[(u16, &str)] = &[$(($code, $name)),+];
+
+        pub fn keycode_for(key: &Key) -> Option<u16> {
+            match key.as_str() {
+                $($name => Some($code),)+
+                _ => None,
+            }
+        }
+    };
+}
+
+macos_keycodes! {
     (0x00, "a"),
     (0x01, "s"),
     (0x02, "d"),
@@ -396,7 +434,7 @@ const KEYCODES: &[(u16, &str)] = &[
     (0x7C, "arrow_right"),
     (0x7D, "arrow_down"),
     (0x7E, "arrow_up"),
-];
+}
 
 pub fn key_for_keycode(code: i64) -> Option<Key> {
     let index = usize::try_from(code).ok()?;
@@ -418,13 +456,6 @@ fn key_map() -> &'static [Option<Key>; 128] {
 
 pub(super) fn prewarm_key_map() {
     let _ = key_map();
-}
-
-pub fn keycode_for(key: &Key) -> Option<u16> {
-    KEYCODES
-        .iter()
-        .find(|(_, name)| *name == key.as_str())
-        .map(|(code, _)| *code)
 }
 
 /// Modifier state extracted from a `FlagsChanged` event, since macOS reports

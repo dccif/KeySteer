@@ -57,7 +57,12 @@ struct NativeResult {
 }
 
 unsafe extern "C" {
-    fn NmkDetectVisionElements(bounds: NativeRect, config: NativeConfig) -> *mut NativeResult;
+    safe fn NmkSetLatestVisionScan(scan_id: u64);
+    safe fn NmkDetectVisionElements(
+        bounds: NativeRect,
+        config: NativeConfig,
+        scan_id: u64,
+    ) -> *mut NativeResult;
     fn NmkFreeVisionResult(result: *mut NativeResult);
 }
 
@@ -68,7 +73,15 @@ struct Candidate {
     is_text: bool,
 }
 
-pub fn detect(bounds: Rect, options: &VisionOptions) -> (Vec<UiTarget>, UiScanStatus) {
+pub(super) fn mark_latest(scan_id: u64) {
+    NmkSetLatestVisionScan(scan_id);
+}
+
+pub fn detect(
+    scan_id: u64,
+    bounds: Rect,
+    options: &VisionOptions,
+) -> (Vec<UiTarget>, UiScanStatus) {
     let native_bounds = NativeRect {
         origin: NativePoint {
             x: bounds.x,
@@ -89,7 +102,7 @@ pub fn detect(bounds: Rect, options: &VisionOptions) -> (Vec<UiTarget>, UiScanSt
         rectangle_min_aspect: options.rectangle_min_aspect,
         rectangle_max_aspect: options.rectangle_max_aspect,
     };
-    let result = unsafe { NmkDetectVisionElements(native_bounds, config) };
+    let result = NmkDetectVisionElements(native_bounds, config, scan_id);
     if result.is_null() {
         return (
             Vec::new(),
@@ -104,7 +117,8 @@ pub fn detect(bounds: Rect, options: &VisionOptions) -> (Vec<UiTarget>, UiScanSt
         0 => UiScanStatus::Success,
         1 => UiScanStatus::PermissionDenied(message),
         2 => UiScanStatus::TimedOut,
-        4 => UiScanStatus::Unsupported(message),
+        4 => UiScanStatus::ContextChanged,
+        5 => UiScanStatus::Unsupported(message),
         _ => UiScanStatus::Failed(message),
     };
     let regions = if raw.regions.is_null() {

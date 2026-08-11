@@ -77,13 +77,37 @@ pub struct HookThread {
     join: Option<std::thread::JoinHandle<()>>,
 }
 
-impl HookThread {
-    pub fn start(click_tracker: SharedClickTracker) -> Result<Self, String> {
-        input::prewarm_key_map();
+pub struct HookStartup {
+    sender: SyncSender<Envelope>,
+    receiver: Option<Receiver<Envelope>>,
+    mailbox: Arc<crate::platform::disposition_mailbox::DispositionMailbox>,
+    latest_pointer: SharedPointer,
+    stop: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+    ready: Receiver<Result<(), String>>,
+    activate: SyncSender<()>,
+    activated: Receiver<()>,
+}
+
+struct HookHandshake {
+    ready: SyncSender<Result<(), String>>,
+    activate: Receiver<()>,
+    activated: SyncSender<()>,
+}
+
+impl HookStartup {
+    pub fn spawn(click_tracker: SharedClickTracker) -> Result<Self, String> {
         let (event_tx, event_rx) = mpsc::sync_channel(64);
         let mailbox = Arc::new(crate::platform::disposition_mailbox::DispositionMailbox::default());
         let thread_mailbox = Arc::clone(&mailbox);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (activate_tx, activate_rx) = mpsc::sync_channel(1);
+        let (activated_tx, activated_rx) = mpsc::sync_channel(1);
+        let handshake = HookHandshake {
+            ready: ready_tx,
+            activate: activate_rx,
+            activated: activated_tx,
+        };
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let latest_pointer = Arc::new(Mutex::new(None));
@@ -96,7 +120,7 @@ impl HookThread {
                     event_tap_thread(
                         event_tx,
                         thread_mailbox,
-                        ready_tx,
+                        handshake,
                         thread_stop,
                         thread_pointer,
                         click_tracker,
@@ -105,38 +129,67 @@ impl HookThread {
             })
             .map_err(|error| format!("cannot start macOS event tap thread: {error}"))?;
 
-        match ready_rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(Ok(())) => Ok(Self {
-                sender: event_tx,
-                receiver: event_rx,
-                mailbox,
-                pending: None,
-                latest_pointer,
-                stop,
-                join: Some(join),
-            }),
-            Ok(Err(error)) => {
-                if join.join().is_err() {
-                    crate::app::logging::report_error(
-                        "macos-hook",
-                        "event tap thread panicked during startup",
-                    );
-                }
-                Err(error)
-            }
-            Err(_) => {
-                stop.store(true, Ordering::Release);
-                if join.join().is_err() {
-                    crate::app::logging::report_error(
-                        "macos-hook",
-                        "event tap thread panicked during startup",
-                    );
-                }
-                Err("macOS event tap thread did not start".into())
-            }
-        }
+        Ok(Self {
+            sender: event_tx,
+            receiver: Some(event_rx),
+            mailbox,
+            latest_pointer,
+            stop,
+            join: Some(join),
+            ready: ready_rx,
+            activate: activate_tx,
+            activated: activated_rx,
+        })
     }
 
+    pub fn finish(mut self, timeout: Duration) -> Result<HookThread, String> {
+        let deadline = Instant::now() + timeout;
+        match self.ready.recv_timeout(timeout) {
+            Ok(Ok(())) => {
+                self.activate
+                    .send(())
+                    .map_err(|_| "macOS event tap stopped before activation".to_string())?;
+                self.activated
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .map_err(|_| "macOS event tap did not activate".to_string())?;
+                Ok(HookThread {
+                    sender: self.sender.clone(),
+                    receiver: self
+                        .receiver
+                        .take()
+                        .ok_or_else(|| "macOS event tap receiver is unavailable".to_string())?,
+                    mailbox: Arc::clone(&self.mailbox),
+                    pending: None,
+                    latest_pointer: Arc::clone(&self.latest_pointer),
+                    stop: Arc::clone(&self.stop),
+                    join: self.join.take(),
+                })
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err("macOS event tap did not start".into()),
+        }
+    }
+}
+
+impl Drop for HookStartup {
+    fn drop(&mut self) {
+        if self.join.is_none() {
+            return;
+        }
+        self.stop.store(true, Ordering::Release);
+        let _ = self.activate.try_send(());
+        if let Some(join) = self.join.take()
+            && join.join().is_err()
+        {
+            crate::app::logging::report_error(
+                "macos-hook",
+                "event tap thread panicked during startup",
+            );
+        }
+    }
+}
+
+impl HookThread {
     pub(super) fn event_sender(&self) -> EventSender {
         EventSender {
             sender: self.sender.clone(),
@@ -199,11 +252,19 @@ impl Drop for HookThread {
 fn event_tap_thread(
     sender: SyncSender<Envelope>,
     mailbox: Arc<crate::platform::disposition_mailbox::DispositionMailbox>,
-    ready: SyncSender<Result<(), String>>,
+    handshake: HookHandshake,
     stop: Arc<AtomicBool>,
     latest_pointer: SharedPointer,
     click_tracker: SharedClickTracker,
 ) {
+    let HookHandshake {
+        ready,
+        activate,
+        activated,
+    } = handshake;
+    // Build the reverse key table on this worker while AppKit initializes on
+    // the main thread. No physical event is captured until activation below.
+    input::prewarm_key_map();
     let state = Arc::new(Mutex::new(TapState::default()));
     let callback = CallbackContext {
         sender: sender.clone(),
@@ -233,8 +294,14 @@ fn event_tap_thread(
     };
     let run_loop = CFRunLoop::get_current();
     run_loop.add_source(&source, unsafe { kCFRunLoopDefaultMode });
-    tap.enable();
     if ready.send(Ok(())).is_err() {
+        return;
+    }
+    if activate.recv().is_err() || stop.load(Ordering::Acquire) {
+        return;
+    }
+    tap.enable();
+    if activated.send(()).is_err() {
         return;
     }
 
@@ -430,20 +497,10 @@ fn cancel_latest_pointer_signal(latest_pointer: &SharedPointer, point: Point) {
 }
 
 fn modifier_transition(state: &SharedState, code: i64, flags: u64) -> Option<(Key, KeyState)> {
-    let name = match code {
-        56 => "left_shift",
-        60 => "right_shift",
-        59 => "left_ctrl",
-        62 => "right_ctrl",
-        58 => "left_alt",
-        61 => "right_alt",
-        55 => "left_win",
-        54 => "right_win",
-        57 => "caps_lock",
-        63 => "fn",
-        _ => return None,
-    };
-    let key = Key::new(name).ok()?;
+    if !matches!(code, 54..=63) {
+        return None;
+    }
+    let key = input::key_for_keycode(code)?;
     let mut state = state.lock().ok()?;
     let key_state = if code == 57 {
         state.caps_lock_down = !state.caps_lock_down;

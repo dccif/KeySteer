@@ -73,11 +73,16 @@ item、window 和 display link 都有线程亲和性。
 
 ### 线程和事件
 
-- `hook.rs` 在专用 CFRunLoop thread 安装 CGEventTap，并做 disposition handshake。
+- `hook.rs` 在专用 CFRunLoop thread 安装 CGEventTap，并做 disposition handshake。tap 的创建与
+  status item、frame clock、屏幕和 workspace 初始化并行，Backend 完成前才启用，启动期间
+  的异步事件先进入 fallback channel，成功后通过共享 `OnceLock` 路由到有界 Hook 队列。
 - AppKit main run loop 负责窗口、菜单栏和 workspace 事件。
 - `ui_scan.rs` 有一个持久扫描 worker；Hybrid 内部只在本次 job scope 并发 AX。
 - worker/menu event 通过 hook queue 或 channel 发送，并显式唤醒主 run loop。
 - frame clock 绑定 overlay cursor view，跨屏后 AppKit 自动跟踪目标显示器 cadence。
+- Backend 缓存一个轻量 `CGEventSource`；单键与拥有所有权的组合键批次复用它，批次先验证
+  全部键码再注入。正向键码使用由反向表同源生成的编译期 `match`，修饰键 Hook 复用预热
+  `Key`，鼠标批次以 `OwnedCf` 数组负责失败路径释放。
 
 ### 子模块
 

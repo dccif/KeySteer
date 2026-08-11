@@ -75,6 +75,10 @@ working set、private bytes、handle 和 thread 数。
 - `NSPanel`、`NSView`、`CALayer`、`CAShapeLayer`、`CATextLayer` 全部由 typed `Retained<T>` 管理。
 - Core Graphics 颜色和路径使用拥有型 Core Foundation wrapper。
 - 静态 shapes/labels、cursor 和 indicator 分层；光标移动只更新动态层。
+- area、backing scale、静态内容和两个动态层分别失效。区域不变时不重复枚举屏幕或设置
+  `NSPanel`/root view/root layer frame；已显示的 panel 不重复 `orderFrontRegardless`。
+- cursor 的内容与中心点分开缓存，普通移动只写一次 frame。indicator 使用独立容器 layer，
+  普通移动只写容器 frame；文字、held、样式、尺寸或 Retina scale 改变才配置内部文字层。
 - CALayer/CATextLayer 按当前 scene 所需槽位复用，文字内容不变时不重新创建 `NSString`；
   scene 缩小时，多余 shape 会从 root layer 移除，多余 label 会先断开 mask、子层与父层再释放。
   因此 Grid 首屏的二级预览层不会在返回 Normal 后继续成为常驻高水位缓存。
@@ -125,3 +129,9 @@ UI Hint 在活动扫描和重试期间复用 `scanned`/`hints` 容量，并为�
 - 新原生调用必须位于平台边界，使用 RAII/typed owner，并为最小 unsafe 块记录 SAFETY 契约。
 
 最终性能结论必须来自双 4K、高 DPI、高刷新率真机的 p95/p99、分配次数、峰值 RAM/VRAM 和截图容差数据；API 名称或 GPU 标签本身不构成性能证明。
+
+macOS 原生探针使用固定 AppKit fixture 子进程，运行：
+`bash tools/benchmark-macos-native.sh 709815c 5`。脚本在临时 detached worktree 构建同一探针，
+交替执行基线和当前分支，原始日志与中位数汇总写入 `target/macos-native-bench/`；正式数据
+必须在已授予 Accessibility 与 Screen Recording 的 Apple Silicon 实机采集。汇总阶段也会
+验证 24 个 fixture 控件：AX 身份与矩形完全一致，Vision/Hybrid 的逻辑坐标误差不超过 1 px。

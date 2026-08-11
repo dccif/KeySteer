@@ -4,6 +4,7 @@
 #import <Vision/Vision.h>
 
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -41,7 +42,20 @@ enum {
     NMK_VISION_PERMISSION = 1,
     NMK_VISION_TIMEOUT = 2,
     NMK_VISION_FAILED = 3,
+    NMK_VISION_CONTEXT_CHANGED = 4,
 };
+
+enum { NMK_MAX_VISION_REGIONS = 2000 };
+
+static _Atomic uint64_t latestVisionScan = 0;
+
+void NmkSetLatestVisionScan(uint64_t scanID) {
+    atomic_store_explicit(&latestVisionScan, scanID, memory_order_release);
+}
+
+static bool scanIsCurrent(uint64_t scanID) {
+    return atomic_load_explicit(&latestVisionScan, memory_order_acquire) == scanID;
+}
 
 static NmkVisionResult *resultWithStatus(int32_t status, NSString *message) {
     NmkVisionResult *result = calloc(1, sizeof(NmkVisionResult));
@@ -142,8 +156,16 @@ static CGImageRef captureRegion(
     return captured;
 }
 
-NmkVisionResult *NmkDetectVisionElements(CGRect windowBounds, NmkVisionConfig config) {
+void NmkFreeVisionResult(NmkVisionResult *result);
+
+NmkVisionResult *NmkDetectVisionElements(
+    CGRect windowBounds,
+    NmkVisionConfig config,
+    uint64_t scanID) {
     @autoreleasepool {
+        if (!scanIsCurrent(scanID)) {
+            return resultWithStatus(NMK_VISION_CONTEXT_CHANGED, nil);
+        }
         if (!CGPreflightScreenCaptureAccess()) {
             static dispatch_once_t requestOnce;
             static bool granted = false;
@@ -163,6 +185,10 @@ NmkVisionResult *NmkDetectVisionElements(CGRect windowBounds, NmkVisionConfig co
             &captureMessage,
             &capturedBounds);
         if (image == NULL) return resultWithStatus(captureStatus, captureMessage);
+        if (!scanIsCurrent(scanID)) {
+            CGImageRelease(image);
+            return resultWithStatus(NMK_VISION_CONTEXT_CHANGED, nil);
+        }
 
         NSMutableArray<VNRequest *> *requests = [NSMutableArray array];
         VNDetectRectanglesRequest *rectangleRequest = nil;
@@ -186,47 +212,57 @@ NmkVisionResult *NmkDetectVisionElements(CGRect windowBounds, NmkVisionConfig co
         NSError *error = nil;
         BOOL performed = [handler performRequests:requests error:&error];
         CGImageRelease(image);
+        if (!scanIsCurrent(scanID)) {
+            return resultWithStatus(NMK_VISION_CONTEXT_CHANGED, nil);
+        }
         if (!performed || error != nil) {
             return resultWithStatus(NMK_VISION_FAILED, error.localizedDescription ?: @"Vision request failed");
         }
 
-        NSMutableArray<NSDictionary *> *regions = [NSMutableArray array];
-        for (VNRectangleObservation *observation in rectangleRequest.results ?: @[]) {
-            if (observation.confidence < config.minimum_confidence) continue;
-            CGRect box = observation.boundingBox;
-            [regions addObject:@{@"x": @(box.origin.x), @"y": @(box.origin.y),
-                @"w": @(box.size.width), @"h": @(box.size.height),
-                @"confidence": @(observation.confidence), @"text": @NO, @"label": @""}];
-        }
-        for (VNRecognizedTextObservation *observation in textRequest.results ?: @[]) {
-            if (observation.confidence < config.minimum_confidence) continue;
-            VNRecognizedText *candidate = [observation topCandidates:1].firstObject;
-            CGRect box = observation.boundingBox;
-            [regions addObject:@{@"x": @(box.origin.x), @"y": @(box.origin.y),
-                @"w": @(box.size.width), @"h": @(box.size.height),
-                @"confidence": @(observation.confidence), @"text": @YES,
-                @"label": candidate.string ?: @""}];
-        }
-
+        NSArray<VNRectangleObservation *> *rectangleResults = rectangleRequest.results ?: @[];
+        NSArray<VNRecognizedTextObservation *> *textResults = textRequest.results ?: @[];
+        NSUInteger capacity = MIN(
+            (NSUInteger)NMK_MAX_VISION_REGIONS,
+            rectangleResults.count + textResults.count);
         NmkVisionResult *result = resultWithStatus(NMK_VISION_OK, nil);
         if (result == NULL) return NULL;
         result->captured_bounds = capturedBounds;
-        result->count = regions.count;
-        result->regions = calloc(result->count, sizeof(NmkVisionRegion));
-        if (result->count > 0 && result->regions == NULL) {
+        result->regions = calloc(capacity, sizeof(NmkVisionRegion));
+        if (capacity > 0 && result->regions == NULL) {
             free(result);
             return NULL;
         }
-        for (NSUInteger index = 0; index < regions.count; index++) {
-            NSDictionary *region = regions[index];
-            NmkVisionRegion *out = &result->regions[index];
-            out->x = [region[@"x"] doubleValue];
-            out->y = [region[@"y"] doubleValue];
-            out->width = [region[@"w"] doubleValue];
-            out->height = [region[@"h"] doubleValue];
-            out->confidence = [region[@"confidence"] doubleValue];
-            out->is_text = [region[@"text"] boolValue];
-            out->label = strdup([region[@"label"] UTF8String]);
+
+        for (VNRecognizedTextObservation *observation in textResults) {
+            if (result->count >= capacity) break;
+            if (observation.confidence < config.minimum_confidence) continue;
+            VNRecognizedText *candidate = [observation topCandidates:1].firstObject;
+            CGRect box = observation.boundingBox;
+            NmkVisionRegion *out = &result->regions[result->count++];
+            out->x = box.origin.x;
+            out->y = box.origin.y;
+            out->width = box.size.width;
+            out->height = box.size.height;
+            out->confidence = observation.confidence;
+            out->is_text = true;
+            out->label = strdup([(candidate.string ?: @"") UTF8String]);
+        }
+        for (VNRectangleObservation *observation in rectangleResults) {
+            if (result->count >= capacity) break;
+            if (observation.confidence < config.minimum_confidence) continue;
+            CGRect box = observation.boundingBox;
+            NmkVisionRegion *out = &result->regions[result->count++];
+            out->x = box.origin.x;
+            out->y = box.origin.y;
+            out->width = box.size.width;
+            out->height = box.size.height;
+            out->confidence = observation.confidence;
+            out->is_text = false;
+            out->label = strdup("");
+        }
+        if (!scanIsCurrent(scanID)) {
+            NmkFreeVisionResult(result);
+            return resultWithStatus(NMK_VISION_CONTEXT_CHANGED, nil);
         }
         return result;
     }
