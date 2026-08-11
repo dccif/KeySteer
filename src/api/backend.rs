@@ -120,12 +120,14 @@ pub trait Backend {
     fn scroll(&self, dx: f64, dy: f64) -> Result<(), String>;
     fn send_key(&self, key: &Key, state: super::input::KeyState) -> Result<(), String>;
 
-    /// Inject an ordered keyboard sequence. Platforms with a native batch API
-    /// override this; the default preserves the existing per-event behaviour.
-    /// The engine records a conservative cleanup set when this returns an error.
-    fn send_keys(&self, events: &[(Key, super::input::KeyState)]) -> Result<(), String> {
+    /// Inject an owned, ordered keyboard sequence. Ownership lets an
+    /// asynchronous backend queue the batch without cloning it first.
+    /// Platforms with a native batch API override this; the default preserves
+    /// the existing per-event behaviour. The engine records a conservative
+    /// cleanup set when this returns an error.
+    fn send_keys(&self, events: Vec<(Key, super::input::KeyState)>) -> Result<(), String> {
         for (key, state) in events {
-            self.send_key(key, *state)?;
+            self.send_key(&key, state)?;
         }
         Ok(())
     }

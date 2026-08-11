@@ -34,6 +34,11 @@ mode scene，也不重建静态 Grid/Hint 内容。latched 的真实按钮状态
 - 渲染线程独占透明 click-through HWND、D3D11 BGRA device、DXGI device、Direct2D context、DirectWrite factory 和 DirectComposition device。
 - Direct2D 直接绘制到 DirectComposition surface；GPU 路径没有全屏 CPU RGBA/DIB，也没有上传 memcpy。
 - Rect、Line、文字、cursor 与 indicator 在 GPU surface 中完成；颜色 brush、字体 format 和 UTF-16 scratch buffer 有界复用。
+- cursor/indicator 的像素内容与屏幕位置分开失效：普通移动只更新 DirectComposition visual
+  offset 并提交一次 compositor commit，不再重新 BeginDraw、栅格化圆形或绘制不变文字；
+  半径、颜色、文字、held 状态、样式或 surface 尺寸变化时才重绘紧凑 surface。
+- 静态 surface 只在静态 scene 或覆盖区域原点变化时访问和重绘；区域不变的逐帧提交不会
+  重复调用全屏 `SetWindowPos`，也不会为静态 surface 产生 COM AddRef/Release。
 - GPU HWND 使用 `WS_EX_LAYERED | WS_EX_TRANSPARENT | NOACTIVATE | TOOLWINDOW | TOPMOST`；layered + transparent 才保证跨进程点击穿透，`HTTRANSPARENT` 仅作为额外防线，因为它只能继续命中同线程窗口。
 - 渲染线程使用 Win32 消息队列作为 latest-frame/control 唤醒源；即使 normal 覆盖层静止也会
   持续响应窗口消息，并对 `WM_NCHITTEST` 返回 `HTTRANSPARENT`。禁止让全屏 HWND 在
@@ -48,6 +53,12 @@ mode scene，也不重建静态 Grid/Hint 内容。latched 的真实按钮状态
 1. GPU 初始化失败时直接启用持久 DIB renderer。
 2. GPU present/commit 失败时重建一次完整 GPU device tree，并重画最新帧。
 3. 60 秒内再次失败则本次会话固定使用 DIB，避免设备抖动反复重建。
+
+Windows 原生探针以 ignored release tests 保存，避免进入普通 CI 或发布二进制。使用
+`cargo test --release native_performance_probe -- --ignored --nocapture --test-threads=1`
+运行聚合入口；它报告键盘批次、Hook FIFO/disposition、GPU 初始化/首帧/移动帧的
+p50/p95/p99，以及 GPU ready、first present、steady motion、dismissed 四个阶段的进程
+working set、private bytes、handle 和 thread 数。
 
 `src/platform/windows/overlay.rs` 是稳定软件回退。它复用单个 top-down premultiplied DIB、文字 mask、UTF-16 buffer 和有界字体缓存；只在 GPU 不可用或重复丢失时运行。
 

@@ -779,6 +779,18 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    fn percentiles(mut samples: Vec<u128>) -> (u128, u128, u128) {
+        samples.sort_unstable();
+        let last = samples.len() - 1;
+        (
+            samples[last * 50 / 100],
+            samples[last * 95 / 100],
+            samples[last * 99 / 100],
+        )
+    }
 
     #[test]
     fn menu_mask_is_needed_only_for_consumed_non_modifier_down_with_forwarded_alt() {
@@ -907,6 +919,58 @@ mod tests {
             Err((_, InjectionSubmissionFailure::Full))
         ));
         assert_eq!(queue.abandon_pending(), MAX_PENDING_INJECTIONS);
+    }
+
+    #[test]
+    #[ignore = "native performance probe"]
+    fn native_performance_probe_hook_queue_and_disposition() {
+        const WARMUP: usize = 5_000;
+        const SAMPLES: usize = 20_000;
+        let request = || InjectionRequest::MouseButton {
+            button: MouseButton::Left,
+            action: ButtonAction::Click,
+        };
+
+        let queue = InjectionQueue::default();
+        let mut queue_samples = Vec::with_capacity(SAMPLES);
+        for sample in 0..WARMUP + SAMPLES {
+            let started = Instant::now();
+            black_box(queue.submit(request(), |_| Ok(())).unwrap());
+            black_box(queue.take_next().unwrap());
+            assert!(queue.take_next().is_none());
+            if sample >= WARMUP {
+                queue_samples.push(started.elapsed().as_nanos());
+            }
+        }
+        let (queue_p50, queue_p95, queue_p99) = percentiles(queue_samples);
+
+        let mailbox = Arc::new(DispositionMailbox::default());
+        let responder_mailbox = Arc::clone(&mailbox);
+        let (generation_tx, generation_rx) = mpsc::sync_channel(1);
+        let responder = std::thread::spawn(move || {
+            while let Ok(generation) = generation_rx.recv() {
+                responder_mailbox.complete(generation, KeyDisposition::Consume);
+            }
+        });
+        let mut disposition_samples = Vec::with_capacity(SAMPLES);
+        for sample in 0..WARMUP + SAMPLES {
+            let generation = mailbox.begin();
+            let started = Instant::now();
+            generation_tx.send(generation).unwrap();
+            assert_eq!(
+                mailbox.wait(generation, Duration::from_secs(1)),
+                Some(KeyDisposition::Consume)
+            );
+            if sample >= WARMUP {
+                disposition_samples.push(started.elapsed().as_nanos());
+            }
+        }
+        drop(generation_tx);
+        responder.join().unwrap();
+        let (disposition_p50, disposition_p95, disposition_p99) = percentiles(disposition_samples);
+        println!(
+            "native_hook samples={SAMPLES} queue_p50={queue_p50}ns queue_p95={queue_p95}ns queue_p99={queue_p99}ns disposition_p50={disposition_p50}ns disposition_p95={disposition_p95}ns disposition_p99={disposition_p99}ns"
+        );
     }
 
     #[test]

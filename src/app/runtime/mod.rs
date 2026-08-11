@@ -2268,7 +2268,7 @@ impl Engine {
             .map(|key| (key, KeyState::Down))
             .chain(keys.iter().rev().cloned().map(|key| (key, KeyState::Up)))
             .collect::<Vec<_>>();
-        if let Err(error) = backend.send_keys(&events) {
+        if let Err(error) = backend.send_keys(events) {
             // A batch failure may mean that Windows accepted only a prefix.
             // Record every member conservatively; redundant key-up events are
             // harmless and safer than leaving a modifier held.

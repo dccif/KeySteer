@@ -321,28 +321,14 @@ pub fn send_keys(events: &[(Key, KeyState)]) -> Result<(), String> {
     if events.is_empty() {
         return Ok(());
     }
-    let inputs = events
-        .iter()
-        .map(|(key, state)| key_input(key, *state))
-        .collect::<Result<Vec<_>, _>>()?;
-    // SAFETY: the slice remains live for the call. Last-error is read before
-    // cleanup attempts below can replace the calling thread's error slot.
-    let (sent, last_error) = unsafe {
-        windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::WIN32_ERROR(0));
-        let sent = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) as usize;
-        let last_error = if sent != inputs.len() {
-            windows::Win32::Foundation::GetLastError().0
-        } else {
-            0
-        };
-        (sent, last_error)
+    let inputs = KeyInputBatch::new(events)?;
+    let failure = match try_send(inputs.as_slice()) {
+        Ok(()) => return Ok(()),
+        Err(failure) => failure,
     };
-    if sent == inputs.len() {
-        return Ok(());
-    }
 
     let mut held = Vec::<Key>::new();
-    for (key, state) in events.iter().take(sent) {
+    for (key, state) in events.iter().take(failure.sent) {
         match state {
             KeyState::Down => held.push(key.clone()),
             KeyState::Up => {
@@ -360,7 +346,51 @@ pub fn send_keys(events: &[(Key, KeyState)]) -> Result<(), String> {
     if !releases.is_empty() {
         let _ = send(&releases);
     }
-    Err(send_input_failure(sent, inputs.len(), last_error))
+    Err(failure.message())
+}
+
+/// Most configured chords contain at most eight keys (sixteen down/up edges).
+/// Keep their native INPUT records on the hook thread's stack; arbitrary host
+/// sequences remain supported by the heap fallback.
+const INLINE_KEY_INPUTS: usize = 16;
+
+// The size skew is intentional: boxing the inline variant would restore the
+// allocation this batch exists to avoid on the input-injection hot path.
+#[allow(clippy::large_enum_variant)]
+enum KeyInputBatch {
+    Inline {
+        inputs: [INPUT; INLINE_KEY_INPUTS],
+        len: usize,
+    },
+    Heap(Vec<INPUT>),
+}
+
+impl KeyInputBatch {
+    fn new(events: &[(Key, KeyState)]) -> Result<Self, String> {
+        if events.len() <= INLINE_KEY_INPUTS {
+            let mut inputs = std::array::from_fn(|_| INPUT::default());
+            for (index, (key, state)) in events.iter().enumerate() {
+                inputs[index] = key_input(key, *state)?;
+            }
+            return Ok(Self::Inline {
+                inputs,
+                len: events.len(),
+            });
+        }
+        Ok(Self::Heap(
+            events
+                .iter()
+                .map(|(key, state)| key_input(key, *state))
+                .collect::<Result<Vec<_>, _>>()?,
+        ))
+    }
+
+    fn as_slice(&self) -> &[INPUT] {
+        match self {
+            Self::Inline { inputs, len } => &inputs[..*len],
+            Self::Heap(inputs) => inputs,
+        }
+    }
 }
 
 /// Keys that require `KEYEVENTF_EXTENDEDKEY` to be delivered correctly.
@@ -377,8 +407,25 @@ fn is_extended(vk: u16) -> bool {
     )
 }
 
-/// Virtual-key table, shared by both mapping directions.
-const VIRTUAL_KEYS: &[(u16, &str)] = &[
+/// Keep the reverse table and the compiler-optimised name lookup generated
+/// from one source of truth. This avoids a linear scan on every injected edge
+/// without adding a runtime map or another allocation.
+macro_rules! define_virtual_keys {
+    ($(($code:expr, $name:literal)),+ $(,)?) => {
+        const VIRTUAL_KEYS: &[(u16, &str)] = &[
+            $(($code, $name)),+
+        ];
+
+        pub fn virtual_key_for(key: &Key) -> Option<u16> {
+            match key.as_str() {
+                $($name => Some($code),)+
+                _ => None,
+            }
+        }
+    };
+}
+
+define_virtual_keys! {
     (0x08, "backspace"),
     (0x09, "tab"),
     (0x0D, "enter"),
@@ -495,7 +542,7 @@ const VIRTUAL_KEYS: &[(u16, &str)] = &[
     (0xDC, "\\"),
     (0xDD, "]"),
     (0xDE, "'"),
-];
+}
 
 pub fn key_for_virtual_key(vk: u32) -> Option<Key> {
     let index = usize::try_from(vk).ok()?;
@@ -519,16 +566,21 @@ pub(super) fn prewarm_key_map() {
     let _ = key_map();
 }
 
-pub fn virtual_key_for(key: &Key) -> Option<u16> {
-    VIRTUAL_KEYS
-        .iter()
-        .find(|(_, name)| *name == key.as_str())
-        .map(|(code, _)| *code)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    fn percentiles(mut samples: Vec<u128>) -> (u128, u128, u128) {
+        samples.sort_unstable();
+        let last = samples.len() - 1;
+        (
+            samples[last * 50 / 100],
+            samples[last * 95 / 100],
+            samples[last * 99 / 100],
+        )
+    }
 
     #[test]
     fn virtual_key_mapping_round_trips() {
@@ -541,6 +593,72 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn common_key_sequences_use_the_inline_native_batch() {
+        let event = (Key::new("a").unwrap(), KeyState::Down);
+        let events = vec![event; INLINE_KEY_INPUTS];
+        let batch = KeyInputBatch::new(&events).unwrap();
+        assert!(matches!(batch, KeyInputBatch::Inline { len, .. } if len == INLINE_KEY_INPUTS));
+    }
+
+    #[test]
+    fn oversized_key_sequences_preserve_the_heap_fallback() {
+        let event = (Key::new("a").unwrap(), KeyState::Down);
+        let events = vec![event; INLINE_KEY_INPUTS + 1];
+        let batch = KeyInputBatch::new(&events).unwrap();
+        assert!(
+            matches!(batch, KeyInputBatch::Heap(inputs) if inputs.len() == INLINE_KEY_INPUTS + 1)
+        );
+    }
+
+    #[test]
+    #[ignore = "native performance probe"]
+    fn native_performance_probe_key_input_batch() {
+        const WARMUP: usize = 10_000;
+        const SAMPLES: usize = 50_000;
+        let keys = ["left_ctrl", "left_shift", "left_alt", "a"].map(|name| Key::new(name).unwrap());
+        let events = keys
+            .iter()
+            .cloned()
+            .map(|key| (key, KeyState::Down))
+            .chain(keys.iter().rev().cloned().map(|key| (key, KeyState::Up)))
+            .collect::<Vec<_>>();
+
+        for _ in 0..WARMUP {
+            black_box(KeyInputBatch::new(black_box(&events)).unwrap());
+        }
+        let mut inline_samples = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let started = Instant::now();
+            black_box(KeyInputBatch::new(black_box(&events)).unwrap());
+            inline_samples.push(started.elapsed().as_nanos());
+        }
+        let (inline_p50, inline_p95, inline_p99) = percentiles(inline_samples);
+
+        let mut legacy_samples = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let started = Instant::now();
+            let inputs = events
+                .iter()
+                .map(|(key, state)| {
+                    let vk = VIRTUAL_KEYS
+                        .iter()
+                        .find(|(_, name)| *name == key.as_str())
+                        .map(|(code, _)| *code)
+                        .ok_or_else(|| format!("no Windows virtual key for {key}"))?;
+                    Ok::<_, String>(virtual_key_input(vk, *state))
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            black_box(inputs);
+            legacy_samples.push(started.elapsed().as_nanos());
+        }
+        let (legacy_p50, legacy_p95, legacy_p99) = percentiles(legacy_samples);
+        println!(
+            "native_key_batch samples={SAMPLES} inline_p50={inline_p50}ns inline_p95={inline_p95}ns inline_p99={inline_p99}ns legacy_p50={legacy_p50}ns legacy_p95={legacy_p95}ns legacy_p99={legacy_p99}ns"
+        );
     }
 
     #[test]

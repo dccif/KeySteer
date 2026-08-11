@@ -119,6 +119,11 @@ impl WindowsBackend {
         let (async_tx, async_rx) = mpsc::channel();
         let event_tx = EventSender::new(async_tx, owner_thread);
         let mut pending = VecDeque::new();
+        // Begin GPU prewarming before tray and display discovery. The render
+        // thread reports readiness as soon as its message queue exists, then
+        // builds the D3D/D2D/DComp device tree concurrently with the remaining
+        // native startup work.
+        let overlay = OverlayWorker::start(event_tx.clone())?;
         let status_item = match status_item::StatusItem::new(event_tx.clone()) {
             Ok(item) => Some(item),
             Err(error) => {
@@ -150,7 +155,6 @@ impl WindowsBackend {
             );
             Vec::new()
         });
-        let overlay = OverlayWorker::start(event_tx.clone())?;
         Ok(Self {
             hook: None,
             overlay,
@@ -469,8 +473,8 @@ impl Backend for WindowsBackend {
         })
     }
 
-    fn send_keys(&self, events: &[(Key, KeyState)]) -> Result<(), String> {
-        self.inject_input(hook::InjectionRequest::Keys(events.to_vec()))
+    fn send_keys(&self, events: Vec<(Key, KeyState)>) -> Result<(), String> {
+        self.inject_input(hook::InjectionRequest::Keys(events))
     }
 
     fn set_frame_clock(&mut self, active: bool) -> Result<(), String> {

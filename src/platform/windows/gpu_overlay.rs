@@ -46,7 +46,9 @@ use windows::core::{Interface, PCWSTR, w};
 use windows_numerics::Vector2;
 
 use crate::api::geometry::{Point, Rect};
-use crate::api::overlay::{Color, LabelStyle, OverlayLabel, OverlayScene, OverlayShape};
+use crate::api::overlay::{
+    Color, CursorMarker, Indicator, LabelStyle, OverlayLabel, OverlayScene, OverlayShape,
+};
 
 use super::native::OwnedWindow;
 
@@ -76,7 +78,7 @@ struct WindowContent {
     static_surface: IDCompositionSurface,
     cursor_surface: Option<LayerSurface>,
     indicator_surface: Option<LayerSurface>,
-    static_scene: Option<Arc<OverlayScene>>,
+    last_scene: Option<Arc<OverlayScene>>,
     area: Rect,
     width: u32,
     height: u32,
@@ -93,6 +95,15 @@ struct FontEntry {
     size_bits: u64,
     bold: bool,
     format: IDWriteTextFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SceneChanges {
+    static_changed: bool,
+    cursor_changed: bool,
+    cursor_repaint: bool,
+    indicator_changed: bool,
+    indicator_repaint: bool,
 }
 
 impl GpuOverlay {
@@ -147,30 +158,33 @@ impl GpuOverlay {
     pub(super) fn present(&mut self, scene: Arc<OverlayScene>, area: Rect) -> Result<(), String> {
         let width = dimension(area.width)?;
         let height = dimension(area.height)?;
-        self.ensure_content(area, width, height)?;
-        let (static_surface, hwnd, static_changed) = self
+        let area_changed = self.ensure_content(area, width, height)?;
+        let (hwnd, changes) = self
             .content
             .as_ref()
             .map(|content| {
                 (
-                    content.static_surface.clone(),
                     content.window.raw(),
-                    content
-                        .static_scene
-                        .as_deref()
-                        .is_none_or(|previous| !static_scene_eq(previous, scene.as_ref())),
+                    scene_changes(content.last_scene.as_deref(), scene.as_ref(), area_changed),
                 )
             })
             .ok_or("DirectComposition content was not retained")?;
-        if static_changed {
+        if changes.static_changed {
+            let static_surface = self
+                .content
+                .as_ref()
+                .map(|content| content.static_surface.clone())
+                .ok_or("DirectComposition content was not retained")?;
             self.draw_static(&static_surface, scene.as_ref(), area)?;
         }
-        self.draw_cursor(scene.cursor_marker.as_ref(), area)?;
-        self.draw_indicator(scene.indicator.as_ref(), area)?;
-        if let Some(content) = self.content.as_mut()
-            && static_changed
-        {
-            content.static_scene = Some(scene);
+        if changes.cursor_changed {
+            self.draw_cursor(scene.cursor_marker.as_ref(), area, changes.cursor_repaint)?;
+        }
+        if changes.indicator_changed {
+            self.draw_indicator(scene.indicator.as_ref(), area, changes.indicator_repaint)?;
+        }
+        if let Some(content) = self.content.as_mut() {
+            content.last_scene = Some(scene);
         }
         // SAFETY: all mutations were recorded on `self.dcomp`; the HWND stays
         // owned by `self.content` and SW_SHOWNOACTIVATE cannot activate it.
@@ -197,14 +211,19 @@ impl GpuOverlay {
         }
     }
 
-    fn ensure_content(&mut self, area: Rect, width: u32, height: u32) -> Result<(), String> {
+    /// Ensure the compositor tree exists and report whether its screen origin
+    /// changed. A stable frame must not issue a full-screen SetWindowPos.
+    fn ensure_content(&mut self, area: Rect, width: u32, height: u32) -> Result<bool, String> {
         if let Some(content) = self.content.as_mut()
             && content.width == width
             && content.height == height
         {
-            reposition(content.window.raw(), area)?;
-            content.area = area;
-            return Ok(());
+            let area_changed = content.area != area;
+            if area_changed {
+                reposition(content.window.raw(), area)?;
+                content.area = area;
+            }
+            return Ok(area_changed);
         }
 
         self.ensure_class()?;
@@ -256,12 +275,12 @@ impl GpuOverlay {
             static_surface,
             cursor_surface: None,
             indicator_surface: None,
-            static_scene: None,
+            last_scene: None,
             area,
             width,
             height,
         });
-        Ok(())
+        Ok(true)
     }
 
     fn ensure_class(&mut self) -> Result<(), String> {
@@ -383,10 +402,10 @@ impl GpuOverlay {
 
     fn draw_cursor(
         &mut self,
-        marker: Option<&crate::api::overlay::CursorMarker>,
+        marker: Option<&CursorMarker>,
         area: Rect,
+        repaint: bool,
     ) -> Result<(), String> {
-        let dcomp = self.dcomp.clone();
         let Some(marker) = marker else {
             if let Some(content) = self.content.as_mut() {
                 // SAFETY: clearing content releases the visual's surface.
@@ -405,56 +424,73 @@ impl GpuOverlay {
         );
         let width = dimension(bounds.width)?;
         let height = dimension(bounds.height)?;
-        let (surface, visual) = {
+        let surface_to_paint = {
+            let dcomp = &self.dcomp;
             let content = self
                 .content
                 .as_mut()
                 .ok_or("DirectComposition content is unavailable")?;
-            (
-                ensure_layer_surface(&dcomp, &mut content.cursor_surface, width, height)?,
-                content.cursor_visual.clone(),
-            )
+            let recreated =
+                ensure_layer_surface(dcomp, &mut content.cursor_surface, width, height)?;
+            let layer = content
+                .cursor_surface
+                .as_ref()
+                .ok_or("DirectComposition cursor surface was not retained")?;
+            // SAFETY: the interfaces share a DComp device and offsets are
+            // local to the owned overlay window. Reused surfaces remain bound.
+            unsafe {
+                if recreated {
+                    content
+                        .cursor_visual
+                        .SetContent(&layer.surface)
+                        .map_err(|error| format!("cannot bind cursor surface: {error}"))?;
+                }
+                content
+                    .cursor_visual
+                    .SetOffsetX2((bounds.x - area.x) as f32)
+                    .and_then(|()| {
+                        content
+                            .cursor_visual
+                            .SetOffsetY2((bounds.y - area.y) as f32)
+                    })
+            }
+            .map_err(|error| format!("cannot position cursor visual: {error}"))?;
+            (repaint || recreated).then(|| layer.surface.clone())
         };
-        // SAFETY: the interfaces share a DComp device and offsets are local to
-        // the owned overlay window.
-        unsafe {
-            visual
-                .SetContent(&surface)
-                .and_then(|()| visual.SetOffsetX2((bounds.x - area.x) as f32))
-                .and_then(|()| visual.SetOffsetY2((bounds.y - area.y) as f32))
+        if let Some(surface) = surface_to_paint {
+            self.draw_surface(
+                &surface,
+                Point::new(bounds.x, bounds.y),
+                None,
+                |renderer, origin| {
+                    renderer.draw_shape(
+                        &OverlayShape::Rect {
+                            rect: Rect::new(
+                                marker.center.x - marker.radius,
+                                marker.center.y - marker.radius,
+                                marker.radius * 2.0,
+                                marker.radius * 2.0,
+                            ),
+                            fill: marker.fill,
+                            stroke: marker.stroke,
+                            stroke_width: marker.stroke_width,
+                            corner_radius: marker.radius,
+                            z_index: i32::MAX,
+                        },
+                        origin,
+                    )
+                },
+            )?;
         }
-        .map_err(|error| format!("cannot configure cursor visual: {error}"))?;
-        self.draw_surface(
-            &surface,
-            Point::new(bounds.x, bounds.y),
-            None,
-            |renderer, origin| {
-                renderer.draw_shape(
-                    &OverlayShape::Rect {
-                        rect: Rect::new(
-                            marker.center.x - marker.radius,
-                            marker.center.y - marker.radius,
-                            marker.radius * 2.0,
-                            marker.radius * 2.0,
-                        ),
-                        fill: marker.fill,
-                        stroke: marker.stroke,
-                        stroke_width: marker.stroke_width,
-                        corner_radius: marker.radius,
-                        z_index: i32::MAX,
-                    },
-                    origin,
-                )
-            },
-        )
+        Ok(())
     }
 
     fn draw_indicator(
         &mut self,
-        indicator: Option<&crate::api::overlay::Indicator>,
+        indicator: Option<&Indicator>,
         area: Rect,
+        repaint: bool,
     ) -> Result<(), String> {
-        let dcomp = self.dcomp.clone();
         let Some(indicator) = indicator else {
             if let Some(content) = self.content.as_mut() {
                 // SAFETY: clearing content releases the visual's surface.
@@ -477,37 +513,60 @@ impl GpuOverlay {
             .inset(-1.0, -1.0);
         let width = dimension(bounds.width)?;
         let height = dimension(bounds.height)?;
-        let (surface, visual) = {
+        let surface_to_paint = {
+            let dcomp = &self.dcomp;
             let content = self
                 .content
                 .as_mut()
                 .ok_or("DirectComposition content is unavailable")?;
-            (
-                ensure_layer_surface(&dcomp, &mut content.indicator_surface, width, height)?,
-                content.indicator_visual.clone(),
-            )
-        };
-        // SAFETY: the interfaces share a DComp device and offsets are local to
-        // the owned overlay window.
-        unsafe {
-            visual
-                .SetContent(&surface)
-                .and_then(|()| visual.SetOffsetX2((bounds.x - area.x) as f32))
-                .and_then(|()| visual.SetOffsetY2((bounds.y - area.y) as f32))
-        }
-        .map_err(|error| format!("cannot configure indicator visual: {error}"))?;
-        self.draw_surface(
-            &surface,
-            Point::new(bounds.x, bounds.y),
-            None,
-            |renderer, origin| {
-                renderer.draw_label_parts(&indicator.text, first, &indicator.style, 0, origin)?;
-                if let (Some(text), Some(rect)) = (&indicator.held_text, held) {
-                    renderer.draw_label_parts(text, rect, &indicator.style, 0, origin)?;
+            let recreated =
+                ensure_layer_surface(dcomp, &mut content.indicator_surface, width, height)?;
+            let layer = content
+                .indicator_surface
+                .as_ref()
+                .ok_or("DirectComposition indicator surface was not retained")?;
+            // SAFETY: the interfaces share a DComp device and offsets are
+            // local to the owned overlay window. Reused surfaces remain bound.
+            unsafe {
+                if recreated {
+                    content
+                        .indicator_visual
+                        .SetContent(&layer.surface)
+                        .map_err(|error| format!("cannot bind indicator surface: {error}"))?;
                 }
-                Ok(())
-            },
-        )
+                content
+                    .indicator_visual
+                    .SetOffsetX2((bounds.x - area.x) as f32)
+                    .and_then(|()| {
+                        content
+                            .indicator_visual
+                            .SetOffsetY2((bounds.y - area.y) as f32)
+                    })
+            }
+            .map_err(|error| format!("cannot position indicator visual: {error}"))?;
+            (repaint || recreated).then(|| layer.surface.clone())
+        };
+        if let Some(surface) = surface_to_paint {
+            self.draw_surface(
+                &surface,
+                Point::new(bounds.x, bounds.y),
+                None,
+                |renderer, origin| {
+                    renderer.draw_label_parts(
+                        &indicator.text,
+                        first,
+                        &indicator.style,
+                        0,
+                        origin,
+                    )?;
+                    if let (Some(text), Some(rect)) = (&indicator.held_text, held) {
+                        renderer.draw_label_parts(text, rect, &indicator.style, 0, origin)?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        Ok(())
     }
 
     fn draw_shape(&mut self, shape: &OverlayShape, origin: Point) -> Result<(), String> {
@@ -713,12 +772,12 @@ fn ensure_layer_surface(
     slot: &mut Option<LayerSurface>,
     width: u32,
     height: u32,
-) -> Result<IDCompositionSurface, String> {
+) -> Result<bool, String> {
     if let Some(layer) = slot
         && layer.width == width
         && layer.height == height
     {
-        return Ok(layer.surface.clone());
+        return Ok(false);
     }
     // SAFETY: dimensions are positive and the format matches the renderer's
     // Direct2D bitmap target.
@@ -732,11 +791,11 @@ fn ensure_layer_surface(
     }
     .map_err(|error| format!("cannot create tight DirectComposition surface: {error}"))?;
     *slot = Some(LayerSurface {
-        surface: surface.clone(),
+        surface,
         width,
         height,
     });
-    Ok(surface)
+    Ok(true)
 }
 
 fn static_scene_eq(left: &OverlayScene, right: &OverlayScene) -> bool {
@@ -744,6 +803,55 @@ fn static_scene_eq(left: &OverlayScene, right: &OverlayScene) -> bool {
         && left.clip == right.clip
         && left.shapes == right.shapes
         && left.labels == right.labels
+}
+
+fn cursor_content_eq(left: Option<&CursorMarker>, right: Option<&CursorMarker>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            left.radius == right.radius
+                && left.fill == right.fill
+                && left.stroke == right.stroke
+                && left.stroke_width == right.stroke_width
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn indicator_content_eq(left: Option<&Indicator>, right: Option<&Indicator>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            left.text == right.text
+                && left.held_text == right.held_text
+                && left.style == right.style
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn scene_changes(
+    previous: Option<&OverlayScene>,
+    next: &OverlayScene,
+    area_changed: bool,
+) -> SceneChanges {
+    SceneChanges {
+        static_changed: area_changed
+            || previous.is_none_or(|previous| !static_scene_eq(previous, next)),
+        cursor_changed: area_changed
+            || previous.is_none_or(|previous| {
+                previous.cursor_marker.as_ref() != next.cursor_marker.as_ref()
+            }),
+        cursor_repaint: previous.is_none_or(|previous| {
+            !cursor_content_eq(previous.cursor_marker.as_ref(), next.cursor_marker.as_ref())
+        }),
+        indicator_changed: area_changed
+            || previous
+                .is_none_or(|previous| previous.indicator.as_ref() != next.indicator.as_ref()),
+        indicator_repaint: previous.is_none_or(|previous| {
+            !indicator_content_eq(previous.indicator.as_ref(), next.indicator.as_ref())
+        }),
+    }
 }
 
 fn create_window(area: Rect) -> Result<HWND, String> {
@@ -857,6 +965,44 @@ unsafe extern "system" fn window_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+    use std::time::Instant;
+
+    fn percentiles(mut samples: Vec<u128>) -> (u128, u128, u128) {
+        samples.sort_unstable();
+        let last = samples.len() - 1;
+        (
+            samples[last * 50 / 100],
+            samples[last * 95 / 100],
+            samples[last * 99 / 100],
+        )
+    }
+
+    fn report_process_metrics(label: &str) {
+        let script = format!(
+            "$p=Get-Process -Id {}; Write-Output ('native_metrics label={label} working_set=' + $p.WorkingSet64 + ' private_bytes=' + $p.PrivateMemorySize64 + ' handles=' + $p.HandleCount + ' threads=' + $p.Threads.Count)",
+            std::process::id()
+        );
+        match Command::new(r"C:\Program Files\PowerShell\7\pwsh.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &script,
+            ])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                print!("{}", String::from_utf8_lossy(&output.stdout));
+            }
+            Ok(output) => println!(
+                "native_metrics label={label} unavailable: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => println!("native_metrics label={label} unavailable: {error}"),
+        }
+    }
 
     #[test]
     fn static_cache_ignores_cursor_only_changes() {
@@ -882,6 +1028,72 @@ mod tests {
             Color::rgb(10, 11, 12),
         ));
         assert!(!static_scene_eq(&first, &second));
+    }
+
+    #[test]
+    fn dynamic_layers_move_without_repainting_unchanged_content() {
+        let mut first = OverlayScene::new();
+        first.cursor_marker = Some(CursorMarker {
+            center: Point::new(10.0, 20.0),
+            radius: 8.0,
+            fill: Color::rgb(4, 5, 6),
+            stroke: Color::rgb(7, 8, 9),
+            stroke_width: 1.0,
+        });
+        first.indicator = Some(Indicator {
+            text: "Normal".into(),
+            held_text: Some("Shift".into()),
+            position: Point::new(30.0, 40.0),
+            style: LabelStyle::default(),
+        });
+
+        let mut moved = first.clone();
+        moved.cursor_marker.as_mut().unwrap().center = Point::new(100.0, 200.0);
+        moved.indicator.as_mut().unwrap().position = Point::new(120.0, 240.0);
+        assert_eq!(
+            scene_changes(Some(&first), &moved, false),
+            SceneChanges {
+                static_changed: false,
+                cursor_changed: true,
+                cursor_repaint: false,
+                indicator_changed: true,
+                indicator_repaint: false,
+            }
+        );
+
+        let area_moved = scene_changes(Some(&moved), &moved, true);
+        assert!(area_moved.static_changed);
+        assert!(area_moved.cursor_changed);
+        assert!(!area_moved.cursor_repaint);
+        assert!(area_moved.indicator_changed);
+        assert!(!area_moved.indicator_repaint);
+    }
+
+    #[test]
+    fn dynamic_layers_repaint_when_their_content_changes() {
+        let mut first = OverlayScene::new();
+        first.cursor_marker = Some(CursorMarker {
+            center: Point::new(10.0, 20.0),
+            radius: 8.0,
+            fill: Color::rgb(4, 5, 6),
+            stroke: Color::rgb(7, 8, 9),
+            stroke_width: 1.0,
+        });
+        first.indicator = Some(Indicator {
+            text: "Normal".into(),
+            held_text: None,
+            position: Point::new(30.0, 40.0),
+            style: LabelStyle::default(),
+        });
+
+        let mut changed = first.clone();
+        changed.cursor_marker.as_mut().unwrap().radius = 12.0;
+        changed.indicator.as_mut().unwrap().held_text = Some("Ctrl".into());
+        let changes = scene_changes(Some(&first), &changed, false);
+        assert!(changes.cursor_changed);
+        assert!(changes.cursor_repaint);
+        assert!(changes.indicator_changed);
+        assert!(changes.indicator_repaint);
     }
 
     #[test]
@@ -930,5 +1142,121 @@ mod tests {
         });
         renderer.present(Arc::new(scene), area)?;
         renderer.dismiss()
+    }
+
+    #[test]
+    #[ignore = "native performance probe; requires an interactive Windows compositor"]
+    fn native_performance_probe_directcomposition_motion() -> Result<(), String> {
+        const WARMUP_FRAMES: usize = 100;
+        const SAMPLES: usize = 2_000;
+
+        let gpu_started = Instant::now();
+        let mut renderer = GpuOverlay::new()?;
+        println!("native_gpu_ready_ns={}", gpu_started.elapsed().as_nanos());
+        report_process_metrics("gpu_ready");
+
+        let area = Rect::new(0.0, 0.0, 3840.0, 2160.0);
+        let mut scene = OverlayScene::new();
+        scene.clip = Some(area);
+        scene.backdrop = Some(Color::rgba(0, 0, 0, 8));
+        for index in 0..1_000 {
+            let column = index % 40;
+            let row = index / 40;
+            scene.labels.push(OverlayLabel::new(
+                format!("{index:03}"),
+                Rect::new(column as f64 * 96.0, row as f64 * 72.0, 88.0, 32.0),
+                LabelStyle::default(),
+            ));
+        }
+        scene.cursor_marker = Some(CursorMarker {
+            center: Point::new(200.0, 200.0),
+            radius: 8.0,
+            fill: Color::rgba(255, 255, 255, 32),
+            stroke: Color::rgb(255, 255, 255),
+            stroke_width: 1.0,
+        });
+        scene.indicator = Some(Indicator {
+            text: "Normal".into(),
+            held_text: Some("Shift".into()),
+            position: Point::new(280.0, 220.0),
+            style: LabelStyle::default(),
+        });
+
+        let first_scene = Arc::new(scene);
+        let first_started = Instant::now();
+        renderer.present(Arc::clone(&first_scene), area)?;
+        println!(
+            "native_first_present_ns={}",
+            first_started.elapsed().as_nanos()
+        );
+        report_process_metrics("first_present");
+
+        let mut current = first_scene;
+        let mut samples = Vec::with_capacity(SAMPLES);
+        for frame in 0..WARMUP_FRAMES + SAMPLES {
+            let mut next = current.as_ref().clone();
+            let x = 200.0 + (frame % 1_000) as f64;
+            let y = 200.0 + (frame % 500) as f64;
+            next.cursor_marker.as_mut().unwrap().center = Point::new(x, y);
+            next.indicator.as_mut().unwrap().position = Point::new(x + 80.0, y + 20.0);
+            let next = Arc::new(next);
+            let started = Instant::now();
+            renderer.present(Arc::clone(&next), area)?;
+            let elapsed = started.elapsed().as_nanos();
+            if frame >= WARMUP_FRAMES {
+                samples.push(elapsed);
+            }
+            current = next;
+        }
+        let (p50, p95, p99) = percentiles(samples);
+        println!("native_motion_present samples={SAMPLES} p50={p50}ns p95={p95}ns p99={p99}ns");
+
+        // Conservative in-process representation of the previous renderer:
+        // force both tight dynamic surfaces to repaint on every position
+        // update. It intentionally does not add the old per-frame full-screen
+        // SetWindowPos or static-surface COM clone, so the comparison cannot
+        // overstate the benefit of position-only visual updates.
+        let mut repaint_samples = Vec::with_capacity(SAMPLES);
+        for frame in 0..WARMUP_FRAMES + SAMPLES {
+            let mut next = current.as_ref().clone();
+            let x = 400.0 + (frame % 1_000) as f64;
+            let y = 400.0 + (frame % 500) as f64;
+            let alternate = frame.is_multiple_of(2);
+            let marker = next.cursor_marker.as_mut().unwrap();
+            marker.center = Point::new(x, y);
+            marker.fill = if alternate {
+                Color::rgba(255, 255, 255, 32)
+            } else {
+                Color::rgba(240, 240, 240, 32)
+            };
+            let indicator = next.indicator.as_mut().unwrap();
+            indicator.position = Point::new(x + 80.0, y + 20.0);
+            indicator.style.text_color = if alternate {
+                Color::rgb(255, 255, 255)
+            } else {
+                Color::rgb(240, 240, 240)
+            };
+            let next = Arc::new(next);
+            let started = Instant::now();
+            renderer.present(Arc::clone(&next), area)?;
+            let elapsed = started.elapsed().as_nanos();
+            if frame >= WARMUP_FRAMES {
+                repaint_samples.push(elapsed);
+            }
+            current = next;
+        }
+        let (repaint_p50, repaint_p95, repaint_p99) = percentiles(repaint_samples);
+        println!(
+            "native_forced_repaint_present samples={SAMPLES} p50={repaint_p50}ns p95={repaint_p95}ns p99={repaint_p99}ns"
+        );
+        report_process_metrics("steady_motion");
+
+        let dismiss_started = Instant::now();
+        renderer.dismiss()?;
+        println!("native_dismiss_ns={}", dismiss_started.elapsed().as_nanos());
+        drop(current);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        report_process_metrics("dismissed");
+        Ok(())
     }
 }
