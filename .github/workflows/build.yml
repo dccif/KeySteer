@@ -1,10 +1,10 @@
-name: Build and publish release
+name: Build, check and publish
 
 on:
   workflow_dispatch:
     inputs:
       platform:
-        description: Packages to build
+        description: Packages to build, or checks only
         required: true
         default: all
         type: choice
@@ -12,16 +12,69 @@ on:
           - all
           - windows
           - macos
+          - checks
       run_tests:
         description: Run the Rust test suite before packaging
         required: true
         default: true
         type: boolean
+      run_miri:
+        description: Run Miri when platform is checks
+        required: true
+        default: false
+        type: boolean
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  check-release-notes:
+    if: ${{ inputs.platform == 'checks' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Validate current version release notes
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version = "\([^" ]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test -n "$version"
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          bash tools/compose-release-notes.sh "$version" "$output"
+          test -s "$output"
+
+  check-windows:
+    if: ${{ inputs.platform == 'checks' }}
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup toolchain install 1.97 --profile minimal --component rustfmt,clippy
+      - run: rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-features
+      - run: cargo check --locked --target aarch64-pc-windows-msvc --all-targets
+
+  check-macos:
+    if: ${{ inputs.platform == 'checks' }}
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup toolchain install 1.97 --profile minimal --component clippy
+      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-features
+      - run: cargo check --locked --target x86_64-apple-darwin --all-targets
+
+  portable-miri:
+    if: ${{ inputs.platform == 'checks' && inputs.run_miri }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup toolchain install nightly --profile minimal --component miri
+      - run: |
+          cargo +nightly miri test --locked domain::
+
   windows:
     if: ${{ inputs.platform == 'all' || inputs.platform == 'windows' }}
     runs-on: windows-2025
@@ -116,6 +169,8 @@ jobs:
     if: ${{ inputs.platform == 'all' }}
     needs: [windows, macos]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v6

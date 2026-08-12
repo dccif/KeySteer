@@ -5,7 +5,7 @@
 - 通用发布保留目标默认 CPU baseline，并始终 `--locked`；打包从 commit 生成 `SOURCE_DATE_EPOCH`，不在发布过程中修改 Cargo.lock。Windows 发布入口同时传递 `/Brepro`，消除 PE/CodeView 的非确定性字段。
 - `tools/build-native.ps1` / `tools/build-native.sh` 仅构建 host architecture，使用独立 `target-native/` 和 `-C target-cpu=native`。
 - `perf-probe` 是 opt-in feature；正式通用发布默认不启用。mimalloc 在 Windows x64 A/B 中未通过启动 p99 门禁，未保留依赖或 feature。
-- `.github/workflows/ci.yml` 在 Windows/macOS 运行 fmt、Clippy、tests 与另一架构 check；Miri 是手动任务。
+- `.github/workflows/build.yml` 统一承载 CI 与发布且仅手动触发：可选择 Windows/macOS 打包发布或仅运行检查；Miri 也是手动选项。
 - PGO 不在缺少代表性整进程训练语料时启用；必须先由对应架构原生 runner 产出稳定训练集，并通过同一 p99/内存门禁。
 
 性能变更使用独立 target/worktree A/B：关键 p99 回退不得超过 2%；目标延迟改善至少 3%或内存下降至少 5%才保留。`tools/benchmark-windows-dist.ps1` 记录启动与 working set/private bytes/handles/threads；真实 ready 延迟要求被测二进制启用 `perf-probe`，并通过 `KEYSTEER_PERF_PROBE` 输出生命周期 JSONL marker。普通发行包的 `--check` 结果只标记为 config-check，不冒充 ready 延迟。
@@ -81,7 +81,7 @@ sampling directly from an isolated A/B target directory before packaging.
 
 ## GitHub Actions
 
-根目录 `.github/workflows/ci.yml`：
+根目录 `.github/workflows/build.yml` 选择 `checks` 时运行检查任务：
 
 - 4 target 打包矩阵：macOS arm64/x64、Windows x64/arm64。
 - 可执行 target 跑 tests，所有 target 跑 clippy。
@@ -89,7 +89,7 @@ sampling directly from an isolated A/B target directory before packaging.
 - Linux job 跑 fmt 和 shipped-config integration test。
 - docs job 使用 Node 24 + pnpm 10，跑 test/typecheck/build。
 
-`.github/workflows/build.yml` 手动运行时会构建所选平台；选择 `all` 时，待四个平台的
+同一 workflow 手动运行时会构建所选平台；选择 `checks` 时仅运行上述检查，选择 `all` 时，待四个平台的
 ZIP 都成功后，以 Cargo 版本创建 `v<version>` GitHub Release，并且只上传四个 ZIP。
 只构建单个平台时保留 workflow artifact，但不创建不完整的 Release。macOS 证书和
 notarization 通过 secrets 注入。创建 Release 时把 `.github/release-notes.md` 的固定安装
