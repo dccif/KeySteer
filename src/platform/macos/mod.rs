@@ -295,8 +295,11 @@ impl Backend for MacOsBackend {
     }
 
     fn mouse_button(&self, button: MouseButton, action: ButtonAction) -> Result<(), String> {
-        input::mouse_button(&self.click_tracker, button, action)?;
         let bit = input::button_mask(button);
+        if super::redundant_button_action(self.held_buttons.get() & bit != 0, action) {
+            return Ok(());
+        }
+        input::mouse_button(&self.click_tracker, button, action)?;
         match action {
             ButtonAction::Press => self.held_buttons.set(self.held_buttons.get() | bit),
             ButtonAction::Release => self.held_buttons.set(self.held_buttons.get() & !bit),

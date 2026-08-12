@@ -21,9 +21,10 @@
 `pointer.smooth_acceleration` 默认启用 Normal 的 smootherstep S 曲线；关闭时使用线性
 加速。两种模式都按真实时间积分并在松开最后一个方向键时立即停止。
 
-`normal.long_press_toggle_ms` 默认 500；0 禁用。它只为直接绑定的 click/double-click
-建立 deadline，达到阈值后把对应鼠标按钮交给现有 latched Toggle 状态机。普通点击仍在
-按下沿立即完成，配置允许范围为 `0..=60000`。
+`normal.long_press_toggle_ms` 默认 500；0 禁用。它为直接绑定的 click/double-click 和
+单独按住的无参数 `toggle` 激活键建立 deadline。前者达到阈值后把对应鼠标按钮交给现有
+latched Toggle 状态机；后者把激活键自身锁定为 `Down`。普通点击仍在按下沿立即完成，
+配置允许范围为 `0..=60000`。
 
 `mode_indicator.cursor.{left,middle,right}_pressed_color` 控制合成鼠标按钮被 `press` 或
 `toggle` 锁定时，以及普通 click 的物理触发键仍按住时的光标圆形颜色；每个 Mode 的
@@ -84,6 +85,11 @@ warning，不是解析错误。
 TOML 右值可以是字符串，也可以是字符串数组；数组解析为有序 `Binding::Sequence`。
 canonical 输出必须能重新 parse。`press/release/toggle` 是合成输入状态管理；
 `precision/slow/fast` 才是移动速度修饰符。
+
+无参数 `toggle` 对所有键使用相同规则。伙伴键在激活键之前或之后按下都可被锁定；伙伴
+绑定为 click/double-click 时锁定其鼠标按钮，否则锁定解析出的键盘目标。单独短按激活键
+释放全部现有 latch，单独长按达到 `long_press_toggle_ms` 才锁定激活键自身。Windows 与
+macOS 原生后端把重复的同按钮 `Press` 视为幂等操作，不得注入第二个 mouse-down。
 
 ## 继承和优先级
 

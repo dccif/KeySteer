@@ -627,7 +627,8 @@ pub struct Normal {
     /// Forward keyboard input that does not match a complete KeySteer binding.
     pub passthrough_unbound_keys: bool,
     /// Hold a physical key bound to click/double-click for this many
-    /// milliseconds to toggle that mouse button. Zero disables the feature.
+    /// milliseconds to toggle that mouse button. The same threshold lets a
+    /// parameterless toggle activation key latch itself. Zero disables both.
     pub long_press_toggle_ms: u64,
     pub bindings: Bindings,
     pub app_configs: Vec<AppOverride>,

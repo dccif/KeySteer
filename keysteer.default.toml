@@ -48,6 +48,7 @@
 # targets accept every key name and alias listed below. For example:
 #   n = "toggle"                      N+key toggles that action's input target;
 #                                      bare N releases all latched inputs
+#                                      while holding N latches N itself
 #   x = ["press shift", "left_click", "release shift"]
 #   h = ["home", "wait 50 100", "home"]
 #
@@ -159,8 +160,9 @@ inherits = ["hotkeys"]
 # Normal behaviour.
 passthrough_unbound_keys = true
 # A click key still clicks immediately. Holding it this long then toggles the
-# same mouse button; releasing the key does not release the toggled button.
-# Set to 0 to disable long-press toggles.
+# same mouse button. Holding a parameterless toggle key by itself latches that
+# key. Releasing the physical key does not undo either latch. Set to 0 to
+# disable both long-press behaviours.
 long_press_toggle_ms = 500
 
 # ---------------------------------------------------------------------------

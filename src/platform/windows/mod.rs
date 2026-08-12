@@ -453,6 +453,9 @@ impl Backend for WindowsBackend {
 
     fn mouse_button(&self, button: MouseButton, action: ButtonAction) -> Result<(), String> {
         let bit = input::button_mask(button);
+        if super::redundant_button_action(self.held_buttons.get() & bit != 0, action) {
+            return Ok(());
+        }
         self.inject_input(hook::InjectionRequest::MouseButton { button, action })?;
         match action {
             ButtonAction::Press => self.held_buttons.set(self.held_buttons.get() | bit),

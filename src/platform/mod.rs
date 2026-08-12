@@ -27,6 +27,14 @@ pub mod unsupported;
 
 use crate::api::Backend;
 
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+pub(crate) const fn redundant_button_action(
+    held: bool,
+    action: crate::api::command::ButtonAction,
+) -> bool {
+    held && matches!(action, crate::api::command::ButtonAction::Press)
+}
+
 #[cfg(target_os = "windows")]
 pub(crate) fn prepare_console_for_cli() {
     windows::prepare_console_for_cli();
@@ -75,5 +83,20 @@ pub const fn backend_name() -> &'static str {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         "unsupported"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::command::ButtonAction;
+
+    #[test]
+    fn an_already_held_button_never_receives_another_press() {
+        assert!(redundant_button_action(true, ButtonAction::Press));
+        assert!(!redundant_button_action(false, ButtonAction::Press));
+        assert!(!redundant_button_action(true, ButtonAction::Release));
+        assert!(!redundant_button_action(true, ButtonAction::Click));
+        assert!(!redundant_button_action(true, ButtonAction::DoubleClick));
     }
 }

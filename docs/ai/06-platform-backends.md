@@ -4,7 +4,8 @@
 
 两端都实现 `api::Backend`：poll、按键 disposition、屏幕/光标/前台应用、输入注入、
 frame clock、overlay、UI scan、appearance、状态栏开关和 autostart。目标后端由
-`src/platform/mod.rs` 在编译期选择。
+`src/platform/mod.rs` 在编译期选择。两端都跟踪本进程已注入的鼠标按钮状态；对已经按住
+的同一按钮再次请求 `Press` 必须幂等返回，不得向系统追加第二个 mouse-down。
 
 ## Windows
 

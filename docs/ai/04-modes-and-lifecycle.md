@@ -33,8 +33,9 @@ settings；不能注入输入、创建窗口或直接扫描 UI。
   解析积分计算，对角线归一化。
 - key repeat 只在 display frame 尚不可用时作为 fallback。
 - 离散点击、模式切换、send/exec 等由 Engine 执行，不在 Normal 重复实现。
-- Normal click 键可按 `long_press_toggle_ms` 建立 Engine deadline；到期后复用 latched Toggle，
-  物理键释放只取消未到期项，不释放已经 Toggle 的鼠标按钮。
+- Normal click 键和单独按住的无参数 `toggle` 激活键可按 `long_press_toggle_ms` 建立 Engine
+  deadline；到期后复用 latched Toggle。物理键释放只取消未到期项，不释放已经 Toggle 的
+  鼠标按钮或激活键自身；组合伙伴出现时会取消激活键的自锁 deadline。
 
 ### Grid (`src/modes/grid.rs`)
 

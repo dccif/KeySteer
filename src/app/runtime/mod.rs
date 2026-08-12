@@ -56,7 +56,7 @@ struct PendingSequence {
 struct PendingLongPressToggle {
     fires_at: Instant,
     key: Key,
-    button: Button,
+    target: InputTarget,
 }
 
 /// What the engine decided to do with a key, so the caller can tell the
@@ -270,8 +270,9 @@ pub struct Engine {
     /// unused activation key clears every currently latched input instead.
     active_default_toggles: BTreeMap<Key, bool>,
     pending_sequences: Vec<PendingSequence>,
-    /// Click keys waiting to cross the configured hold threshold. Firing one
-    /// delegates to the same latched-input state machine as explicit toggle.
+    /// Click keys and parameterless toggle activations waiting to cross the
+    /// configured hold threshold. Firing delegates to the same latched-input
+    /// state machine as explicit toggle.
     pending_long_press_toggles: Vec<PendingLongPressToggle>,
     timers: HashMap<String, Timer>,
     scan_owners: HashMap<u64, ModeId>,
@@ -877,8 +878,12 @@ impl Engine {
             if !self.pressed.contains(&toggle.key) {
                 continue;
             }
-            let target = InputTarget::Mouse(toggle.button);
-            self.toggle_targets(std::slice::from_ref(&target), backend)?;
+            self.toggle_targets(std::slice::from_ref(&toggle.target), backend)?;
+            if matches!(&toggle.target, InputTarget::Key(key) if key == &toggle.key)
+                && let Some(used) = self.active_default_toggles.get_mut(&toggle.key)
+            {
+                *used = true;
+            }
             self.refresh_overlay(backend)?;
         }
         Ok(())
@@ -1274,8 +1279,8 @@ impl Engine {
             }
             let pending_long_press = self.pending_long_press_toggle(&resolved, &input);
             let suppress_click = pending_long_press.as_ref().is_some_and(|pending| {
-                self.matching_latched_target(&InputTarget::Mouse(pending.button))
-                    .is_some()
+                matches!(&pending.target, InputTarget::Mouse(_))
+                    && self.matching_latched_target(&pending.target).is_some()
             });
             let applied = if suppress_click {
                 true
@@ -1656,23 +1661,28 @@ impl Engine {
         {
             return None;
         }
-        let button = match resolved.binding.as_ref() {
-            Binding::Click(button) | Binding::DoubleClick(button) => *button,
+        let target = match resolved.binding.as_ref() {
+            Binding::Click(button) | Binding::DoubleClick(button) => InputTarget::Mouse(*button),
+            Binding::Toggle(targets)
+                if targets.is_empty() && self.pressed_toggle_targets(&input.key).is_empty() =>
+            {
+                InputTarget::Key(input.key.clone())
+            }
             _ => return None,
         };
         Some(PendingLongPressToggle {
             fires_at: Instant::now()
                 + Duration::from_millis(self.config.normal.long_press_toggle_ms),
             key: input.key.clone(),
-            button,
+            target,
         })
     }
 
     fn cancel_pending_long_press_targets(&mut self, targets: &[InputTarget]) {
         self.pending_long_press_toggles.retain(|pending| {
-            !targets.iter().any(
-                |target| matches!(target, InputTarget::Mouse(button) if button == &pending.button),
-            )
+            !targets
+                .iter()
+                .any(|target| Self::targets_match(target, &pending.target))
         });
     }
 
@@ -1744,6 +1754,9 @@ impl Engine {
         for used in self.active_default_toggles.values_mut() {
             *used = true;
         }
+        self.pending_long_press_toggles.retain(
+            |pending| !matches!(&pending.target, InputTarget::Key(key) if key == &pending.key),
+        );
         self.cancel_pending_long_press_targets(&targets);
         self.toggle_targets(&targets, backend)?;
         self.refresh_overlay(backend)
@@ -4553,6 +4566,55 @@ mod tests {
     }
 
     #[test]
+    fn parameterless_toggle_captures_three_keyboard_partners_in_either_order() {
+        for events in [
+            vec![
+                key_down("left_win"),
+                key_down("left_shift"),
+                key_down("e"),
+                key_down("n"),
+            ],
+            vec![
+                key_down("n"),
+                key_down("left_win"),
+                key_down("left_shift"),
+                key_down("e"),
+            ],
+        ] {
+            let mut engine = engine_with_normal_binding("n", "toggle");
+            engine.active = ModeId::normal();
+            let (mut backend, log) = FakeBackend::new(Vec::new());
+
+            for event in events {
+                engine.handle_backend_event(event, &mut backend).unwrap();
+            }
+
+            let expected = BTreeSet::from([
+                InputTarget::Key(Key::new("left_win").unwrap()),
+                InputTarget::Key(Key::new("left_shift").unwrap()),
+                InputTarget::Key(Key::new("e").unwrap()),
+            ]);
+            assert_eq!(engine.latched, expected);
+            assert!(
+                engine.pending_long_press_toggles.is_empty(),
+                "a partner must cancel the activation key's self-latch deadline"
+            );
+            let sent_down: BTreeSet<_> = log
+                .lock()
+                .unwrap()
+                .sent
+                .iter()
+                .filter(|(_, state)| *state == KeyState::Down)
+                .map(|(key, _)| key.clone())
+                .collect();
+            assert_eq!(
+                sent_down,
+                BTreeSet::from(["left_win".into(), "left_shift".into(), "e".into()])
+            );
+        }
+    }
+
+    #[test]
     fn separate_toggle_chords_accumulate_instead_of_clearing_existing_targets() {
         let mut engine = engine_with_normal_binding("n", "toggle");
         let log = run_in_normal(
@@ -4589,6 +4651,58 @@ mod tests {
         let log = log.lock().unwrap();
         assert!(log.sent.is_empty());
         assert!(log.buttons.is_empty());
+    }
+
+    #[test]
+    fn long_press_parameterless_toggle_latches_its_activation_key_until_a_short_tap() {
+        let mut engine = engine_with_normal_binding("n", "toggle");
+        engine.active = ModeId::normal();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+        let n = Key::new("n").unwrap();
+        let target = InputTarget::Key(n.clone());
+
+        engine
+            .handle_backend_event(key_down("n"), &mut backend)
+            .unwrap();
+        assert_eq!(engine.pending_long_press_toggles.len(), 1);
+        assert_eq!(engine.pending_long_press_toggles[0].target, target);
+        assert!(log.lock().unwrap().sent.is_empty());
+
+        engine.pending_long_press_toggles[0].fires_at = Instant::now();
+        engine.fire_due_long_press_toggles(&mut backend).unwrap();
+        assert!(engine.latched.contains(&InputTarget::Key(n.clone())));
+        assert_eq!(log.lock().unwrap().sent, vec![("n".into(), KeyState::Down)]);
+
+        engine
+            .handle_backend_event(key_up("n"), &mut backend)
+            .unwrap();
+        assert!(
+            engine.latched.contains(&InputTarget::Key(n.clone())),
+            "the physical release must not undo the long-press latch"
+        );
+        assert_eq!(log.lock().unwrap().sent.len(), 1);
+
+        engine
+            .handle_backend_event(key_down("n"), &mut backend)
+            .unwrap();
+        assert_eq!(engine.pending_long_press_toggles.len(), 1);
+        engine
+            .handle_backend_event(key_up("n"), &mut backend)
+            .unwrap();
+        assert!(engine.latched.is_empty());
+        assert_eq!(
+            log.lock().unwrap().sent,
+            vec![("n".into(), KeyState::Down), ("n".into(), KeyState::Up),]
+        );
+
+        engine.config.normal.long_press_toggle_ms = 0;
+        engine
+            .handle_backend_event(key_down("n"), &mut backend)
+            .unwrap();
+        assert!(engine.pending_long_press_toggles.is_empty());
+        engine
+            .handle_backend_event(key_up("n"), &mut backend)
+            .unwrap();
     }
 
     #[test]
@@ -4643,6 +4757,30 @@ mod tests {
             ]
         );
         assert!(engine.latched.is_empty());
+    }
+
+    #[test]
+    fn caps_lock_uses_the_same_implicit_toggle_partner_rule_as_every_other_key() {
+        let mut engine = engine_with_normal_binding("n", "toggle");
+        engine.active = ModeId::normal();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+
+        engine
+            .handle_backend_event(key_down("caps_lock"), &mut backend)
+            .unwrap();
+        engine
+            .handle_backend_event(key_down("n"), &mut backend)
+            .unwrap();
+
+        assert!(
+            engine
+                .latched
+                .contains(&InputTarget::Key(Key::new("caps_lock").unwrap()))
+        );
+        assert_eq!(
+            log.lock().unwrap().sent,
+            vec![("caps_lock".into(), KeyState::Down)]
+        );
     }
 
     #[test]

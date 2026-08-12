@@ -69,7 +69,7 @@ h = "move_left"
 | `left_press`、`right_press` | 按住鼠标按钮。 |
 | `left_release`、`right_release` | 松开鼠标按钮。 |
 | `toggle_left`、`toggle_right` | 切换对应按钮的按住状态。 |
-| `toggle` | 无参数时切换绑定的输入状态；单独按下可释放所有 latched 输入。 |
+| `toggle` | 无参数时切换同时按住伙伴的输入状态，伙伴先按或后按均可；单独短按释放所有 latched 输入，单独长按达到阈值后锁定激活键自身。 |
 | `press <目标...>` | 按住一个或多个键/鼠标按钮。 |
 | `release <目标...>` | 释放之前按住的目标。 |
 | `toggle <目标...>` | 切换目标状态。 |

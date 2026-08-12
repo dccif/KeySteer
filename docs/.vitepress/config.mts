@@ -52,6 +52,7 @@ export default withMermaid({
         items: [
           { text: '配置文件', link: '/reference/configuration' },
           { text: '模式与动作', link: '/reference/modes-and-actions' },
+          { text: '更新日志 / Release Notes', link: '/releases/' },
         ],
       },
       {
