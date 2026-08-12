@@ -2,7 +2,7 @@
 
 ## 优化构建档位（2026-08）
 
-- 通用发布保留目标默认 CPU baseline，并始终 `--locked`；打包从 commit 生成 `SOURCE_DATE_EPOCH`，不在发布过程中修改 Cargo.lock。Windows 发布入口同时传递 `/Brepro`，消除 PE/CodeView 的非确定性字段。
+- 通用发布保留目标默认 CPU baseline；workflow 先按 `Cargo.toml` 定向同步 Cargo.lock 中的 `keysteer` 根包版本，不更新第三方依赖，后续测试与打包始终使用 `--locked`。打包从 commit 生成 `SOURCE_DATE_EPOCH`，Windows 发布入口同时传递 `/Brepro`。
 - `tools/build-native.ps1` / `tools/build-native.sh` 仅构建 host architecture，使用独立 `target-native/` 和 `-C target-cpu=native`。
 - `perf-probe` 是 opt-in feature；正式通用发布默认不启用。mimalloc 在 Windows x64 A/B 中未通过启动 p99 门禁，未保留依赖或 feature。
 - `.github/workflows/build.yml` 统一承载 CI 与发布且仅手动触发：可选择 Windows/macOS 打包发布或仅运行检查；Miri 也是手动选项。
