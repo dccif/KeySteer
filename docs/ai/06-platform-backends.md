@@ -1,5 +1,12 @@
 # Windows 与 macOS 原生后端
 
+## Native safety boundary（2026-08）
+
+- Windows DIB/GPU/window 尺寸先通过 `NativeDimensions`；i32 narrowing、BGRA 长度和 `isize::MAX` 约束均在 FFI 前完成。
+- 低级 Hook callback 使用 `try_send`，队列忙时 fail-open；timeout warning 以原子单槽合并。
+- Vision result 由 Rust RAII owner 释放，读取 slice 前验证 count<=2000 和非空指针。
+- COM apartment 显式 `!Send/!Sync`，确保 `CoUninitialize` 回到初始化线程。
+
 ## 共同契约
 
 两端都实现 `api::Backend`：poll、按键 disposition、屏幕/光标/前台应用、输入注入、

@@ -1,5 +1,15 @@
 # 构建、打包、文档站与测试
 
+## 优化构建档位（2026-08）
+
+- 通用发布保留目标默认 CPU baseline，并始终 `--locked`；打包从 commit 生成 `SOURCE_DATE_EPOCH`，不在发布过程中修改 Cargo.lock。Windows 发布入口同时传递 `/Brepro`，消除 PE/CodeView 的非确定性字段。
+- `tools/build-native.ps1` / `tools/build-native.sh` 仅构建 host architecture，使用独立 `target-native/` 和 `-C target-cpu=native`。
+- `perf-probe` 是 opt-in feature；正式通用发布默认不启用。mimalloc 在 Windows x64 A/B 中未通过启动 p99 门禁，未保留依赖或 feature。
+- `.github/workflows/ci.yml` 在 Windows/macOS 运行 fmt、Clippy、tests 与另一架构 check；Miri 是手动任务。
+- PGO 不在缺少代表性整进程训练语料时启用；必须先由对应架构原生 runner 产出稳定训练集，并通过同一 p99/内存门禁。
+
+性能变更使用独立 target/worktree A/B：关键 p99 回退不得超过 2%；目标延迟改善至少 3%或内存下降至少 5%才保留。`tools/benchmark-windows-dist.ps1` 记录启动与 working set/private bytes/handles/threads；真实 ready 延迟要求被测二进制启用 `perf-probe`，并通过 `KEYSTEER_PERF_PROBE` 输出生命周期 JSONL marker。普通发行包的 `--check` 结果只标记为 config-check，不冒充 ready 延迟。
+
 ## Cargo 结构
 
 项目是一个 crate，同时提供：
@@ -27,6 +37,12 @@ release profile：`opt-level=3`、fat LTO、`codegen-units=1`、abort panic、st
 
 不要发布裸 `target/release`。
 
+完整平台发布时，workflow 从 `Cargo.toml` 读取版本，并由
+`tools/compose-release-notes.sh` 精确提取 `docs/releases/index.md` 中同名的
+`## <version>` 条目。该双语内容和 `.github/release-notes.md` 的固定安装提示会置于
+GitHub 自动生成的 commit/PR notes 之前；版本条目缺失、重复或为空时禁止创建 Release。
+普通 CI 也会运行同一提取器，确保版本更新与文档条目在合并前保持同步。
+
 ### Windows
 
 `packaging/windows/package.ps1 [target]`：
@@ -40,12 +56,13 @@ release profile：`opt-level=3`、fat LTO、`codegen-units=1`、abort panic、st
 支持 `x86_64-pc-windows-msvc`、`aarch64-pc-windows-msvc`。
 
 `tools/benchmark-windows-dist.ps1 [target]` starts the unpacked
-`dist/<target>/KeySteer/KeySteer.exe`, then delegates its validated Alt+E/;
-left-click scenario to `tools/windows-comparison-runner/`. `-SetupKey`,
-`-Key`, and `-Observe` override the scenario for another configuration. It
-writes the runner CSV and a JSON sidecar containing the fixed settle delay and
-process-creation time. The latter is not application-ready latency. The script
-stops its launched process unless `-KeepRunning` is selected.
+`dist/<target>/KeySteer/KeySteer.exe` and writes in-memory startup/resource
+samples to JSON after the measured interval. With `-UsePerfProbe`, the binary
+must be built with `--features perf-probe` and startup samples are the emitted
+`backend_started` elapsed time. Without it, samples are explicitly named
+`config_check_process_ms`. The script stops its launched process unless
+`-KeepRunning` is selected. `-Executable` and `-ConfigPath` allow equivalent
+sampling directly from an isolated A/B target directory before packaging.
 
 ### macOS
 
@@ -120,8 +137,8 @@ GitHub Pages。需要更新线上文档时，在 Actions 页面运行 `Deploy do
 - `tests/integration.rs`：发布配置可解析、默认快捷键跨平台、CLI/项目不变量。
 - 文档站 Node tests：轻量模拟模型，不替代 Rust tests。
 - 平台原生窗口/权限/Hook 仍需要对应 OS 的实机验证。
-- `tools/windows-comparison-runner/` 是独立 Windows 黑盒性能 runner；它不属于主 crate 的
-  `cargo test`，需要通过自己的 `--manifest-path` 构建、测试和 Clippy。
+- `tools/benchmark-windows-dist.ps1` 是 Windows 黑盒整进程采样入口；它不属于主 crate 的
+  `cargo test`，需在对应架构真机上分别运行基线与候选包。
 
 常用完整检查：
 

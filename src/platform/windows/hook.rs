@@ -2,6 +2,8 @@
 
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -10,9 +12,10 @@ use std::time::Duration;
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, KBDLLHOOKSTRUCT, LLKHF_UP, MSG, MSLLHOOKSTRUCT,
-    PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SetWindowsHookExW, TranslateMessage,
-    UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_MOUSEMOVE, WM_QUIT,
+    CallNextHookEx, DispatchMessageW, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, LLKHF_UP, MSG,
+    MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
+    TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_MOUSEMOVE,
+    WM_QUIT,
 };
 
 use crate::api::backend::{BackendEvent, KeyDisposition};
@@ -40,6 +43,7 @@ static EVENT_SENDER: OnceLock<Mutex<Option<EventSink>>> = OnceLock::new();
 static WAKE_THREAD: AtomicU32 = AtomicU32::new(0);
 static HOOK_THREAD: AtomicU32 = AtomicU32::new(0);
 static WAKE_FAILED: AtomicBool = AtomicBool::new(false);
+static TIMEOUT_WARNING_PENDING: AtomicBool = AtomicBool::new(false);
 static POINTER_PENDING: AtomicBool = AtomicBool::new(false);
 static POINTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static CONSUMED_POINTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -303,6 +307,31 @@ pub struct HookThread {
     join: Option<std::thread::JoinHandle<()>>,
 }
 
+struct OwnedHook {
+    raw: HHOOK,
+    _thread: PhantomData<Rc<()>>,
+}
+
+impl OwnedHook {
+    fn new(raw: HHOOK) -> Self {
+        Self {
+            raw,
+            _thread: PhantomData,
+        }
+    }
+}
+
+impl Drop for OwnedHook {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from a successful SetWindowsHookExW call,
+        // this non-Send guard remains on the installing thread, and Drop is
+        // the only unhook path.
+        if let Err(error) = unsafe { UnhookWindowsHookEx(self.raw) } {
+            crate::log_warning!("windows-hook", "cannot remove hook: {error}");
+        }
+    }
+}
+
 impl HookThread {
     pub fn start() -> Result<Self, String> {
         // Build canonical shared Key values before the first physical key edge
@@ -356,6 +385,12 @@ impl HookThread {
             ));
         }
         if let Ok(envelope) = self.receiver.try_recv() {
+            if matches!(
+                &envelope.event,
+                BackendEvent::Warning(message) if message == TIMEOUT_WARNING
+            ) {
+                TIMEOUT_WARNING_PENDING.store(false, Ordering::Release);
+            }
             self.pending = envelope.generation;
             return Some(envelope.event);
         }
@@ -454,7 +489,7 @@ fn hook_thread(
     let slot = EVENT_SENDER.get_or_init(|| Mutex::new(None));
     let keyboard_hook = match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), None, 0) }
     {
-        Ok(hook) => hook,
+        Ok(hook) => OwnedHook::new(hook),
         Err(error) => {
             let _ = ready.send(Err(format!("SetWindowsHookExW failed: {error}")));
             return;
@@ -462,14 +497,8 @@ fn hook_thread(
     };
     let mouse_hook = match unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0) }
     {
-        Ok(hook) => hook,
+        Ok(hook) => OwnedHook::new(hook),
         Err(error) => {
-            if let Err(unhook_error) = unsafe { UnhookWindowsHookEx(keyboard_hook) } {
-                crate::log_warning!(
-                    "windows-hook",
-                    "cannot remove keyboard hook after mouse-hook failure: {unhook_error}"
-                );
-            }
             let _ = ready.send(Err(format!("SetWindowsHookExW(mouse) failed: {error}")));
             return;
         }
@@ -486,18 +515,6 @@ fn hook_thread(
     WAKE_THREAD.store(wake_thread, Ordering::Release);
     POINTER_PENDING.store(false, Ordering::Release);
     if ready.send(Ok(thread_id)).is_err() {
-        if let Err(error) = unsafe { UnhookWindowsHookEx(mouse_hook) } {
-            crate::log_warning!(
-                "windows-hook",
-                "cannot remove abandoned mouse hook: {error}"
-            );
-        }
-        if let Err(error) = unsafe { UnhookWindowsHookEx(keyboard_hook) } {
-            crate::log_warning!(
-                "windows-hook",
-                "cannot remove abandoned keyboard hook: {error}"
-            );
-        }
         if let Ok(mut current) = slot.lock() {
             *current = None;
         }
@@ -555,12 +572,8 @@ fn hook_thread(
             DispatchMessageW(&message);
         }
     }
-    if let Err(error) = unsafe { UnhookWindowsHookEx(mouse_hook) } {
-        crate::log_warning!("windows-hook", "cannot remove mouse hook: {error}");
-    }
-    if let Err(error) = unsafe { UnhookWindowsHookEx(keyboard_hook) } {
-        crate::log_warning!("windows-hook", "cannot remove keyboard hook: {error}");
-    }
+    drop(mouse_hook);
+    drop(keyboard_hook);
     let abandoned = injection.abandon_pending();
     if abandoned != 0 {
         let _ = send_envelope(Envelope {
@@ -584,13 +597,13 @@ fn send_envelope(envelope: Envelope) -> bool {
         return false;
     };
     let delivered = {
-        let Ok(sender) = slot.lock() else {
+        let Ok(sender) = slot.try_lock() else {
             return false;
         };
         let Some(sender) = sender.as_ref() else {
             return false;
         };
-        sender.sender.send(envelope).is_ok()
+        try_deliver(&sender.sender, envelope)
     };
     if !delivered {
         return false;
@@ -601,20 +614,41 @@ fn send_envelope(envelope: Envelope) -> bool {
 
 fn begin_disposition(event: BackendEvent) -> Option<(Arc<DispositionMailbox>, u64)> {
     let slot = EVENT_SENDER.get()?;
-    let (sender, mailbox, generation) = {
-        let sink = slot.lock().ok()?;
+    let (mailbox, generation) = {
+        let sink = slot.try_lock().ok()?;
         let sink = sink.as_ref()?;
         let generation = sink.mailbox.begin();
-        (sink.sender.clone(), Arc::clone(&sink.mailbox), generation)
+        try_deliver(
+            &sink.sender,
+            Envelope {
+                event,
+                generation: Some(generation),
+            },
+        )
+        .then(|| (Arc::clone(&sink.mailbox), generation))?
     };
-    sender
-        .send(Envelope {
-            event,
-            generation: Some(generation),
-        })
-        .ok()?;
     wake_owner();
     Some((mailbox, generation))
+}
+
+#[inline(always)]
+fn try_deliver(sender: &SyncSender<Envelope>, envelope: Envelope) -> bool {
+    sender.try_send(envelope).is_ok()
+}
+
+fn queue_timeout_warning() {
+    if TIMEOUT_WARNING_PENDING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    if !send_envelope(Envelope {
+        event: BackendEvent::Warning(TIMEOUT_WARNING.into()),
+        generation: None,
+    }) {
+        TIMEOUT_WARNING_PENDING.store(false, Ordering::Release);
+    }
 }
 
 fn wake_owner() {
@@ -733,10 +767,7 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         match mailbox.wait(generation, Duration::from_millis(100)) {
             Some(disposition) => disposition,
             None => {
-                let _ = send_envelope(Envelope {
-                    event: BackendEvent::Warning(TIMEOUT_WARNING.into()),
-                    generation: None,
-                });
+                queue_timeout_warning();
                 KeyDisposition::Forward
             }
         }
@@ -868,6 +899,28 @@ mod tests {
 
         hook.set_disposition(KeyDisposition::Forward).unwrap();
         assert!(hook.pending.is_none());
+    }
+
+    #[test]
+    fn a_full_event_queue_fails_open_without_waiting() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        assert!(try_deliver(
+            &sender,
+            Envelope {
+                event: BackendEvent::Warning("first".into()),
+                generation: None,
+            }
+        ));
+
+        let started = Instant::now();
+        assert!(!try_deliver(
+            &sender,
+            Envelope {
+                event: BackendEvent::Warning("second".into()),
+                generation: None,
+            }
+        ));
+        assert!(started.elapsed() < Duration::from_millis(10));
     }
 
     #[test]

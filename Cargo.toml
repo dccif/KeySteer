@@ -1,6 +1,6 @@
 [package]
 name = "keysteer"
-version = "0.8.7"
+version = "0.8.8"
 authors = ["dccif"]
 edition = "2024"
 rust-version = "1.97"
@@ -35,12 +35,15 @@ path = "src/main.rs"
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 semver = "1.0"
-sha2 = "0.11"
+sha2 = { version = "0.11", default-features = false }
 smallvec = "1.15"
 toml = "1.1.4"
 toml_edit = "0.25"
 # update.rs must explicitly select NativeTls because ureq defaults to Rustls.
-ureq = { version = "3.3", default-features = false, features = ["json", "native-tls"] }
+ureq = { version = "3.3", default-features = false, features = ["json", "native-tls-no-default"] }
+[features]
+default = []
+perf-probe = []
 
 # ---------------------------------------------------------------------------
 # Platform backends. Cargo evaluates these against the *target*, so the right
@@ -49,9 +52,10 @@ ureq = { version = "3.3", default-features = false, features = ["json", "native-
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.25"
 core-foundation = "0.10"
-objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSDate", "NSRunLoop", "NSString", "NSURL", "NSUserDefaults", "objc2-core-foundation"] }
-objc2-quartz-core = { version = "0.3", features = [
+objc2 = { version = "0.6", default-features = false, features = ["std"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSDate", "NSEnumerator", "NSRunLoop", "NSString", "NSURL", "NSUserDefaults", "objc2-core-foundation"] }
+objc2-quartz-core = { version = "0.3", default-features = false, features = [
+    "std",
     "CADisplayLink",
     "CALayer",
     "CAShapeLayer",
@@ -60,22 +64,27 @@ objc2-quartz-core = { version = "0.3", features = [
     "objc2-core-foundation",
     "objc2-core-graphics",
 ] }
-objc2-core-graphics = { version = "0.3", features = ["CGColor", "CGPath"] }
-objc2-core-foundation = { version = "0.3", features = ["CFString"] }
-objc2-core-text = { version = "0.3", features = [
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGColor", "CGPath"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFString"] }
+objc2-core-text = { version = "0.3", default-features = false, features = [
+    "std",
     "CTFont",
     "CTFontTraits",
     "objc2-core-graphics",
 ] }
-objc2-app-kit = { version = "0.3", features = [
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "libc",
     "objc2-quartz-core",
     "NSApplication",
     "NSButton",
+    "NSCell",
     "NSColor",
     "NSControl",
     "NSEvent",
     "NSFont",
     "NSImageView",
+    "NSImage",
     "NSMenu",
     "NSMenuItem",
     "NSGraphics",
@@ -93,7 +102,6 @@ objc2-app-kit = { version = "0.3", features = [
     "objc2-core-foundation",
     "objc2-core-graphics",
 ] }
-foreign-types = "0.5"
 libc = "0.2.189"
 
 [target.'cfg(target_os = "windows")'.dependencies.windows]
@@ -130,9 +138,11 @@ features = [
 [target.'cfg(target_os = "windows")'.dependencies.windows-numerics]
 version = "0.3.1"
 
-[build-dependencies]
+[target.'cfg(any(windows, target_os = "macos"))'.build-dependencies]
 cc = "1.2"
-winresource = "0.1.31"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = { version = "0.1.31", default-features = false }
 
 [dev-dependencies]
 stats_alloc = "0.1.10"

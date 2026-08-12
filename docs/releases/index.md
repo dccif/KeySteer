@@ -1,5 +1,11 @@
 # 更新日志 / Release Notes
 
+## 0.8.8
+
+输入响应和 UI Hint 扫描更快、内存与安装体积更小。
+
+Input response and UI Hint scanning are faster with lower memory use and a smaller package.
+
 ## 0.8.7
 
 Windows 和 macOS 的光标与提示移动更加流畅，组合按键和长按操作也更快、更省内存。

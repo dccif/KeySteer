@@ -116,7 +116,7 @@ impl HintMode {
         }
     }
 
-    fn request_scan(&mut self, ctx: &HostContext<'_>) -> Vec<Command> {
+    fn request_scan(&mut self, ctx: &HostContext<'_>) -> CommandBatch {
         self.scanning = true;
         self.status = None;
         self.clear_scan_results(false);
@@ -126,20 +126,21 @@ impl HintMode {
         self.retry_attempt = 0;
         self.retry_pending = false;
         let request = self.scan_request(ctx);
-        vec![
+        let mut commands = CommandBatch::two(
             Command::CancelTimer {
                 id: SCAN_RETRY_TIMER_ID.into(),
             },
             Command::HideOverlay,
-            request,
-        ]
+        );
+        commands.push(request);
+        commands
     }
 
-    fn retry_scan(&mut self, ctx: &HostContext<'_>) -> Vec<Command> {
+    fn retry_scan(&mut self, ctx: &HostContext<'_>) -> CommandBatch {
         self.retry_attempt = self.retry_attempt.saturating_add(1);
         self.retry_pending = false;
         self.scanning = true;
-        vec![self.scan_request(ctx)]
+        CommandBatch::one(self.scan_request(ctx))
     }
 
     fn scan_request(&mut self, ctx: &HostContext<'_>) -> Command {
@@ -207,8 +208,16 @@ impl HintMode {
             .filter(|(_, (_, name_lower))| query.is_empty() || name_lower.contains(&query))
             .map(|(i, (target, _))| (target.rect, i));
 
-        self.hints = hints::assign(candidates, &self.alphabet, self.config.label_direction)
-            .unwrap_or_default();
+        if hints::assign_into(
+            &mut self.hints,
+            candidates,
+            &self.alphabet,
+            self.config.label_direction,
+        )
+        .is_err()
+        {
+            self.hints.clear();
+        }
     }
 
     fn hint_is_visible(&self, hint: &Hint<usize>) -> bool {
@@ -223,7 +232,7 @@ impl HintMode {
         key: &Key,
         state: KeyState,
         ctx: &HostContext<'_>,
-    ) -> Vec<Command> {
+    ) -> CommandBatch {
         let changed = match state {
             KeyState::Down => {
                 let was_released = self.held_overlap_keys.is_empty();
@@ -238,20 +247,24 @@ impl HintMode {
         if changed && !self.scanning && !self.hints.is_empty() {
             self.redraw(ctx)
         } else {
-            Vec::new()
+            CommandBatch::new()
         }
     }
 
     fn scene(&self, ctx: &HostContext<'_>) -> OverlayScene {
         let palette = ctx.palette;
         let placement = self.config.placement;
+        let visible_count = self
+            .hints
+            .iter()
+            .filter(|hint| self.hint_is_visible(hint))
+            .count();
         let shape_capacity = if self.config.boundary_highlight.enabled {
-            self.hints.len()
+            visible_count
         } else {
             0
         };
-        let label_capacity =
-            self.hints.len() + usize::from(matches!(&self.input, Input::Search(_)));
+        let label_capacity = visible_count + usize::from(matches!(&self.input, Input::Search(_)));
         let mut scene = OverlayScene::with_capacity(shape_capacity, label_capacity);
         scene.clip = self.scan_bounds.or_else(|| Some(ctx.active_bounds()));
 
@@ -288,6 +301,7 @@ impl HintMode {
             Input::Labels(s) => s.as_str(),
             Input::Search(_) => "",
         };
+        let matched_prefix_len = typed.chars().count();
         for hint in self.hints.iter().filter(|hint| self.hint_is_visible(hint)) {
             let width = label_style.font_size * 0.75 * hint.label.chars().count() as f64
                 + label_style.padding_x * 2.0;
@@ -301,7 +315,7 @@ impl HintMode {
             );
             scene.push_label(
                 OverlayLabel::new(hint.label.clone(), rect, label_style.clone())
-                    .with_matched_prefix(typed.chars().count())
+                    .with_matched_prefix(matched_prefix_len)
                     .with_z_index(2),
             );
         }
@@ -332,12 +346,12 @@ impl HintMode {
         scene
     }
 
-    fn redraw(&self, ctx: &HostContext<'_>) -> Vec<Command> {
-        vec![Command::show_overlay(if self.finished {
+    fn redraw(&self, ctx: &HostContext<'_>) -> CommandBatch {
+        CommandBatch::one(Command::show_overlay(if self.finished {
             self.finished_scene(ctx)
         } else {
             self.scene(ctx)
-        })]
+        }))
     }
 
     fn finished_scene(&self, ctx: &HostContext<'_>) -> OverlayScene {
@@ -358,7 +372,7 @@ impl HintMode {
         scene
     }
 
-    fn status_scene(&self, ctx: &HostContext<'_>) -> Vec<Command> {
+    fn status_scene(&self, ctx: &HostContext<'_>) -> CommandBatch {
         let palette = ctx.palette;
         let style = self.config.ui.resolve(
             palette,
@@ -382,31 +396,31 @@ impl HintMode {
         let mut scene = OverlayScene::new();
         scene.clip = self.scan_bounds.or(Some(bounds));
         scene.push_label(OverlayLabel::new(text, rect, style).with_z_index(10));
-        vec![Command::show_overlay(scene)]
+        CommandBatch::one(Command::show_overlay(scene))
     }
 
-    fn select(&mut self, index: usize) -> Vec<Command> {
+    fn select(&mut self, index: usize) -> CommandBatch {
         let Some(target) = self.scanned.get(index) else {
             return self.cancel();
         };
         let point = target.rect.center();
         self.selected = Some(index);
-        vec![
+        CommandBatch::two(
             Command::warp_to(point),
             Command::FinishMode {
                 cause: FinishCause::Selection,
             },
-        ]
+        )
     }
 
-    fn cancel(&self) -> Vec<Command> {
-        vec![
+    fn cancel(&self) -> CommandBatch {
+        CommandBatch::two(
             Command::HideOverlay,
             Command::SwitchMode(self.return_mode.clone()),
-        ]
+        )
     }
 
-    fn key_down(&mut self, key: &Key, ctx: &HostContext<'_>) -> Vec<Command> {
+    fn key_down(&mut self, key: &Key, ctx: &HostContext<'_>) -> CommandBatch {
         if self.finished {
             return match key.as_str() {
                 "esc" => self.cancel(),
@@ -418,7 +432,7 @@ impl HintMode {
                     }
                     self.redraw(ctx)
                 }
-                _ => Vec::new(),
+                _ => CommandBatch::new(),
             };
         }
         // Before the first batch arrives only allow bailing out. Once partial
@@ -427,7 +441,7 @@ impl HintMode {
             return if key.as_str() == "esc" {
                 self.cancel()
             } else {
-                Vec::new()
+                CommandBatch::new()
             };
         }
 
@@ -483,7 +497,7 @@ impl HintMode {
         }
 
         let Some(ch) = key.as_char() else {
-            return Vec::new();
+            return CommandBatch::new();
         };
 
         match &mut self.input {
@@ -493,15 +507,14 @@ impl HintMode {
                     self.relabel();
                     return self.redraw(ctx);
                 }
-                Vec::new()
+                CommandBatch::new()
             }
             Input::Labels(typed) => {
                 if !self.alphabet.contains(&ch) {
-                    return Vec::new();
+                    return CommandBatch::new();
                 }
                 typed.push(ch);
-                let candidate = typed.clone();
-                match hints::match_input(&self.hints, &candidate) {
+                match hints::match_input(&self.hints, typed) {
                     Match::Complete(index) => self.select(index),
                     Match::Partial { .. } => self.redraw(ctx),
                     // Dead end: drop the character and keep the hints up.
@@ -509,7 +522,7 @@ impl HintMode {
                         if let Input::Labels(typed) = &mut self.input {
                             typed.pop();
                         }
-                        Vec::new()
+                        CommandBatch::new()
                     }
                 }
             }
@@ -597,13 +610,13 @@ impl Mode for HintMode {
     }
 
     fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
-        CommandBatch::from(match event {
+        match event {
             ModeEvent::Activated { previous } => {
                 self.return_mode = previous.clone().unwrap_or_else(ModeId::idle);
                 self.request_scan(ctx)
             }
             ModeEvent::Restarted => self.request_scan(ctx),
-            ModeEvent::FinishRequested { .. } if self.finished => Vec::new(),
+            ModeEvent::FinishRequested { .. } if self.finished => CommandBatch::new(),
             ModeEvent::FinishRequested { .. } => {
                 self.finished = true;
                 let mut commands = self.redraw(ctx);
@@ -626,17 +639,17 @@ impl Mode for HintMode {
                 self.retry_pending = false;
                 self.selected = None;
                 self.finished = false;
-                vec![Command::CancelTimer {
+                CommandBatch::one(Command::CancelTimer {
                     id: SCAN_RETRY_TIMER_ID.into(),
-                }]
+                })
             }
-            ModeEvent::UiScanned(_) if self.finished => Vec::new(),
+            ModeEvent::UiScanned(_) if self.finished => CommandBatch::new(),
             ModeEvent::UiScanned(result) if result.id == self.scan_id => {
                 if result.status == UiScanStatus::ContextChanged {
                     self.scanning = false;
                     self.clear_scan_results(false);
                     self.status = Some("Focused window changed — Esc to exit".into());
-                    return self.status_scene(ctx).into();
+                    return self.status_scene(ctx);
                 }
 
                 let added = self.append_targets(&result.targets);
@@ -650,7 +663,7 @@ impl Mode for HintMode {
                 if result.status == UiScanStatus::Partial {
                     self.status = None;
                     return if added {
-                        self.redraw(ctx).into()
+                        self.redraw(ctx)
                     } else {
                         CommandBatch::new()
                     };
@@ -676,7 +689,7 @@ impl Mode for HintMode {
                         delay: Duration::from_millis(self.config.scan_retry_delay_ms),
                         repeating: false,
                     });
-                    return commands.into();
+                    return commands;
                 }
 
                 self.scanning = false;
@@ -692,7 +705,7 @@ impl Mode for HintMode {
                     UiScanStatus::Partial | UiScanStatus::ContextChanged => unreachable!(),
                 };
                 if self.hints.is_empty() {
-                    return self.status_scene(ctx).into();
+                    return self.status_scene(ctx);
                 }
                 self.redraw(ctx)
             }
@@ -722,11 +735,11 @@ impl Mode for HintMode {
                 self.request_scan(ctx)
             }
             ModeEvent::ScreenRetargeted { screen, .. } => {
-                vec![Command::warp_to(screen.bounds.center())]
+                CommandBatch::one(Command::warp_to(screen.bounds.center()))
             }
             ModeEvent::Resumed if self.finished => self.redraw(ctx),
             ModeEvent::Resumed if self.scanning && self.hints.is_empty() => {
-                vec![Command::HideOverlay]
+                CommandBatch::one(Command::HideOverlay)
             }
             ModeEvent::Resumed if self.hints.is_empty() => self.status_scene(ctx),
             ModeEvent::Resumed => self.redraw(ctx),
@@ -755,9 +768,9 @@ impl Mode for HintMode {
             } => self.key_down(key, ctx),
             // In particular, do not treat the trailing repeat from the
             // Primary+F activation chord as an `f` hint selection.
-            ModeEvent::Key { repeat: true, .. } => Vec::new(),
-            _ => Vec::new(),
-        })
+            ModeEvent::Key { repeat: true, .. } => CommandBatch::new(),
+            _ => CommandBatch::new(),
+        }
     }
 }
 

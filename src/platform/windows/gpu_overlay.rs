@@ -50,7 +50,7 @@ use crate::api::overlay::{
     Color, CursorMarker, Indicator, LabelStyle, OverlayLabel, OverlayScene, OverlayShape,
 };
 
-use super::native::OwnedWindow;
+use super::native::{NativeDimensions, OwnedWindow};
 
 const MAX_BRUSHES: usize = 64;
 const MAX_TEXT_FORMATS: usize = 32;
@@ -73,11 +73,11 @@ pub(super) struct GpuOverlay {
 struct WindowContent {
     window: OwnedWindow,
     _target: IDCompositionTarget,
-    _root: IDCompositionVisual,
-    _static_visual: IDCompositionVisual,
+    root: IDCompositionVisual,
+    static_visual: Option<IDCompositionVisual>,
     cursor_visual: IDCompositionVisual,
     indicator_visual: IDCompositionVisual,
-    static_surface: IDCompositionSurface,
+    static_surface: Option<IDCompositionSurface>,
     cursor_surface: Option<LayerSurface>,
     indicator_surface: Option<LayerSurface>,
     last_scene: Option<Arc<OverlayScene>>,
@@ -160,9 +160,11 @@ impl GpuOverlay {
     }
 
     pub(super) fn present(&mut self, scene: Arc<OverlayScene>, area: Rect) -> Result<(), String> {
-        let width = dimension(area.width)?;
-        let height = dimension(area.height)?;
+        let dimensions = NativeDimensions::from_f64(area.width, area.height)?;
+        let width = dimensions.width_u32();
+        let height = dimensions.height_u32();
         let area_changed = self.ensure_content(area, width, height)?;
+        self.ensure_static_layer(scene_has_static_content(&scene), width, height)?;
         let (hwnd, changes) = self
             .content
             .as_ref()
@@ -177,9 +179,10 @@ impl GpuOverlay {
             let static_surface = self
                 .content
                 .as_ref()
-                .map(|content| content.static_surface.clone())
-                .ok_or("DirectComposition content was not retained")?;
-            self.draw_static(&static_surface, scene.as_ref(), area)?;
+                .and_then(|content| content.static_surface.clone());
+            if let Some(static_surface) = static_surface {
+                self.draw_static(&static_surface, scene.as_ref(), area)?;
+            }
         }
         if changes.cursor_changed {
             self.draw_cursor(scene.cursor_marker.as_ref(), area, changes.cursor_repaint)?;
@@ -292,31 +295,16 @@ impl GpuOverlay {
         // SAFETY: device methods return owned COM interfaces.
         let visual = unsafe { self.dcomp.CreateVisual() }
             .map_err(|error| format!("CreateVisual failed: {error}"))?;
-        // SAFETY: dimensions are positive and the pixel/alpha formats are the
-        // formats required by Direct2D and DirectComposition.
-        let static_surface = unsafe {
-            self.dcomp.CreateSurface(
-                width,
-                height,
-                DXGI_FORMAT_B8G8R8A8_UNORM,
-                DXGI_ALPHA_MODE_PREMULTIPLIED,
-            )
-        }
-        .map_err(|error| format!("CreateSurface failed: {error}"))?;
         // SAFETY: every interface belongs to this device and stays alive in
         // WindowContent. Null reference visuals place static at the bottom and
         // dynamic visuals successively above it.
-        let static_visual = unsafe { self.dcomp.CreateVisual() }
-            .map_err(|error| format!("Create static visual failed: {error}"))?;
         let cursor_visual = unsafe { self.dcomp.CreateVisual() }
             .map_err(|error| format!("Create cursor visual failed: {error}"))?;
         let indicator_visual = unsafe { self.dcomp.CreateVisual() }
             .map_err(|error| format!("Create indicator visual failed: {error}"))?;
         unsafe {
-            static_visual
-                .SetContent(&static_surface)
-                .and_then(|()| visual.AddVisual(&static_visual, false, None))
-                .and_then(|()| visual.AddVisual(&cursor_visual, true, None))
+            visual
+                .AddVisual(&cursor_visual, false, None)
                 .and_then(|()| visual.AddVisual(&indicator_visual, true, None))
                 .and_then(|()| target.SetRoot(&visual))
                 .and_then(|()| self.dcomp.Commit())
@@ -325,11 +313,11 @@ impl GpuOverlay {
         self.content = Some(WindowContent {
             window,
             _target: target,
-            _root: visual,
-            _static_visual: static_visual,
+            root: visual,
+            static_visual: None,
             cursor_visual,
             indicator_visual,
-            static_surface,
+            static_surface: None,
             cursor_surface: None,
             indicator_surface: None,
             last_scene: None,
@@ -338,6 +326,36 @@ impl GpuOverlay {
             height,
         });
         Ok(true)
+    }
+
+    fn ensure_static_layer(
+        &mut self,
+        required: bool,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        let Some(content) = self.content.as_mut() else {
+            return Err("DirectComposition content was not retained".into());
+        };
+        if required && content.static_surface.is_none() {
+            let (surface, visual) = create_static_layer(
+                &self.dcomp,
+                &content.root,
+                &content.cursor_visual,
+                width,
+                height,
+            )?;
+            content.static_surface = Some(surface);
+            content.static_visual = Some(visual);
+        } else if !required && let Some(visual) = content.static_visual.take() {
+            // SAFETY: the visual is currently a child of this root and drawing
+            // is not active. Removing it before dropping the surface releases
+            // the screen-sized compositor allocation.
+            unsafe { content.root.RemoveVisual(&visual) }
+                .map_err(|error| format!("cannot detach static visual: {error}"))?;
+            content.static_surface = None;
+        }
+        Ok(())
     }
 
     fn ensure_class(&mut self) -> Result<(), String> {
@@ -796,6 +814,36 @@ impl GpuOverlay {
     }
 }
 
+fn create_static_layer(
+    device: &IDCompositionDevice,
+    root: &IDCompositionVisual,
+    cursor: &IDCompositionVisual,
+    width: u32,
+    height: u32,
+) -> Result<(IDCompositionSurface, IDCompositionVisual), String> {
+    // SAFETY: dimensions were validated before content creation. All returned
+    // interfaces and both existing visuals belong to this compositor device
+    // and render thread; attachment occurs outside an active BeginDraw.
+    unsafe {
+        let surface = device
+            .CreateSurface(
+                width,
+                height,
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                DXGI_ALPHA_MODE_PREMULTIPLIED,
+            )
+            .map_err(|error| format!("CreateSurface failed: {error}"))?;
+        let visual = device
+            .CreateVisual()
+            .map_err(|error| format!("Create static visual failed: {error}"))?;
+        visual
+            .SetContent(&surface)
+            .and_then(|()| root.AddVisual(&visual, false, Some(cursor)))
+            .map_err(|error| format!("cannot attach static visual: {error}"))?;
+        Ok((surface, visual))
+    }
+}
+
 fn ensure_layer_surface(
     device: &IDCompositionDevice,
     slot: &mut Option<LayerSurface>,
@@ -883,11 +931,14 @@ fn scene_changes(
     }
 }
 
+fn scene_has_static_content(scene: &OverlayScene) -> bool {
+    scene.backdrop.is_some() || !scene.shapes.is_empty() || !scene.labels.is_empty()
+}
+
 fn create_window(area: Rect) -> Result<HWND, String> {
     let x = area.x.round() as i32;
     let y = area.y.round() as i32;
-    let width = dimension(area.width)? as i32;
-    let height = dimension(area.height)? as i32;
+    let dimensions = NativeDimensions::from_f64(area.width, area.height)?;
     // SAFETY: the class is registered before this function is called. A
     // successfully created HWND belongs to this thread; initialization either
     // completes or destroys it before returning the error.
@@ -899,8 +950,8 @@ fn create_window(area: Rect) -> Result<HWND, String> {
             WS_POPUP,
             x,
             y,
-            width,
-            height,
+            dimensions.width_i32(),
+            dimensions.height_i32(),
             None,
             None,
             None,
@@ -920,6 +971,7 @@ fn create_window(area: Rect) -> Result<HWND, String> {
 }
 
 fn reposition(hwnd: HWND, area: Rect) -> Result<(), String> {
+    let dimensions = NativeDimensions::from_f64(area.width, area.height)?;
     // SAFETY: `hwnd` is owned by the current render thread.
     unsafe {
         SetWindowPos(
@@ -927,8 +979,8 @@ fn reposition(hwnd: HWND, area: Rect) -> Result<(), String> {
             Some(HWND_TOPMOST),
             area.x.round() as i32,
             area.y.round() as i32,
-            dimension(area.width)? as i32,
-            dimension(area.height)? as i32,
+            dimensions.width_i32(),
+            dimensions.height_i32(),
             SWP_NOACTIVATE,
         )
     }
@@ -936,10 +988,7 @@ fn reposition(hwnd: HWND, area: Rect) -> Result<(), String> {
 }
 
 fn dimension(value: f64) -> Result<u32, String> {
-    if !value.is_finite() || value <= 0.0 || value > u32::MAX as f64 {
-        return Err(format!("invalid overlay dimension {value}"));
-    }
-    Ok(value.round().max(1.0) as u32)
+    NativeDimensions::from_f64(value, 1.0).map(NativeDimensions::width_u32)
 }
 
 fn d2d_color(color: Color) -> D2D1_COLOR_F {

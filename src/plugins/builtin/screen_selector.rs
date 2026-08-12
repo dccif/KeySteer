@@ -138,52 +138,53 @@ impl ScreenSelector {
         }
     }
 
-    fn retarget(index: usize, ctx: &HostContext<'_>) -> Vec<Command> {
-        vec![Command::RetargetScreen {
+    fn retarget(index: usize, ctx: &HostContext<'_>) -> CommandBatch {
+        CommandBatch::one(Command::RetargetScreen {
             index,
             preserve: Self::preserve(ctx),
-        }]
+        })
     }
 
-    fn close_and_retarget(&self, index: usize, ctx: &HostContext<'_>) -> Vec<Command> {
+    fn close_and_retarget(&self, index: usize, ctx: &HostContext<'_>) -> CommandBatch {
         let close = if self.modal {
             Command::PopMode
         } else {
             Command::SwitchMode(self.return_mode.clone())
         };
-        vec![
-            Command::HideOverlay,
-            close,
-            Command::RetargetScreen {
-                index,
-                preserve: Self::preserve(ctx),
-            },
-        ]
+        let mut batch = CommandBatch::two(Command::HideOverlay, close);
+        batch.push(Command::RetargetScreen {
+            index,
+            preserve: Self::preserve(ctx),
+        });
+        batch
     }
 
-    fn cancel(&self) -> Vec<Command> {
+    fn cancel(&self) -> CommandBatch {
         let close = if self.modal {
             Command::PopMode
         } else {
             Command::SwitchMode(self.return_mode.clone())
         };
-        vec![Command::HideOverlay, close]
+        CommandBatch::two(Command::HideOverlay, close)
     }
 
-    fn choose_input(&mut self, ctx: &HostContext<'_>) -> Vec<Command> {
-        let matches: Vec<_> = self
+    fn choose_input(&mut self, ctx: &HostContext<'_>) -> CommandBatch {
+        let mut matches = self
             .cells
             .iter()
-            .filter(|(label, _, _)| label.starts_with(&self.input))
-            .collect();
-        if matches.is_empty() {
+            .filter(|(label, _, _)| label.starts_with(&self.input));
+        let first = matches
+            .next()
+            .map(|(label, index, _)| (label == &self.input, *index));
+        let multiple = matches.next().is_some();
+        let Some((exact, index)) = first else {
             self.input.clear();
-            return vec![Command::show_overlay(self.scene(ctx))];
+            return CommandBatch::one(Command::show_overlay(self.scene(ctx)));
+        };
+        if !multiple && exact {
+            return self.close_and_retarget(index, ctx);
         }
-        if matches.len() == 1 && matches[0].0 == self.input {
-            return self.close_and_retarget(matches[0].1, ctx);
-        }
-        vec![Command::show_overlay(self.scene(ctx))]
+        CommandBatch::one(Command::show_overlay(self.scene(ctx)))
     }
 }
 
@@ -197,10 +198,10 @@ impl Mode for ScreenSelector {
     }
 
     fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
-        CommandBatch::from(match event {
+        match event {
             ModeEvent::Invoked { verb, args } if verb == VERB => {
                 if args.is_empty() {
-                    vec![Command::PushMode(self.id.clone())]
+                    CommandBatch::one(Command::PushMode(self.id.clone()))
                 } else {
                     Self::resolve_target(args, ctx)
                         .map(|index| Self::retarget(index, ctx))
@@ -211,22 +212,22 @@ impl Mode for ScreenSelector {
                 self.modal = true;
                 self.return_mode = previous.clone();
                 self.build(ctx);
-                vec![Command::show_overlay(self.scene(ctx))]
+                CommandBatch::one(Command::show_overlay(self.scene(ctx)))
             }
             ModeEvent::Activated { previous } => {
                 self.modal = false;
                 self.return_mode = previous.clone().unwrap_or_else(ModeId::idle);
                 self.build(ctx);
-                vec![Command::show_overlay(self.scene(ctx))]
+                CommandBatch::one(Command::show_overlay(self.scene(ctx)))
             }
             ModeEvent::ScreensChanged(_) => {
                 self.build(ctx);
-                vec![Command::show_overlay(self.scene(ctx))]
+                CommandBatch::one(Command::show_overlay(self.scene(ctx)))
             }
             ModeEvent::Deactivated => {
                 self.cells.clear();
                 self.input.clear();
-                Vec::new()
+                CommandBatch::new()
             }
             ModeEvent::Key {
                 key,
@@ -236,7 +237,7 @@ impl Mode for ScreenSelector {
                 "esc" => self.cancel(),
                 "backspace" => {
                     self.input.pop();
-                    vec![Command::show_overlay(self.scene(ctx))]
+                    CommandBatch::one(Command::show_overlay(self.scene(ctx)))
                 }
                 "enter" => self
                     .cells
@@ -249,11 +250,11 @@ impl Mode for ScreenSelector {
                         self.input.push(character);
                         self.choose_input(ctx)
                     }
-                    None => Vec::new(),
+                    None => CommandBatch::new(),
                 },
             },
-            _ => Vec::new(),
-        })
+            _ => CommandBatch::new(),
+        }
     }
 }
 

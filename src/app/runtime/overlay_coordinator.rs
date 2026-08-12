@@ -152,6 +152,7 @@ impl Engine {
         }
         let scene = Arc::new(scene);
         backend.present(Arc::clone(&scene))?;
+        crate::app::perf_probe::mark("overlay_presented");
         self.trace(trace_overlay, "overlay", "backend present: ok");
         self.last_scene = Some(scene);
         self.overlay_visible = true;
@@ -180,6 +181,7 @@ impl Engine {
         self.overlay_visible = false;
         self.overlay_dynamic = DynamicOverlayState::default();
         self.overlay_positions = None;
+        crate::app::perf_probe::mark("overlay_hidden");
         Ok(())
     }
 

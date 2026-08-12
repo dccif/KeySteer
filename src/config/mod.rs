@@ -306,6 +306,12 @@ pub struct Config {
     resolved_key_aliases: BTreeMap<String, String>,
 }
 
+pub(crate) struct LoadedConfig {
+    pub(crate) config: Config,
+    pub(crate) raw_text: String,
+    pub(crate) path: PathBuf,
+}
+
 impl Default for Config {
     fn default() -> Self {
         let mut config = Self {
@@ -1432,24 +1438,33 @@ impl Config {
     }
 
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        Self::load_with_source(path).map(|loaded| loaded.config)
+    }
+
+    pub(crate) fn load_with_source(path: &Path) -> Result<LoadedConfig, ConfigError> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| ConfigError::Io(format!("cannot read {}: {e}", path.display())))?;
         let config = Self::parse(&text)?;
         config.validate()?;
-        Ok(config)
+        Ok(LoadedConfig {
+            config,
+            raw_text: text,
+            path: path.to_path_buf(),
+        })
     }
 
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        #[derive(Default, Deserialize)]
-        #[serde(default)]
-        struct AliasHeader {
-            key_aliases: KeyAliases,
-        }
-
-        let header: AliasHeader =
+        let value: toml::Value =
             toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
-        let aliases = compile_key_aliases(&header.key_aliases.effective()?)?;
-        let mut config: Self = with_key_aliases(&aliases, || toml::from_str(text))
+        let key_aliases = value
+            .get("key_aliases")
+            .cloned()
+            .map(KeyAliases::deserialize)
+            .transpose()
+            .map_err(|e| ConfigError::Parse(e.to_string()))?
+            .unwrap_or_default();
+        let aliases = compile_key_aliases(&key_aliases.effective()?)?;
+        let mut config: Self = with_key_aliases(&aliases, || Self::deserialize(value))
             .map_err(|e| ConfigError::Parse(e.to_string()))?;
         config.resolved_key_aliases = aliases;
         config.apply_configured_key_aliases()?;
@@ -1808,9 +1823,14 @@ impl Config {
                 "ui_hint.vision must enable detect_text or detect_rectangles".into(),
             ));
         }
-        if vision.request_timeout_ms == 0 || vision.rectangle_max_candidates == 0 {
+        if !(1..=30_000).contains(&vision.request_timeout_ms) {
             return Err(bad(
-                "ui_hint.vision timeout and rectangle_max_candidates must be positive".into(),
+                "ui_hint.vision.request_timeout_ms must be 1..=30000".into()
+            ));
+        }
+        if !(1..=2_000).contains(&vision.rectangle_max_candidates) {
+            return Err(bad(
+                "ui_hint.vision.rectangle_max_candidates must be 1..=2000".into(),
             ));
         }
         for (name, value) in [

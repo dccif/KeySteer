@@ -4,8 +4,33 @@ use std::path::{Path, PathBuf};
 
 // Keep the current audited native surface from growing. Portable layers are
 // checked separately below and remain entirely safe Rust.
-const MAX_UNSAFE_EXPRESSIONS: usize = 312;
+const MAX_UNSAFE_EXPRESSIONS: usize = 304;
 const MAX_UNSAFE_FILES: usize = 23;
+const PER_FILE_BUDGET: &[(&str, usize)] = &[
+    ("src/platform/macos/accessibility.rs", 15),
+    ("src/platform/macos/autostart.rs", 5),
+    ("src/platform/macos/display_link.rs", 4),
+    ("src/platform/macos/hook.rs", 2),
+    ("src/platform/macos/input.rs", 11),
+    ("src/platform/macos/native.rs", 2),
+    ("src/platform/macos/overlay.rs", 6),
+    ("src/platform/macos/permissions.rs", 5),
+    ("src/platform/macos/screens.rs", 4),
+    ("src/platform/macos/status_item.rs", 4),
+    ("src/platform/macos/vision.rs", 5),
+    ("src/platform/macos/workspace.rs", 4),
+    ("src/platform/windows/accessibility.rs", 64),
+    ("src/platform/windows/autostart.rs", 4),
+    ("src/platform/windows/console_control.rs", 5),
+    ("src/platform/windows/gpu_overlay.rs", 43),
+    ("src/platform/windows/hook.rs", 20),
+    ("src/platform/windows/input.rs", 6),
+    ("src/platform/windows/overlay.rs", 26),
+    ("src/platform/windows/screens.rs", 8),
+    ("src/platform/windows/status_item.rs", 27),
+    ("src/platform/windows/system_events.rs", 4),
+    ("src/platform/windows/native/mod.rs", 30),
+];
 
 fn rust_files(directory: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
     let entries = std::fs::read_dir(directory)?;
@@ -55,6 +80,18 @@ fn unsafe_surface_does_not_regress() -> Result<(), Box<dyn std::error::Error>> {
     for path in files {
         let source = std::fs::read_to_string(&path)?;
         let count = unsafe_expressions(&source);
+        let relative = path
+            .strip_prefix(Path::new(env!("CARGO_MANIFEST_DIR")))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let budget = PER_FILE_BUDGET
+            .iter()
+            .find_map(|(candidate, budget)| (*candidate == relative).then_some(*budget))
+            .unwrap_or(0);
+        assert!(
+            count <= budget,
+            "unsafe budget regressed in {relative}: {count} > {budget}"
+        );
         if count > 0 {
             expression_count += count;
         }

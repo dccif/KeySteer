@@ -25,11 +25,9 @@ for tool in cargo codesign ditto iconutil plutil sips; do
 done
 
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
+export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$project_root" log -1 --format=%ct)}"
 (
   cd "$project_root"
-  # A release version bump changes the root package entry in Cargo.lock.
-  # Synchronize workspace packages only; dependency versions stay pinned.
-  cargo update --workspace
   cargo build --locked --release --target "$target"
 )
 

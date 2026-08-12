@@ -31,7 +31,7 @@ pub use idle::IdleMode;
 pub use normal::NormalMode;
 pub use recursive_grid::RecursiveGridMode;
 
-use crate::api::{Command, FinishCause, Mode};
+use crate::api::{Command, CommandBatch, FinishCause, Mode};
 use crate::config::{Config, LifecycleAction};
 
 /// Instantiate the built-in modes enabled by `config`.
@@ -55,24 +55,24 @@ pub fn built_in(config: &Config) -> Vec<Box<dyn Mode>> {
     modes
 }
 
-fn lifecycle_commands(action: &LifecycleAction, return_mode: &crate::api::ModeId) -> Vec<Command> {
+fn lifecycle_commands(action: &LifecycleAction, return_mode: &crate::api::ModeId) -> CommandBatch {
     match action {
-        LifecycleAction::Keep => Vec::new(),
-        LifecycleAction::Finish => vec![Command::FinishMode {
+        LifecycleAction::Keep => CommandBatch::new(),
+        LifecycleAction::Finish => CommandBatch::one(Command::FinishMode {
             cause: FinishCause::Click,
-        }],
-        LifecycleAction::Restart => vec![Command::RestartMode],
-        LifecycleAction::Return => vec![
+        }),
+        LifecycleAction::Restart => CommandBatch::one(Command::RestartMode),
+        LifecycleAction::Return => CommandBatch::two(
             Command::HideOverlay,
             Command::SwitchMode(return_mode.clone()),
-        ],
+        ),
         LifecycleAction::Mode(mode) => {
-            vec![Command::HideOverlay, Command::SwitchMode(mode.clone())]
+            CommandBatch::two(Command::HideOverlay, Command::SwitchMode(mode.clone()))
         }
-        LifecycleAction::Click { button, action } => vec![Command::MouseButton {
+        LifecycleAction::Click { button, action } => CommandBatch::one(Command::MouseButton {
             button: *button,
             action: *action,
-        }],
+        }),
     }
 }
 

@@ -86,6 +86,6 @@ macOS：
 
 ## 独立工具
 
-- `tools/windows-comparison-runner/`：独立 Cargo crate；在 Windows 上用统一的键盘注入、
-  低级鼠标 Hook 和进程资源采样，对 KeySteer 与同类工具做黑盒延迟/内存对比。它不链接
-  KeySteer crate，测试期间先在内存中记录，结束后才写 CSV，避免磁盘 I/O 污染延迟。
+- `tools/benchmark-windows-dist.ps1`：Windows 整进程启动与资源采样入口；启用
+  `perf-probe` 时读取真实 `backend_started` marker，否则只将 `--check` 计为配置检查耗时。
+  采样期间先保存在内存中，结束后才写 JSON，避免磁盘 I/O 污染测量区间。

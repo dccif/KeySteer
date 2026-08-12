@@ -5,7 +5,8 @@
 //! has been visited, while input and tray handling remain responsive.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -65,13 +66,25 @@ struct ScanJob {
 struct QueueState {
     pending: Option<ScanJob>,
     active_id: Option<u64>,
-    latest_id: u64,
     stopping: bool,
 }
 
 struct SharedQueue {
     state: Mutex<QueueState>,
     ready: Condvar,
+    latest_id: AtomicU64,
+    stopping: AtomicBool,
+}
+
+impl Default for SharedQueue {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+            latest_id: AtomicU64::new(0),
+            stopping: AtomicBool::new(false),
+        }
+    }
 }
 
 /// Backend-owned UIA worker. `stop` is idempotent and joins the COM thread.
@@ -83,10 +96,7 @@ pub struct UiAutomationWorker {
 
 impl UiAutomationWorker {
     pub fn start() -> Result<Self, String> {
-        let shared = Arc::new(SharedQueue {
-            state: Mutex::new(QueueState::default()),
-            ready: Condvar::new(),
-        });
+        let shared = Arc::new(SharedQueue::default());
         let worker_shared = Arc::clone(&shared);
         let thread_id = Arc::new(AtomicU32::new(0));
         let worker_thread_id = Arc::clone(&thread_id);
@@ -111,7 +121,7 @@ impl UiAutomationWorker {
             return Err("UI Automation worker is stopping".into());
         }
         let request_id = request.id;
-        state.latest_id = request_id;
+        self.shared.latest_id.store(request_id, Ordering::Release);
         let replaced = state.pending.replace(ScanJob { request, sender });
         let cancel_active = state.active_id.is_some_and(|id| id != request_id);
         if cancel_active {
@@ -147,6 +157,7 @@ impl UiAutomationWorker {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             state.stopping = true;
+            self.shared.stopping.store(true, Ordering::Release);
             let pending = state.pending.take();
             self.shared.ready.notify_all();
             pending
@@ -194,7 +205,7 @@ impl Drop for UiAutomationWorker {
     }
 }
 
-struct ComApartment;
+struct ComApartment(std::marker::PhantomData<std::rc::Rc<()>>);
 
 impl ComApartment {
     fn initialise() -> Result<Self, String> {
@@ -205,7 +216,7 @@ impl ComApartment {
             unsafe { CoUninitialize() };
             return Err(format!("CoEnableCallCancellation failed: {error}"));
         }
-        Ok(Self)
+        Ok(Self(std::marker::PhantomData))
     }
 }
 
@@ -302,11 +313,12 @@ fn fail_jobs_until_stopped(shared: &SharedQueue, error: String) {
 }
 
 fn is_current(shared: &SharedQueue, id: u64) -> bool {
-    let state = shared
-        .state
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    !state.stopping && state.latest_id == id
+    !shared.stopping.load(Ordering::Acquire) && shared.latest_id.load(Ordering::Acquire) == id
+}
+
+#[inline]
+fn context_is_current(shared: &SharedQueue, id: u64, original: Option<(HWND, u32)>) -> bool {
+    is_current(shared, id) && original == foreground_context()
 }
 
 fn run_scan(
@@ -691,12 +703,14 @@ fn stream_scan(
     let mut queried_window = false;
     let mut provider_timed_out = false;
     let mut terminal_status = UiScanStatus::Success;
+    let mut next_publish_count = PARTIAL_BATCH_SIZE;
+    let mut last_publish = Instant::now();
 
     // Windows are ordered front-to-back. Popup/menu targets are therefore
     // published before their owner, and every lower window carries the bounds
     // of higher click-receiving windows as occluders.
     for window in windows {
-        if !is_current(shared, job.request.id) || original != foreground_context() {
+        if !context_is_current(shared, job.request.id, original) {
             return Ok(UiScanStatus::ContextChanged);
         }
         if Instant::now() >= deadline {
@@ -748,7 +762,12 @@ fn stream_scan(
             let element = unsafe { elements.GetElement(index as i32) }
                 .map_err(|error| format!("cannot read UIA descendant {index}: {error}"))?;
             visited_count += 1;
-            if !is_current(shared, job.request.id) || original != foreground_context() {
+            // The atomic generation is cheap enough for every node. Querying
+            // foreground HWND/PID crosses into user32, so sample it every 32
+            // nodes and always immediately before publishing a partial batch.
+            if !is_current(shared, job.request.id)
+                || visited_count.is_multiple_of(32) && original != foreground_context()
+            {
                 return Ok(UiScanStatus::ContextChanged);
             }
             if Instant::now() >= deadline {
@@ -770,19 +789,30 @@ fn stream_scan(
             {
                 batch.push(target);
                 target_count += 1;
-                if batch.len() >= PARTIAL_BATCH_SIZE {
+                let publish_due = target_count >= next_publish_count
+                    || next_publish_count > PARTIAL_BATCH_SIZE
+                        && last_publish.elapsed() >= Duration::from_millis(16);
+                if publish_due {
+                    if !context_is_current(shared, job.request.id, original) {
+                        return Ok(UiScanStatus::ContextChanged);
+                    }
                     send_partial(job, std::mem::take(&mut batch));
+                    next_publish_count = target_count.saturating_mul(2).max(target_count + 1);
+                    last_publish = Instant::now();
                 }
             }
         }
-        // Do not wait for the next HWND to fill a 24-item batch. A small menu
-        // or dropdown should become usable as soon as its own provider query
-        // completes, while the worker continues with windows underneath it.
+        // Publish a small popup/menu after its provider query when the 16 ms
+        // responsiveness budget elapsed. Otherwise coalesce it with the next
+        // window to avoid cumulatively rebuilding every Hint label.
         if !batch.is_empty()
-            && is_current(shared, job.request.id)
-            && original == foreground_context()
+            && next_publish_count > PARTIAL_BATCH_SIZE
+            && last_publish.elapsed() >= Duration::from_millis(16)
+            && context_is_current(shared, job.request.id, original)
         {
             send_partial(job, std::mem::take(&mut batch));
+            next_publish_count = target_count.saturating_mul(2).max(target_count + 1);
+            last_publish = Instant::now();
         }
         if element_count > remaining {
             terminal_status = UiScanStatus::TimedOut;
@@ -800,7 +830,7 @@ fn stream_scan(
     if provider_timed_out && terminal_status == UiScanStatus::Success {
         terminal_status = UiScanStatus::TimedOut;
     }
-    if !batch.is_empty() && is_current(shared, job.request.id) && original == foreground_context() {
+    if !batch.is_empty() && context_is_current(shared, job.request.id, original) {
         send_partial(job, batch);
     }
     Ok(terminal_status)
@@ -1052,13 +1082,14 @@ pub fn is_usable(target: &UiTarget, within: Rect) -> bool {
 struct DedupEntry {
     x: f64,
     y: f64,
-    name: String,
-    role: String,
+    semantic_index: usize,
 }
 
 struct SpatialDeduper {
     cell_size: f64,
     cells: HashMap<(i32, i32), Vec<DedupEntry>>,
+    semantics: Vec<(String, String)>,
+    semantic_buckets: HashMap<u64, Vec<usize>>,
 }
 
 impl SpatialDeduper {
@@ -1066,11 +1097,14 @@ impl SpatialDeduper {
         Self {
             cell_size: minimum_spacing.max(1.0),
             cells: HashMap::new(),
+            semantics: Vec::new(),
+            semantic_buckets: HashMap::new(),
         }
     }
 
     fn insert(&mut self, target: &UiTarget) -> bool {
         let center = target.rect.center();
+        let semantic_index = self.semantic_index(target);
         let cell = (
             (center.x / self.cell_size).floor() as i32,
             (center.y / self.cell_size).floor() as i32,
@@ -1081,8 +1115,7 @@ impl SpatialDeduper {
                     entries.iter().any(|entry| {
                         (entry.x - center.x).abs() < self.cell_size
                             && (entry.y - center.y).abs() < self.cell_size
-                            && entry.name == target.name
-                            && entry.role == target.role
+                            && entry.semantic_index == semantic_index
                     })
                 }) {
                     return false;
@@ -1092,10 +1125,29 @@ impl SpatialDeduper {
         self.cells.entry(cell).or_default().push(DedupEntry {
             x: center.x,
             y: center.y,
-            name: target.name.clone(),
-            role: target.role.clone(),
+            semantic_index,
         });
         true
+    }
+
+    fn semantic_index(&mut self, target: &UiTarget) -> usize {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        target.name.hash(&mut hasher);
+        target.role.hash(&mut hasher);
+        let hash = hasher.finish();
+        if let Some(index) = self.semantic_buckets.get(&hash).and_then(|indices| {
+            indices.iter().copied().find(|&index| {
+                let (name, role) = &self.semantics[index];
+                name == &target.name && role == &target.role
+            })
+        }) {
+            return index;
+        }
+        let index = self.semantics.len();
+        self.semantics
+            .push((target.name.clone(), target.role.clone()));
+        self.semantic_buckets.entry(hash).or_default().push(index);
+        index
     }
 }
 
@@ -1170,6 +1222,18 @@ mod tests {
         assert!(!deduper.insert(&target(11.0, 11.0, "Save", "button")));
         assert!(deduper.insert(&target(11.0, 11.0, "Cancel", "button")));
         assert!(deduper.insert(&target(11.0, 11.0, "Save", "link")));
+    }
+
+    #[test]
+    fn atomic_scan_generation_cancels_stale_and_stopping_work() {
+        let shared = SharedQueue::default();
+        shared.latest_id.store(7, Ordering::Release);
+        assert!(is_current(&shared, 7));
+        assert!(!is_current(&shared, 6));
+        shared.latest_id.store(8, Ordering::Release);
+        assert!(!is_current(&shared, 7));
+        shared.stopping.store(true, Ordering::Release);
+        assert!(!is_current(&shared, 8));
     }
 
     #[test]

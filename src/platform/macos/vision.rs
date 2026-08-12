@@ -1,4 +1,5 @@
 use std::ffi::{CStr, c_char};
+use std::ptr::NonNull;
 
 use crate::api::command::{UiScanStatus, VisionOptions};
 use crate::api::geometry::{Rect, UiTarget};
@@ -49,11 +50,79 @@ struct NativeRegion {
 
 #[repr(C)]
 struct NativeResult {
+    abi_version: u32,
+    region_stride: u32,
     status: i32,
     regions: *mut NativeRegion,
     count: u64,
     message: *mut c_char,
     captured_bounds: NativeRect,
+}
+
+const MAX_VISION_REGIONS: usize = 2_000;
+const VISION_ABI_VERSION: u32 = 1;
+
+struct OwnedVisionResult(NonNull<NativeResult>);
+
+impl OwnedVisionResult {
+    fn new(result: *mut NativeResult) -> Result<Option<Self>, String> {
+        let Some(result) = NonNull::new(result) else {
+            return Ok(None);
+        };
+        if result.as_ptr().addr() % std::mem::align_of::<NativeResult>() != 0 {
+            return Err("Vision returned a misaligned result pointer".into());
+        }
+        Ok(Some(Self(result)))
+    }
+
+    fn as_ref(&self) -> &NativeResult {
+        // SAFETY: the bridge returned an owned non-null result and this wrapper
+        // retains it until Drop. No mutable access is exposed while borrowed.
+        unsafe { self.0.as_ref() }
+    }
+
+    fn regions(&self) -> Result<&[NativeRegion], String> {
+        let raw = self.as_ref();
+        if raw.abi_version != VISION_ABI_VERSION
+            || raw.region_stride as usize != std::mem::size_of::<NativeRegion>()
+        {
+            return Err(format!(
+                "Vision ABI mismatch: version={}, region_stride={}",
+                raw.abi_version, raw.region_stride
+            ));
+        }
+        let count = usize::try_from(raw.count)
+            .map_err(|_| "Vision returned an unrepresentable region count".to_string())?;
+        if count > MAX_VISION_REGIONS {
+            return Err(format!(
+                "Vision returned {count} regions; maximum is {MAX_VISION_REGIONS}"
+            ));
+        }
+        if count == 0 {
+            return Ok(&[]);
+        }
+        let regions = NonNull::new(raw.regions)
+            .ok_or_else(|| "Vision returned regions with a null pointer".to_string())?;
+        if regions.as_ptr().addr() % std::mem::align_of::<NativeRegion>() != 0 {
+            return Err("Vision returned a misaligned region pointer".into());
+        }
+        let _byte_len = count
+            .checked_mul(std::mem::size_of::<NativeRegion>())
+            .filter(|&length| length <= isize::MAX as usize)
+            .ok_or_else(|| "Vision returned an unrepresentable region buffer".to_string())?;
+        // SAFETY: the native bridge allocates `count` contiguous NativeRegion
+        // values, the count is capped by the shared ABI maximum, and the owner
+        // keeps the allocation alive for the returned borrow.
+        Ok(unsafe { std::slice::from_raw_parts(regions.as_ptr(), count) })
+    }
+}
+
+impl Drop for OwnedVisionResult {
+    fn drop(&mut self) {
+        // SAFETY: this wrapper is constructed only from an owned bridge result
+        // and Drop is the sole release path.
+        unsafe { NmkFreeVisionResult(self.0.as_ptr()) };
+    }
 }
 
 unsafe extern "C" {
@@ -102,14 +171,18 @@ pub fn detect(
         rectangle_min_aspect: options.rectangle_min_aspect,
         rectangle_max_aspect: options.rectangle_max_aspect,
     };
-    let result = NmkDetectVisionElements(native_bounds, config, scan_id);
-    if result.is_null() {
-        return (
-            Vec::new(),
-            UiScanStatus::Failed("Vision could not allocate a result".into()),
-        );
-    }
-    let raw = unsafe { &*result };
+    let result =
+        match OwnedVisionResult::new(NmkDetectVisionElements(native_bounds, config, scan_id)) {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                return (
+                    Vec::new(),
+                    UiScanStatus::Failed("Vision could not allocate a result".into()),
+                );
+            }
+            Err(error) => return (Vec::new(), UiScanStatus::Failed(error)),
+        };
+    let raw = result.as_ref();
     let coordinate_bounds =
         capture_bounds_or_window(native_rect_to_rect(raw.captured_bounds), bounds);
     let message = c_string(raw.message);
@@ -121,10 +194,9 @@ pub fn detect(
         5 => UiScanStatus::Unsupported(message),
         _ => UiScanStatus::Failed(message),
     };
-    let regions = if raw.regions.is_null() {
-        &[][..]
-    } else {
-        unsafe { std::slice::from_raw_parts(raw.regions, raw.count as usize) }
+    let regions = match result.regions() {
+        Ok(regions) => regions,
+        Err(error) => return (Vec::new(), UiScanStatus::Failed(error)),
     };
     let mut candidates = Vec::with_capacity(regions.len());
     for region in regions {
@@ -133,7 +205,6 @@ pub fn detect(
         }
     }
     let targets = merge_candidates(candidates, options.merge_iou_threshold);
-    unsafe { NmkFreeVisionResult(result) };
     (targets, status)
 }
 

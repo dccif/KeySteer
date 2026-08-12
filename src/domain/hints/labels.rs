@@ -21,12 +21,10 @@ pub fn assign<T>(
     if alphabet.len() < 2 {
         return Err("hint alphabet needs at least 2 characters".into());
     }
-
     let labels = match direction {
         LabelDirection::Normal => labels_normal(targets.len(), alphabet),
         LabelDirection::Reverse => labels_reverse(targets.len(), alphabet),
     };
-
     Ok(targets
         .into_iter()
         .zip(labels)
@@ -36,6 +34,99 @@ pub fn assign<T>(
             value,
         })
         .collect())
+}
+
+/// Assign into a reusable buffer, retaining every label String allocation.
+pub fn assign_into<T, I>(
+    output: &mut Vec<Hint<T>>,
+    targets: I,
+    alphabet: &[char],
+    direction: LabelDirection,
+) -> Result<(), String>
+where
+    I: Iterator<Item = (Rect, T)> + Clone,
+{
+    let count = targets.clone().count();
+    if count != 0 && alphabet.len() < 2 {
+        return Err("hint alphabet needs at least 2 characters".into());
+    }
+    output.truncate(count);
+    output.reserve(count.saturating_sub(output.len()));
+    for (index, (bounds, value)) in targets.enumerate() {
+        if let Some(hint) = output.get_mut(index) {
+            write_label(&mut hint.label, index, count, alphabet, direction);
+            hint.bounds = bounds;
+            hint.value = value;
+        } else {
+            let mut label = String::new();
+            write_label(&mut label, index, count, alphabet, direction);
+            output.push(Hint {
+                label,
+                bounds,
+                value,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn write_label(
+    label: &mut String,
+    index: usize,
+    count: usize,
+    alphabet: &[char],
+    direction: LabelDirection,
+) {
+    label.clear();
+    let radix = alphabet.len();
+    match direction {
+        LabelDirection::Normal => {
+            let mut reserved = 0usize;
+            while radix - reserved + reserved * radix < count {
+                reserved += 1;
+                if reserved == radix {
+                    let width = fixed_width_for(count, radix);
+                    write_fixed_width(label, index, alphabet, width, false);
+                    return;
+                }
+            }
+            let singles = radix - reserved;
+            if index < singles {
+                label.push(alphabet[index]);
+            } else {
+                let pair = index - singles;
+                label.push(alphabet[singles + pair / radix]);
+                label.push(alphabet[pair % radix]);
+            }
+        }
+        LabelDirection::Reverse if count <= radix => label.push(alphabet[index]),
+        LabelDirection::Reverse => {
+            let width = fixed_width_for(count, radix);
+            write_fixed_width(label, index, alphabet, width, true);
+        }
+    }
+}
+
+fn write_fixed_width(
+    label: &mut String,
+    mut index: usize,
+    alphabet: &[char],
+    width: usize,
+    little_endian: bool,
+) {
+    let radix = alphabet.len();
+    if little_endian {
+        for _ in 0..width {
+            label.push(alphabet[index % radix]);
+            index /= radix;
+        }
+        return;
+    }
+    let mut divisor = radix.saturating_pow(width.saturating_sub(1) as u32);
+    for _ in 0..width {
+        label.push(alphabet[(index / divisor) % radix]);
+        divisor = (divisor / radix).max(1);
+    }
 }
 
 fn labels_normal(count: usize, alphabet: &[char]) -> Vec<String> {
@@ -165,6 +256,38 @@ mod tests {
             )
             .unwrap()
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn assign_into_reuses_label_capacity_and_preserves_sequences() {
+        let alphabet = chars("asdfghjkl");
+        let source = targets(25);
+        let mut output = Vec::new();
+        assign_into(
+            &mut output,
+            source.iter().copied(),
+            &alphabet,
+            LabelDirection::Normal,
+        )
+        .unwrap();
+        let capacities: Vec<_> = output.iter().map(|hint| hint.label.capacity()).collect();
+        let expected = assign(source.iter().copied(), &alphabet, LabelDirection::Normal).unwrap();
+        assert_eq!(output, expected);
+
+        assign_into(
+            &mut output,
+            source.iter().copied(),
+            &alphabet,
+            LabelDirection::Normal,
+        )
+        .unwrap();
+        assert_eq!(
+            output
+                .iter()
+                .map(|hint| hint.label.capacity())
+                .collect::<Vec<_>>(),
+            capacities
         );
     }
 }

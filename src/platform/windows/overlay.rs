@@ -7,6 +7,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
@@ -32,7 +33,7 @@ use crate::api::overlay::{
     Color, LabelStyle, OverlayItems, OverlayLabel, OverlayScene, OverlayShape,
 };
 
-use super::native::{OwnedWindow, SelectedObject};
+use super::native::{NativeDimensions, OwnedWindow, SelectedObject};
 
 /// Renders scenes into layered click-through windows, one per monitor.
 pub struct Overlay {
@@ -1127,16 +1128,18 @@ struct DibSurface {
     dc: HDC,
     bitmap: HBITMAP,
     old_bitmap: HGDIOBJ,
-    bits: *mut u8,
+    bits: NonNull<u8>,
+    byte_len: usize,
 }
 
 impl DibSurface {
     fn new(width: usize, height: usize) -> Result<Self, String> {
+        let dimensions = NativeDimensions::from_usize(width, height)?;
         let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: width as i32,
-                biHeight: -(height as i32),
+                biWidth: dimensions.width_i32(),
+                biHeight: -dimensions.height_i32(),
                 biPlanes: 1,
                 biBitCount: 32,
                 biCompression: BI_RGB.0,
@@ -1166,8 +1169,12 @@ impl DibSurface {
             }
         };
         let old_bitmap = unsafe { SelectObject(dc, bitmap.into()) };
-        if old_bitmap.0.is_null() || old_bitmap.0 as usize == usize::MAX {
+        let bits = NonNull::new(bits.cast::<u8>());
+        if bits.is_none() || old_bitmap.0.is_null() || old_bitmap.0 as usize == usize::MAX {
             unsafe {
+                if !old_bitmap.0.is_null() && old_bitmap.0 as usize != usize::MAX {
+                    let _ = SelectObject(dc, old_bitmap);
+                }
                 if !DeleteObject(bitmap.into()).as_bool() {
                     crate::app::logging::report_error(
                         "windows-overlay",
@@ -1181,34 +1188,36 @@ impl DibSurface {
                     );
                 }
             }
-            return Err("SelectObject(DIB) failed".into());
+            return Err(if bits.is_none() {
+                "CreateDIBSection returned a null pixel buffer".into()
+            } else {
+                "SelectObject(DIB) failed".into()
+            });
         }
+        let bits =
+            bits.ok_or_else(|| "CreateDIBSection returned a null pixel buffer".to_string())?;
         Ok(Self {
             width,
             height,
             dc,
             bitmap,
             old_bitmap,
-            bits: bits.cast(),
+            bits,
+            byte_len: dimensions.byte_len(),
         })
     }
 
     fn pixels(&self) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                self.bits,
-                self.width.saturating_mul(self.height).saturating_mul(4),
-            )
-        }
+        // SAFETY: `bits` is non-null and points to the DIB allocation owned by
+        // `self`. `byte_len` was checked before the native allocation and the
+        // immutable borrow prevents mutable access for the returned lifetime.
+        unsafe { std::slice::from_raw_parts(self.bits.as_ptr(), self.byte_len) }
     }
 
     fn pixels_mut(&mut self) -> &mut [u8] {
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                self.bits,
-                self.width.saturating_mul(self.height).saturating_mul(4),
-            )
-        }
+        // SAFETY: `self` exclusively owns the DIB and `&mut self` guarantees no
+        // aliases. The validated allocation length is at most `isize::MAX`.
+        unsafe { std::slice::from_raw_parts_mut(self.bits.as_ptr(), self.byte_len) }
     }
 
     fn clear(&mut self) {

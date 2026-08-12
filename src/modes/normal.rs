@@ -19,8 +19,56 @@ use crate::api::command::{Command, CommandBatch, HostContext, Mode, ModeEvent};
 use crate::api::input::{Key, KeyState, ModeId};
 use crate::api::overlay::Color;
 use crate::config::{Config, Palette, Pointer, Scroll};
-use std::collections::BTreeMap;
+use smallvec::SmallVec;
 use std::time::{Duration, Instant};
+
+/// A tiny key-owned map optimized for the usual one-to-four held gestures.
+/// Linear lookup is faster than a tree at this size and avoids node allocation.
+struct SmallKeyMap<T> {
+    entries: SmallVec<[(Key, T); 4]>,
+}
+
+impl<T> Default for SmallKeyMap<T> {
+    fn default() -> Self {
+        Self {
+            entries: SmallVec::new(),
+        }
+    }
+}
+
+impl<T: Copy> SmallKeyMap<T> {
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn values(&self) -> impl Iterator<Item = &T> {
+        self.entries.iter().map(|(_, value)| value)
+    }
+
+    fn insert(&mut self, key: Key, value: T) -> Option<T> {
+        if let Some((_, current)) = self
+            .entries
+            .iter_mut()
+            .find(|(candidate, _)| candidate == &key)
+        {
+            return Some(std::mem::replace(current, value));
+        }
+        self.entries.push((key, value));
+        None
+    }
+
+    fn remove(&mut self, key: &Key) -> Option<T> {
+        let index = self
+            .entries
+            .iter()
+            .position(|(candidate, _)| candidate == key)?;
+        Some(self.entries.swap_remove(index).1)
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
 
 /// Allocation-free set of active movement directions.
 #[derive(Debug, Clone, Copy, Default)]
@@ -181,11 +229,11 @@ pub struct NormalMode {
 
     /// Directions currently held, keyed by the key holding them so releasing
     /// the right key stops the right direction.
-    moving: BTreeMap<Key, Direction>,
+    moving: SmallKeyMap<Direction>,
     /// Scroll gestures currently held.
-    scrolling: BTreeMap<Key, (Direction, ScrollAmount)>,
+    scrolling: SmallKeyMap<(Direction, ScrollAmount)>,
     /// Speed modifiers currently held.
-    speeds: BTreeMap<Key, Speed>,
+    speeds: SmallKeyMap<Speed>,
 
     motion: Motion,
     /// Once the first native display update arrives, OS key repeats are
@@ -201,9 +249,9 @@ impl NormalMode {
             profile: config.pointer.clone(),
             scroll: config.scroll.clone(),
             passthrough_unbound_keys: config.normal.passthrough_unbound_keys,
-            moving: BTreeMap::new(),
-            scrolling: BTreeMap::new(),
-            speeds: BTreeMap::new(),
+            moving: SmallKeyMap::default(),
+            scrolling: SmallKeyMap::default(),
+            speeds: SmallKeyMap::default(),
             motion: Motion::default(),
             frame_driven: false,
             fallback_tick: None,
@@ -393,6 +441,17 @@ mod tests {
     use super::*;
     use crate::api::geometry::{Point, Rect, Screen};
     use std::time::Duration;
+
+    #[test]
+    fn small_key_map_preserves_values_after_inline_capacity_spills() {
+        let mut map = SmallKeyMap::default();
+        for (index, name) in ["a", "s", "d", "f", "g"].into_iter().enumerate() {
+            assert!(map.insert(Key::new(name).unwrap(), index).is_none());
+        }
+        assert_eq!(map.values().copied().sum::<usize>(), 10);
+        assert_eq!(map.remove(&Key::new("d").unwrap()), Some(2));
+        assert_eq!(map.values().copied().sum::<usize>(), 8);
+    }
 
     struct Env {
         screens: Vec<Screen>,

@@ -262,6 +262,9 @@ impl From<[Command; 2]> for CommandBatch {
 
 impl From<Vec<Command>> for CommandBatch {
     fn from(commands: Vec<Command>) -> Self {
+        if commands.len() > 2 {
+            return Self::Many(commands);
+        }
         let mut commands = commands.into_iter();
         let Some(first) = commands.next() else {
             return Self::Empty;
@@ -269,13 +272,7 @@ impl From<Vec<Command>> for CommandBatch {
         let Some(second) = commands.next() else {
             return Self::One(first);
         };
-        let Some(third) = commands.next() else {
-            return Self::Two(first, second);
-        };
-        let mut many = Vec::with_capacity(commands.size_hint().0.saturating_add(3));
-        many.extend([first, second, third]);
-        many.extend(commands);
-        Self::Many(many)
+        Self::Two(first, second)
     }
 }
 
@@ -729,5 +726,9 @@ mod tests {
         assert!(matches!(batch, CommandBatch::Two(_, _)));
         batch.push(Command::Quit);
         assert!(matches!(batch, CommandBatch::Many(_)));
+        assert_eq!(
+            batch.into_iter().collect::<Vec<_>>(),
+            [Command::HideOverlay, Command::ReloadConfig, Command::Quit]
+        );
     }
 }

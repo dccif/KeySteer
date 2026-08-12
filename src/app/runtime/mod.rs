@@ -15,7 +15,9 @@ mod command_executor;
 mod input_router;
 mod overlay_coordinator;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+#[cfg(test)]
+use std::collections::BTreeSet;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -837,6 +839,7 @@ impl Engine {
             "backend",
             format_args!("{} backend started", backend.name()),
         );
+        crate::app::perf_probe::mark("backend_started");
         self.trace_lazy(self.config.debug.backend, "backend", || {
             format!("started {} backend", backend.name())
         });
@@ -965,6 +968,7 @@ impl Engine {
                 crate::app::logging::report_error("backend", format!("shutdown failed: {error}"));
             }
         } else {
+            crate::app::perf_probe::mark("shutdown_complete");
             crate::app::logging::info_args(
                 "backend",
                 format_args!("{} backend stopped", backend.name()),
@@ -1151,6 +1155,11 @@ impl Engine {
                 self.refresh_overlay(backend)?;
             }
             BackendEvent::UiScanned(result) => {
+                crate::app::perf_probe::mark(if result.status == UiScanStatus::Partial {
+                    "ui_scan_partial"
+                } else {
+                    "ui_scan_terminal"
+                });
                 match &result.status {
                     UiScanStatus::Failed(error) => crate::app::logging::report_error(
                         "ui-scan",
@@ -1641,7 +1650,7 @@ impl Engine {
                 if owner == self.active {
                     return None;
                 }
-                self.lookup_inherited(&owner, key, &mut BTreeSet::new())
+                self.lookup_inherited(&owner, key, &mut SmallVec::new())
             }),
         }
     }
@@ -1650,11 +1659,12 @@ impl Engine {
         &self,
         owner: &ModeId,
         key: &Key,
-        visited: &mut BTreeSet<ModeId>,
+        visited: &mut SmallVec<[ModeId; 8]>,
     ) -> Option<ResolvedBinding> {
-        if !visited.insert(owner.clone()) {
+        if visited.contains(owner) {
             return None;
         }
+        visited.push(owner.clone());
         if let Some(binding) = self.lookup_in(owner, key) {
             return (binding.as_ref() != &Binding::Disabled).then(|| ResolvedBinding {
                 binding,
@@ -1699,7 +1709,7 @@ impl Engine {
         if source == "hotkeys" {
             Ok(ModeId::idle())
         } else {
-            ModeId::new(source)
+            ModeId::parse_borrowed(source)
         }
     }
 
@@ -2149,7 +2159,7 @@ impl Engine {
 
             Binding::Warp { x, y } => {
                 self.execute(
-                    vec![Command::WarpPointer {
+                    [Command::WarpPointer {
                         x: *x as f64,
                         y: *y as f64,
                     }],
@@ -2172,7 +2182,7 @@ impl Engine {
             }
             Binding::FinishMode => {
                 self.execute(
-                    vec![Command::FinishMode {
+                    [Command::FinishMode {
                         cause: FinishCause::Explicit,
                     }],
                     backend,
@@ -2180,12 +2190,12 @@ impl Engine {
                 Ok(true)
             }
             Binding::RestartMode => {
-                self.execute(vec![Command::RestartMode], backend)?;
+                self.execute([Command::RestartMode], backend)?;
                 Ok(true)
             }
             Binding::SetConfig { path, value } => {
                 self.execute(
-                    vec![Command::SetConfigValue {
+                    [Command::SetConfigValue {
                         path: path.clone(),
                         value: value.clone(),
                     }],
@@ -2195,13 +2205,13 @@ impl Engine {
             }
 
             Binding::Click(button) => {
-                self.execute(vec![Command::click(map_button(*button))], backend)?;
+                self.execute([Command::click(map_button(*button))], backend)?;
                 self.activate_click_indicator(input, *button, backend)?;
                 Ok(true)
             }
             Binding::DoubleClick(button) => {
                 self.execute(
-                    vec![Command::MouseButton {
+                    [Command::MouseButton {
                         button: map_button(*button),
                         action: ButtonAction::DoubleClick,
                     }],

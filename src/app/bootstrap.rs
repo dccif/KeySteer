@@ -7,8 +7,9 @@ use crate::{Engine, modes, platform, plugins};
 use super::cli::CliOptions;
 
 pub(crate) fn run(args: CliOptions) -> Result<(), String> {
+    crate::app::perf_probe::mark("bootstrap_started");
     let rediscover_config_on_reload = args.config.is_none();
-    let (config, config_path, loaded_from_file) = match &args.config {
+    let (config, config_path, loaded_from_file, config_source) = match &args.config {
         Some(name) => {
             if !name
                 .file_name()
@@ -20,15 +21,22 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
                 ));
             }
             let path = crate::app::paths::explicit_config_file(name)?;
+            let loaded = Config::load_with_source(&path).map_err(|e| e.to_string())?;
             (
-                Config::load(&path).map_err(|e| e.to_string())?,
-                Some(path),
+                loaded.config,
+                Some(loaded.path),
                 true,
+                Some(loaded.raw_text),
             )
         }
         None => match Config::discover() {
-            Some(path) => match Config::load(&path) {
-                Ok(config) => (config, Some(path), true),
+            Some(path) => match Config::load_with_source(&path) {
+                Ok(loaded) => (
+                    loaded.config,
+                    Some(loaded.path),
+                    true,
+                    Some(loaded.raw_text),
+                ),
                 Err(error) => {
                     crate::app::logging::report_error(
                         "config",
@@ -37,10 +45,10 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
                             path.display()
                         ),
                     );
-                    (Config::default(), Config::default_write_path(), false)
+                    (Config::default(), Config::default_write_path(), false, None)
                 }
             },
-            None => (Config::default(), Config::default_write_path(), false),
+            None => (Config::default(), Config::default_write_path(), false, None),
         },
     };
     crate::app::logging::set_non_error_enabled(config.debug.enabled);
@@ -88,10 +96,24 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
         return doctor(&config);
     }
 
+    let built_in_modes = modes::built_in(&config);
+    let bundled_plugins = plugins::bundled(&config)?;
+    let store = if let Some(config_path) = config_path {
+        Some(
+            match config_source {
+                Some(source) => Ok(ConfigStore::from_validated_text(config_path, source)),
+                None => ConfigStore::open(config_path, &config),
+            }
+            .map_err(|e| e.to_string())?,
+        )
+    } else {
+        None
+    };
+
     let mut backend = platform::backend()?;
-    let mut engine = Engine::new(config.clone(), backend.appearance());
-    if let Some(config_path) = config_path {
-        let store = ConfigStore::open(config_path, &config).map_err(|e| e.to_string())?;
+    crate::app::perf_probe::mark("backend_created");
+    let mut engine = Engine::new(config, backend.appearance());
+    if let Some(store) = store {
         if rediscover_config_on_reload {
             if let Some(directory) = crate::app::paths::data_dir() {
                 engine.attach_discovered_config_store(store, directory);
@@ -103,14 +125,16 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
         }
     }
 
-    for mode in modes::built_in(&config) {
+    for mode in built_in_modes {
         engine.register(mode);
     }
-    for plugin in plugins::bundled(&config)? {
+    for plugin in bundled_plugins {
         if let Err(error) = engine.register_plugin_dyn(plugin) {
             crate::report_warning!("plugin", "skipping plugin: {error}");
         }
     }
+
+    crate::app::perf_probe::mark("engine_ready");
 
     engine.run(backend.as_mut())
 }

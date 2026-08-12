@@ -9,7 +9,23 @@ use super::{Config, ConfigError};
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
     path: PathBuf,
-    document: DocumentMut,
+    source: StoreSource,
+}
+
+#[derive(Debug, Clone)]
+enum StoreSource {
+    Raw(String),
+    Parsed(DocumentMut),
+}
+
+impl StoreSource {
+    #[cfg(test)]
+    fn text(&self) -> String {
+        match self {
+            Self::Raw(text) => text.clone(),
+            Self::Parsed(document) => document.to_string(),
+        }
+    }
 }
 
 impl ConfigStore {
@@ -21,10 +37,17 @@ impl ConfigStore {
         } else {
             fallback.to_toml()
         };
-        let document = text
-            .parse::<DocumentMut>()
-            .map_err(|e| ConfigError::Parse(format!("cannot edit {}: {e}", path.display())))?;
-        Ok(Self { path, document })
+        Config::parse(&text)?;
+        Ok(Self::from_validated_text(path, text))
+    }
+
+    pub(crate) fn from_validated_text(path: impl Into<PathBuf>, text: String) -> Self {
+        // The caller already parsed and validated this exact source. Keep the
+        // compact text and defer the comment-preserving AST until the first edit.
+        Self {
+            path: path.into(),
+            source: StoreSource::Raw(text),
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -34,12 +57,9 @@ impl ConfigStore {
     pub fn reload(&mut self) -> Result<Config, ConfigError> {
         let text = std::fs::read_to_string(&self.path)
             .map_err(|e| ConfigError::Io(format!("cannot read {}: {e}", self.path.display())))?;
-        let document = text
-            .parse::<DocumentMut>()
-            .map_err(|e| ConfigError::Parse(format!("cannot edit {}: {e}", self.path.display())))?;
         let config = Config::parse(&text)?;
         config.validate()?;
-        self.document = document;
+        self.source = StoreSource::Raw(text);
         Ok(config)
     }
 
@@ -57,13 +77,19 @@ impl ConfigStore {
             .cloned()
             .ok_or_else(|| ConfigError::Parse(format!("missing TOML value for {path}")))?;
 
-        let mut candidate = self.document.clone();
+        let document = match &self.source {
+            StoreSource::Raw(text) => text.parse::<DocumentMut>().map_err(|e| {
+                ConfigError::Parse(format!("cannot edit {}: {e}", self.path.display()))
+            })?,
+            StoreSource::Parsed(document) => document.clone(),
+        };
+        let mut candidate = document;
         set_item(candidate.as_table_mut(), &segments, value)?;
         let text = candidate.to_string();
         let config = Config::parse(&text)?;
         config.validate()?;
         atomic_write(&self.path, text.as_bytes())?;
-        self.document = candidate;
+        self.source = StoreSource::Parsed(candidate);
         Ok(config)
     }
 }
@@ -139,9 +165,9 @@ mod tests {
     fn invalid_update_keeps_the_last_valid_document() {
         let path = std::env::temp_dir().join(test_file_name("keysteer-store"));
         let mut store = ConfigStore::open(&path, &Config::default()).unwrap();
-        let before = store.document.to_string();
+        let before = store.source.text();
         assert!(store.set("pointer.initial_speed", "0").is_err());
-        assert_eq!(store.document.to_string(), before);
+        assert_eq!(store.source.text(), before);
         let _ = std::fs::remove_file(path);
     }
 
@@ -154,6 +180,19 @@ mod tests {
             .set("key_aliases.windows.Primary", "\"left_alt\"")
             .unwrap();
         assert_eq!(config.key_aliases.windows["Primary"], "left_alt");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn document_ast_is_lazy_and_reload_returns_to_raw_source() {
+        let path = std::env::temp_dir().join(test_file_name("keysteer-lazy-store"));
+        std::fs::write(&path, Config::default().to_toml()).unwrap();
+        let mut store = ConfigStore::open(&path, &Config::default()).unwrap();
+        assert!(matches!(store.source, StoreSource::Raw(_)));
+        store.set("pointer.initial_speed", "11").unwrap();
+        assert!(matches!(store.source, StoreSource::Parsed(_)));
+        store.reload().unwrap();
+        assert!(matches!(store.source, StoreSource::Raw(_)));
         let _ = std::fs::remove_file(path);
     }
 }

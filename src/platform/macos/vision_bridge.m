@@ -30,6 +30,8 @@ typedef struct {
 } NmkVisionRegion;
 
 typedef struct {
+    uint32_t abi_version;
+    uint32_t region_stride;
     int32_t status;
     NmkVisionRegion *regions;
     uint64_t count;
@@ -45,9 +47,10 @@ enum {
     NMK_VISION_CONTEXT_CHANGED = 4,
 };
 
-enum { NMK_MAX_VISION_REGIONS = 2000 };
+enum { NMK_VISION_ABI_VERSION = 1, NMK_MAX_VISION_REGIONS = 2000 };
 
 static _Atomic uint64_t latestVisionScan = 0;
+static _Atomic bool captureInFlight = false;
 
 void NmkSetLatestVisionScan(uint64_t scanID) {
     atomic_store_explicit(&latestVisionScan, scanID, memory_order_release);
@@ -57,9 +60,25 @@ static bool scanIsCurrent(uint64_t scanID) {
     return atomic_load_explicit(&latestVisionScan, memory_order_acquire) == scanID;
 }
 
+static bool tryAcquireCapture(void) {
+    bool expected = false;
+    return atomic_compare_exchange_strong_explicit(
+        &captureInFlight,
+        &expected,
+        true,
+        memory_order_acq_rel,
+        memory_order_acquire);
+}
+
+static void releaseCapture(void) {
+    atomic_store_explicit(&captureInFlight, false, memory_order_release);
+}
+
 static NmkVisionResult *resultWithStatus(int32_t status, NSString *message) {
     NmkVisionResult *result = calloc(1, sizeof(NmkVisionResult));
     if (result == NULL) return NULL;
+    result->abi_version = NMK_VISION_ABI_VERSION;
+    result->region_stride = sizeof(NmkVisionRegion);
     result->status = status;
     if (message.length > 0) result->message = strdup(message.UTF8String);
     return result;
@@ -95,6 +114,15 @@ static CGImageRef captureRegion(
     }
     if (capturedBounds != NULL) *capturedBounds = clipped;
 
+    // ScreenCaptureKit has no cancellation API. Keep this permit until the
+    // actual completion callback, not merely until the synchronous caller
+    // times out, so full-resolution captures can never overlap.
+    if (!tryAcquireCapture()) {
+        *status = NMK_VISION_TIMEOUT;
+        *message = @"A previous screen capture is still completing";
+        return NULL;
+    }
+
     dispatch_group_t group = dispatch_group_create();
     __block CGImageRef captured = NULL;
     __block NSError *captureError = nil;
@@ -102,11 +130,13 @@ static CGImageRef captureRegion(
     [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent *content, NSError *error) {
         if (error != nil || content.displays.count == 0) {
             captureError = error;
+            releaseCapture();
             dispatch_group_leave(group);
             return;
         }
         SCDisplay *display = displayForID(displayID, content);
         if (display == nil) {
+            releaseCapture();
             dispatch_group_leave(group);
             return;
         }
@@ -133,11 +163,15 @@ static CGImageRef captureRegion(
         [SCScreenshotManager captureImageWithFilter:filter configuration:configuration completionHandler:^(CGImageRef image, NSError *error) {
             captureError = error;
             if (image != NULL) captured = CGImageRetain(image);
+            releaseCapture();
             dispatch_group_leave(group);
         }];
     }];
 
-    dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, (int64_t)timeoutMS * NSEC_PER_MSEC);
+    uint64_t boundedTimeoutMS = MIN(MAX(timeoutMS, 1), 30000);
+    dispatch_time_t deadline = dispatch_time(
+        DISPATCH_TIME_NOW,
+        (int64_t)boundedTimeoutMS * NSEC_PER_MSEC);
     if (dispatch_group_wait(group, deadline) != 0) {
         // The ScreenCaptureKit operation cannot be cancelled. Release a late
         // image after its completion block leaves the group instead of leaking
@@ -163,6 +197,10 @@ NmkVisionResult *NmkDetectVisionElements(
     NmkVisionConfig config,
     uint64_t scanID) {
     @autoreleasepool {
+        config.timeout_ms = MIN(MAX(config.timeout_ms, 1), 30000);
+        config.rectangle_max_candidates = MIN(
+            MAX(config.rectangle_max_candidates, 1),
+            (uint64_t)NMK_MAX_VISION_REGIONS);
         if (!scanIsCurrent(scanID)) {
             return resultWithStatus(NMK_VISION_CONTEXT_CHANGED, nil);
         }

@@ -1,5 +1,12 @@
 # UI Hint 扫描链路
 
+## 性能与取消约束（2026-08）
+
+- Windows UIA 以原子 scan id/stopping flag 做逐节点取消检查；前台 HWND/PID 每 32 个节点采样一次，并在发布 partial 前强制复核。
+- 第一批 24 个目标立即发布；随后按目标数翻倍或 16ms 时限合并 partial，terminal 总是立即发布。Hint 复用标签 String 和结果 Vec。
+- macOS ScreenCaptureKit capture 是 native single-flight。timeout 不释放 permit；permit 只由真实 completion callback 释放，晚到图片恰好释放一次。
+- Vision timeout 限制为 1..=30000ms，rectangle candidates 限制为 1..=2000，Rust 与 Objective-C 两侧均校验。
+
 ## 公共请求模型
 
 `UiScanRequest` 包含 scan id、软超时、屏幕 bounds、语义 roles、树深度、可见/可点击

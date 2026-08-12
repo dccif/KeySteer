@@ -420,19 +420,23 @@ enum ModeName {
 
 impl ModeId {
     pub fn new(value: impl Into<String>) -> Result<Self, String> {
-        let value = value.into();
+        Self::parse_borrowed(&value.into())
+    }
+
+    /// Parse a borrowed id without allocating for built-in modes.
+    pub fn parse_borrowed(value: &str) -> Result<Self, String> {
         let valid = !value.is_empty()
             && value
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '/'));
         if valid {
-            let name = match value.as_str() {
+            let name = match value {
                 "idle" => ModeName::Idle,
                 "normal" => ModeName::Normal,
                 "grid" => ModeName::Grid,
                 "recursive_grid" => ModeName::RecursiveGrid,
                 "ui_hint" => ModeName::UiHint,
-                _ => ModeName::Shared(value.into()),
+                _ => ModeName::Shared(Arc::from(value)),
             };
             Ok(Self(name))
         } else {

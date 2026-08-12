@@ -15,6 +15,7 @@ use crate::api::geometry::{Point, Rect};
 use crate::api::input::{Key, KeyState, ModeId};
 use crate::api::overlay::{Color, LabelStyle, OverlayLabel, OverlayScene, OverlayShape};
 use crate::config::{Config, GridLayer, Palette, RecursiveGridUi, TargetingLifecycle};
+use smallvec::SmallVec;
 
 /// Grid shape at one depth.
 #[derive(Debug, Clone, PartialEq)]
@@ -35,9 +36,9 @@ pub struct RecursiveGridMode {
     ui: RecursiveGridUi,
 
     /// Areas from the root down to the current one; `stack[0]` is the root.
-    stack: Vec<Rect>,
+    stack: SmallVec<[Rect; 12]>,
     /// Per-depth row-major indices replayed with each layer's layout.
-    path: Vec<usize>,
+    path: SmallVec<[usize; 12]>,
     /// A leaf has been selected and the session is ready to finish.
     terminal: bool,
     finished: bool,
@@ -61,8 +62,8 @@ impl RecursiveGridMode {
             default_cursor_follow_selection: rg.cursor_follow_selection,
             cursor_follow_selection: rg.cursor_follow_selection,
             ui: rg.ui.clone(),
-            stack: Vec::new(),
-            path: Vec::new(),
+            stack: SmallVec::new(),
+            path: SmallVec::new(),
             terminal: false,
             finished: false,
             lifecycle: rg.lifecycle.clone(),
@@ -325,31 +326,32 @@ impl RecursiveGridMode {
         scene
     }
 
-    fn redraw(&self, palette: &Palette) -> Vec<Command> {
-        vec![Command::show_overlay(self.scene(palette))]
+    fn redraw(&self, palette: &Palette) -> CommandBatch {
+        CommandBatch::one(Command::show_overlay(self.scene(palette)))
     }
 
     /// Complete selection by moving only; lifecycle configuration decides what follows.
-    fn commit(&self, point: Point, palette: &Palette) -> Vec<Command> {
-        vec![
+    fn commit(&self, point: Point, palette: &Palette) -> CommandBatch {
+        let mut commands = CommandBatch::two(
             Command::warp_to(point),
             Command::show_overlay(self.scene(palette)),
-            Command::FinishMode {
-                cause: FinishCause::Selection,
-            },
-        ]
+        );
+        commands.push(Command::FinishMode {
+            cause: FinishCause::Selection,
+        });
+        commands
     }
 
-    fn cancel(&self) -> Vec<Command> {
-        vec![
+    fn cancel(&self) -> CommandBatch {
+        CommandBatch::two(
             Command::HideOverlay,
             Command::SwitchMode(self.return_mode.clone()),
-        ]
+        )
     }
 
-    fn toggle_cursor_follow(&mut self, palette: &Palette) -> Vec<Command> {
+    fn toggle_cursor_follow(&mut self, palette: &Palette) -> CommandBatch {
         self.cursor_follow_selection = !self.cursor_follow_selection;
-        let mut commands = Vec::new();
+        let mut commands = CommandBatch::new();
         if self.cursor_follow_selection
             && let Some(area) = self.current()
         {
@@ -360,18 +362,19 @@ impl RecursiveGridMode {
     }
 
     fn reset(&mut self, bounds: Rect) {
-        self.stack = vec![bounds];
+        self.stack.clear();
+        self.stack.push(bounds);
         self.path.clear();
         self.terminal = false;
         self.finished = false;
         self.cursor_follow_selection = self.default_cursor_follow_selection;
     }
 
-    fn retarget(&mut self, bounds: Rect, preserve: bool, palette: &Palette) -> Vec<Command> {
+    fn retarget(&mut self, bounds: Rect, preserve: bool, palette: &Palette) -> CommandBatch {
         let path = if preserve {
             self.path.clone()
         } else {
-            Vec::new()
+            SmallVec::new()
         };
         let was_finished = preserve && self.finished;
         let follow = self.cursor_follow_selection;
@@ -392,12 +395,13 @@ impl RecursiveGridMode {
             self.terminal = self.depth() >= self.max_depth || !self.can_descend();
             self.finished = was_finished;
         }
-        let mut commands = vec![Command::warp_to(self.current().unwrap_or(bounds).center())];
+        let mut commands =
+            CommandBatch::one(Command::warp_to(self.current().unwrap_or(bounds).center()));
         commands.extend(self.redraw(palette));
         commands
     }
 
-    fn select(&mut self, index: usize, cell: Rect, palette: &Palette) -> Vec<Command> {
+    fn select(&mut self, index: usize, cell: Rect, palette: &Palette) -> CommandBatch {
         self.stack.push(cell);
         self.path.push(index);
         // A selected cell is terminal after the configured depth, or when it
@@ -408,7 +412,7 @@ impl RecursiveGridMode {
             return self.commit(cell.center(), palette);
         }
 
-        let mut commands = Vec::new();
+        let mut commands = CommandBatch::new();
         if self.cursor_follow_selection {
             commands.push(Command::warp_to(cell.center()));
         }
@@ -416,7 +420,7 @@ impl RecursiveGridMode {
         commands
     }
 
-    fn key_down(&mut self, key: &Key, ctx: &HostContext<'_>) -> Vec<Command> {
+    fn key_down(&mut self, key: &Key, ctx: &HostContext<'_>) -> CommandBatch {
         match key.as_str() {
             "esc" => return self.cancel(),
             "enter" => {
@@ -444,20 +448,20 @@ impl RecursiveGridMode {
         }
 
         if self.terminal || self.finished {
-            return Vec::new();
+            return CommandBatch::new();
         }
         let Some(ch) = key.as_char() else {
-            return Vec::new();
+            return CommandBatch::new();
         };
         let layout = self.layout_at(self.depth());
         let Some(index) = layout.keys.iter().position(|candidate| *candidate == ch) else {
-            return Vec::new();
+            return CommandBatch::new();
         };
         let Some(cell) = self
             .current()
             .and_then(|area| area.subdivision(layout.rows, layout.cols, index))
         else {
-            return Vec::new();
+            return CommandBatch::new();
         };
         self.select(index, cell, ctx.palette)
     }
@@ -503,7 +507,7 @@ impl Mode for RecursiveGridMode {
     }
 
     fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
-        CommandBatch::from(match event {
+        match event {
             ModeEvent::Activated { previous } => {
                 self.return_mode = previous.clone().unwrap_or_else(ModeId::idle);
                 self.reset(ctx.active_bounds());
@@ -513,7 +517,7 @@ impl Mode for RecursiveGridMode {
                 self.reset(ctx.active_bounds());
                 self.redraw(ctx.palette)
             }
-            ModeEvent::FinishRequested { .. } if self.finished => Vec::new(),
+            ModeEvent::FinishRequested { .. } if self.finished => CommandBatch::new(),
             ModeEvent::FinishRequested { .. } => {
                 self.finished = true;
                 let mut commands = self.redraw(ctx.palette);
@@ -531,7 +535,7 @@ impl Mode for RecursiveGridMode {
                 self.path.clear();
                 self.terminal = false;
                 self.finished = false;
-                Vec::new()
+                CommandBatch::new()
             }
             ModeEvent::ScreensChanged(_) => {
                 self.reset(ctx.active_bounds());
@@ -569,8 +573,8 @@ impl Mode for RecursiveGridMode {
                 state: KeyState::Down,
                 ..
             } => self.key_down(key, ctx),
-            _ => Vec::new(),
-        })
+            _ => CommandBatch::new(),
+        }
     }
 }
 
@@ -758,7 +762,7 @@ mod tests {
         activate(&mut mode, &env);
         press(&mut mode, &env, "t");
         press(&mut mode, &env, "g");
-        assert_eq!(mode.path, [1, 4]);
+        assert_eq!(mode.path.as_slice(), [1, 4]);
         let target = Screen {
             bounds: Rect::new(-1200.0, 100.0, 1200.0, 800.0),
             work_area: Rect::new(-1200.0, 100.0, 1200.0, 800.0),
@@ -774,7 +778,7 @@ mod tests {
             },
             &env.ctx(),
         );
-        assert_eq!(mode.path, [1, 4]);
+        assert_eq!(mode.path.as_slice(), [1, 4]);
         assert_eq!(mode.depth(), 2);
         assert_eq!(scene_of(&out).clip, Some(target.bounds));
         assert!(out.contains(&Command::warp_to(mode.current().unwrap().center())));
@@ -949,7 +953,7 @@ mod tests {
         env.cursor = Point::new(1500.0, 400.0);
         let out = mode.handle(&ModeEvent::PointerMoved(env.cursor), &env.ctx());
 
-        assert_eq!(mode.stack, vec![env.screens[1].bounds]);
+        assert_eq!(mode.stack.as_slice(), [env.screens[1].bounds]);
         assert_eq!(mode.depth(), 0);
         assert_eq!(scene_of(&out).clip, Some(env.screens[1].bounds));
     }

@@ -34,13 +34,13 @@ if ([string]::IsNullOrWhiteSpace($version)) {
 
 Push-Location $projectRoot
 try {
-    # A release version bump changes the root package entry in Cargo.lock.
-    # Keep third-party dependency versions pinned while synchronizing only
-    # packages that belong to this workspace.
-    & cargo update --workspace
-    if ($LASTEXITCODE -ne 0) {
-        throw "cargo workspace lockfile synchronization failed with exit code $LASTEXITCODE"
+    if (-not $env:SOURCE_DATE_EPOCH) {
+        $env:SOURCE_DATE_EPOCH = (& git log -1 --format=%ct).Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $env:SOURCE_DATE_EPOCH) {
+            throw "cannot derive SOURCE_DATE_EPOCH from the checked-out commit"
+        }
     }
+    $env:RUSTFLAGS = (($env:RUSTFLAGS, "-C link-arg=/Brepro") -join " ").Trim()
 
     & cargo build --locked --release --target $Target
     if ($LASTEXITCODE -ne 0) {

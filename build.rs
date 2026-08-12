@@ -1,5 +1,5 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=assets/icons/keysteer.ico");
     println!("cargo:rerun-if-changed=src/platform/windows/compositor_clock.c");
     println!("cargo:rerun-if-changed=src/platform/macos/vision_bridge.m");
@@ -45,6 +45,7 @@ fn civil_date(days_since_epoch: u64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
+#[cfg(windows)]
 fn compile_windows_resources() -> Result<(), Box<dyn std::error::Error>> {
     // Official Windows artifacts are built on Windows. Cross-platform
     // `cargo check --target ...` runs without a Windows resource compiler.
@@ -74,6 +75,13 @@ fn compile_windows_resources() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[cfg(not(windows))]
+fn compile_windows_resources() -> Result<(), Box<dyn std::error::Error>> {
+    println!("cargo:warning=skipping Windows resources on a non-Windows host");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 fn compile_macos_bridge() {
     // `cargo check --target ...-apple-darwin` can still type-check the Rust
     // backend from another host. Only a macOS host has the SDK and Objective-C
@@ -103,4 +111,9 @@ fn compile_macos_bridge() {
     ] {
         println!("cargo:rustc-link-lib=framework={framework}");
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn compile_macos_bridge() {
+    println!("cargo:warning=skipping macOS Objective-C bridge on a non-macOS host");
 }

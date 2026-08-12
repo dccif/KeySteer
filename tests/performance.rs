@@ -3,7 +3,11 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Duration;
 
-use keysteer::api::{Appearance, Binding, Direction, HostContext, KeyState, Mode};
+use keysteer::api::{
+    Appearance, Binding, Command, CommandBatch, Direction, HostContext, KeyState, LabelDirection,
+    Mode, Rect,
+};
+use keysteer::domain::hints::assign_into;
 use keysteer::modes::normal::NormalMode;
 use keysteer::{Config, Key, ModeEvent, Point};
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
@@ -57,5 +61,69 @@ fn steady_normal_frames_do_not_allocate() {
     assert_eq!(
         change.bytes_allocated, 0,
         "steady frames allocated bytes: {change:?}"
+    );
+    inline_command_batches_do_not_allocate();
+    warmed_hint_assignment_reuses_two_thousand_labels();
+}
+
+fn inline_command_batches_do_not_allocate() {
+    let region = Region::new(GLOBAL);
+    for _ in 0..10_000 {
+        let mut batch = CommandBatch::new();
+        batch.push(Command::HideOverlay);
+        batch.push(Command::ReloadConfig);
+        black_box(batch);
+    }
+    let change = region.change();
+    assert_eq!(
+        change.allocations, 0,
+        "inline batches allocated: {change:?}"
+    );
+    assert_eq!(
+        change.bytes_allocated, 0,
+        "inline batches allocated bytes: {change:?}"
+    );
+}
+
+fn warmed_hint_assignment_reuses_two_thousand_labels() {
+    const TARGETS: usize = 2_000;
+    let alphabet: Vec<char> = "arstneioqwfpjluy".chars().collect();
+    let targets = (0..TARGETS).map(|index| {
+        (
+            Rect::new((index % 100) as f64, (index / 100) as f64, 8.0, 8.0),
+            index,
+        )
+    });
+    let mut output = Vec::new();
+    assert!(
+        assign_into(
+            &mut output,
+            targets.clone(),
+            &alphabet,
+            LabelDirection::Normal,
+        )
+        .is_ok(),
+        "valid hint alphabet must assign"
+    );
+
+    let region = Region::new(GLOBAL);
+    for _ in 0..100 {
+        assert!(
+            assign_into(
+                &mut output,
+                targets.clone(),
+                &alphabet,
+                LabelDirection::Normal,
+            )
+            .is_ok(),
+            "valid hint alphabet must assign"
+        );
+        black_box(&output);
+    }
+    let change = region.change();
+    assert_eq!(change.allocations, 0, "hint relabel allocated: {change:?}");
+    assert_eq!(
+        change.bytes_allocated, 0,
+        "hint relabel allocated bytes: {change:?}"
     );
 }

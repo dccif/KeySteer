@@ -7,6 +7,7 @@ mod bootstrap;
 mod cli;
 pub(crate) mod logging;
 pub(crate) mod paths;
+pub(crate) mod perf_probe;
 pub mod runtime;
 pub(crate) mod update;
 

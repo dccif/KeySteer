@@ -11,6 +11,7 @@ use crate::api::geometry::{Point, Rect};
 use crate::api::input::{Key, KeyState, ModeId};
 use crate::api::overlay::{Color, LabelStyle, OverlayLabel, OverlayScene, OverlayShape};
 use crate::config::{Config, GridUi, Palette, TargetingLifecycle};
+use smallvec::SmallVec;
 
 #[derive(Debug, Clone, PartialEq)]
 struct Layout {
@@ -32,9 +33,9 @@ pub struct GridMode {
     cursor_follow_selection: bool,
     ui: GridUi,
     /// Areas from the active display to the selected leaf.
-    stack: Vec<Rect>,
+    stack: SmallVec<[Rect; 12]>,
     /// Row-major cell indices used to replay the selection on another display.
-    path: Vec<usize>,
+    path: SmallVec<[usize; 12]>,
     /// A leaf has been selected and the session is ready to finish.
     terminal: bool,
     finished: bool,
@@ -55,8 +56,8 @@ impl GridMode {
             default_cursor_follow_selection: grid.cursor_follow_selection,
             cursor_follow_selection: grid.cursor_follow_selection,
             ui: grid.ui.clone(),
-            stack: Vec::new(),
-            path: Vec::new(),
+            stack: SmallVec::new(),
+            path: SmallVec::new(),
             terminal: false,
             finished: false,
             lifecycle: grid.lifecycle.clone(),
@@ -357,13 +358,13 @@ impl GridMode {
         scene
     }
 
-    fn redraw(&self, palette: &Palette) -> Vec<Command> {
-        vec![Command::show_overlay(self.scene(palette))]
+    fn redraw(&self, palette: &Palette) -> CommandBatch {
+        CommandBatch::one(Command::show_overlay(self.scene(palette)))
     }
 
-    fn toggle_cursor_follow(&mut self, palette: &Palette) -> Vec<Command> {
+    fn toggle_cursor_follow(&mut self, palette: &Palette) -> CommandBatch {
         self.cursor_follow_selection = !self.cursor_follow_selection;
-        let mut commands = Vec::new();
+        let mut commands = CommandBatch::new();
         if self.cursor_follow_selection
             && let Some(area) = self.current()
         {
@@ -374,18 +375,19 @@ impl GridMode {
     }
 
     fn reset(&mut self, bounds: Rect) {
-        self.stack = vec![bounds];
+        self.stack.clear();
+        self.stack.push(bounds);
         self.path.clear();
         self.terminal = false;
         self.finished = false;
         self.cursor_follow_selection = self.default_cursor_follow_selection;
     }
 
-    fn retarget(&mut self, bounds: Rect, preserve: bool, palette: &Palette) -> Vec<Command> {
+    fn retarget(&mut self, bounds: Rect, preserve: bool, palette: &Palette) -> CommandBatch {
         let path = if preserve {
             self.path.clone()
         } else {
-            Vec::new()
+            SmallVec::new()
         };
         let was_finished = preserve && self.finished;
         let follow = self.cursor_follow_selection;
@@ -405,12 +407,13 @@ impl GridMode {
             self.terminal = self.depth() >= self.max_depth;
             self.finished = was_finished;
         }
-        let mut commands = vec![Command::warp_to(self.current().unwrap_or(bounds).center())];
+        let mut commands =
+            CommandBatch::one(Command::warp_to(self.current().unwrap_or(bounds).center()));
         commands.extend(self.redraw(palette));
         commands
     }
 
-    fn select(&mut self, index: usize, cell: Rect, palette: &Palette) -> Vec<Command> {
+    fn select(&mut self, index: usize, cell: Rect, palette: &Palette) -> CommandBatch {
         self.stack.push(cell);
         self.path.push(index);
         if self.depth() >= self.max_depth {
@@ -418,16 +421,17 @@ impl GridMode {
         }
 
         if self.terminal {
-            return vec![
+            let mut commands = CommandBatch::two(
                 Command::warp_to(cell.center()),
                 Command::show_overlay(self.scene(palette)),
-                Command::FinishMode {
-                    cause: FinishCause::Selection,
-                },
-            ];
+            );
+            commands.push(Command::FinishMode {
+                cause: FinishCause::Selection,
+            });
+            return commands;
         }
 
-        let mut commands = Vec::new();
+        let mut commands = CommandBatch::new();
         if self.cursor_follow_selection {
             commands.push(Command::warp_to(cell.center()));
         }
@@ -435,27 +439,28 @@ impl GridMode {
         commands
     }
 
-    fn commit_current(&self, palette: &Palette) -> Vec<Command> {
+    fn commit_current(&self, palette: &Palette) -> CommandBatch {
         let Some(area) = self.current() else {
             return self.cancel();
         };
-        vec![
+        let mut commands = CommandBatch::two(
             Command::warp_to(area.center()),
             Command::show_overlay(self.scene(palette)),
-            Command::FinishMode {
-                cause: FinishCause::Selection,
-            },
-        ]
+        );
+        commands.push(Command::FinishMode {
+            cause: FinishCause::Selection,
+        });
+        commands
     }
 
-    fn cancel(&self) -> Vec<Command> {
-        vec![
+    fn cancel(&self) -> CommandBatch {
+        CommandBatch::two(
             Command::HideOverlay,
             Command::SwitchMode(self.return_mode.clone()),
-        ]
+        )
     }
 
-    fn key_down(&mut self, key: &Key, ctx: &HostContext<'_>) -> Vec<Command> {
+    fn key_down(&mut self, key: &Key, ctx: &HostContext<'_>) -> CommandBatch {
         match key.as_str() {
             "esc" => return self.cancel(),
             "enter" => return self.commit_current(ctx.palette),
@@ -480,10 +485,10 @@ impl GridMode {
         }
 
         if self.terminal || self.finished {
-            return Vec::new();
+            return CommandBatch::new();
         }
         let Some(key) = key.as_char() else {
-            return Vec::new();
+            return CommandBatch::new();
         };
         let Some(index) = self
             .layout
@@ -491,13 +496,13 @@ impl GridMode {
             .iter()
             .position(|candidate| *candidate == key)
         else {
-            return Vec::new();
+            return CommandBatch::new();
         };
         let Some(cell) = self
             .current()
             .and_then(|area| area.subdivision(self.layout.rows, self.layout.cols, index))
         else {
-            return Vec::new();
+            return CommandBatch::new();
         };
         self.select(index, cell, ctx.palette)
     }
@@ -517,7 +522,7 @@ impl Mode for GridMode {
     }
 
     fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
-        CommandBatch::from(match event {
+        match event {
             ModeEvent::Activated { previous } => {
                 self.return_mode = previous.clone().unwrap_or_else(ModeId::idle);
                 self.reset(ctx.active_bounds());
@@ -527,7 +532,7 @@ impl Mode for GridMode {
                 self.reset(ctx.active_bounds());
                 self.redraw(ctx.palette)
             }
-            ModeEvent::FinishRequested { .. } if self.finished => Vec::new(),
+            ModeEvent::FinishRequested { .. } if self.finished => CommandBatch::new(),
             ModeEvent::FinishRequested { .. } => {
                 self.finished = true;
                 let mut commands = self.redraw(ctx.palette);
@@ -557,7 +562,7 @@ impl Mode for GridMode {
                 self.path.clear();
                 self.terminal = false;
                 self.finished = false;
-                Vec::new()
+                CommandBatch::new()
             }
             ModeEvent::ConfigReloaded => {
                 let return_mode = self.return_mode.clone();
@@ -581,8 +586,8 @@ impl Mode for GridMode {
                 state: KeyState::Down,
                 ..
             } => self.key_down(key, ctx),
-            _ => Vec::new(),
-        })
+            _ => CommandBatch::new(),
+        }
     }
 }
 
@@ -946,7 +951,7 @@ mod tests {
         activate(&mut mode, &env);
         press(&mut mode, &env, "q");
         press(&mut mode, &env, "w");
-        assert_eq!(mode.path, [5, 6]);
+        assert_eq!(mode.path.as_slice(), [5, 6]);
         let target = Screen {
             bounds: Rect::new(1000.0, 0.0, 1600.0, 900.0),
             work_area: Rect::new(1000.0, 0.0, 1600.0, 900.0),
@@ -962,7 +967,7 @@ mod tests {
             },
             &env.ctx(),
         );
-        assert_eq!(mode.path, [5, 6]);
+        assert_eq!(mode.path.as_slice(), [5, 6]);
         assert_eq!(mode.depth(), 2);
         assert_eq!(scene_of(&out).clip, Some(target.bounds));
         assert!(out.contains(&Command::warp_to(mode.current().unwrap().center())));

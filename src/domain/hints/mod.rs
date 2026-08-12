@@ -5,5 +5,5 @@ mod labels;
 mod matcher;
 
 pub use grid::{fit_grid, grid_labels};
-pub use labels::{Hint, assign};
+pub use labels::{Hint, assign, assign_into};
 pub use matcher::{Match, match_input};
