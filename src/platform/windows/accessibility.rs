@@ -25,12 +25,13 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::System::Variant::{VARIANT, VT_BOOL, VT_I4};
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomation2, IUIAutomationCacheRequest, IUIAutomationElement,
-    TreeScope_Descendants, UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId,
-    UIA_IsEnabledPropertyId, UIA_IsExpandCollapsePatternAvailablePropertyId,
-    UIA_IsInvokePatternAvailablePropertyId, UIA_IsKeyboardFocusablePropertyId,
-    UIA_IsOffscreenPropertyId, UIA_IsSelectionItemPatternAvailablePropertyId,
-    UIA_IsTogglePatternAvailablePropertyId, UIA_NamePropertyId,
+    CUIAutomation, IUIAutomation, IUIAutomation2, IUIAutomationCacheRequest,
+    IUIAutomationCondition, IUIAutomationElement, TreeScope_Descendants,
+    UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId, UIA_IsEnabledPropertyId,
+    UIA_IsExpandCollapsePatternAvailablePropertyId, UIA_IsInvokePatternAvailablePropertyId,
+    UIA_IsKeyboardFocusablePropertyId, UIA_IsOffscreenPropertyId,
+    UIA_IsSelectionItemPatternAvailablePropertyId, UIA_IsTogglePatternAvailablePropertyId,
+    UIA_NamePropertyId, UIA_PROPERTY_ID,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumThreadWindows, EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetForegroundWindow,
@@ -209,12 +210,17 @@ struct ComApartment(std::marker::PhantomData<std::rc::Rc<()>>);
 
 impl ComApartment {
     fn initialise() -> Result<Self, String> {
-        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
-            .ok()
-            .map_err(|error| format!("CoInitializeEx failed: {error}"))?;
-        if let Err(error) = unsafe { CoEnableCallCancellation(None) } {
-            unsafe { CoUninitialize() };
-            return Err(format!("CoEnableCallCancellation failed: {error}"));
+        // SAFETY: this constructor runs on the future UIA owner thread. A
+        // successful COM initialization is rolled back immediately if call
+        // cancellation cannot be enabled; otherwise Drop owns both releases.
+        unsafe {
+            CoInitializeEx(None, COINIT_MULTITHREADED)
+                .ok()
+                .map_err(|error| format!("CoInitializeEx failed: {error}"))?;
+            if let Err(error) = CoEnableCallCancellation(None) {
+                CoUninitialize();
+                return Err(format!("CoEnableCallCancellation failed: {error}"));
+            }
         }
         Ok(Self(std::marker::PhantomData))
     }
@@ -885,52 +891,95 @@ fn variant_i32(value: i32) -> VARIANT {
 /// trees, while the Rust-side role filter still honours user configuration.
 fn create_interactive_condition(
     automation: &IUIAutomation,
-) -> Result<windows::Win32::UI::Accessibility::IUIAutomationCondition, String> {
+) -> Result<IUIAutomationCondition, String> {
     let true_value = variant_bool(true);
     let false_value = variant_bool(false);
-    let focusable = unsafe {
-        automation.CreatePropertyCondition(UIA_IsKeyboardFocusablePropertyId, &true_value)
-    }
-    .map_err(|error| format!("keyboard-focusable condition failed: {error}"))?;
-    let invokable = unsafe {
-        automation.CreatePropertyCondition(UIA_IsInvokePatternAvailablePropertyId, &true_value)
-    }
-    .map_err(|error| format!("invoke condition failed: {error}"))?;
-    let button = unsafe {
-        automation.CreatePropertyCondition(UIA_ControlTypePropertyId, &variant_i32(50000))
-    }
-    .map_err(|error| format!("button condition failed: {error}"))?;
-    let expandable = unsafe {
-        automation
-            .CreatePropertyCondition(UIA_IsExpandCollapsePatternAvailablePropertyId, &true_value)
-    }
-    .map_err(|error| format!("expand/collapse condition failed: {error}"))?;
-    let toggle = unsafe {
-        automation.CreatePropertyCondition(UIA_IsTogglePatternAvailablePropertyId, &true_value)
-    }
-    .map_err(|error| format!("toggle condition failed: {error}"))?;
-    let selection = unsafe {
-        automation
-            .CreatePropertyCondition(UIA_IsSelectionItemPatternAvailablePropertyId, &true_value)
-    }
-    .map_err(|error| format!("selection condition failed: {error}"))?;
-    let enabled =
-        unsafe { automation.CreatePropertyCondition(UIA_IsEnabledPropertyId, &true_value) }
-            .map_err(|error| format!("enabled condition failed: {error}"))?;
-    let onscreen =
-        unsafe { automation.CreatePropertyCondition(UIA_IsOffscreenPropertyId, &false_value) }
-            .map_err(|error| format!("onscreen condition failed: {error}"))?;
+    let focusable = property_condition(
+        automation,
+        UIA_IsKeyboardFocusablePropertyId,
+        &true_value,
+        "keyboard-focusable",
+    )?;
+    let invokable = property_condition(
+        automation,
+        UIA_IsInvokePatternAvailablePropertyId,
+        &true_value,
+        "invoke",
+    )?;
+    let button = property_condition(
+        automation,
+        UIA_ControlTypePropertyId,
+        &variant_i32(50000),
+        "button",
+    )?;
+    let expandable = property_condition(
+        automation,
+        UIA_IsExpandCollapsePatternAvailablePropertyId,
+        &true_value,
+        "expand/collapse",
+    )?;
+    let toggle = property_condition(
+        automation,
+        UIA_IsTogglePatternAvailablePropertyId,
+        &true_value,
+        "toggle",
+    )?;
+    let selection = property_condition(
+        automation,
+        UIA_IsSelectionItemPatternAvailablePropertyId,
+        &true_value,
+        "selection",
+    )?;
+    let enabled = property_condition(automation, UIA_IsEnabledPropertyId, &true_value, "enabled")?;
+    let onscreen = property_condition(
+        automation,
+        UIA_IsOffscreenPropertyId,
+        &false_value,
+        "onscreen",
+    )?;
 
-    let mut interactive = unsafe { automation.CreateOrCondition(&focusable, &invokable) }
-        .map_err(|error| format!("interactive condition failed: {error}"))?;
+    let mut interactive = or_condition(automation, &focusable, &invokable, "interactive")?;
     for extra in [&button, &expandable, &toggle, &selection] {
-        interactive = unsafe { automation.CreateOrCondition(&interactive, extra) }
-            .map_err(|error| format!("interactive condition failed: {error}"))?;
+        interactive = or_condition(automation, &interactive, extra, "interactive")?;
     }
-    let enabled_and_visible = unsafe { automation.CreateAndCondition(&enabled, &onscreen) }
-        .map_err(|error| format!("visibility condition failed: {error}"))?;
-    unsafe { automation.CreateAndCondition(&enabled_and_visible, &interactive) }
-        .map_err(|error| format!("final UIA condition failed: {error}"))
+    let enabled_and_visible = and_condition(automation, &enabled, &onscreen, "visibility")?;
+    and_condition(automation, &enabled_and_visible, &interactive, "final UIA")
+}
+
+fn property_condition(
+    automation: &IUIAutomation,
+    property: UIA_PROPERTY_ID,
+    value: &VARIANT,
+    context: &str,
+) -> Result<IUIAutomationCondition, String> {
+    // SAFETY: the property id and VARIANT are initialized UIA values; the
+    // returned COM condition is independently reference counted.
+    unsafe { automation.CreatePropertyCondition(property, value) }
+        .map_err(|error| format!("{context} condition failed: {error}"))
+}
+
+fn or_condition(
+    automation: &IUIAutomation,
+    left: &IUIAutomationCondition,
+    right: &IUIAutomationCondition,
+    context: &str,
+) -> Result<IUIAutomationCondition, String> {
+    // SAFETY: both conditions are live COM interfaces from this automation
+    // instance and remain borrowed for the complete call.
+    unsafe { automation.CreateOrCondition(left, right) }
+        .map_err(|error| format!("{context} condition failed: {error}"))
+}
+
+fn and_condition(
+    automation: &IUIAutomation,
+    left: &IUIAutomationCondition,
+    right: &IUIAutomationCondition,
+    context: &str,
+) -> Result<IUIAutomationCondition, String> {
+    // SAFETY: both conditions are live COM interfaces from this automation
+    // instance and remain borrowed for the complete call.
+    unsafe { automation.CreateAndCondition(left, right) }
+        .map_err(|error| format!("{context} condition failed: {error}"))
 }
 
 const DEFAULT_CONTROL_TYPES: [i32; 17] = [

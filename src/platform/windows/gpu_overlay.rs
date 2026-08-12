@@ -99,6 +99,72 @@ struct FontEntry {
     format: IDWriteTextFormat,
 }
 
+/// Owns the native draw pairing after a successful DirectComposition
+/// `BeginDraw`. Cloned COM interfaces only adjust reference counts; they do not
+/// allocate another device or surface. Drop covers every early return and panic.
+struct SurfaceDrawGuard {
+    d2d: ID2D1DeviceContext,
+    surface: IDCompositionSurface,
+    d2d_started: bool,
+    finished: bool,
+}
+
+impl SurfaceDrawGuard {
+    fn new(d2d: &ID2D1DeviceContext, surface: &IDCompositionSurface) -> Self {
+        Self {
+            d2d: d2d.clone(),
+            surface: surface.clone(),
+            d2d_started: false,
+            finished: false,
+        }
+    }
+
+    fn begin_d2d(&mut self, bitmap: &windows::Win32::Graphics::Direct2D::ID2D1Bitmap1) {
+        // SAFETY: the bitmap was created from this guard's active composition
+        // surface and belongs to the same D2D device context.
+        unsafe {
+            self.d2d.SetTarget(bitmap);
+            self.d2d.BeginDraw();
+        }
+        self.d2d_started = true;
+    }
+
+    fn finish(mut self) -> Result<(), String> {
+        self.finish_inner()
+    }
+
+    fn finish_inner(&mut self) -> Result<(), String> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+        // SAFETY: each flag is set only after its matching BeginDraw succeeds.
+        // Marking finished first makes this exactly-once even when EndDraw
+        // reports an error; the D2D target is always detached before return.
+        let (d2d_result, surface_result) = unsafe {
+            let d2d_result = if self.d2d_started {
+                let result = self.d2d.EndDraw(None, None);
+                self.d2d.SetTarget(None);
+                result.map_err(|error| format!("Direct2D EndDraw failed: {error}"))
+            } else {
+                Ok(())
+            };
+            let surface_result = self
+                .surface
+                .EndDraw()
+                .map_err(|error| format!("DirectComposition EndDraw failed: {error}"));
+            (d2d_result, surface_result)
+        };
+        d2d_result.and(surface_result)
+    }
+}
+
+impl Drop for SurfaceDrawGuard {
+    fn drop(&mut self) {
+        let _ = self.finish_inner();
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SceneChanges {
     static_changed: bool,
@@ -404,6 +470,7 @@ impl GpuOverlay {
         // interface is explicitly requested as IDXGISurface.
         let dxgi: IDXGISurface = unsafe { surface.BeginDraw(None, &mut offset) }
             .map_err(|error| format!("DirectComposition BeginDraw failed: {error}"))?;
+        let mut draw_guard = SurfaceDrawGuard::new(&self.d2d, surface);
         let properties = D2D1_BITMAP_PROPERTIES1 {
             pixelFormat: D2D1_PIXEL_FORMAT {
                 format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -416,26 +483,16 @@ impl GpuOverlay {
         };
         // SAFETY: `dxgi` is the surface returned by BeginDraw and properties
         // describe that surface's exact format.
-        let bitmap = match unsafe {
+        let bitmap = unsafe {
             self.d2d
                 .CreateBitmapFromDxgiSurface(&dxgi, Some(&properties))
-        } {
-            Ok(bitmap) => bitmap,
-            Err(error) => {
-                // SAFETY: every successful BeginDraw is paired with EndDraw.
-                let _ = unsafe { surface.EndDraw() };
-                return Err(format!("CreateBitmapFromDxgiSurface failed: {error}"));
-            }
-        };
+        }
+        .map_err(|error| format!("CreateBitmapFromDxgiSurface failed: {error}"))?;
         #[cfg(test)]
         {
             self.begin_draws = self.begin_draws.wrapping_add(1);
         }
-        // SAFETY: the bitmap belongs to the same D2D device context.
-        unsafe {
-            self.d2d.SetTarget(&bitmap);
-            self.d2d.BeginDraw();
-        }
+        draw_guard.begin_d2d(&bitmap);
         let origin = Point::new(
             coordinate_origin.x - f64::from(offset.x),
             coordinate_origin.y - f64::from(offset.y),
@@ -445,16 +502,7 @@ impl GpuOverlay {
         // for the duration of the call.
         unsafe { self.d2d.Clear(clear.as_ref().map(std::ptr::from_ref)) };
         let draw_result = draw(self, origin);
-        // SAFETY: BeginDraw above is paired exactly once. Dropping `bitmap`
-        // after detaching it cannot leave a target reference behind.
-        let d2d_result = unsafe { self.d2d.EndDraw(None, None) }
-            .map_err(|error| format!("Direct2D EndDraw failed: {error}"));
-        // SAFETY: EndDraw completed and detaching releases the bitmap target.
-        unsafe { self.d2d.SetTarget(None) };
-        // SAFETY: BeginDraw on the DirectComposition surface succeeded once.
-        let surface_result = unsafe { surface.EndDraw() }
-            .map_err(|error| format!("DirectComposition EndDraw failed: {error}"));
-        draw_result.and(d2d_result).and(surface_result)
+        draw_result.and(draw_guard.finish())
     }
 
     fn draw_static(

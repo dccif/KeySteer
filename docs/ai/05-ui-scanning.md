@@ -3,7 +3,7 @@
 ## 性能与取消约束（2026-08）
 
 - Windows UIA 以原子 scan id/stopping flag 做逐节点取消检查；前台 HWND/PID 每 32 个节点采样一次，并在发布 partial 前强制复核。
-- 第一批 24 个目标立即发布；随后按目标数翻倍或 16ms 时限合并 partial，terminal 总是立即发布。Hint 复用标签 String 和结果 Vec。
+- macOS AX/Vision/Hybrid 共用纯数量批次：第一批 24 个目标立即发布，随后在累计 48、96、192… 个目标时发布，terminal 立即补发剩余目标；不使用时间间隔，也不依赖显示刷新率。Hint 复用标签 String 和结果 Vec。
 - macOS ScreenCaptureKit capture 是 native single-flight。timeout 不释放 permit；permit 只由真实 completion callback 释放，晚到图片恰好释放一次。
 - Vision timeout 限制为 1..=30000ms，rectangle candidates 限制为 1..=2000，Rust 与 Objective-C 两侧均校验。
 
@@ -32,6 +32,8 @@ Engine 用 scan id 记录 owner；HintMode 也只接受当前 `scan_id`。旧 wo
 4. 搜索模式只过滤已扫描目标，不重新遍历平台树。
 5. 完整标签选中后保存 target、warp pointer、建立 finished 状态。
 6. 只有没有出现标签时才按 `scan_retry_count`/delay 重试；每次预算递增，单次最多 30s。
+7. overlap cycle 修饰键按下时立即置顶下一项；按住期间固定当前标签集合，后续 Partial
+   只累计目标，释放后再一次性合入，避免增长中的堆叠组自动换项。
 
 因此“流式”是端到端语义，不只是 worker 分批：Mode 会在扫描尚未结束时展示和接受已有
 结果。不要为了完整排序而等终态。
@@ -74,7 +76,9 @@ Engine 用 scan id 记录 owner；HintMode 也只接受当前 `scan_id`。旧 wo
 - 新任务替换等待中的旧任务，并向旧请求发送 `ContextChanged`。
 - 每次发送前检查 `LATEST_SCAN` 和 frontmost pid；新 id 也会让正在遍历的 AX 在节点边界
   停止，并让 Vision 在 capture/识别阶段边界释放过期结果。
-- AX 和 Vision 都流式分批；Hybrid 在 scoped thread 中并行 AX，同时当前 worker 执行 Vision。
+- AX 和 Vision 共用纯计数的流式发布器；Hybrid 在 scoped thread 中并行 AX，同时当前 worker
+  执行 Vision。合计首批 24 项立即发布，之后在累计数量达到 48、96、192……时发布，终态
+  无条件刷新剩余项。这里不使用时间间隔，因此不依赖显示刷新率或机器速度。
 
 AX：`src/platform/macos/accessibility.rs`。
 
@@ -82,7 +86,7 @@ AX：`src/platform/macos/accessibility.rs`。
 - 设置每节点 messaging timeout，受总 deadline 和 max depth 限制。
 - 读取 role、frame、enabled、actions 和 accessible name，语义 role 映射在本文件。
 - 一次扫描复用固定的 AX 属性名 `CFString`；矩形去重使用预分配 `HashSet`。
-- 遍历过程把拥有所有权的 8 项 batch 直接交给 callback，不保留完整目标数组或深拷贝
+- 遍历过程把拥有所有权的 24 项 batch 直接交给共享发布器，不保留完整目标数组或深拷贝
   已发送的 Partial。
 
 Vision：`src/platform/macos/vision.rs` + `vision_bridge.m`。

@@ -7,8 +7,10 @@
 //! `/` enters search mode, where typing filters elements by their accessible
 //! name instead of matching labels.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashMap;
 use std::time::Duration;
+
+use smallvec::SmallVec;
 
 use crate::api::binding::Binding;
 use crate::api::command::{
@@ -51,7 +53,11 @@ pub struct HintMode {
     /// Everything the current scan has returned so far.
     scanned: Vec<UiTarget>,
     scanned_names_lower: Vec<String>,
-    seen_targets: HashSet<(i64, i64, i64, i64, String, String)>,
+    search_names_initialized: bool,
+    /// Rectangles normally identify one target. A tiny inline collision list
+    /// preserves distinct controls sharing bounds without owning a second copy
+    /// of every target name and role.
+    seen_targets: HashMap<(i64, i64, i64, i64), SmallVec<[usize; 2]>>,
     /// Labelled subset currently on screen; the value is an index into
     /// `scanned`.
     hints: Vec<Hint<usize>>,
@@ -65,8 +71,12 @@ pub struct HintMode {
     /// Display bounds used by the newest scan. Pointer movement to another
     /// display invalidates both pending and rendered results.
     scan_bounds: Option<Rect>,
-    held_overlap_keys: BTreeSet<Key>,
+    held_overlap_keys: SmallVec<[Key; 2]>,
     overlap_cycle: usize,
+    /// New scan targets are accumulated while the overlap modifier is held,
+    /// but the visible labels stay pinned until release. Otherwise every
+    /// streamed partial can change the selected member of a growing stack.
+    overlap_labels_dirty: bool,
     selected: Option<usize>,
     finished: bool,
 }
@@ -78,7 +88,8 @@ impl HintMode {
             alphabet: config.ui_hint.hint_characters.chars().collect(),
             scanned: Vec::new(),
             scanned_names_lower: Vec::new(),
-            seen_targets: HashSet::new(),
+            search_names_initialized: false,
+            seen_targets: HashMap::new(),
             hints: Vec::new(),
             input: Input::Labels(String::new()),
             scanning: false,
@@ -88,8 +99,9 @@ impl HintMode {
             retry_attempt: 0,
             retry_pending: false,
             scan_bounds: None,
-            held_overlap_keys: BTreeSet::new(),
+            held_overlap_keys: SmallVec::new(),
             overlap_cycle: 0,
+            overlap_labels_dirty: false,
             selected: None,
             finished: false,
         }
@@ -98,8 +110,10 @@ impl HintMode {
     fn clear_scan_results(&mut self, release_large_buffers: bool) {
         self.scanned.clear();
         self.scanned_names_lower.clear();
+        self.search_names_initialized = false;
         self.seen_targets.clear();
         self.hints.clear();
+        self.overlap_labels_dirty = false;
         if release_large_buffers {
             if self.scanned.capacity() > MAX_IDLE_RETAINED_TARGETS {
                 self.scanned = Vec::new();
@@ -111,7 +125,7 @@ impl HintMode {
                 self.hints = Vec::new();
             }
             if self.seen_targets.capacity() > MAX_IDLE_RETAINED_TARGETS {
-                self.seen_targets = HashSet::new();
+                self.seen_targets = HashMap::new();
             }
         }
     }
@@ -182,12 +196,20 @@ impl HintMode {
                 (rect.y * 4.0).round() as i64,
                 (rect.width * 4.0).round() as i64,
                 (rect.height * 4.0).round() as i64,
-                target.name.clone(),
-                target.role.clone(),
             );
-            if self.seen_targets.insert(key) {
-                self.scanned_names_lower.push(target.name.to_lowercase());
+            let duplicate = self.seen_targets.get(&key).is_some_and(|indices| {
+                indices.iter().any(|&index| {
+                    let existing = &self.scanned[index];
+                    existing.name == target.name && existing.role == target.role
+                })
+            });
+            if !duplicate {
+                let index = self.scanned.len();
+                if self.search_names_initialized {
+                    self.scanned_names_lower.push(target.name.to_lowercase());
+                }
                 self.scanned.push(target.clone());
+                self.seen_targets.entry(key).or_default().push(index);
             }
         }
         self.scanned.len() != before
@@ -196,17 +218,26 @@ impl HintMode {
     /// Assign labels to the targets matching the current search query.
     fn relabel(&mut self) {
         let query = match &self.input {
-            Input::Search(q) => q.to_lowercase(),
-            Input::Labels(_) => String::new(),
+            Input::Search(query) => Some(query.to_lowercase()),
+            Input::Labels(_) => None,
         };
+        if query.is_some() && !self.search_names_initialized {
+            self.scanned_names_lower.clear();
+            self.scanned_names_lower
+                .extend(self.scanned.iter().map(|target| target.name.to_lowercase()));
+            self.search_names_initialized = true;
+        }
 
         let candidates = self
             .scanned
             .iter()
-            .zip(&self.scanned_names_lower)
             .enumerate()
-            .filter(|(_, (_, name_lower))| query.is_empty() || name_lower.contains(&query))
-            .map(|(i, (target, _))| (target.rect, i));
+            .filter(|(index, _)| {
+                query
+                    .as_ref()
+                    .is_none_or(|query| self.scanned_names_lower[*index].contains(query))
+            })
+            .map(|(index, target)| (target.rect, index));
 
         if hints::assign_into(
             &mut self.hints,
@@ -218,6 +249,7 @@ impl HintMode {
         {
             self.hints.clear();
         }
+        self.overlap_labels_dirty = false;
     }
 
     fn hint_is_visible(&self, hint: &Hint<usize>) -> bool {
@@ -236,15 +268,33 @@ impl HintMode {
         let changed = match state {
             KeyState::Down => {
                 let was_released = self.held_overlap_keys.is_empty();
-                let inserted = self.held_overlap_keys.insert(key.clone());
+                let inserted = if self.held_overlap_keys.contains(key) {
+                    false
+                } else {
+                    self.held_overlap_keys.push(key.clone());
+                    true
+                };
                 if inserted && was_released {
                     self.overlap_cycle = self.overlap_cycle.wrapping_add(1);
                 }
                 inserted
             }
-            KeyState::Up => self.held_overlap_keys.remove(key),
+            KeyState::Up => self
+                .held_overlap_keys
+                .iter()
+                .position(|candidate| candidate == key)
+                .map(|index| self.held_overlap_keys.swap_remove(index))
+                .is_some(),
         };
-        if changed && !self.scanning && !self.hints.is_empty() {
+        if changed
+            && state == KeyState::Up
+            && self.held_overlap_keys.is_empty()
+            && self.overlap_labels_dirty
+            && self.input.text().is_empty()
+        {
+            self.relabel();
+        }
+        if changed && !self.hints.is_empty() {
             self.redraw(ctx)
         } else {
             CommandBatch::new()
@@ -656,13 +706,24 @@ impl Mode for HintMode {
                 // Once the user starts typing, preserve the labels they can
                 // already see and select. Later batches remain available after
                 // the next scan instead of changing codes under their fingers.
-                if added && self.input.text().is_empty() {
-                    self.relabel();
-                }
+                let labels_changed = if added && self.input.text().is_empty() {
+                    if self.held_overlap_keys.is_empty() || self.hints.is_empty() {
+                        self.relabel();
+                        true
+                    } else {
+                        // Keep the currently raised label stable while the
+                        // overlap key is held. The targets remain accumulated
+                        // and are labelled together on the final release edge.
+                        self.overlap_labels_dirty = true;
+                        false
+                    }
+                } else {
+                    false
+                };
 
                 if result.status == UiScanStatus::Partial {
                     self.status = None;
-                    return if added {
+                    return if labels_changed {
                         self.redraw(ctx)
                     } else {
                         CommandBatch::new()
@@ -778,6 +839,7 @@ impl Mode for HintMode {
 mod tests {
     use super::*;
     use crate::api::geometry::{Point, Screen};
+    use std::collections::HashSet;
 
     struct Env {
         screens: Vec<Screen>,
@@ -1149,6 +1211,127 @@ mod tests {
             .map(|label| label.text.clone())
             .expect("one overlapping label should be raised");
         assert_ne!(first_top, second_top);
+
+        release(&mut mode, &env, "right_shift");
+        let third = press(&mut mode, &env, "left_shift");
+        let third_top = scene_of(&third)
+            .labels
+            .iter()
+            .find(|label| label.z_index == 3)
+            .map(|label| label.text.clone())
+            .expect("one overlapping label should be raised");
+        assert_ne!(first_top, third_top);
+        assert_ne!(second_top, third_top);
+    }
+
+    #[test]
+    fn held_overlap_key_pins_streamed_stack_until_release() {
+        let env = Env::new();
+        let mut mode = HintMode::new(&env.config);
+        activate(&mut mode, &env);
+        mode.handle(
+            &ModeEvent::UiScanned(crate::api::UiScanResult {
+                id: mode.scan_id,
+                targets: vec![target("One", 100.0), target("Two", 100.0)],
+                status: UiScanStatus::Partial,
+            }),
+            &env.ctx(),
+        );
+
+        let raised = press(&mut mode, &env, "left_shift");
+        let raised_text = scene_of(&raised)
+            .labels
+            .iter()
+            .find(|label| label.z_index == 3)
+            .map(|label| label.text.clone())
+            .expect("one overlapping label should be raised immediately");
+
+        let streamed = mode.handle(
+            &ModeEvent::UiScanned(crate::api::UiScanResult {
+                id: mode.scan_id,
+                targets: vec![target("Three", 100.0), target("Four", 100.0)],
+                status: UiScanStatus::Partial,
+            }),
+            &env.ctx(),
+        );
+        assert!(
+            streamed.is_empty(),
+            "a held stack must not redraw per partial"
+        );
+        assert_eq!(mode.hints.len(), 2, "visible labels stay pinned while held");
+        assert_eq!(
+            mode.scene(&env.ctx())
+                .labels
+                .iter()
+                .find(|label| label.z_index == 3)
+                .map(|label| label.text.as_str()),
+            Some(raised_text.as_str())
+        );
+
+        let released = release(&mut mode, &env, "left_shift");
+        assert_eq!(scene_of(&released).labels.len(), 4);
+        assert!(!mode.overlap_labels_dirty);
+
+        let mut raised_labels = HashSet::new();
+        for key in ["left_shift", "right_shift", "left_shift", "right_shift"] {
+            let cycled = press(&mut mode, &env, key);
+            raised_labels.insert(
+                scene_of(&cycled)
+                    .labels
+                    .iter()
+                    .find(|label| label.z_index == 3)
+                    .map(|label| label.text.clone())
+                    .expect("one label should be raised"),
+            );
+            release(&mut mode, &env, key);
+        }
+        assert_eq!(
+            raised_labels.len(),
+            4,
+            "every stacked label must be reachable"
+        );
+    }
+
+    #[test]
+    fn repeated_overlap_down_does_not_cycle_again_while_held() {
+        let env = Env::new();
+        let mut mode = HintMode::new(&env.config);
+        activate(&mut mode, &env);
+        deliver(
+            &mut mode,
+            &env,
+            vec![target("One", 100.0), target("Two", 100.0)],
+        );
+
+        let first = press(&mut mode, &env, "left_shift");
+        let first_top = scene_of(&first)
+            .labels
+            .iter()
+            .find(|label| label.z_index == 3)
+            .map(|label| label.text.clone());
+        let cycle = mode.overlap_cycle;
+
+        assert!(press(&mut mode, &env, "left_shift").is_empty());
+        assert!(
+            mode.handle(
+                &ModeEvent::Key {
+                    key: Key::new("left_shift").unwrap(),
+                    state: KeyState::Down,
+                    repeat: true,
+                },
+                &env.ctx(),
+            )
+            .is_empty()
+        );
+        assert_eq!(mode.overlap_cycle, cycle);
+        assert_eq!(
+            mode.scene(&env.ctx())
+                .labels
+                .iter()
+                .find(|label| label.z_index == 3)
+                .map(|label| label.text.clone()),
+            first_top
+        );
     }
 
     #[test]
@@ -1415,8 +1598,12 @@ mod tests {
             &env,
             vec![target("Save", 0.0), target("Cancel", 200.0)],
         );
+        assert!(!mode.search_names_initialized);
+        assert!(mode.scanned_names_lower.is_empty());
 
         press(&mut mode, &env, "/");
+        assert!(mode.search_names_initialized);
+        assert_eq!(mode.scanned_names_lower, ["save", "cancel"]);
         let out = press(&mut mode, &env, "c");
         assert_eq!(mode.hints.len(), 1, "only Cancel should survive");
         assert_eq!(mode.scanned[mode.hints[0].value].name, "Cancel");
@@ -1426,6 +1613,29 @@ mod tests {
             scene_of(&out).labels.iter().any(|l| l.text == "/c"),
             "search box missing"
         );
+    }
+
+    #[test]
+    fn spatial_dedup_reuses_canonical_strings_but_keeps_real_collisions() {
+        let env = Env::new();
+        let mut mode = HintMode::new(&env.config);
+        activate(&mut mode, &env);
+
+        let save = target("Save", 0.0);
+        let mut different_name = save.clone();
+        different_name.name = "Save as".into();
+        let mut different_role = save.clone();
+        different_role.role = "checkbox".into();
+        deliver(
+            &mut mode,
+            &env,
+            vec![save.clone(), save, different_name, different_role],
+        );
+
+        assert_eq!(mode.scanned.len(), 3);
+        assert_eq!(mode.seen_targets.len(), 1);
+        assert_eq!(mode.seen_targets.values().next().unwrap().len(), 3);
+        assert!(mode.scanned_names_lower.is_empty());
     }
 
     #[test]

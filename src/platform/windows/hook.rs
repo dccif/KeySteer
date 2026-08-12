@@ -4,7 +4,7 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -44,7 +44,7 @@ static WAKE_THREAD: AtomicU32 = AtomicU32::new(0);
 static HOOK_THREAD: AtomicU32 = AtomicU32::new(0);
 static WAKE_FAILED: AtomicBool = AtomicBool::new(false);
 static TIMEOUT_WARNING_PENDING: AtomicBool = AtomicBool::new(false);
-static POINTER_PENDING: AtomicBool = AtomicBool::new(false);
+static POINTER_PENDING: AtomicU64 = AtomicU64::new(0);
 static POINTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static CONSUMED_POINTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static LATEST_POINTER: AtomicU64 = AtomicU64::new(0);
@@ -513,7 +513,7 @@ fn hook_thread(
         *current = Some(EventSink { sender, mailbox });
     }
     WAKE_THREAD.store(wake_thread, Ordering::Release);
-    POINTER_PENDING.store(false, Ordering::Release);
+    POINTER_PENDING.store(0, Ordering::Release);
     if ready.send(Ok(thread_id)).is_err() {
         if let Ok(mut current) = slot.lock() {
             *current = None;
@@ -589,7 +589,7 @@ fn hook_thread(
     }
     WAKE_THREAD.store(0, Ordering::Release);
     HOOK_THREAD.store(0, Ordering::Release);
-    POINTER_PENDING.store(false, Ordering::Release);
+    POINTER_PENDING.store(0, Ordering::Release);
 }
 
 fn send_envelope(envelope: Envelope) -> bool {
@@ -666,37 +666,44 @@ fn wake_owner() {
 fn store_latest_pointer(point: Point) {
     let x = point.x as i32 as u32 as u64;
     let y = point.y as i32 as u32 as u64;
-    POINTER_SEQUENCE.fetch_add(1, Ordering::SeqCst);
-    LATEST_POINTER.store(x | (y << 32), Ordering::SeqCst);
-    POINTER_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+    // Release fences order the odd marker before the payload and the payload
+    // before the final even marker. Readers only accept a value bracketed by
+    // the same even sequence number.
+    POINTER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    fence(Ordering::Release);
+    LATEST_POINTER.store(x | (y << 32), Ordering::Relaxed);
+    fence(Ordering::Release);
+    POINTER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     if mark_pointer_pending() {
         wake_owner();
     }
 }
 
 fn mark_pointer_pending() -> bool {
-    POINTER_PENDING
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
+    // A counter, rather than a bool, closes the clear-vs-publish race: the
+    // consumer's acquire swap either observes this release increment or a
+    // concurrent producer observes zero and posts a fresh wake-up.
+    POINTER_PENDING.fetch_add(1, Ordering::Release) == 0
 }
 
 fn take_latest_pointer() -> Option<Point> {
-    if !POINTER_PENDING.swap(false, Ordering::AcqRel) {
+    if POINTER_PENDING.swap(0, Ordering::Acquire) == 0 {
         return None;
     }
     let (sequence, packed) = loop {
-        let before = POINTER_SEQUENCE.load(Ordering::SeqCst);
+        let before = POINTER_SEQUENCE.load(Ordering::Acquire);
         if before & 1 != 0 {
             std::hint::spin_loop();
             continue;
         }
-        let packed = LATEST_POINTER.load(Ordering::SeqCst);
-        let after = POINTER_SEQUENCE.load(Ordering::SeqCst);
+        let packed = LATEST_POINTER.load(Ordering::Relaxed);
+        fence(Ordering::Acquire);
+        let after = POINTER_SEQUENCE.load(Ordering::Relaxed);
         if before == after {
             break (after, packed);
         }
     };
-    if CONSUMED_POINTER_SEQUENCE.swap(sequence, Ordering::SeqCst) == sequence {
+    if CONSUMED_POINTER_SEQUENCE.swap(sequence, Ordering::Relaxed) == sequence {
         return None;
     }
     Some(Point::new(
@@ -1049,14 +1056,14 @@ mod tests {
 
     #[test]
     fn pointer_burst_uses_one_latest_value_slot() {
-        POINTER_PENDING.store(false, Ordering::Release);
+        POINTER_PENDING.store(0, Ordering::Release);
         assert!(mark_pointer_pending());
         assert!(
             !mark_pointer_pending(),
             "an existing pending move must not wake twice"
         );
 
-        POINTER_PENDING.store(false, Ordering::Release);
+        POINTER_PENDING.store(0, Ordering::Release);
         store_latest_pointer(Point::new(-300.0, 100.0));
         store_latest_pointer(Point::new(1920.0, 1080.0));
         assert_eq!(take_latest_pointer(), Some(Point::new(1920.0, 1080.0)));
@@ -1065,5 +1072,81 @@ mod tests {
         // A repeated edge position is still a real native event.
         store_latest_pointer(Point::new(1920.0, 1080.0));
         assert_eq!(take_latest_pointer(), Some(Point::new(1920.0, 1080.0)));
+    }
+}
+
+#[cfg(test)]
+mod pointer_mailbox_loom_tests {
+    use loom::sync::Arc;
+    use loom::sync::atomic::{AtomicU64, Ordering, fence};
+    use loom::thread;
+
+    struct Mailbox {
+        pending: AtomicU64,
+        sequence: AtomicU64,
+        value: AtomicU64,
+    }
+
+    impl Mailbox {
+        fn new() -> Self {
+            Self {
+                pending: AtomicU64::new(0),
+                sequence: AtomicU64::new(0),
+                value: AtomicU64::new(0),
+            }
+        }
+
+        fn store(&self, value: u64) {
+            self.sequence.fetch_add(1, Ordering::Relaxed);
+            fence(Ordering::Release);
+            self.value.store(value, Ordering::Relaxed);
+            fence(Ordering::Release);
+            self.sequence.fetch_add(1, Ordering::Relaxed);
+            self.pending.fetch_add(1, Ordering::Release);
+        }
+
+        fn take(&self) -> Option<(u64, u64)> {
+            if self.pending.swap(0, Ordering::Acquire) == 0 {
+                return None;
+            }
+            loop {
+                let before = self.sequence.load(Ordering::Acquire);
+                if before & 1 != 0 {
+                    thread::yield_now();
+                    continue;
+                }
+                let value = self.value.load(Ordering::Relaxed);
+                fence(Ordering::Acquire);
+                let after = self.sequence.load(Ordering::Relaxed);
+                if before == after {
+                    return Some((after, value));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pointer_mailbox_orderings_never_pair_a_value_with_the_wrong_sequence() {
+        loom::model(|| {
+            let mailbox = Arc::new(Mailbox::new());
+            mailbox.store(1);
+
+            let writer_mailbox = Arc::clone(&mailbox);
+            let writer = thread::spawn(move || writer_mailbox.store(2));
+            let reader_mailbox = Arc::clone(&mailbox);
+            let reader = thread::spawn(move || reader_mailbox.take());
+
+            let first = reader.join().expect("reader should not panic");
+            writer.join().expect("writer should not panic");
+            let second = mailbox.take();
+
+            let mut saw_latest = false;
+            for (sequence, value) in [first, second].into_iter().flatten() {
+                assert_eq!(sequence & 1, 0);
+                assert_eq!(value, sequence / 2);
+                saw_latest |= value == 2;
+            }
+            assert!(saw_latest, "the second store must not be lost");
+        });
     }
 }

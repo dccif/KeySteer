@@ -1,5 +1,11 @@
 # 更新日志 / Release Notes
 
+## 0.8.9
+
+UI Hint 扫描与重叠切换更稳定，启动和输入响应更快、内存占用更低，并进一步收紧原生资源与 Unsafe 安全边界。
+
+UI Hint scanning and overlap switching are more reliable, startup and input are faster with lower memory use, and native resource and unsafe boundaries are tighter.
+
 ## 0.8.8
 
 输入响应和 UI Hint 扫描更快、内存与安装体积更小。

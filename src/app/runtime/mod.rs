@@ -443,7 +443,7 @@ impl Engine {
     pub fn new(config: Config, appearance: Appearance) -> Self {
         crate::app::logging::set_non_error_enabled(config.debug.enabled);
         let palette = config.palette(appearance);
-        let mut engine = Self {
+        Self {
             config,
             palette,
             appearance,
@@ -484,9 +484,7 @@ impl Engine {
             config_store: None,
             config_discovery_directory: None,
             started_at: Instant::now(),
-        };
-        engine.rebuild_tables();
-        engine
+        }
     }
 
     /// Register a mode. Later registrations replace earlier ones with the same
@@ -494,6 +492,13 @@ impl Engine {
     pub fn register(&mut self, mode: Box<dyn Mode>) {
         self.modes.insert(mode.id(), mode);
         self.rebuild_tables();
+    }
+
+    /// Bootstrap already owns the complete registration sequence. Deferring
+    /// compilation lets the backend's initial focused application be folded
+    /// into the first and only startup table build.
+    pub(crate) fn register_deferred(&mut self, mode: Box<dyn Mode>) {
+        self.modes.insert(mode.id(), mode);
     }
 
     /// Register a plugin and merge its default chords, without letting them
@@ -510,6 +515,21 @@ impl Engine {
     pub fn register_plugin_dyn(
         &mut self,
         plugin: Box<dyn crate::api::plugin::Plugin>,
+    ) -> Result<(), String> {
+        self.register_plugin_dyn_inner(plugin, true)
+    }
+
+    pub(crate) fn register_plugin_dyn_deferred(
+        &mut self,
+        plugin: Box<dyn crate::api::plugin::Plugin>,
+    ) -> Result<(), String> {
+        self.register_plugin_dyn_inner(plugin, false)
+    }
+
+    fn register_plugin_dyn_inner(
+        &mut self,
+        plugin: Box<dyn crate::api::plugin::Plugin>,
+        rebuild: bool,
     ) -> Result<(), String> {
         plugin.manifest().validate()?;
         let id = plugin.id();
@@ -528,7 +548,9 @@ impl Engine {
             }
         }
         self.modes.insert(id, plugin as Box<dyn Mode>);
-        self.rebuild_tables();
+        if rebuild {
+            self.rebuild_tables();
+        }
         Ok(())
     }
 
@@ -880,9 +902,10 @@ impl Engine {
                 backend.keyboard_available()
             ),
         );
-        // Registration happens before the backend can report its initial
-        // foreground process, so fold app-specific bindings in once more now.
+        // Bootstrap defers registration compilation until the backend can
+        // provide its initial app profile. This is the only startup build.
         self.rebuild_tables();
+        crate::app::perf_probe::mark("engine_ready");
         self.trace_lazy(self.config.debug.backend, "backend", || {
             format!(
                 "screens={} cursor=({:.1},{:.1}) focused_app={:?}",
@@ -1240,26 +1263,19 @@ impl Engine {
         let discovered_path = if let Some(directory) = self.config_discovery_directory.clone() {
             let (config, store, path) = match Config::discover_in(&directory) {
                 Some(path) => {
-                    let config = Config::load(&path).map_err(|error| {
+                    let loaded = Config::load_with_source(&path).map_err(|error| {
                         format!(
                             "configuration reload rejected; keeping the last valid configuration: {error}"
                         )
                     })?;
-                    let store = ConfigStore::open(&path, &config).map_err(|error| {
-                        format!(
-                            "configuration reload rejected; keeping the last valid configuration: {error}"
-                        )
-                    })?;
-                    (config, store, Some(path))
+                    let store =
+                        ConfigStore::from_validated_text(loaded.path.clone(), loaded.raw_text);
+                    (loaded.config, store, Some(loaded.path))
                 }
                 None => {
                     let config = Config::default();
                     let path = directory.join("keysteer.user.toml");
-                    let store = ConfigStore::open(path, &config).map_err(|error| {
-                        format!(
-                            "configuration reload rejected; keeping the last valid configuration: {error}"
-                        )
-                    })?;
+                    let store = ConfigStore::from_validated_text(path, config.to_toml());
                     (config, store, None)
                 }
             };
@@ -5988,6 +6004,26 @@ mod tests {
             8,
             "all focus events must still reach the active mode"
         );
+    }
+
+    #[test]
+    fn bootstrap_registration_compiles_binding_tables_once() {
+        let config = Config::default();
+        let modes = crate::modes::built_in(&config);
+        let plugins = crate::plugins::bundled(&config).unwrap();
+        let mut engine = Engine::new(config, Appearance::Dark);
+
+        for mode in modes {
+            engine.register_deferred(mode);
+        }
+        for plugin in plugins {
+            engine.register_plugin_dyn_deferred(plugin).unwrap();
+        }
+        assert_eq!(engine.table_rebuild_count, 0);
+
+        engine.rebuild_tables();
+        assert_eq!(engine.table_rebuild_count, 1);
+        assert_eq!(engine.tables.len(), engine.binding_mode_ids().len());
     }
 
     #[test]

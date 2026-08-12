@@ -126,15 +126,13 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
     }
 
     for mode in built_in_modes {
-        engine.register(mode);
+        engine.register_deferred(mode);
     }
     for plugin in bundled_plugins {
-        if let Err(error) = engine.register_plugin_dyn(plugin) {
+        if let Err(error) = engine.register_plugin_dyn_deferred(plugin) {
             crate::report_warning!("plugin", "skipping plugin: {error}");
         }
     }
-
-    crate::app::perf_probe::mark("engine_ready");
 
     engine.run(backend.as_mut())
 }

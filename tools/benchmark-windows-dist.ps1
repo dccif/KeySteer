@@ -34,6 +34,9 @@ if ($UsePerfProbe) { New-Item -ItemType Directory -Force -Path $probeRoot | Out-
 for ($index = 0; $index -lt $ColdStarts; $index++) {
     if ($UsePerfProbe) {
         $probePath = Join-Path $probeRoot "ready-$index.jsonl"
+        if (Test-Path -LiteralPath $probePath) {
+            Remove-Item -LiteralPath $probePath -Force
+        }
         $previousProbe = $env:KEYSTEER_PERF_PROBE
         $env:KEYSTEER_PERF_PROBE = $probePath
         $process = Start-Process -FilePath $exe -ArgumentList @("--config", $config) -PassThru -WindowStyle Hidden
@@ -92,6 +95,7 @@ try {
             p95 = $ordered[[math]::Floor(($ordered.Count - 1) * 0.95)]
             p99 = $ordered[[math]::Floor(($ordered.Count - 1) * 0.99)]
         }
+        startup_samples_ms = @($cold)
         resident = $samples
     }
     $output = Join-Path $root "target\benchmarks\windows-$Target.json"

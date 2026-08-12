@@ -27,15 +27,18 @@ typedef struct {
     double confidence;
     bool is_text;
     char *label;
+    uint64_t label_len;
 } NmkVisionRegion;
 
 typedef struct {
     uint32_t abi_version;
+    uint32_t result_size;
     uint32_t region_stride;
     int32_t status;
     NmkVisionRegion *regions;
     uint64_t count;
     char *message;
+    uint64_t message_len;
     CGRect captured_bounds;
 } NmkVisionResult;
 
@@ -47,7 +50,7 @@ enum {
     NMK_VISION_CONTEXT_CHANGED = 4,
 };
 
-enum { NMK_VISION_ABI_VERSION = 1, NMK_MAX_VISION_REGIONS = 2000 };
+enum { NMK_VISION_ABI_VERSION = 2, NMK_MAX_VISION_REGIONS = 2000 };
 
 static _Atomic uint64_t latestVisionScan = 0;
 static _Atomic bool captureInFlight = false;
@@ -78,9 +81,16 @@ static NmkVisionResult *resultWithStatus(int32_t status, NSString *message) {
     NmkVisionResult *result = calloc(1, sizeof(NmkVisionResult));
     if (result == NULL) return NULL;
     result->abi_version = NMK_VISION_ABI_VERSION;
+    result->result_size = sizeof(NmkVisionResult);
     result->region_stride = sizeof(NmkVisionRegion);
     result->status = status;
-    if (message.length > 0) result->message = strdup(message.UTF8String);
+    if (message.length > 0) {
+        const char *utf8 = message.UTF8String;
+        if (utf8 != NULL) {
+            result->message_len = (uint64_t)strlen(utf8);
+            result->message = strdup(utf8);
+        }
+    }
     return result;
 }
 
@@ -283,7 +293,12 @@ NmkVisionResult *NmkDetectVisionElements(
             out->height = box.size.height;
             out->confidence = observation.confidence;
             out->is_text = true;
-            out->label = strdup([(candidate.string ?: @"") UTF8String]);
+            NSString *label = candidate.string ?: @"";
+            const char *utf8 = label.UTF8String;
+            if (utf8 != NULL) {
+                out->label_len = (uint64_t)strlen(utf8);
+                out->label = strdup(utf8);
+            }
         }
         for (VNRectangleObservation *observation in rectangleResults) {
             if (result->count >= capacity) break;
@@ -297,6 +312,7 @@ NmkVisionResult *NmkDetectVisionElements(
             out->confidence = observation.confidence;
             out->is_text = false;
             out->label = strdup("");
+            out->label_len = 0;
         }
         if (!scanIsCurrent(scanID)) {
             NmkFreeVisionResult(result);

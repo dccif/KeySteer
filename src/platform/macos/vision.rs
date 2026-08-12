@@ -1,4 +1,4 @@
-use std::ffi::{CStr, c_char};
+use std::ffi::c_char;
 use std::ptr::NonNull;
 
 use crate::api::command::{UiScanStatus, VisionOptions};
@@ -46,21 +46,26 @@ struct NativeRegion {
     confidence: f64,
     is_text: bool,
     label: *mut c_char,
+    label_len: u64,
 }
 
 #[repr(C)]
 struct NativeResult {
     abi_version: u32,
+    result_size: u32,
     region_stride: u32,
     status: i32,
     regions: *mut NativeRegion,
     count: u64,
     message: *mut c_char,
+    message_len: u64,
     captured_bounds: NativeRect,
 }
 
 const MAX_VISION_REGIONS: usize = 2_000;
-const VISION_ABI_VERSION: u32 = 1;
+const MAX_VISION_LABEL_BYTES: usize = 64 * 1024;
+const MAX_VISION_MESSAGE_BYTES: usize = 4 * 1024;
+const VISION_ABI_VERSION: u32 = 2;
 
 struct OwnedVisionResult(NonNull<NativeResult>);
 
@@ -84,11 +89,12 @@ impl OwnedVisionResult {
     fn regions(&self) -> Result<&[NativeRegion], String> {
         let raw = self.as_ref();
         if raw.abi_version != VISION_ABI_VERSION
+            || raw.result_size as usize != std::mem::size_of::<NativeResult>()
             || raw.region_stride as usize != std::mem::size_of::<NativeRegion>()
         {
             return Err(format!(
-                "Vision ABI mismatch: version={}, region_stride={}",
-                raw.abi_version, raw.region_stride
+                "Vision ABI mismatch: version={}, result_size={}, region_stride={}",
+                raw.abi_version, raw.result_size, raw.region_stride
             ));
         }
         let count = usize::try_from(raw.count)
@@ -185,7 +191,19 @@ pub fn detect(
     let raw = result.as_ref();
     let coordinate_bounds =
         capture_bounds_or_window(native_rect_to_rect(raw.captured_bounds), bounds);
-    let message = c_string(raw.message);
+    if raw.abi_version != VISION_ABI_VERSION
+        || raw.result_size as usize != std::mem::size_of::<NativeResult>()
+    {
+        return (
+            Vec::new(),
+            UiScanStatus::Failed("Vision returned incompatible result metadata".into()),
+        );
+    }
+    let message = match native_string(raw.message, raw.message_len, MAX_VISION_MESSAGE_BYTES) {
+        Ok(message) if !message.is_empty() => message,
+        Ok(_) => "Vision scan failed".into(),
+        Err(error) => return (Vec::new(), UiScanStatus::Failed(error)),
+    };
     let status = match raw.status {
         0 => UiScanStatus::Success,
         1 => UiScanStatus::PermissionDenied(message),
@@ -200,8 +218,10 @@ pub fn detect(
     };
     let mut candidates = Vec::with_capacity(regions.len());
     for region in regions {
-        if let Some(candidate) = classify(region, coordinate_bounds, options) {
-            candidates.push(candidate);
+        match classify(region, coordinate_bounds, options) {
+            Ok(Some(candidate)) => candidates.push(candidate),
+            Ok(None) => {}
+            Err(error) => return (Vec::new(), UiScanStatus::Failed(error)),
         }
     }
     let targets = merge_candidates(candidates, options.merge_iou_threshold);
@@ -230,22 +250,36 @@ fn capture_bounds_or_window(captured_bounds: Rect, window_bounds: Rect) -> Rect 
     }
 }
 
-fn c_string(value: *const c_char) -> String {
-    if value.is_null() {
-        return "Vision scan failed".into();
+fn native_string(value: *const c_char, length: u64, maximum: usize) -> Result<String, String> {
+    let length = usize::try_from(length)
+        .map_err(|_| "Vision returned an unrepresentable string length".to_string())?;
+    if length > maximum {
+        return Err(format!(
+            "Vision returned a {length}-byte string; maximum is {maximum}"
+        ));
     }
-    unsafe { CStr::from_ptr(value) }
-        .to_string_lossy()
-        .into_owned()
+    if length == 0 {
+        return Ok(String::new());
+    }
+    let value = NonNull::new(value.cast_mut())
+        .ok_or_else(|| "Vision returned a non-empty string with a null pointer".to_string())?;
+    // SAFETY: the ABI supplies an explicit bounded byte length, and the owning
+    // result keeps every strdup allocation alive for this borrow.
+    let bytes = unsafe { std::slice::from_raw_parts(value.as_ptr().cast::<u8>(), length) };
+    Ok(String::from_utf8_lossy(bytes).into_owned())
 }
 
-fn classify(region: &NativeRegion, bounds: Rect, options: &VisionOptions) -> Option<Candidate> {
+fn classify(
+    region: &NativeRegion,
+    bounds: Rect,
+    options: &VisionOptions,
+) -> Result<Option<Candidate>, String> {
     let rect = normalized_to_global(
         bounds,
         Rect::new(region.x, region.y, region.width, region.height),
     );
     if rect.is_empty() || !rect.width.is_finite() || !rect.height.is_finite() {
-        return None;
+        return Ok(None);
     }
     let aspect = rect.width / rect.height.max(f64::EPSILON);
     let (role, native_role) = if region.is_text {
@@ -257,7 +291,7 @@ fn classify(region: &NativeRegion, bounds: Rect, options: &VisionOptions) -> Opt
         } else if region.confidence >= options.generic_clickable_min_confidence {
             ("control", "vision:text")
         } else {
-            return None;
+            return Ok(None);
         }
     } else if rect.width <= options.checkbox_max_size
         && rect.height <= options.checkbox_max_size
@@ -278,18 +312,18 @@ fn classify(region: &NativeRegion, bounds: Rect, options: &VisionOptions) -> Opt
     } else if region.confidence >= options.generic_clickable_min_confidence {
         ("control", "vision:rectangle")
     } else {
-        return None;
+        return Ok(None);
     };
-    Some(Candidate {
+    Ok(Some(Candidate {
         target: UiTarget {
             rect,
-            name: c_string(region.label),
+            name: native_string(region.label, region.label_len, MAX_VISION_LABEL_BYTES)?,
             role: role.into(),
             native_role: Some(native_role.into()),
         },
         confidence: region.confidence,
         is_text: region.is_text,
-    })
+    }))
 }
 
 fn normalized_to_global(bounds: Rect, normalized: Rect) -> Rect {
@@ -392,9 +426,14 @@ mod tests {
             confidence: 0.9,
             is_text: true,
             label: empty.as_ptr().cast_mut(),
+            label_len: 0,
         };
         assert_eq!(
-            classify(&link, bounds, &options).unwrap().target.role,
+            classify(&link, bounds, &options)
+                .unwrap()
+                .unwrap()
+                .target
+                .role,
             "link"
         );
         let checkbox = NativeRegion {
@@ -405,9 +444,14 @@ mod tests {
             confidence: 0.9,
             is_text: false,
             label: empty.as_ptr().cast_mut(),
+            label_len: 0,
         };
         assert_eq!(
-            classify(&checkbox, bounds, &options).unwrap().target.role,
+            classify(&checkbox, bounds, &options)
+                .unwrap()
+                .unwrap()
+                .target
+                .role,
             "checkbox"
         );
     }
@@ -425,8 +469,21 @@ mod tests {
             confidence: 0.1,
             is_text: false,
             label: empty.as_ptr().cast_mut(),
+            label_len: 0,
         };
-        assert!(classify(&region, bounds, &options).is_none());
+        assert!(classify(&region, bounds, &options).unwrap().is_none());
+    }
+
+    #[test]
+    fn native_strings_reject_malformed_metadata_without_scanning_for_nul() {
+        assert_eq!(native_string(std::ptr::null(), 0, 8).unwrap(), "");
+        assert!(native_string(std::ptr::null(), 1, 8).is_err());
+        assert!(native_string(std::ptr::null(), 9, 8).is_err());
+        let bytes = b"hello";
+        assert_eq!(
+            native_string(bytes.as_ptr().cast(), bytes.len() as u64, 8).unwrap(),
+            "hello"
+        );
     }
 
     #[test]
