@@ -1,5 +1,11 @@
 # 更新日志 / Release Notes
 
+## 0.8.7
+
+Windows 和 macOS 的光标与提示移动更加流畅，组合按键和长按操作也更快、更省内存。
+
+Cursor and indicator movement is now smoother on Windows and macOS, while key combinations and hold actions are faster and use less memory.
+
 ## 0.8.6
 
 修复 `n = "toggle"`：可单独长按 `n` 让它保持按下，和键盘或鼠标按键组合时无论先后顺序都能正确锁定，短按 `n` 仍会全部松开。

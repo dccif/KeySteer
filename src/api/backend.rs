@@ -145,6 +145,18 @@ pub trait Backend {
     /// Submit immutable shared frame data. An asynchronous backend may retain
     /// it without forcing the engine to deep-clone the scene.
     fn present(&mut self, scene: Arc<OverlayScene>) -> Result<(), String>;
+    /// Move dynamic layers already presented by [`Self::present`].
+    ///
+    /// `None` leaves that layer unchanged. `Ok(true)` means the backend
+    /// accepted the lightweight update; the default asks the engine to fall
+    /// back to a complete scene so third-party backends remain compatible.
+    fn update_overlay_positions(
+        &mut self,
+        _cursor: Option<Point>,
+        _indicator: Option<Point>,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
     /// Remove all overlay surfaces from the screen.
     fn dismiss(&mut self) -> Result<(), String>;
 

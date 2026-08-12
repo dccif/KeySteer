@@ -6,6 +6,8 @@
 frame clock、overlay、UI scan、appearance、状态栏开关和 autostart。目标后端由
 `src/platform/mod.rs` 在编译期选择。两端都跟踪本进程已注入的鼠标按钮状态；对已经按住
 的同一按钮再次请求 `Press` 必须幂等返回，不得向系统追加第二个 mouse-down。
+两端还实现动态 overlay 位置快路径；`None` 表示该层保持原位，跨屏、缩放或任何内容变化
+仍由完整 `present` 同步状态。
 
 ## Windows
 
@@ -18,6 +20,8 @@ frame clock、overlay、UI scan、appearance、状态栏开关和 autostart。�
 - 创建 Backend 的线程也是 Win32 message loop、tray、overlay window 的 owner。
 - overlay worker 在 tray 和屏幕枚举之前启动；消息队列就绪后，GPU device tree 在渲染线程
   与剩余启动工作并行预热，保持第一次进入模式的低延迟。
+- 完整 frame 和 cursor/indicator 坐标各使用一个 latest-value 槽；GPU 位置更新只写 visual
+  offset 并 commit，不进入 Direct2D；DIB 回退从缓存场景恢复完整绘制。
 - `hook.rs` 是专用低级键盘 Hook 线程，使用每事件 disposition handshake。点击、滚轮和
   键盘注入写入一个预分配、固定上限为 32 项的 FIFO，再由 Hook 线程退出当前物理键回调
   后的 `WM_APP` 消息串行执行 `SendInput`。Engine 只入队而不等待 Hook 执行，避免快速
@@ -81,6 +85,8 @@ item、window 和 display link 都有线程亲和性。
 - `ui_scan.rs` 有一个持久扫描 worker；Hybrid 内部只在本次 job scope 并发 AX。
 - worker/menu event 通过 hook queue 或 channel 发送，并显式唤醒主 run loop。
 - frame clock 绑定 overlay cursor view，跨屏后 AppKit 自动跟踪目标显示器 cadence。
+- cursor/indicator 位置更新直接在禁用隐式动画的事务中修改已有 CALayer frame，不构造
+  `NSString`、颜色、路径或完整 scene；隐藏或首帧未完成时由 Engine 回退完整提交。
 - Backend 缓存一个轻量 `CGEventSource`；单键与拥有所有权的组合键批次复用它，批次先验证
   全部键码再注入。正向键码使用由反向表同源生成的编译期 `match`，修饰键 Hook 复用预热
   `Key`，鼠标批次以 `OwnedCf` 数组负责失败路径释放。

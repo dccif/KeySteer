@@ -504,6 +504,15 @@ impl Backend for WindowsBackend {
         self.overlay.present(scene, area, scale)
     }
 
+    fn update_overlay_positions(
+        &mut self,
+        cursor: Option<Point>,
+        indicator: Option<Point>,
+    ) -> Result<bool, String> {
+        self.overlay.update_positions(cursor, indicator)?;
+        Ok(true)
+    }
+
     fn dismiss(&mut self) -> Result<(), String> {
         self.overlay.dismiss()
     }

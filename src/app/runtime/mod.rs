@@ -21,6 +21,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use smallvec::SmallVec;
+
 use crate::api::backend::{Appearance, Backend, BackendEvent, KeyDisposition};
 use crate::api::binding::{Binding, Button, DEFAULT_WAIT_MS, InputTarget};
 use crate::api::command::{
@@ -57,6 +59,100 @@ struct PendingLongPressToggle {
     fires_at: Instant,
     key: Key,
     target: InputTarget,
+}
+
+type TargetBuffer = SmallVec<[InputTarget; 8]>;
+
+/// Inputs owned by `press`/`toggle` are a tiny sorted set in practice. Keeping
+/// the common case inline avoids one tree-node allocation per held target.
+#[derive(Debug, Default)]
+struct LatchedTargets(TargetBuffer);
+
+impl LatchedTargets {
+    fn insert(&mut self, target: InputTarget) -> bool {
+        match self.0.binary_search(&target) {
+            Ok(_) => false,
+            Err(index) => {
+                self.0.insert(index, target);
+                true
+            }
+        }
+    }
+
+    fn remove(&mut self, target: &InputTarget) -> bool {
+        let Ok(index) = self.0.binary_search(target) else {
+            return false;
+        };
+        self.0.remove(index);
+        true
+    }
+
+    fn contains(&self, target: &InputTarget) -> bool {
+        self.0.binary_search(target).is_ok()
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, InputTarget> {
+        self.0.iter()
+    }
+
+    fn extend(&mut self, targets: impl IntoIterator<Item = InputTarget>) {
+        for target in targets {
+            self.insert(target);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+#[derive(Debug, Default)]
+struct DefaultToggleKeys(SmallVec<[(Key, bool); 2]>);
+
+impl DefaultToggleKeys {
+    fn insert(&mut self, key: Key, used: bool) -> Option<bool> {
+        if let Some((_, current)) = self.0.iter_mut().find(|(candidate, _)| candidate == &key) {
+            return Some(std::mem::replace(current, used));
+        }
+        self.0.push((key, used));
+        None
+    }
+
+    fn get_mut(&mut self, key: &Key) -> Option<&mut bool> {
+        self.0
+            .iter_mut()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value)
+    }
+
+    fn remove(&mut self, key: &Key) -> Option<bool> {
+        let index = self.0.iter().position(|(candidate, _)| candidate == key)?;
+        Some(self.0.swap_remove(index).1)
+    }
+
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut bool> {
+        self.0.iter_mut().map(|(_, value)| value)
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &Key> {
+        self.0.iter().map(|(key, _)| key)
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+#[cfg(test)]
+impl PartialEq<BTreeSet<InputTarget>> for LatchedTargets {
+    fn eq(&self, other: &BTreeSet<InputTarget>) -> bool {
+        self.iter().eq(other.iter())
+    }
 }
 
 /// What the engine decided to do with a key, so the caller can tell the
@@ -214,8 +310,47 @@ impl<T> IntoIterator for KeyMap<T> {
 /// coalesced until the outermost batch completes.
 enum PendingOverlay {
     Refresh,
+    Positions,
     Show(Arc<OverlayScene>),
     Hide,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OverlayPositions {
+    cursor: Option<Point>,
+    indicator: Option<Point>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IndicatorGeometry {
+    width: f64,
+    height: f64,
+    x_offset: f64,
+    y_offset: f64,
+}
+
+impl IndicatorGeometry {
+    fn position(self, cursor: Point, screens: &[Screen]) -> Point {
+        let mut position = Point::new(cursor.x + self.x_offset, cursor.y + self.y_offset);
+        if let Some(screen) = Screen::containing(screens, &cursor) {
+            position.x = position.x.clamp(
+                (screen.bounds.x + self.width).min(screen.bounds.right()),
+                screen.bounds.right(),
+            );
+            position.y = position.y.clamp(
+                screen.bounds.y,
+                (screen.bounds.bottom() - self.height).max(screen.bounds.y),
+            );
+        }
+        position
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DynamicOverlayState {
+    cursor: bool,
+    indicator: Option<IndicatorGeometry>,
+    follows_cursor_screen: bool,
 }
 
 pub struct Engine {
@@ -264,16 +399,16 @@ pub struct Engine {
     /// Synthetic keyboard keys and mouse buttons held by `press` or `toggle`.
     /// Keeping one shared set makes these actions idempotent and lets the UI
     /// report exactly what the engine is responsible for releasing.
-    latched: BTreeSet<InputTarget>,
+    latched: LatchedTargets,
     /// Physically held activation keys for parameterless `toggle`. The value is
     /// true once a companion target was toggled during this press. Releasing an
     /// unused activation key clears every currently latched input instead.
-    active_default_toggles: BTreeMap<Key, bool>,
+    active_default_toggles: DefaultToggleKeys,
     pending_sequences: Vec<PendingSequence>,
     /// Click keys and parameterless toggle activations waiting to cross the
     /// configured hold threshold. Firing delegates to the same latched-input
     /// state machine as explicit toggle.
-    pending_long_press_toggles: Vec<PendingLongPressToggle>,
+    pending_long_press_toggles: SmallVec<[PendingLongPressToggle; 4]>,
     timers: HashMap<String, Timer>,
     scan_owners: HashMap<u64, ModeId>,
     /// Mode that owns native display frames. This can differ from `active`
@@ -285,6 +420,8 @@ pub struct Engine {
     /// Mode-owned scene before cursor decorations are added.
     overlay_content: Option<Arc<OverlayScene>>,
     overlay_visible: bool,
+    overlay_dynamic: DynamicOverlayState,
+    overlay_positions: Option<OverlayPositions>,
     command_batch_depth: usize,
     pending_overlay: Option<PendingOverlay>,
 
@@ -325,16 +462,18 @@ impl Engine {
             key_dispositions: KeyMap::default(),
             active_gestures: KeyMap::default(),
             active_click_indicators: ActiveClickIndicators::default(),
-            latched: BTreeSet::new(),
-            active_default_toggles: BTreeMap::new(),
+            latched: LatchedTargets::default(),
+            active_default_toggles: DefaultToggleKeys::default(),
             pending_sequences: Vec::new(),
-            pending_long_press_toggles: Vec::new(),
+            pending_long_press_toggles: SmallVec::new(),
             timers: HashMap::new(),
             scan_owners: HashMap::new(),
             frame_clock_owner: None,
             last_scene: None,
             overlay_content: None,
             overlay_visible: false,
+            overlay_dynamic: DynamicOverlayState::default(),
+            overlay_positions: None,
             command_batch_depth: 0,
             pending_overlay: None,
             enabled: true,
@@ -843,12 +982,12 @@ impl Engine {
             .map(|t| t.fires_at)
             .chain(
                 self.pending_sequences
-                    .iter()
+                    .last()
                     .map(|sequence| sequence.fires_at),
             )
             .chain(
                 self.pending_long_press_toggles
-                    .iter()
+                    .last()
                     .map(|pending| pending.fires_at),
             )
             .map(|fires_at| fires_at.saturating_duration_since(now))
@@ -863,18 +1002,14 @@ impl Engine {
             return Ok(());
         }
         let now = Instant::now();
-        let mut due = Vec::new();
-        let mut pending = Vec::with_capacity(self.pending_long_press_toggles.len());
-        for toggle in self.pending_long_press_toggles.drain(..) {
-            if toggle.fires_at <= now {
-                due.push(toggle);
-            } else {
-                pending.push(toggle);
-            }
-        }
-        self.pending_long_press_toggles = pending;
-        due.sort_by_key(|toggle| toggle.fires_at);
-        for toggle in due {
+        while self
+            .pending_long_press_toggles
+            .last()
+            .is_some_and(|toggle| toggle.fires_at <= now)
+        {
+            let Some(toggle) = self.pending_long_press_toggles.pop() else {
+                break;
+            };
             if !self.pressed.contains(&toggle.key) {
                 continue;
             }
@@ -891,18 +1026,14 @@ impl Engine {
 
     fn fire_due_sequences(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
         let now = Instant::now();
-        let mut due = Vec::new();
-        let mut pending = Vec::with_capacity(self.pending_sequences.len());
-        for sequence in self.pending_sequences.drain(..) {
-            if sequence.fires_at <= now {
-                due.push(sequence);
-            } else {
-                pending.push(sequence);
-            }
-        }
-        self.pending_sequences = pending;
-        due.sort_by_key(|sequence| sequence.fires_at);
-        for sequence in due {
+        while self
+            .pending_sequences
+            .last()
+            .is_some_and(|sequence| sequence.fires_at <= now)
+        {
+            let Some(sequence) = self.pending_sequences.pop() else {
+                break;
+            };
             if let Err(error) =
                 self.continue_sequence(sequence.actions, sequence.owner, sequence.input, backend)
             {
@@ -983,7 +1114,7 @@ impl Engine {
                 }
                 self.dispatch(ModeEvent::PointerMoved(p), backend)?;
                 if changed {
-                    self.refresh_overlay(backend)?;
+                    self.refresh_overlay_positions(backend)?;
                 }
             }
             BackendEvent::Frame(elapsed) => {
@@ -1296,7 +1427,10 @@ impl Engine {
             if applied && let Some(pending) = pending_long_press {
                 self.pending_long_press_toggles
                     .retain(|current| current.key != pending.key);
-                self.pending_long_press_toggles.push(pending);
+                let index = self
+                    .pending_long_press_toggles
+                    .partition_point(|current| current.fires_at > pending.fires_at);
+                self.pending_long_press_toggles.insert(index, pending);
             }
             if display_changed || click_indicator_released {
                 self.refresh_overlay(backend)?;
@@ -1664,7 +1798,7 @@ impl Engine {
         let target = match resolved.binding.as_ref() {
             Binding::Click(button) | Binding::DoubleClick(button) => InputTarget::Mouse(*button),
             Binding::Toggle(targets)
-                if targets.is_empty() && self.pressed_toggle_targets(&input.key).is_empty() =>
+                if targets.is_empty() && !self.has_pressed_toggle_partner(&input.key) =>
             {
                 InputTarget::Key(input.key.clone())
             }
@@ -1686,18 +1820,25 @@ impl Engine {
         });
     }
 
-    fn toggle_partner_targets(key: &Key, binding: Option<&Binding>) -> Vec<InputTarget> {
+    fn has_pressed_toggle_partner(&self, activation: &Key) -> bool {
+        self.pressed.iter().any(|key| key != activation)
+    }
+
+    fn toggle_partner_targets(key: &Key, binding: Option<&Binding>) -> TargetBuffer {
+        let mut targets = TargetBuffer::new();
         if let Some(Binding::Click(button) | Binding::DoubleClick(button)) = binding {
-            return vec![InputTarget::Mouse(*button)];
+            targets.push(InputTarget::Mouse(*button));
+            return targets;
         }
         if key.is_modifier() {
-            return vec![InputTarget::Key(key.clone())];
+            targets.push(InputTarget::Key(key.clone()));
+            return targets;
         }
 
-        fn append(binding: &Binding, targets: &mut BTreeSet<InputTarget>) {
+        fn append(binding: &Binding, targets: &mut TargetBuffer) {
             match binding {
                 Binding::Click(button) | Binding::DoubleClick(button) => {
-                    targets.insert(InputTarget::Mouse(*button));
+                    targets.push(InputTarget::Mouse(*button));
                 }
                 Binding::Send(chord) => {
                     targets.extend(chord.keys().iter().cloned().map(InputTarget::Key));
@@ -1716,32 +1857,29 @@ impl Engine {
             }
         }
 
-        let mut targets = BTreeSet::new();
         if let Some(binding) = binding {
             append(binding, &mut targets);
         }
         if targets.is_empty() {
-            targets.insert(InputTarget::Key(key.clone()));
+            targets.push(InputTarget::Key(key.clone()));
         }
-        targets.into_iter().collect()
+        targets.sort_unstable();
+        targets.dedup();
+        targets
     }
 
-    fn pressed_toggle_targets(&self, activation: &Key) -> Vec<InputTarget> {
-        let partners: Vec<Key> = self
-            .pressed
-            .iter()
-            .filter(|key| *key != activation)
-            .cloned()
-            .collect();
-        let mut targets = BTreeSet::new();
-        for key in partners {
-            let resolved = self.lookup(&key);
+    fn pressed_toggle_targets(&self, activation: &Key) -> TargetBuffer {
+        let mut targets = TargetBuffer::new();
+        for key in self.pressed.iter().filter(|key| *key != activation) {
+            let resolved = self.lookup(key);
             targets.extend(Self::toggle_partner_targets(
-                &key,
+                key,
                 resolved.as_ref().map(|item| item.binding.as_ref()),
             ));
         }
-        targets.into_iter().collect()
+        targets.sort_unstable();
+        targets.dedup();
+        targets
     }
 
     fn capture_default_toggle_partner(
@@ -1828,12 +1966,16 @@ impl Engine {
                     return Err("too many action sequences are waiting".into());
                 }
                 let delay = random_wait_ms(min_ms, max_ms);
-                self.pending_sequences.push(PendingSequence {
+                let pending = PendingSequence {
                     fires_at: Instant::now() + Duration::from_millis(delay),
                     actions,
                     owner,
                     input,
-                });
+                };
+                let index = self
+                    .pending_sequences
+                    .partition_point(|current| current.fires_at > pending.fires_at);
+                self.pending_sequences.insert(index, pending);
                 return Ok(());
             }
             let nested = ResolvedBinding {
@@ -2168,7 +2310,7 @@ impl Engine {
         targets: &[InputTarget],
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
-        let mut pressed = Vec::new();
+        let mut pressed = TargetBuffer::new();
         for target in targets {
             if self.matching_latched_target(target).is_some() {
                 continue;
@@ -2231,7 +2373,7 @@ impl Engine {
         targets: &[InputTarget],
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
-        let original = self.latched.clone();
+        let original: TargetBuffer = self.latched.iter().cloned().collect();
         for target in targets {
             let result = if self.matching_latched_target(target).is_some() {
                 self.release_targets(std::slice::from_ref(target), false, backend)
@@ -2253,17 +2395,26 @@ impl Engine {
 
     fn restore_latched(
         &mut self,
-        original: &BTreeSet<InputTarget>,
+        original: &[InputTarget],
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
-        let release: Vec<_> = self.latched.difference(original).cloned().collect();
+        let release: TargetBuffer = self
+            .latched
+            .iter()
+            .filter(|target| original.binary_search(target).is_err())
+            .cloned()
+            .collect();
         self.release_targets(&release, false, backend)?;
-        let press: Vec<_> = original.difference(&self.latched).cloned().collect();
+        let press: TargetBuffer = original
+            .iter()
+            .filter(|target| !self.latched.contains(target))
+            .cloned()
+            .collect();
         self.press_targets(&press, backend)
     }
 
     fn release_latched(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
-        let held: Vec<_> = self.latched.iter().cloned().collect();
+        let held: TargetBuffer = self.latched.iter().cloned().collect();
         self.release_targets(&held, false, backend)
     }
 
@@ -2495,7 +2646,12 @@ mod tests {
     use crate::api::binding::Direction;
     use crate::api::geometry::Rect;
     use crate::api::input::InputEvent;
+    use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
+    use std::alloc::System;
     use std::sync::{Arc, Mutex};
+
+    #[global_allocator]
+    static TEST_ALLOCATOR: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
 
     /// Records what the engine asked of the platform.
     #[derive(Default)]
@@ -2506,6 +2662,7 @@ mod tests {
         moves: Vec<(f64, f64)>,
         scrolls: Vec<(f64, f64)>,
         scenes: Vec<OverlayScene>,
+        positions: Vec<(Option<Point>, Option<Point>)>,
         timeline: Vec<&'static str>,
         dispositions: Vec<KeyDisposition>,
         scans: usize,
@@ -2525,6 +2682,8 @@ mod tests {
         fail_start: bool,
         fail_warp: bool,
         fail_mouse: bool,
+        accept_position_updates: bool,
+        fail_position_updates: bool,
     }
 
     impl FakeBackend {
@@ -2537,6 +2696,8 @@ mod tests {
                     fail_start: false,
                     fail_warp: false,
                     fail_mouse: false,
+                    accept_position_updates: false,
+                    fail_position_updates: false,
                 },
                 log,
             )
@@ -2628,6 +2789,17 @@ mod tests {
             log.scenes.push(scene.as_ref().clone());
             log.timeline.push("present");
             Ok(())
+        }
+        fn update_overlay_positions(
+            &mut self,
+            cursor: Option<Point>,
+            indicator: Option<Point>,
+        ) -> Result<bool, String> {
+            if self.fail_position_updates {
+                return Err("injected position update failure".into());
+            }
+            self.log.lock().unwrap().positions.push((cursor, indicator));
+            Ok(self.accept_position_updates)
         }
         fn dismiss(&mut self) -> Result<(), String> {
             self.log.lock().unwrap().dismissals += 1;
@@ -5255,6 +5427,353 @@ mod tests {
 
         // Activation draws once; the two identical redraws are suppressed.
         assert_eq!(log.lock().unwrap().presents, 1);
+    }
+
+    fn visible_normal_overlay() -> (Engine, FakeBackend, Arc<Mutex<Recorder>>) {
+        let config = Config::default();
+        let mut engine = Engine::new(config.clone(), Appearance::Dark);
+        for mode in crate::modes::built_in(&config) {
+            engine.register(mode);
+        }
+        engine.active = ModeId::normal();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+        engine.screens = backend.screens().unwrap();
+        engine.cursor = backend.pointer().unwrap();
+        engine
+            .show_overlay(Arc::new(OverlayScene::new()), &mut backend)
+            .unwrap();
+        (engine, backend, log)
+    }
+
+    fn visible_dense_overlay() -> (Engine, FakeBackend, Arc<Mutex<Recorder>>) {
+        let (mut engine, mut backend, log) = visible_normal_overlay();
+        let mut scene = OverlayScene::with_capacity(0, 1_000);
+        for index in 0..1_000 {
+            scene.labels.push(crate::api::overlay::OverlayLabel::new(
+                format!("{index:03}"),
+                Rect::new(
+                    (index % 40) as f64 * 24.0,
+                    (index / 40) as f64 * 24.0,
+                    22.0,
+                    22.0,
+                ),
+                crate::api::overlay::LabelStyle::default(),
+            ));
+        }
+        engine.show_overlay(Arc::new(scene), &mut backend).unwrap();
+        backend.accept_position_updates = true;
+        (engine, backend, log)
+    }
+
+    #[test]
+    fn pointer_motion_uses_position_only_backend_update() {
+        let (mut engine, mut backend, log) = visible_normal_overlay();
+        backend.accept_position_updates = true;
+        engine.cursor = Point::new(200.0, 300.0);
+
+        engine.refresh_overlay_positions(&mut backend).unwrap();
+
+        let log = log.lock().unwrap();
+        assert_eq!(log.presents, 1, "movement rebuilt the complete scene");
+        assert_eq!(log.positions.len(), 1);
+        assert_eq!(log.positions[0].0, Some(Point::new(200.0, 300.0)));
+        assert!(log.positions[0].1.is_some());
+    }
+
+    #[test]
+    #[ignore = "allocation probe; run alone with --test-threads=1"]
+    fn overlay_position_path_is_allocation_free() {
+        let (mut engine, mut backend, log) = visible_dense_overlay();
+        engine.cursor = Point::new(100.0, 100.0);
+        engine.refresh_overlay_positions(&mut backend).unwrap();
+        log.lock().unwrap().positions.clear();
+
+        let region = Region::new(TEST_ALLOCATOR);
+        for index in 0..10_000 {
+            engine.cursor = Point::new(100.0 + (index % 500) as f64, 100.0);
+            engine.refresh_overlay_positions(&mut backend).unwrap();
+            log.lock().unwrap().positions.clear();
+        }
+        let change = region.change();
+        assert_eq!(change.allocations, 0, "position path allocated: {change:?}");
+        assert_eq!(change.deallocations, 0, "position path freed: {change:?}");
+        assert_eq!(
+            change.bytes_allocated, 0,
+            "position path allocated: {change:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "microbenchmark probe; run in release with --test-threads=1"]
+    fn overlay_position_performance_probe() {
+        const WARMUP: usize = 1_000;
+        const SAMPLES: usize = 10_000;
+        fn measure(mut operation: impl FnMut(usize)) -> (u128, u128, u128) {
+            for index in 0..WARMUP {
+                operation(index);
+            }
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for index in 0..SAMPLES {
+                let started = Instant::now();
+                operation(index);
+                samples.push(started.elapsed().as_nanos());
+            }
+            samples.sort_unstable();
+            let last = samples.len() - 1;
+            (
+                samples[last * 50 / 100],
+                samples[last * 95 / 100],
+                samples[last * 99 / 100],
+            )
+        }
+
+        let (mut fast, mut fast_backend, fast_log) = visible_dense_overlay();
+        let position = measure(|index| {
+            fast.cursor = Point::new(100.0 + (index % 500) as f64, 100.0);
+            fast.refresh_overlay_positions(&mut fast_backend).unwrap();
+            fast_log.lock().unwrap().positions.clear();
+        });
+
+        let (mut full, mut full_backend, full_log) = visible_dense_overlay();
+        let complete = measure(|index| {
+            full.cursor = Point::new(100.0 + (index % 500) as f64, 100.0);
+            full.refresh_overlay(&mut full_backend).unwrap();
+            let mut log = full_log.lock().unwrap();
+            log.scenes.clear();
+            log.timeline.clear();
+        });
+        println!(
+            "overlay_probe samples={SAMPLES} position_p50={}ns position_p95={}ns position_p99={}ns complete_p50={}ns complete_p95={}ns complete_p99={}ns",
+            position.0, position.1, position.2, complete.0, complete.1, complete.2
+        );
+    }
+
+    #[test]
+    #[ignore = "allocation probe; run alone with --test-threads=1"]
+    fn pending_long_press_wait_is_allocation_free() {
+        let mut engine = engine_with_normal_binding("n", "toggle");
+        engine.active = ModeId::normal();
+        engine
+            .pending_long_press_toggles
+            .push(PendingLongPressToggle {
+                fires_at: Instant::now() + Duration::from_secs(60),
+                key: Key::new("n").unwrap(),
+                target: InputTarget::Key(Key::new("n").unwrap()),
+            });
+        let (mut backend, _) = FakeBackend::new(Vec::new());
+
+        let region = Region::new(TEST_ALLOCATOR);
+        for _ in 0..10_000 {
+            engine.fire_due_long_press_toggles(&mut backend).unwrap();
+        }
+        let change = region.change();
+        assert_eq!(change.allocations, 0, "waiting allocated: {change:?}");
+        assert_eq!(change.deallocations, 0, "waiting freed: {change:?}");
+        assert_eq!(change.bytes_allocated, 0, "waiting allocated: {change:?}");
+    }
+
+    #[test]
+    #[ignore = "allocation probe; run alone with --test-threads=1"]
+    fn common_toggle_transaction_is_allocation_free() {
+        let mut engine = engine_with_normal_binding("n", "toggle");
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+        let targets = [
+            InputTarget::Mouse(Button::Left),
+            InputTarget::Mouse(Button::Right),
+        ];
+        engine.toggle_targets(&targets, &mut backend).unwrap();
+        engine.toggle_targets(&targets, &mut backend).unwrap();
+        {
+            let mut log = log.lock().unwrap();
+            log.buttons.clear();
+            log.timeline.clear();
+        }
+
+        let region = Region::new(TEST_ALLOCATOR);
+        for _ in 0..10_000 {
+            engine.toggle_targets(&targets, &mut backend).unwrap();
+            engine.toggle_targets(&targets, &mut backend).unwrap();
+            let mut log = log.lock().unwrap();
+            log.buttons.clear();
+            log.timeline.clear();
+        }
+        let change = region.change();
+        assert_eq!(change.allocations, 0, "toggle allocated: {change:?}");
+        assert_eq!(change.deallocations, 0, "toggle freed: {change:?}");
+        assert_eq!(change.bytes_allocated, 0, "toggle allocated: {change:?}");
+    }
+
+    #[test]
+    #[ignore = "microbenchmark probe; run in release with --test-threads=1"]
+    fn toggle_performance_probe() {
+        const WARMUP: usize = 1_000;
+        const SAMPLES: usize = 10_000;
+        fn measure(mut operation: impl FnMut()) -> (u128, u128, u128) {
+            for _ in 0..WARMUP {
+                operation();
+            }
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let started = Instant::now();
+                operation();
+                samples.push(started.elapsed().as_nanos());
+            }
+            samples.sort_unstable();
+            let last = samples.len() - 1;
+            (
+                samples[last * 50 / 100],
+                samples[last * 95 / 100],
+                samples[last * 99 / 100],
+            )
+        }
+        fn clear_log(log: &Arc<Mutex<Recorder>>) {
+            let mut log = log.lock().unwrap();
+            log.scenes.clear();
+            log.positions.clear();
+            log.timeline.clear();
+            log.dispositions.clear();
+            log.buttons.clear();
+            log.sent.clear();
+        }
+
+        let mut bare = engine_with_normal_binding("n", "toggle");
+        bare.active = ModeId::normal();
+        let (mut bare_backend, bare_log) = FakeBackend::new(Vec::new());
+        let bare_result = measure(|| {
+            bare.handle_backend_event(key_down("n"), &mut bare_backend)
+                .unwrap();
+            bare.handle_backend_event(key_up("n"), &mut bare_backend)
+                .unwrap();
+            clear_log(&bare_log);
+        });
+
+        let mut chord = engine_with_normal_binding("n", "toggle");
+        chord.active = ModeId::normal();
+        let (mut chord_backend, chord_log) = FakeBackend::new(Vec::new());
+        let chord_result = measure(|| {
+            for event in [
+                key_down("left_ctrl"),
+                key_down("left_shift"),
+                key_down("e"),
+                key_down("n"),
+                key_up("n"),
+                key_up("e"),
+                key_up("left_shift"),
+                key_up("left_ctrl"),
+                key_down("n"),
+                key_up("n"),
+            ] {
+                chord
+                    .handle_backend_event(event, &mut chord_backend)
+                    .unwrap();
+            }
+            clear_log(&chord_log);
+        });
+
+        let mut mouse_config = Config::default();
+        mouse_config.normal.bindings.clear();
+        mouse_config
+            .normal
+            .bindings
+            .insert("n".into(), Binding::Toggle(Vec::new()));
+        mouse_config.normal.bindings.insert(
+            ";".into(),
+            Binding::Click(crate::api::binding::Button::Left),
+        );
+        let mut mouse = Engine::new(mouse_config, Appearance::Dark);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        mouse.register(Box::new(ProbeMode::new("normal", seen)));
+        mouse.active = ModeId::normal();
+        let (mut mouse_backend, mouse_log) = FakeBackend::new(Vec::new());
+        let mouse_result = measure(|| {
+            for event in [
+                key_down("n"),
+                key_down(";"),
+                key_up(";"),
+                key_up("n"),
+                key_down("n"),
+                key_up("n"),
+            ] {
+                mouse
+                    .handle_backend_event(event, &mut mouse_backend)
+                    .unwrap();
+            }
+            clear_log(&mouse_log);
+        });
+
+        let left = InputTarget::Key(Key::new("left_ctrl").unwrap());
+        let right = InputTarget::Key(Key::new("e").unwrap());
+        let rollback_targets = [left, right];
+        let mut rollback = engine_with_normal_binding("n", "toggle");
+        rollback.active = ModeId::normal();
+        let (mut rollback_backend, rollback_log) = FakeBackend::new(Vec::new());
+        rollback
+            .press_targets(&rollback_targets, &mut rollback_backend)
+            .unwrap();
+        let rollback_result = measure(|| {
+            rollback_log.lock().unwrap().fail_next_key_up = true;
+            let _ = rollback.toggle_targets(&rollback_targets, &mut rollback_backend);
+            clear_log(&rollback_log);
+        });
+
+        println!(
+            "toggle_probe samples={SAMPLES} bare_p50={}ns bare_p95={}ns bare_p99={}ns chord_p50={}ns chord_p95={}ns chord_p99={}ns mouse_p50={}ns mouse_p95={}ns mouse_p99={}ns rollback_p50={}ns rollback_p95={}ns rollback_p99={}ns",
+            bare_result.0,
+            bare_result.1,
+            bare_result.2,
+            chord_result.0,
+            chord_result.1,
+            chord_result.2,
+            mouse_result.0,
+            mouse_result.1,
+            mouse_result.2,
+            rollback_result.0,
+            rollback_result.1,
+            rollback_result.2,
+        );
+    }
+
+    #[test]
+    fn unsupported_or_failed_position_update_falls_back_to_full_scene() {
+        for fail in [false, true] {
+            let (mut engine, mut backend, log) = visible_normal_overlay();
+            backend.fail_position_updates = fail;
+            engine.cursor = Point::new(200.0, 300.0);
+
+            engine.refresh_overlay_positions(&mut backend).unwrap();
+
+            let log = log.lock().unwrap();
+            assert_eq!(log.presents, 2, "fail={fail}: no complete fallback");
+            let scene = log.scenes.last().unwrap();
+            assert_eq!(
+                scene.cursor_marker.as_ref().map(|marker| marker.center),
+                Some(Point::new(200.0, 300.0))
+            );
+        }
+    }
+
+    #[test]
+    fn crossing_a_screen_edge_rebuilds_the_cursor_only_overlay() {
+        let (mut engine, mut backend, log) = visible_normal_overlay();
+        backend.accept_position_updates = true;
+        engine.screens.push(Screen {
+            bounds: Rect::new(1000.0, 0.0, 1000.0, 800.0),
+            work_area: Rect::new(1000.0, 0.0, 1000.0, 800.0),
+            is_primary: false,
+            scale: 2.0,
+            name: None,
+        });
+        engine.cursor = Point::new(1200.0, 300.0);
+
+        engine.refresh_overlay_positions(&mut backend).unwrap();
+
+        let log = log.lock().unwrap();
+        assert_eq!(log.presents, 2);
+        assert!(log.positions.is_empty());
+        assert_eq!(
+            log.scenes.last().and_then(|scene| scene.clip),
+            Some(Rect::new(1000.0, 0.0, 1000.0, 800.0))
+        );
     }
 
     #[test]

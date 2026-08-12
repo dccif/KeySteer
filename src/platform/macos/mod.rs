@@ -334,6 +334,14 @@ impl Backend for MacOsBackend {
         self.overlay.present(scene)
     }
 
+    fn update_overlay_positions(
+        &mut self,
+        cursor: Option<Point>,
+        indicator: Option<Point>,
+    ) -> Result<bool, String> {
+        self.overlay.update_positions(cursor, indicator)
+    }
+
     fn dismiss(&mut self) -> Result<(), String> {
         self.overlay.dismiss()
     }

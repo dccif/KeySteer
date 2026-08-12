@@ -111,6 +111,61 @@ impl Overlay {
         autoreleasepool(|_| self.present_inner(scene))
     }
 
+    /// Move existing dynamic layers without rebuilding text, paths or colors.
+    pub fn update_positions(
+        &mut self,
+        cursor: Option<Point>,
+        indicator: Option<Point>,
+    ) -> Result<bool, String> {
+        autoreleasepool(|_| self.update_positions_inner(cursor, indicator))
+    }
+
+    fn update_positions_inner(
+        &mut self,
+        cursor: Option<Point>,
+        indicator: Option<Point>,
+    ) -> Result<bool, String> {
+        if !self.visible {
+            return Ok(false);
+        }
+        let area = self.area.ok_or("macOS overlay area is unavailable")?;
+        let scene = self
+            .scene
+            .as_deref()
+            .ok_or("macOS overlay scene is unavailable")?;
+        let content = self
+            .content
+            .as_mut()
+            .ok_or("macOS overlay layer tree is unavailable")?;
+        let _transaction = DisabledActions::begin();
+        if let Some(center) = cursor {
+            let marker = scene
+                .cursor_marker
+                .as_ref()
+                .ok_or("macOS cursor layer has no complete scene")?;
+            content.cursor.setFrame(to_window_rect(
+                Rect::new(
+                    center.x - marker.radius,
+                    center.y - marker.radius,
+                    marker.radius * 2.0,
+                    marker.radius * 2.0,
+                ),
+                area,
+            ));
+        }
+        if let Some(position) = indicator {
+            if scene.indicator.is_none() {
+                return Err("macOS indicator layer has no complete scene".into());
+            }
+            let (width, height) = content.indicator_size;
+            content.indicator_root.setFrame(to_window_rect(
+                Rect::new(position.x - width, position.y, width, height),
+                area,
+            ));
+        }
+        Ok(true)
+    }
+
     fn present_inner(&mut self, scene: Arc<OverlayScene>) -> Result<(), String> {
         if self.visible && self.scene.as_ref() == Some(&scene) {
             return Ok(());

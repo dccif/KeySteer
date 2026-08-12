@@ -1,6 +1,6 @@
 [package]
 name = "keysteer"
-version = "0.8.6"
+version = "0.8.7"
 authors = ["dccif"]
 edition = "2024"
 rust-version = "1.97"
@@ -36,6 +36,7 @@ path = "src/main.rs"
 serde = { version = "1.0.229", features = ["derive"] }
 semver = "1.0"
 sha2 = "0.11"
+smallvec = "1.15"
 toml = "1.1.4"
 toml_edit = "0.25"
 # update.rs must explicitly select NativeTls because ureq defaults to Rustls.

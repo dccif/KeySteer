@@ -44,6 +44,8 @@ Mode 不持有 Backend，也不能访问 HWND、NSWindow、UIA 或 AX。Backend 
 `Backend::send_keys` 接收拥有所有权的事件 `Vec`：Engine 只构造一次批次，Windows 等异步
 后端可直接把它移入原生队列，不需要为了跨线程生命周期再次复制；同步后端的默认实现仍按
 顺序逐事件发送。
+`Backend::update_overlay_positions` 是完整 `present` 之后的可选快路径：Engine 只发送自己
+拥有的 cursor/indicator 新坐标；默认返回 `false`，未实现它的后端会自动退回完整场景。
 
 ## Engine 拥有什么
 
@@ -73,8 +75,9 @@ Mode 不持有 Backend，也不能访问 HWND、NSWindow、UIA 或 AX。Backend 
 5. 处理一个 `BackendEvent`，随后触发到期 timer 和延迟动作序列。
 6. 退出时释放所有 latched 输入、隐藏覆盖层并关闭 backend。
 
-`Backend::poll` 最多阻塞 50ms 或到下一个 timer/sequence 截止时间。超时返回 `None`
-是 Engine 执行内部定时任务的机会。
+`Backend::poll` 最多阻塞 50ms 或到下一个 timer/sequence/长按截止时间。延迟序列和长按项
+按截止时间倒序保存，最近项位于 `Vec` 尾部；等待只读取尾项，到期只 `pop`，不得在每次
+poll 后重新分配并拆分整个队列。超时返回 `None` 是 Engine 执行内部定时任务的机会。
 
 ## 键盘同步握手
 

@@ -11,6 +11,11 @@ Engine 保存最后一次 scene 并跳过完全相同的提交。`OverlayScene` 
 `Rect::subdivision` 直接计算单格，Recursive Grid 的层级布局在配置应用阶段编译，选择
 热路径不构造完整 `Vec<Cell>`。
 
+Engine 另外缓存自己生成的 cursor/indicator 几何。普通指针移动只调用
+`Backend::update_overlay_positions`，不再克隆 scene、重新生成 held 文字或比较静态内容；
+跨屏 clip、appearance、样式、held 状态和模式内容变化仍提交完整 scene。未实现快路径、
+首帧未就绪或原生更新失败时立即退回完整 `present`。
+
 Normal 的活动方向使用四位 mask，而不是每个显示帧收集一个 `BTreeSet`。移动距离仍由
 真实 elapsed 的解析积分决定；这个优化只消除逐帧堆分配，不改变对向抵消、对角线归一化
 或多物理键绑定到同一方向时的去重语义。
@@ -26,6 +31,8 @@ click 的物理触发键仍按住时，仅替换 marker 的填充/轮廓颜色�
 mode scene，也不重建静态 Grid/Hint 内容。latched 的真实按钮状态优先；普通 click 使用
 最近仍按住的触发键，并由该键的释放事件清除。颜色提示本身不使用 timer 或 polling；
 可配置的长按 Toggle 复用 Engine 的下一 deadline 超时，不创建周期轮询或额外线程。
+长按和延迟 sequence 使用 deadline 倒序 `Vec`，等待轮询只查看尾项，到期从尾部弹出；常见
+不超过 8 项的 Toggle 目标、回滚快照和按压事务使用栈内 `SmallVec`，超长组合才分配。
 
 ## Windows GPU 主路径
 

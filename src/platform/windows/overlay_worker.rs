@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::api::geometry::Rect;
+use crate::api::geometry::{Point, Rect};
 use crate::api::overlay::OverlayScene;
 
 use super::{EventSender, gpu_overlay::GpuOverlay, native, overlay};
@@ -23,6 +23,12 @@ struct Frame {
     scale: f64,
 }
 
+#[derive(Clone, Copy)]
+struct Positions {
+    cursor: Option<Point>,
+    indicator: Option<Point>,
+}
+
 enum Control {
     Dismiss(SyncSender<Result<(), String>>),
     Shutdown(SyncSender<Result<(), String>>),
@@ -31,6 +37,7 @@ enum Control {
 #[derive(Default)]
 struct State {
     latest: Option<Frame>,
+    positions: Option<Positions>,
     control: Option<Control>,
 }
 
@@ -83,6 +90,24 @@ impl OverlayWorker {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             state.latest = Some(Frame { scene, area, scale });
+            state.positions = None;
+        }
+        self.wake_renderer()
+    }
+
+    /// Coalesce dynamic positions independently from complete frames.
+    pub(super) fn update_positions(
+        &self,
+        cursor: Option<Point>,
+        indicator: Option<Point>,
+    ) -> Result<(), String> {
+        {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.positions = Some(Positions { cursor, indicator });
         }
         self.wake_renderer()
     }
@@ -103,6 +128,7 @@ impl OverlayWorker {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             state.latest = None;
+            state.positions = None;
             state.control = Some(make(reply_tx));
         }
         self.wake_renderer()?;
@@ -149,16 +175,21 @@ fn render_loop(shared: &Shared, events: &EventSender, ready: SyncSender<u32>) {
     if let Some(notice) = startup_notice {
         warn(events, notice);
     }
+    let mut scale = 1.0;
     loop {
-        let (control, frame) = {
+        let (control, frame, positions) = {
             let mut state = shared
                 .state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            (state.control.take(), state.latest.take())
+            (
+                state.control.take(),
+                state.latest.take(),
+                state.positions.take(),
+            )
         };
 
-        if control.is_none() && frame.is_none() {
+        if control.is_none() && frame.is_none() && positions.is_none() {
             match native::wait_and_dispatch_window_message() {
                 Ok(true) => continue,
                 Ok(false) => return,
@@ -189,6 +220,7 @@ fn render_loop(shared: &Shared, events: &EventSender, ready: SyncSender<u32>) {
         }
 
         if let Some(frame) = frame {
+            scale = frame.scale;
             let scene = match dpi_cache.scene_for_dpi(frame.scene.as_ref(), frame.scale) {
                 std::borrow::Cow::Borrowed(_) => Arc::clone(&frame.scene),
                 std::borrow::Cow::Owned(scene) => Arc::new(scene),
@@ -199,6 +231,25 @@ fn render_loop(shared: &Shared, events: &EventSender, ready: SyncSender<u32>) {
                 Err(error) => warn(
                     events,
                     format!("Windows overlay render failed; the next frame will retry: {error}"),
+                ),
+            }
+        }
+        if let Some(mut positions) = positions {
+            if scale.is_finite()
+                && scale.max(1.0) != 1.0
+                && let Some(indicator) = positions.indicator.as_mut()
+            {
+                indicator.x = indicator.x.round();
+                indicator.y = indicator.y.round();
+            }
+            match renderer.update_positions(positions.cursor, positions.indicator) {
+                Ok(Some(notice)) => warn(events, notice),
+                Ok(None) => {}
+                Err(error) => warn(
+                    events,
+                    format!(
+                        "Windows overlay position update failed; the next frame will retry: {error}"
+                    ),
                 ),
             }
         }
@@ -219,6 +270,8 @@ enum Renderer {
 struct AdaptiveRenderer {
     renderer: Renderer,
     last_gpu_rebuild: Option<Instant>,
+    last_scene: Option<Arc<OverlayScene>>,
+    last_area: Option<Rect>,
 }
 
 impl AdaptiveRenderer {
@@ -228,6 +281,8 @@ impl AdaptiveRenderer {
                 Self {
                     renderer: Renderer::Gpu(gpu),
                     last_gpu_rebuild: None,
+                    last_scene: None,
+                    last_area: None,
                 },
                 None,
             ),
@@ -235,6 +290,8 @@ impl AdaptiveRenderer {
                 Self {
                     renderer: Renderer::Cpu(overlay::Overlay::new()),
                     last_gpu_rebuild: None,
+                    last_scene: None,
+                    last_area: None,
                 },
                 Some(format!(
                     "DirectComposition is unavailable; using the DIB renderer: {error}"
@@ -246,11 +303,17 @@ impl AdaptiveRenderer {
     fn present(&mut self, scene: Arc<OverlayScene>, area: Rect) -> Result<Option<String>, String> {
         let gpu_error = match &mut self.renderer {
             Renderer::Gpu(gpu) => match gpu.present(Arc::clone(&scene), area) {
-                Ok(()) => return Ok(None),
+                Ok(()) => {
+                    self.last_scene = Some(scene);
+                    self.last_area = Some(area);
+                    return Ok(None);
+                }
                 Err(error) => error,
             },
             Renderer::Cpu(cpu) => {
-                cpu.present(scene, area)?;
+                cpu.present(Arc::clone(&scene), area)?;
+                self.last_scene = Some(scene);
+                self.last_area = Some(area);
                 return Ok(None);
             }
         };
@@ -262,6 +325,8 @@ impl AdaptiveRenderer {
                 && replacement.present(Arc::clone(&scene), area).is_ok()
             {
                 self.renderer = Renderer::Gpu(replacement);
+                self.last_scene = Some(scene);
+                self.last_area = Some(area);
                 return Ok(Some(format!(
                     "DirectComposition device was rebuilt after a render failure: {gpu_error}"
                 )));
@@ -269,18 +334,51 @@ impl AdaptiveRenderer {
         }
 
         let mut cpu = overlay::Overlay::new();
-        cpu.present(scene, area)?;
+        cpu.present(Arc::clone(&scene), area)?;
         self.renderer = Renderer::Cpu(cpu);
+        self.last_scene = Some(scene);
+        self.last_area = Some(area);
         Ok(Some(format!(
             "DirectComposition failed repeatedly; using the DIB renderer for this session: {gpu_error}"
         )))
     }
 
+    fn update_positions(
+        &mut self,
+        cursor: Option<Point>,
+        indicator: Option<Point>,
+    ) -> Result<Option<String>, String> {
+        if let Renderer::Gpu(gpu) = &mut self.renderer
+            && gpu.update_positions(cursor, indicator).is_ok()
+        {
+            return Ok(None);
+        }
+
+        let area = self
+            .last_area
+            .ok_or("overlay position update arrived before the first complete frame")?;
+        let mut scene = self
+            .last_scene
+            .as_deref()
+            .cloned()
+            .ok_or("overlay position update arrived before the first complete frame")?;
+        if let (Some(position), Some(marker)) = (cursor, scene.cursor_marker.as_mut()) {
+            marker.center = position;
+        }
+        if let (Some(position), Some(item)) = (indicator, scene.indicator.as_mut()) {
+            item.position = position;
+        }
+        self.present(Arc::new(scene), area)
+    }
+
     fn dismiss(&mut self) -> Result<(), String> {
-        match &mut self.renderer {
+        let result = match &mut self.renderer {
             Renderer::Gpu(gpu) => gpu.dismiss(),
             Renderer::Cpu(cpu) => cpu.dismiss(),
-        }
+        };
+        self.last_scene = None;
+        self.last_area = None;
+        result
     }
 }
 

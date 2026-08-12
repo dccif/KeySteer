@@ -109,7 +109,7 @@ mod macos {
             style: LabelStyle::default(),
         });
 
-        let mut current = Arc::new(scene);
+        let current = Arc::new(scene);
         let first_started = Instant::now();
         backend.present(Arc::clone(&current))?;
         println!(
@@ -120,30 +120,24 @@ mod macos {
 
         let mut cursor_samples = Vec::with_capacity(MOTION_SAMPLES);
         for index in 0..MOTION_SAMPLES {
-            let mut next = current.as_ref().clone();
             let x = clip.x + 100.0 + (index % 600) as f64;
             let y = clip.y + 100.0 + (index % 300) as f64;
-            if let Some(cursor) = next.cursor_marker.as_mut() {
-                cursor.center = Point::new(x, y);
-            }
-            current = Arc::new(next);
             let started = Instant::now();
-            backend.present(Arc::clone(&current))?;
+            if !backend.update_overlay_positions(Some(Point::new(x, y)), None)? {
+                return Err("macOS backend rejected a visible cursor position update".into());
+            }
             cursor_samples.push(started.elapsed().as_nanos());
         }
         print_percentiles("native_cursor_move", &mut cursor_samples);
 
         let mut indicator_samples = Vec::with_capacity(MOTION_SAMPLES);
         for index in 0..MOTION_SAMPLES {
-            let mut next = current.as_ref().clone();
             let x = clip.x + 100.0 + (index % 600) as f64;
             let y = clip.y + 100.0 + (index % 300) as f64;
-            if let Some(indicator) = next.indicator.as_mut() {
-                indicator.position = Point::new(x + 80.0, y + 28.0);
-            }
-            current = Arc::new(next);
             let started = Instant::now();
-            backend.present(Arc::clone(&current))?;
+            if !backend.update_overlay_positions(None, Some(Point::new(x + 80.0, y + 28.0)))? {
+                return Err("macOS backend rejected a visible indicator position update".into());
+            }
             indicator_samples.push(started.elapsed().as_nanos());
         }
         print_percentiles("native_indicator_move", &mut indicator_samples);

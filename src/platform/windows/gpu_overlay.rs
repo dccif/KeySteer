@@ -66,6 +66,8 @@ pub(super) struct GpuOverlay {
     brushes: HashMap<u32, ID2D1SolidColorBrush>,
     formats: Vec<FontEntry>,
     utf16: Vec<u16>,
+    #[cfg(test)]
+    begin_draws: usize,
 }
 
 struct WindowContent {
@@ -152,6 +154,8 @@ impl GpuOverlay {
             brushes: HashMap::with_capacity(16),
             formats: Vec::with_capacity(8),
             utf16: Vec::with_capacity(32),
+            #[cfg(test)]
+            begin_draws: 0,
         })
     }
 
@@ -186,13 +190,66 @@ impl GpuOverlay {
         if let Some(content) = self.content.as_mut() {
             content.last_scene = Some(scene);
         }
-        // SAFETY: all mutations were recorded on `self.dcomp`; the HWND stays
-        // owned by `self.content` and SW_SHOWNOACTIVATE cannot activate it.
+        self.commit(Some(hwnd))
+    }
+
+    /// Move existing dynamic visuals without opening a Direct2D surface.
+    pub(super) fn update_positions(
+        &mut self,
+        cursor: Option<Point>,
+        indicator: Option<Point>,
+    ) -> Result<(), String> {
+        let content = self
+            .content
+            .as_ref()
+            .ok_or("DirectComposition content is unavailable")?;
+        if let Some(center) = cursor {
+            let marker = content
+                .last_scene
+                .as_deref()
+                .and_then(|scene| scene.cursor_marker.as_ref())
+                .ok_or("cursor visual has no complete scene")?;
+            if content.cursor_surface.is_none() {
+                return Err("cursor visual surface is unavailable".into());
+            }
+            let bounds = cursor_bounds(marker, center);
+            configure_visual(
+                &content.cursor_visual,
+                None,
+                bounds.x - content.area.x,
+                bounds.y - content.area.y,
+            )?;
+        }
+        if let Some(position) = indicator {
+            let item = content
+                .last_scene
+                .as_deref()
+                .and_then(|scene| scene.indicator.as_ref())
+                .ok_or("indicator visual has no complete scene")?;
+            if content.indicator_surface.is_none() {
+                return Err("indicator visual surface is unavailable".into());
+            }
+            let bounds = indicator_bounds(item, position);
+            configure_visual(
+                &content.indicator_visual,
+                None,
+                bounds.x - content.area.x,
+                bounds.y - content.area.y,
+            )?;
+        }
+        self.commit(None)
+    }
+
+    fn commit(&self, show: Option<HWND>) -> Result<(), String> {
+        // SAFETY: all visual mutations were recorded on `self.dcomp`; an HWND
+        // supplied by `present` remains owned by `self.content`.
         unsafe {
             self.dcomp
                 .Commit()
                 .map_err(|error| format!("DirectComposition commit failed: {error}"))?;
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            if let Some(hwnd) = show {
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            }
         }
         Ok(())
     }
@@ -352,6 +409,10 @@ impl GpuOverlay {
                 return Err(format!("CreateBitmapFromDxgiSurface failed: {error}"));
             }
         };
+        #[cfg(test)]
+        {
+            self.begin_draws = self.begin_draws.wrapping_add(1);
+        }
         // SAFETY: the bitmap belongs to the same D2D device context.
         unsafe {
             self.d2d.SetTarget(&bitmap);
@@ -415,13 +476,7 @@ impl GpuOverlay {
             }
             return Ok(());
         };
-        let padding = (marker.stroke_width.max(0.0) / 2.0).ceil() + 1.0;
-        let bounds = Rect::new(
-            marker.center.x - marker.radius - padding,
-            marker.center.y - marker.radius - padding,
-            marker.radius * 2.0 + padding * 2.0,
-            marker.radius * 2.0 + padding * 2.0,
-        );
+        let bounds = cursor_bounds(marker, marker.center);
         let width = dimension(bounds.width)?;
         let height = dimension(bounds.height)?;
         let surface_to_paint = {
@@ -436,25 +491,13 @@ impl GpuOverlay {
                 .cursor_surface
                 .as_ref()
                 .ok_or("DirectComposition cursor surface was not retained")?;
-            // SAFETY: the interfaces share a DComp device and offsets are
-            // local to the owned overlay window. Reused surfaces remain bound.
-            unsafe {
-                if recreated {
-                    content
-                        .cursor_visual
-                        .SetContent(&layer.surface)
-                        .map_err(|error| format!("cannot bind cursor surface: {error}"))?;
-                }
-                content
-                    .cursor_visual
-                    .SetOffsetX2((bounds.x - area.x) as f32)
-                    .and_then(|()| {
-                        content
-                            .cursor_visual
-                            .SetOffsetY2((bounds.y - area.y) as f32)
-                    })
-            }
-            .map_err(|error| format!("cannot position cursor visual: {error}"))?;
+            let bind = recreated.then(|| layer.surface.clone());
+            configure_visual(
+                &content.cursor_visual,
+                bind.as_ref(),
+                bounds.x - area.x,
+                bounds.y - area.y,
+            )?;
             (repaint || recreated).then(|| layer.surface.clone())
         };
         if let Some(surface) = surface_to_paint {
@@ -508,9 +551,7 @@ impl GpuOverlay {
                 &indicator.style,
             )
         });
-        let bounds = held
-            .map_or(first, |held| first.union(&held))
-            .inset(-1.0, -1.0);
+        let bounds = indicator_bounds(indicator, indicator.position);
         let width = dimension(bounds.width)?;
         let height = dimension(bounds.height)?;
         let surface_to_paint = {
@@ -525,25 +566,13 @@ impl GpuOverlay {
                 .indicator_surface
                 .as_ref()
                 .ok_or("DirectComposition indicator surface was not retained")?;
-            // SAFETY: the interfaces share a DComp device and offsets are
-            // local to the owned overlay window. Reused surfaces remain bound.
-            unsafe {
-                if recreated {
-                    content
-                        .indicator_visual
-                        .SetContent(&layer.surface)
-                        .map_err(|error| format!("cannot bind indicator surface: {error}"))?;
-                }
-                content
-                    .indicator_visual
-                    .SetOffsetX2((bounds.x - area.x) as f32)
-                    .and_then(|()| {
-                        content
-                            .indicator_visual
-                            .SetOffsetY2((bounds.y - area.y) as f32)
-                    })
-            }
-            .map_err(|error| format!("cannot position indicator visual: {error}"))?;
+            let bind = recreated.then(|| layer.surface.clone());
+            configure_visual(
+                &content.indicator_visual,
+                bind.as_ref(),
+                bounds.x - area.x,
+                bounds.y - area.y,
+            )?;
             (repaint || recreated).then(|| layer.surface.clone())
         };
         if let Some(surface) = surface_to_paint {
@@ -942,6 +971,53 @@ fn local_point(point: Point, origin: Point) -> Vector2 {
     }
 }
 
+fn configure_visual(
+    visual: &IDCompositionVisual,
+    content: Option<&IDCompositionSurface>,
+    x: f64,
+    y: f64,
+) -> Result<(), String> {
+    // SAFETY: the visual and optional surface belong to the same live
+    // DirectComposition device; offsets are local to the owned overlay HWND.
+    unsafe {
+        if let Some(content) = content {
+            visual
+                .SetContent(content)
+                .map_err(|error| format!("cannot bind dynamic surface: {error}"))?;
+        }
+        visual
+            .SetOffsetX2(x as f32)
+            .and_then(|()| visual.SetOffsetY2(y as f32))
+    }
+    .map_err(|error| format!("cannot position dynamic visual: {error}"))
+}
+
+fn cursor_bounds(marker: &CursorMarker, center: Point) -> Rect {
+    let padding = (marker.stroke_width.max(0.0) / 2.0).ceil() + 1.0;
+    Rect::new(
+        center.x - marker.radius - padding,
+        center.y - marker.radius - padding,
+        marker.radius * 2.0 + padding * 2.0,
+        marker.radius * 2.0 + padding * 2.0,
+    )
+}
+
+fn indicator_bounds(indicator: &Indicator, position: Point) -> Rect {
+    let first = indicator_rect(&indicator.text, position, &indicator.style);
+    indicator
+        .held_text
+        .as_deref()
+        .map(|text| {
+            indicator_rect(
+                text,
+                Point::new(position.x, first.bottom() + 4.0),
+                &indicator.style,
+            )
+        })
+        .map_or(first, |held| first.union(&held))
+        .inset(-1.0, -1.0)
+}
+
 fn indicator_rect(text: &str, position: Point, style: &LabelStyle) -> Rect {
     let width = (text.chars().count() as f64 * style.font_size * 0.7 + style.padding_x * 2.0)
         .max(style.font_size * 2.0);
@@ -1192,11 +1268,33 @@ mod tests {
         report_process_metrics("first_present");
 
         let mut current = first_scene;
+        let begin_draws = renderer.begin_draws;
         let mut samples = Vec::with_capacity(SAMPLES);
         for frame in 0..WARMUP_FRAMES + SAMPLES {
-            let mut next = current.as_ref().clone();
             let x = 200.0 + (frame % 1_000) as f64;
             let y = 200.0 + (frame % 500) as f64;
+            let started = Instant::now();
+            renderer
+                .update_positions(Some(Point::new(x, y)), Some(Point::new(x + 80.0, y + 20.0)))?;
+            let elapsed = started.elapsed().as_nanos();
+            if frame >= WARMUP_FRAMES {
+                samples.push(elapsed);
+            }
+        }
+        assert_eq!(
+            renderer.begin_draws, begin_draws,
+            "position-only frames must not enter Direct2D BeginDraw"
+        );
+        let (p50, p95, p99) = percentiles(samples);
+        println!("native_motion_present samples={SAMPLES} p50={p50}ns p95={p95}ns p99={p99}ns");
+
+        // Exact shape of the previous Engine/backend route: construct a new
+        // shared scene and let `present` rediscover that only positions moved.
+        let mut complete_samples = Vec::with_capacity(SAMPLES);
+        for frame in 0..WARMUP_FRAMES + SAMPLES {
+            let mut next = current.as_ref().clone();
+            let x = 300.0 + (frame % 1_000) as f64;
+            let y = 300.0 + (frame % 500) as f64;
             next.cursor_marker.as_mut().unwrap().center = Point::new(x, y);
             next.indicator.as_mut().unwrap().position = Point::new(x + 80.0, y + 20.0);
             let next = Arc::new(next);
@@ -1204,12 +1302,14 @@ mod tests {
             renderer.present(Arc::clone(&next), area)?;
             let elapsed = started.elapsed().as_nanos();
             if frame >= WARMUP_FRAMES {
-                samples.push(elapsed);
+                complete_samples.push(elapsed);
             }
             current = next;
         }
-        let (p50, p95, p99) = percentiles(samples);
-        println!("native_motion_present samples={SAMPLES} p50={p50}ns p95={p95}ns p99={p99}ns");
+        let (complete_p50, complete_p95, complete_p99) = percentiles(complete_samples);
+        println!(
+            "native_complete_scene_motion samples={SAMPLES} p50={complete_p50}ns p95={complete_p95}ns p99={complete_p99}ns"
+        );
 
         // Conservative in-process representation of the previous renderer:
         // force both tight dynamic surfaces to repaint on every position

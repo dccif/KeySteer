@@ -141,7 +141,7 @@ impl Engine {
                     // Synthetic movement is not guaranteed to re-enter the
                     // input hook. Store the constrained position actually sent.
                     self.cursor = to;
-                    self.refresh_overlay(backend)?;
+                    self.refresh_overlay_positions(backend)?;
                 }
                 Command::WarpPointer { x, y } => {
                     let Some(to) = self.constrain_absolute_pointer(Point::new(x, y)) else {
@@ -159,7 +159,7 @@ impl Engine {
                         format!("warp_pointer x={:.3} y={:.3}: ok", to.x, to.y)
                     });
                     self.cursor = to;
-                    self.refresh_overlay(backend)?;
+                    self.refresh_overlay_positions(backend)?;
                 }
                 Command::MouseButton { button, action } => {
                     if let Err(error) = backend.mouse_button(button, action) {

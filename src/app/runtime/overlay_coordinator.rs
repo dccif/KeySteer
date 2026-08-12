@@ -41,11 +41,19 @@ impl Engine {
         // The engine owns mode decoration. A temporary mode changes only this
         // display identity; the active mode keeps its underlying scene/state.
         let display_mode = self.display_mode();
+        let mut dynamic = DynamicOverlayState {
+            follows_cursor_screen: scene.clip.is_none()
+                && scene.backdrop.is_none()
+                && scene.labels.is_empty()
+                && scene.shapes.is_empty(),
+            ..DynamicOverlayState::default()
+        };
         if let Some(cursor) = self
             .config
             .mode_indicator
             .cursor_for_mode(display_mode.as_str())
         {
+            dynamic.cursor = true;
             let pressed_button = [
                 crate::api::binding::Button::Left,
                 crate::api::binding::Button::Middle,
@@ -86,8 +94,11 @@ impl Engine {
                 stroke_width: cursor.stroke_width.max(0) as f64,
             });
         }
-        if scene.indicator.is_none() {
-            scene.indicator = self.build_indicator(&display_mode);
+        if scene.indicator.is_none()
+            && let Some((indicator, geometry)) = self.build_indicator(&display_mode)
+        {
+            scene.indicator = Some(indicator);
+            dynamic.indicator = Some(geometry);
         }
         // Cursor-only scenes use a fixed screen-sized surface. Moving an
         // NSPanel on every pointer event trails macOS's hardware cursor under
@@ -123,12 +134,20 @@ impl Engine {
 
         // Skip identical frames: overlay presentation is the most expensive
         // thing we do, and modes redraw on every keystroke.
+        let positions = OverlayPositions {
+            cursor: dynamic.cursor.then_some(self.cursor),
+            indicator: dynamic
+                .indicator
+                .map(|geometry| geometry.position(self.cursor, &self.screens)),
+        };
         if self.overlay_visible
             && self
                 .last_scene
                 .as_deref()
                 .is_some_and(|previous| previous == &scene)
         {
+            self.overlay_dynamic = dynamic;
+            self.overlay_positions = Some(positions);
             return Ok(());
         }
         let scene = Arc::new(scene);
@@ -136,6 +155,8 @@ impl Engine {
         self.trace(trace_overlay, "overlay", "backend present: ok");
         self.last_scene = Some(scene);
         self.overlay_visible = true;
+        self.overlay_dynamic = dynamic;
+        self.overlay_positions = Some(positions);
         Ok(())
     }
 
@@ -157,12 +178,14 @@ impl Engine {
         }
         self.last_scene = None;
         self.overlay_visible = false;
+        self.overlay_dynamic = DynamicOverlayState::default();
+        self.overlay_positions = None;
         Ok(())
     }
 
     pub(super) fn refresh_overlay(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
         if self.command_batch_depth > 0 {
-            if self.pending_overlay.is_none() {
+            if matches!(self.pending_overlay, None | Some(PendingOverlay::Positions)) {
                 self.pending_overlay = Some(PendingOverlay::Refresh);
             }
             return Ok(());
@@ -178,12 +201,59 @@ impl Engine {
         self.present_overlay(scene, backend)
     }
 
+    /// Move only Engine-owned dynamic decorations. Static mode content and
+    /// indicator text/style remain shared with the last complete scene.
+    pub(super) fn refresh_overlay_positions(
+        &mut self,
+        backend: &mut dyn Backend,
+    ) -> Result<(), String> {
+        if self.active == ModeId::idle() || !self.overlay_visible {
+            return Ok(());
+        }
+        if self.overlay_dynamic.follows_cursor_screen {
+            let current_clip =
+                Screen::containing(&self.screens, &self.cursor).map(|screen| screen.bounds);
+            if self.last_scene.as_deref().and_then(|scene| scene.clip) != current_clip {
+                return self.refresh_overlay(backend);
+            }
+        }
+
+        let positions = OverlayPositions {
+            cursor: self.overlay_dynamic.cursor.then_some(self.cursor),
+            indicator: self
+                .overlay_dynamic
+                .indicator
+                .map(|geometry| geometry.position(self.cursor, &self.screens)),
+        };
+        if positions.cursor.is_none() && positions.indicator.is_none() {
+            return Ok(());
+        }
+        if self.overlay_positions == Some(positions) {
+            return Ok(());
+        }
+        if self.command_batch_depth > 0 {
+            if self.pending_overlay.is_none() {
+                self.pending_overlay = Some(PendingOverlay::Positions);
+            }
+            return Ok(());
+        }
+
+        match backend.update_overlay_positions(positions.cursor, positions.indicator) {
+            Ok(true) => {
+                self.overlay_positions = Some(positions);
+                Ok(())
+            }
+            Ok(false) | Err(_) => self.refresh_overlay_now(backend),
+        }
+    }
+
     pub(super) fn flush_pending_overlay(
         &mut self,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
         match self.pending_overlay.take() {
             Some(PendingOverlay::Refresh) => self.refresh_overlay_now(backend),
+            Some(PendingOverlay::Positions) => self.refresh_overlay_positions(backend),
             Some(PendingOverlay::Show(mut scene)) => {
                 Arc::make_mut(&mut scene).sort_in_place();
                 self.show_shared_overlay_now(scene, backend)
@@ -193,7 +263,7 @@ impl Engine {
         }
     }
 
-    fn build_indicator(&self, display_mode: &ModeId) -> Option<Indicator> {
+    fn build_indicator(&self, display_mode: &ModeId) -> Option<(Indicator, IndicatorGeometry)> {
         let mode = self.modes.get(display_mode)?;
         let display = mode.display_name();
         let (text, ui) = self
@@ -234,25 +304,20 @@ impl Engine {
         // `position.x` is the shared right edge of both badges. Keeping the
         // anchor independent of the longest line prevents a wide held-input
         // badge from pushing the shorter mode badge away from the cursor.
-        let mut position = Point::new(
-            self.cursor.x + ui.indicator_x_offset as f64,
-            self.cursor.y + ui.indicator_y_offset as f64,
-        );
-        if let Some(screen) = Screen::containing(&self.screens, &self.cursor) {
-            position.x = position.x.clamp(
-                (screen.bounds.x + width).min(screen.bounds.right()),
-                screen.bounds.right(),
-            );
-            position.y = position.y.clamp(
-                screen.bounds.y,
-                (screen.bounds.bottom() - height).max(screen.bounds.y),
-            );
-        }
-        Some(Indicator {
-            text,
-            held_text,
-            position,
-            style,
-        })
+        let geometry = IndicatorGeometry {
+            width,
+            height,
+            x_offset: ui.indicator_x_offset as f64,
+            y_offset: ui.indicator_y_offset as f64,
+        };
+        Some((
+            Indicator {
+                text,
+                held_text,
+                position: geometry.position(self.cursor, &self.screens),
+                style,
+            },
+            geometry,
+        ))
     }
 }
