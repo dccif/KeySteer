@@ -623,11 +623,7 @@ impl Backend for WindowsBackend {
     }
 
     fn open_url(&mut self, url: &str) -> Result<(), String> {
-        std::process::Command::new("explorer.exe")
-            .arg(url)
-            .spawn()
-            .map(|_| ())
-            .map_err(|error| format!("Windows could not open the default browser: {error}"))
+        status_item::open_https_url(url)
     }
 
     fn name(&self) -> &'static str {

@@ -13,18 +13,20 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
+    ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessageW, HCURSOR, HICON,
     IDI_APPLICATION, IDYES, LoadIconW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND,
     MB_YESNO, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, PostMessageW,
-    PostThreadMessageW, RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow,
-    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
-    TranslateMessage, WM_APP, WM_CANCELMODE, WM_DISPLAYCHANGE, WM_LBUTTONUP, WM_NULL, WM_QUIT,
-    WM_RBUTTONUP, WM_SETTINGCHANGE, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    PostThreadMessageW, RegisterClassExW, RegisterWindowMessageW, SW_SHOWNORMAL,
+    SetForegroundWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TrackPopupMenu, TranslateMessage, WM_APP, WM_CANCELMODE, WM_DISPLAYCHANGE, WM_LBUTTONUP,
+    WM_NULL, WM_QUIT, WM_RBUTTONUP, WM_SETTINGCHANGE, WNDCLASSEXW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_POPUP,
 };
-use windows::core::{PCWSTR, w};
+use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::api::Autostart;
 use crate::api::backend::{BackendEvent, UpdateCheckResult, UpdateProgress};
@@ -325,6 +327,34 @@ fn add_icon(hwnd: HWND) -> bool {
     unsafe { Shell_NotifyIconW(NIM_ADD, &icon_data(hwnd)) }.as_bool()
 }
 
+pub(super) fn open_https_url(url: &str) -> Result<(), String> {
+    if !url.starts_with("https://") || url.contains('\0') {
+        return Err("Windows refused an invalid HTTPS URL".into());
+    }
+    let url = HSTRING::from(url);
+    // SAFETY: all strings are valid, live, NUL-terminated UTF-16 values for
+    // the duration of the call. No owner HWND, parameters or working directory
+    // are supplied. ShellExecuteW does not return an owned process handle.
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            &url,
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    let code = result.0 as isize;
+    if code > 32 {
+        Ok(())
+    } else {
+        Err(format!(
+            "Windows could not open the default HTTPS browser (ShellExecuteW code {code})"
+        ))
+    }
+}
+
 fn emit(event: BackendEvent) {
     let sender = SENDER
         .get()
@@ -430,12 +460,14 @@ fn show_menu(hwnd: HWND) {
         );
         (previous_foreground, command)
     };
-    if let Err(error) = unsafe { DestroyMenu(menu) } {
-        crate::log_warning!("windows-tray", "cannot destroy tray menu: {error}");
-    }
-    let _ = unsafe { PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0)) };
-    if !previous_foreground.is_invalid() && unsafe { GetForegroundWindow() } == hwnd {
-        unsafe {
+    // SAFETY: menu and hwnd were created by this tray thread and remain valid
+    // through this cleanup; the foreground HWND is only compared/restored.
+    unsafe {
+        if let Err(error) = DestroyMenu(menu) {
+            crate::log_warning!("windows-tray", "cannot destroy tray menu: {error}");
+        }
+        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+        if !previous_foreground.is_invalid() && GetForegroundWindow() == hwnd {
             let _ = SetForegroundWindow(previous_foreground);
         }
     }
@@ -722,6 +754,12 @@ mod tests {
 
         drop(first);
         assert!(NativeDialogGuard::acquire().is_some());
+    }
+
+    #[test]
+    fn shell_url_launcher_rejects_non_https_and_embedded_nul() {
+        assert!(open_https_url("file:///C:/Windows").is_err());
+        assert!(open_https_url("https://example.invalid/\0payload").is_err());
     }
 
     #[test]

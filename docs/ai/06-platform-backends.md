@@ -20,6 +20,10 @@ frame clock、overlay、UI scan、appearance、系统浏览器、状态栏开关
 
 `src/platform/windows/native/` contains the zero-allocation ownership boundary for shared Win32 resources. Owned HWND/HANDLE values and GDI selection guards perform the same single destroy/close/restore operation as the direct code they replace; hot-path forwarding helpers are always inlined. UIA enumeration continues filtering in the native callback instead of allocating an intermediate HWND list.
 
+Web simulator URLs are passed directly to `ShellExecuteW` with the `open` verb.
+Do not route fragment-bearing URLs through `explorer.exe`: its command-line parser
+may open File Explorer instead of preserving the complete URL for the default browser.
+
 组合入口：`src/platform/windows/mod.rs`。
 
 ### 线程和事件

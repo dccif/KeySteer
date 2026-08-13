@@ -2,9 +2,9 @@
 
 ## 0.8.12
 
-修复 macOS 检查更新闪退问题，并确保更新线程在完成、失败或退出时及时释放资源。
+修复 Windows/macOS 检查更新失败、Windows 模拟器入口误开文件管理器及更新线程退出清理问题。
 
-Fix macOS update-check crashes and ensure update workers release resources after completion, failure, or exit.
+Fix update checks on Windows and macOS, open the simulator in the Windows browser, and clean up update workers reliably.
 
 ## 0.8.11
 
