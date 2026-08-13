@@ -64,6 +64,23 @@ impl DispositionMailbox {
             .then_some(slot.disposition)
             .flatten()
     }
+
+    /// Fail-open any callback currently waiting for the engine.
+    ///
+    /// Native hook shutdown and permission revocation must not wait for the
+    /// normal disposition timeout. Advancing the generation makes the old
+    /// waiter stale and the notification wakes it immediately.
+    #[cfg(any(target_os = "macos", test))]
+    pub(super) fn cancel_pending(&self) {
+        let generation = self
+            .next_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
+        slot.generation = generation;
+        slot.disposition = None;
+        self.ready.notify_all();
+    }
 }
 
 #[cfg(test)]
@@ -96,5 +113,15 @@ mod tests {
             mailbox.wait(second, Duration::ZERO),
             Some(KeyDisposition::Consume)
         );
+    }
+
+    #[test]
+    fn cancellation_invalidates_a_pending_callback() {
+        let mailbox = DispositionMailbox::default();
+        let generation = mailbox.begin();
+        mailbox.cancel_pending();
+
+        assert_eq!(mailbox.wait(generation, Duration::ZERO), None);
+        assert!(!mailbox.complete(generation, KeyDisposition::Consume));
     }
 }

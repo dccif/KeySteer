@@ -21,8 +21,11 @@ use super::input;
 
 const DISPOSITION_TIMEOUT: Duration = Duration::from_millis(100);
 const RUN_LOOP_SLICE: Duration = Duration::from_millis(20);
+const STOP_TIMEOUT: Duration = Duration::from_millis(250);
 pub const TIMEOUT_WARNING: &str =
     "keyboard disposition timed out; the key was forwarded and the event tap remained active";
+const PERMISSION_REVOKED_WARNING: &str = "Accessibility permission was revoked; the keyboard hook stopped and keys will be forwarded until KeySteer is restarted after permission is restored";
+const USER_DISABLED_WARNING: &str = "the macOS event tap was disabled by the user; the keyboard hook stopped instead of overriding that choice";
 
 struct Envelope {
     event: BackendEvent,
@@ -48,16 +51,33 @@ impl EventSender {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TapDisabled {
+    Timeout,
+    UserInput,
+}
+
+fn should_reenable(disabled: TapDisabled, trusted: bool) -> bool {
+    disabled == TapDisabled::Timeout && trusted
+}
+
 #[derive(Default)]
 struct TapState {
     last_flags: u64,
     caps_lock_down: bool,
-    needs_reenable: bool,
+    disabled: Option<TapDisabled>,
 }
 
 type SharedState = Arc<Mutex<TapState>>;
 type SharedPointer = Arc<Mutex<Option<Point>>>;
 type SharedClickTracker = Arc<Mutex<ClickTracker>>;
+type SharedRunLoop = Arc<Mutex<Option<CFRunLoop>>>;
+
+fn default_run_loop_mode() -> core_foundation::runloop::CFRunLoopMode {
+    // SAFETY: Core Foundation exports this process-lifetime static mode; all
+    // callers only borrow the pointer for a CFRunLoop API call.
+    unsafe { kCFRunLoopDefaultMode }
+}
 
 struct CallbackContext {
     sender: SyncSender<Envelope>,
@@ -74,6 +94,9 @@ pub struct HookThread {
     pending: Option<u64>,
     latest_pointer: SharedPointer,
     stop: Arc<AtomicBool>,
+    active: Arc<AtomicBool>,
+    run_loop: SharedRunLoop,
+    finished: Receiver<()>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -83,6 +106,9 @@ pub struct HookStartup {
     mailbox: Arc<crate::platform::disposition_mailbox::DispositionMailbox>,
     latest_pointer: SharedPointer,
     stop: Arc<AtomicBool>,
+    active: Arc<AtomicBool>,
+    run_loop: SharedRunLoop,
+    finished: Option<Receiver<()>>,
     join: Option<std::thread::JoinHandle<()>>,
     ready: Receiver<Result<(), String>>,
     activate: SyncSender<()>,
@@ -93,6 +119,16 @@ struct HookHandshake {
     ready: SyncSender<Result<(), String>>,
     activate: Receiver<()>,
     activated: SyncSender<()>,
+}
+
+struct HookThreadContext {
+    sender: SyncSender<Envelope>,
+    mailbox: Arc<crate::platform::disposition_mailbox::DispositionMailbox>,
+    stop: Arc<AtomicBool>,
+    active: Arc<AtomicBool>,
+    run_loop: SharedRunLoop,
+    latest_pointer: SharedPointer,
+    click_tracker: SharedClickTracker,
 }
 
 impl HookStartup {
@@ -110,6 +146,11 @@ impl HookStartup {
         };
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
+        let active = Arc::new(AtomicBool::new(false));
+        let thread_active = Arc::clone(&active);
+        let run_loop = Arc::new(Mutex::new(None));
+        let thread_run_loop = Arc::clone(&run_loop);
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
         let latest_pointer = Arc::new(Mutex::new(None));
         let thread_pointer = Arc::clone(&latest_pointer);
         let join = std::thread::Builder::new()
@@ -118,13 +159,18 @@ impl HookStartup {
                 let event_tx = event_tx.clone();
                 move || {
                     event_tap_thread(
-                        event_tx,
-                        thread_mailbox,
                         handshake,
-                        thread_stop,
-                        thread_pointer,
-                        click_tracker,
-                    )
+                        HookThreadContext {
+                            sender: event_tx,
+                            mailbox: thread_mailbox,
+                            stop: thread_stop,
+                            active: thread_active,
+                            run_loop: thread_run_loop,
+                            latest_pointer: thread_pointer,
+                            click_tracker,
+                        },
+                    );
+                    let _ = finished_tx.send(());
                 }
             })
             .map_err(|error| format!("cannot start macOS event tap thread: {error}"))?;
@@ -135,6 +181,9 @@ impl HookStartup {
             mailbox,
             latest_pointer,
             stop,
+            active,
+            run_loop,
+            finished: Some(finished_rx),
             join: Some(join),
             ready: ready_rx,
             activate: activate_tx,
@@ -162,6 +211,11 @@ impl HookStartup {
                     pending: None,
                     latest_pointer: Arc::clone(&self.latest_pointer),
                     stop: Arc::clone(&self.stop),
+                    active: Arc::clone(&self.active),
+                    run_loop: Arc::clone(&self.run_loop),
+                    finished: self.finished.take().ok_or_else(|| {
+                        "macOS event tap completion signal is unavailable".to_string()
+                    })?,
                     join: self.join.take(),
                 })
             }
@@ -177,19 +231,25 @@ impl Drop for HookStartup {
             return;
         }
         self.stop.store(true, Ordering::Release);
+        self.active.store(false, Ordering::Release);
+        self.mailbox.cancel_pending();
         let _ = self.activate.try_send(());
-        if let Some(join) = self.join.take()
-            && join.join().is_err()
-        {
-            crate::app::logging::report_error(
-                "macos-hook",
-                "event tap thread panicked during startup",
+        stop_run_loop(&self.run_loop);
+        if let Some(finished) = self.finished.as_ref() {
+            join_with_timeout(
+                &mut self.join,
+                finished,
+                "event tap thread did not stop during startup cleanup",
             );
         }
     }
 }
 
 impl HookThread {
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
     pub(super) fn event_sender(&self) -> EventSender {
         EventSender {
             sender: self.sender.clone(),
@@ -234,12 +294,46 @@ impl HookThread {
 
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(join) = self.join.take()
-            && join.join().is_err()
-        {
-            crate::app::logging::report_error("macos-hook", "event tap thread panicked");
-        }
+        self.active.store(false, Ordering::Release);
+        self.mailbox.cancel_pending();
+        stop_run_loop(&self.run_loop);
+        join_with_timeout(
+            &mut self.join,
+            &self.finished,
+            "event tap thread did not stop within 250 ms; detaching it safely",
+        );
         self.pending = None;
+    }
+}
+
+fn stop_run_loop(run_loop: &SharedRunLoop) {
+    if let Ok(run_loop) = run_loop.lock()
+        && let Some(run_loop) = run_loop.as_ref()
+    {
+        run_loop.stop();
+    }
+}
+
+fn join_with_timeout(
+    join: &mut Option<std::thread::JoinHandle<()>>,
+    finished: &Receiver<()>,
+    timeout_message: &str,
+) {
+    let Some(handle) = join.take() else {
+        return;
+    };
+    match finished.recv_timeout(STOP_TIMEOUT) {
+        Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+            if handle.join().is_err() {
+                crate::app::logging::report_error("macos-hook", "event tap thread panicked");
+            }
+        }
+        Err(RecvTimeoutError::Timeout) => {
+            // Dropping JoinHandle detaches; the worker owns all native values
+            // it may still touch and has already been told to fail open.
+            drop(handle);
+            crate::app::logging::report_error("macos-hook", timeout_message);
+        }
     }
 }
 
@@ -249,19 +343,21 @@ impl Drop for HookThread {
     }
 }
 
-fn event_tap_thread(
-    sender: SyncSender<Envelope>,
-    mailbox: Arc<crate::platform::disposition_mailbox::DispositionMailbox>,
-    handshake: HookHandshake,
-    stop: Arc<AtomicBool>,
-    latest_pointer: SharedPointer,
-    click_tracker: SharedClickTracker,
-) {
+fn event_tap_thread(handshake: HookHandshake, context: HookThreadContext) {
     let HookHandshake {
         ready,
         activate,
         activated,
     } = handshake;
+    let HookThreadContext {
+        sender,
+        mailbox,
+        stop,
+        active,
+        run_loop: shared_run_loop,
+        latest_pointer,
+        click_tracker,
+    } = context;
     // Build the reverse key table on this worker while AppKit initializes on
     // the main thread. No physical event is captured until activation below.
     input::prewarm_key_map();
@@ -273,6 +369,7 @@ fn event_tap_thread(
         latest_pointer,
         click_tracker,
     };
+    let callback_mailbox = Arc::clone(&callback.mailbox);
     let tap = match create_tap(move |proxy, event_type, event| {
         handle_event(proxy, event_type, event, &callback)
     }) {
@@ -293,7 +390,10 @@ fn event_tap_thread(
         }
     };
     let run_loop = CFRunLoop::get_current();
-    run_loop.add_source(&source, unsafe { kCFRunLoopDefaultMode });
+    if let Ok(mut shared) = shared_run_loop.lock() {
+        *shared = Some(run_loop.clone());
+    }
+    run_loop.add_source(&source, default_run_loop_mode());
     if ready.send(Ok(())).is_err() {
         return;
     }
@@ -301,25 +401,55 @@ fn event_tap_thread(
         return;
     }
     tap.enable();
+    active.store(true, Ordering::Release);
     if activated.send(()).is_err() {
+        active.store(false, Ordering::Release);
         return;
     }
 
     while !stop.load(Ordering::Acquire) {
-        CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, RUN_LOOP_SLICE, true);
-        let needs_reenable = state
+        CFRunLoop::run_in_mode(default_run_loop_mode(), RUN_LOOP_SLICE, true);
+        let disabled = state
             .lock()
-            .map(|mut state| std::mem::take(&mut state.needs_reenable))
-            .unwrap_or(false);
-        if needs_reenable {
-            tap.enable();
-            let _ = sender.try_send(Envelope {
-                event: BackendEvent::Warning(
-                    "the macOS event tap was disabled by the system and re-enabled".into(),
-                ),
-                generation: None,
-            });
+            .map(|mut state| state.disabled.take())
+            .unwrap_or(None);
+        match disabled {
+            Some(disabled) if should_reenable(disabled, super::permissions::is_trusted()) => {
+                tap.enable();
+                let _ = sender.try_send(Envelope {
+                    event: BackendEvent::Warning(
+                        "the macOS event tap timed out and was re-enabled".into(),
+                    ),
+                    generation: None,
+                });
+                super::workspace::wake_main_run_loop();
+            }
+            Some(disabled) => {
+                let trusted = super::permissions::is_trusted();
+                active.store(false, Ordering::Release);
+                stop.store(true, Ordering::Release);
+                callback_mailbox.cancel_pending();
+                let _ = sender.try_send(Envelope {
+                    event: BackendEvent::Warning(
+                        if trusted && disabled == TapDisabled::UserInput {
+                            USER_DISABLED_WARNING
+                        } else {
+                            PERMISSION_REVOKED_WARNING
+                        }
+                        .into(),
+                    ),
+                    generation: None,
+                });
+                super::workspace::wake_main_run_loop();
+            }
+            None => {}
         }
+    }
+    active.store(false, Ordering::Release);
+    callback_mailbox.cancel_pending();
+    run_loop.remove_source(&source, default_run_loop_mode());
+    if let Ok(mut shared) = shared_run_loop.lock() {
+        *shared = None;
     }
 }
 
@@ -370,7 +500,11 @@ fn handle_event(
         CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
     ) {
         if let Ok(mut state) = state.lock() {
-            state.needs_reenable = true;
+            state.disabled = Some(if matches!(event_type, CGEventType::TapDisabledByTimeout) {
+                TapDisabled::Timeout
+            } else {
+                TapDisabled::UserInput
+            });
         }
         return CallbackResult::Keep;
     }
@@ -561,6 +695,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_a_timeout_with_permission_is_automatically_reenabled() {
+        assert!(should_reenable(TapDisabled::Timeout, true));
+        assert!(!should_reenable(TapDisabled::Timeout, false));
+        assert!(!should_reenable(TapDisabled::UserInput, true));
+        assert!(!should_reenable(TapDisabled::UserInput, false));
+    }
+
+    #[test]
     fn disposition_is_delivered_to_the_exact_waiting_event() {
         let (event_tx, event_rx) = mpsc::sync_channel(64);
         let mailbox = Arc::new(crate::platform::disposition_mailbox::DispositionMailbox::default());
@@ -572,6 +714,9 @@ mod tests {
             pending: Some(generation),
             latest_pointer: Arc::new(Mutex::new(None)),
             stop: Arc::new(AtomicBool::new(false)),
+            active: Arc::new(AtomicBool::new(true)),
+            run_loop: Arc::new(Mutex::new(None)),
+            finished: mpsc::sync_channel(1).1,
             join: None,
         };
         hook.set_disposition(KeyDisposition::Consume).unwrap();
@@ -594,6 +739,9 @@ mod tests {
             pending: Some(generation),
             latest_pointer: Arc::new(Mutex::new(None)),
             stop: Arc::new(AtomicBool::new(false)),
+            active: Arc::new(AtomicBool::new(true)),
+            run_loop: Arc::new(Mutex::new(None)),
+            finished: mpsc::sync_channel(1).1,
             join: None,
         };
         hook.set_disposition(KeyDisposition::Forward).unwrap();
@@ -661,6 +809,9 @@ mod tests {
             pending: None,
             latest_pointer: Arc::clone(&latest_pointer),
             stop: Arc::new(AtomicBool::new(false)),
+            active: Arc::new(AtomicBool::new(true)),
+            run_loop: Arc::new(Mutex::new(None)),
+            finished: mpsc::sync_channel(1).1,
             join: None,
         };
         let edge = Point::new(999.0, 400.0);
@@ -689,6 +840,9 @@ mod tests {
             pending: None,
             latest_pointer: Arc::new(Mutex::new(None)),
             stop: Arc::new(AtomicBool::new(false)),
+            active: Arc::new(AtomicBool::new(true)),
+            run_loop: Arc::new(Mutex::new(None)),
+            finished: mpsc::sync_channel(1).1,
             join: None,
         };
         hook.event_sender()

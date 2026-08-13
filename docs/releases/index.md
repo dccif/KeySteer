@@ -2,9 +2,9 @@
 
 ## 0.8.10
 
-UI Hint 退出后会立即取消过期扫描，重复进入依然快速且不再积压旧结果。
+UI Hint 退出后会立即取消过期扫描、重复进入依然快速，并修复 macOS 撤销辅助功能权限时可能卡住的问题。
 
-UI Hint now cancels stale scans immediately on exit, keeping repeated entry fast without queuing old results.
+UI Hint now cancels stale scans immediately on exit, keeps repeated entry fast, and fixes a potential hang when macOS Accessibility permission is revoked.
 
 ## 0.8.9
 

@@ -125,6 +125,10 @@ Retina 下快速重绘时文字基线出现单帧纵向抖动。
 
 - 键盘捕获需要 Accessibility；缺失时 Backend 仍能启动菜单栏，但
   `keyboard_available=false` 并给出说明。
+- 运行中撤销 Accessibility 时，`TapDisabledByUserInput` 被视为用户意图：Hook 立即
+  fail-open 并停止，不自动重新启用；只有仍受信任时的 `TapDisabledByTimeout` 才恢复。
+  Hook stop 会取消待决 disposition、停止其 CFRunLoop，并以 250 ms 为 join 上限，避免
+  权限变更或系统设置操作被无界退出等待卡住。
 - Vision 屏幕内容检测需要 Screen Recording。
 - 权限绑定应用 bundle identity；正式用户必须运行打包的 `KeySteer.app`，不能让 Terminal
   代替应用申请权限。

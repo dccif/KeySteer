@@ -178,7 +178,7 @@ impl MacOsBackend {
     }
 
     fn has_hook(&self) -> bool {
-        self.hook.is_some()
+        self.hook.as_ref().is_some_and(HookThread::is_active)
     }
 
     fn refresh_native_events(&mut self) {
