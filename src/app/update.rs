@@ -25,10 +25,7 @@ const DOWNLOAD_GLOBAL_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_RELEASE_RESPONSE_BYTES: u64 = 64 * 1024;
 const MAX_DOWNLOAD_BYTES: u64 = 10 * 1024 * 1024;
 const DOWNLOAD_BUFFER_BYTES: usize = 32 * 1024;
-// Native TLS enters Security.framework/CFNetwork on macOS. A 512 KiB custom
-// stack can overflow below Rust and abort a `panic=abort` release process.
-// Keep the normal Rust worker allowance; it exists only during a manual check.
-const UPDATE_THREAD_STACK_BYTES: usize = 2 * 1024 * 1024;
+const UPDATE_THREAD_STACK_BYTES: usize = 512 * 1024;
 const UPDATE_STOP_WAIT: Duration = Duration::from_millis(250);
 static CHECK_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
@@ -698,6 +695,29 @@ mod tests {
     }
 
     #[test]
+    fn native_tls_https_transport_is_compiled_in() {
+        use std::net::TcpListener;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let _ = listener.accept();
+        });
+        let agent: ureq::Agent = metadata_agent_config().into();
+
+        let request = catch_unwind(AssertUnwindSafe(|| {
+            agent.get(format!("https://{address}")).call()
+        }));
+
+        server.join().unwrap();
+        assert!(
+            request.is_ok(),
+            "ureq panicked because the selected NativeTls transport was not compiled"
+        );
+    }
+
+    #[test]
     fn update_checks_are_single_flight_and_release_the_guard() {
         let first = UpdateCheckGuard::acquire().expect("first check should acquire the guard");
         assert!(UpdateCheckGuard::acquire().is_none());
@@ -778,7 +798,7 @@ mod tests {
     fn automatic_update_downloads_are_bounded_to_ten_mib() {
         assert_eq!(MAX_DOWNLOAD_BYTES, 10 * 1024 * 1024);
         assert_eq!(DOWNLOAD_BUFFER_BYTES, 32 * 1024);
-        assert_eq!(UPDATE_THREAD_STACK_BYTES, 2 * 1024 * 1024);
+        assert_eq!(UPDATE_THREAD_STACK_BYTES, 512 * 1024);
         assert_eq!(DOWNLOAD_GLOBAL_TIMEOUT, Duration::from_secs(60));
     }
 

@@ -41,8 +41,9 @@ sha2 = { version = "0.11", default-features = false }
 smallvec = "1.15"
 toml = "1.1.4"
 toml_edit = "0.25"
-# update.rs must explicitly select NativeTls because ureq defaults to Rustls.
-ureq = { version = "3.3", default-features = false, features = ["json", "native-tls-no-default"] }
+# update.rs explicitly selects NativeTls because ureq defaults to Rustls. The
+# `native-tls-no-default` helper alone does not compile ureq's HTTPS connector.
+ureq = { version = "3.3", default-features = false, features = ["json", "native-tls"] }
 [features]
 default = []
 perf-probe = []

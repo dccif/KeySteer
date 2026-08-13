@@ -125,8 +125,8 @@ worker。worker 只查询 GitHub 最新正式 Release，并以 SemVer 对比 `CA
 drop request-scoped Agent 及原生 TLS 连接。Windows 提示在线程内使用同线程临时 owner，
 关闭后销毁 owner 并结束线程；macOS 提示保持非 modal，OK action 关闭窗口并释放唯一 retained
 Alert。不得累积更新 worker、弹窗或连接。它不是启动任务，也没有定时轮询。
-更新 worker 使用 2 MiB 临时栈，避免 macOS 原生 TLS/Security.framework 在过小栈上导致
-release 进程 abort；macOS 整个 worker 运行在 autorelease pool 内，结束时集中释放原生临时对象。
+更新 worker 使用 512 KiB 临时栈；`ureq` 显式编译完整的 `native-tls` HTTPS connector，
+macOS 整个 worker 运行在 autorelease pool 内，结束时集中释放原生临时对象。
 两端 Backend 持有更新任务的 cancel token、完成通知和 JoinHandle：正常完成会及时 reap；
 退出时先取消并最多等待 250ms；元数据请求和下载分别有 3 秒、60 秒的整体硬超时，
 阻塞中的原生网络调用不会无限存活或无限 join。
