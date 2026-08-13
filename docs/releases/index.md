@@ -1,5 +1,11 @@
 # 更新日志 / Release Notes
 
+## 0.8.10
+
+UI Hint 退出后会立即取消过期扫描，重复进入依然快速且不再积压旧结果。
+
+UI Hint now cancels stale scans immediately on exit, keeping repeated entry fast without queuing old results.
+
 ## 0.8.9
 
 UI Hint 扫描与重叠切换更稳定，启动和输入响应更快、内存占用更低，并进一步收紧原生资源与 Unsafe 安全边界。

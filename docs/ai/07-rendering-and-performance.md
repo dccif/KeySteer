@@ -103,10 +103,11 @@ working set、private bytes、handle 和 thread 数。
 
 窗口仍在 AppKit 主线程创建和更新。Engine、输入 Hook 与扫描工作不通过原生对象共享状态，只通过有界队列/安全 mailbox 通信。
 
-UI Hint 在活动扫描和重试期间复用 `scanned`/`hints` 容量，并为目标名缓存一次 lowercase
-结果；搜索重标记不得逐目标重新分配小写字符串。目标去重使用 `HashSet`，标签重叠分组使用
-按左边界排序的扫描线与并查集，常见稀疏布局不再全量执行 n² 比较。离开模式时若容量超过
-小型扫描上限则直接释放 backing allocation，因此 2000 目标级扫描不会成为 Idle 常驻内存。
+UI Hint 按需为目标名缓存一次 lowercase 结果；退出后立即 drop 所有目标、标签和 String，
+不保留旧坐标或扫描结果。为避免常见不足 100 项的重入重新增长容器，最多保留 128 项的
+空 `scanned`/`hints`/dedup backing；超过上限的 request-scoped backing 立即释放，因此大型
+扫描不会成为 Idle 常驻内存。搜索重标记不得逐目标重新分配小写字符串。目标去重使用矩形
+到 canonical index 的小碰撞表，标签重叠分组使用按左边界排序的扫描线与并查集。
 
 ## 帧时钟
 

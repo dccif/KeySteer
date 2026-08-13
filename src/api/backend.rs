@@ -164,6 +164,15 @@ pub trait Backend {
     /// [`BackendEvent::UiScanned`] so a slow tree walk cannot stall the engine.
     fn request_ui_scan(&mut self, request: UiScanRequest) -> Result<(), String>;
 
+    /// Cancel a scan that no longer has an active consumer.
+    ///
+    /// Backends should keep reusable provider/worker state warm while dropping
+    /// request-scoped work. The default keeps third-party backends source
+    /// compatible when they do not retain asynchronous scans.
+    fn cancel_ui_scan(&mut self, _id: u64) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Which system appearance is active, for theme selection.
     fn appearance(&self) -> Appearance {
         Appearance::Dark

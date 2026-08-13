@@ -40,9 +40,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{BOOL, Interface};
 
-use crate::api::backend::BackendEvent;
-use crate::api::command::{UiScanRequest, UiScanResult, UiScanStatus, UiScanStrategy};
+use crate::api::command::{UiScanRequest, UiScanStatus, UiScanStrategy};
 use crate::api::geometry::{Rect, UiTarget};
+use crate::platform::scan_mailbox::ScanMailbox;
 
 use super::EventSender;
 
@@ -53,27 +53,48 @@ const MAX_SCAN_WINDOWS: usize = 16;
 const MINIMUM_SPACING: f64 = 8.0;
 const MIN_SCAN_TIMEOUT_MS: u64 = 250;
 const MAX_SCAN_TIMEOUT_MS: u64 = 30_000;
-const UIA_CANCEL_TIMEOUT_MS: u32 = 500;
 const UIA_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 
 static STRATEGY_FALLBACK_REPORTED: AtomicBool = AtomicBool::new(false);
 
+fn request_call_cancellation(thread_id: u32) {
+    if thread_id != 0 {
+        // SAFETY: `thread_id` belongs to the live worker thread, which enabled
+        // COM call cancellation before accepting jobs. A zero-second timeout
+        // requests cancellation without blocking the engine thread.
+        let _ = unsafe { CoCancelCall(thread_id, 0) };
+    }
+}
+
 struct ScanJob {
     request: UiScanRequest,
-    sender: EventSender,
+    generation: u64,
+    mailbox: Arc<ScanMailbox>,
+    wake: EventSender,
+}
+
+impl ScanJob {
+    fn publish(&self, targets: Vec<UiTarget>, status: UiScanStatus) {
+        if self
+            .mailbox
+            .publish(self.generation, self.request.id, targets, status)
+        {
+            self.wake.wake();
+        }
+    }
 }
 
 #[derive(Default)]
 struct QueueState {
     pending: Option<ScanJob>,
-    active_id: Option<u64>,
+    active: Option<(u64, u64)>,
     stopping: bool,
 }
 
 struct SharedQueue {
     state: Mutex<QueueState>,
     ready: Condvar,
-    latest_id: AtomicU64,
+    latest_generation: AtomicU64,
     stopping: AtomicBool,
 }
 
@@ -82,7 +103,7 @@ impl Default for SharedQueue {
         Self {
             state: Mutex::new(QueueState::default()),
             ready: Condvar::new(),
-            latest_id: AtomicU64::new(0),
+            latest_generation: AtomicU64::new(0),
             stopping: AtomicBool::new(false),
         }
     }
@@ -112,7 +133,13 @@ impl UiAutomationWorker {
         })
     }
 
-    pub fn submit(&self, request: UiScanRequest, sender: EventSender) -> Result<(), String> {
+    pub fn submit(
+        &self,
+        request: UiScanRequest,
+        generation: u64,
+        mailbox: Arc<ScanMailbox>,
+        wake: EventSender,
+    ) -> Result<(), String> {
         let mut state = self
             .shared
             .state
@@ -121,30 +148,58 @@ impl UiAutomationWorker {
         if state.stopping {
             return Err("UI Automation worker is stopping".into());
         }
-        let request_id = request.id;
-        self.shared.latest_id.store(request_id, Ordering::Release);
-        let replaced = state.pending.replace(ScanJob { request, sender });
-        let cancel_active = state.active_id.is_some_and(|id| id != request_id);
+        self.shared
+            .latest_generation
+            .store(generation, Ordering::Release);
+        let replaced = state.pending.replace(ScanJob {
+            request,
+            generation,
+            mailbox,
+            wake,
+        });
+        let cancel_active = state
+            .active
+            .is_some_and(|(_, active_generation)| active_generation != generation);
         if cancel_active {
             // Keep the queue lock until cancellation has been requested. The
             // worker cannot finish the old job and pick up this new one in the
             // small interval before CoCancelCall, so the new call can never be
             // cancelled by mistake.
             let thread_id = self.thread_id.load(Ordering::Acquire);
-            if thread_id != 0 {
-                let _ = unsafe { CoCancelCall(thread_id, 0) };
-            }
+            request_call_cancellation(thread_id);
         }
         self.shared.ready.notify_one();
         drop(state);
-        if let Some(replaced) = replaced {
-            let _ = replaced.sender.send(scan_result(
-                replaced.request.id,
-                Vec::new(),
-                UiScanStatus::ContextChanged,
-            ));
-        }
+        drop(replaced);
         Ok(())
+    }
+
+    pub fn cancel(&self, request_id: u64) {
+        let cancel_active = {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if state
+                .pending
+                .as_ref()
+                .is_some_and(|job| job.request.id == request_id)
+            {
+                state.pending.take();
+            }
+            let cancel_active = state
+                .active
+                .is_some_and(|(active_id, _)| active_id == request_id);
+            if cancel_active {
+                self.shared.latest_generation.store(0, Ordering::Release);
+            }
+            cancel_active
+        };
+        if cancel_active {
+            let thread_id = self.thread_id.load(Ordering::Acquire);
+            request_call_cancellation(thread_id);
+        }
     }
 
     pub fn stop(&mut self) {
@@ -163,17 +218,9 @@ impl UiAutomationWorker {
             self.shared.ready.notify_all();
             pending
         };
-        if let Some(pending) = pending {
-            let _ = pending.sender.send(scan_result(
-                pending.request.id,
-                Vec::new(),
-                UiScanStatus::ContextChanged,
-            ));
-        }
+        drop(pending);
         let thread_id = self.thread_id.load(Ordering::Acquire);
-        if thread_id != 0 {
-            let _ = unsafe { CoCancelCall(thread_id, UIA_CANCEL_TIMEOUT_MS) };
-        }
+        request_call_cancellation(thread_id);
         if let Some(join) = self.join.take() {
             let deadline = Instant::now() + UIA_SHUTDOWN_WAIT;
             while !join.is_finished() && Instant::now() < deadline {
@@ -268,8 +315,9 @@ fn worker_main(shared: Arc<SharedQueue>, thread_id: Arc<AtomicU32>) {
 
     while let Some(job) = next_job(&shared) {
         let id = job.request.id;
+        let generation = job.generation;
         run_scan(job, &automation, automation2.as_ref(), &shared);
-        finish_job(&shared, id);
+        finish_job(&shared, id, generation);
     }
     // COM interfaces must be released before the apartment is uninitialised.
     drop(automation2);
@@ -293,38 +341,39 @@ fn next_job(shared: &SharedQueue) -> Option<ScanJob> {
         None
     } else {
         let job = state.pending.take();
-        state.active_id = job.as_ref().map(|job| job.request.id);
+        state.active = job.as_ref().map(|job| (job.request.id, job.generation));
         job
     }
 }
 
-fn finish_job(shared: &SharedQueue, id: u64) {
+fn finish_job(shared: &SharedQueue, id: u64, generation: u64) {
     let mut state = shared
         .state
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    if state.active_id == Some(id) {
-        state.active_id = None;
+    if state.active == Some((id, generation)) {
+        state.active = None;
     }
 }
 
 fn fail_jobs_until_stopped(shared: &SharedQueue, error: String) {
     while let Some(job) = next_job(shared) {
-        let _ = job.sender.send(scan_result(
-            job.request.id,
-            Vec::new(),
-            UiScanStatus::Failed(error.clone()),
-        ));
+        job.publish(Vec::new(), UiScanStatus::Failed(error.clone()));
     }
 }
 
-fn is_current(shared: &SharedQueue, id: u64) -> bool {
-    !shared.stopping.load(Ordering::Acquire) && shared.latest_id.load(Ordering::Acquire) == id
+fn is_current(shared: &SharedQueue, generation: u64) -> bool {
+    !shared.stopping.load(Ordering::Acquire)
+        && shared.latest_generation.load(Ordering::Acquire) == generation
 }
 
 #[inline]
-fn context_is_current(shared: &SharedQueue, id: u64, original: Option<(HWND, u32)>) -> bool {
-    is_current(shared, id) && original == foreground_context()
+fn context_is_current(
+    shared: &SharedQueue,
+    generation: u64,
+    original: Option<(HWND, u32)>,
+) -> bool {
+    is_current(shared, generation) && original == foreground_context()
 }
 
 fn run_scan(
@@ -367,19 +416,14 @@ fn run_scan(
         .as_ref()
         .is_some_and(|app| original.is_none_or(|(_, pid)| pid != app.process_id));
     if request_context_changed {
-        let _ = job.sender.send(scan_result(
-            job.request.id,
-            Vec::new(),
-            UiScanStatus::ContextChanged,
-        ));
+        job.publish(Vec::new(), UiScanStatus::ContextChanged);
         return;
     }
     let Some((hwnd, _)) = original else {
-        let _ = job.sender.send(scan_result(
-            job.request.id,
+        job.publish(
             Vec::new(),
             UiScanStatus::Failed("No foreground window is available".into()),
-        ));
+        );
         return;
     };
 
@@ -387,9 +431,7 @@ fn run_scan(
         Ok(status) => status,
         Err(error) => UiScanStatus::Failed(format!("UI Automation scan failed: {error}")),
     };
-    let _ = job
-        .sender
-        .send(scan_result(job.request.id, Vec::new(), status));
+    job.publish(Vec::new(), status);
 }
 
 fn scan_timeout_ms(requested: u64) -> u32 {
@@ -716,7 +758,7 @@ fn stream_scan(
     // published before their owner, and every lower window carries the bounds
     // of higher click-receiving windows as occluders.
     for window in windows {
-        if !context_is_current(shared, job.request.id, original) {
+        if !context_is_current(shared, job.generation, original) {
             return Ok(UiScanStatus::ContextChanged);
         }
         if Instant::now() >= deadline {
@@ -771,7 +813,7 @@ fn stream_scan(
             // The atomic generation is cheap enough for every node. Querying
             // foreground HWND/PID crosses into user32, so sample it every 32
             // nodes and always immediately before publishing a partial batch.
-            if !is_current(shared, job.request.id)
+            if !is_current(shared, job.generation)
                 || visited_count.is_multiple_of(32) && original != foreground_context()
             {
                 return Ok(UiScanStatus::ContextChanged);
@@ -799,7 +841,7 @@ fn stream_scan(
                     || next_publish_count > PARTIAL_BATCH_SIZE
                         && last_publish.elapsed() >= Duration::from_millis(16);
                 if publish_due {
-                    if !context_is_current(shared, job.request.id, original) {
+                    if !context_is_current(shared, job.generation, original) {
                         return Ok(UiScanStatus::ContextChanged);
                     }
                     send_partial(job, std::mem::take(&mut batch));
@@ -814,7 +856,7 @@ fn stream_scan(
         if !batch.is_empty()
             && next_publish_count > PARTIAL_BATCH_SIZE
             && last_publish.elapsed() >= Duration::from_millis(16)
-            && context_is_current(shared, job.request.id, original)
+            && context_is_current(shared, job.generation, original)
         {
             send_partial(job, std::mem::take(&mut batch));
             next_publish_count = target_count.saturating_mul(2).max(target_count + 1);
@@ -836,16 +878,14 @@ fn stream_scan(
     if provider_timed_out && terminal_status == UiScanStatus::Success {
         terminal_status = UiScanStatus::TimedOut;
     }
-    if !batch.is_empty() && context_is_current(shared, job.request.id, original) {
+    if !batch.is_empty() && context_is_current(shared, job.generation, original) {
         send_partial(job, batch);
     }
     Ok(terminal_status)
 }
 
 fn send_partial(job: &ScanJob, targets: Vec<UiTarget>) {
-    let _ = job
-        .sender
-        .send(scan_result(job.request.id, targets, UiScanStatus::Partial));
+    job.publish(targets, UiScanStatus::Partial);
 }
 
 fn create_cache_request(automation: &IUIAutomation) -> Result<IUIAutomationCacheRequest, String> {
@@ -1210,14 +1250,6 @@ fn foreground_context() -> Option<(HWND, u32)> {
     Some((hwnd, process_id))
 }
 
-fn scan_result(id: u64, targets: Vec<UiTarget>, status: UiScanStatus) -> BackendEvent {
-    BackendEvent::UiScanned(UiScanResult {
-        id,
-        targets,
-        status,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1276,10 +1308,10 @@ mod tests {
     #[test]
     fn atomic_scan_generation_cancels_stale_and_stopping_work() {
         let shared = SharedQueue::default();
-        shared.latest_id.store(7, Ordering::Release);
+        shared.latest_generation.store(7, Ordering::Release);
         assert!(is_current(&shared, 7));
         assert!(!is_current(&shared, 6));
-        shared.latest_id.store(8, Ordering::Release);
+        shared.latest_generation.store(8, Ordering::Release);
         assert!(!is_current(&shared, 7));
         shared.stopping.store(true, Ordering::Release);
         assert!(!is_current(&shared, 8));

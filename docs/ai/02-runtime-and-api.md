@@ -112,6 +112,8 @@ Engine 为每个物理键保存 disposition，确保 key-up 与 key-down 使用�
 - `MouseButton::Click/DoubleClick` 成功后发送一次 `Clicked`；Press/Release/Toggle 不发送。
 - `PushMode/PopMode` 使用 `Suspended/Resumed` 保存下层模式状态。
 - `ScanUi` 异步返回 `UiScanned`；scan owner 按 id 路由，旧结果不得进入新 session。
+- Mode 退出、完成、禁用或异常恢复时，Engine 调用 `Backend::cancel_ui_scan` 并立即移除
+  owner；取消只结束 request-scoped 工作，不销毁平台扫描 worker。
 - `SetFrameClock` 使用原生显示帧，不使用 Mode timer 模拟移动帧率。
 
 状态栏的 `CheckForUpdates` 经 BackendEvent 进入 Engine，再由 Backend 启动独立 HTTPS

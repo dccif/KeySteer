@@ -174,6 +174,7 @@ impl Engine {
                     }
                 }
                 Command::FinishMode { cause } => {
+                    self.cancel_scans_for_owner(owner, backend)?;
                     self.dispatch(ModeEvent::FinishRequested { cause }, backend)?;
                 }
                 Command::RestartMode => self.restart_active(backend)?,
@@ -240,13 +241,16 @@ impl Engine {
                         roles,
                         ..request
                     };
-                    // A mode can only consume its latest scan generation. Drop
-                    // superseded ownership before inserting the new request so
-                    // stale/cancelled scans cannot grow this map indefinitely.
-                    self.scan_owners
-                        .retain(|_, existing_owner| existing_owner != owner);
+                    let request_id = request.id;
+                    // A mode can only consume its latest scan generation.
+                    // Cancel the superseded native job before publishing the
+                    // new owner so providers cannot retain stale work.
+                    self.cancel_scans_for_owner(owner, backend)?;
                     self.scan_owners.insert(request.id, owner.clone());
-                    backend.request_ui_scan(request)?;
+                    if let Err(error) = backend.request_ui_scan(request) {
+                        self.scan_owners.remove(&request_id);
+                        return Err(error);
+                    }
                 }
 
                 Command::SwitchMode(id) => {

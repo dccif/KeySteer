@@ -19,6 +19,9 @@ mod multi_click;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod disposition_mailbox;
 
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+mod scan_mailbox;
+
 #[cfg(target_os = "windows")]
 pub mod windows;
 

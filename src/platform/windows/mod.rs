@@ -38,6 +38,7 @@ use crate::api::command::{ButtonAction, FocusedApp, MouseButton};
 use crate::api::geometry::{Point, Rect, Screen};
 use crate::api::input::{Key, KeyState};
 use crate::api::overlay::OverlayScene;
+use crate::platform::scan_mailbox::ScanMailbox;
 
 use self::overlay_worker::OverlayWorker;
 
@@ -68,6 +69,11 @@ impl EventSender {
 
     fn send(&self, event: BackendEvent) -> Result<(), ()> {
         self.sender.send(event).map_err(|_| ())?;
+        self.wake();
+        Ok(())
+    }
+
+    fn wake(&self) {
         if self.wake_thread != 0
             && let Err(error) = native::post_thread_wake(self.wake_thread, WAKE_MESSAGE)
         {
@@ -76,7 +82,6 @@ impl EventSender {
                 "cannot wake engine for asynchronous event: {error}"
             );
         }
-        Ok(())
     }
 }
 
@@ -86,6 +91,7 @@ pub struct WindowsBackend {
     /// Events produced off-thread (scan results).
     async_rx: Receiver<BackendEvent>,
     event_tx: EventSender,
+    scan_mailbox: Arc<ScanMailbox>,
     pending: VecDeque<BackendEvent>,
     screens: Vec<Screen>,
     /// Foreground window at the last check, to detect focus changes.
@@ -118,6 +124,7 @@ impl WindowsBackend {
         let owner_thread = native::prepare_thread_message_queue();
         let (async_tx, async_rx) = mpsc::channel();
         let event_tx = EventSender::new(async_tx, owner_thread);
+        let scan_mailbox = Arc::new(ScanMailbox::default());
         let mut pending = VecDeque::new();
         // Begin GPU prewarming before tray and display discovery. The render
         // thread reports readiness as soon as its message queue exists, then
@@ -160,6 +167,7 @@ impl WindowsBackend {
             overlay,
             async_rx,
             event_tx,
+            scan_mailbox,
             pending,
             screens: initial_screens,
             last_foreground: native::foreground_window(),
@@ -238,6 +246,9 @@ impl WindowsBackend {
         }
         if let Some(event) = self.pending.pop_front() {
             return Ok(Some(event));
+        }
+        if let Some(result) = self.scan_mailbox.take() {
+            return Ok(Some(BackendEvent::UiScanned(result)));
         }
         if let Ok(event) = self.async_rx.try_recv() {
             return Ok(Some(event));
@@ -524,7 +535,27 @@ impl Backend for WindowsBackend {
         let Some(worker) = self.ui_automation.as_ref() else {
             return Err("UI Automation worker was not retained after startup".into());
         };
-        worker.submit(request, self.event_tx.clone())
+        let request_id = request.id;
+        let generation = self.scan_mailbox.begin(request.id);
+        let result = worker.submit(
+            request,
+            generation,
+            Arc::clone(&self.scan_mailbox),
+            self.event_tx.clone(),
+        );
+        if result.is_err() {
+            self.scan_mailbox.cancel(request_id);
+        }
+        result
+    }
+
+    fn cancel_ui_scan(&mut self, id: u64) -> Result<(), String> {
+        if self.scan_mailbox.cancel(id)
+            && let Some(worker) = self.ui_automation.as_ref()
+        {
+            worker.cancel(id);
+        }
+        Ok(())
     }
 
     fn appearance(&self) -> Appearance {

@@ -2,7 +2,9 @@
 
 ## 性能与取消约束（2026-08）
 
-- Windows UIA 以原子 scan id/stopping flag 做逐节点取消检查；前台 HWND/PID 每 32 个节点采样一次，并在发布 partial 前强制复核。
+- Windows UIA 以内部 generation/stopping flag 做逐节点取消检查；前台 HWND/PID 每 32 个节点采样一次，并在发布 partial 前强制复核。
+- 两个平台的结果进入带内部 generation 的 latest-only mailbox。Engine 忙时合并当前扫描的
+  Partial；新请求或取消直接丢弃旧槽，旧结果不会排在下一次 UI Hint 的首批标签前。
 - macOS AX/Vision/Hybrid 共用纯数量批次：第一批 24 个目标立即发布，随后在累计 48、96、192… 个目标时发布，terminal 立即补发剩余目标；不使用时间间隔，也不依赖显示刷新率。Hint 复用标签 String 和结果 Vec。
 - macOS ScreenCaptureKit capture 是 native single-flight。timeout 不释放 permit；permit 只由真实 completion callback 释放，晚到图片恰好释放一次。
 - Vision timeout 限制为 1..=30000ms，rectangle candidates 限制为 1..=2000，Rust 与 Objective-C 两侧均校验。
@@ -21,6 +23,10 @@
 
 Engine 用 scan id 记录 owner；HintMode 也只接受当前 `scan_id`。旧 worker 即使晚返回也
 不会污染新的页面。
+
+退出或完成 owner 时 Engine 显式取消 scan。取消不销毁常驻 worker，也不缓存旧目标；
+Hint 退出会 drop 目标、标签和字符串，下一次进入重新扫描。仅复用最多 128 项的空容器
+backing，以降低常见不足 100 个标签时的重入分配；大型扫描容量不会留在 Idle。
 
 ## HintMode 端
 
@@ -43,6 +49,8 @@ Engine 用 scan id 记录 owner；HintMode 也只接受当前 `scan_id`。旧 wo
 实现：`src/platform/windows/accessibility.rs`。
 
 - 一个 backend-owned MTA worker 长期持有 COM/UIA；新任务替换 pending 旧任务。
+- 退出 owner 时使 generation 失效、清 pending，并以 `CoCancelCall(thread, 0)` 非阻塞请求
+  取消 provider call；COM apartment 与 Automation 对象继续保持温热。
 - `IUIAutomation2` 可用时设置 connection/transaction timeout；不可用时退回基础 UIA。
 - `FindAllBuildCache(TreeScope_Descendants, condition, cache)` 一次让 provider 填充需要的
   属性，避免逐节点跨进程读取。
@@ -73,7 +81,9 @@ Engine 用 scan id 记录 owner；HintMode 也只接受当前 `scan_id`。旧 wo
 调度：`src/platform/macos/ui_scan.rs`。
 
 - 一个持久 worker + 单 pending slot，避免多个全分辨率截图并行扩大内存。
-- 新任务替换等待中的旧任务，并向旧请求发送 `ContextChanged`。
+- 新任务替换等待中的旧任务；旧 generation 的未消费结果直接丢弃，不排入公共事件队列。
+- 退出 owner 时清除 pending、失效 native generation；已经提交且无法取消的
+  ScreenCaptureKit capture 仍由真实 completion 恰好释放一次。
 - 每次发送前检查 `LATEST_SCAN` 和 frontmost pid；新 id 也会让正在遍历的 AX 在节点边界
   停止，并让 Vision 在 capture/识别阶段边界释放过期结果。
 - AX 和 Vision 共用纯计数的流式发布器；Hybrid 在 scoped thread 中并行 AX，同时当前 worker

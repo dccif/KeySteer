@@ -35,6 +35,7 @@ use crate::api::command::{ButtonAction, FocusedApp, MouseButton};
 use crate::api::geometry::{Point, Screen};
 use crate::api::input::{Key, KeyState};
 use crate::api::overlay::OverlayScene;
+use crate::platform::scan_mailbox::ScanMailbox;
 
 use self::hook::{HookStartup, HookThread};
 use self::overlay::Overlay;
@@ -81,9 +82,13 @@ impl EventSender {
             None => self.fallback.send(event).map_err(|_| ()),
         };
         if result.is_ok() {
-            workspace::wake_main_run_loop();
+            self.wake();
         }
         result
+    }
+
+    fn wake(&self) {
+        workspace::wake_main_run_loop();
     }
 }
 
@@ -91,6 +96,7 @@ pub struct MacOsBackend {
     hook: Option<HookThread>,
     async_rx: Receiver<BackendEvent>,
     event_tx: EventSender,
+    scan_mailbox: Arc<ScanMailbox>,
     pending: VecDeque<BackendEvent>,
     overlay: Overlay,
     screens: Vec<Screen>,
@@ -108,6 +114,7 @@ impl MacOsBackend {
     pub fn new() -> Result<Self, String> {
         let (async_tx, async_rx) = mpsc::channel();
         let event_tx = EventSender::new(async_tx);
+        let scan_mailbox = Arc::new(ScanMailbox::default());
         let configured_interval = NSEvent::doubleClickInterval();
         let double_click_interval = if configured_interval.is_finite() && configured_interval > 0.0
         {
@@ -155,6 +162,7 @@ impl MacOsBackend {
             hook,
             async_rx,
             event_tx,
+            scan_mailbox,
             pending: VecDeque::new(),
             overlay: Overlay::new(),
             screens: initial_screens,
@@ -195,6 +203,7 @@ impl MacOsBackend {
             .or_else(|| {
                 self.pending
                     .pop_front()
+                    .or_else(|| self.scan_mailbox.take().map(BackendEvent::UiScanned))
                     .or_else(|| self.async_rx.try_recv().ok())
             })
     }
@@ -347,7 +356,20 @@ impl Backend for MacOsBackend {
     }
 
     fn request_ui_scan(&mut self, request: crate::api::UiScanRequest) -> Result<(), String> {
-        ui_scan::request_scan(request, self.event_tx.clone());
+        let generation = self.scan_mailbox.begin(request.id);
+        ui_scan::request_scan(
+            request,
+            generation,
+            Arc::clone(&self.scan_mailbox),
+            self.event_tx.clone(),
+        );
+        Ok(())
+    }
+
+    fn cancel_ui_scan(&mut self, id: u64) -> Result<(), String> {
+        if self.scan_mailbox.cancel(id) {
+            ui_scan::cancel_scan(id);
+        }
         Ok(())
     }
 

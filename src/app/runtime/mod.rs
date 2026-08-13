@@ -576,6 +576,46 @@ impl Engine {
         format!("{RECOVERABLE_INPUT_PREFIX}{action}: {error}")
     }
 
+    fn cancel_scans_for_owner(
+        &mut self,
+        owner: &ModeId,
+        backend: &mut dyn Backend,
+    ) -> Result<(), String> {
+        let ids = self
+            .scan_owners
+            .iter()
+            .filter_map(|(&id, candidate)| (candidate == owner).then_some(id))
+            .collect::<SmallVec<[u64; 1]>>();
+        let mut first_error = None;
+        for id in ids {
+            self.scan_owners.remove(&id);
+            if let Err(error) = backend.cancel_ui_scan(id)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn cancel_all_scans(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
+        let ids = self
+            .scan_owners
+            .keys()
+            .copied()
+            .collect::<SmallVec<[u64; 2]>>();
+        self.scan_owners.clear();
+        let mut first_error = None;
+        for id in ids {
+            if let Err(error) = backend.cancel_ui_scan(id)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
     fn recover_from_input_error(&mut self, error: &str, backend: &mut dyn Backend) -> bool {
         let Some(message) = error.strip_prefix(RECOVERABLE_INPUT_PREFIX) else {
             return false;
@@ -596,7 +636,12 @@ impl Engine {
         self.active_click_indicators.clear();
         self.modal_stack.clear();
         self.timers.clear();
-        self.scan_owners.clear();
+        if let Err(cancel_error) = self.cancel_all_scans(backend) {
+            crate::app::logging::report_error(
+                "ui-scan",
+                format!("cannot cancel scans during input recovery: {cancel_error}"),
+            );
+        }
         self.frame_clock_owner = None;
         if let Err(clock_error) = backend.set_frame_clock(false) {
             self.trace_lazy(self.config.debug.backend, "backend", || {
@@ -966,6 +1011,12 @@ impl Engine {
         self.pending_sequences.clear();
         self.pending_long_press_toggles.clear();
         self.active_click_indicators.clear();
+        if let Err(error) = self.cancel_all_scans(backend) {
+            crate::app::logging::report_error("ui-scan", format!("cannot cancel scans: {error}"));
+            if result.is_ok() {
+                result = Err(error);
+            }
+        }
         if let Err(error) = self.release_latched(backend) {
             crate::app::logging::report_error(
                 "action",
@@ -1220,6 +1271,7 @@ impl Engine {
                 self.enabled = !self.enabled;
                 backend.set_enabled(self.enabled)?;
                 if !self.enabled {
+                    self.cancel_all_scans(backend)?;
                     self.pending_sequences.clear();
                     self.pending_long_press_toggles.clear();
                     self.active_click_indicators.clear();
@@ -2542,6 +2594,7 @@ impl Engine {
         };
         let current = self.active.clone();
         self.dispatch(ModeEvent::Deactivated, backend)?;
+        self.cancel_scans_for_owner(&current, backend)?;
         self.timers.retain(|_, timer| timer.owner != current);
         self.active = previous;
         self.dispatch(ModeEvent::Resumed, backend)
@@ -2602,6 +2655,7 @@ impl Engine {
                 let commands = old.handle(&ModeEvent::Deactivated, &context);
                 let old_id = old.id();
                 self.execute(commands, backend)?;
+                self.cancel_scans_for_owner(&old_id, backend)?;
                 self.timers.retain(|_, t| t.owner != old_id);
             }
             self.active = target;
@@ -2692,6 +2746,7 @@ mod tests {
         timeline: Vec<&'static str>,
         dispositions: Vec<KeyDisposition>,
         scans: usize,
+        cancelled_scans: Vec<u64>,
         shutdowns: usize,
         /// Button press/release/click calls, in order.
         buttons: Vec<(MouseButton, ButtonAction)>,
@@ -2835,6 +2890,10 @@ mod tests {
             self.log.lock().unwrap().scans += 1;
             Ok(())
         }
+        fn cancel_ui_scan(&mut self, id: u64) -> Result<(), String> {
+            self.log.lock().unwrap().cancelled_scans.push(id);
+            Ok(())
+        }
         fn shutdown(&mut self) -> Result<(), String> {
             self.log.lock().unwrap().shutdowns += 1;
             Ok(())
@@ -2864,6 +2923,48 @@ mod tests {
         assert_eq!(engine.active_mode(), &ModeId::idle());
         assert_eq!(log.lock().unwrap().clicks, 0);
         assert_eq!(log.lock().unwrap().shutdowns, 1);
+    }
+
+    #[test]
+    fn leaving_a_scan_owner_cancels_native_work_without_stopping_the_backend() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = Engine::new(Config::default(), Appearance::Dark);
+        engine.register(Box::new(ProbeMode::new("idle", Arc::clone(&seen))));
+        engine.register(Box::new(ProbeMode::new("ui_hint", seen)));
+        engine.active = ModeId::ui_hint();
+        engine.scan_owners.insert(41, ModeId::ui_hint());
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+
+        engine
+            .activate(ModeId::idle(), Some(ModeId::ui_hint()), &mut backend)
+            .unwrap();
+
+        assert!(engine.scan_owners.is_empty());
+        assert_eq!(log.lock().unwrap().cancelled_scans, [41]);
+        assert_eq!(log.lock().unwrap().shutdowns, 0);
+    }
+
+    #[test]
+    fn finish_cancels_scan_even_when_the_mode_lifecycle_keeps_it_active() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = Engine::new(Config::default(), Appearance::Dark);
+        engine.register(Box::new(ProbeMode::new("ui_hint", seen)));
+        engine.active = ModeId::ui_hint();
+        engine.scan_owners.insert(73, ModeId::ui_hint());
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+
+        engine
+            .execute(
+                [Command::FinishMode {
+                    cause: FinishCause::Explicit,
+                }],
+                &mut backend,
+            )
+            .unwrap();
+
+        assert_eq!(engine.active_mode(), &ModeId::ui_hint());
+        assert!(engine.scan_owners.is_empty());
+        assert_eq!(log.lock().unwrap().cancelled_scans, [73]);
     }
 
     /// Minimal mode that records the events it saw and emits scripted commands.

@@ -4,8 +4,8 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use objc2::rc::autoreleasepool;
 use smallvec::SmallVec;
 
-use crate::api::backend::BackendEvent;
-use crate::api::command::{UiScanRequest, UiScanResult, UiScanStatus, UiScanStrategy};
+use crate::api::command::{UiScanRequest, UiScanStatus, UiScanStrategy};
+use crate::platform::scan_mailbox::ScanMailbox;
 
 use super::{EventSender, accessibility, vision};
 
@@ -15,7 +15,20 @@ const FIRST_PARTIAL_TARGETS: usize = 24;
 
 struct ScanJob {
     request: UiScanRequest,
-    sender: EventSender,
+    generation: u64,
+    mailbox: Arc<ScanMailbox>,
+    wake: EventSender,
+}
+
+impl ScanJob {
+    fn publish(&self, targets: Vec<crate::api::UiTarget>, status: UiScanStatus) {
+        if self
+            .mailbox
+            .publish(self.generation, self.request.id, targets, status)
+        {
+            self.wake.wake();
+        }
+    }
 }
 
 struct ScanQueue {
@@ -47,10 +60,12 @@ impl<T> PartialBatches<T> {
         for target in targets {
             self.pending.push(target);
             if self.published + self.pending.len() == self.next_total {
-                let next_capacity = self.next_total.min(2_000);
+                let current_total = self.next_total;
+                let following_total = current_total.saturating_mul(2).min(2_000);
+                let next_capacity = following_total.saturating_sub(current_total);
                 let batch = std::mem::replace(&mut self.pending, Vec::with_capacity(next_capacity));
                 self.published += batch.len();
-                self.next_total = self.next_total.saturating_mul(2);
+                self.next_total = following_total;
                 ready.push(batch);
             }
         }
@@ -81,7 +96,7 @@ impl<'a> PartialPublisher<'a> {
     }
 
     fn push(&self, mut targets: Vec<crate::api::UiTarget>) {
-        if !scan_is_current(self.job.request.id, self.pid) {
+        if !scan_is_current(self.job.generation, self.pid) {
             return;
         }
         if let Some(bounds) = self.job.request.bounds {
@@ -115,12 +130,8 @@ impl<'a> PartialPublisher<'a> {
     }
 
     fn send(&self, targets: Vec<crate::api::UiTarget>) {
-        if scan_is_current(self.job.request.id, self.pid) {
-            let _ = self.job.sender.send(scan_result(
-                self.job.request.id,
-                targets,
-                UiScanStatus::Partial,
-            ));
+        if scan_is_current(self.job.generation, self.pid) {
+            self.job.publish(targets, UiScanStatus::Partial);
         }
     }
 }
@@ -149,6 +160,19 @@ impl ScanQueue {
         replaced
     }
 
+    fn cancel(&self, request_id: u64) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if pending
+            .as_ref()
+            .is_some_and(|job| job.request.id == request_id)
+        {
+            pending.take();
+        }
+    }
+
     fn run(&self) {
         loop {
             let job = {
@@ -172,32 +196,45 @@ impl ScanQueue {
     }
 }
 
-pub(super) fn request_scan(request: UiScanRequest, sender: EventSender) {
-    LATEST_SCAN.store(request.id, Ordering::Release);
-    vision::mark_latest(request.id);
-    let request_id = request.id;
+pub(super) fn request_scan(
+    request: UiScanRequest,
+    generation: u64,
+    mailbox: Arc<ScanMailbox>,
+    wake: EventSender,
+) {
+    LATEST_SCAN.store(generation, Ordering::Release);
+    vision::mark_latest(generation);
     let queue = match SCAN_QUEUE.get_or_init(ScanQueue::start) {
         Ok(queue) => queue,
         Err(error) => {
-            let _ = sender.send(scan_result(
-                request_id,
+            if mailbox.publish(
+                generation,
+                request.id,
                 Vec::new(),
                 UiScanStatus::Failed(error.clone()),
-            ));
+            ) {
+                wake.wake();
+            }
             return;
         }
     };
-    if let Some(replaced) = queue.submit(ScanJob { request, sender }) {
-        let _ = replaced.sender.send(scan_result(
-            replaced.request.id,
-            Vec::new(),
-            UiScanStatus::ContextChanged,
-        ));
+    drop(queue.submit(ScanJob {
+        request,
+        generation,
+        mailbox,
+        wake,
+    }));
+}
+
+pub(super) fn cancel_scan(request_id: u64) {
+    LATEST_SCAN.store(0, Ordering::Release);
+    vision::mark_latest(0);
+    if let Some(Ok(queue)) = SCAN_QUEUE.get() {
+        queue.cancel(request_id);
     }
 }
 
 fn run_scan(job: ScanJob) {
-    let request_id = job.request.id;
     let original_pid = accessibility::frontmost_pid();
     let request_context_changed = job
         .request
@@ -205,20 +242,15 @@ fn run_scan(job: ScanJob) {
         .as_ref()
         .is_some_and(|app| Some(app.process_id as libc::pid_t) != original_pid);
     if request_context_changed {
-        let _ = job.sender.send(scan_result(
-            request_id,
-            Vec::new(),
-            UiScanStatus::ContextChanged,
-        ));
+        job.publish(Vec::new(), UiScanStatus::ContextChanged);
         return;
     }
 
     let Some(pid) = original_pid else {
-        let _ = job.sender.send(scan_result(
-            request_id,
+        job.publish(
             Vec::new(),
             UiScanStatus::Failed("No frontmost application is available".into()),
-        ));
+        );
         return;
     };
 
@@ -237,9 +269,9 @@ fn run_scan(job: ScanJob) {
         (false, false) => unreachable!("every UI scan strategy has a source"),
     };
 
-    let status = if scan_is_current(request_id, pid) {
+    let status = if scan_is_current(job.generation, pid) {
         publisher.finish();
-        if scan_is_current(request_id, pid) {
+        if scan_is_current(job.generation, pid) {
             status
         } else {
             UiScanStatus::ContextChanged
@@ -247,7 +279,7 @@ fn run_scan(job: ScanJob) {
     } else {
         UiScanStatus::ContextChanged
     };
-    let _ = job.sender.send(scan_result(request_id, Vec::new(), status));
+    job.publish(Vec::new(), status);
 }
 
 fn scan_sources(strategy: UiScanStrategy) -> (bool, bool) {
@@ -262,7 +294,7 @@ fn stream_ax(job: &ScanJob, pid: libc::pid_t, publisher: &PartialPublisher<'_>) 
     accessibility::scan_process_stream(
         pid,
         &job.request,
-        || scan_id_is_current(job.request.id),
+        || scan_id_is_current(job.generation),
         |batch| publisher.push(batch),
     )
     .map(|_| UiScanStatus::Success)
@@ -274,7 +306,7 @@ fn stream_vision(
     pid: libc::pid_t,
     publisher: &PartialPublisher<'_>,
 ) -> UiScanStatus {
-    let (targets, status) = scan_vision(pid, &job.request);
+    let (targets, status) = scan_vision(pid, job.generation, &job.request);
     publisher.push(targets);
     status
 }
@@ -286,20 +318,12 @@ fn combined_status(ax: UiScanStatus, vision: UiScanStatus) -> UiScanStatus {
     }
 }
 
-fn scan_is_current(request_id: u64, pid: libc::pid_t) -> bool {
-    scan_id_is_current(request_id) && accessibility::frontmost_pid() == Some(pid)
+fn scan_is_current(generation: u64, pid: libc::pid_t) -> bool {
+    scan_id_is_current(generation) && accessibility::frontmost_pid() == Some(pid)
 }
 
-fn scan_id_is_current(request_id: u64) -> bool {
-    LATEST_SCAN.load(Ordering::Acquire) == request_id
-}
-
-fn scan_result(id: u64, targets: Vec<crate::api::UiTarget>, status: UiScanStatus) -> BackendEvent {
-    BackendEvent::UiScanned(UiScanResult {
-        id,
-        targets,
-        status,
-    })
+fn scan_id_is_current(generation: u64) -> bool {
+    LATEST_SCAN.load(Ordering::Acquire) == generation
 }
 
 fn requested_window_bounds(
@@ -314,6 +338,7 @@ fn requested_window_bounds(
 
 fn scan_vision(
     pid: libc::pid_t,
+    generation: u64,
     request: &UiScanRequest,
 ) -> (Vec<crate::api::UiTarget>, UiScanStatus) {
     let window_bounds = match accessibility::focused_window_bounds(pid) {
@@ -326,7 +351,7 @@ fn scan_vision(
     // Vision is deliberately executed on this one persistent worker. A timed
     // out native capture may finish late, but another full-resolution capture
     // can never overlap it and multiply memory consumption.
-    vision::detect(request.id, bounds, &request.vision)
+    vision::detect(generation, bounds, &request.vision)
 }
 
 #[cfg(test)]
@@ -401,19 +426,26 @@ mod tests {
             ready: Condvar::new(),
         };
         let (sender, _receiver) = std::sync::mpsc::channel();
-        let sender = EventSender::new(sender);
+        let wake = EventSender::new(sender);
+        let mailbox = Arc::new(ScanMailbox::default());
+        let first_generation = mailbox.begin(1);
         assert!(
             queue
                 .submit(ScanJob {
                     request: request(1),
-                    sender: sender.clone(),
+                    generation: first_generation,
+                    mailbox: Arc::clone(&mailbox),
+                    wake: wake.clone(),
                 })
                 .is_none()
         );
+        let second_generation = mailbox.begin(2);
         let replaced = queue
             .submit(ScanJob {
                 request: request(2),
-                sender,
+                generation: second_generation,
+                mailbox,
+                wake,
             })
             .expect("the single slot should replace its old request");
         assert_eq!(replaced.request.id, 1);
@@ -463,5 +495,13 @@ mod tests {
             assert_eq!(sizes, expected_sizes);
             assert_eq!(output, Vec::from_iter(0..count));
         }
+    }
+
+    #[test]
+    fn final_partial_reserves_only_the_remaining_target_limit() {
+        let mut batches = PartialBatches::new();
+        let ready = batches.push(0..1_536);
+        assert_eq!(ready.iter().map(Vec::len).sum::<usize>(), 1_536);
+        assert_eq!(batches.pending.capacity(), 464);
     }
 }

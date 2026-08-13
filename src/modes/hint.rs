@@ -23,8 +23,9 @@ use crate::config::{Config, Palette, UiHint as HintsConfig};
 use crate::hints::{self, Hint, Match};
 
 const SCAN_RETRY_TIMER_ID: &str = "ui_hint.scan_retry";
-/// Keep small scans warm, but do not pin a multi-thousand-target allocation
-/// after leaving this comparatively heavy mode.
+/// Reuse the small container backing needed by the common UIHint session.
+/// Elements and their strings are still dropped on exit; only empty capacity
+/// is retained, and larger scans cannot become an Idle high-water mark.
 const MAX_IDLE_RETAINED_TARGETS: usize = 128;
 const MAX_SCAN_TIMEOUT_MS: u64 = 30_000;
 
@@ -949,10 +950,10 @@ mod tests {
         mode.scanned_names_lower.reserve(1_024);
         mode.seen_targets.reserve(1_024);
         mode.hints.reserve(1_024);
-        assert!(mode.scanned.capacity() > MAX_IDLE_RETAINED_TARGETS);
-        assert!(mode.scanned_names_lower.capacity() > MAX_IDLE_RETAINED_TARGETS);
-        assert!(mode.seen_targets.capacity() > MAX_IDLE_RETAINED_TARGETS);
-        assert!(mode.hints.capacity() > MAX_IDLE_RETAINED_TARGETS);
+        assert!(mode.scanned.capacity() >= 1_024);
+        assert!(mode.scanned_names_lower.capacity() >= 1_024);
+        assert!(mode.seen_targets.capacity() >= 1_024);
+        assert!(mode.hints.capacity() >= 1_024);
 
         mode.handle(&ModeEvent::Deactivated, &env.ctx());
 
@@ -960,6 +961,31 @@ mod tests {
         assert_eq!(mode.scanned_names_lower.capacity(), 0);
         assert_eq!(mode.seen_targets.capacity(), 0);
         assert_eq!(mode.hints.capacity(), 0);
+    }
+
+    #[test]
+    fn deactivation_reuses_only_small_empty_container_capacity() {
+        let env = Env::new();
+        let mut mode = HintMode::new(&env.config);
+        activate(&mut mode, &env);
+        deliver(
+            &mut mode,
+            &env,
+            (0..100)
+                .map(|index| target(&format!("Target {index}"), index as f64 * 2.0))
+                .collect(),
+        );
+        assert_eq!(mode.scanned.len(), 100);
+
+        mode.handle(&ModeEvent::Deactivated, &env.ctx());
+
+        assert!(mode.scanned.is_empty());
+        assert!(mode.scanned.capacity() >= 100);
+        assert_eq!(mode.scanned_names_lower.capacity(), 0);
+        assert!(mode.seen_targets.is_empty());
+        assert!(mode.seen_targets.capacity() >= 100);
+        assert!(mode.hints.is_empty());
+        assert!(mode.hints.capacity() >= 100);
     }
 
     #[test]
