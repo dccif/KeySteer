@@ -102,6 +102,7 @@ pub struct WindowsBackend {
     status_item: Option<status_item::StatusItem>,
     console_control: Option<console_control::ConsoleControl>,
     ui_automation: Option<accessibility::UiAutomationWorker>,
+    update_worker: Option<crate::app::update::UpdateWorker>,
     held_buttons: Cell<u8>,
 }
 
@@ -177,6 +178,7 @@ impl WindowsBackend {
             status_item,
             console_control,
             ui_automation: None,
+            update_worker: None,
             held_buttons: Cell::new(0),
         })
     }
@@ -316,6 +318,9 @@ impl WindowsBackend {
     /// active provider call, drop its COM interfaces, and call
     /// `CoUninitialize` on the worker thread before it is joined.
     fn shutdown_resources(&mut self) -> Result<(), String> {
+        if let Some(mut worker) = self.update_worker.take() {
+            worker.cancel_and_wait();
+        }
         if let Some(mut worker) = self.ui_automation.take() {
             worker.stop();
         }
@@ -334,6 +339,16 @@ impl WindowsBackend {
         }
         self.console_control.take();
         release_result.and(dismiss_result)
+    }
+
+    fn reap_update_worker(&mut self) {
+        if self
+            .update_worker
+            .as_mut()
+            .is_some_and(crate::app::update::UpdateWorker::reap_finished)
+        {
+            self.update_worker.take();
+        }
     }
 
     fn take_native_change(&mut self) -> Option<BackendEvent> {
@@ -385,6 +400,7 @@ impl Backend for WindowsBackend {
     }
 
     fn poll(&mut self, timeout: Duration) -> Result<Option<BackendEvent>, String> {
+        self.reap_update_worker();
         if let Some(event) = self.try_event()? {
             return Ok(Some(event));
         }
@@ -574,16 +590,21 @@ impl Backend for WindowsBackend {
     }
 
     fn check_for_updates(&mut self) -> Result<(), String> {
+        self.reap_update_worker();
+        if self.update_worker.is_some() {
+            return Ok(());
+        }
         let progress_sender = self.event_tx.clone();
         let complete_sender = self.event_tx.clone();
-        crate::app::update::check_async(
+        self.update_worker = crate::app::update::check_async(
             move |progress| {
                 let _ = progress_sender.send(BackendEvent::UpdateProgress(progress));
             },
             move |result| {
                 let _ = complete_sender.send(BackendEvent::UpdateChecked(result));
             },
-        )
+        )?;
+        Ok(())
     }
 
     fn present_update_progress(

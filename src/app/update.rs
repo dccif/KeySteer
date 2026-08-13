@@ -3,7 +3,10 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use semver::Version;
@@ -18,11 +21,78 @@ const RELEASE_DOWNLOAD_ROOT: &str = "https://github.com/dccif/KeySteer/releases/
 const GH_PROXY_ROOT: &str = "https://gh-proxy.com";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const DOWNLOAD_BODY_TIMEOUT: Duration = Duration::from_secs(30);
+const DOWNLOAD_GLOBAL_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_RELEASE_RESPONSE_BYTES: u64 = 64 * 1024;
 const MAX_DOWNLOAD_BYTES: u64 = 10 * 1024 * 1024;
 const DOWNLOAD_BUFFER_BYTES: usize = 32 * 1024;
-const UPDATE_THREAD_STACK_BYTES: usize = 512 * 1024;
+// Native TLS enters Security.framework/CFNetwork on macOS. A 512 KiB custom
+// stack can overflow below Rust and abort a `panic=abort` release process.
+// Keep the normal Rust worker allowance; it exists only during a manual check.
+const UPDATE_THREAD_STACK_BYTES: usize = 2 * 1024 * 1024;
+const UPDATE_STOP_WAIT: Duration = Duration::from_millis(250);
 static CHECK_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+pub(crate) struct UpdateWorker {
+    cancel: Arc<AtomicBool>,
+    done: Receiver<()>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl UpdateWorker {
+    /// Reap a completed thread so its native handle and stack reservation are
+    /// released while KeySteer remains running.
+    pub(crate) fn reap_finished(&mut self) -> bool {
+        if self.join.as_ref().is_some_and(JoinHandle::is_finished) {
+            self.join_finished();
+        }
+        self.join.is_none()
+    }
+
+    /// Request cancellation and wait briefly for ordinary cleanup. Blocking
+    /// native network calls retain their own hard timeout, so shutdown never
+    /// waits indefinitely.
+    pub(crate) fn cancel_and_wait(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        if self.join.is_none() {
+            return;
+        }
+        let completed = self.join.as_ref().is_some_and(JoinHandle::is_finished)
+            || !matches!(
+                self.done.recv_timeout(UPDATE_STOP_WAIT),
+                Err(RecvTimeoutError::Timeout)
+            );
+        if completed {
+            self.join_finished();
+        } else {
+            // Dropping a JoinHandle detaches the bounded worker. It will see
+            // cancellation after the current native call and run all RAII
+            // cleanup; the application shutdown path is never held hostage.
+            self.join.take();
+        }
+    }
+
+    fn join_finished(&mut self) {
+        if let Some(join) = self.join.take()
+            && join.join().is_err()
+        {
+            crate::app::logging::report_error("update-check", "update worker panicked");
+        }
+    }
+}
+
+impl Drop for UpdateWorker {
+    fn drop(&mut self) {
+        self.cancel_and_wait();
+    }
+}
+
+struct WorkerDone(Sender<()>);
+
+impl Drop for WorkerDone {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
 
 struct UpdateCheckGuard;
 
@@ -108,28 +178,59 @@ impl FetchFailure {
 pub(crate) fn check_async(
     progress: impl Fn(UpdateProgress) + Send + 'static,
     complete: impl FnOnce(UpdateCheckResult) + Send + 'static,
-) -> Result<(), String> {
+) -> Result<Option<UpdateWorker>, String> {
     let Some(guard) = UpdateCheckGuard::acquire() else {
-        return Ok(());
+        return Ok(None);
     };
-    std::thread::Builder::new()
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let (done_tx, done) = mpsc::channel();
+    let join = std::thread::Builder::new()
         .name("keysteer-update-check".into())
         .stack_size(UPDATE_THREAD_STACK_BYTES)
         .spawn(move || {
-            let _guard = guard;
-            progress(UpdateProgress::Checking);
-            let result = check_latest_release(&progress).unwrap_or_else(UpdateCheckResult::Failed);
-            complete(result);
+            let _done = WorkerDone(done_tx);
+            with_platform_autorelease_pool(|| {
+                let _guard = guard;
+                if worker_cancel.load(Ordering::Acquire) {
+                    return;
+                }
+                progress(UpdateProgress::Checking);
+                let result = check_latest_release(&progress, &worker_cancel)
+                    .unwrap_or_else(UpdateCheckResult::Failed);
+                if !worker_cancel.load(Ordering::Acquire) {
+                    complete(result);
+                }
+            });
         })
-        .map(|_| ())
-        .map_err(|error| format!("cannot start update check: {error}"))
+        .map_err(|error| format!("cannot start update check: {error}"))?;
+    Ok(Some(UpdateWorker {
+        cancel,
+        done,
+        join: Some(join),
+    }))
 }
 
-fn check_latest_release(progress: &dyn Fn(UpdateProgress)) -> Result<UpdateCheckResult, String> {
+#[cfg(target_os = "macos")]
+fn with_platform_autorelease_pool<R>(work: impl FnOnce() -> R) -> R {
+    objc2::rc::autoreleasepool(|_| work())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn with_platform_autorelease_pool<R>(work: impl FnOnce() -> R) -> R {
+    work()
+}
+
+fn check_latest_release(
+    progress: &dyn Fn(UpdateProgress),
+    cancel: &AtomicBool,
+) -> Result<UpdateCheckResult, String> {
+    ensure_not_cancelled(cancel)?;
     let current = Version::parse(env!("CARGO_PKG_VERSION"))
         .map_err(|error| format!("invalid current package version: {error}"))?;
     let target = release_target()?;
-    let latest = fetch_latest_release(target)?;
+    let latest = fetch_latest_release(target, cancel)?;
+    ensure_not_cancelled(cancel)?;
 
     if latest.version <= current {
         return Ok(UpdateCheckResult::UpToDate {
@@ -139,13 +240,15 @@ fn check_latest_release(progress: &dyn Fn(UpdateProgress)) -> Result<UpdateCheck
 
     let latest_version = latest.version.to_string();
     let report_download = |percent| {
-        progress(UpdateProgress::Downloading {
-            latest: latest_version.clone(),
-            percent,
-        });
+        if !cancel.load(Ordering::Acquire) {
+            progress(UpdateProgress::Downloading {
+                latest: latest_version.clone(),
+                percent,
+            });
+        }
     };
     report_download(0);
-    let path = download_release(&latest, target, &report_download)?;
+    let path = download_release(&latest, target, &report_download, cancel)?;
     Ok(UpdateCheckResult::UpdateDownloaded {
         current: current.to_string(),
         latest: latest.version.to_string(),
@@ -153,28 +256,39 @@ fn check_latest_release(progress: &dyn Fn(UpdateProgress)) -> Result<UpdateCheck
     })
 }
 
-fn fetch_latest_release(target: &str) -> Result<ReleaseInfo, String> {
+fn fetch_latest_release(target: &str, cancel: &AtomicBool) -> Result<ReleaseInfo, String> {
     match fetch_github_release(target) {
         Ok(release) => Ok(release),
-        Err(github) => match fetch_cdn_version() {
-            Ok(version) => Ok(ReleaseInfo {
-                version,
-                asset: None,
-            }),
-            Err(cdn) => {
-                if github.timed_out && cdn.timed_out {
-                    Err(format!(
-                        "Update check timed out: GitHub and the CDN fallback each exceeded {} seconds.",
-                        REQUEST_TIMEOUT.as_secs()
-                    ))
-                } else {
-                    Err(format!(
-                        "Update check failed. {}: {}; CDN retry via {}: {}",
-                        github.source, github.details, cdn.source, cdn.details
-                    ))
+        Err(github) => {
+            ensure_not_cancelled(cancel)?;
+            match fetch_cdn_version() {
+                Ok(version) => Ok(ReleaseInfo {
+                    version,
+                    asset: None,
+                }),
+                Err(cdn) => {
+                    if github.timed_out && cdn.timed_out {
+                        Err(format!(
+                            "Update check timed out: GitHub and the CDN fallback each exceeded {} seconds.",
+                            REQUEST_TIMEOUT.as_secs()
+                        ))
+                    } else {
+                        Err(format!(
+                            "Update check failed. {}: {}; CDN retry via {}: {}",
+                            github.source, github.details, cdn.source, cdn.details
+                        ))
+                    }
                 }
             }
-        },
+        }
+    }
+}
+
+fn ensure_not_cancelled(cancel: &AtomicBool) -> Result<(), String> {
+    if cancel.load(Ordering::Acquire) {
+        Err("update check was cancelled".into())
+    } else {
+        Ok(())
     }
 }
 
@@ -273,7 +387,9 @@ fn download_release(
     release: &ReleaseInfo,
     target: &str,
     progress: &dyn Fn(u8),
+    cancel: &AtomicBool,
 ) -> Result<PathBuf, String> {
+    ensure_not_cancelled(cancel)?;
     let file_name = release_asset_name(&release.version, target);
     let url = format!("{RELEASE_DOWNLOAD_ROOT}/v{}/{file_name}", release.version);
     let directory = downloads_directory()?;
@@ -297,9 +413,14 @@ fn download_release(
         ));
     }
 
-    if let Err(direct_error) =
-        download_and_validate(&url, partial_guard.path(), release.asset.as_ref(), progress)
-    {
+    if let Err(direct_error) = download_and_validate(
+        &url,
+        partial_guard.path(),
+        release.asset.as_ref(),
+        progress,
+        cancel,
+    ) {
+        ensure_not_cancelled(cancel)?;
         let proxy_url = gh_proxy_url(&url);
         progress(0);
         download_and_validate(
@@ -307,6 +428,7 @@ fn download_release(
             partial_guard.path(),
             release.asset.as_ref(),
             progress,
+            cancel,
         )
         .map_err(|proxy_error| {
                 format!(
@@ -327,8 +449,10 @@ fn download_and_validate(
     path: &Path,
     asset: Option<&ReleaseAsset>,
     progress: &dyn Fn(u8),
+    cancel: &AtomicBool,
 ) -> Result<(), String> {
-    let receipt = download_to(url, path, asset.map(|asset| asset.size), progress)?;
+    let receipt = download_to(url, path, asset.map(|asset| asset.size), progress, cancel)?;
+    ensure_not_cancelled(cancel)?;
     validate_zip(path)?;
     if let Some(asset) = asset {
         if receipt.bytes != asset.size {
@@ -352,7 +476,9 @@ fn download_to(
     path: &Path,
     expected_size: Option<u64>,
     progress: &dyn Fn(u8),
+    cancel: &AtomicBool,
 ) -> Result<DownloadReceipt, String> {
+    ensure_not_cancelled(cancel)?;
     let agent: ureq::Agent = download_agent_config().into();
     let mut response = agent
         .get(url)
@@ -389,12 +515,14 @@ fn download_to(
     let mut last_percent = 0_u8;
     let mut buffer = [0_u8; DOWNLOAD_BUFFER_BYTES];
     loop {
+        ensure_not_cancelled(cancel)?;
         let read = reader
             .read(&mut buffer)
             .map_err(|error| download_io_error("update download failed", &error))?;
         if read == 0 {
             break;
         }
+        ensure_not_cancelled(cancel)?;
         file.write_all(&buffer[..read]).map_err(|error| {
             format!(
                 "cannot write temporary download {}: {error}",
@@ -512,6 +640,7 @@ fn metadata_agent_config() -> ureq::config::Config {
 
 fn download_agent_config() -> ureq::config::Config {
     ureq::Agent::config_builder()
+        .timeout_global(Some(DOWNLOAD_GLOBAL_TIMEOUT))
         .timeout_resolve(Some(REQUEST_TIMEOUT))
         .timeout_connect(Some(REQUEST_TIMEOUT))
         .timeout_send_request(Some(REQUEST_TIMEOUT))
@@ -578,6 +707,34 @@ mod tests {
     }
 
     #[test]
+    fn update_worker_cancels_and_reaps_without_waiting_for_the_network_timeout() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (done_tx, done) = mpsc::channel();
+        let join = std::thread::spawn(move || {
+            let _done = WorkerDone(done_tx);
+            while !worker_cancel.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        });
+        let mut worker = UpdateWorker {
+            cancel,
+            done,
+            join: Some(join),
+        };
+
+        worker.cancel_and_wait();
+
+        assert!(worker.join.is_none());
+    }
+
+    #[test]
+    fn cancelled_update_work_stops_before_starting_more_io() {
+        let cancel = AtomicBool::new(true);
+        assert!(ensure_not_cancelled(&cancel).is_err());
+    }
+
+    #[test]
     fn release_tags_accept_the_optional_v_prefix() {
         assert_eq!(
             parse_release_version("v0.2.0").unwrap(),
@@ -621,7 +778,8 @@ mod tests {
     fn automatic_update_downloads_are_bounded_to_ten_mib() {
         assert_eq!(MAX_DOWNLOAD_BYTES, 10 * 1024 * 1024);
         assert_eq!(DOWNLOAD_BUFFER_BYTES, 32 * 1024);
-        assert_eq!(UPDATE_THREAD_STACK_BYTES, 512 * 1024);
+        assert_eq!(UPDATE_THREAD_STACK_BYTES, 2 * 1024 * 1024);
+        assert_eq!(DOWNLOAD_GLOBAL_TIMEOUT, Duration::from_secs(60));
     }
 
     #[test]

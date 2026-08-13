@@ -1,10 +1,16 @@
 # 更新日志 / Release Notes
 
+## 0.8.12
+
+修复 macOS 检查更新闪退问题，并确保更新线程在完成、失败或退出时及时释放资源。
+
+Fix macOS update-check crashes and ensure update workers release resources after completion, failure, or exit.
+
 ## 0.8.11
 
-新增从托盘或菜单栏一键将当前配置安全带入网页模拟器。
+新增从托盘或菜单栏一键将当前配置安全带入网页模拟器，并修复 macOS 检查更新闪退及更新线程退出清理问题。
 
-Open the current configuration safely in the web simulator from the tray or menu bar.
+Open the current configuration safely in the web simulator from the tray or menu bar, and fix macOS update-check crashes and worker cleanup on exit.
 
 ## 0.8.10
 

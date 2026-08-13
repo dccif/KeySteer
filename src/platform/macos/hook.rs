@@ -41,6 +41,7 @@ pub(super) struct EventSender {
 }
 
 impl EventSender {
+    #[cfg(test)]
     pub(super) fn send(&self, event: BackendEvent) -> Result<(), ()> {
         self.sender
             .send(Envelope {
@@ -48,6 +49,18 @@ impl EventSender {
                 generation: None,
             })
             .map_err(|_| ())
+    }
+
+    pub(super) fn try_send(&self, event: BackendEvent) -> Result<(), BackendEvent> {
+        self.sender
+            .try_send(Envelope {
+                event,
+                generation: None,
+            })
+            .map_err(|error| match error {
+                std::sync::mpsc::TrySendError::Full(envelope)
+                | std::sync::mpsc::TrySendError::Disconnected(envelope) => envelope.event,
+            })
     }
 }
 
@@ -851,6 +864,23 @@ mod tests {
         assert!(matches!(
             hook.next_event(Duration::from_millis(10)),
             Some(BackendEvent::ReloadConfig)
+        ));
+    }
+
+    #[test]
+    fn external_event_sender_never_blocks_when_the_hook_queue_is_full() {
+        let (event_tx, _event_rx) = mpsc::sync_channel(1);
+        event_tx
+            .send(Envelope {
+                event: BackendEvent::ReloadConfig,
+                generation: None,
+            })
+            .unwrap();
+        let sender = EventSender { sender: event_tx };
+
+        assert!(matches!(
+            sender.try_send(BackendEvent::OpenConfigSimulator),
+            Err(BackendEvent::OpenConfigSimulator)
         ));
     }
 

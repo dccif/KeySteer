@@ -79,7 +79,13 @@ impl EventSender {
 
     fn send(&self, event: BackendEvent) -> Result<(), ()> {
         let result = match self.hook.get() {
-            Some(sender) => sender.send(event),
+            Some(sender) => match sender.try_send(event) {
+                Ok(()) => Ok(()),
+                // Status/update workers must never block behind the bounded
+                // keyboard queue. Preserve the event through the unbounded
+                // fallback and wake the main run loop explicitly.
+                Err(event) => self.fallback.send(event).map_err(|_| ()),
+            },
             None => self.fallback.send(event).map_err(|_| ()),
         };
         if result.is_ok() {
@@ -105,6 +111,7 @@ pub struct MacOsBackend {
     frame_clock: display_link::DisplayFrameClock,
     workspace: workspace::Workspace,
     status_item: Option<status_item::StatusItem>,
+    update_worker: Option<crate::app::update::UpdateWorker>,
     held_buttons: Cell<u8>,
     click_tracker: Arc<Mutex<ClickTracker>>,
     warned_about_permissions: bool,
@@ -171,6 +178,7 @@ impl MacOsBackend {
             frame_clock,
             workspace,
             status_item,
+            update_worker: None,
             held_buttons: Cell::new(0),
             click_tracker,
             warned_about_permissions: false,
@@ -230,6 +238,16 @@ impl MacOsBackend {
         }
         first_error.map_or(Ok(()), Err)
     }
+
+    fn reap_update_worker(&mut self) {
+        if self
+            .update_worker
+            .as_mut()
+            .is_some_and(crate::app::update::UpdateWorker::reap_finished)
+        {
+            self.update_worker.take();
+        }
+    }
 }
 
 impl Drop for MacOsBackend {
@@ -245,6 +263,7 @@ impl Drop for MacOsBackend {
 
 impl Backend for MacOsBackend {
     fn poll(&mut self, timeout: Duration) -> Result<Option<BackendEvent>, String> {
+        self.reap_update_worker();
         let deadline = Instant::now() + timeout;
         loop {
             self.refresh_native_events();
@@ -394,16 +413,21 @@ impl Backend for MacOsBackend {
     }
 
     fn check_for_updates(&mut self) -> Result<(), String> {
+        self.reap_update_worker();
+        if self.update_worker.is_some() {
+            return Ok(());
+        }
         let progress_sender = self.event_tx.clone();
         let complete_sender = self.event_tx.clone();
-        crate::app::update::check_async(
+        self.update_worker = crate::app::update::check_async(
             move |progress| {
                 let _ = progress_sender.send(BackendEvent::UpdateProgress(progress));
             },
             move |result| {
                 let _ = complete_sender.send(BackendEvent::UpdateChecked(result));
             },
-        )
+        )?;
+        Ok(())
     }
 
     fn present_update_progress(
@@ -459,6 +483,9 @@ impl Backend for MacOsBackend {
     }
 
     fn shutdown(&mut self) -> Result<(), String> {
+        if let Some(mut worker) = self.update_worker.take() {
+            worker.cancel_and_wait();
+        }
         let release_result = self.release_held_buttons();
         if let Some(mut hook) = self.hook.take() {
             hook.stop();

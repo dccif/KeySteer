@@ -1,6 +1,6 @@
 [package]
 name = "keysteer"
-version = "0.8.11"
+version = "0.8.12"
 authors = ["dccif"]
 edition = "2024"
 rust-version = "1.97"
