@@ -5,6 +5,7 @@
 pub(crate) mod about;
 mod bootstrap;
 mod cli;
+pub(crate) mod config_simulator;
 pub(crate) mod logging;
 pub(crate) mod paths;
 pub(crate) mod perf_probe;

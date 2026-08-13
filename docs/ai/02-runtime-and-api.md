@@ -126,6 +126,12 @@ drop request-scoped Agent 及原生 TLS 连接。Windows 提示在线程内使�
 关闭后销毁 owner 并结束线程；macOS 提示保持非 modal，OK action 关闭窗口并释放唯一 retained
 Alert。不得累积更新 worker、弹窗或连接。它不是启动任务，也没有定时轮询。
 
+状态栏的 `OpenConfigSimulator` 同样先进入 Engine。Engine 从 `ConfigStore` 取得当前有效
+源文本，只在点击时以 zlib + Base64URL 生成 URL fragment，再由 `Backend::open_url` 交给
+系统浏览器。配置 fragment 不得放进 query、不得启动本地 HTTP 服务，也不得在启动时预计算。
+生成的 source/compressed/encoded/url 均为单次局部值且不缓存；Engine 对成功打开后的快速
+重复菜单事件做 2 秒防抖，避免重复压缩和连续打开浏览器标签页。
+
 ## 可恢复输入失败
 
 合成输入在 Windows 高权限窗口等环境可能因权限被拒绝。`command_executor.rs` 把这类

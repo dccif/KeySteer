@@ -1,6 +1,6 @@
 [package]
 name = "keysteer"
-version = "0.8.10"
+version = "0.8.11"
 authors = ["dccif"]
 edition = "2024"
 rust-version = "1.97"
@@ -33,6 +33,8 @@ name = "keysteer"
 path = "src/main.rs"
 
 [dependencies]
+base64 = "0.23"
+miniz_oxide = "0.8"
 serde = { version = "1.0.229", features = ["derive"] }
 semver = "1.0"
 sha2 = { version = "0.11", default-features = false }

@@ -10,7 +10,7 @@
 ## 共同契约
 
 两端都实现 `api::Backend`：poll、按键 disposition、屏幕/光标/前台应用、输入注入、
-frame clock、overlay、UI scan、appearance、状态栏开关和 autostart。目标后端由
+frame clock、overlay、UI scan、appearance、系统浏览器、状态栏开关和 autostart。目标后端由
 `src/platform/mod.rs` 在编译期选择。两端都跟踪本进程已注入的鼠标按钮状态；对已经按住
 的同一按钮再次请求 `Press` 必须幂等返回，不得向系统追加第二个 mouse-down。
 两端还实现动态 overlay 位置快路径；`None` 表示该层保持原位，跨屏、缩放或任何内容变化
@@ -54,7 +54,7 @@ frame clock、overlay、UI scan、appearance、状态栏开关和 autostart。�
 | `overlay.rs` | topmost layered click-through HWND、RGBA DIB、文字栅格化 |
 | `accessibility.rs` | UI Automation 与 popup/遮挡扫描 |
 | `frame_clock.rs` | `DwmFlush` 合成帧 |
-| `status_item.rs` | notification-area 图标、菜单、非阻塞更新提示和 Release 页面打开 |
+| `status_item.rs` | notification-area 图标、菜单、非阻塞更新提示和网页打开请求 |
 | `autostart.rs` | 当前用户登录启动注册表项 |
 | `system_events.rs` | foreground/display/appearance 变化 |
 | `console_control.rs` | 控制台关闭和进程退出事件 |
@@ -111,7 +111,7 @@ item、window 和 display link 都有线程亲和性。
 | `vision.rs` | Rust FFI 封装和视觉候选后处理 |
 | `vision_bridge.m` | ScreenCaptureKit + Vision Objective-C bridge |
 | `workspace.rs` | 前台应用、appearance、run-loop wait/wake |
-| `status_item.rs` | NSStatusItem 菜单、非模态 NSAlert 和 NSWorkspace 页面打开 |
+| `status_item.rs` | NSStatusItem 菜单、非模态 NSAlert 和网页打开请求 |
 | `permissions.rs` | Accessibility trust 检测、提示和设置入口 |
 | `autostart.rs`/bridge | ServiceManagement `SMAppService` 登录项 |
 

@@ -43,6 +43,8 @@ pub enum BackendEvent {
     Quit,
     /// The user asked to reload the configuration.
     ReloadConfig,
+    /// The user asked to edit the active configuration in the web simulator.
+    OpenConfigSimulator,
     /// The user toggled the engine on or off.
     ToggleEnabled,
     /// The user toggled whether KeySteer runs when the current user signs in.
@@ -204,6 +206,13 @@ pub trait Backend {
     /// Present the result using the platform's native UI.
     fn present_update_result(&mut self, _result: &UpdateCheckResult) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Open an HTTPS URL using the user's default browser.
+    ///
+    /// The default keeps third-party and test backends source compatible.
+    fn open_url(&mut self, _url: &str) -> Result<(), String> {
+        Err(format!("{} cannot open web pages", self.name()))
     }
 
     /// Name of the backend, for diagnostics.

@@ -19,7 +19,6 @@ enum StoreSource {
 }
 
 impl StoreSource {
-    #[cfg(test)]
     fn text(&self) -> String {
         match self {
             Self::Raw(text) => text.clone(),
@@ -52,6 +51,15 @@ impl ConfigStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Return the exact source currently backing the active configuration.
+    ///
+    /// This intentionally serializes the comment-preserving document after a
+    /// runtime edit instead of rereading the file, so callers see the same
+    /// configuration that the engine is using.
+    pub(crate) fn source_text(&self) -> String {
+        self.source.text()
     }
 
     pub fn reload(&mut self) -> Result<Config, ConfigError> {

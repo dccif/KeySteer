@@ -1,5 +1,11 @@
 # 更新日志 / Release Notes
 
+## 0.8.11
+
+新增从托盘或菜单栏一键将当前配置安全带入网页模拟器。
+
+Open the current configuration safely in the web simulator from the tray or menu bar.
+
 ## 0.8.10
 
 UI Hint 退出后会立即取消过期扫描、重复进入依然快速，并修复 macOS 撤销辅助功能权限时可能卡住的问题。

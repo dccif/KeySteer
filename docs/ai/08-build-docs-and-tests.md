@@ -125,6 +125,7 @@ GitHub Pages。需要更新线上文档时，在 Actions 页面运行 `Deploy do
 模拟器重点是键位和 Grid/Recursive Grid/UI Hint 样式可视化，不是完整 Rust runtime。它：
 
 - 解析/输出 TOML，支持导入和下载。
+- 可从 KeySteer 菜单接收 zlib + Base64URL fragment；页面立即清除 fragment，并只在浏览器本地解码。
 - 模拟 Mode binding inheritance 和空格分组键。
 - 展示键位动作分类和 targeting overlay 外观。
 - 不使用 Rust/WASM 校验器；复杂配置和最终校验交给程序/文档。

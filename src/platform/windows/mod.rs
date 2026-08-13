@@ -601,6 +601,14 @@ impl Backend for WindowsBackend {
         status_item::present_update_result(result)
     }
 
+    fn open_url(&mut self, url: &str) -> Result<(), String> {
+        std::process::Command::new("explorer.exe")
+            .arg(url)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("Windows could not open the default browser: {error}"))
+    }
+
     fn name(&self) -> &'static str {
         "windows"
     }

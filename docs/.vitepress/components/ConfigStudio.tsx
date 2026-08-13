@@ -9,6 +9,7 @@ import {
   toggleButton,
 } from '../simulator/state'
 import { effectiveBindings, resolveBinding } from '../simulator/bindings'
+import { consumeConfigHandoff } from '../simulator/config-handoff'
 import CommonConfigControls from '../config-studio/CommonConfigControls'
 import ModeStyleControls from '../config-studio/ModeStyleControls'
 import {
@@ -208,6 +209,34 @@ export default defineComponent({
       }
     }
 
+    function importSource(source: string, name: string, successMessage: string): void {
+      const parsed = parseConfigDocument(source)
+      document.value = parsed.document
+      sourceName.value = name
+      sourceStats.value = { bytes: parsed.bytes, sections: parsed.sections, values: parsed.values }
+      message.value = successMessage
+    }
+
+    async function initialize(): Promise<void> {
+      // Capture and erase the fragment synchronously before the first await.
+      const handoff = consumeConfigHandoff(window.location, window.history)
+      await loadDefault()
+      const result = await handoff
+      if (result.kind === 'config') {
+        try {
+          importSource(
+            result.source,
+            '当前 KeySteer 配置',
+            '已从 KeySteer 导入当前配置；数据仅在本机浏览器中处理',
+          )
+        } catch (error) {
+          message.value = `TOML 解析失败：${formatError(error)}`
+        }
+      } else if (result.kind === 'error') {
+        message.value = result.message
+      }
+    }
+
     function selectKey(spec: KeySpec): void {
       if (!spec.key) return
       const parts: string[] = (Object.keys(modifiers) as Modifier[]).filter((modifier) => modifiers[modifier])
@@ -254,11 +283,7 @@ export default defineComponent({
       if (!file) return
       file.text().then((source) => {
         try {
-          const parsed = parseConfigDocument(source)
-          document.value = parsed.document
-          sourceName.value = file.name
-          sourceStats.value = { bytes: parsed.bytes, sections: parsed.sections, values: parsed.values }
-          message.value = `已导入 ${file.name}；配置值已解析，原注释不会写入生成文件`
+          importSource(source, file.name, `已导入 ${file.name}；配置值已解析，原注释不会写入生成文件`)
         } catch (error) {
           message.value = `TOML 解析失败：${formatError(error)}`
         } finally {
@@ -383,7 +408,7 @@ export default defineComponent({
 
     onMounted(() => {
       isMac.value = /Mac|iPhone|iPad/.test(navigator.platform)
-      void loadDefault()
+      void initialize()
       animationFrame = requestAnimationFrame(animate)
     })
     onBeforeUnmount(() => {

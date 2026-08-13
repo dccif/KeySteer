@@ -36,10 +36,11 @@ const ICON_ID: u32 = 1;
 const APP_ICON_RESOURCE_ID: usize = 1;
 const CMD_TOGGLE: i32 = 1;
 const CMD_RELOAD: i32 = 2;
-const CMD_AUTOSTART: i32 = 3;
-const CMD_CHECK_UPDATES: i32 = 4;
-const CMD_ABOUT: i32 = 5;
-const CMD_QUIT: i32 = 6;
+const CMD_CONFIG_SIMULATOR: i32 = 3;
+const CMD_AUTOSTART: i32 = 4;
+const CMD_CHECK_UPDATES: i32 = 5;
+const CMD_ABOUT: i32 = 6;
+const CMD_QUIT: i32 = 7;
 
 static SENDER: OnceLock<Mutex<Option<EventSender>>> = OnceLock::new();
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -377,6 +378,14 @@ fn show_menu(hwnd: HWND) {
             .and_then(|_| {
                 AppendMenuW(
                     menu,
+                    MF_STRING,
+                    CMD_CONFIG_SIMULATOR as usize,
+                    w!("Configuration & Simulator..."),
+                )
+            })
+            .and_then(|_| {
+                AppendMenuW(
+                    menu,
                     autostart_flags,
                     CMD_AUTOSTART as usize,
                     w!("Start at Login"),
@@ -433,6 +442,7 @@ fn show_menu(hwnd: HWND) {
     match command.0 {
         CMD_TOGGLE => emit(BackendEvent::ToggleEnabled),
         CMD_RELOAD => emit(BackendEvent::ReloadConfig),
+        CMD_CONFIG_SIMULATOR => emit(BackendEvent::OpenConfigSimulator),
         CMD_AUTOSTART => emit(BackendEvent::ToggleAutostart),
         CMD_CHECK_UPDATES => emit(BackendEvent::CheckForUpdates),
         CMD_ABOUT => present_about(),
@@ -691,6 +701,11 @@ mod tests {
         assert!(matches!(
             receiver.recv().unwrap(),
             BackendEvent::ReloadConfig
+        ));
+        emit(BackendEvent::OpenConfigSimulator);
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            BackendEvent::OpenConfigSimulator
         ));
         emit(BackendEvent::CheckForUpdates);
         assert!(matches!(

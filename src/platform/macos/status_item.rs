@@ -49,6 +49,11 @@ define_class!(
             emit(BackendEvent::ReloadConfig);
         }
 
+        #[unsafe(method(openConfigSimulator:))]
+        fn open_config_simulator(&self, _sender: Option<&AnyObject>) {
+            emit(BackendEvent::OpenConfigSimulator);
+        }
+
         #[unsafe(method(toggleAutostart:))]
         fn toggle_autostart(&self, _sender: Option<&AnyObject>) {
             emit(BackendEvent::ToggleAutostart);
@@ -164,6 +169,12 @@ impl StatusItem {
 
         let toggle_item = menu_item(mtm, "Pause", sel!(toggleEnabled:), &target);
         let reload_item = menu_item(mtm, "Reload Configuration", sel!(reloadConfig:), &target);
+        let simulator_item = menu_item(
+            mtm,
+            "Configuration & Simulator...",
+            sel!(openConfigSimulator:),
+            &target,
+        );
         let autostart_item = menu_item(mtm, "Start at Login", sel!(toggleAutostart:), &target);
         let update_item = menu_item(mtm, "Check for Updates...", sel!(checkForUpdates:), &target);
         let about_item = menu_item(mtm, "About KeySteer...", sel!(showAbout:), &target);
@@ -178,6 +189,7 @@ impl StatusItem {
         let quit_item = menu_item(mtm, "Quit KeySteer", sel!(quitApplication:), &target);
         menu.addItem(&toggle_item);
         menu.addItem(&reload_item);
+        menu.addItem(&simulator_item);
         menu.addItem(&autostart_item);
         menu.addItem(&update_item);
         menu.addItem(&about_item);
@@ -458,6 +470,11 @@ mod tests {
         assert!(matches!(
             receiver.recv().unwrap(),
             BackendEvent::ReloadConfig
+        ));
+        emit(BackendEvent::OpenConfigSimulator);
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            BackendEvent::OpenConfigSimulator
         ));
         emit(BackendEvent::CheckForUpdates);
         assert!(matches!(

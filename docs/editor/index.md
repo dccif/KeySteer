@@ -2,6 +2,8 @@
 
 配置与模拟器适合“先试试再保存”：在浏览器中编辑键位、预览鼠标操作、调整 `Grid`/`Recursive Grid`/`UI Hint` 的样式。数据只在本机浏览器中处理，不会上传。复杂动作、外部命令和高级字段请以 TOML 文档为准。
 
+KeySteer 0.8.11 及更高版本可从托盘或菜单栏选择 **Configuration & Simulator...**，直接带入当前生效的配置。配置经 URL fragment 交给浏览器，GitHub Pages 请求不会包含它；页面读取后会立即清除 fragment。浏览器扩展在交接瞬间理论上仍可能读取页面地址，因此不要在配置命令中保存密码或令牌。
+
 <p class="ks-open-simulator">
   <a href="../simulator" target="_blank" rel="noopener">打开配置与模拟器 ↗</a>
 </p>

@@ -436,6 +436,8 @@ pub struct Engine {
     /// Automatic startup keeps discovering this directory on every reload.
     /// An explicit `--config` leaves this unset and remains pinned to its path.
     config_discovery_directory: Option<PathBuf>,
+    /// Prevent rapid status-menu clicks from opening duplicate browser tabs.
+    last_config_simulator_open: Option<Instant>,
     started_at: Instant,
 }
 
@@ -483,6 +485,7 @@ impl Engine {
             should_quit: false,
             config_store: None,
             config_discovery_directory: None,
+            last_config_simulator_open: None,
             started_at: Instant::now(),
         }
     }
@@ -1265,6 +1268,25 @@ impl Engine {
             BackendEvent::ReloadConfig => {
                 if let Err(error) = self.reload_config(backend) {
                     crate::app::logging::report_error("config", error);
+                }
+            }
+            BackendEvent::OpenConfigSimulator => {
+                let now = Instant::now();
+                if self.last_config_simulator_open.is_some_and(|previous| {
+                    now.saturating_duration_since(previous)
+                        < crate::app::config_simulator::OPEN_DEBOUNCE
+                }) {
+                    return Ok(());
+                }
+                let source = self
+                    .config_store
+                    .as_ref()
+                    .map_or_else(|| self.config.to_toml(), ConfigStore::source_text);
+                let url = crate::app::config_simulator::url_for_config(&source);
+                if let Err(error) = backend.open_url(&url) {
+                    crate::app::logging::report_error("config-simulator", error);
+                } else {
+                    self.last_config_simulator_open = Some(now);
                 }
             }
             BackendEvent::ToggleEnabled => {
@@ -2747,6 +2769,7 @@ mod tests {
         dispositions: Vec<KeyDisposition>,
         scans: usize,
         cancelled_scans: Vec<u64>,
+        opened_urls: Vec<String>,
         shutdowns: usize,
         /// Button press/release/click calls, in order.
         buttons: Vec<(MouseButton, ButtonAction)>,
@@ -2894,6 +2917,10 @@ mod tests {
             self.log.lock().unwrap().cancelled_scans.push(id);
             Ok(())
         }
+        fn open_url(&mut self, url: &str) -> Result<(), String> {
+            self.log.lock().unwrap().opened_urls.push(url.to_string());
+            Ok(())
+        }
         fn shutdown(&mut self) -> Result<(), String> {
             self.log.lock().unwrap().shutdowns += 1;
             Ok(())
@@ -2901,6 +2928,50 @@ mod tests {
         fn name(&self) -> &'static str {
             "fake"
         }
+    }
+
+    #[test]
+    fn simulator_menu_uses_the_active_config_source() {
+        let source = "# current profile\n[normal]\nlong_press_toggle_ms = 777\n";
+        let mut engine = Engine::new(Config::parse(source).unwrap(), Appearance::Dark);
+        engine.attach_config_store(ConfigStore::from_validated_text(
+            "keysteer.profile.toml",
+            source.to_string(),
+        ));
+        let (mut backend, log) = FakeBackend::new(vec![BackendEvent::OpenConfigSimulator]);
+
+        engine.run(&mut backend).unwrap();
+
+        assert_eq!(
+            log.lock().unwrap().opened_urls,
+            [crate::app::config_simulator::url_for_config(source)]
+        );
+    }
+
+    #[test]
+    fn simulator_menu_serializes_config_without_a_store() {
+        let config = Config::default();
+        let expected = crate::app::config_simulator::url_for_config(&config.to_toml());
+        let mut engine = Engine::new(config, Appearance::Dark);
+        let (mut backend, log) = FakeBackend::new(vec![BackendEvent::OpenConfigSimulator]);
+
+        engine.run(&mut backend).unwrap();
+
+        assert_eq!(log.lock().unwrap().opened_urls, [expected]);
+    }
+
+    #[test]
+    fn simulator_menu_debounces_rapid_repeated_clicks() {
+        let mut engine = Engine::new(Config::default(), Appearance::Dark);
+        let (mut backend, log) = FakeBackend::new(vec![
+            BackendEvent::OpenConfigSimulator,
+            BackendEvent::OpenConfigSimulator,
+            BackendEvent::OpenConfigSimulator,
+        ]);
+
+        engine.run(&mut backend).unwrap();
+
+        assert_eq!(log.lock().unwrap().opened_urls.len(), 1);
     }
 
     #[test]
