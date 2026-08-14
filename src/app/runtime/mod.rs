@@ -244,7 +244,6 @@ impl PressedKeys {
         true
     }
 
-    #[cfg(test)]
     fn clear(&mut self) {
         self.0.clear();
     }
@@ -623,12 +622,36 @@ impl Engine {
         let Some(message) = error.strip_prefix(RECOVERABLE_INPUT_PREFIX) else {
             return false;
         };
+        self.reset_runtime_input_state(message, false, backend);
+        true
+    }
+
+    fn reset_runtime_input_state(
+        &mut self,
+        message: &str,
+        capture_lost: bool,
+        backend: &mut dyn Backend,
+    ) {
         if !self.input_failure_active {
             crate::app::logging::report_error(
                 "input",
-                format!("{message}; this action was rejected and runtime input state was reset"),
+                if capture_lost {
+                    format!(
+                        "{message}; stale physical input was discarded and runtime input state was reset"
+                    )
+                } else {
+                    format!("{message}; this action was rejected and runtime input state was reset")
+                },
             );
             self.input_failure_active = true;
+        }
+
+        if capture_lost {
+            // The native capture source has stopped, so the matching physical
+            // key-up edges can never arrive. This is intentionally not done
+            // for ordinary injection failure while the hook remains alive.
+            self.pressed.clear();
+            self.key_dispositions.clear();
         }
 
         let previous = self.active.clone();
@@ -701,7 +724,6 @@ impl Engine {
         self.overlay_content = None;
         self.last_scene = None;
         self.overlay_visible = false;
-        true
     }
 
     fn recoverable_input_succeeded(&mut self) {
@@ -1182,6 +1204,9 @@ impl Engine {
                     "asynchronous native input",
                     message,
                 ));
+            }
+            BackendEvent::InputCaptureLost(message) => {
+                self.reset_runtime_input_state(&message, true, backend);
             }
             BackendEvent::PointerMoved(reported) => {
                 let p = self
@@ -3033,6 +3058,30 @@ mod tests {
         assert!(engine.scan_owners.is_empty());
         assert_eq!(log.lock().unwrap().cancelled_scans, [41]);
         assert_eq!(log.lock().unwrap().shutdowns, 0);
+    }
+
+    #[test]
+    fn capture_loss_discards_physical_keys_that_can_no_longer_receive_key_up() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = engine_with_probes(&seen, &[]);
+        engine.active = ModeId::normal();
+        let key = Key::new("h").unwrap();
+        engine.pressed.insert(key.clone());
+        engine.key_dispositions.insert(key, KeyDisposition::Consume);
+        engine.frame_clock_owner = Some(ModeId::normal());
+        let (mut backend, _) = FakeBackend::new(Vec::new());
+
+        engine
+            .handle_backend_event(
+                BackendEvent::InputCaptureLost("Accessibility permission removed".into()),
+                &mut backend,
+            )
+            .unwrap();
+
+        assert!(engine.pressed.is_empty());
+        assert!(engine.key_dispositions.is_empty());
+        assert!(engine.frame_clock_owner.is_none());
+        assert_eq!(engine.active_mode(), &ModeId::idle());
     }
 
     #[test]

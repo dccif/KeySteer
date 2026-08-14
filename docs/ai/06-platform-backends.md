@@ -132,10 +132,17 @@ Retina 下快速重绘时文字基线出现单帧纵向抖动。
 - 键盘捕获需要 Accessibility；缺失时 Backend 仍能启动菜单栏，但
   `keyboard_available=false` 并给出说明。
 - 运行中撤销 Accessibility 时，`TapDisabledByUserInput` 被视为用户意图：Hook 立即
-  fail-open 并停止，不自动重新启用；只有仍受信任时的 `TapDisabledByTimeout` 才恢复。
-  Hook stop 会取消待决 disposition、停止其 CFRunLoop，并以 250 ms 为 join 上限，避免
-  权限变更或系统设置操作被无界退出等待卡住。
+  fail-open 并停止，不自动重新启用。capture-loss 使用独立原子单槽，不经过可能已满的
+  Hook 队列；Backend 在旧物理输入前交付它并丢弃旧 KeyDown/Pointer，Engine 随即停止帧
+  时钟、释放合成输入并回到 Idle。撤权路径不在 TCC 正在改动时调用
+  `AXIsProcessTrusted`。`TapDisabledByTimeout` 全进程只自动恢复一次，再次超时同样停止。
+- macOS Backend 的幂等 shutdown 顺序为：先移除 status item/系统回调，再停止 display
+  link、失效并停止 UI scan、取消更新、释放 held input、停止 Hook、关闭 overlay。Hook、扫描和更新采用
+  有界等待；系统 API 不响应取消时不让 Quit 永久卡住，主函数返回后由进程退出保证没有
+  KeySteer 线程残留。
 - Vision 屏幕内容检测需要 Screen Recording。
+- Vision 自动扫描只做 Screen Recording preflight；权限申请不得从扫描 worker 发起，以免
+  在用户修改 TCC 设置时与 System Settings 竞争。
 - 权限绑定应用 bundle identity；正式用户必须运行打包的 `KeySteer.app`，不能让 Terminal
   代替应用申请权限。
 - `SMAppService` 需要 bundle 上下文，裸二进制不等同正式 `.app` 登录项。

@@ -24,6 +24,10 @@ pub enum BackendEvent {
     /// native input callback never waits on the engine while the engine waits
     /// on that same callback. Successful requests produce no event.
     InputInjectionFailed(String),
+    /// Native physical-input capture was lost and will not recover in this
+    /// process. The engine must discard physical-key bookkeeping because the
+    /// matching key-up events can no longer be observed.
+    InputCaptureLost(String),
     /// The pointer moved.
     PointerMoved(Point),
     /// The display is ready for another animation frame.

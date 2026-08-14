@@ -7,6 +7,9 @@
   Partial；新请求或取消直接丢弃旧槽，旧结果不会排在下一次 UI Hint 的首批标签前。
 - macOS AX/Vision/Hybrid 共用纯数量批次：第一批 24 个目标立即发布，随后在累计 48、96、192… 个目标时发布，terminal 立即补发剩余目标；不使用时间间隔，也不依赖显示刷新率。Hint 复用标签 String 和结果 Vec。
 - macOS ScreenCaptureKit capture 是 native single-flight。timeout 不释放 permit；permit 只由真实 completion callback 释放，晚到图片恰好释放一次。
+- macOS 扫描 worker 由 Backend 懒创建并拥有，不再是进程静态 detached worker。退出时先使
+  generation 失效、丢弃 pending，再唤醒并有界等待 worker；已经提交且系统不支持取消的
+  ScreenCaptureKit completion 由进程退出兜底，不能阻塞 Quit。
 - Vision timeout 限制为 1..=30000ms，rectangle candidates 限制为 1..=2000，Rust 与 Objective-C 两侧均校验。
 
 ## 公共请求模型

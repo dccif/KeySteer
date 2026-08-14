@@ -103,10 +103,11 @@ pub struct MacOsBackend {
     async_rx: Receiver<BackendEvent>,
     event_tx: EventSender,
     scan_mailbox: Arc<ScanMailbox>,
+    scan_worker: ui_scan::UiScanWorker,
     pending: VecDeque<BackendEvent>,
     overlay: Overlay,
     screens: Vec<Screen>,
-    display_watcher: screens::DisplayWatcher,
+    display_watcher: Option<screens::DisplayWatcher>,
     frame_clock: display_link::DisplayFrameClock,
     workspace: workspace::Workspace,
     status_item: Option<status_item::StatusItem>,
@@ -115,6 +116,7 @@ pub struct MacOsBackend {
     click_tracker: Arc<Mutex<ClickTracker>>,
     warned_about_permissions: bool,
     keyboard: input::KeyboardInjector,
+    shutdown_complete: bool,
 }
 
 impl MacOsBackend {
@@ -170,10 +172,11 @@ impl MacOsBackend {
             async_rx,
             event_tx,
             scan_mailbox,
+            scan_worker: ui_scan::UiScanWorker::new(),
             pending: VecDeque::new(),
             overlay: Overlay::new(),
             screens: initial_screens,
-            display_watcher,
+            display_watcher: Some(display_watcher),
             frame_clock,
             workspace,
             status_item,
@@ -182,6 +185,7 @@ impl MacOsBackend {
             click_tracker,
             warned_about_permissions: false,
             keyboard,
+            shutdown_complete: false,
         })
     }
 
@@ -191,7 +195,10 @@ impl MacOsBackend {
 
     fn refresh_native_events(&mut self) {
         self.pending.extend(self.workspace.refresh());
-        if self.display_watcher.take_changed()
+        if self
+            .display_watcher
+            .as_ref()
+            .is_some_and(screens::DisplayWatcher::take_changed)
             && let Ok(current) = screens::list_screens()
             && !current.is_empty()
             && current != self.screens
@@ -203,6 +210,9 @@ impl MacOsBackend {
     }
 
     fn try_event(&mut self) -> Option<BackendEvent> {
+        if let Some(event) = self.hook.as_mut().and_then(HookThread::take_capture_loss) {
+            return Some(event);
+        }
         // CGEventTap is synchronously waiting for disposition; never place a
         // scan result or status event ahead of physical input.
         self.hook
@@ -247,14 +257,43 @@ impl MacOsBackend {
             self.update_worker.take();
         }
     }
+
+    fn shutdown_resources(&mut self) -> Result<(), String> {
+        if self.shutdown_complete {
+            return Ok(());
+        }
+        self.shutdown_complete = true;
+
+        // Stop every producer before tearing down the AppKit objects they may
+        // wake or update. All operations are idempotent so Drop can safely use
+        // the same path after an earlier error.
+        self.status_item.take();
+        self.display_watcher.take();
+        self.frame_clock.stop();
+        self.scan_worker.shutdown();
+        if let Some(mut worker) = self.update_worker.take() {
+            worker.cancel_and_wait();
+        }
+
+        let mut first_error = self.release_held_buttons().err();
+        if let Some(mut hook) = self.hook.take() {
+            hook.stop();
+        }
+        if let Err(error) = self.overlay.dismiss()
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        first_error.map_or(Ok(()), Err)
+    }
 }
 
 impl Drop for MacOsBackend {
     fn drop(&mut self) {
-        if let Err(error) = self.release_held_buttons() {
+        if let Err(error) = self.shutdown_resources() {
             crate::app::logging::report_error(
-                "macos-input",
-                format!("cannot release held mouse buttons during drop: {error}"),
+                "macos-shutdown",
+                format!("cannot completely release macOS backend resources: {error}"),
             );
         }
     }
@@ -386,7 +425,7 @@ impl Backend for MacOsBackend {
 
     fn request_ui_scan(&mut self, request: crate::api::UiScanRequest) -> Result<(), String> {
         let generation = self.scan_mailbox.begin(request.id);
-        ui_scan::request_scan(
+        self.scan_worker.request_scan(
             request,
             generation,
             Arc::clone(&self.scan_mailbox),
@@ -397,7 +436,7 @@ impl Backend for MacOsBackend {
 
     fn cancel_ui_scan(&mut self, id: u64) -> Result<(), String> {
         if self.scan_mailbox.cancel(id) {
-            ui_scan::cancel_scan(id);
+            self.scan_worker.cancel_scan(id);
         }
         Ok(())
     }
@@ -492,14 +531,6 @@ impl Backend for MacOsBackend {
     }
 
     fn shutdown(&mut self) -> Result<(), String> {
-        if let Some(mut worker) = self.update_worker.take() {
-            worker.cancel_and_wait();
-        }
-        let release_result = self.release_held_buttons();
-        if let Some(mut hook) = self.hook.take() {
-            hook.stop();
-        }
-        let dismiss_result = self.overlay.dismiss();
-        release_result.and(dismiss_result)
+        self.shutdown_resources()
     }
 }

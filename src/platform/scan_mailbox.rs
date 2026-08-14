@@ -73,7 +73,13 @@ impl ScanMailbox {
             return false;
         }
         let was_ready = !state.targets.is_empty() || state.terminal.is_some();
-        state.targets.extend(targets);
+        if state.targets.is_empty() {
+            // Preserve the producer's allocation for the common first batch;
+            // extending an empty Vec would allocate and move every target.
+            state.targets = targets;
+        } else {
+            state.targets.extend(targets);
+        }
         if status != UiScanStatus::Partial {
             state.terminal = Some(status);
         }

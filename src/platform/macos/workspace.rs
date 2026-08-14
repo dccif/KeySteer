@@ -11,6 +11,7 @@ use crate::api::backend::{Appearance, BackendEvent};
 use crate::api::command::FocusedApp;
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_APP_EVENTS_PER_POLL: usize = 64;
 
 unsafe extern "C" {
     fn CFRunLoopGetMain() -> *mut std::ffi::c_void;
@@ -96,14 +97,20 @@ pub fn pump_app_events() {
         };
         let application = NSApplication::sharedApplication(mtm);
         let expiration = NSDate::distantPast();
-        while let Some(event) = application.nextEventMatchingMask_untilDate_inMode_dequeue(
-            NSEventMask::Any,
-            Some(&expiration),
-            // SAFETY: NSDefaultRunLoopMode is a process-lifetime Foundation
-            // constant used only for this synchronous main-thread call.
-            unsafe { NSDefaultRunLoopMode },
-            true,
-        ) {
+        // A System Settings/TCC transition can enqueue an event burst. Keep a
+        // fixed budget so AppKit cannot indefinitely starve the engine's Quit
+        // or capture-loss event; remaining events stay queued for next poll.
+        for _ in 0..MAX_APP_EVENTS_PER_POLL {
+            let Some(event) = application.nextEventMatchingMask_untilDate_inMode_dequeue(
+                NSEventMask::Any,
+                Some(&expiration),
+                // SAFETY: NSDefaultRunLoopMode is a process-lifetime Foundation
+                // constant used only for this synchronous main-thread call.
+                unsafe { NSDefaultRunLoopMode },
+                true,
+            ) else {
+                break;
+            };
             application.sendEvent(&event);
         }
     });
@@ -145,5 +152,10 @@ mod tests {
     fn refresh_interval_is_short_but_not_a_hot_loop() {
         assert!(REFRESH_INTERVAL >= Duration::from_millis(100));
         assert!(REFRESH_INTERVAL <= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn app_event_pump_has_a_finite_budget() {
+        assert!((1..=256).contains(&MAX_APP_EVENTS_PER_POLL));
     }
 }

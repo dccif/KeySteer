@@ -1,5 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use objc2::rc::autoreleasepool;
 use smallvec::SmallVec;
@@ -10,8 +12,8 @@ use crate::platform::scan_mailbox::ScanMailbox;
 use super::{EventSender, accessibility, vision};
 
 static LATEST_SCAN: AtomicU64 = AtomicU64::new(0);
-static SCAN_QUEUE: OnceLock<Result<Arc<ScanQueue>, String>> = OnceLock::new();
 const FIRST_PARTIAL_TARGETS: usize = 24;
+const STOP_TIMEOUT: Duration = Duration::from_millis(500);
 
 struct ScanJob {
     request: UiScanRequest,
@@ -32,8 +34,136 @@ impl ScanJob {
 }
 
 struct ScanQueue {
-    pending: Mutex<Option<ScanJob>>,
+    state: Mutex<ScanQueueState>,
     ready: Condvar,
+}
+
+#[derive(Default)]
+struct ScanQueueState {
+    pending: Option<ScanJob>,
+    stopping: bool,
+}
+
+/// Backend-owned scan worker. It is created lazily on the first UIHint scan,
+/// remains warm between scans, and is explicitly stopped when the backend
+/// shuts down instead of relying on a process-static detached thread.
+pub(super) struct UiScanWorker {
+    queue: Option<Arc<ScanQueue>>,
+    finished: Option<Receiver<()>>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl UiScanWorker {
+    pub(super) fn new() -> Self {
+        Self {
+            queue: None,
+            finished: None,
+            join: None,
+        }
+    }
+
+    pub(super) fn request_scan(
+        &mut self,
+        request: UiScanRequest,
+        generation: u64,
+        mailbox: Arc<ScanMailbox>,
+        wake: EventSender,
+    ) {
+        LATEST_SCAN.store(generation, Ordering::Release);
+        vision::mark_latest(generation);
+        let queue = match self.ensure_started() {
+            Ok(queue) => queue,
+            Err(error) => {
+                if mailbox.publish(
+                    generation,
+                    request.id,
+                    Vec::new(),
+                    UiScanStatus::Failed(error),
+                ) {
+                    wake.wake();
+                }
+                return;
+            }
+        };
+        drop(queue.submit(ScanJob {
+            request,
+            generation,
+            mailbox,
+            wake,
+        }));
+    }
+
+    pub(super) fn cancel_scan(&self, request_id: u64) {
+        LATEST_SCAN.store(0, Ordering::Release);
+        vision::mark_latest(0);
+        if let Some(queue) = self.queue.as_ref() {
+            queue.cancel(request_id);
+        }
+    }
+
+    pub(super) fn shutdown(&mut self) {
+        LATEST_SCAN.store(0, Ordering::Release);
+        vision::mark_latest(0);
+        if let Some(queue) = self.queue.take() {
+            queue.stop();
+        }
+        let Some(join) = self.join.take() else {
+            self.finished.take();
+            return;
+        };
+        let completed = join.is_finished()
+            || self.finished.as_ref().is_some_and(|finished| {
+                !matches!(
+                    finished.recv_timeout(STOP_TIMEOUT),
+                    Err(RecvTimeoutError::Timeout)
+                )
+            });
+        self.finished.take();
+        if completed {
+            if join.join().is_err() {
+                crate::app::logging::report_error("macos-ui-scan", "UI scan worker panicked");
+            }
+        } else {
+            // ScreenCaptureKit has no cancellation API for an already submitted
+            // image request. The generation is invalidated and pending work is
+            // gone; dropping the handle keeps Quit bounded, and process exit
+            // then guarantees that no worker survives KeySteer.
+            drop(join);
+            crate::app::logging::report_error(
+                "macos-ui-scan",
+                "UI scan worker did not stop within 500 ms; process exit will finish teardown",
+            );
+        }
+    }
+
+    fn ensure_started(&mut self) -> Result<Arc<ScanQueue>, String> {
+        if let Some(queue) = self.queue.as_ref() {
+            return Ok(Arc::clone(queue));
+        }
+        let queue = Arc::new(ScanQueue {
+            state: Mutex::new(ScanQueueState::default()),
+            ready: Condvar::new(),
+        });
+        let worker_queue = Arc::clone(&queue);
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        let join = std::thread::Builder::new()
+            .name("keysteer-ui-scan".into())
+            .spawn(move || {
+                worker_queue.run();
+                let _ = finished_tx.send(());
+            })
+            .map_err(|error| format!("Cannot start UI scan worker: {error}"))?;
+        self.queue = Some(Arc::clone(&queue));
+        self.finished = Some(finished_rx);
+        self.join = Some(join);
+        Ok(queue)
+    }
+}
+
+impl Drop for UiScanWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 /// Count-driven partial batching. It intentionally has no timer: publication
@@ -137,100 +267,54 @@ impl<'a> PartialPublisher<'a> {
 }
 
 impl ScanQueue {
-    fn start() -> Result<Arc<Self>, String> {
-        let queue = Arc::new(Self {
-            pending: Mutex::new(None),
-            ready: Condvar::new(),
-        });
-        let worker_queue = Arc::clone(&queue);
-        std::thread::Builder::new()
-            .name("keysteer-ui-scan".into())
-            .spawn(move || worker_queue.run())
-            .map_err(|error| format!("Cannot start UI scan worker: {error}"))?;
-        Ok(queue)
-    }
-
     fn submit(&self, job: ScanJob) -> Option<ScanJob> {
-        let mut pending = self
-            .pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let replaced = pending.replace(job);
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.stopping {
+            return Some(job);
+        }
+        let replaced = state.pending.replace(job);
         self.ready.notify_one();
         replaced
     }
 
     fn cancel(&self, request_id: u64) {
-        let mut pending = self
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state
             .pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if pending
             .as_ref()
             .is_some_and(|job| job.request.id == request_id)
         {
-            pending.take();
+            state.pending.take();
         }
+    }
+
+    fn stop(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.stopping = true;
+        state.pending.take();
+        self.ready.notify_all();
     }
 
     fn run(&self) {
         loop {
             let job = {
-                let mut pending = self
-                    .pending
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                while pending.is_none() {
-                    pending = self
+                let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                while state.pending.is_none() && !state.stopping {
+                    state = self
                         .ready
-                        .wait(pending)
+                        .wait(state)
                         .unwrap_or_else(|error| error.into_inner());
                 }
-                let Some(job) = pending.take() else {
+                if state.stopping {
+                    return;
+                }
+                let Some(job) = state.pending.take() else {
                     continue;
                 };
                 job
             };
             autoreleasepool(|_| run_scan(job));
         }
-    }
-}
-
-pub(super) fn request_scan(
-    request: UiScanRequest,
-    generation: u64,
-    mailbox: Arc<ScanMailbox>,
-    wake: EventSender,
-) {
-    LATEST_SCAN.store(generation, Ordering::Release);
-    vision::mark_latest(generation);
-    let queue = match SCAN_QUEUE.get_or_init(ScanQueue::start) {
-        Ok(queue) => queue,
-        Err(error) => {
-            if mailbox.publish(
-                generation,
-                request.id,
-                Vec::new(),
-                UiScanStatus::Failed(error.clone()),
-            ) {
-                wake.wake();
-            }
-            return;
-        }
-    };
-    drop(queue.submit(ScanJob {
-        request,
-        generation,
-        mailbox,
-        wake,
-    }));
-}
-
-pub(super) fn cancel_scan(request_id: u64) {
-    LATEST_SCAN.store(0, Ordering::Release);
-    vision::mark_latest(0);
-    if let Some(Ok(queue)) = SCAN_QUEUE.get() {
-        queue.cancel(request_id);
     }
 }
 
@@ -422,7 +506,7 @@ mod tests {
     #[test]
     fn pending_scan_slot_keeps_only_the_latest_request() {
         let queue = ScanQueue {
-            pending: Mutex::new(None),
+            state: Mutex::new(ScanQueueState::default()),
             ready: Condvar::new(),
         };
         let (sender, _receiver) = std::sync::mpsc::channel();
@@ -450,9 +534,39 @@ mod tests {
             .expect("the single slot should replace its old request");
         assert_eq!(replaced.request.id, 1);
         assert_eq!(
-            queue.pending.lock().unwrap().as_ref().unwrap().request.id,
+            queue
+                .state
+                .lock()
+                .unwrap()
+                .pending
+                .as_ref()
+                .unwrap()
+                .request
+                .id,
             2
         );
+    }
+
+    #[test]
+    fn stopping_the_scan_queue_drops_pending_work() {
+        let queue = ScanQueue {
+            state: Mutex::new(ScanQueueState::default()),
+            ready: Condvar::new(),
+        };
+        let (sender, _receiver) = std::sync::mpsc::channel();
+        let mailbox = Arc::new(ScanMailbox::default());
+        queue.submit(ScanJob {
+            request: request(7),
+            generation: mailbox.begin(7),
+            mailbox,
+            wake: EventSender::new(sender),
+        });
+
+        queue.stop();
+
+        let state = queue.state.lock().unwrap();
+        assert!(state.stopping);
+        assert!(state.pending.is_none());
     }
 
     #[test]

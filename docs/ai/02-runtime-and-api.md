@@ -79,6 +79,11 @@ Engine 的 Frame、指针、按键等通用热路径直接调用借用式 `Mode:
 5. 处理一个 `BackendEvent`，随后触发到期 timer 和延迟动作序列。
 6. 退出时释放所有 latched 输入、隐藏覆盖层并关闭 backend。
 
+原生输入捕获永久丢失与普通合成注入失败是两条不同恢复路径。前者通过
+`InputCaptureLost` 可靠上报，并额外清空物理 pressed/disposition 状态，因为对应 KeyUp
+已经不可能到达；两者都会停止帧时钟、取消扫描、释放合成输入并回到 Idle。Quit 必须调用
+Backend 的幂等完整关闭流程；普通发布包返回主函数后不得保留 KeySteer 进程或线程。
+
 `Backend::poll` 最多阻塞 50ms 或到下一个 timer/sequence/长按截止时间。延迟序列和长按项
 按截止时间倒序保存，最近项位于 `Vec` 尾部；等待只读取尾项，到期只 `pop`，不得在每次
 poll 后重新分配并拆分整个队列。超时返回 `None` 是 Engine 执行内部定时任务的机会。

@@ -1,6 +1,7 @@
 //! Dedicated CGEventTap thread with per-event disposition handshakes.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -24,8 +25,9 @@ const RUN_LOOP_SLICE: Duration = Duration::from_millis(20);
 const STOP_TIMEOUT: Duration = Duration::from_millis(250);
 pub const TIMEOUT_WARNING: &str =
     "keyboard disposition timed out; the key was forwarded and the event tap remained active";
-const PERMISSION_REVOKED_WARNING: &str = "Accessibility permission was revoked; the keyboard hook stopped and keys will be forwarded until KeySteer is restarted after permission is restored";
-const USER_DISABLED_WARNING: &str = "the macOS event tap was disabled by the user; the keyboard hook stopped instead of overriding that choice";
+const CAPTURE_LOSS_NONE: u8 = 0;
+const CAPTURE_LOSS_USER_INPUT: u8 = 1;
+const CAPTURE_LOSS_REPEATED_TIMEOUT: u8 = 2;
 
 struct Envelope {
     event: BackendEvent,
@@ -70,10 +72,6 @@ enum TapDisabled {
     UserInput,
 }
 
-fn should_reenable(disabled: TapDisabled, trusted: bool) -> bool {
-    disabled == TapDisabled::Timeout && trusted
-}
-
 #[derive(Default)]
 struct TapState {
     last_flags: u64,
@@ -108,9 +106,11 @@ pub struct HookThread {
     latest_pointer: SharedPointer,
     stop: Arc<AtomicBool>,
     active: Arc<AtomicBool>,
+    capture_loss: Arc<AtomicU8>,
     run_loop: SharedRunLoop,
     finished: Receiver<()>,
     join: Option<std::thread::JoinHandle<()>>,
+    deferred: VecDeque<BackendEvent>,
 }
 
 pub struct HookStartup {
@@ -120,6 +120,7 @@ pub struct HookStartup {
     latest_pointer: SharedPointer,
     stop: Arc<AtomicBool>,
     active: Arc<AtomicBool>,
+    capture_loss: Arc<AtomicU8>,
     run_loop: SharedRunLoop,
     finished: Option<Receiver<()>>,
     join: Option<std::thread::JoinHandle<()>>,
@@ -139,6 +140,7 @@ struct HookThreadContext {
     mailbox: Arc<crate::platform::disposition_mailbox::DispositionMailbox>,
     stop: Arc<AtomicBool>,
     active: Arc<AtomicBool>,
+    capture_loss: Arc<AtomicU8>,
     run_loop: SharedRunLoop,
     latest_pointer: SharedPointer,
     click_tracker: SharedClickTracker,
@@ -161,6 +163,8 @@ impl HookStartup {
         let thread_stop = Arc::clone(&stop);
         let active = Arc::new(AtomicBool::new(false));
         let thread_active = Arc::clone(&active);
+        let capture_loss = Arc::new(AtomicU8::new(CAPTURE_LOSS_NONE));
+        let thread_capture_loss = Arc::clone(&capture_loss);
         let run_loop = Arc::new(Mutex::new(None));
         let thread_run_loop = Arc::clone(&run_loop);
         let (finished_tx, finished_rx) = mpsc::sync_channel(1);
@@ -178,6 +182,7 @@ impl HookStartup {
                             mailbox: thread_mailbox,
                             stop: thread_stop,
                             active: thread_active,
+                            capture_loss: thread_capture_loss,
                             run_loop: thread_run_loop,
                             latest_pointer: thread_pointer,
                             click_tracker,
@@ -195,6 +200,7 @@ impl HookStartup {
             latest_pointer,
             stop,
             active,
+            capture_loss,
             run_loop,
             finished: Some(finished_rx),
             join: Some(join),
@@ -225,11 +231,13 @@ impl HookStartup {
                     latest_pointer: Arc::clone(&self.latest_pointer),
                     stop: Arc::clone(&self.stop),
                     active: Arc::clone(&self.active),
+                    capture_loss: Arc::clone(&self.capture_loss),
                     run_loop: Arc::clone(&self.run_loop),
                     finished: self.finished.take().ok_or_else(|| {
                         "macOS event tap completion signal is unavailable".to_string()
                     })?,
                     join: self.join.take(),
+                    deferred: VecDeque::new(),
                 })
             }
             Ok(Err(error)) => Err(error),
@@ -270,6 +278,9 @@ impl HookThread {
     }
 
     pub fn next_event(&mut self, timeout: Duration) -> Option<BackendEvent> {
+        if let Some(event) = self.deferred.pop_front() {
+            return Some(event);
+        }
         let envelope = match self.receiver.recv_timeout(timeout) {
             Ok(envelope) => envelope,
             Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => return None,
@@ -292,6 +303,64 @@ impl HookThread {
 
     pub fn try_next_event(&mut self) -> Option<BackendEvent> {
         self.next_event(Duration::ZERO)
+    }
+
+    /// Report terminal capture loss out-of-band from the bounded callback
+    /// queue. Permission removal can happen while that queue is full, so a
+    /// normal `try_send` is not reliable enough for state recovery.
+    pub fn take_capture_loss(&mut self) -> Option<BackendEvent> {
+        let reason = self.capture_loss.swap(CAPTURE_LOSS_NONE, Ordering::AcqRel);
+        if reason == CAPTURE_LOSS_NONE {
+            self.reap_finished();
+            return None;
+        }
+
+        self.pending = None;
+        self.mailbox.cancel_pending();
+        if let Ok(mut pointer) = self.latest_pointer.lock() {
+            pointer.take();
+        }
+        while let Ok(envelope) = self.receiver.try_recv() {
+            if envelope.generation.is_some()
+                || matches!(
+                    envelope.event,
+                    BackendEvent::Input(_)
+                        | BackendEvent::PointerMoved(_)
+                        | BackendEvent::InputInjectionFailed(_)
+                        | BackendEvent::Warning(_)
+                )
+            {
+                continue;
+            }
+            self.deferred.push_back(envelope.event);
+        }
+        self.reap_finished();
+
+        let message = match reason {
+            CAPTURE_LOSS_USER_INPUT => {
+                "macOS disabled physical input capture, usually because Accessibility permission was removed; KeySteer stopped capturing input and must be restarted after permission is restored"
+            }
+            CAPTURE_LOSS_REPEATED_TIMEOUT => {
+                "the macOS event tap timed out again after its single recovery attempt; KeySteer stopped capturing input and must be restarted"
+            }
+            _ => "macOS physical input capture stopped; KeySteer must be restarted",
+        };
+        Some(BackendEvent::InputCaptureLost(message.into()))
+    }
+
+    fn reap_finished(&mut self) {
+        if !self
+            .join
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+        {
+            return;
+        }
+        if let Some(handle) = self.join.take()
+            && handle.join().is_err()
+        {
+            crate::app::logging::report_error("macos-hook", "event tap thread panicked");
+        }
     }
 
     pub fn set_disposition(&mut self, disposition: KeyDisposition) -> Result<(), String> {
@@ -367,6 +436,7 @@ fn event_tap_thread(handshake: HookHandshake, context: HookThreadContext) {
         mailbox,
         stop,
         active,
+        capture_loss,
         run_loop: shared_run_loop,
         latest_pointer,
         click_tracker,
@@ -420,6 +490,7 @@ fn event_tap_thread(handshake: HookHandshake, context: HookThreadContext) {
         return;
     }
 
+    let mut timeout_retried = false;
     while !stop.load(Ordering::Acquire) {
         CFRunLoop::run_in_mode(default_run_loop_mode(), RUN_LOOP_SLICE, true);
         let disabled = state
@@ -427,7 +498,8 @@ fn event_tap_thread(handshake: HookHandshake, context: HookThreadContext) {
             .map(|mut state| state.disabled.take())
             .unwrap_or(None);
         match disabled {
-            Some(disabled) if should_reenable(disabled, super::permissions::is_trusted()) => {
+            Some(TapDisabled::Timeout) if !timeout_retried => {
+                timeout_retried = true;
                 tap.enable();
                 let _ = sender.try_send(Envelope {
                     event: BackendEvent::Warning(
@@ -438,21 +510,20 @@ fn event_tap_thread(handshake: HookHandshake, context: HookThreadContext) {
                 super::workspace::wake_main_run_loop();
             }
             Some(disabled) => {
-                let trusted = super::permissions::is_trusted();
                 active.store(false, Ordering::Release);
                 stop.store(true, Ordering::Release);
                 callback_mailbox.cancel_pending();
-                let _ = sender.try_send(Envelope {
-                    event: BackendEvent::Warning(
-                        if trusted && disabled == TapDisabled::UserInput {
-                            USER_DISABLED_WARNING
-                        } else {
-                            PERMISSION_REVOKED_WARNING
-                        }
-                        .into(),
-                    ),
-                    generation: None,
-                });
+                let reason = if disabled == TapDisabled::UserInput {
+                    CAPTURE_LOSS_USER_INPUT
+                } else {
+                    CAPTURE_LOSS_REPEATED_TIMEOUT
+                };
+                let _ = capture_loss.compare_exchange(
+                    CAPTURE_LOSS_NONE,
+                    reason,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
                 super::workspace::wake_main_run_loop();
             }
             None => {}
@@ -708,11 +779,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_timeout_with_permission_is_automatically_reenabled() {
-        assert!(should_reenable(TapDisabled::Timeout, true));
-        assert!(!should_reenable(TapDisabled::Timeout, false));
-        assert!(!should_reenable(TapDisabled::UserInput, true));
-        assert!(!should_reenable(TapDisabled::UserInput, false));
+    fn only_one_timeout_is_automatically_reenabled() {
+        let mut retried = false;
+        assert!(matches!(TapDisabled::Timeout, TapDisabled::Timeout) && !retried);
+        retried = true;
+        assert!(!(matches!(TapDisabled::Timeout, TapDisabled::Timeout) && !retried));
+        assert!(!matches!(TapDisabled::UserInput, TapDisabled::Timeout));
     }
 
     #[test]
@@ -728,9 +800,11 @@ mod tests {
             latest_pointer: Arc::new(Mutex::new(None)),
             stop: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicBool::new(true)),
+            capture_loss: Arc::new(AtomicU8::new(CAPTURE_LOSS_NONE)),
             run_loop: Arc::new(Mutex::new(None)),
             finished: mpsc::sync_channel(1).1,
             join: None,
+            deferred: VecDeque::new(),
         };
         hook.set_disposition(KeyDisposition::Consume).unwrap();
         assert_eq!(
@@ -753,9 +827,11 @@ mod tests {
             latest_pointer: Arc::new(Mutex::new(None)),
             stop: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicBool::new(true)),
+            capture_loss: Arc::new(AtomicU8::new(CAPTURE_LOSS_NONE)),
             run_loop: Arc::new(Mutex::new(None)),
             finished: mpsc::sync_channel(1).1,
             join: None,
+            deferred: VecDeque::new(),
         };
         hook.set_disposition(KeyDisposition::Forward).unwrap();
         assert!(hook.pending.is_none());
@@ -786,6 +862,46 @@ mod tests {
             ),
             CallbackResult::Keep
         ));
+    }
+
+    #[test]
+    fn capture_loss_is_delivered_even_when_the_event_queue_is_full() {
+        let (event_tx, event_rx) = mpsc::sync_channel(1);
+        event_tx
+            .try_send(Envelope {
+                event: BackendEvent::Input(InputEvent {
+                    key: Key::new("a").unwrap(),
+                    state: KeyState::Down,
+                    repeat: false,
+                    injected: false,
+                    timestamp_millis: 0,
+                }),
+                generation: Some(1),
+            })
+            .unwrap();
+        let capture_loss = Arc::new(AtomicU8::new(CAPTURE_LOSS_USER_INPUT));
+        let mut hook = HookThread {
+            sender: event_tx,
+            receiver: event_rx,
+            mailbox: Arc::new(crate::platform::disposition_mailbox::DispositionMailbox::default()),
+            pending: Some(1),
+            latest_pointer: Arc::new(Mutex::new(Some(Point::new(1.0, 2.0)))),
+            stop: Arc::new(AtomicBool::new(false)),
+            active: Arc::new(AtomicBool::new(false)),
+            capture_loss,
+            run_loop: Arc::new(Mutex::new(None)),
+            finished: mpsc::sync_channel(1).1,
+            join: None,
+            deferred: VecDeque::new(),
+        };
+
+        assert!(matches!(
+            hook.take_capture_loss(),
+            Some(BackendEvent::InputCaptureLost(_))
+        ));
+        assert!(hook.try_next_event().is_none());
+        assert!(hook.pending.is_none());
+        assert_eq!(*hook.latest_pointer.lock().unwrap(), None);
     }
 
     #[test]
@@ -823,9 +939,11 @@ mod tests {
             latest_pointer: Arc::clone(&latest_pointer),
             stop: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicBool::new(true)),
+            capture_loss: Arc::new(AtomicU8::new(CAPTURE_LOSS_NONE)),
             run_loop: Arc::new(Mutex::new(None)),
             finished: mpsc::sync_channel(1).1,
             join: None,
+            deferred: VecDeque::new(),
         };
         let edge = Point::new(999.0, 400.0);
         for _ in 0..2 {
@@ -854,9 +972,11 @@ mod tests {
             latest_pointer: Arc::new(Mutex::new(None)),
             stop: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicBool::new(true)),
+            capture_loss: Arc::new(AtomicU8::new(CAPTURE_LOSS_NONE)),
             run_loop: Arc::new(Mutex::new(None)),
             finished: mpsc::sync_channel(1).1,
             join: None,
+            deferred: VecDeque::new(),
         };
         hook.event_sender()
             .send(BackendEvent::ReloadConfig)

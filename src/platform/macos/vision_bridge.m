@@ -215,12 +215,11 @@ NmkVisionResult *NmkDetectVisionElements(
             return resultWithStatus(NMK_VISION_CONTEXT_CHANGED, nil);
         }
         if (!CGPreflightScreenCaptureAccess()) {
-            static dispatch_once_t requestOnce;
-            static bool granted = false;
-            dispatch_once(&requestOnce, ^{ granted = CGRequestScreenCaptureAccess(); });
-            if (!granted && !CGPreflightScreenCaptureAccess()) {
-                return resultWithStatus(NMK_VISION_PERMISSION, @"Screen Recording permission is required for Vision hints");
-            }
+            // Scanning is an automatic worker operation, not an explicit
+            // permission UI. Requesting access here can contend with System
+            // Settings while the user is removing a TCC grant. Only preflight
+            // on the worker and let the normal permission guidance handle it.
+            return resultWithStatus(NMK_VISION_PERMISSION, @"Screen Recording permission is required for Vision hints");
         }
 
         int32_t captureStatus = NMK_VISION_OK;
