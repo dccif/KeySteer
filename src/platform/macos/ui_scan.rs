@@ -1,18 +1,18 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use objc2::rc::autoreleasepool;
-use smallvec::SmallVec;
-
 use crate::api::command::{UiScanRequest, UiScanStatus, UiScanStrategy};
+use crate::app::worker::WorkerJoin;
+use crate::platform::partial_batcher::PartialBatcher;
 use crate::platform::scan_mailbox::ScanMailbox;
+use objc2::rc::autoreleasepool;
 
 use super::{EventSender, accessibility, vision};
 
 static LATEST_SCAN: AtomicU64 = AtomicU64::new(0);
 const FIRST_PARTIAL_TARGETS: usize = 24;
+const MAX_TARGETS: usize = 2_000;
 const STOP_TIMEOUT: Duration = Duration::from_millis(500);
 
 struct ScanJob {
@@ -49,16 +49,14 @@ struct ScanQueueState {
 /// shuts down instead of relying on a process-static detached thread.
 pub(super) struct UiScanWorker {
     queue: Option<Arc<ScanQueue>>,
-    finished: Option<Receiver<()>>,
-    join: Option<std::thread::JoinHandle<()>>,
+    worker: Option<WorkerJoin>,
 }
 
 impl UiScanWorker {
     pub(super) fn new() -> Self {
         Self {
             queue: None,
-            finished: None,
-            join: None,
+            worker: None,
         }
     }
 
@@ -101,39 +99,19 @@ impl UiScanWorker {
         }
     }
 
-    pub(super) fn shutdown(&mut self) {
+    pub(super) fn shutdown(&mut self) -> Result<(), String> {
         LATEST_SCAN.store(0, Ordering::Release);
         vision::mark_latest(0);
-        if let Some(queue) = self.queue.take() {
+        if let Some(queue) = self.queue.as_ref() {
             queue.stop();
         }
-        let Some(join) = self.join.take() else {
-            self.finished.take();
-            return;
+        let Some(worker) = self.worker.as_mut() else {
+            return Ok(());
         };
-        let completed = join.is_finished()
-            || self.finished.as_ref().is_some_and(|finished| {
-                !matches!(
-                    finished.recv_timeout(STOP_TIMEOUT),
-                    Err(RecvTimeoutError::Timeout)
-                )
-            });
-        self.finished.take();
-        if completed {
-            if join.join().is_err() {
-                crate::app::logging::report_error("macos-ui-scan", "UI scan worker panicked");
-            }
-        } else {
-            // ScreenCaptureKit has no cancellation API for an already submitted
-            // image request. The generation is invalidated and pending work is
-            // gone; dropping the handle keeps Quit bounded, and process exit
-            // then guarantees that no worker survives KeySteer.
-            drop(join);
-            crate::app::logging::report_error(
-                "macos-ui-scan",
-                "UI scan worker did not stop within 500 ms; process exit will finish teardown",
-            );
-        }
+        worker.join_timeout(STOP_TIMEOUT)?;
+        self.worker.take();
+        self.queue.take();
+        Ok(())
     }
 
     fn ensure_started(&mut self) -> Result<Arc<ScanQueue>, String> {
@@ -145,65 +123,22 @@ impl UiScanWorker {
             ready: Condvar::new(),
         });
         let worker_queue = Arc::clone(&queue);
-        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
-        let join = std::thread::Builder::new()
-            .name("keysteer-ui-scan".into())
-            .spawn(move || {
-                worker_queue.run();
-                let _ = finished_tx.send(());
-            })
-            .map_err(|error| format!("Cannot start UI scan worker: {error}"))?;
+        let worker = WorkerJoin::spawn(
+            "macOS UI scan",
+            std::thread::Builder::new().name("keysteer-ui-scan".into()),
+            move || worker_queue.run(),
+        )?;
         self.queue = Some(Arc::clone(&queue));
-        self.finished = Some(finished_rx);
-        self.join = Some(join);
+        self.worker = Some(worker);
         Ok(queue)
     }
 }
 
 impl Drop for UiScanWorker {
     fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
-/// Count-driven partial batching. It intentionally has no timer: publication
-/// is independent of display refresh rate and machine speed. The first 24
-/// targets are visible immediately; later publications happen when the total
-/// reaches 48, 96, 192, and so on. Completion always flushes the remainder.
-struct PartialBatches<T> {
-    pending: Vec<T>,
-    published: usize,
-    next_total: usize,
-}
-
-impl<T> PartialBatches<T> {
-    fn new() -> Self {
-        Self {
-            pending: Vec::with_capacity(FIRST_PARTIAL_TARGETS),
-            published: 0,
-            next_total: FIRST_PARTIAL_TARGETS,
+        if let Err(error) = self.shutdown() {
+            crate::app::logging::report_error("macos-ui-scan", &error);
         }
-    }
-
-    fn push(&mut self, targets: impl IntoIterator<Item = T>) -> SmallVec<[Vec<T>; 1]> {
-        let mut ready = SmallVec::new();
-        for target in targets {
-            self.pending.push(target);
-            if self.published + self.pending.len() == self.next_total {
-                let current_total = self.next_total;
-                let following_total = current_total.saturating_mul(2).min(2_000);
-                let next_capacity = following_total.saturating_sub(current_total);
-                let batch = std::mem::replace(&mut self.pending, Vec::with_capacity(next_capacity));
-                self.published += batch.len();
-                self.next_total = following_total;
-                ready.push(batch);
-            }
-        }
-        ready
-    }
-
-    fn finish(&mut self) -> Option<Vec<T>> {
-        (!self.pending.is_empty()).then(|| std::mem::take(&mut self.pending))
     }
 }
 
@@ -213,7 +148,7 @@ impl<T> PartialBatches<T> {
 struct PartialPublisher<'a> {
     job: &'a ScanJob,
     pid: libc::pid_t,
-    batches: Mutex<PartialBatches<crate::api::UiTarget>>,
+    batches: Mutex<PartialBatcher<crate::api::UiTarget>>,
 }
 
 impl<'a> PartialPublisher<'a> {
@@ -221,7 +156,7 @@ impl<'a> PartialPublisher<'a> {
         Self {
             job,
             pid,
-            batches: Mutex::new(PartialBatches::new()),
+            batches: Mutex::new(PartialBatcher::new(FIRST_PARTIAL_TARGETS, MAX_TARGETS)),
         }
     }
 
@@ -242,7 +177,7 @@ impl<'a> PartialPublisher<'a> {
             .batches
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let ready = batches.push(targets);
+        let ready = batches.extend(targets);
         for batch in ready {
             self.send(batch);
         }
@@ -567,55 +502,5 @@ mod tests {
         let state = queue.state.lock().unwrap();
         assert!(state.stopping);
         assert!(state.pending.is_none());
-    }
-
-    #[test]
-    fn partial_batches_are_count_driven_and_completion_flushes_the_remainder() {
-        let mut batches = PartialBatches::new();
-        assert!(batches.push(0..23).is_empty());
-        let first = batches.push([23]);
-        assert_eq!(first.as_slice(), &[Vec::from_iter(0..24)]);
-
-        let second = batches.push(24..48);
-        assert_eq!(second.as_slice(), &[Vec::from_iter(24..48)]);
-        assert!(batches.push(48..95).is_empty());
-        let third = batches.push([95]);
-        assert_eq!(third.as_slice(), &[Vec::from_iter(48..96)]);
-
-        assert!(batches.push(96..101).is_empty());
-        assert_eq!(batches.finish(), Some(Vec::from_iter(96..101)));
-        assert_eq!(batches.finish(), None);
-    }
-
-    #[test]
-    fn partial_batch_boundaries_cover_zero_24_25_and_2000_targets() {
-        for (count, expected_sizes) in [
-            (0, vec![]),
-            (24, vec![24]),
-            (25, vec![24, 1]),
-            (2_000, vec![24, 24, 48, 96, 192, 384, 768, 464]),
-        ] {
-            let mut batches = PartialBatches::new();
-            let mut output = Vec::new();
-            let mut sizes = Vec::new();
-            for batch in batches.push(0..count) {
-                sizes.push(batch.len());
-                output.extend(batch);
-            }
-            if let Some(batch) = batches.finish() {
-                sizes.push(batch.len());
-                output.extend(batch);
-            }
-            assert_eq!(sizes, expected_sizes);
-            assert_eq!(output, Vec::from_iter(0..count));
-        }
-    }
-
-    #[test]
-    fn final_partial_reserves_only_the_remaining_target_limit() {
-        let mut batches = PartialBatches::new();
-        let ready = batches.push(0..1_536);
-        assert_eq!(ready.iter().map(Vec::len).sum::<usize>(), 1_536);
-        assert_eq!(batches.pending.capacity(), 464);
     }
 }

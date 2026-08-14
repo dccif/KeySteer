@@ -152,6 +152,7 @@ impl Engine {
         }
         let scene = Arc::new(scene);
         crate::app::perf_probe::mark("overlay_submitted");
+        crate::app::perf_probe::mark("native_submitted");
         backend.present(Arc::clone(&scene))?;
         crate::app::perf_probe::mark("overlay_presented");
         self.trace(trace_overlay, "overlay", "backend present: ok");
@@ -241,6 +242,7 @@ impl Engine {
             return Ok(());
         }
 
+        crate::app::perf_probe::mark("native_submitted");
         match backend.update_overlay_positions(positions.cursor, positions.indicator) {
             Ok(true) => {
                 self.overlay_positions = Some(positions);

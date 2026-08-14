@@ -18,10 +18,10 @@ use crate::api::command::{
     UiScanStatus,
 };
 use crate::api::geometry::{Rect, UiTarget};
-use crate::api::input::{Key, KeyState, ModeId};
+use crate::api::input::{Key, KeyChord, KeyState, ModeId};
 use crate::api::overlay::{Color, OverlayLabel, OverlayScene, OverlayShape};
 use crate::config::{Config, Palette, UiHint as HintsConfig};
-use crate::hints::{self, Hint, Match};
+use crate::hints::{self, CompactHint, Match};
 
 const SCAN_RETRY_TIMER_ID: &str = "ui_hint.scan_retry";
 /// Reuse the small container backing needed by the common UIHint session.
@@ -51,6 +51,7 @@ impl Input {
 pub struct HintMode {
     config: HintsConfig,
     alphabet: Vec<char>,
+    overlap_cycle_chord: Option<KeyChord>,
 
     /// Everything the current scan has returned so far.
     scanned: Vec<UiTarget>,
@@ -62,7 +63,7 @@ pub struct HintMode {
     seen_targets: HashMap<(i64, i64, i64, i64), SmallVec<[usize; 2]>>,
     /// Labelled subset currently on screen; the value is an index into
     /// `scanned`.
-    hints: Vec<Hint<usize>>,
+    hints: Vec<CompactHint<usize>>,
     input: Input,
     scanning: bool,
     status: Option<String>,
@@ -88,6 +89,7 @@ impl HintMode {
         Self {
             config: config.ui_hint.clone(),
             alphabet: config.ui_hint.hint_characters.chars().collect(),
+            overlap_cycle_chord: KeyChord::parse(&config.ui_hint.overlap_cycle_key).ok(),
             scanned: Vec::new(),
             scanned_names_lower: Vec::new(),
             search_names_initialized: false,
@@ -236,6 +238,7 @@ impl HintMode {
                 self.scan_bounds
                     .is_none_or(|bounds| bounds.contains(&target.rect.center()))
             });
+            self.seen_targets.reserve(self.scanned.len());
 
             let mut index = 0;
             while index < self.scanned.len() {
@@ -257,6 +260,12 @@ impl HintMode {
             return !self.scanned.is_empty();
         }
 
+        let incoming = targets.len();
+        self.scanned.reserve(incoming);
+        self.seen_targets.reserve(incoming);
+        if self.search_names_initialized {
+            self.scanned_names_lower.reserve(incoming);
+        }
         for target in targets {
             self.append_target(target);
         }
@@ -324,6 +333,15 @@ impl HintMode {
             return commands;
         }
 
+        if status == UiScanStatus::Success
+            && !labels_changed
+            && !self.hints.is_empty()
+            && self.status.is_none()
+        {
+            self.scanning = false;
+            return CommandBatch::new();
+        }
+
         self.scanning = false;
         self.status = match &status {
             UiScanStatus::Success if self.hints.is_empty() => {
@@ -345,7 +363,9 @@ impl HintMode {
     /// Assign labels to the targets matching the current search query.
     fn relabel(&mut self) {
         let query = match &self.input {
-            Input::Search(query) => Some(query.to_lowercase()),
+            // Key names are normalized to lowercase before Mode delivery, so
+            // the accumulated search query is already canonical.
+            Input::Search(query) => Some(query.as_str()),
             Input::Labels(_) => None,
         };
         if query.is_some() && !self.search_names_initialized {
@@ -360,13 +380,11 @@ impl HintMode {
             .iter()
             .enumerate()
             .filter(|(index, _)| {
-                query
-                    .as_ref()
-                    .is_none_or(|query| self.scanned_names_lower[*index].contains(query))
+                query.is_none_or(|query| self.scanned_names_lower[*index].contains(query))
             })
             .map(|(index, target)| (target.rect, index));
 
-        if hints::assign_into(
+        if hints::assign_compact_into(
             &mut self.hints,
             candidates,
             &self.alphabet,
@@ -379,9 +397,9 @@ impl HintMode {
         self.overlap_labels_dirty = false;
     }
 
-    fn hint_is_visible(&self, hint: &Hint<usize>) -> bool {
+    fn hint_is_visible(&self, hint: &CompactHint<usize>) -> bool {
         match &self.input {
-            Input::Labels(typed) => typed.is_empty() || hint.label.starts_with(typed),
+            Input::Labels(typed) => typed.is_empty() || hint.label.as_str().starts_with(typed),
             Input::Search(_) => true,
         }
     }
@@ -480,7 +498,7 @@ impl HintMode {
         };
         let matched_prefix_len = typed.chars().count();
         for hint in self.hints.iter().filter(|hint| self.hint_is_visible(hint)) {
-            let width = label_style.font_size * 0.75 * hint.label.chars().count() as f64
+            let width = label_style.font_size * 0.75 * hint.label.as_str().chars().count() as f64
                 + label_style.padding_x * 2.0;
             let height = label_style.font_size * 1.4 + label_style.padding_y * 2.0;
             let placed = placement.place(&hint.bounds, width, height);
@@ -491,7 +509,7 @@ impl HintMode {
                 placed.height,
             );
             scene.push_label(
-                OverlayLabel::new(hint.label.clone(), rect, label_style.clone())
+                OverlayLabel::new(hint.label.as_str(), rect, label_style.clone())
                     .with_matched_prefix(matched_prefix_len)
                     .with_z_index(2),
             );
@@ -691,7 +709,7 @@ impl HintMode {
                     return CommandBatch::new();
                 }
                 typed.push(ch);
-                match hints::match_input(&self.hints, typed) {
+                match match_compact_input(&self.hints, typed) {
                     Match::Complete(index) => self.select(index),
                     Match::Partial { .. } => self.redraw(ctx),
                     // Dead end: drop the character and keep the hints up.
@@ -704,6 +722,26 @@ impl HintMode {
                 }
             }
         }
+    }
+}
+
+fn match_compact_input(hints: &[CompactHint<usize>], input: &str) -> Match<usize> {
+    if input.is_empty() {
+        return Match::Partial {
+            remaining: hints.len(),
+        };
+    }
+    if let Some(hit) = hints.iter().find(|hint| hint.label.as_str() == input) {
+        return Match::Complete(hit.value);
+    }
+    let remaining = hints
+        .iter()
+        .filter(|hint| hint.label.as_str().starts_with(input))
+        .count();
+    if remaining == 0 {
+        Match::None
+    } else {
+        Match::Partial { remaining }
     }
 }
 
@@ -720,9 +758,9 @@ fn rotate_overlapping_labels(labels: &mut [OverlayLabel], cycle: usize) {
     }
 
     let count = labels.len();
-    let mut parents: Vec<usize> = (0..count).collect();
-    let mut ranks = vec![0u8; count];
-    let mut order: Vec<usize> = (0..count).collect();
+    let mut parents: SmallVec<[usize; 128]> = (0..count).collect();
+    let mut ranks: SmallVec<[u8; 128]> = std::iter::repeat_n(0, count).collect();
+    let mut order: SmallVec<[usize; 128]> = (0..count).collect();
     order.sort_unstable_by(|left, right| {
         labels[*left]
             .rect
@@ -733,7 +771,7 @@ fn rotate_overlapping_labels(labels: &mut [OverlayLabel], cycle: usize) {
     // Sweep from left to right. Only rectangles whose right edge still
     // reaches the current label can intersect it, avoiding the previous full
     // n-by-n scan for ordinary sparse UI layouts.
-    let mut active: Vec<usize> = Vec::new();
+    let mut active: SmallVec<[usize; 128]> = SmallVec::new();
     for index in order {
         let left = labels[index].rect.left();
         active.retain(|other| labels[*other].rect.right() >= left);
@@ -757,12 +795,12 @@ fn rotate_overlapping_labels(labels: &mut [OverlayLabel], cycle: usize) {
         active.push(index);
     }
 
-    let mut sizes = vec![0usize; count];
+    let mut sizes: SmallVec<[usize; 128]> = std::iter::repeat_n(0, count).collect();
     for index in 0..count {
         let component = root(&mut parents, index);
         sizes[component] += 1;
     }
-    let mut positions = vec![0usize; count];
+    let mut positions: SmallVec<[usize; 128]> = std::iter::repeat_n(0, count).collect();
     for (index, label) in labels.iter_mut().enumerate() {
         let component = root(&mut parents, index);
         let size = sizes[component];
@@ -875,7 +913,13 @@ impl Mode for HintMode {
                 key,
                 state,
                 repeat: false,
-            } if self.config.overlap_cycle_matches(key) => self.overlap_cycle_key(key, *state, ctx),
+            } if self
+                .overlap_cycle_chord
+                .as_ref()
+                .is_some_and(|chord| chord.activation_matches(key)) =>
+            {
+                self.overlap_cycle_key(key, *state, ctx)
+            }
             ModeEvent::Key {
                 key,
                 state: KeyState::Down,
@@ -1147,7 +1191,74 @@ mod tests {
 
         let completed = deliver(&mut mode, &env, Vec::new());
         assert!(!mode.scanning);
-        assert_eq!(scene_of(&completed).labels.len(), 2);
+        assert!(
+            completed.is_empty(),
+            "an unchanged terminal must not redraw"
+        );
+        assert_eq!(mode.hints.len(), 2);
+    }
+
+    #[test]
+    #[ignore = "microbenchmark probe; run in release with --test-threads=1"]
+    fn unchanged_terminal_performance_probe() {
+        const WARMUP: usize = 2_000;
+        const SAMPLES: usize = 20_000;
+
+        fn prepared(env: &Env) -> HintMode {
+            let mut mode = HintMode::new(&env.config);
+            activate(&mut mode, env);
+            let scan_id = mode.scan_id;
+            mode.handle_owned(
+                ModeEvent::UiScanned(UiScanResult {
+                    id: scan_id,
+                    targets: vec![target("Save", 0.0), target("Cancel", 200.0)],
+                    status: UiScanStatus::Partial,
+                }),
+                &env.ctx(),
+            );
+            mode
+        }
+
+        fn measure(mut operation: impl FnMut()) -> (u128, u128, u128) {
+            for _ in 0..WARMUP {
+                operation();
+            }
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let started = std::time::Instant::now();
+                operation();
+                samples.push(started.elapsed().as_nanos());
+            }
+            samples.sort_unstable();
+            let last = samples.len() - 1;
+            (
+                samples[last * 50 / 100],
+                samples[last * 95 / 100],
+                samples[last * 99 / 100],
+            )
+        }
+
+        let env = Env::new();
+        let mut fast = prepared(&env);
+        let scan_id = fast.scan_id;
+        let no_op = measure(|| {
+            std::hint::black_box(fast.handle_owned(
+                ModeEvent::UiScanned(UiScanResult {
+                    id: scan_id,
+                    targets: Vec::new(),
+                    status: UiScanStatus::Success,
+                }),
+                &env.ctx(),
+            ));
+        });
+        let legacy = prepared(&env);
+        let redraw = measure(|| {
+            std::hint::black_box(legacy.redraw(&env.ctx()));
+        });
+        println!(
+            "hint_terminal_probe samples={SAMPLES} no_op_p50={}ns no_op_p95={}ns no_op_p99={}ns redraw_p50={}ns redraw_p95={}ns redraw_p99={}ns",
+            no_op.0, no_op.1, no_op.2, redraw.0, redraw.1, redraw.2,
+        );
     }
 
     #[test]
@@ -1698,6 +1809,71 @@ mod tests {
         assert!(
             scene_of(&out).labels.iter().any(|l| l.text == "/c"),
             "search box missing"
+        );
+    }
+
+    #[test]
+    fn unicode_search_uses_the_normalized_key_without_changing_matches() {
+        let env = Env::new();
+        let mut mode = HintMode::new(&env.config);
+        activate(&mut mode, &env);
+        deliver(
+            &mut mode,
+            &env,
+            vec![target("École", 0.0), target("Cancel", 200.0)],
+        );
+
+        press(&mut mode, &env, "/");
+        press(&mut mode, &env, "É");
+
+        assert_eq!(mode.input.text(), "é");
+        assert_eq!(mode.hints.len(), 1);
+        assert_eq!(mode.scanned[mode.hints[0].value].name, "École");
+    }
+
+    #[test]
+    #[ignore = "microbenchmark probe; run in release with --test-threads=1"]
+    fn normalized_search_query_performance_probe() {
+        const WARMUP: usize = 2_000;
+        const SAMPLES: usize = 20_000;
+        const CALLS_PER_SAMPLE: usize = 100;
+
+        fn measure(mut operation: impl FnMut()) -> (u128, u128, u128) {
+            for _ in 0..WARMUP {
+                operation();
+            }
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let started = std::time::Instant::now();
+                for _ in 0..CALLS_PER_SAMPLE {
+                    operation();
+                }
+                samples.push(started.elapsed().as_nanos() / CALLS_PER_SAMPLE as u128);
+            }
+            samples.sort_unstable();
+            let last = samples.len() - 1;
+            (
+                samples[last * 50 / 100],
+                samples[last * 95 / 100],
+                samples[last * 99 / 100],
+            )
+        }
+
+        let query = String::from("école");
+        let borrowed = measure(|| {
+            std::hint::black_box(query.as_str());
+        });
+        let normalized_again = measure(|| {
+            std::hint::black_box(query.to_lowercase());
+        });
+        println!(
+            "hint_search_query_probe samples={SAMPLES} calls_per_sample={CALLS_PER_SAMPLE} borrowed_p50={}ns borrowed_p95={}ns borrowed_p99={}ns normalized_again_p50={}ns normalized_again_p95={}ns normalized_again_p99={}ns",
+            borrowed.0,
+            borrowed.1,
+            borrowed.2,
+            normalized_again.0,
+            normalized_again.1,
+            normalized_again.2,
         );
     }
 

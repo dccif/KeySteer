@@ -7,7 +7,8 @@
 - Vision result 由 Rust RAII owner 释放，读取 slice 前验证 count<=2000 和非空指针。
 - COM apartment 显式 `!Send/!Sync`，确保 `CoUninitialize` 回到初始化线程。
 - 两个平台入口不放行 undocumented unsafe；每个最小块记录 `SAFETY` 契约。机械门禁当前为
-  不高于 275 个 unsafe expression/23 个文件，portable 层继续保持零 unsafe。
+  不高于 255 个 unsafe expression/20 个文件；`domain` 与其余 portable 层使用编译期
+  `forbid(unsafe_code)`/测试门禁保持零 unsafe。
 
 ## 共同契约
 
@@ -45,9 +46,16 @@ may open File Explorer instead of preserving the complete URL for the default br
   请求中，再生成最多 16 个栈内 `INPUT`；超长序列才分配。虚拟键正向查找由同一份定义表
   生成编译期 `match`，不在线性表中逐项搜索，也不维护第二份运行时 map。
 - 物理左右 Alt 始终立即透传，不延迟也不回放，因此 AHK、Quicker 和 `Alt+物理鼠标键` 能看到真实状态。若随后一个明确绑定的非修饰键被消费，Hook 将带自身标记的未分配 `0xE8` down/up 排入自己的消息循环，回调返回后再发送，以阻止 Alt 松开时激活菜单；失败只报告非致命 warning。
-- `accessibility.rs` 是持久 COM MTA UIA worker。
+- `accessibility.rs` 是持久 COM MTA UIA worker，并在 MTA 内复用只读 query plan。
 - `frame_clock.rs` 有 DWM 等待 worker，one-slot channel 合并多余帧。
 - worker 和 tray 通过 `EventSender` 发 channel，并用自定义 `WM_APP` 唤醒 engine thread。
+- Windows Hook、overlay renderer 和 tray 的 readiness 由 `WorkerJoin` 设置 deadline；平台初始化
+  失败必须返回错误，不能在 `recv()` 上无限等待。
+- overlay、frame clock、Hook、tray、UIA 和 update 都通过公共 `WorkerJoin` 记录 completion、panic
+  与 shutdown deadline。frame-clock 的 compositor event 由 worker 自己拥有，Engine 只读取其
+  临时 token 发出 interrupt；即使 deadline 失败也不会关闭仍被 worker 使用的 HANDLE。
+  `WorkerJoin` 等待超时会保留 `JoinHandle`，调用者可以在同一绝对 deadline 内继续回收，不能
+  因第一次短等待超时就静默 detach。
 - `MsgWaitForMultipleObjects`/message pump 保持原生窗口与 Engine poll 集成。
 
 ### 子模块
@@ -94,15 +102,20 @@ item、window 和 display link 都有线程亲和性。
 - `hook.rs` 在专用 CFRunLoop thread 安装 CGEventTap，并做 disposition handshake。tap 的创建与
   status item、frame clock、屏幕和 workspace 初始化并行，Backend 完成前才启用，启动期间
   的异步事件先进入 fallback channel，成功后通过共享 `OnceLock` 路由到有界 Hook 队列。
-- AppKit main run loop 负责窗口、菜单栏和 workspace 事件。
+- AppKit main run loop 负责窗口、菜单栏和 workspace 事件；wake 使用 typed
+  `objc2-core-foundation` 接口。workspace 先比较 PID，只有前台进程变化时才分配 bundle ID，
+  appearance 与静态 `NSString` 直接比较。
 - `ui_scan.rs` 有一个持久扫描 worker；Hybrid 内部只在本次 job scope 并发 AX。
 - worker/menu event 通过 hook queue 或 channel 发送，并显式唤醒主 run loop。
 - frame clock 绑定 overlay cursor view，跨屏后 AppKit 自动跟踪目标显示器 cadence。
+- 高频 Pointer 位置使用原子 seqlock latest-point mailbox；队列忙时只覆盖旧位置，按键和
+  capture-loss 仍走各自可靠路径，因此 EventTap callback 不再竞争 `Mutex<Point>`。
 - cursor/indicator 位置更新直接在禁用隐式动画的事务中修改已有 CALayer frame，不构造
   `NSString`、颜色、路径或完整 scene；隐藏或首帧未完成时由 Engine 回退完整提交。
 - Backend 缓存一个轻量 `CGEventSource`；单键与拥有所有权的组合键批次复用它，批次先验证
-  全部键码再注入。正向键码使用由反向表同源生成的编译期 `match`，修饰键 Hook 复用预热
-  `Key`，鼠标批次以 `OwnedCf` 数组负责失败路径释放。
+  全部键码再注入。输入注入使用 `objc2-core-graphics` 的 typed retained/borrowed API，
+  `input.rs` 编译期 `forbid(unsafe_code)`；正向键码使用由反向表同源生成的编译期 `match`，
+  修饰键 Hook 复用预热 `Key`。
 
 ### 子模块
 
@@ -137,9 +150,9 @@ Retina 下快速重绘时文字基线出现单帧纵向抖动。
   时钟、释放合成输入并回到 Idle。撤权路径不在 TCC 正在改动时调用
   `AXIsProcessTrusted`。`TapDisabledByTimeout` 全进程只自动恢复一次，再次超时同样停止。
 - macOS Backend 的幂等 shutdown 顺序为：先移除 status item/系统回调，再停止 display
-  link、失效并停止 UI scan、取消更新、释放 held input、停止 Hook、关闭 overlay。Hook、扫描和更新采用
-  有界等待；系统 API 不响应取消时不让 Quit 永久卡住，主函数返回后由进程退出保证没有
-  KeySteer 线程残留。
+  link、失效并停止 UI scan、取消更新、释放 held input、停止 Hook、关闭 overlay。扫描和更新
+  event tap、扫描和更新使用公共 `WorkerJoin`；成功 shutdown 必须完成 join，deadline 超时作为错误传播并立即退出
+  进程，不能在后台 worker 仍存活时继续驻留。
 - Vision 屏幕内容检测需要 Screen Recording。
 - Vision 自动扫描只做 Screen Recording preflight；权限申请不得从扫描 worker 发起，以免
   在用户修改 TCC 设置时与 System Settings 竞争。

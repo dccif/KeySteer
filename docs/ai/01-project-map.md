@@ -23,7 +23,7 @@ keysteer/
 | 路径 | 职责 | 常见入口 |
 | --- | --- | --- |
 | `src/api/` | 跨平台公共协议：按键、动作、命令、事件、几何、场景、插件、后端 trait | `api/mod.rs`, `command.rs`, `backend.rs` |
-| `src/app/` | 程序启动、CLI、日志、路径、网页配置交接和运行时编排 | `bootstrap.rs`, `config_simulator.rs`, `runtime/mod.rs` |
+| `src/app/` | 程序启动、CLI、日志、路径、网页配置交接、worker join 和运行时编排 | `bootstrap.rs`, `config_simulator.rs`, `worker.rs`, `runtime/mod.rs` |
 | `src/config/` | TOML 模型、校验、主题解析、原子写入 | `mod.rs`, `store.rs`, `style.rs` |
 | `src/domain/hints/` | 与平台无关的 UI Hint 标签分配、匹配和空间算法 | `labels.rs`, `matcher.rs`, `grid.rs` |
 | `src/modes/` | 五个内置 Mode 状态机 | `normal.rs`, `grid.rs`, `recursive_grid.rs`, `hint.rs` |
@@ -40,6 +40,10 @@ keysteer/
 - `src/lib.rs`：公开库模块，并保留 `engine`、`hints` 兼容别名。
 - `src/app/bootstrap.rs`：加载配置、创建 backend/engine、注册内置模式和插件、进入事件循环。
 - `src/platform/mod.rs`：唯一的目标平台选择点。
+- `src/platform/partial_batcher.rs` / `scan_mailbox.rs`：两端共用的纯计数流式批次与
+  generation-aware latest-only 扫描邮箱。
+- `src/platform/latest_point_mailbox.rs`：macOS EventTap 使用的无锁 latest-point
+  seqlock；只合并高频位置，不承载按键或控制事件。
 
 ## `src/api/` 文件定位
 

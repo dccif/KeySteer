@@ -1,5 +1,11 @@
 # 更新日志 / Release Notes
 
+## 0.8.14
+
+进一步降低普通输入与 UI Hint 的尾延迟和临时分配，并收紧 Windows/macOS 原生线程与 Unsafe 安全边界。
+
+Further reduce input and UI Hint tail latency and temporary allocations while tightening native thread and unsafe boundaries on Windows and macOS.
+
 ## 0.8.13
 
 UI Hint 扫描结果改为零拷贝传递，快捷键注入减少临时分配，并进一步收紧跨平台 Unsafe 边界。

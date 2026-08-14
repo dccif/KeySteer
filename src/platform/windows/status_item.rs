@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::thread::JoinHandle;
+use std::time::Duration;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::UI::Shell::{
@@ -28,6 +28,7 @@ use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::api::Autostart;
 use crate::api::backend::{BackendEvent, UpdateCheckResult, UpdateProgress};
+use crate::app::worker::WorkerJoin;
 
 use super::EventSender;
 
@@ -89,8 +90,10 @@ impl Drop for NativeDialogGuard {
 pub struct StatusItem {
     thread_id: u32,
     hwnd: HWND,
-    join: Option<JoinHandle<()>>,
+    worker: Option<WorkerJoin>,
 }
+
+const TRAY_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl StatusItem {
     pub fn new(sender: EventSender) -> Result<Self, String> {
@@ -100,28 +103,29 @@ impl StatusItem {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(sender);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-        let join = std::thread::Builder::new()
-            .name("keysteer-tray".into())
-            .spawn(move || tray_thread(ready_tx))
-            .map_err(|error| {
-                clear_sender();
-                format!("cannot start tray thread: {error}")
-            })?;
-        match ready_rx.recv() {
+        let mut worker = WorkerJoin::spawn(
+            "Windows tray",
+            std::thread::Builder::new().name("keysteer-tray".into()),
+            move || tray_thread(ready_tx),
+        )
+        .inspect_err(|_| {
+            clear_sender();
+        })?;
+        match worker.wait_ready(&ready_rx, TRAY_STOP_TIMEOUT) {
             Ok(Ok((thread_id, hwnd))) => Ok(Self {
                 thread_id,
                 hwnd: HWND(hwnd as *mut _),
-                join: Some(join),
+                worker: Some(worker),
             }),
             Ok(Err(error)) => {
-                let _ = join.join();
+                let _ = worker.join_timeout(TRAY_STOP_TIMEOUT);
                 clear_sender();
                 Err(error)
             }
-            Err(_) => {
-                let _ = join.join();
+            Err(error) => {
+                let _ = worker.join_timeout(TRAY_STOP_TIMEOUT);
                 clear_sender();
-                Err("tray thread stopped before reporting readiness".into())
+                Err(error)
             }
         }
     }
@@ -138,7 +142,11 @@ impl StatusItem {
         APPEARANCE_CHANGED.swap(false, Ordering::AcqRel)
     }
 
-    pub fn stop(&mut self) {
+    pub fn stop(&mut self) -> Result<(), String> {
+        if self.worker.is_none() {
+            clear_sender();
+            return Ok(());
+        }
         let mut posted = false;
         if self.thread_id != 0 {
             if !self.hwnd.is_invalid() {
@@ -158,18 +166,18 @@ impl StatusItem {
             self.thread_id = 0;
             self.hwnd = HWND::default();
         }
-        if let Some(join) = self.join.take() {
-            if posted {
-                if join.join().is_err() {
-                    crate::app::logging::report_error("windows-tray", "tray thread panicked");
-                }
-            } else {
-                // Never block shutdown when Windows rejected the only wake-up
-                // that can terminate this message-loop thread.
-                drop(join);
-            }
+        let result = self
+            .worker
+            .as_mut()
+            .map_or(Ok(()), |worker| worker.join_timeout(TRAY_STOP_TIMEOUT));
+        if result.is_ok() {
+            self.worker.take();
         }
         clear_sender();
+        if !posted && result.is_ok() {
+            return Err("Windows rejected the tray shutdown wake-up".into());
+        }
+        result
     }
 }
 
@@ -186,7 +194,9 @@ pub(super) fn set_update_progress(progress: &UpdateProgress) {
 
 impl Drop for StatusItem {
     fn drop(&mut self) {
-        self.stop();
+        if let Err(error) = self.stop() {
+            crate::app::logging::report_error("windows-tray", &error);
+        }
     }
 }
 

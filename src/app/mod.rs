@@ -11,5 +11,6 @@ pub(crate) mod paths;
 pub(crate) mod perf_probe;
 pub mod runtime;
 pub(crate) mod update;
+pub(crate) mod worker;
 
 pub use cli::{prepare_console_for_cli, run_cli};

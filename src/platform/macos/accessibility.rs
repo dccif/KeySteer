@@ -69,6 +69,7 @@ unsafe extern "C" {
     fn AXUIElementCopyActionNames(element: AXUIElementRef, names: *mut *const c_void) -> c_int;
     fn AXUIElementSetMessagingTimeout(element: AXUIElementRef, timeout: c_double) -> c_int;
     fn AXUIElementGetTypeID() -> usize;
+    fn AXValueGetTypeID() -> usize;
     fn AXValueGetType(value: AXValueRef) -> c_int;
     fn AXValueGetValue(value: AXValueRef, value_type: c_int, output: *mut c_void) -> bool;
 }
@@ -254,7 +255,7 @@ impl Scan<'_> {
                     rect,
                     name: accessible_name(element, &self.attributes),
                     role: semantic_role.to_string(),
-                    native_role: Some(role.clone()),
+                    native_role: Some(role),
                 });
                 self.target_count += 1;
                 if self.batch.len() >= 24 {
@@ -329,10 +330,13 @@ fn element_rect(element: AXUIElementRef, attributes: &AxAttributes) -> Option<Re
     let size = copy_attribute(element, &attributes.size)?;
     let mut point = CGPoint::new(0.0, 0.0);
     let mut dimensions = CGSize::new(0.0, 0.0);
-    // SAFETY: both +1 objects are live. AXValueGetType verifies their concrete
-    // payloads before AXValueGetValue writes into correctly sized outputs.
+    // SAFETY: both +1 objects are live Core Foundation values. CFGetTypeID
+    // first proves they are AXValue objects before AXValueGetType inspects the
+    // payload, and AXValueGetValue writes into correctly sized outputs.
     let (point_ok, size_ok) = unsafe {
-        if AXValueGetType(position.as_ptr()) != AX_VALUE_CGPOINT
+        if CFGetTypeID(position.as_ptr()) != AXValueGetTypeID()
+            || CFGetTypeID(size.as_ptr()) != AXValueGetTypeID()
+            || AXValueGetType(position.as_ptr()) != AX_VALUE_CGPOINT
             || AXValueGetType(size.as_ptr()) != AX_VALUE_CGSIZE
         {
             return None;

@@ -31,6 +31,10 @@ Mode 热路径返回 `CommandBatch`：0/1/2 个命令不分配，第三个命令
 `tests/performance.rs` 用 instrumented allocator 锁定预热后的 Normal frame 为零分配，
 `cargo bench --bench core_hot_paths` 报告其 p50/p95/p99。temporary-mode chord 与 keymap 一起
 预编译，物理修饰键查通用别名时使用借用查表，不在按键路径构造临时 `Key`。
+Engine 的稳定 `ModeSlot` 缓存活动模式、pointer interest 和已编译路由；优化只减少分派与
+临时所有权开销，不改变 `CompiledKeymap` 的查找语义。UIHint 点击状态的 inline 2 指同时
+活动的 `(Key, MouseButton)` 指示器条目，而不是 Hint 标签字符数；常见 0–1 项不分配，第三个
+同时活动的点击状态才安全 spill。
 
 cursor marker 由 Engine 在 mode scene 之上装饰；合成鼠标按钮进入 latched 状态，或普通
 click 的物理触发键仍按住时，仅替换 marker 的填充/轮廓颜色并刷新动态 overlay，不改变
@@ -108,6 +112,8 @@ UI Hint 按需为目标名缓存一次 lowercase 结果；退出后立即 drop �
 空 `scanned`/`hints`/dedup backing；超过上限的 request-scoped backing 立即释放，因此大型
 扫描不会成为 Idle 常驻内存。搜索重标记不得逐目标重新分配小写字符串。目标去重使用矩形
 到 canonical index 的小碰撞表，标签重叠分组使用按左边界排序的扫描线与并查集。
+重叠轮换的 parents/ranks/order/positions 等工作表使用 inline 128 的 `SmallVec`；常见不足
+100 项的 Shift 堆叠切换不触发临时堆分配，超出 128 项仍安全 spill。
 
 ## 帧时钟
 
@@ -115,6 +121,8 @@ UI Hint 按需为目标名缓存一次 lowercase 结果；退出后立即 drop �
   compositor heartbeat。它原生覆盖不同刷新率和多适配器屏幕，并把 stop event 纳入同一次
   无限期等待，因此停止移动不必等下一次 VBlank，也不需要跨屏重建时钟。持续移动期间用
   `DCompositionBoostCompositorClock` 请求动态刷新高频模式，停止和所有错误出口都会撤销。
+- compositor-clock 路径不读取目标 monitor，Engine 的每帧 retarget 因而跳过
+  `MonitorFromPoint`；只有 DXGI fallback 才在目标越出缓存屏幕或拓扑变化时重新解析输出。
 - Windows 10 或新 API 不可用时，用 `MonitorFromPoint` 将光标位置映射到原生输出，再通过
   `IDXGIOutput::WaitForVBlank` 等待该输出的下一次 VBlank；跨屏移动会重新选择输出，
   不查询或缓存刷新率。远程、无头或 DXGI output 不可用时最终回退 `DwmFlush`。
@@ -144,9 +152,14 @@ UI Hint 按需为目标名缓存一次 lowercase 结果；退出后立即 drop �
 
 最终性能结论必须来自双 4K、高 DPI、高刷新率真机的 p95/p99、分配次数、峰值 RAM/VRAM 和截图容差数据；API 名称或 GPU 标签本身不构成性能证明。
 
+每个候选必须先单独运行至少 20k 样本的小测。非安全项只有 p99 改善至少 3%或分配/内存
+下降至少 5%，且其他关键 p99 回退不超过 2%时才能进入组合测试；例如 UIA control-type
+位集在常见内置 role 上慢于小常量线性表，已经撤销，不能因理论复杂度更低而保留。
+
 `perf-probe` 启用且设置输出路径时使用固定 4096 项的有界队列；Engine/Hook/renderer 只做
 非阻塞时间戳入队，JSONL 写入与 flush 在专用探针线程执行。队列满时丢探针记录而不是反压
-输入，shutdown 在非热路径等待写出完成；普通 release 不编译该模块。
+输入，shutdown 在非热路径等待写出完成；marker 覆盖 `input_received`、`mode_handled`、
+`commands_ready`、`native_submitted` 和原生 `native_presented`；普通 release 不编译该模块。
 
 macOS 原生探针使用固定 AppKit fixture 子进程，运行：
 `bash tools/benchmark-macos-native.sh 709815c 5`。脚本在临时 detached worktree 构建同一探针，

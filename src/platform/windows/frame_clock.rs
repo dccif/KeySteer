@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
+use crate::app::worker::WorkerJoin;
+
 use super::{WAKE_MESSAGE, native};
 
 /// Let the Windows 10 DXGI fallback observe dynamic-refresh changes where the
@@ -25,10 +27,13 @@ pub struct DisplayFrameClock {
     owner_thread: u32,
     running: Arc<AtomicBool>,
     target_monitor: Arc<AtomicIsize>,
-    compositor_signal: Option<native::CompositorClockSignal>,
+    uses_target_monitor: Arc<AtomicBool>,
+    compositor_token: Arc<AtomicIsize>,
     receiver: Option<Receiver<Duration>>,
-    join: Option<std::thread::JoinHandle<()>>,
+    worker: Option<WorkerJoin>,
 }
+
+const CLOCK_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl DisplayFrameClock {
     pub fn new(owner_thread: u32) -> Self {
@@ -36,9 +41,10 @@ impl DisplayFrameClock {
             owner_thread,
             running: Arc::new(AtomicBool::new(false)),
             target_monitor: Arc::new(AtomicIsize::new(0)),
-            compositor_signal: None,
+            uses_target_monitor: Arc::new(AtomicBool::new(true)),
+            compositor_token: Arc::new(AtomicIsize::new(0)),
             receiver: None,
-            join: None,
+            worker: None,
         }
     }
 
@@ -56,53 +62,59 @@ impl DisplayFrameClock {
         let (sender, receiver) = mpsc::sync_channel(1);
         let running = Arc::clone(&self.running);
         let target_monitor = Arc::clone(&self.target_monitor);
-        let compositor_signal = native::CompositorClockSignal::try_new();
-        let compositor_stop = compositor_signal
-            .as_ref()
-            .map(native::CompositorClockSignal::token);
+        let uses_target_monitor = Arc::clone(&self.uses_target_monitor);
+        let compositor_token = Arc::clone(&self.compositor_token);
         let owner_thread = self.owner_thread;
+        self.uses_target_monitor.store(true, Ordering::Release);
         running.store(true, Ordering::Release);
-        let join = std::thread::Builder::new()
-            .name("keysteer-display-clock".into())
-            .spawn(move || {
+        let worker = WorkerJoin::spawn(
+            "Windows display clock",
+            std::thread::Builder::new().name("keysteer-display-clock".into()),
+            move || {
+                // The worker owns the native stop event. If shutdown reaches
+                // its deadline, the detached worker therefore cannot observe a
+                // closed or recycled HANDLE; process exit remains the fallback.
+                let compositor_signal = native::CompositorClockSignal::try_new();
+                uses_target_monitor.store(compositor_signal.is_none(), Ordering::Release);
+                let stop_event = compositor_signal
+                    .as_ref()
+                    .map(native::CompositorClockSignal::token);
+                compositor_token.store(stop_event.unwrap_or_default(), Ordering::Release);
                 run_clock(
                     running,
                     target_monitor,
-                    compositor_stop,
+                    uses_target_monitor,
+                    stop_event,
                     sender,
                     owner_thread,
-                )
-            })
-            .map_err(|error| {
-                self.running.store(false, Ordering::Release);
-                format!("cannot start the display frame clock: {error}")
-            })?;
+                );
+                compositor_token.store(0, Ordering::Release);
+            },
+        )
+        .inspect_err(|_| {
+            self.running.store(false, Ordering::Release);
+        })?;
         self.receiver = Some(receiver);
-        self.compositor_signal = compositor_signal;
-        self.join = Some(join);
+        self.worker = Some(worker);
         Ok(())
     }
 
-    pub fn stop(&mut self) {
+    pub fn stop(&mut self) -> Result<(), String> {
         self.running.store(false, Ordering::Release);
-        if let Some(signal) = self.compositor_signal.as_ref()
-            && !signal.interrupt()
-        {
+        let compositor_token = self.compositor_token.load(Ordering::Acquire);
+        if compositor_token != 0 && !native::interrupt_compositor_clock(compositor_token) {
             crate::app::logging::report_error(
                 "windows-frame-clock",
                 "cannot interrupt compositor frame wait",
             );
         }
-        if let Some(join) = self.join.take()
-            && join.join().is_err()
-        {
-            crate::app::logging::report_error(
-                "windows-frame-clock",
-                "display frame thread panicked",
-            );
+        if let Some(worker) = self.worker.as_mut() {
+            worker.join_timeout(CLOCK_STOP_TIMEOUT)?;
+            self.worker.take();
         }
-        self.compositor_signal = None;
+        self.compositor_token.store(0, Ordering::Release);
         self.receiver = None;
+        Ok(())
     }
 
     pub fn is_running(&self) -> bool {
@@ -113,8 +125,10 @@ impl DisplayFrameClock {
     /// topology lookup, not a refresh-rate query; the clock still waits on the
     /// display hardware for each update.
     pub fn retarget(&self, x: f64, y: f64) {
-        self.target_monitor
-            .store(native::monitor_for_point(x, y), Ordering::Release);
+        if self.uses_target_monitor.load(Ordering::Acquire) {
+            self.target_monitor
+                .store(native::monitor_for_point(x, y), Ordering::Release);
+        }
     }
 
     pub fn try_next(&self) -> Option<Duration> {
@@ -124,7 +138,9 @@ impl DisplayFrameClock {
 
 impl Drop for DisplayFrameClock {
     fn drop(&mut self) {
-        self.stop();
+        if let Err(error) = self.stop() {
+            crate::app::logging::report_error("windows-frame-clock", &error);
+        }
     }
 }
 
@@ -154,6 +170,7 @@ impl Drop for CompositorBoost {
 fn run_clock(
     running: Arc<AtomicBool>,
     target_monitor: Arc<AtomicIsize>,
+    uses_target_monitor: Arc<AtomicBool>,
     mut compositor_stop: Option<isize>,
     sender: SyncSender<Duration>,
     owner_thread: u32,
@@ -175,6 +192,7 @@ fn run_clock(
                     );
                     compositor_boost.disable();
                     compositor_stop = None;
+                    uses_target_monitor.store(true, Ordering::Release);
                     continue;
                 }
             }
@@ -286,5 +304,69 @@ mod tests {
             Ok(true)
         );
         assert_eq!(receiver.try_recv().unwrap(), Duration::from_millis(48));
+    }
+
+    #[test]
+    fn compositor_path_does_not_query_a_target_monitor() {
+        let clock = DisplayFrameClock::new(0);
+        clock.target_monitor.store(123, Ordering::Release);
+        clock.uses_target_monitor.store(false, Ordering::Release);
+        clock.retarget(10.0, 20.0);
+        assert_eq!(clock.target_monitor.load(Ordering::Acquire), 123);
+    }
+
+    #[test]
+    #[ignore = "microbenchmark probe; run in release with --test-threads=1"]
+    fn compositor_retarget_performance_probe() {
+        const WARMUP: usize = 2_000;
+        const SAMPLES: usize = 20_000;
+        const CALLS_PER_SAMPLE: usize = 100;
+
+        fn percentiles(samples: &mut [u128]) -> (u128, u128, u128) {
+            samples.sort_unstable();
+            let last = samples.len() - 1;
+            (
+                samples[last * 50 / 100],
+                samples[last * 95 / 100],
+                samples[last * 99 / 100],
+            )
+        }
+
+        let clock = DisplayFrameClock::new(0);
+        let skipped = || {
+            clock.uses_target_monitor.store(false, Ordering::Release);
+            clock.retarget(100.0, 100.0);
+        };
+        let queried = || {
+            clock.uses_target_monitor.store(true, Ordering::Release);
+            clock.retarget(100.0, 100.0);
+        };
+        for _ in 0..WARMUP {
+            skipped();
+            queried();
+        }
+        let mut skipped_samples = Vec::with_capacity(SAMPLES);
+        let mut queried_samples = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let measure = |operation: &dyn Fn(), samples: &mut Vec<u128>| {
+                let started = Instant::now();
+                for _ in 0..CALLS_PER_SAMPLE {
+                    operation();
+                }
+                samples.push(started.elapsed().as_nanos() / CALLS_PER_SAMPLE as u128);
+            };
+            if sample % 2 == 0 {
+                measure(&skipped, &mut skipped_samples);
+                measure(&queried, &mut queried_samples);
+            } else {
+                measure(&queried, &mut queried_samples);
+                measure(&skipped, &mut skipped_samples);
+            }
+        }
+        println!(
+            "windows_retarget_probe samples={SAMPLES} calls_per_sample={CALLS_PER_SAMPLE} skipped={:?} queried={:?}",
+            percentiles(&mut skipped_samples),
+            percentiles(&mut queried_samples),
+        );
     }
 }

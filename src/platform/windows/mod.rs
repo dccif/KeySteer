@@ -317,27 +317,70 @@ impl WindowsBackend {
     /// active provider call, drop its COM interfaces, and call
     /// `CoUninitialize` on the worker thread before it is joined.
     fn shutdown_resources(&mut self) -> Result<(), String> {
-        if let Some(mut worker) = self.update_worker.take() {
-            worker.cancel_and_wait();
+        let mut first_error = None;
+        if let Some(worker) = self.update_worker.as_mut() {
+            match worker.cancel_and_wait() {
+                Ok(()) => {
+                    self.update_worker.take();
+                }
+                Err(error) => first_error = Some(error),
+            }
         }
-        if let Some(mut worker) = self.ui_automation.take() {
-            worker.stop();
+        if let Some(worker) = self.ui_automation.as_mut() {
+            match worker.stop() {
+                Ok(()) => {
+                    self.ui_automation.take();
+                }
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
         }
-        let release_result = self.release_held_buttons();
-        self.frame_clock.stop();
-        if let Some(mut hook) = self.hook.take() {
-            hook.stop();
+        if let Err(error) = self.release_held_buttons()
+            && first_error.is_none()
+        {
+            first_error = Some(error);
         }
-        if let Some(mut status_item) = self.status_item.take() {
-            status_item.stop();
+        if let Err(error) = self.frame_clock.stop()
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        if let Some(hook) = self.hook.as_mut() {
+            match hook.stop() {
+                Ok(()) => {
+                    self.hook.take();
+                }
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        if let Some(status_item) = self.status_item.as_mut() {
+            match status_item.stop() {
+                Ok(()) => {
+                    self.status_item.take();
+                }
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
         }
         self.foreground_watcher.take();
-        let dismiss_result = self.overlay.dismiss();
-        if let Some(control) = self.console_control.as_ref() {
-            control.mark_shutdown_complete();
+        if let Err(error) = self.overlay.dismiss()
+            && first_error.is_none()
+        {
+            first_error = Some(error);
         }
-        self.console_control.take();
-        release_result.and(dismiss_result)
+        if let Err(error) = self.overlay.shutdown()
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        if first_error.is_none() {
+            if let Some(control) = self.console_control.as_ref() {
+                control.mark_shutdown_complete();
+            }
+            self.console_control.take();
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn reap_update_worker(&mut self) {
@@ -518,8 +561,7 @@ impl Backend for WindowsBackend {
             }
             self.frame_clock.start()
         } else {
-            self.frame_clock.stop();
-            Ok(())
+            self.frame_clock.stop()
         }
     }
 

@@ -1,51 +1,28 @@
 //! macOS keycode mapping and CoreGraphics input injection.
 
+#![forbid(unsafe_code)]
+
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use core_graphics::event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField};
+use core_graphics::event::{CGEvent, CGEventTapLocation, CGEventType, EventField};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
-use core_graphics::geometry::CGPoint;
+use objc2_core_foundation::{CFRetained, CGPoint};
+use objc2_core_graphics::{
+    CGAssociateMouseAndMouseCursorPosition, CGError, CGEvent as NativeEvent,
+    CGEventField as NativeEventField, CGEventTapLocation as NativeEventTapLocation,
+    CGEventType as NativeEventType, CGMouseButton as NativeMouseButton, CGScrollEventUnit,
+    CGWarpMouseCursorPosition,
+};
 
 use crate::api::command::{ButtonAction, MouseButton};
 use crate::api::geometry::Point;
 use crate::api::input::{Key, KeyState};
 use crate::platform::multi_click::ClickTracker;
 
-use super::native::OwnedCf;
-
 /// Tags our synthetic events so the tap can ignore them. Any value works as
 /// long as it is unlikely to collide with another tool's.
 pub const INJECTED_TAG: i64 = 0x4E4D_4B31;
-
-unsafe extern "C" {
-    fn CGWarpMouseCursorPosition(new_position: CGPoint) -> i32;
-    fn CGAssociateMouseAndMouseCursorPosition(connected: u8) -> i32;
-    fn CGEventCreate(source: *const std::ffi::c_void) -> *mut std::ffi::c_void;
-    fn CGEventGetLocation(event: *const std::ffi::c_void) -> CGPoint;
-    fn CGEventCreateMouseEvent(
-        source: *const std::ffi::c_void,
-        event_type: u32,
-        mouse_cursor_position: CGPoint,
-        mouse_button: u32,
-    ) -> *mut std::ffi::c_void;
-    fn CGEventCreateScrollWheelEvent(
-        source: *const std::ffi::c_void,
-        units: u32,
-        wheel_count: u32,
-        wheel1: i32,
-        ...
-    ) -> *mut std::ffi::c_void;
-    fn CGEventSetIntegerValueField(event: *mut std::ffi::c_void, field: u32, value: i64);
-    fn CGEventSetLocation(event: *mut std::ffi::c_void, location: CGPoint);
-    fn CGEventPost(tap: u32, event: *mut std::ffi::c_void);
-}
-
-/// `kCGScrollEventUnitPixel`.
-const SCROLL_UNIT_PIXEL: u32 = 0;
-/// `kCGSessionEventTap` — location-based mouse input is posted above the HID
-/// accessibility-zoom transform, matching neru's reliable native path.
-const SESSION_EVENT_TAP: u32 = 1;
 
 pub(super) struct KeyboardInjector {
     source: Result<CGEventSource, String>,
@@ -115,46 +92,39 @@ impl KeyboardInjector {
 pub fn cursor_position() -> Result<Point, String> {
     // A NULL source is sufficient for reading the global cursor and avoids
     // allocating a separate CGEventSource for every mouse action.
-    // SAFETY: CGEventCreate returns a +1 event or null; the wrapper takes the
-    // create-rule reference exactly once.
-    let Some(event) = (unsafe { OwnedCf::from_create_rule(CGEventCreate(std::ptr::null())) })
-    else {
+    let Some(event) = NativeEvent::new(None) else {
         return Err("cannot read the cursor position".into());
     };
-    // SAFETY: `event` is a live CGEvent for this value-returning query.
-    let position = unsafe { CGEventGetLocation(event.as_ptr()) };
+    let position = NativeEvent::location(Some(&event));
     Ok(Point::new(position.x, position.y))
 }
 
 pub fn warp_cursor(to: Point) -> Result<(), String> {
     // Decoupling briefly stops the hardware delta from fighting the warp.
-    // SAFETY: the global cursor association API has no pointer arguments.
-    unsafe { CGAssociateMouseAndMouseCursorPosition(0) };
-    // SAFETY: CGPoint is initialized and passed by value.
-    let status = unsafe { CGWarpMouseCursorPosition(CGPoint::new(to.x, to.y)) };
-    // SAFETY: this balances the preceding temporary disassociation.
-    unsafe { CGAssociateMouseAndMouseCursorPosition(1) };
+    CGAssociateMouseAndMouseCursorPosition(false);
+    let status = CGWarpMouseCursorPosition(CGPoint::new(to.x, to.y));
+    CGAssociateMouseAndMouseCursorPosition(true);
 
-    if status == 0 {
+    if status == CGError::Success {
         Ok(())
     } else {
-        Err(format!("CGWarpMouseCursorPosition failed: {status}"))
+        Err(format!("CGWarpMouseCursorPosition failed: {}", status.0))
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MouseEventSpec {
-    event_type: u32,
-    button: u32,
+    event_type: NativeEventType,
+    button: NativeMouseButton,
 }
 
-fn button_number(button: MouseButton) -> u32 {
+fn button_number(button: MouseButton) -> NativeMouseButton {
     match button {
-        MouseButton::Left => CGMouseButton::Left as u32,
-        MouseButton::Right => CGMouseButton::Right as u32,
-        MouseButton::Middle => CGMouseButton::Center as u32,
-        MouseButton::X1 => 3,
-        MouseButton::X2 => 4,
+        MouseButton::Left => NativeMouseButton::Left,
+        MouseButton::Right => NativeMouseButton::Right,
+        MouseButton::Middle => NativeMouseButton::Center,
+        MouseButton::X1 => NativeMouseButton(3),
+        MouseButton::X2 => NativeMouseButton(4),
     }
 }
 
@@ -168,7 +138,7 @@ fn button_event(button: MouseButton, down: bool) -> MouseEventSpec {
         (_, false) => CGEventType::OtherMouseUp,
     };
     MouseEventSpec {
-        event_type: event_type as u32,
+        event_type: NativeEventType(event_type as u32),
         button: button_number(button),
     }
 }
@@ -180,7 +150,7 @@ fn drag_event(button: MouseButton) -> MouseEventSpec {
         _ => CGEventType::OtherMouseDragged,
     };
     MouseEventSpec {
-        event_type: event_type as u32,
+        event_type: NativeEventType(event_type as u32),
         button: button_number(button),
     }
 }
@@ -202,44 +172,36 @@ fn movement_event(held_buttons: u8) -> MouseEventSpec {
         }
     }
     MouseEventSpec {
-        event_type: CGEventType::MouseMoved as u32,
-        button: CGMouseButton::Left as u32,
+        event_type: NativeEventType::MouseMoved,
+        button: NativeMouseButton::Left,
     }
 }
 
-fn create_mouse_event(spec: MouseEventSpec, at: Point, click_count: i64) -> Option<OwnedCf> {
-    // SAFETY: the event parameters are initialized enum/value types and the
-    // returned +1 object is transferred into OwnedCf exactly once.
-    let event = unsafe {
-        OwnedCf::from_create_rule(CGEventCreateMouseEvent(
-            std::ptr::null(),
-            spec.event_type,
-            CGPoint::new(at.x, at.y),
-            spec.button,
-        ))
-    }?;
-    // SAFETY: `event` is live and exclusively owned while both integer fields
-    // are set synchronously.
-    unsafe {
-        CGEventSetIntegerValueField(
-            event.as_mut_ptr(),
-            EventField::EVENT_SOURCE_USER_DATA,
-            INJECTED_TAG,
+fn create_mouse_event(
+    spec: MouseEventSpec,
+    at: Point,
+    click_count: i64,
+) -> Option<CFRetained<NativeEvent>> {
+    let event =
+        NativeEvent::new_mouse_event(None, spec.event_type, CGPoint::new(at.x, at.y), spec.button)?;
+    NativeEvent::set_integer_value_field(
+        Some(&event),
+        NativeEventField::EventSourceUserData,
+        INJECTED_TAG,
+    );
+    if click_count > 0 {
+        NativeEvent::set_integer_value_field(
+            Some(&event),
+            NativeEventField::MouseEventClickState,
+            click_count,
         );
-        if click_count > 0 {
-            CGEventSetIntegerValueField(
-                event.as_mut_ptr(),
-                EventField::MOUSE_EVENT_CLICK_STATE,
-                click_count,
-            );
-        }
-        if spec.button > CGMouseButton::Center as u32 {
-            CGEventSetIntegerValueField(
-                event.as_mut_ptr(),
-                EventField::MOUSE_EVENT_BUTTON_NUMBER,
-                spec.button as i64,
-            );
-        }
+    }
+    if spec.button.0 > NativeMouseButton::Center.0 {
+        NativeEvent::set_integer_value_field(
+            Some(&event),
+            NativeEventField::MouseEventButtonNumber,
+            i64::from(spec.button.0),
+        );
     }
     Some(event)
 }
@@ -248,10 +210,7 @@ fn post_mouse_event(spec: MouseEventSpec, at: Point) -> Result<(), String> {
     let Some(event) = create_mouse_event(spec, at, 0) else {
         return Err("cannot create a macOS mouse movement event".into());
     };
-    // SAFETY: `event` is a live CGEvent and CGEventPost does not retain it.
-    unsafe {
-        CGEventPost(SESSION_EVENT_TAP, event.as_mut_ptr());
-    }
+    NativeEvent::post(NativeEventTapLocation::SessionEventTap, Some(&event));
     Ok(())
 }
 
@@ -310,7 +269,7 @@ pub fn mouse_button(
     // Create the complete sequence before posting any part of it. If event
     // allocation fails, no partial click can leave a target application with a
     // button held down.
-    let mut events: [Option<OwnedCf>; 4] = std::array::from_fn(|_| None);
+    let mut events: [Option<CFRetained<NativeEvent>>; 4] = std::array::from_fn(|_| None);
     for index in 0..step_count {
         events[index] = create_mouse_event(
             button_event(button, steps[index].down),
@@ -322,11 +281,7 @@ pub fn mouse_button(
         }
     }
     for event in events[..step_count].iter().flatten() {
-        // SAFETY: every optional event is live for the synchronous post and is
-        // retained by its OwnedCf until the loop iteration ends.
-        unsafe {
-            CGEventPost(SESSION_EVENT_TAP, event.as_mut_ptr());
-        }
+        NativeEvent::post(NativeEventTapLocation::SessionEventTap, Some(event));
     }
     tracker.commit(plan);
     Ok(())
@@ -342,22 +297,18 @@ pub fn scroll(dx: f64, dy: f64) -> Result<(), String> {
         return Ok(());
     }
 
-    // SAFETY: the returned Create-rule event is transferred immediately into
-    // OwnedCf. The variadic arguments exactly match wheel_count=2 (vertical,
-    // horizontal).
-    unsafe {
-        let Some(event) = OwnedCf::from_create_rule(CGEventCreateScrollWheelEvent(
-            std::ptr::null(),
-            SCROLL_UNIT_PIXEL,
-            2,
-            vertical,
-            horizontal,
-        )) else {
-            return Err("cannot create a macOS pixel scroll event".into());
-        };
-        CGEventSetLocation(event.as_mut_ptr(), CGPoint::new(at.x, at.y));
-        CGEventPost(SESSION_EVENT_TAP, event.as_mut_ptr());
-    }
+    let Some(event) = NativeEvent::new_scroll_wheel_event2(
+        None,
+        CGScrollEventUnit::Pixel,
+        2,
+        vertical,
+        horizontal,
+        0,
+    ) else {
+        return Err("cannot create a macOS pixel scroll event".into());
+    };
+    NativeEvent::set_location(Some(&event), CGPoint::new(at.x, at.y));
+    NativeEvent::post(NativeEventTapLocation::SessionEventTap, Some(&event));
     Ok(())
 }
 

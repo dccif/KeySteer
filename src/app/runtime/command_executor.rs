@@ -110,7 +110,7 @@ impl Engine {
                         binding: Arc::new(Binding::Sequence(actions)),
                         owner: owner.clone(),
                     };
-                    self.apply_binding(&resolved, &input, backend)?;
+                    self.apply_binding(resolved, &input, backend)?;
                 }
                 Command::MovePointer { dx, dy } => {
                     let requested = Point::new(self.cursor.x + dx, self.cursor.y + dy);
@@ -130,7 +130,7 @@ impl Engine {
                         continue;
                     }
                     if let Err(error) = backend.move_pointer(self.cursor, actual_dx, actual_dy) {
-                        return Err(Self::recoverable_input_error("pointer movement", error));
+                        return Err(self.recoverable_input_error("pointer movement", error));
                     }
                     self.recoverable_input_succeeded();
                     self.trace_lazy(self.config.debug.motion, "backend", || {
@@ -152,7 +152,7 @@ impl Engine {
                         continue;
                     };
                     if let Err(error) = backend.warp_pointer(to) {
-                        return Err(Self::recoverable_input_error("pointer warp", error));
+                        return Err(self.recoverable_input_error("pointer warp", error));
                     }
                     self.recoverable_input_succeeded();
                     self.trace_lazy(self.config.debug.motion, "backend", || {
@@ -163,7 +163,7 @@ impl Engine {
                 }
                 Command::MouseButton { button, action } => {
                     if let Err(error) = backend.mouse_button(button, action) {
-                        return Err(Self::recoverable_input_error(
+                        return Err(self.recoverable_input_error(
                             &format!("mouse button {button:?} {action:?}"),
                             error,
                         ));
@@ -184,7 +184,7 @@ impl Engine {
                     let dx = dx * if invert_horizontal { -1.0 } else { 1.0 };
                     let dy = dy * if invert_vertical { -1.0 } else { 1.0 };
                     if let Err(error) = backend.scroll(dx, dy) {
-                        return Err(Self::recoverable_input_error("scroll", error));
+                        return Err(self.recoverable_input_error("scroll", error));
                     }
                     self.recoverable_input_succeeded();
                     self.trace_lazy(self.config.debug.backend, "backend", || {
@@ -208,14 +208,14 @@ impl Engine {
 
                 Command::SendKey { key, state } => {
                     if let Err(error) = backend.send_key(&key, state) {
-                        return Err(Self::recoverable_input_error("keyboard input", error));
+                        return Err(self.recoverable_input_error("keyboard input", error));
                     }
                     self.recoverable_input_succeeded();
                 }
                 Command::SendChord { keys } => {
                     if let Err(error) = backend.send_chord(&keys) {
                         self.latched.extend(keys.into_iter().map(InputTarget::Key));
-                        return Err(Self::recoverable_input_error("keyboard chord", error));
+                        return Err(self.recoverable_input_error("keyboard chord", error));
                     }
                     self.recoverable_input_succeeded();
                 }

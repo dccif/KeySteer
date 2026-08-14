@@ -1,5 +1,6 @@
 use crate::api::geometry::Rect;
 use crate::api::hint::LabelDirection;
+use smallvec::SmallVec;
 
 /// A target with its assigned, prefix-free label.
 #[derive(Debug, Clone, PartialEq)]
@@ -7,6 +8,64 @@ pub struct Hint<T> {
     pub label: String,
     pub bounds: Rect,
     pub value: T,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct HintCode(SmallVec<[u8; 8]>);
+
+impl HintCode {
+    pub(crate) fn as_str(&self) -> &str {
+        // `push` is the only mutation path and appends complete encoded chars.
+        // Keep the conversion safe even if that invariant changes later.
+        std::str::from_utf8(&self.0).unwrap_or_default()
+    }
+}
+
+impl std::ops::Deref for HintCode {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl PartialEq<String> for HintCode {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other
+    }
+}
+
+pub(crate) struct CompactHint<T> {
+    pub(crate) label: HintCode,
+    pub(crate) bounds: Rect,
+    pub(crate) value: T,
+}
+
+trait LabelBuffer {
+    fn clear(&mut self);
+    fn push(&mut self, value: char);
+}
+
+impl LabelBuffer for String {
+    fn clear(&mut self) {
+        String::clear(self);
+    }
+
+    fn push(&mut self, value: char) {
+        String::push(self, value);
+    }
+}
+
+impl LabelBuffer for HintCode {
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    fn push(&mut self, value: char) {
+        let mut encoded = [0; 4];
+        self.0
+            .extend_from_slice(value.encode_utf8(&mut encoded).as_bytes());
+    }
 }
 
 pub fn assign<T>(
@@ -70,8 +129,41 @@ where
     Ok(())
 }
 
-fn write_label(
-    label: &mut String,
+pub(crate) fn assign_compact_into<T, I>(
+    output: &mut Vec<CompactHint<T>>,
+    targets: I,
+    alphabet: &[char],
+    direction: LabelDirection,
+) -> Result<(), String>
+where
+    I: Iterator<Item = (Rect, T)> + Clone,
+{
+    let count = targets.clone().count();
+    if count != 0 && alphabet.len() < 2 {
+        return Err("hint alphabet needs at least 2 characters".into());
+    }
+    output.truncate(count);
+    output.reserve(count.saturating_sub(output.len()));
+    for (index, (bounds, value)) in targets.enumerate() {
+        if let Some(hint) = output.get_mut(index) {
+            write_label(&mut hint.label, index, count, alphabet, direction);
+            hint.bounds = bounds;
+            hint.value = value;
+        } else {
+            let mut label = HintCode::default();
+            write_label(&mut label, index, count, alphabet, direction);
+            output.push(CompactHint {
+                label,
+                bounds,
+                value,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn write_label<L: LabelBuffer>(
+    label: &mut L,
     index: usize,
     count: usize,
     alphabet: &[char],
@@ -107,8 +199,8 @@ fn write_label(
     }
 }
 
-fn write_fixed_width(
-    label: &mut String,
+fn write_fixed_width<L: LabelBuffer>(
+    label: &mut L,
     mut index: usize,
     alphabet: &[char],
     width: usize,

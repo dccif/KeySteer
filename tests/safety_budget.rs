@@ -4,22 +4,20 @@ use std::path::{Path, PathBuf};
 
 // Keep the current audited native surface from growing. Portable layers are
 // checked separately below and remain entirely safe Rust.
-const MAX_UNSAFE_EXPRESSIONS: usize = 275;
-const MAX_UNSAFE_FILES: usize = 23;
+const MAX_UNSAFE_EXPRESSIONS: usize = 255;
+const MAX_UNSAFE_FILES: usize = 20;
 const PER_FILE_BUDGET: &[(&str, usize)] = &[
     ("src/platform/macos/accessibility.rs", 12),
     ("src/platform/macos/autostart.rs", 5),
     ("src/platform/macos/display_link.rs", 4),
-    ("src/platform/macos/hook.rs", 2),
     ("src/platform/macos/input.rs", 11),
-    ("src/platform/macos/native.rs", 2),
+    ("src/platform/macos/native.rs", 3),
     ("src/platform/macos/overlay.rs", 6),
     ("src/platform/macos/permissions.rs", 5),
     ("src/platform/macos/screens.rs", 4),
     ("src/platform/macos/status_item.rs", 4),
     ("src/platform/macos/vision.rs", 5),
-    ("src/platform/macos/workspace.rs", 4),
-    ("src/platform/windows/accessibility.rs", 43),
+    ("src/platform/windows/accessibility.rs", 42),
     ("src/platform/windows/autostart.rs", 4),
     ("src/platform/windows/console_control.rs", 5),
     ("src/platform/windows/gpu_overlay.rs", 39),
@@ -27,7 +25,7 @@ const PER_FILE_BUDGET: &[(&str, usize)] = &[
     ("src/platform/windows/input.rs", 6),
     ("src/platform/windows/overlay.rs", 25),
     ("src/platform/windows/screens.rs", 8),
-    ("src/platform/windows/status_item.rs", 25),
+    ("src/platform/windows/status_item.rs", 23),
     ("src/platform/windows/system_events.rs", 4),
     ("src/platform/windows/native/mod.rs", 34),
 ];

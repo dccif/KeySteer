@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 use objc2::MainThreadMarker;
 use objc2::rc::autoreleasepool;
 use objc2_app_kit::{NSApplication, NSEventMask, NSWorkspace};
-use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSRunLoop, NSString, NSUserDefaults};
+use objc2_core_foundation::CFRunLoop;
+use objc2_foundation::{NSComparisonResult, NSDate, NSRunLoop, NSUserDefaults, ns_string};
 
 use crate::api::backend::{Appearance, BackendEvent};
 use crate::api::command::FocusedApp;
@@ -13,21 +14,11 @@ use crate::api::command::FocusedApp;
 const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_APP_EVENTS_PER_POLL: usize = 64;
 
-unsafe extern "C" {
-    fn CFRunLoopGetMain() -> *mut std::ffi::c_void;
-    fn CFRunLoopWakeUp(run_loop: *mut std::ffi::c_void);
-}
-
 /// Wake AppKit's main run loop after a backend producer queues an event.
 /// A Rust channel wake alone does not commit pending NSWindow/NSView updates.
 pub fn wake_main_run_loop() {
-    // SAFETY: Core Foundation returns a borrowed process-lifetime main run loop;
-    // the null check precedes the wake call and no ownership is transferred.
-    unsafe {
-        let run_loop = CFRunLoopGetMain();
-        if !run_loop.is_null() {
-            CFRunLoopWakeUp(run_loop);
-        }
+    if let Some(run_loop) = CFRunLoop::main() {
+        run_loop.wake_up();
     }
 }
 
@@ -39,9 +30,10 @@ pub fn wait_for_app_event(timeout: Duration) {
     }
     autoreleasepool(|_| {
         let deadline = NSDate::dateWithTimeIntervalSinceNow(timeout.as_secs_f64());
-        // SAFETY: NSDefaultRunLoopMode is a process-lifetime Foundation
-        // constant used for this synchronous main-thread pump.
-        NSRunLoop::mainRunLoop().runMode_beforeDate(unsafe { NSDefaultRunLoopMode }, &deadline);
+        NSRunLoop::mainRunLoop().runMode_beforeDate(
+            super::native::default_run_loop_modes().foundation,
+            &deadline,
+        );
     });
 }
 
@@ -76,10 +68,13 @@ impl Workspace {
         self.next_refresh = Instant::now() + REFRESH_INTERVAL;
 
         let mut events = Vec::new();
-        let focused = focused_app();
-        if focused != self.focused {
-            self.focused = focused.clone();
-            events.push(BackendEvent::FocusChanged(focused));
+        let focused_pid = frontmost_process_id();
+        if focused_pid != self.focused.as_ref().map(|app| app.process_id) {
+            let focused = focused_app();
+            if focused != self.focused {
+                self.focused = focused.clone();
+                events.push(BackendEvent::FocusChanged(focused));
+            }
         }
         let appearance = appearance();
         if appearance != self.appearance {
@@ -104,9 +99,7 @@ pub fn pump_app_events() {
             let Some(event) = application.nextEventMatchingMask_untilDate_inMode_dequeue(
                 NSEventMask::Any,
                 Some(&expiration),
-                // SAFETY: NSDefaultRunLoopMode is a process-lifetime Foundation
-                // constant used only for this synchronous main-thread call.
-                unsafe { NSDefaultRunLoopMode },
+                super::native::default_run_loop_modes().foundation,
                 true,
             ) else {
                 break;
@@ -132,15 +125,23 @@ fn focused_app() -> Option<FocusedApp> {
 fn appearance() -> Appearance {
     autoreleasepool(|_| {
         let defaults = NSUserDefaults::standardUserDefaults();
-        let key = NSString::from_str("AppleInterfaceStyle");
         if defaults
-            .stringForKey(&key)
-            .is_some_and(|style| style.to_string().eq_ignore_ascii_case("dark"))
+            .stringForKey(ns_string!("AppleInterfaceStyle"))
+            .is_some_and(|style| {
+                style.caseInsensitiveCompare(ns_string!("Dark")) == NSComparisonResult::Same
+            })
         {
             Appearance::Dark
         } else {
             Appearance::Light
         }
+    })
+}
+
+fn frontmost_process_id() -> Option<u32> {
+    autoreleasepool(|_| {
+        let application = NSWorkspace::sharedWorkspace().frontmostApplication()?;
+        u32::try_from(application.processIdentifier()).ok()
     })
 }
 

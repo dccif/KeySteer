@@ -21,6 +21,7 @@ use crate::api::backend::{BackendEvent, KeyDisposition};
 use crate::api::command::{ButtonAction, MouseButton};
 use crate::api::geometry::Point;
 use crate::api::input::{InputEvent, Key, KeyState};
+use crate::app::worker::WorkerJoin;
 
 use super::input;
 use crate::platform::disposition_mailbox::DispositionMailbox;
@@ -51,6 +52,7 @@ const WAKE_MESSAGE: u32 = WM_APP + 0x4D;
 const RESET_PRESSED_MESSAGE: u32 = WM_APP + 0x4F;
 const INJECTION_MESSAGE: u32 = WM_APP + 0x50;
 const MENU_MASK_MESSAGE: u32 = WM_APP + 0x51;
+const HOOK_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Native input work executed only from the hook thread's message loop. A
 /// posted request cannot run until the physical-key callback ahead of it has
@@ -306,7 +308,7 @@ pub struct HookThread {
     injection: Arc<InjectionQueue>,
     pending: Option<u64>,
     thread_id: u32,
-    join: Option<std::thread::JoinHandle<()>>,
+    worker: Option<WorkerJoin>,
 }
 
 struct OwnedHook {
@@ -357,9 +359,10 @@ impl HookThread {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let thread_mailbox = Arc::clone(&mailbox);
         let thread_injection = Arc::clone(&injection);
-        let join = std::thread::Builder::new()
-            .name("keysteer-keyboard-hook".into())
-            .spawn(move || {
+        let mut worker = WorkerJoin::spawn(
+            "Windows input hook",
+            std::thread::Builder::new().name("keysteer-keyboard-hook".into()),
+            move || {
                 hook_thread(
                     event_tx,
                     thread_mailbox,
@@ -367,18 +370,26 @@ impl HookThread {
                     ready_tx,
                     owner_thread,
                 )
-            })
-            .map_err(|e| format!("cannot start keyboard hook thread: {e}"))?;
-        let thread_id = ready_rx
-            .recv()
-            .map_err(|_| "keyboard hook thread stopped before reporting readiness".to_string())??;
+            },
+        )?;
+        let thread_id = match worker.wait_ready(&ready_rx, HOOK_STOP_TIMEOUT) {
+            Ok(Ok(thread_id)) => thread_id,
+            Ok(Err(error)) => {
+                let _ = worker.join_timeout(HOOK_STOP_TIMEOUT);
+                return Err(error);
+            }
+            Err(error) => {
+                let _ = worker.join_timeout(HOOK_STOP_TIMEOUT);
+                return Err(error);
+            }
+        };
         Ok(Self {
             receiver: event_rx,
             mailbox,
             injection,
             pending: None,
             thread_id,
-            join: Some(join),
+            worker: Some(worker),
         })
     }
 
@@ -449,7 +460,10 @@ impl HookThread {
             })
     }
 
-    pub fn stop(&mut self) {
+    pub fn stop(&mut self) -> Result<(), String> {
+        if self.worker.is_none() {
+            return Ok(());
+        }
         let mut stop_posted = true;
         if self.thread_id != 0 {
             if let Err(error) =
@@ -465,23 +479,25 @@ impl HookThread {
             }
             self.thread_id = 0;
         }
-        if let Some(join) = self.join.take() {
-            if stop_posted {
-                if join.join().is_err() {
-                    crate::app::logging::report_error("windows-hook", "input hook thread panicked");
-                }
-            } else {
-                // Waiting here could block forever because the quit message
-                // was not delivered. Detaching is the only safe fallback.
-                drop(join);
-            }
+        let result = self
+            .worker
+            .as_mut()
+            .map_or(Ok(()), |worker| worker.join_timeout(HOOK_STOP_TIMEOUT));
+        if result.is_ok() {
+            self.worker.take();
         }
+        if !stop_posted && result.is_ok() {
+            return Err("Windows rejected the input-hook shutdown wake-up".into());
+        }
+        result
     }
 }
 
 impl Drop for HookThread {
     fn drop(&mut self) {
-        self.stop();
+        if let Err(error) = self.stop() {
+            crate::app::logging::report_error("windows-hook", &error);
+        }
     }
 }
 
@@ -906,7 +922,7 @@ mod tests {
             injection: Arc::new(InjectionQueue::default()),
             pending: Some(generation),
             thread_id: 0,
-            join: None,
+            worker: None,
         };
 
         hook.set_disposition(KeyDisposition::Consume).unwrap();
@@ -929,7 +945,7 @@ mod tests {
             injection: Arc::new(InjectionQueue::default()),
             pending: Some(generation),
             thread_id: 0,
-            join: None,
+            worker: None,
         };
 
         hook.set_disposition(KeyDisposition::Forward).unwrap();

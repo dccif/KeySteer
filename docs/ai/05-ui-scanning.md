@@ -3,9 +3,10 @@
 ## 性能与取消约束（2026-08）
 
 - Windows UIA 以内部 generation/stopping flag 做逐节点取消检查；前台 HWND/PID 每 32 个节点采样一次，并在发布 partial 前强制复核。
-- 两个平台的结果进入带内部 generation 的 latest-only mailbox。Engine 忙时合并当前扫描的
+- 两个平台使用同一个纯计数 `PartialBatcher`：第一批 24 项，随后按累计数量
+  48、96、192……发布，terminal 立即补齐；没有 16ms 条件或刷新率依赖。结果进入带内部
+  generation 的 latest-only mailbox。Engine 忙时合并当前扫描的
   Partial；新请求或取消直接丢弃旧槽，旧结果不会排在下一次 UI Hint 的首批标签前。
-- macOS AX/Vision/Hybrid 共用纯数量批次：第一批 24 个目标立即发布，随后在累计 48、96、192… 个目标时发布，terminal 立即补发剩余目标；不使用时间间隔，也不依赖显示刷新率。Hint 复用标签 String 和结果 Vec。
 - macOS ScreenCaptureKit capture 是 native single-flight。timeout 不释放 permit；permit 只由真实 completion callback 释放，晚到图片恰好释放一次。
 - macOS 扫描 worker 由 Backend 懒创建并拥有，不再是进程静态 detached worker。退出时先使
   generation 失效、丢弃 pending，再唤醒并有界等待 worker；已经提交且系统不支持取消的
@@ -56,11 +57,13 @@ backing，以降低常见不足 100 个标签时的重入分配；大型扫描�
 - 退出 owner 时使 generation 失效、清 pending，并以 `CoCancelCall(thread, 0)` 非阻塞请求
   取消 provider call；COM apartment 与 Automation 对象继续保持温热。
 - `IUIAutomation2` 可用时设置 connection/transaction timeout；不可用时退回基础 UIA。
+- worker 初始化时构建一次并复用 `CacheRequest`、true condition 和 clickable condition；每轮
+  仍重新查询 ElementArray，不缓存旧控件或窗口。
 - `FindAllBuildCache(TreeScope_Descendants, condition, cache)` 一次让 provider 填充需要的
   属性，避免逐节点跨进程读取。
 - `clickable_only` 尽量编译成 provider-side condition；失败时才扫描全部 descendants 并
   在客户端过滤。
-- 每批最多 24 个目标，立即发 `Partial`；目标数量、深度、时间和窗口数都有边界。
+- 首批 24 个目标立即发 `Partial`，后续使用公共数量翻倍边界；目标数量、深度、时间和窗口数都有边界。
 
 ### popup/dropdown/dialog
 

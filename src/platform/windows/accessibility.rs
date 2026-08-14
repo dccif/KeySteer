@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use smallvec::SmallVec;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, VARIANT_FALSE, VARIANT_TRUE};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
@@ -40,6 +40,8 @@ use windows::core::{BOOL, Interface};
 
 use crate::api::command::{UiScanRequest, UiScanStatus, UiScanStrategy};
 use crate::api::geometry::{Rect, UiTarget};
+use crate::app::worker::WorkerJoin;
+use crate::platform::partial_batcher::PartialBatcher;
 use crate::platform::scan_mailbox::ScanMailbox;
 
 use super::EventSender;
@@ -111,7 +113,7 @@ impl Default for SharedQueue {
 pub struct UiAutomationWorker {
     shared: Arc<SharedQueue>,
     thread_id: Arc<AtomicU32>,
-    join: Option<JoinHandle<()>>,
+    worker: Option<WorkerJoin>,
 }
 
 impl UiAutomationWorker {
@@ -120,14 +122,15 @@ impl UiAutomationWorker {
         let worker_shared = Arc::clone(&shared);
         let thread_id = Arc::new(AtomicU32::new(0));
         let worker_thread_id = Arc::clone(&thread_id);
-        let join = std::thread::Builder::new()
-            .name("keysteer-uia".into())
-            .spawn(move || worker_main(worker_shared, worker_thread_id))
-            .map_err(|error| format!("Cannot start the UIA worker: {error}"))?;
+        let worker = WorkerJoin::spawn(
+            "Windows UI Automation",
+            std::thread::Builder::new().name("keysteer-uia".into()),
+            move || worker_main(worker_shared, worker_thread_id),
+        )?;
         Ok(Self {
             shared,
             thread_id,
-            join: Some(join),
+            worker: Some(worker),
         })
     }
 
@@ -200,9 +203,9 @@ impl UiAutomationWorker {
         }
     }
 
-    pub fn stop(&mut self) {
-        if self.join.is_none() {
-            return;
+    pub fn stop(&mut self) -> Result<(), String> {
+        if self.worker.is_none() {
+            return Ok(());
         }
         let pending = {
             let mut state = self
@@ -219,35 +222,20 @@ impl UiAutomationWorker {
         drop(pending);
         let thread_id = self.thread_id.load(Ordering::Acquire);
         request_call_cancellation(thread_id);
-        if let Some(join) = self.join.take() {
-            let deadline = Instant::now() + UIA_SHUTDOWN_WAIT;
-            while !join.is_finished() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            if join.is_finished() {
-                if join.join().is_err() {
-                    crate::app::logging::report_error(
-                        "windows-uia",
-                        "UI Automation worker panicked",
-                    );
-                }
-            } else {
-                // A broken out-of-process provider may ignore cancellation.
-                // Never block input/overlay shutdown indefinitely; process exit
-                // reclaims the detached COM thread and all of its handles.
-                crate::log_warning!(
-                    "windows-uia",
-                    "UI Automation worker did not stop within 2 seconds; detaching it"
-                );
-                drop(join);
-            }
-        }
+        let Some(worker) = self.worker.as_mut() else {
+            return Ok(());
+        };
+        worker.join_timeout(UIA_SHUTDOWN_WAIT)?;
+        self.worker.take();
+        Ok(())
     }
 }
 
 impl Drop for UiAutomationWorker {
     fn drop(&mut self) {
-        self.stop();
+        if let Err(error) = self.stop() {
+            crate::app::logging::report_error("windows-uia", &error);
+        }
     }
 }
 
@@ -279,6 +267,49 @@ impl Drop for ComApartment {
         // SAFETY: this balances the successful CoInitializeEx owned by this
         // thread-bound guard after all COM interfaces were dropped.
         unsafe { CoUninitialize() };
+    }
+}
+
+/// Immutable UIA query objects retained by the worker's MTA.
+///
+/// They describe which properties to cache and whether to filter for
+/// interactive controls; no window or element from an earlier scan is kept.
+struct UiaQueryPlan {
+    cache: IUIAutomationCacheRequest,
+    all: IUIAutomationCondition,
+    interactive: Option<IUIAutomationCondition>,
+}
+
+impl UiaQueryPlan {
+    fn new(automation: &IUIAutomation) -> Result<Self, String> {
+        let cache = create_cache_request(automation)?;
+        // SAFETY: the live automation interface creates an owned immutable
+        // condition on its owning MTA thread.
+        let all = unsafe { automation.CreateTrueCondition() }
+            .map_err(|error| format!("cannot create the UIA scan condition: {error}"))?;
+        let interactive = match create_interactive_condition(automation) {
+            Ok(condition) => Some(condition),
+            Err(error) => {
+                crate::log_warning!(
+                    "windows-uia",
+                    "cannot create interactive UIA condition; clickable scans will filter cached properties locally: {error}"
+                );
+                None
+            }
+        };
+        Ok(Self {
+            cache,
+            all,
+            interactive,
+        })
+    }
+
+    fn condition(&self, clickable_only: bool) -> (&IUIAutomationCondition, bool) {
+        if clickable_only && let Some(interactive) = self.interactive.as_ref() {
+            (interactive, true)
+        } else {
+            (&self.all, false)
+        }
     }
 }
 
@@ -316,14 +347,34 @@ fn worker_main(shared: Arc<SharedQueue>, thread_id: Arc<AtomicU32>) {
             None
         }
     };
+    let query_plan = match UiaQueryPlan::new(&automation) {
+        Ok(plan) => plan,
+        Err(error) => {
+            fail_jobs_until_stopped(&shared, error);
+            drop(automation2);
+            drop(automation);
+            drop(apartment);
+            thread_id.store(0, Ordering::Release);
+            return;
+        }
+    };
 
+    let mut configured_timeout = None;
     while let Some(job) = next_job(&shared) {
         let id = job.request.id;
         let generation = job.generation;
-        run_scan(job, &automation, automation2.as_ref(), &shared);
+        run_scan(
+            job,
+            &automation,
+            automation2.as_ref(),
+            &query_plan,
+            &shared,
+            &mut configured_timeout,
+        );
         finish_job(&shared, id, generation);
     }
     // COM interfaces must be released before the apartment is uninitialised.
+    drop(query_plan);
     drop(automation2);
     drop(automation);
     drop(apartment);
@@ -384,7 +435,9 @@ fn run_scan(
     job: ScanJob,
     automation: &IUIAutomation,
     automation2: Option<&IUIAutomation2>,
+    query_plan: &UiaQueryPlan,
     shared: &SharedQueue,
+    configured_timeout: &mut Option<u32>,
 ) {
     if matches!(
         job.request.strategy,
@@ -398,10 +451,13 @@ fn run_scan(
     }
 
     let timeout_ms = scan_timeout_ms(job.request.timeout_ms);
-    if let Some(automation2) = automation2 {
+    if let Some(automation2) = automation2
+        && timeout_needs_configuration(*configured_timeout, timeout_ms)
+    {
         // SAFETY: `automation2` is a live interface on its owning MTA thread and
         // timeout_ms is clamped to the supported positive range.
-        if let Err(error) = unsafe { automation2.SetConnectionTimeout(timeout_ms) } {
+        let connection_set = unsafe { automation2.SetConnectionTimeout(timeout_ms) };
+        if let Err(error) = &connection_set {
             crate::log_warning!(
                 "windows-uia",
                 "cannot set UIA connection timeout; continuing with provider defaults: {error}"
@@ -409,11 +465,15 @@ fn run_scan(
         }
         // SAFETY: `automation2` is a live interface on its owning MTA thread and
         // timeout_ms is clamped to the supported positive range.
-        if let Err(error) = unsafe { automation2.SetTransactionTimeout(timeout_ms) } {
+        let transaction_set = unsafe { automation2.SetTransactionTimeout(timeout_ms) };
+        if let Err(error) = &transaction_set {
             crate::log_warning!(
                 "windows-uia",
                 "cannot set UIA transaction timeout; continuing with provider defaults: {error}"
             );
+        }
+        if connection_set.is_ok() && transaction_set.is_ok() {
+            *configured_timeout = Some(timeout_ms);
         }
     }
 
@@ -435,7 +495,7 @@ fn run_scan(
         return;
     };
 
-    let status = match stream_scan(automation, hwnd, &job, shared, original) {
+    let status = match stream_scan(automation, query_plan, hwnd, &job, shared, original) {
         Ok(status) => status,
         Err(error) => UiScanStatus::Failed(format!("UI Automation scan failed: {error}")),
     };
@@ -444,6 +504,11 @@ fn run_scan(
 
 fn scan_timeout_ms(requested: u64) -> u32 {
     requested.clamp(MIN_SCAN_TIMEOUT_MS, MAX_SCAN_TIMEOUT_MS) as u32
+}
+
+#[inline]
+fn timeout_needs_configuration(configured: Option<u32>, requested: u32) -> bool {
+    configured != Some(requested)
 }
 
 fn is_timeout_hresult(code: i32) -> bool {
@@ -463,8 +528,8 @@ struct ScanWindow {
 }
 
 fn rect_from_native(rect: RECT) -> Option<Rect> {
-    let width = rect.right - rect.left;
-    let height = rect.bottom - rect.top;
+    let width = i64::from(rect.right) - i64::from(rect.left);
+    let height = i64::from(rect.bottom) - i64::from(rect.top);
     (width > 0 && height > 0).then(|| {
         Rect::new(
             rect.left as f64,
@@ -725,6 +790,7 @@ fn target_center_is_visible(target: &UiTarget, bounds: Rect, occluders: &[Rect])
 
 fn stream_scan(
     automation: &IUIAutomation,
+    query_plan: &UiaQueryPlan,
     hwnd: HWND,
     job: &ScanJob,
     shared: &SharedQueue,
@@ -733,34 +799,9 @@ fn stream_scan(
     if hwnd.is_invalid() {
         return Ok(UiScanStatus::Success);
     }
-    let cache = create_cache_request(automation)?;
-    let (condition, provider_filters_interactive) = if job.request.clickable_only {
-        match create_interactive_condition(automation) {
-            Ok(condition) => (condition, true),
-            Err(error) => {
-                crate::log_warning!(
-                    "windows-uia",
-                    "cannot create interactive UIA condition; scanning all descendants: {error}"
-                );
-                (
-                    // SAFETY: the live automation interface creates an owned
-                    // condition on its owning MTA thread.
-                    unsafe { automation.CreateTrueCondition() }.map_err(|fallback| {
-                        format!("cannot create fallback UIA condition: {fallback}")
-                    })?,
-                    false,
-                )
-            }
-        }
-    } else {
-        (
-            // SAFETY: the live automation interface creates an owned condition
-            // on its owning MTA thread.
-            unsafe { automation.CreateTrueCondition() }
-                .map_err(|error| format!("cannot create the UIA scan condition: {error}"))?,
-            false,
-        )
-    };
+    let cache = &query_plan.cache;
+    let (condition, provider_filters_interactive) =
+        query_plan.condition(job.request.clickable_only);
     let mut allowed = control_types_for(&job.request.roles);
     if allowed.is_empty() {
         allowed.extend(DEFAULT_CONTROL_TYPES);
@@ -785,14 +826,12 @@ fn stream_scan(
     let deadline =
         Instant::now() + Duration::from_millis(u64::from(scan_timeout_ms(job.request.timeout_ms)));
     let mut deduper = SpatialDeduper::new(MINIMUM_SPACING);
-    let mut batch = Vec::with_capacity(PARTIAL_BATCH_SIZE);
+    let mut batches = PartialBatcher::new(PARTIAL_BATCH_SIZE, MAX_TARGETS);
     let mut target_count = 0usize;
     let mut visited_count = 0usize;
     let mut queried_window = false;
     let mut provider_timed_out = false;
     let mut terminal_status = UiScanStatus::Success;
-    let mut next_publish_count = PARTIAL_BATCH_SIZE;
-    let mut last_publish = Instant::now();
 
     // Windows are ordered front-to-back. Popup/menu targets are therefore
     // published before their owner, and every lower window carries the bounds
@@ -815,7 +854,7 @@ fn stream_scan(
 
         // SAFETY: the HWND is live for this iteration and `cache` belongs to
         // the same automation instance and MTA thread.
-        let root = match unsafe { automation.ElementFromHandleBuildCache(window.hwnd, &cache) } {
+        let root = match unsafe { automation.ElementFromHandleBuildCache(window.hwnd, cache) } {
             Ok(root) => root,
             Err(error) => {
                 provider_timed_out |= is_timeout_error(&error);
@@ -832,7 +871,7 @@ fn stream_scan(
         // SAFETY: root, condition and cache are live COM interfaces from this
         // automation instance and remain borrowed through the bulk call.
         let elements =
-            match unsafe { root.FindAllBuildCache(TreeScope_Descendants, &condition, &cache) } {
+            match unsafe { root.FindAllBuildCache(TreeScope_Descendants, condition, cache) } {
                 Ok(elements) => elements,
                 Err(error) => {
                     provider_timed_out |= is_timeout_error(&error);
@@ -882,32 +921,14 @@ fn stream_scan(
             ) && target_center_is_visible(&target, window.bounds, &window.occluders)
                 && deduper.insert(&target)
             {
-                batch.push(target);
                 target_count += 1;
-                let publish_due = target_count >= next_publish_count
-                    || next_publish_count > PARTIAL_BATCH_SIZE
-                        && last_publish.elapsed() >= Duration::from_millis(16);
-                if publish_due {
+                if let Some(batch) = batches.push_one(target) {
                     if !context_is_current(shared, job.generation, original) {
                         return Ok(UiScanStatus::ContextChanged);
                     }
-                    send_partial(job, std::mem::take(&mut batch));
-                    next_publish_count = target_count.saturating_mul(2).max(target_count + 1);
-                    last_publish = Instant::now();
+                    send_partial(job, batch);
                 }
             }
-        }
-        // Publish a small popup/menu after its provider query when the 16 ms
-        // responsiveness budget elapsed. Otherwise coalesce it with the next
-        // window to avoid cumulatively rebuilding every Hint label.
-        if !batch.is_empty()
-            && next_publish_count > PARTIAL_BATCH_SIZE
-            && last_publish.elapsed() >= Duration::from_millis(16)
-            && context_is_current(shared, job.generation, original)
-        {
-            send_partial(job, std::mem::take(&mut batch));
-            next_publish_count = target_count.saturating_mul(2).max(target_count + 1);
-            last_publish = Instant::now();
         }
         if element_count > remaining {
             terminal_status = UiScanStatus::TimedOut;
@@ -925,7 +946,9 @@ fn stream_scan(
     if provider_timed_out && terminal_status == UiScanStatus::Success {
         terminal_status = UiScanStatus::TimedOut;
     }
-    if !batch.is_empty() && context_is_current(shared, job.generation, original) {
+    if context_is_current(shared, job.generation, original)
+        && let Some(batch) = batches.finish()
+    {
         send_partial(job, batch);
     }
     Ok(terminal_status)
@@ -1131,13 +1154,15 @@ fn target_from_element(
         (raw_rect.right - raw_rect.left) as f64,
         (raw_rect.bottom - raw_rect.top) as f64,
     );
+    if !rect_is_usable(&rect, within) {
+        return None;
+    }
     // SAFETY: the cached element remains live; the returned BSTR is converted
     // to an owned Rust String before the COM value is released.
     let name = unsafe { element.CachedName() }
         .map(|name| name.to_string())
         .unwrap_or_default();
-    let target = to_target(rect, name, control_type);
-    is_usable(&target, within).then_some(target)
+    Some(to_target(rect, name, control_type))
 }
 
 fn is_interactive(element: &IUIAutomationElement) -> bool {
@@ -1228,11 +1253,20 @@ pub fn to_target(rect: Rect, name: String, control_type: i32) -> UiTarget {
     }
 }
 
+#[cfg(test)]
 pub fn is_usable(target: &UiTarget, within: Rect) -> bool {
-    target.rect.width >= 2.0
-        && target.rect.height >= 2.0
-        && !(target.rect.width >= within.width && target.rect.height >= within.height)
-        && within.intersect(&target.rect).is_some()
+    rect_is_usable(&target.rect, within)
+}
+
+fn rect_is_usable(rect: &Rect, within: Rect) -> bool {
+    rect.x.is_finite()
+        && rect.y.is_finite()
+        && rect.width.is_finite()
+        && rect.height.is_finite()
+        && rect.width >= 2.0
+        && rect.height >= 2.0
+        && !(rect.width >= within.width && rect.height >= within.height)
+        && within.intersect(rect).is_some()
 }
 
 struct DedupEntry {
@@ -1243,9 +1277,9 @@ struct DedupEntry {
 
 struct SpatialDeduper {
     cell_size: f64,
-    cells: HashMap<(i32, i32), Vec<DedupEntry>>,
+    cells: HashMap<(i32, i32), SmallVec<[DedupEntry; 2]>>,
     semantics: Vec<(String, String)>,
-    semantic_buckets: HashMap<u64, Vec<usize>>,
+    semantic_buckets: HashMap<u64, SmallVec<[usize; 2]>>,
 }
 
 impl SpatialDeduper {
@@ -1265,8 +1299,8 @@ impl SpatialDeduper {
             (center.x / self.cell_size).floor() as i32,
             (center.y / self.cell_size).floor() as i32,
         );
-        for y in cell.1 - 1..=cell.1 + 1 {
-            for x in cell.0 - 1..=cell.0 + 1 {
+        for y in cell.1.saturating_sub(1)..=cell.1.saturating_add(1) {
+            for x in cell.0.saturating_sub(1)..=cell.0.saturating_add(1) {
                 if self.cells.get(&(x, y)).is_some_and(|entries| {
                     entries.iter().any(|entry| {
                         (entry.x - center.x).abs() < self.cell_size
@@ -1320,6 +1354,7 @@ fn foreground_context() -> Option<(HWND, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stats_alloc::{INSTRUMENTED_SYSTEM, Region};
 
     fn target(x: f64, y: f64, name: &str, role: &str) -> UiTarget {
         UiTarget {
@@ -1373,6 +1408,82 @@ mod tests {
     }
 
     #[test]
+    fn spatial_deduper_handles_extreme_native_coordinates() {
+        let mut deduper = SpatialDeduper::new(8.0);
+        let coordinate = f64::from(i32::MAX) * 8.0;
+        assert!(deduper.insert(&target(coordinate, coordinate, "Max", "button")));
+        let coordinate = f64::from(i32::MIN) * 8.0;
+        assert!(deduper.insert(&target(coordinate, coordinate, "Min", "button")));
+    }
+
+    #[test]
+    #[ignore = "microbenchmark probe; run in release with --test-threads=1"]
+    fn deduper_inline_buckets_performance_probe() {
+        const WARMUP: usize = 2_000;
+        const SAMPLES: usize = 20_000;
+        const BUCKETS: usize = 100;
+
+        fn fill_inline() {
+            let mut cells: HashMap<usize, SmallVec<[usize; 2]>> = HashMap::new();
+            for index in 0..BUCKETS {
+                cells.entry(index).or_default().push(index);
+            }
+            std::hint::black_box(cells);
+        }
+
+        fn fill_heap() {
+            let mut cells: HashMap<usize, Vec<usize>> = HashMap::new();
+            for index in 0..BUCKETS {
+                cells.entry(index).or_default().push(index);
+            }
+            std::hint::black_box(cells);
+        }
+
+        fn percentiles(samples: &mut [u128]) -> (u128, u128, u128) {
+            samples.sort_unstable();
+            let last = samples.len() - 1;
+            (
+                samples[last * 50 / 100],
+                samples[last * 95 / 100],
+                samples[last * 99 / 100],
+            )
+        }
+
+        for _ in 0..WARMUP {
+            fill_inline();
+            fill_heap();
+        }
+        let mut inline_samples = Vec::with_capacity(SAMPLES);
+        let mut heap_samples = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let measure = |operation: fn(), samples: &mut Vec<u128>| {
+                let started = Instant::now();
+                operation();
+                samples.push(started.elapsed().as_nanos());
+            };
+            if sample % 2 == 0 {
+                measure(fill_inline, &mut inline_samples);
+                measure(fill_heap, &mut heap_samples);
+            } else {
+                measure(fill_heap, &mut heap_samples);
+                measure(fill_inline, &mut inline_samples);
+            }
+        }
+
+        let inline_region = Region::new(&INSTRUMENTED_SYSTEM);
+        fill_inline();
+        let inline_allocations = inline_region.change().allocations;
+        let heap_region = Region::new(&INSTRUMENTED_SYSTEM);
+        fill_heap();
+        let heap_allocations = heap_region.change().allocations;
+        println!(
+            "uia_deduper_bucket_probe samples={SAMPLES} buckets={BUCKETS} inline={:?} heap={:?} inline_allocations={inline_allocations} heap_allocations={heap_allocations}",
+            percentiles(&mut inline_samples),
+            percentiles(&mut heap_samples),
+        );
+    }
+
+    #[test]
     fn atomic_scan_generation_cancels_stale_and_stopping_work() {
         let shared = SharedQueue::default();
         shared.latest_generation.store(7, Ordering::Release);
@@ -1397,6 +1508,76 @@ mod tests {
         assert_eq!(scan_timeout_ms(0), 250);
         assert_eq!(scan_timeout_ms(2_500), 2_500);
         assert_eq!(scan_timeout_ms(u64::MAX), 30_000);
+    }
+
+    #[test]
+    fn timeout_configuration_is_reused_only_for_the_same_successful_value() {
+        assert!(timeout_needs_configuration(None, 2_500));
+        assert!(!timeout_needs_configuration(Some(2_500), 2_500));
+        assert!(timeout_needs_configuration(Some(2_500), 5_000));
+    }
+
+    #[test]
+    #[ignore = "microbenchmark probe; run in release with --test-threads=1"]
+    fn timeout_configuration_performance_probe() {
+        const WARMUP: usize = 2_000;
+        const SAMPLES: usize = 20_000;
+        const CALLS_PER_SAMPLE: usize = 100;
+
+        #[inline(never)]
+        fn fake_com_setter(timeout: u32) {
+            std::hint::black_box(timeout);
+        }
+
+        fn percentiles(samples: &mut [u128]) -> (u128, u128, u128) {
+            samples.sort_unstable();
+            let last = samples.len() - 1;
+            (
+                samples[last * 50 / 100],
+                samples[last * 95 / 100],
+                samples[last * 99 / 100],
+            )
+        }
+
+        let cached = || {
+            if timeout_needs_configuration(Some(2_500), 2_500) {
+                fake_com_setter(2_500);
+                fake_com_setter(2_500);
+            }
+        };
+        let repeated = || {
+            fake_com_setter(2_500);
+            fake_com_setter(2_500);
+        };
+        for _ in 0..WARMUP {
+            cached();
+            repeated();
+        }
+
+        let mut cached_samples = Vec::with_capacity(SAMPLES);
+        let mut repeated_samples = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let measure = |operation: &dyn Fn(), samples: &mut Vec<u128>| {
+                let started = Instant::now();
+                for _ in 0..CALLS_PER_SAMPLE {
+                    operation();
+                }
+                samples.push(started.elapsed().as_nanos() / CALLS_PER_SAMPLE as u128);
+            };
+            if sample % 2 == 0 {
+                measure(&cached, &mut cached_samples);
+                measure(&repeated, &mut repeated_samples);
+            } else {
+                measure(&repeated, &mut repeated_samples);
+                measure(&cached, &mut cached_samples);
+            }
+        }
+
+        println!(
+            "uia_timeout_probe samples={SAMPLES} calls_per_sample={CALLS_PER_SAMPLE} cached={:?} repeated={:?}",
+            percentiles(&mut cached_samples),
+            percentiles(&mut repeated_samples),
+        );
     }
 
     #[test]
@@ -1436,6 +1617,20 @@ mod tests {
             Some(Rect::new(-100.0, 20.0, 400.0, 200.0))
         );
         assert!(rect_from_native(RECT::default()).is_none());
+        assert_eq!(
+            rect_from_native(RECT {
+                left: i32::MIN,
+                top: i32::MIN,
+                right: i32::MAX,
+                bottom: i32::MAX,
+            }),
+            Some(Rect::new(
+                f64::from(i32::MIN),
+                f64::from(i32::MIN),
+                4_294_967_295.0,
+                4_294_967_295.0,
+            ))
+        );
     }
 
     #[test]
@@ -1447,5 +1642,60 @@ mod tests {
         assert!(!is_usable(&item, window));
         item.rect = window;
         assert!(!is_usable(&item, window));
+        item.rect = Rect::new(f64::NAN, 10.0, 40.0, 20.0);
+        assert!(!is_usable(&item, window));
+    }
+
+    #[test]
+    #[ignore = "microbenchmark probe; run in release with --test-threads=1"]
+    fn rect_filter_before_strings_performance_probe() {
+        const WARMUP: usize = 2_000;
+        const SAMPLES: usize = 20_000;
+        const CALLS_PER_SAMPLE: usize = 100;
+
+        fn percentiles(samples: &mut [u128]) -> (u128, u128, u128) {
+            samples.sort_unstable();
+            let last = samples.len() - 1;
+            (
+                samples[last * 50 / 100],
+                samples[last * 95 / 100],
+                samples[last * 99 / 100],
+            )
+        }
+
+        let within = Rect::new(0.0, 0.0, 1000.0, 800.0);
+        let rejected = Rect::new(2000.0, 2000.0, 40.0, 20.0);
+        let early = || std::hint::black_box(rect_is_usable(&rejected, within));
+        let late = || {
+            let target = to_target(rejected, "Save changes".to_owned(), 50_000);
+            std::hint::black_box(is_usable(&target, within))
+        };
+        for _ in 0..WARMUP {
+            early();
+            late();
+        }
+        let mut early_samples = Vec::with_capacity(SAMPLES);
+        let mut late_samples = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let measure = |operation: &dyn Fn() -> bool, samples: &mut Vec<u128>| {
+                let started = Instant::now();
+                for _ in 0..CALLS_PER_SAMPLE {
+                    std::hint::black_box(operation());
+                }
+                samples.push(started.elapsed().as_nanos() / CALLS_PER_SAMPLE as u128);
+            };
+            if sample % 2 == 0 {
+                measure(&early, &mut early_samples);
+                measure(&late, &mut late_samples);
+            } else {
+                measure(&late, &mut late_samples);
+                measure(&early, &mut early_samples);
+            }
+        }
+        println!(
+            "uia_rect_filter_probe samples={SAMPLES} calls_per_sample={CALLS_PER_SAMPLE} early={:?} late={:?}",
+            percentiles(&mut early_samples),
+            percentiles(&mut late_samples),
+        );
     }
 }

@@ -5,8 +5,6 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::thread::JoinHandle;
 use std::time::Duration;
 
 use semver::Version;
@@ -14,6 +12,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::api::backend::{UpdateCheckResult, UpdateProgress};
+use crate::app::worker::WorkerJoin;
 
 const LATEST_RELEASE_API: &str = "https://api.github.com/repos/dccif/KeySteer/releases/latest";
 const CDN_VERSIONS_API: &str = "https://data.jsdelivr.com/v1/package/gh/dccif/KeySteer";
@@ -31,63 +30,36 @@ static CHECK_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 pub(crate) struct UpdateWorker {
     cancel: Arc<AtomicBool>,
-    done: Receiver<()>,
-    join: Option<JoinHandle<()>>,
+    worker: WorkerJoin,
 }
 
 impl UpdateWorker {
     /// Reap a completed thread so its native handle and stack reservation are
     /// released while KeySteer remains running.
     pub(crate) fn reap_finished(&mut self) -> bool {
-        if self.join.as_ref().is_some_and(JoinHandle::is_finished) {
-            self.join_finished();
+        match self.worker.reap_finished() {
+            Ok(done) => done,
+            Err(error) => {
+                crate::app::logging::report_error("update-check", &error);
+                true
+            }
         }
-        self.join.is_none()
     }
 
     /// Request cancellation and wait briefly for ordinary cleanup. Blocking
     /// native network calls retain their own hard timeout, so shutdown never
     /// waits indefinitely.
-    pub(crate) fn cancel_and_wait(&mut self) {
+    pub(crate) fn cancel_and_wait(&mut self) -> Result<(), String> {
         self.cancel.store(true, Ordering::Release);
-        if self.join.is_none() {
-            return;
-        }
-        let completed = self.join.as_ref().is_some_and(JoinHandle::is_finished)
-            || !matches!(
-                self.done.recv_timeout(UPDATE_STOP_WAIT),
-                Err(RecvTimeoutError::Timeout)
-            );
-        if completed {
-            self.join_finished();
-        } else {
-            // Dropping a JoinHandle detaches the bounded worker. It will see
-            // cancellation after the current native call and run all RAII
-            // cleanup; the application shutdown path is never held hostage.
-            self.join.take();
-        }
-    }
-
-    fn join_finished(&mut self) {
-        if let Some(join) = self.join.take()
-            && join.join().is_err()
-        {
-            crate::app::logging::report_error("update-check", "update worker panicked");
-        }
+        self.worker.join_timeout(UPDATE_STOP_WAIT)
     }
 }
 
 impl Drop for UpdateWorker {
     fn drop(&mut self) {
-        self.cancel_and_wait();
-    }
-}
-
-struct WorkerDone(Sender<()>);
-
-impl Drop for WorkerDone {
-    fn drop(&mut self) {
-        let _ = self.0.send(());
+        if let Err(error) = self.cancel_and_wait() {
+            crate::app::logging::report_error("update-check", &error);
+        }
     }
 }
 
@@ -184,12 +156,12 @@ pub(crate) fn check_async(
     };
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
-    let (done_tx, done) = mpsc::channel();
-    let join = std::thread::Builder::new()
-        .name("keysteer-update-check".into())
-        .stack_size(UPDATE_THREAD_STACK_BYTES)
-        .spawn(move || {
-            let _done = WorkerDone(done_tx);
+    let worker = WorkerJoin::spawn(
+        "update-check",
+        std::thread::Builder::new()
+            .name("keysteer-update-check".into())
+            .stack_size(UPDATE_THREAD_STACK_BYTES),
+        move || {
             with_platform_autorelease_pool(|| {
                 let _guard = guard;
                 if worker_cancel.load(Ordering::Acquire) {
@@ -202,13 +174,9 @@ pub(crate) fn check_async(
                     complete(result);
                 }
             });
-        })
-        .map_err(|error| format!("cannot start update check: {error}"))?;
-    Ok(Some(UpdateWorker {
-        cancel,
-        done,
-        join: Some(join),
-    }))
+        },
+    )?;
+    Ok(Some(UpdateWorker { cancel, worker }))
 }
 
 #[cfg(target_os = "macos")]
@@ -773,22 +741,17 @@ mod tests {
     fn update_worker_cancels_and_reaps_without_waiting_for_the_network_timeout() {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
-        let (done_tx, done) = mpsc::channel();
-        let join = std::thread::spawn(move || {
-            let _done = WorkerDone(done_tx);
+        let worker = WorkerJoin::spawn("test-update", std::thread::Builder::new(), move || {
             while !worker_cancel.load(Ordering::Acquire) {
                 std::thread::yield_now();
             }
-        });
-        let mut worker = UpdateWorker {
-            cancel,
-            done,
-            join: Some(join),
-        };
+        })
+        .unwrap();
+        let mut worker = UpdateWorker { cancel, worker };
 
-        worker.cancel_and_wait();
+        worker.cancel_and_wait().unwrap();
 
-        assert!(worker.join.is_none());
+        assert!(worker.worker.reap_finished().unwrap());
     }
 
     #[test]

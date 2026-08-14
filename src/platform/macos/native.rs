@@ -2,6 +2,27 @@
 
 use std::ffi::c_void;
 
+use core_foundation::runloop::{CFRunLoopMode, kCFRunLoopDefaultMode};
+use objc2_foundation::{NSDefaultRunLoopMode, NSRunLoopMode};
+
+/// Process-lifetime run-loop modes exported by Core Foundation/Foundation.
+pub(crate) struct RunLoopModes {
+    pub(crate) core_foundation: CFRunLoopMode,
+    pub(crate) foundation: &'static NSRunLoopMode,
+}
+
+/// Keep the imported statics behind one reviewed native boundary.
+pub(crate) fn default_run_loop_modes() -> RunLoopModes {
+    // SAFETY: both frameworks export process-lifetime immutable mode objects.
+    // Callers only borrow them for synchronous run-loop API calls.
+    unsafe {
+        RunLoopModes {
+            core_foundation: kCFRunLoopDefaultMode,
+            foundation: NSDefaultRunLoopMode,
+        }
+    }
+}
+
 /// A Core Foundation object returned at +1 by a Create/Copy function.
 ///
 /// This is pointer-sized and performs the same single `CFRelease` that callers
@@ -22,11 +43,6 @@ impl OwnedCf {
     #[inline(always)]
     pub(crate) fn as_ptr(&self) -> *const c_void {
         self.0
-    }
-
-    #[inline(always)]
-    pub(crate) fn as_mut_ptr(&self) -> *mut c_void {
-        self.0.cast_mut()
     }
 
     /// Transfer the +1 reference into another typed create-rule wrapper.

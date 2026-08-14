@@ -27,12 +27,9 @@ pub fn enable_dpi_awareness() {
 }
 
 fn rect_to_api(r: RECT) -> Rect {
-    Rect::new(
-        r.left as f64,
-        r.top as f64,
-        (r.right - r.left) as f64,
-        (r.bottom - r.top) as f64,
-    )
+    let width = i64::from(r.right) - i64::from(r.left);
+    let height = i64::from(r.bottom) - i64::from(r.top);
+    Rect::new(r.left as f64, r.top as f64, width as f64, height as f64)
 }
 
 /// Collects monitors during enumeration.

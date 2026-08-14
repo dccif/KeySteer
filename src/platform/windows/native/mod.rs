@@ -275,10 +275,13 @@ impl CompositorClockSignal {
     pub(crate) fn token(&self) -> isize {
         self.0.raw().0 as isize
     }
+}
 
-    pub(crate) fn interrupt(&self) -> bool {
-        compositor_call(CompositorCall::Signal(self.token())) != 0
-    }
+/// Wake a compositor-clock wait without borrowing the worker-owned handle.
+/// The token is published only while that worker retains the corresponding
+/// event, so callers never own or close it.
+pub(crate) fn interrupt_compositor_clock(token: isize) -> bool {
+    token != 0 && compositor_call(CompositorCall::Signal(token)) != 0
 }
 
 pub(crate) fn wait_for_compositor_frame(stop_event: isize) -> CompositorWait {
@@ -875,7 +878,7 @@ mod tests {
             return;
         };
 
-        assert!(signal.interrupt());
+        assert!(interrupt_compositor_clock(signal.token()));
         assert_eq!(
             wait_for_compositor_frame(signal.token()),
             CompositorWait::Interrupted

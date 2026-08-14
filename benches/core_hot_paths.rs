@@ -17,7 +17,7 @@ use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
 
 const SAMPLES: usize = 20_000;
-const CALLS_PER_SAMPLE: usize = 100;
+const CALLS_PER_SAMPLE: usize = 1_000;
 
 fn main() -> Result<(), String> {
     benchmark_normal_frame()?;

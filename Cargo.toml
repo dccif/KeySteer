@@ -1,6 +1,6 @@
 [package]
 name = "keysteer"
-version = "0.8.13"
+version = "0.8.14"
 authors = ["dccif"]
 edition = "2024"
 rust-version = "1.97"
@@ -67,8 +67,18 @@ objc2-quartz-core = { version = "0.3", default-features = false, features = [
     "objc2-core-foundation",
     "objc2-core-graphics",
 ] }
-objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGColor", "CGPath"] }
-objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFString"] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = [
+    "std",
+    "libc",
+    "CGColor",
+    "CGError",
+    "CGEvent",
+    "CGEventSource",
+    "CGEventTypes",
+    "CGPath",
+    "CGRemoteOperation",
+] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFRunLoop", "CFString"] }
 objc2-core-text = { version = "0.3", default-features = false, features = [
     "std",
     "CTFont",

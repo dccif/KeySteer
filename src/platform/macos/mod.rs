@@ -262,7 +262,6 @@ impl MacOsBackend {
         if self.shutdown_complete {
             return Ok(());
         }
-        self.shutdown_complete = true;
 
         // Stop every producer before tearing down the AppKit objects they may
         // wake or update. All operations are idempotent so Drop can safely use
@@ -270,21 +269,43 @@ impl MacOsBackend {
         self.status_item.take();
         self.display_watcher.take();
         self.frame_clock.stop();
-        self.scan_worker.shutdown();
-        if let Some(mut worker) = self.update_worker.take() {
-            worker.cancel_and_wait();
+        let mut first_error = self.scan_worker.shutdown().err();
+        if let Some(worker) = self.update_worker.as_mut() {
+            match worker.cancel_and_wait() {
+                Ok(()) => {
+                    self.update_worker.take();
+                }
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
         }
 
-        let mut first_error = self.release_held_buttons().err();
-        if let Some(mut hook) = self.hook.take() {
-            hook.stop();
+        if let Err(error) = self.release_held_buttons()
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        if let Some(hook) = self.hook.as_mut() {
+            match hook.stop() {
+                Ok(()) => {
+                    self.hook.take();
+                }
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
         }
         if let Err(error) = self.overlay.dismiss()
             && first_error.is_none()
         {
             first_error = Some(error);
         }
-        first_error.map_or(Ok(()), Err)
+        match first_error {
+            Some(error) => Err(error),
+            None => {
+                self.shutdown_complete = true;
+                Ok(())
+            }
+        }
     }
 }
 

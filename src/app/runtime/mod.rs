@@ -37,7 +37,32 @@ use crate::api::overlay::{CursorMarker, Indicator, OverlayScene};
 use crate::config::{Bindings, Config, ConfigStore, Palette};
 use input_router::CompiledKeymap;
 
-const RECOVERABLE_INPUT_PREFIX: &str = "[recoverable-input] ";
+/// Internal classification for failures crossing the Engine loop. Public APIs
+/// keep their string errors, while recovery decisions never parse display text.
+#[derive(Debug)]
+enum RuntimeError {
+    RecoverableInput(String),
+    Platform(String),
+    Fatal(String),
+}
+
+impl RuntimeError {
+    fn message(&self) -> &str {
+        match self {
+            Self::RecoverableInput(message) | Self::Platform(message) | Self::Fatal(message) => {
+                message
+            }
+        }
+    }
+
+    fn into_message(self) -> String {
+        match self {
+            Self::RecoverableInput(message) | Self::Platform(message) | Self::Fatal(message) => {
+                message
+            }
+        }
+    }
+}
 
 /// A pending timer request from a mode.
 #[derive(Debug, Clone)]
@@ -172,6 +197,133 @@ struct ResolvedBinding {
     owner: ModeId,
 }
 
+struct ModeSlot {
+    id: ModeId,
+    mode: Box<dyn Mode>,
+    pointer_events: bool,
+    table: Option<CompiledKeymap>,
+    temporary_chords: Vec<TemporaryChord>,
+}
+
+fn builtin_wants_pointer_events(id: &ModeId) -> bool {
+    id != &ModeId::idle() && id != &ModeId::normal()
+}
+
+#[derive(Default)]
+struct ModeRegistry {
+    slots: Vec<ModeSlot>,
+    indices: BTreeMap<ModeId, usize>,
+}
+
+impl ModeRegistry {
+    fn insert(&mut self, id: ModeId, mode: Box<dyn Mode>, pointer_events: bool) -> usize {
+        if let Some(&index) = self.indices.get(&id) {
+            self.slots[index].mode = mode;
+            self.slots[index].pointer_events = pointer_events;
+            return index;
+        }
+        let index = self.slots.len();
+        self.slots.push(ModeSlot {
+            id: id.clone(),
+            mode,
+            pointer_events,
+            table: None,
+            temporary_chords: Vec::new(),
+        });
+        self.indices.insert(id, index);
+        index
+    }
+
+    fn contains_key(&self, id: &ModeId) -> bool {
+        self.indices.contains_key(id)
+    }
+
+    fn index_of(&self, id: &ModeId) -> Option<usize> {
+        self.indices.get(id).copied()
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &ModeId> {
+        self.indices.keys()
+    }
+
+    fn get(&self, id: &ModeId) -> Option<&dyn Mode> {
+        let index = self.index_of(id)?;
+        self.slots.get(index).map(|slot| slot.mode.as_ref())
+    }
+
+    fn get_mut(&mut self, id: &ModeId) -> Option<&mut Box<dyn Mode>> {
+        let index = self.index_of(id)?;
+        self.get_index_mut(index)
+    }
+
+    fn get_index_mut(&mut self, index: usize) -> Option<&mut Box<dyn Mode>> {
+        self.slots.get_mut(index).map(|slot| &mut slot.mode)
+    }
+
+    fn id_at(&self, index: usize) -> Option<&ModeId> {
+        self.slots.get(index).map(|slot| &slot.id)
+    }
+
+    fn wants_pointer_events_at(&self, index: usize) -> Option<bool> {
+        self.slots.get(index).map(|slot| slot.pointer_events)
+    }
+
+    fn table(&self, id: &ModeId) -> Option<&CompiledKeymap> {
+        let index = self.index_of(id)?;
+        self.slots.get(index)?.table.as_ref()
+    }
+
+    fn table_mut_or_default(&mut self, id: &ModeId) -> Option<&mut CompiledKeymap> {
+        let index = self.index_of(id)?;
+        Some(
+            self.slots
+                .get_mut(index)?
+                .table
+                .get_or_insert_with(CompiledKeymap::default),
+        )
+    }
+
+    fn temporary_chords(&self, id: &ModeId) -> Option<&[TemporaryChord]> {
+        let index = self.index_of(id)?;
+        Some(&self.slots.get(index)?.temporary_chords)
+    }
+
+    fn clear_routes(&mut self) {
+        for slot in &mut self.slots {
+            slot.table = None;
+            slot.temporary_chords.clear();
+        }
+    }
+
+    fn set_routes(
+        &mut self,
+        id: &ModeId,
+        table: Option<CompiledKeymap>,
+        temporary_chords: Vec<TemporaryChord>,
+    ) {
+        if let Some(index) = self.index_of(id)
+            && let Some(slot) = self.slots.get_mut(index)
+        {
+            slot.table = table;
+            slot.temporary_chords = temporary_chords;
+        }
+    }
+
+    fn tables(&self) -> impl Iterator<Item = (&ModeId, &CompiledKeymap)> {
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.table.as_ref().map(|table| (&slot.id, table)))
+    }
+
+    #[cfg(test)]
+    fn table_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| slot.table.is_some())
+            .count()
+    }
+}
+
 /// Remembers the receiving mode across the release half of a held gesture.
 #[derive(Debug, Clone)]
 struct ActiveGesture {
@@ -183,7 +335,7 @@ struct ActiveGesture {
 /// follows the physical activation key until it is released. This is visual
 /// state only: unlike `latched`, it never owns a synthetic mouse button.
 #[derive(Debug, Default)]
-struct ActiveClickIndicators(Vec<(Key, Button)>);
+struct ActiveClickIndicators(SmallVec<[(Key, Button); 2]>);
 
 impl ActiveClickIndicators {
     fn activate(&mut self, key: Key, button: Button) {
@@ -228,11 +380,20 @@ impl Default for PressedKeys {
 }
 
 impl PressedKeys {
+    #[cfg(test)]
     fn insert(&mut self, key: Key) -> bool {
         if self.0.contains(&key) {
             return false;
         }
         self.0.push(key);
+        true
+    }
+
+    fn insert_ref(&mut self, key: &Key) -> bool {
+        if self.0.contains(key) {
+            return false;
+        }
+        self.0.push(key.clone());
         true
     }
 
@@ -354,19 +515,26 @@ struct DynamicOverlayState {
     follows_cursor_screen: bool,
 }
 
+struct TemporaryChord {
+    chord: KeyChord,
+    conflicts_with_ui_hint_overlap: bool,
+}
+
+fn chords_conflict(left: &KeyChord, right: &KeyChord) -> bool {
+    left.activation_matches(right.activation_key())
+        || right.activation_matches(left.activation_key())
+}
+
 pub struct Engine {
     config: Config,
     palette: Palette,
     appearance: Appearance,
 
-    modes: BTreeMap<ModeId, Box<dyn Mode>>,
+    modes: ModeRegistry,
     active: ModeId,
+    active_slot: Option<usize>,
 
-    /// Resolved binding table per mode, rebuilt only when its effective profile changes.
-    tables: BTreeMap<ModeId, CompiledKeymap>,
-    /// Parsed temporary-mode chords, rebuilt with the binding tables instead
-    /// of reparsed on every key edge and overlay refresh.
-    temporary_chords: BTreeMap<ModeId, Vec<(String, KeyChord)>>,
+    ui_hint_overlap_chord: Option<KeyChord>,
     /// Exact per-mode app-override patches used to build `tables`.
     binding_profile_key: Vec<Bindings>,
     #[cfg(test)]
@@ -382,6 +550,8 @@ pub struct Engine {
     screens: Vec<Screen>,
     cursor: Point,
     focused_app: Option<FocusedApp>,
+    /// Cached because this guard is checked for every physical key edge.
+    focused_app_excluded: bool,
 
     pressed: PressedKeys,
     /// The OS must see matching down/up halves even if a mode switch happens
@@ -430,6 +600,7 @@ pub struct Engine {
     /// Suppress repeated reports while the focused window rejects a stream of
     /// synthetic input (most commonly Windows UIPI on an elevated window).
     input_failure_active: bool,
+    pending_runtime_error: Option<RuntimeError>,
     should_quit: bool,
     config_store: Option<ConfigStore>,
     /// Automatic startup keeps discovering this directory on every reload.
@@ -448,10 +619,10 @@ impl Engine {
             config,
             palette,
             appearance,
-            modes: BTreeMap::new(),
+            modes: ModeRegistry::default(),
             active: ModeId::idle(),
-            tables: BTreeMap::new(),
-            temporary_chords: BTreeMap::new(),
+            active_slot: None,
+            ui_hint_overlap_chord: None,
             binding_profile_key: Vec::new(),
             #[cfg(test)]
             table_rebuild_count: 0,
@@ -461,6 +632,7 @@ impl Engine {
             screens: Vec::new(),
             cursor: Point::default(),
             focused_app: None,
+            focused_app_excluded: false,
             pressed: PressedKeys::default(),
             key_dispositions: KeyMap::default(),
             active_gestures: KeyMap::default(),
@@ -481,6 +653,7 @@ impl Engine {
             pending_overlay: None,
             enabled: true,
             input_failure_active: false,
+            pending_runtime_error: None,
             should_quit: false,
             config_store: None,
             config_discovery_directory: None,
@@ -492,7 +665,7 @@ impl Engine {
     /// Register a mode. Later registrations replace earlier ones with the same
     /// id, which is how a plugin can override a built-in mode.
     pub fn register(&mut self, mode: Box<dyn Mode>) {
-        self.modes.insert(mode.id(), mode);
+        self.insert_mode(mode);
         self.rebuild_tables();
     }
 
@@ -500,7 +673,20 @@ impl Engine {
     /// compilation lets the backend's initial focused application be folded
     /// into the first and only startup table build.
     pub(crate) fn register_deferred(&mut self, mode: Box<dyn Mode>) {
-        self.modes.insert(mode.id(), mode);
+        self.insert_mode(mode);
+    }
+
+    fn insert_mode(&mut self, mode: Box<dyn Mode>) {
+        let id = mode.id();
+        // Pointer interest is an internal optimisation for the two built-in
+        // modes that deliberately ignore physical motion. Keeping it out of
+        // the public Mode vtable avoids perturbing every mode's hot dispatch;
+        // plugins retain the compatible default of receiving pointer events.
+        let pointer_events = builtin_wants_pointer_events(&id);
+        let index = self.modes.insert(id.clone(), mode, pointer_events);
+        if id == self.active {
+            self.active_slot = Some(index);
+        }
     }
 
     /// Register a plugin and merge its default chords, without letting them
@@ -544,12 +730,13 @@ impl Engine {
             .extend(plugin.manifest().default_bindings.clone());
         for verb in plugin.manifest().verbs.clone() {
             if let Some(existing) = self.plugin_verbs.insert(verb.clone(), id.clone()) {
-                return Err(format!(
+                return Err(RuntimeError::Fatal(format!(
                     "plugin verb {verb:?} is already owned by {existing}"
-                ));
+                ))
+                .into_message());
             }
         }
-        self.modes.insert(id, plugin as Box<dyn Mode>);
+        self.insert_mode(plugin as Box<dyn Mode>);
         if rebuild {
             self.rebuild_tables();
         }
@@ -574,8 +761,16 @@ impl Engine {
         self.config_discovery_directory = Some(directory);
     }
 
-    fn recoverable_input_error(action: &str, error: String) -> String {
-        format!("{RECOVERABLE_INPUT_PREFIX}{action}: {error}")
+    fn recoverable_input_error(&mut self, action: &str, error: String) -> String {
+        let error = RuntimeError::RecoverableInput(format!("{action}: {error}"));
+        let message = error.message().to_owned();
+        // Keep the first failure while rollback runs. A rollback can itself
+        // inject or release input; replacing this value would lose the error
+        // that is actually propagated to the Engine loop.
+        if self.pending_runtime_error.is_none() {
+            self.pending_runtime_error = Some(error);
+        }
+        message
     }
 
     fn cancel_scans_for_owner(
@@ -619,10 +814,14 @@ impl Engine {
     }
 
     fn recover_from_input_error(&mut self, error: &str, backend: &mut dyn Backend) -> bool {
-        let Some(message) = error.strip_prefix(RECOVERABLE_INPUT_PREFIX) else {
+        let Some(RuntimeError::RecoverableInput(message)) = self.pending_runtime_error.take()
+        else {
             return false;
         };
-        self.reset_runtime_input_state(message, false, backend);
+        if message != error {
+            return false;
+        }
+        self.reset_runtime_input_state(&message, false, backend);
         true
     }
 
@@ -695,7 +894,7 @@ impl Engine {
                 // commands: the recovery path must not inject more input.
                 let _ = mode.handle(&ModeEvent::Deactivated, &context);
             }
-            self.active = ModeId::idle();
+            self.set_active(ModeId::idle());
             let context = HostContext {
                 screens: &self.screens,
                 cursor: self.cursor,
@@ -740,6 +939,11 @@ impl Engine {
         &self.active
     }
 
+    fn set_active(&mut self, active: ModeId) {
+        self.active_slot = self.modes.index_of(&active);
+        self.active = active;
+    }
+
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
@@ -754,8 +958,8 @@ impl Engine {
 
     /// Bindings active in `mode`, for diagnostics and tests.
     pub fn bindings_in(&self, mode: &ModeId) -> Vec<(String, Binding)> {
-        self.tables
-            .get(mode)
+        self.modes
+            .table(mode)
             .map(CompiledKeymap::entries)
             .unwrap_or_default()
     }
@@ -786,36 +990,42 @@ impl Engine {
             .config
             .binding_profile_key(ids.iter().map(|id| id.as_str()), self.focused_app.as_ref());
 
-        let mut tables: BTreeMap<ModeId, CompiledKeymap> = BTreeMap::new();
-        let mut temporary_chords = BTreeMap::new();
+        let ui_hint_overlap_chord = KeyChord::parse(&self.config.ui_hint.overlap_cycle_key).ok();
+        let mut routes = Vec::with_capacity(ids.len());
         for id in ids {
-            if let Some((_, _, temporary_keys)) = self.config.inheritance_for(id.as_str()) {
-                let parsed = temporary_keys
-                    .iter()
-                    .filter_map(|text| {
-                        KeyChord::parse(text)
-                            .ok()
-                            .map(|chord| (text.clone(), chord))
-                    })
-                    .collect::<Vec<_>>();
-                temporary_chords.insert(id.clone(), parsed);
-            }
-            let Some(configured) = self.config.bindings_for(id.as_str()) else {
-                continue;
-            };
-            let merged = self.merge_overrides(id.as_str(), configured);
+            let temporary_chords = self
+                .config
+                .inheritance_for(id.as_str())
+                .map(|(_, _, temporary_keys)| {
+                    temporary_keys
+                        .iter()
+                        .filter_map(|text| {
+                            KeyChord::parse(text).ok().map(|chord| TemporaryChord {
+                                conflicts_with_ui_hint_overlap: ui_hint_overlap_chord
+                                    .as_ref()
+                                    .is_some_and(|overlap| chords_conflict(overlap, &chord)),
+                                chord,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let table = self.config.bindings_for(id.as_str()).map(|configured| {
+                let merged = self.merge_overrides(id.as_str(), configured);
+                CompiledKeymap::compile(merged, self.config.resolved_key_aliases())
+            });
+            routes.push((id, table, temporary_chords));
+        }
 
-            tables.insert(
-                id,
-                CompiledKeymap::compile(merged, self.config.resolved_key_aliases()),
-            );
+        self.modes.clear_routes();
+        for (id, table, temporary_chords) in routes {
+            self.modes.set_routes(&id, table, temporary_chords);
         }
 
         // A plugin's suggested chord applies in `normal`, which is where the
         // user works, and only if that chord is still free.
         let normal = ModeId::normal();
-        if self.modes.contains_key(&normal) {
-            let table = tables.entry(normal).or_default();
+        if let Some(table) = self.modes.table_mut_or_default(&normal) {
             for (chord, binding) in &self.plugin_bindings {
                 let taken = table.contains_chord(chord);
                 if !taken {
@@ -824,8 +1034,7 @@ impl Engine {
             }
         }
 
-        self.tables = tables;
-        self.temporary_chords = temporary_chords;
+        self.ui_hint_overlap_chord = ui_hint_overlap_chord;
         self.binding_profile_key = binding_profile_key;
         #[cfg(test)]
         {
@@ -848,15 +1057,19 @@ impl Engine {
         merged.into_iter().collect()
     }
 
-    fn is_excluded_app(&self) -> bool {
-        let Some(app) = &self.focused_app else {
+    fn excluded_app_matches(config: &Config, app: Option<&FocusedApp>) -> bool {
+        let Some(app) = app else {
             return false;
         };
-        self.config
+        config
             .general
             .excluded_apps
             .iter()
             .any(|e| e.eq_ignore_ascii_case(&app.bundle_id))
+    }
+
+    fn is_excluded_app(&self) -> bool {
+        self.focused_app_excluded
     }
 
     fn context(&self) -> HostContext<'_> {
@@ -890,7 +1103,7 @@ impl Engine {
         if !self.config.debug.enabled || !self.config.debug.keys {
             return;
         }
-        for (mode, table) in &self.tables {
+        for (mode, table) in self.modes.tables() {
             let entries = table.entries();
             self.trace(
                 true,
@@ -925,7 +1138,7 @@ impl Engine {
                     format!("shutdown after startup failure also failed: {shutdown_error}"),
                 );
             }
-            return Err(error);
+            return Err(RuntimeError::Platform(error).into_message());
         }
         crate::app::logging::info_args(
             "backend",
@@ -963,6 +1176,8 @@ impl Engine {
             );
             None
         });
+        self.focused_app_excluded =
+            Self::excluded_app_matches(&self.config, self.focused_app.as_ref());
         crate::app::logging::info_args(
             "backend",
             format_args!(
@@ -1079,6 +1294,12 @@ impl Engine {
     /// How long we may block before a timer needs servicing.
     fn next_timeout(&self) -> Duration {
         const MAX: Duration = Duration::from_millis(50);
+        if self.timers.is_empty()
+            && self.pending_sequences.is_empty()
+            && self.pending_long_press_toggles.is_empty()
+        {
+            return MAX;
+        }
         let now = Instant::now();
         self.timers
             .values()
@@ -1100,6 +1321,9 @@ impl Engine {
     }
 
     fn fire_due_long_press_toggles(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
+        if self.pending_long_press_toggles.is_empty() {
+            return Ok(());
+        }
         if self.should_quit || !self.enabled || self.is_excluded_app() {
             self.pending_long_press_toggles.clear();
             return Ok(());
@@ -1128,6 +1352,9 @@ impl Engine {
     }
 
     fn fire_due_sequences(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
+        if self.pending_sequences.is_empty() {
+            return Ok(());
+        }
         let now = Instant::now();
         while self
             .pending_sequences
@@ -1150,6 +1377,9 @@ impl Engine {
     }
 
     fn fire_due_timers(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
+        if self.timers.is_empty() {
+            return Ok(());
+        }
         let now = Instant::now();
         let mut due: Vec<String> = self
             .timers
@@ -1200,10 +1430,7 @@ impl Engine {
                 self.handle_key(input, backend)?;
             }
             BackendEvent::InputInjectionFailed(message) => {
-                return Err(Self::recoverable_input_error(
-                    "asynchronous native input",
-                    message,
-                ));
+                return Err(self.recoverable_input_error("asynchronous native input", message));
             }
             BackendEvent::InputCaptureLost(message) => {
                 self.reset_runtime_input_state(&message, true, backend);
@@ -1219,7 +1446,16 @@ impl Engine {
                         format!("position=({:.1},{:.1})", p.x, p.y)
                     });
                 }
-                self.dispatch(ModeEvent::PointerMoved(p), backend)?;
+                let active_slot = self
+                    .active_slot
+                    .filter(|&index| self.modes.id_at(index) == Some(&self.active))
+                    .or_else(|| self.modes.index_of(&self.active));
+                if active_slot
+                    .and_then(|index| self.modes.wants_pointer_events_at(index))
+                    .unwrap_or(true)
+                {
+                    self.dispatch(ModeEvent::PointerMoved(p), backend)?;
+                }
                 if changed {
                     self.refresh_overlay_positions(backend)?;
                 }
@@ -1242,6 +1478,8 @@ impl Engine {
                         self.binding_profile_key_for(app.as_ref()) != self.binding_profile_key
                     };
                 self.focused_app = app.clone();
+                self.focused_app_excluded =
+                    Self::excluded_app_matches(&self.config, self.focused_app.as_ref());
                 if profile_changed {
                     self.rebuild_tables();
                     self.trace_binding_tables();
@@ -1420,6 +1658,8 @@ impl Engine {
         config.validate().map_err(|e| e.to_string())?;
         crate::app::logging::set_non_error_enabled(config.debug.enabled);
         self.config = config;
+        self.focused_app_excluded =
+            Self::excluded_app_matches(&self.config, self.focused_app.as_ref());
         self.palette = self.config.palette(self.appearance);
         self.pending_long_press_toggles.clear();
         self.rebuild_tables();
@@ -1441,15 +1681,17 @@ impl Engine {
             return self.dispose_input(&input, KeyOutcome::Forwarded, trace_key, backend);
         }
 
-        let display_before = self.display_mode();
-        let completed_default_toggle = match input.state {
+        let display_before = self
+            .key_may_change_temporary_mode(&input.key)
+            .then(|| self.display_mode());
+        let (completed_default_toggle, pressed_changed) = match input.state {
             KeyState::Down => {
-                self.pressed.insert(input.key.clone());
-                None
+                let changed = self.pressed.insert_ref(&input.key);
+                (None, changed)
             }
             KeyState::Up => {
-                self.pressed.remove(&input.key);
-                self.active_default_toggles.remove(&input.key)
+                let changed = self.pressed.remove(&input.key);
+                (self.active_default_toggles.remove(&input.key), changed)
             }
         };
         let click_indicator_released =
@@ -1464,7 +1706,8 @@ impl Engine {
                 .active_default_toggles
                 .keys()
                 .any(|key| key != &input.key && self.pressed.contains(key));
-        let display_changed = display_before != self.display_mode();
+        let display_changed = pressed_changed
+            && display_before.is_some_and(|display_before| display_before != self.display_mode());
 
         if !self.enabled || self.is_excluded_app() {
             let outcome = self.complete_key_disposition(&input, KeyOutcome::Forwarded);
@@ -1541,7 +1784,7 @@ impl Engine {
             let applied = if suppress_click {
                 true
             } else {
-                match self.apply_binding(&resolved, &input, backend) {
+                match self.apply_binding(resolved, &input, backend) {
                     Ok(_) => true,
                     Err(error) => {
                         self.report_action_error(error, backend);
@@ -1647,8 +1890,8 @@ impl Engine {
         {
             self.trace_lazy(trace_key, "resolve", || {
                 let available = self
-                    .tables
-                    .get(&ModeId::idle())
+                    .modes
+                    .table(&ModeId::idle())
                     .map(CompiledKeymap::entries)
                     .unwrap_or_default();
                 format!(
@@ -1688,13 +1931,32 @@ impl Engine {
     }
 
     fn temporary_mode_is_active(&self, mode: &ModeId) -> bool {
-        self.temporary_chords.get(mode).is_some_and(|chords| {
-            chords.iter().any(|(name, chord)| {
-                let reserved_for_overlap = self.active == ModeId::ui_hint()
-                    && self.config.ui_hint.overlap_cycle_conflicts_with(name);
-                !reserved_for_overlap && chord.matches_pressed(&self.pressed)
+        self.modes.temporary_chords(mode).is_some_and(|chords| {
+            chords.iter().any(|entry| {
+                let reserved_for_overlap =
+                    self.active == ModeId::ui_hint() && entry.conflicts_with_ui_hint_overlap;
+                !reserved_for_overlap && entry.chord.matches_pressed(&self.pressed)
             })
         })
+    }
+
+    fn key_may_change_temporary_mode(&self, key: &Key) -> bool {
+        self.modes
+            .temporary_chords(&self.active)
+            .is_some_and(|chords| {
+                chords.iter().any(|entry| {
+                    entry.chord.keys().iter().any(|configured| {
+                        configured == key
+                            || matches!(
+                                (configured.as_str(), key.as_str()),
+                                ("alt", "left_alt" | "right_alt")
+                                    | ("ctrl", "left_ctrl" | "right_ctrl")
+                                    | ("shift", "left_shift" | "right_shift")
+                                    | ("win", "left_win" | "right_win")
+                            )
+                    })
+                })
+            })
     }
 
     fn display_mode(&self) -> ModeId {
@@ -1715,6 +1977,12 @@ impl Engine {
         self.active.clone()
     }
 
+    fn ui_hint_overlap_matches(&self, key: &Key) -> bool {
+        self.ui_hint_overlap_chord
+            .as_ref()
+            .is_some_and(|chord| chord.activation_matches(key))
+    }
+
     /// Find the binding for `key` using the compiled mode precedence rules.
     fn lookup(&self, key: &Key) -> Option<ResolvedBinding> {
         let active_match = self.lookup_with_specificity_in(&self.active, key);
@@ -1725,7 +1993,7 @@ impl Engine {
             });
         }
 
-        if self.active == ModeId::ui_hint() && self.config.ui_hint.overlap_cycle_matches(key) {
+        if self.active == ModeId::ui_hint() && self.ui_hint_overlap_matches(key) {
             return None;
         }
 
@@ -1795,7 +2063,7 @@ impl Engine {
     }
 
     fn active_claims_raw_key(&self, key: &Key) -> bool {
-        if self.active == ModeId::ui_hint() && self.config.ui_hint.overlap_cycle_matches(key) {
+        if self.active == ModeId::ui_hint() && self.ui_hint_overlap_matches(key) {
             return true;
         }
         let Some(character) = key.as_char() else {
@@ -1839,7 +2107,7 @@ impl Engine {
         mode: &ModeId,
         key: &Key,
     ) -> Option<(Arc<Binding>, usize)> {
-        let table = self.tables.get(mode)?;
+        let table = self.modes.table(mode)?;
         if self.strict_modifier_matching_enabled() {
             table.lookup_with_specificity_strict(key, &self.pressed, |modifier| {
                 matches!(
@@ -2108,7 +2376,7 @@ impl Engine {
                 binding: Arc::new(action),
                 owner: owner.clone(),
             };
-            self.apply_binding(&nested, &input, backend)?;
+            self.apply_binding(nested, &input, backend)?;
         }
         Ok(())
     }
@@ -2120,7 +2388,7 @@ impl Engine {
     /// [`ModeEvent::Binding`], which is what a plugin sees too.
     fn apply_binding(
         &mut self,
-        resolved: &ResolvedBinding,
+        resolved: ResolvedBinding,
         input: &crate::api::input::InputEvent,
         backend: &mut dyn Backend,
     ) -> Result<bool, String> {
@@ -2145,6 +2413,30 @@ impl Engine {
         // Auto-repeat must not re-trigger a discrete action.
         if input.repeat && !binding.is_held() {
             return Ok(true);
+        }
+
+        // Stateful gestures and mode-specific discrete actions are owned by
+        // the receiving mode. Transfer the resolved binding's Arc directly;
+        // a held key already stored the one clone needed for its release edge.
+        if matches!(
+            binding,
+            Binding::Move(_)
+                | Binding::Scroll(..)
+                | Binding::Speed(_)
+                | Binding::ToggleCursorFollowSelection
+                | Binding::RescanUi
+        ) {
+            return self
+                .dispatch_to(
+                    &resolved.owner,
+                    ModeEvent::Binding {
+                        binding: resolved.binding,
+                        state: input.state,
+                        key: input.key.clone(),
+                    },
+                    backend,
+                )
+                .map(|_| true);
         }
 
         match binding {
@@ -2196,7 +2488,7 @@ impl Engine {
                             binding: Arc::new(action),
                             owner: resolved.owner.clone(),
                         };
-                        self.apply_binding(&nested, input, backend)?;
+                        self.apply_binding(nested, input, backend)?;
                     }
                 }
                 Ok(true)
@@ -2369,24 +2661,11 @@ impl Engine {
             }
             Binding::Wait { .. } => Ok(true),
 
-            // Stateful gestures and mode-specific discrete actions are owned
-            // by the active mode, which alone knows their session state.
             Binding::Move(_)
             | Binding::Scroll(..)
             | Binding::Speed(_)
             | Binding::ToggleCursorFollowSelection
-            | Binding::RescanUi => {
-                self.dispatch_to(
-                    &resolved.owner,
-                    ModeEvent::Binding {
-                        binding: Arc::clone(&resolved.binding),
-                        state: input.state,
-                        key: input.key.clone(),
-                    },
-                    backend,
-                )?;
-                Ok(true)
-            }
+            | Binding::RescanUi => unreachable!("stateful bindings are dispatched above"),
 
             // Filtered out when the table was built.
             Binding::Disabled => Ok(false),
@@ -2457,7 +2736,7 @@ impl Engine {
                         ),
                     }
                 }
-                return Err(Self::recoverable_input_error("input press", error));
+                return Err(self.recoverable_input_error("input press", error));
             }
             self.latched.insert(actual.clone());
             pressed.push(actual);
@@ -2490,7 +2769,7 @@ impl Engine {
             }
         }
         first_error.map_or(Ok(()), |error| {
-            Err(Self::recoverable_input_error("input release", error))
+            Err(self.recoverable_input_error("input release", error))
         })
     }
 
@@ -2557,7 +2836,7 @@ impl Engine {
             // Record every member conservatively; redundant key-up events are
             // harmless and safer than leaving a modifier held.
             self.latched.extend(keys.into_iter().map(InputTarget::Key));
-            return Err(Self::recoverable_input_error("keyboard chord", error));
+            return Err(self.recoverable_input_error("keyboard chord", error));
         }
         Ok(())
     }
@@ -2597,6 +2876,20 @@ impl Engine {
         self.dispatch_to(&active, ModeEvent::ConfigReloaded, backend)
     }
 
+    fn mode_index_for_dispatch(&mut self, owner: &ModeId) -> Option<usize> {
+        if owner == &self.active {
+            if let Some(index) = self.active_slot
+                && self.modes.id_at(index) == Some(owner)
+            {
+                return Some(index);
+            }
+            let index = self.modes.index_of(owner)?;
+            self.active_slot = Some(index);
+            return Some(index);
+        }
+        self.modes.index_of(owner)
+    }
+
     /// Deliver an event to a specific registered mode. This is used for normal
     /// pointer controls borrowed by an active label mode.
     fn dispatch_to(
@@ -2605,6 +2898,9 @@ impl Engine {
         event: ModeEvent,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
+        let Some(mode_index) = self.mode_index_for_dispatch(owner) else {
+            return Ok(());
+        };
         let context = HostContext {
             screens: &self.screens,
             cursor: self.cursor,
@@ -2612,10 +2908,11 @@ impl Engine {
             palette: &self.palette,
             config: &self.config,
         };
-        let Some(mode) = self.modes.get_mut(owner) else {
+        let Some(mode) = self.modes.get_index_mut(mode_index) else {
             return Ok(());
         };
         let commands = mode.handle(&event, &context);
+        crate::app::perf_probe::mark("mode_handled");
         crate::app::perf_probe::mark("commands_ready");
         self.execute_for(owner, commands, backend)
     }
@@ -2629,6 +2926,9 @@ impl Engine {
         event: ModeEvent,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
+        let Some(mode_index) = self.mode_index_for_dispatch(owner) else {
+            return Ok(());
+        };
         let context = HostContext {
             screens: &self.screens,
             cursor: self.cursor,
@@ -2636,10 +2936,11 @@ impl Engine {
             palette: &self.palette,
             config: &self.config,
         };
-        let Some(mode) = self.modes.get_mut(owner) else {
+        let Some(mode) = self.modes.get_index_mut(mode_index) else {
             return Ok(());
         };
         let commands = mode.handle_owned(event, &context);
+        crate::app::perf_probe::mark("mode_handled");
         crate::app::perf_probe::mark("commands_ready");
         self.execute_for(owner, commands, backend)
     }
@@ -2651,7 +2952,7 @@ impl Engine {
         let previous = self.active.clone();
         self.dispatch(ModeEvent::Suspended, backend)?;
         self.modal_stack.push(previous.clone());
-        self.active = target;
+        self.set_active(target);
         self.dispatch(ModeEvent::Pushed { previous }, backend)
     }
 
@@ -2663,7 +2964,7 @@ impl Engine {
         self.dispatch(ModeEvent::Deactivated, backend)?;
         self.cancel_scans_for_owner(&current, backend)?;
         self.timers.retain(|_, timer| timer.owner != current);
-        self.active = previous;
+        self.set_active(previous);
         self.dispatch(ModeEvent::Resumed, backend)
     }
 
@@ -2725,7 +3026,7 @@ impl Engine {
                 self.cancel_scans_for_owner(&old_id, backend)?;
                 self.timers.retain(|_, t| t.owner != old_id);
             }
-            self.active = target;
+            self.set_active(target);
         }
 
         self.dispatch(ModeEvent::Activated { previous }, backend)
@@ -3105,6 +3406,630 @@ mod tests {
         assert_eq!(engine.active_mode(), &ModeId::ui_hint());
         assert!(engine.scan_owners.is_empty());
         assert_eq!(log.lock().unwrap().cancelled_scans, [73]);
+    }
+
+    #[test]
+    fn pointer_interest_skips_only_the_mode_event() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mode = ProbeMode::new("normal", Arc::clone(&seen));
+        let mut engine = Engine::new(Config::default(), Appearance::Dark);
+        engine.register(Box::new(mode));
+        engine.active = ModeId::normal();
+        engine.screens = vec![Screen {
+            bounds: Rect::new(0.0, 0.0, 1_000.0, 800.0),
+            work_area: Rect::new(0.0, 0.0, 1_000.0, 800.0),
+            is_primary: true,
+            scale: 1.0,
+            name: None,
+        }];
+        let (mut backend, _) = FakeBackend::new(Vec::new());
+
+        engine
+            .handle_backend_event(
+                BackendEvent::PointerMoved(Point::new(400.0, 300.0)),
+                &mut backend,
+            )
+            .unwrap();
+
+        assert_eq!(engine.cursor, Point::new(400.0, 300.0));
+        assert!(!seen.lock().unwrap().iter().any(|event| event == "pointer"));
+    }
+
+    #[test]
+    #[ignore = "microbenchmark probe; run in release with --test-threads=1"]
+    fn pointer_interest_performance_probe() {
+        const WARMUP: usize = 2_000;
+        const SAMPLES: usize = 20_000;
+        const CALLS_PER_SAMPLE: usize = 100;
+
+        fn configured_idle_engine() -> Engine {
+            let config = Config::default();
+            let mut engine = Engine::new(config.clone(), Appearance::Dark);
+            engine.register(Box::new(crate::modes::idle::IdleMode::new(&config)));
+            engine.active = ModeId::idle();
+            engine.screens = vec![Screen {
+                bounds: Rect::new(0.0, 0.0, 1_000.0, 800.0),
+                work_area: Rect::new(0.0, 0.0, 1_000.0, 800.0),
+                is_primary: true,
+                scale: 1.0,
+                name: None,
+            }];
+            engine
+        }
+
+        fn legacy_pointer(engine: &mut Engine, backend: &mut dyn Backend, reported: Point) {
+            let point = engine
+                .constrain_absolute_pointer(reported)
+                .unwrap_or(engine.cursor);
+            let changed = engine.cursor != point;
+            engine.cursor = point;
+            engine
+                .dispatch(ModeEvent::PointerMoved(point), backend)
+                .unwrap();
+            if changed {
+                engine.refresh_overlay_positions(backend).unwrap();
+            }
+        }
+
+        fn measure(mut operation: impl FnMut(usize)) -> (u128, u128, u128) {
+            for index in 0..WARMUP {
+                operation(index);
+            }
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for index in 0..SAMPLES {
+                let started = Instant::now();
+                for offset in 0..CALLS_PER_SAMPLE {
+                    operation(index * CALLS_PER_SAMPLE + offset);
+                }
+                samples.push(started.elapsed().as_nanos() / CALLS_PER_SAMPLE as u128);
+            }
+            samples.sort_unstable();
+            let last = samples.len() - 1;
+            (
+                samples[last * 50 / 100],
+                samples[last * 95 / 100],
+                samples[last * 99 / 100],
+            )
+        }
+
+        let mut fast = configured_idle_engine();
+        let (mut fast_backend, _) = FakeBackend::new(Vec::new());
+        let fast_result = measure(|index| {
+            let point = Point::new((index % 999) as f64, (index % 799) as f64);
+            fast.handle_backend_event(BackendEvent::PointerMoved(point), &mut fast_backend)
+                .unwrap();
+        });
+
+        let mut legacy = configured_idle_engine();
+        let (mut legacy_backend, _) = FakeBackend::new(Vec::new());
+        let legacy_result = measure(|index| {
+            let point = Point::new((index % 999) as f64, (index % 799) as f64);
+            legacy_pointer(&mut legacy, &mut legacy_backend, point);
+        });
+
+        println!(
+            "pointer_interest_probe samples={SAMPLES} calls_per_sample={CALLS_PER_SAMPLE} fast_p50={}ns fast_p95={}ns fast_p99={}ns legacy_p50={}ns legacy_p95={}ns legacy_p99={}ns",
+            fast_result.0,
+            fast_result.1,
+            fast_result.2,
+            legacy_result.0,
+            legacy_result.1,
+            legacy_result.2,
+        );
+    }
+
+    #[test]
+    #[ignore = "microbenchmark probe; run in release with --test-threads=1"]
+    fn ui_hint_overlap_routing_performance_probe() {
+        const WARMUP: usize = 2_000;
+        const SAMPLES: usize = 20_000;
+        const CALLS_PER_SAMPLE: usize = 100;
+
+        fn measure(mut operation: impl FnMut() -> bool) -> (u128, u128, u128) {
+            for _ in 0..WARMUP {
+                std::hint::black_box(operation());
+            }
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let started = Instant::now();
+                for _ in 0..CALLS_PER_SAMPLE {
+                    std::hint::black_box(operation());
+                }
+                samples.push(started.elapsed().as_nanos() / CALLS_PER_SAMPLE as u128);
+            }
+            samples.sort_unstable();
+            let last = samples.len() - 1;
+            (
+                samples[last * 50 / 100],
+                samples[last * 95 / 100],
+                samples[last * 99 / 100],
+            )
+        }
+
+        let config = Config::default();
+        let key = Key::new("left_shift").unwrap();
+        let mut engine = Engine::new(config.clone(), Appearance::Dark);
+        engine.register(Box::new(crate::modes::idle::IdleMode::new(&config)));
+        let compiled = measure(|| engine.ui_hint_overlap_matches(&key));
+        let parsed = measure(|| config.ui_hint.overlap_cycle_matches(&key));
+
+        println!(
+            "ui_hint_overlap_probe samples={SAMPLES} calls_per_sample={CALLS_PER_SAMPLE} compiled_p50={}ns compiled_p95={}ns compiled_p99={}ns parsed_p50={}ns parsed_p95={}ns parsed_p99={}ns",
+            compiled.0, compiled.1, compiled.2, parsed.0, parsed.1, parsed.2,
+        );
+    }
+
+    #[test]
+    #[ignore = "microbenchmark probe; run in release with --test-threads=1"]
+    fn click_indicator_inline_performance_probe() {
+        const WARMUP: usize = 2_000;
+        const SAMPLES: usize = 20_000;
+
+        fn measure(mut operation: impl FnMut()) -> (u128, u128, u128) {
+            for _ in 0..WARMUP {
+                operation();
+            }
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let started = Instant::now();
+                operation();
+                samples.push(started.elapsed().as_nanos());
+            }
+            samples.sort_unstable();
+            let last = samples.len() - 1;
+            (
+                samples[last * 50 / 100],
+                samples[last * 95 / 100],
+                samples[last * 99 / 100],
+            )
+        }
+
+        let key = Key::new("x").unwrap();
+        let inline = measure(|| {
+            let mut indicators = ActiveClickIndicators::default();
+            indicators.activate(key.clone(), Button::Left);
+            std::hint::black_box(indicators.release(&key));
+        });
+        let heap = measure(|| {
+            let mut indicators = Vec::new();
+            indicators.push((key.clone(), Button::Left));
+            std::hint::black_box(indicators.remove(0));
+        });
+
+        let inline_region = Region::new(TEST_ALLOCATOR);
+        let mut indicators = ActiveClickIndicators::default();
+        indicators.activate(key.clone(), Button::Left);
+        indicators.release(&key);
+        let inline_allocations = inline_region.change().allocations;
+        let heap_region = Region::new(TEST_ALLOCATOR);
+        let mut indicators = Vec::new();
+        indicators.push((key.clone(), Button::Left));
+        indicators.remove(0);
+        let heap_allocations = heap_region.change().allocations;
+
+        println!(
+            "click_indicator_probe samples={SAMPLES} inline_p50={}ns inline_p95={}ns inline_p99={}ns heap_p50={}ns heap_p95={}ns heap_p99={}ns inline_allocations={inline_allocations} heap_allocations={heap_allocations}",
+            inline.0, inline.1, inline.2, heap.0, heap.1, heap.2,
+        );
+    }
+
+    #[test]
+    #[ignore = "microbenchmark probe; run in release with --test-threads=1"]
+    fn binding_ownership_performance_probe() {
+        const WARMUP: usize = 2_000;
+        const SAMPLES: usize = 20_000;
+        const CALLS_PER_SAMPLE: usize = 100;
+
+        fn direct(binding: &Arc<Binding>) {
+            for _ in 0..CALLS_PER_SAMPLE {
+                std::hint::black_box(binding.as_ref());
+            }
+        }
+
+        fn cloned(binding: &Arc<Binding>) {
+            for _ in 0..CALLS_PER_SAMPLE {
+                drop(std::hint::black_box(Arc::clone(binding)));
+            }
+        }
+
+        fn percentile(samples: &mut [u128], percent: usize) -> u128 {
+            samples.sort_unstable();
+            samples[(samples.len() - 1) * percent / 100]
+        }
+
+        let binding = Arc::new(Binding::Move(Direction::Left));
+        for _ in 0..WARMUP {
+            direct(&binding);
+            cloned(&binding);
+        }
+
+        let mut direct_samples = Vec::with_capacity(SAMPLES);
+        let mut cloned_samples = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let measure = |operation: fn(&Arc<Binding>), samples: &mut Vec<u128>| {
+                let started = Instant::now();
+                operation(&binding);
+                samples.push(started.elapsed().as_nanos() / CALLS_PER_SAMPLE as u128);
+            };
+            if sample % 2 == 0 {
+                measure(direct, &mut direct_samples);
+                measure(cloned, &mut cloned_samples);
+            } else {
+                measure(cloned, &mut cloned_samples);
+                measure(direct, &mut direct_samples);
+            }
+        }
+
+        let direct_p50 = percentile(&mut direct_samples, 50);
+        let direct_p95 = percentile(&mut direct_samples, 95);
+        let direct_p99 = percentile(&mut direct_samples, 99);
+        let cloned_p50 = percentile(&mut cloned_samples, 50);
+        let cloned_p95 = percentile(&mut cloned_samples, 95);
+        let cloned_p99 = percentile(&mut cloned_samples, 99);
+        println!(
+            "binding_ownership_probe samples={SAMPLES} calls_per_sample={CALLS_PER_SAMPLE} direct_p50={direct_p50}ns direct_p95={direct_p95}ns direct_p99={direct_p99}ns cloned_p50={cloned_p50}ns cloned_p95={cloned_p95}ns cloned_p99={cloned_p99}ns"
+        );
+    }
+
+    #[test]
+    #[ignore = "microbenchmark probe; run in release with --test-threads=1"]
+    fn native_role_move_performance_probe() {
+        const WARMUP: usize = 2_000;
+        const SAMPLES: usize = 20_000;
+
+        fn make_target(native_role: String, clone_role: bool) -> crate::api::geometry::UiTarget {
+            let retained_role = if clone_role {
+                native_role.clone()
+            } else {
+                native_role
+            };
+            crate::api::geometry::UiTarget {
+                rect: Rect::new(0.0, 0.0, 40.0, 20.0),
+                name: String::new(),
+                role: "button".to_owned(),
+                native_role: Some(retained_role),
+            }
+        }
+
+        fn percentiles(samples: &mut [u128]) -> (u128, u128, u128) {
+            samples.sort_unstable();
+            let last = samples.len() - 1;
+            (
+                samples[last * 50 / 100],
+                samples[last * 95 / 100],
+                samples[last * 99 / 100],
+            )
+        }
+
+        for _ in 0..WARMUP {
+            drop(std::hint::black_box(make_target("AXButton".into(), false)));
+            drop(std::hint::black_box(make_target("AXButton".into(), true)));
+        }
+        let mut moved_samples = Vec::with_capacity(SAMPLES);
+        let mut cloned_samples = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let measure = |clone_role: bool, samples: &mut Vec<u128>| {
+                let native_role = String::from("AXButton");
+                let started = Instant::now();
+                drop(std::hint::black_box(make_target(native_role, clone_role)));
+                samples.push(started.elapsed().as_nanos());
+            };
+            if sample % 2 == 0 {
+                measure(false, &mut moved_samples);
+                measure(true, &mut cloned_samples);
+            } else {
+                measure(true, &mut cloned_samples);
+                measure(false, &mut moved_samples);
+            }
+        }
+
+        let native_role = String::from("AXButton");
+        let moved_region = Region::new(TEST_ALLOCATOR);
+        drop(make_target(native_role, false));
+        let moved_allocations = moved_region.change().allocations;
+        let native_role = String::from("AXButton");
+        let cloned_region = Region::new(TEST_ALLOCATOR);
+        drop(make_target(native_role, true));
+        let cloned_allocations = cloned_region.change().allocations;
+        println!(
+            "native_role_probe samples={SAMPLES} moved={:?} cloned={:?} moved_allocations={moved_allocations} cloned_allocations={cloned_allocations}",
+            percentiles(&mut moved_samples),
+            percentiles(&mut cloned_samples),
+        );
+    }
+
+    #[test]
+    #[ignore = "microbenchmark probe; run in release with --test-threads=1"]
+    fn excluded_app_cache_performance_probe() {
+        const WARMUP: usize = 2_000;
+        const SAMPLES: usize = 20_000;
+        const CALLS_PER_SAMPLE: usize = 100;
+
+        fn percentiles(samples: &mut [u128]) -> (u128, u128, u128) {
+            samples.sort_unstable();
+            let last = samples.len() - 1;
+            (
+                samples[last * 50 / 100],
+                samples[last * 95 / 100],
+                samples[last * 99 / 100],
+            )
+        }
+
+        fn measure_pair(
+            mut cached: impl FnMut(),
+            mut scanned: impl FnMut(),
+        ) -> ((u128, u128, u128), (u128, u128, u128)) {
+            for _ in 0..WARMUP {
+                cached();
+                scanned();
+            }
+            let mut cached_samples = Vec::with_capacity(SAMPLES);
+            let mut scanned_samples = Vec::with_capacity(SAMPLES);
+            for sample in 0..SAMPLES {
+                let measure = |operation: &mut dyn FnMut(), samples: &mut Vec<u128>| {
+                    let started = Instant::now();
+                    for _ in 0..CALLS_PER_SAMPLE {
+                        operation();
+                    }
+                    samples.push(started.elapsed().as_nanos() / CALLS_PER_SAMPLE as u128);
+                };
+                if sample % 2 == 0 {
+                    measure(&mut cached, &mut cached_samples);
+                    measure(&mut scanned, &mut scanned_samples);
+                } else {
+                    measure(&mut scanned, &mut scanned_samples);
+                    measure(&mut cached, &mut cached_samples);
+                }
+            }
+            (
+                percentiles(&mut cached_samples),
+                percentiles(&mut scanned_samples),
+            )
+        }
+
+        let app = FocusedApp {
+            bundle_id: "com.example.target".into(),
+            window_title: String::new(),
+            process_id: 1,
+        };
+        let empty = Config::default();
+        let mut one = Config::default();
+        one.general.excluded_apps = vec!["com.example.target".into()];
+        let mut sixteen = Config::default();
+        sixteen.general.excluded_apps = (0..15)
+            .map(|index| format!("com.example.other{index}"))
+            .chain([app.bundle_id.clone()])
+            .collect();
+
+        let compare = |config: &Config, cached_value: bool| {
+            measure_pair(
+                || {
+                    std::hint::black_box(cached_value);
+                },
+                || {
+                    std::hint::black_box(Engine::excluded_app_matches(config, Some(&app)));
+                },
+            )
+        };
+        let empty_result = compare(&empty, false);
+        let one_result = compare(&one, true);
+        let sixteen_result = compare(&sixteen, true);
+        println!(
+            "excluded_app_probe samples={SAMPLES} calls_per_sample={CALLS_PER_SAMPLE} empty_cached={:?} empty_scanned={:?} one_cached={:?} one_scanned={:?} sixteen_cached={:?} sixteen_scanned={:?}",
+            empty_result.0,
+            empty_result.1,
+            one_result.0,
+            one_result.1,
+            sixteen_result.0,
+            sixteen_result.1,
+        );
+    }
+
+    #[test]
+    #[ignore = "microbenchmark probe; run in release with --test-threads=1"]
+    fn mode_registry_lookup_baseline_probe() {
+        const WARMUP: usize = 2_000;
+        const SAMPLES: usize = 20_000;
+        const CALLS_PER_SAMPLE: usize = 100;
+
+        fn percentiles(samples: &mut [u128]) -> (u128, u128, u128) {
+            samples.sort_unstable();
+            let last = samples.len() - 1;
+            (
+                samples[last * 50 / 100],
+                samples[last * 95 / 100],
+                samples[last * 99 / 100],
+            )
+        }
+
+        let ids = [
+            ModeId::idle(),
+            ModeId::normal(),
+            ModeId::grid(),
+            ModeId::recursive_grid(),
+            ModeId::ui_hint(),
+        ];
+        let tree: BTreeMap<ModeId, usize> = ids
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, id)| (id, index))
+            .collect();
+        let slots = [0_usize, 1, 2, 3, 4];
+        let active = ModeId::ui_hint();
+        let tree_lookup = || {
+            std::hint::black_box(
+                std::hint::black_box(&tree)
+                    .get(std::hint::black_box(&active))
+                    .copied()
+                    .unwrap(),
+            )
+        };
+        let slot_lookup =
+            || std::hint::black_box(std::hint::black_box(&slots)[std::hint::black_box(4)]);
+        for _ in 0..WARMUP {
+            tree_lookup();
+            slot_lookup();
+        }
+        let mut tree_samples = Vec::with_capacity(SAMPLES);
+        let mut slot_samples = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let measure = |operation: &dyn Fn() -> usize, samples: &mut Vec<u128>| {
+                let started = Instant::now();
+                for _ in 0..CALLS_PER_SAMPLE {
+                    std::hint::black_box(operation());
+                }
+                samples.push(started.elapsed().as_nanos() / CALLS_PER_SAMPLE as u128);
+            };
+            if sample % 2 == 0 {
+                measure(&tree_lookup, &mut tree_samples);
+                measure(&slot_lookup, &mut slot_samples);
+            } else {
+                measure(&slot_lookup, &mut slot_samples);
+                measure(&tree_lookup, &mut tree_samples);
+            }
+        }
+        println!(
+            "mode_registry_lookup_probe samples={SAMPLES} calls_per_sample={CALLS_PER_SAMPLE} tree={:?} slot={:?}",
+            percentiles(&mut tree_samples),
+            percentiles(&mut slot_samples),
+        );
+    }
+
+    #[test]
+    #[ignore = "microbenchmark probe; run in release with --test-threads=1"]
+    fn mode_registry_dispatch_performance_probe() {
+        const WARMUP: usize = 2_000;
+        const SAMPLES: usize = 20_000;
+        const CALLS_PER_SAMPLE: usize = 100;
+
+        fn percentiles(samples: &mut [u128]) -> (u128, u128, u128) {
+            samples.sort_unstable();
+            let last = samples.len() - 1;
+            (
+                samples[last * 50 / 100],
+                samples[last * 95 / 100],
+                samples[last * 99 / 100],
+            )
+        }
+
+        let config = Config::default();
+        let mut registry = ModeRegistry::default();
+        for mode in crate::modes::built_in(&config) {
+            let id = mode.id();
+            let pointer_events = builtin_wants_pointer_events(&id);
+            registry.insert(id, mode, pointer_events);
+        }
+        let active = ModeId::ui_hint();
+        let active_slot = registry.index_of(&active).unwrap();
+        let mut slot_samples = Vec::with_capacity(SAMPLES);
+        let mut tree_samples = Vec::with_capacity(SAMPLES);
+
+        let slot = |registry: &mut ModeRegistry| {
+            std::hint::black_box(
+                registry
+                    .get_index_mut(active_slot)
+                    .unwrap()
+                    .captures_keyboard(),
+            );
+        };
+        let tree = |registry: &mut ModeRegistry| {
+            std::hint::black_box(registry.get_mut(&active).unwrap().captures_keyboard());
+        };
+        for _ in 0..WARMUP {
+            slot(&mut registry);
+            tree(&mut registry);
+        }
+        for sample in 0..SAMPLES {
+            let mut measure = |operation: &dyn Fn(&mut ModeRegistry), samples: &mut Vec<u128>| {
+                let started = Instant::now();
+                for _ in 0..CALLS_PER_SAMPLE {
+                    operation(&mut registry);
+                }
+                samples.push(started.elapsed().as_nanos() / CALLS_PER_SAMPLE as u128);
+            };
+            if sample % 2 == 0 {
+                measure(&slot, &mut slot_samples);
+                measure(&tree, &mut tree_samples);
+            } else {
+                measure(&tree, &mut tree_samples);
+                measure(&slot, &mut slot_samples);
+            }
+        }
+        println!(
+            "mode_registry_dispatch_probe samples={SAMPLES} calls_per_sample={CALLS_PER_SAMPLE} slot={:?} tree={:?}",
+            percentiles(&mut slot_samples),
+            percentiles(&mut tree_samples),
+        );
+    }
+
+    #[test]
+    #[ignore = "microbenchmark probe; run in release with --test-threads=1"]
+    fn compiled_route_slot_baseline_probe() {
+        const WARMUP: usize = 2_000;
+        const SAMPLES: usize = 20_000;
+        const CALLS_PER_SAMPLE: usize = 100;
+
+        fn percentiles(samples: &mut [u128]) -> (u128, u128, u128) {
+            samples.sort_unstable();
+            let last = samples.len() - 1;
+            (
+                samples[last * 50 / 100],
+                samples[last * 95 / 100],
+                samples[last * 99 / 100],
+            )
+        }
+
+        let config = Config::default();
+        let build = || {
+            CompiledKeymap::compile(
+                vec![("a".into(), Binding::Move(Direction::Left))],
+                config.resolved_key_aliases(),
+            )
+        };
+        let mode = ModeId::normal();
+        let external = BTreeMap::from([(mode.clone(), build())]);
+        let slot = [build()];
+        let key = Key::new("a").unwrap();
+        let pressed = PressedKeys::default();
+        let external_lookup = || {
+            std::hint::black_box(
+                external
+                    .get(&mode)
+                    .unwrap()
+                    .lookup_with_specificity(&key, &pressed),
+            );
+        };
+        let slot_lookup = || {
+            std::hint::black_box(slot[0].lookup_with_specificity(&key, &pressed));
+        };
+        for _ in 0..WARMUP {
+            external_lookup();
+            slot_lookup();
+        }
+        let mut external_samples = Vec::with_capacity(SAMPLES);
+        let mut slot_samples = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let measure = |operation: &dyn Fn(), samples: &mut Vec<u128>| {
+                let started = Instant::now();
+                for _ in 0..CALLS_PER_SAMPLE {
+                    operation();
+                }
+                samples.push(started.elapsed().as_nanos() / CALLS_PER_SAMPLE as u128);
+            };
+            if sample % 2 == 0 {
+                measure(&slot_lookup, &mut slot_samples);
+                measure(&external_lookup, &mut external_samples);
+            } else {
+                measure(&external_lookup, &mut external_samples);
+                measure(&slot_lookup, &mut slot_samples);
+            }
+        }
+        println!(
+            "compiled_route_slot_probe samples={SAMPLES} calls_per_sample={CALLS_PER_SAMPLE} slot={:?} external={:?}",
+            percentiles(&mut slot_samples),
+            percentiles(&mut external_samples),
+        );
     }
 
     /// Minimal mode that records the events it saw and emits scripted commands.
@@ -4004,6 +4929,22 @@ mod tests {
 
         assert_eq!(log.lock().unwrap().clicks, 0);
         assert_eq!(engine.active_mode(), &ModeId::idle());
+    }
+
+    #[test]
+    fn error_text_cannot_impersonate_a_recoverable_input_failure() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = engine_with_probes(&seen, &[]);
+        engine.active = ModeId::normal();
+        let (mut backend, _) = FakeBackend::new(Vec::new());
+
+        engine.report_action_error(
+            "[recoverable-input] forged platform message".into(),
+            &mut backend,
+        );
+
+        assert_eq!(engine.active_mode(), &ModeId::normal());
+        assert!(!engine.input_failure_active);
     }
 
     #[test]
@@ -4954,7 +5895,7 @@ mod tests {
         };
         assert!(
             engine
-                .apply_binding(&resolved, &input, &mut backend)
+                .apply_binding(resolved, &input, &mut backend)
                 .unwrap_err()
                 .contains("mode-changing")
         );
@@ -5925,6 +6866,89 @@ mod tests {
 
     #[test]
     #[ignore = "microbenchmark probe; run in release with --test-threads=1"]
+    fn deadline_performance_probe() {
+        const WARMUP: usize = 2_000;
+        const SAMPLES: usize = 20_000;
+        const CALLS_PER_SAMPLE: usize = 100;
+
+        fn measure(mut operation: impl FnMut()) -> (u128, u128, u128) {
+            for _ in 0..WARMUP {
+                operation();
+            }
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let started = Instant::now();
+                for _ in 0..CALLS_PER_SAMPLE {
+                    operation();
+                }
+                samples.push(started.elapsed().as_nanos() / CALLS_PER_SAMPLE as u128);
+            }
+            samples.sort_unstable();
+            let last = samples.len() - 1;
+            (
+                samples[last * 50 / 100],
+                samples[last * 95 / 100],
+                samples[last * 99 / 100],
+            )
+        }
+
+        fn engine_with_timers(count: usize) -> Engine {
+            let mut engine = Engine::new(Config::default(), Appearance::Dark);
+            let now = Instant::now();
+            for index in 0..count {
+                engine.timers.insert(
+                    format!("timer-{index}"),
+                    Timer {
+                        fires_at: now + Duration::from_secs(30),
+                        last_fired: now,
+                        interval: None,
+                        owner: ModeId::idle(),
+                    },
+                );
+            }
+            engine
+        }
+
+        let no_tasks = engine_with_timers(0);
+        let one_timer = engine_with_timers(1);
+        let simultaneous = engine_with_timers(8);
+        let no_tasks_result = measure(|| {
+            std::hint::black_box(no_tasks.next_timeout());
+        });
+        let one_timer_result = measure(|| {
+            std::hint::black_box(one_timer.next_timeout());
+        });
+        let simultaneous_result = measure(|| {
+            std::hint::black_box(simultaneous.next_timeout());
+        });
+
+        let mut idle = engine_with_timers(0);
+        let (mut backend, _) = FakeBackend::new(Vec::new());
+        let service_result = measure(|| {
+            idle.fire_due_long_press_toggles(&mut backend).unwrap();
+            idle.fire_due_timers(&mut backend).unwrap();
+            idle.fire_due_sequences(&mut backend).unwrap();
+        });
+
+        println!(
+            "deadline_probe samples={SAMPLES} calls_per_sample={CALLS_PER_SAMPLE} no_tasks_p50={}ns no_tasks_p95={}ns no_tasks_p99={}ns one_timer_p50={}ns one_timer_p95={}ns one_timer_p99={}ns simultaneous_p50={}ns simultaneous_p95={}ns simultaneous_p99={}ns idle_service_p50={}ns idle_service_p95={}ns idle_service_p99={}ns",
+            no_tasks_result.0,
+            no_tasks_result.1,
+            no_tasks_result.2,
+            one_timer_result.0,
+            one_timer_result.1,
+            one_timer_result.2,
+            simultaneous_result.0,
+            simultaneous_result.1,
+            simultaneous_result.2,
+            service_result.0,
+            service_result.1,
+            service_result.2,
+        );
+    }
+
+    #[test]
+    #[ignore = "microbenchmark probe; run in release with --test-threads=1"]
     fn toggle_performance_probe() {
         const WARMUP: usize = 1_000;
         const SAMPLES: usize = 10_000;
@@ -5965,6 +6989,29 @@ mod tests {
             bare.handle_backend_event(key_up("n"), &mut bare_backend)
                 .unwrap();
             clear_log(&bare_log);
+        });
+
+        let mut repeated = engine_with_normal_binding("n", "toggle");
+        repeated.active = ModeId::normal();
+        let (mut repeated_backend, repeated_log) = FakeBackend::new(Vec::new());
+        let mut repeat_down = match key_down("n") {
+            BackendEvent::Input(input) => input,
+            _ => unreachable!(),
+        };
+        repeat_down.repeat = true;
+        let repeat_result = measure(|| {
+            repeated
+                .handle_backend_event(key_down("n"), &mut repeated_backend)
+                .unwrap();
+            for _ in 0..100 {
+                repeated
+                    .handle_key(repeat_down.clone(), &mut repeated_backend)
+                    .unwrap();
+            }
+            repeated
+                .handle_backend_event(key_up("n"), &mut repeated_backend)
+                .unwrap();
+            clear_log(&repeated_log);
         });
 
         let mut chord = engine_with_normal_binding("n", "toggle");
@@ -6037,10 +7084,13 @@ mod tests {
         });
 
         println!(
-            "toggle_probe samples={SAMPLES} bare_p50={}ns bare_p95={}ns bare_p99={}ns chord_p50={}ns chord_p95={}ns chord_p99={}ns mouse_p50={}ns mouse_p95={}ns mouse_p99={}ns rollback_p50={}ns rollback_p95={}ns rollback_p99={}ns",
+            "toggle_probe samples={SAMPLES} bare_p50={}ns bare_p95={}ns bare_p99={}ns repeat100_p50={}ns repeat100_p95={}ns repeat100_p99={}ns chord_p50={}ns chord_p95={}ns chord_p99={}ns mouse_p50={}ns mouse_p95={}ns mouse_p99={}ns rollback_p50={}ns rollback_p95={}ns rollback_p99={}ns",
             bare_result.0,
             bare_result.1,
             bare_result.2,
+            repeat_result.0,
+            repeat_result.1,
+            repeat_result.2,
             chord_result.0,
             chord_result.1,
             chord_result.2,
@@ -6317,7 +7367,14 @@ mod tests {
 
         engine.rebuild_tables();
         assert_eq!(engine.table_rebuild_count, 1);
-        assert_eq!(engine.tables.len(), engine.binding_mode_ids().len());
+        assert_eq!(
+            engine.modes.table_count(),
+            engine
+                .binding_mode_ids()
+                .into_iter()
+                .filter(|id| engine.modes.contains_key(id))
+                .count()
+        );
     }
 
     #[test]
@@ -6339,6 +7396,7 @@ mod tests {
         engine.run(&mut backend).unwrap();
 
         assert_eq!(engine.active_mode().as_str(), "idle");
+        assert!(engine.is_excluded_app());
         assert!(
             log.lock()
                 .unwrap()

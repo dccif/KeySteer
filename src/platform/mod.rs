@@ -19,6 +19,12 @@ mod multi_click;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod disposition_mailbox;
 
+#[cfg(any(target_os = "macos", test))]
+mod latest_point_mailbox;
+
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+mod partial_batcher;
+
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
 mod scan_mailbox;
 

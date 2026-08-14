@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use core_foundation::runloop::{CFRunLoop, kCFRunLoopDefaultMode};
+use core_foundation::runloop::CFRunLoop;
 use core_graphics::event::{
     CGEvent, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
     CGEventTapProxy, CGEventType, CallbackResult, EventField,
@@ -16,6 +16,7 @@ use crate::api::backend::{BackendEvent, KeyDisposition};
 use crate::api::command::MouseButton;
 use crate::api::geometry::Point;
 use crate::api::input::{InputEvent, Key, KeyState};
+use crate::app::worker::WorkerJoin;
 use crate::platform::multi_click::ClickTracker;
 
 use super::input;
@@ -80,15 +81,9 @@ struct TapState {
 }
 
 type SharedState = Arc<Mutex<TapState>>;
-type SharedPointer = Arc<Mutex<Option<Point>>>;
+type SharedPointer = Arc<crate::platform::latest_point_mailbox::LatestPointMailbox>;
 type SharedClickTracker = Arc<Mutex<ClickTracker>>;
 type SharedRunLoop = Arc<Mutex<Option<CFRunLoop>>>;
-
-fn default_run_loop_mode() -> core_foundation::runloop::CFRunLoopMode {
-    // SAFETY: Core Foundation exports this process-lifetime static mode; all
-    // callers only borrow the pointer for a CFRunLoop API call.
-    unsafe { kCFRunLoopDefaultMode }
-}
 
 struct CallbackContext {
     sender: SyncSender<Envelope>,
@@ -108,8 +103,7 @@ pub struct HookThread {
     active: Arc<AtomicBool>,
     capture_loss: Arc<AtomicU8>,
     run_loop: SharedRunLoop,
-    finished: Receiver<()>,
-    join: Option<std::thread::JoinHandle<()>>,
+    worker: WorkerJoin,
     deferred: VecDeque<BackendEvent>,
 }
 
@@ -122,8 +116,7 @@ pub struct HookStartup {
     active: Arc<AtomicBool>,
     capture_loss: Arc<AtomicU8>,
     run_loop: SharedRunLoop,
-    finished: Option<Receiver<()>>,
-    join: Option<std::thread::JoinHandle<()>>,
+    worker: Option<WorkerJoin>,
     ready: Receiver<Result<(), String>>,
     activate: SyncSender<()>,
     activated: Receiver<()>,
@@ -167,12 +160,13 @@ impl HookStartup {
         let thread_capture_loss = Arc::clone(&capture_loss);
         let run_loop = Arc::new(Mutex::new(None));
         let thread_run_loop = Arc::clone(&run_loop);
-        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
-        let latest_pointer = Arc::new(Mutex::new(None));
+        let latest_pointer =
+            Arc::new(crate::platform::latest_point_mailbox::LatestPointMailbox::default());
         let thread_pointer = Arc::clone(&latest_pointer);
-        let join = std::thread::Builder::new()
-            .name("keysteer-event-tap".into())
-            .spawn({
+        let worker = WorkerJoin::spawn(
+            "macOS event tap",
+            std::thread::Builder::new().name("keysteer-event-tap".into()),
+            {
                 let event_tx = event_tx.clone();
                 move || {
                     event_tap_thread(
@@ -188,10 +182,9 @@ impl HookStartup {
                             click_tracker,
                         },
                     );
-                    let _ = finished_tx.send(());
                 }
-            })
-            .map_err(|error| format!("cannot start macOS event tap thread: {error}"))?;
+            },
+        )?;
 
         Ok(Self {
             sender: event_tx,
@@ -202,8 +195,7 @@ impl HookStartup {
             active,
             capture_loss,
             run_loop,
-            finished: Some(finished_rx),
-            join: Some(join),
+            worker: Some(worker),
             ready: ready_rx,
             activate: activate_tx,
             activated: activated_rx,
@@ -233,10 +225,10 @@ impl HookStartup {
                     active: Arc::clone(&self.active),
                     capture_loss: Arc::clone(&self.capture_loss),
                     run_loop: Arc::clone(&self.run_loop),
-                    finished: self.finished.take().ok_or_else(|| {
-                        "macOS event tap completion signal is unavailable".to_string()
-                    })?,
-                    join: self.join.take(),
+                    worker: self
+                        .worker
+                        .take()
+                        .ok_or_else(|| "macOS event tap worker is unavailable".to_string())?,
                     deferred: VecDeque::new(),
                 })
             }
@@ -248,7 +240,7 @@ impl HookStartup {
 
 impl Drop for HookStartup {
     fn drop(&mut self) {
-        if self.join.is_none() {
+        if self.worker.is_none() {
             return;
         }
         self.stop.store(true, Ordering::Release);
@@ -256,12 +248,10 @@ impl Drop for HookStartup {
         self.mailbox.cancel_pending();
         let _ = self.activate.try_send(());
         stop_run_loop(&self.run_loop);
-        if let Some(finished) = self.finished.as_ref() {
-            join_with_timeout(
-                &mut self.join,
-                finished,
-                "event tap thread did not stop during startup cleanup",
-            );
+        if let Some(mut worker) = self.worker.take()
+            && let Err(error) = worker.join_timeout(STOP_TIMEOUT)
+        {
+            crate::app::logging::report_error("macos-hook", &error);
         }
     }
 }
@@ -287,12 +277,7 @@ impl HookThread {
         };
 
         if let BackendEvent::PointerMoved(marker) = envelope.event {
-            let point = self
-                .latest_pointer
-                .lock()
-                .map(|mut latest| latest.take())
-                .unwrap_or(None)
-                .unwrap_or(marker);
+            let point = self.latest_pointer.take().unwrap_or(marker);
             self.pending = envelope.generation;
             return Some(BackendEvent::PointerMoved(point));
         }
@@ -317,9 +302,7 @@ impl HookThread {
 
         self.pending = None;
         self.mailbox.cancel_pending();
-        if let Ok(mut pointer) = self.latest_pointer.lock() {
-            pointer.take();
-        }
+        self.latest_pointer.clear();
         while let Ok(envelope) = self.receiver.try_recv() {
             if envelope.generation.is_some()
                 || matches!(
@@ -349,17 +332,8 @@ impl HookThread {
     }
 
     fn reap_finished(&mut self) {
-        if !self
-            .join
-            .as_ref()
-            .is_some_and(std::thread::JoinHandle::is_finished)
-        {
-            return;
-        }
-        if let Some(handle) = self.join.take()
-            && handle.join().is_err()
-        {
-            crate::app::logging::report_error("macos-hook", "event tap thread panicked");
+        if let Err(error) = self.worker.reap_finished() {
+            crate::app::logging::report_error("macos-hook", &error);
         }
     }
 
@@ -374,17 +348,14 @@ impl HookThread {
         Ok(())
     }
 
-    pub fn stop(&mut self) {
+    pub fn stop(&mut self) -> Result<(), String> {
         self.stop.store(true, Ordering::Release);
         self.active.store(false, Ordering::Release);
         self.mailbox.cancel_pending();
         stop_run_loop(&self.run_loop);
-        join_with_timeout(
-            &mut self.join,
-            &self.finished,
-            "event tap thread did not stop within 250 ms; detaching it safely",
-        );
+        let result = self.worker.join_timeout(STOP_TIMEOUT);
         self.pending = None;
+        result
     }
 }
 
@@ -396,32 +367,11 @@ fn stop_run_loop(run_loop: &SharedRunLoop) {
     }
 }
 
-fn join_with_timeout(
-    join: &mut Option<std::thread::JoinHandle<()>>,
-    finished: &Receiver<()>,
-    timeout_message: &str,
-) {
-    let Some(handle) = join.take() else {
-        return;
-    };
-    match finished.recv_timeout(STOP_TIMEOUT) {
-        Ok(()) | Err(RecvTimeoutError::Disconnected) => {
-            if handle.join().is_err() {
-                crate::app::logging::report_error("macos-hook", "event tap thread panicked");
-            }
-        }
-        Err(RecvTimeoutError::Timeout) => {
-            // Dropping JoinHandle detaches; the worker owns all native values
-            // it may still touch and has already been told to fail open.
-            drop(handle);
-            crate::app::logging::report_error("macos-hook", timeout_message);
-        }
-    }
-}
-
 impl Drop for HookThread {
     fn drop(&mut self) {
-        self.stop();
+        if let Err(error) = self.stop() {
+            crate::app::logging::report_error("macos-hook", &error);
+        }
     }
 }
 
@@ -476,7 +426,10 @@ fn event_tap_thread(handshake: HookHandshake, context: HookThreadContext) {
     if let Ok(mut shared) = shared_run_loop.lock() {
         *shared = Some(run_loop.clone());
     }
-    run_loop.add_source(&source, default_run_loop_mode());
+    run_loop.add_source(
+        &source,
+        super::native::default_run_loop_modes().core_foundation,
+    );
     if ready.send(Ok(())).is_err() {
         return;
     }
@@ -492,7 +445,11 @@ fn event_tap_thread(handshake: HookHandshake, context: HookThreadContext) {
 
     let mut timeout_retried = false;
     while !stop.load(Ordering::Acquire) {
-        CFRunLoop::run_in_mode(default_run_loop_mode(), RUN_LOOP_SLICE, true);
+        CFRunLoop::run_in_mode(
+            super::native::default_run_loop_modes().core_foundation,
+            RUN_LOOP_SLICE,
+            true,
+        );
         let disabled = state
             .lock()
             .map(|mut state| state.disabled.take())
@@ -531,7 +488,10 @@ fn event_tap_thread(handshake: HookHandshake, context: HookThreadContext) {
     }
     active.store(false, Ordering::Release);
     callback_mailbox.cancel_pending();
-    run_loop.remove_source(&source, default_run_loop_mode());
+    run_loop.remove_source(
+        &source,
+        super::native::default_run_loop_modes().core_foundation,
+    );
     if let Ok(mut shared) = shared_run_loop.lock() {
         *shared = None;
     }
@@ -696,22 +656,11 @@ fn handle_event(
 }
 
 fn store_latest_pointer(latest_pointer: &SharedPointer, point: Point) -> bool {
-    latest_pointer
-        .lock()
-        .map(|mut latest| {
-            let should_signal = latest.is_none();
-            *latest = Some(point);
-            should_signal
-        })
-        .unwrap_or(false)
+    latest_pointer.publish(point)
 }
 
-fn cancel_latest_pointer_signal(latest_pointer: &SharedPointer, point: Point) {
-    if let Ok(mut latest) = latest_pointer.lock()
-        && *latest == Some(point)
-    {
-        *latest = None;
-    }
+fn cancel_latest_pointer_signal(latest_pointer: &SharedPointer, _point: Point) {
+    latest_pointer.cancel_signal();
 }
 
 fn modifier_transition(state: &SharedState, code: i64, flags: u64) -> Option<(Key, KeyState)> {
@@ -797,13 +746,14 @@ mod tests {
             receiver: event_rx,
             mailbox: Arc::clone(&mailbox),
             pending: Some(generation),
-            latest_pointer: Arc::new(Mutex::new(None)),
+            latest_pointer: Arc::new(
+                crate::platform::latest_point_mailbox::LatestPointMailbox::default(),
+            ),
             stop: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicBool::new(true)),
             capture_loss: Arc::new(AtomicU8::new(CAPTURE_LOSS_NONE)),
             run_loop: Arc::new(Mutex::new(None)),
-            finished: mpsc::sync_channel(1).1,
-            join: None,
+            worker: WorkerJoin::spawn("test hook", std::thread::Builder::new(), || {}).unwrap(),
             deferred: VecDeque::new(),
         };
         hook.set_disposition(KeyDisposition::Consume).unwrap();
@@ -824,13 +774,14 @@ mod tests {
             receiver: event_rx,
             mailbox,
             pending: Some(generation),
-            latest_pointer: Arc::new(Mutex::new(None)),
+            latest_pointer: Arc::new(
+                crate::platform::latest_point_mailbox::LatestPointMailbox::default(),
+            ),
             stop: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicBool::new(true)),
             capture_loss: Arc::new(AtomicU8::new(CAPTURE_LOSS_NONE)),
             run_loop: Arc::new(Mutex::new(None)),
-            finished: mpsc::sync_channel(1).1,
-            join: None,
+            worker: WorkerJoin::spawn("test hook", std::thread::Builder::new(), || {}).unwrap(),
             deferred: VecDeque::new(),
         };
         hook.set_disposition(KeyDisposition::Forward).unwrap();
@@ -880,18 +831,20 @@ mod tests {
             })
             .unwrap();
         let capture_loss = Arc::new(AtomicU8::new(CAPTURE_LOSS_USER_INPUT));
+        let latest_pointer =
+            Arc::new(crate::platform::latest_point_mailbox::LatestPointMailbox::default());
+        latest_pointer.publish(Point::new(1.0, 2.0));
         let mut hook = HookThread {
             sender: event_tx,
             receiver: event_rx,
             mailbox: Arc::new(crate::platform::disposition_mailbox::DispositionMailbox::default()),
             pending: Some(1),
-            latest_pointer: Arc::new(Mutex::new(Some(Point::new(1.0, 2.0)))),
+            latest_pointer,
             stop: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicBool::new(false)),
             capture_loss,
             run_loop: Arc::new(Mutex::new(None)),
-            finished: mpsc::sync_channel(1).1,
-            join: None,
+            worker: WorkerJoin::spawn("test hook", std::thread::Builder::new(), || {}).unwrap(),
             deferred: VecDeque::new(),
         };
 
@@ -901,12 +854,12 @@ mod tests {
         ));
         assert!(hook.try_next_event().is_none());
         assert!(hook.pending.is_none());
-        assert_eq!(*hook.latest_pointer.lock().unwrap(), None);
+        assert_eq!(hook.latest_pointer.take(), None);
     }
 
     #[test]
     fn pointer_burst_uses_one_latest_value_slot() {
-        let latest = Arc::new(Mutex::new(None));
+        let latest = Arc::new(crate::platform::latest_point_mailbox::LatestPointMailbox::default());
         let mut signals = 0;
         for index in 0..10_000 {
             signals += usize::from(store_latest_pointer(
@@ -915,12 +868,12 @@ mod tests {
             ));
         }
         assert_eq!(signals, 1);
-        assert_eq!(*latest.lock().unwrap(), Some(Point::new(9_999.0, 9_999.0)));
+        assert_eq!(latest.take(), Some(Point::new(9_999.0, 9_999.0)));
     }
 
     #[test]
     fn a_failed_pointer_signal_can_be_retried() {
-        let latest = Arc::new(Mutex::new(None));
+        let latest = Arc::new(crate::platform::latest_point_mailbox::LatestPointMailbox::default());
         let first = Point::new(10.0, 20.0);
         assert!(store_latest_pointer(&latest, first));
         cancel_latest_pointer_signal(&latest, first);
@@ -930,7 +883,8 @@ mod tests {
     #[test]
     fn repeated_native_edge_position_is_still_delivered() {
         let (event_tx, event_rx) = mpsc::sync_channel(64);
-        let latest_pointer = Arc::new(Mutex::new(None));
+        let latest_pointer =
+            Arc::new(crate::platform::latest_point_mailbox::LatestPointMailbox::default());
         let mut hook = HookThread {
             sender: event_tx.clone(),
             receiver: event_rx,
@@ -941,8 +895,7 @@ mod tests {
             active: Arc::new(AtomicBool::new(true)),
             capture_loss: Arc::new(AtomicU8::new(CAPTURE_LOSS_NONE)),
             run_loop: Arc::new(Mutex::new(None)),
-            finished: mpsc::sync_channel(1).1,
-            join: None,
+            worker: WorkerJoin::spawn("test hook", std::thread::Builder::new(), || {}).unwrap(),
             deferred: VecDeque::new(),
         };
         let edge = Point::new(999.0, 400.0);
@@ -969,13 +922,14 @@ mod tests {
             receiver: event_rx,
             mailbox: Arc::new(crate::platform::disposition_mailbox::DispositionMailbox::default()),
             pending: None,
-            latest_pointer: Arc::new(Mutex::new(None)),
+            latest_pointer: Arc::new(
+                crate::platform::latest_point_mailbox::LatestPointMailbox::default(),
+            ),
             stop: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicBool::new(true)),
             capture_loss: Arc::new(AtomicU8::new(CAPTURE_LOSS_NONE)),
             run_loop: Arc::new(Mutex::new(None)),
-            finished: mpsc::sync_channel(1).1,
-            join: None,
+            worker: WorkerJoin::spawn("test hook", std::thread::Builder::new(), || {}).unwrap(),
             deferred: VecDeque::new(),
         };
         hook.event_sender()

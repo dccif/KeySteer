@@ -6,16 +6,18 @@
 
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::api::geometry::{Point, Rect};
 use crate::api::overlay::OverlayScene;
+use crate::app::worker::WorkerJoin;
 
 use super::{EventSender, gpu_overlay::GpuOverlay, native, overlay};
 
 const DEVICE_FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const RENDER_WAKE_MESSAGE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x50;
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct Frame {
     scene: Arc<OverlayScene>,
@@ -49,7 +51,7 @@ struct Shared {
 pub(super) struct OverlayWorker {
     shared: Arc<Shared>,
     thread_id: u32,
-    join: Option<JoinHandle<()>>,
+    worker: Option<WorkerJoin>,
 }
 
 impl OverlayWorker {
@@ -57,21 +59,22 @@ impl OverlayWorker {
         let shared = Arc::new(Shared::default());
         let thread_shared = Arc::clone(&shared);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        let join = std::thread::Builder::new()
-            .name("keysteer-overlay-render".into())
-            .spawn(move || render_loop(&thread_shared, &events, ready_tx))
-            .map_err(|error| format!("cannot start Windows overlay renderer: {error}"))?;
-        let thread_id = match ready_rx.recv() {
+        let mut worker = WorkerJoin::spawn(
+            "Windows overlay renderer",
+            std::thread::Builder::new().name("keysteer-overlay-render".into()),
+            move || render_loop(&thread_shared, &events, ready_tx),
+        )?;
+        let thread_id = match worker.wait_ready(&ready_rx, STOP_TIMEOUT) {
             Ok(thread_id) => thread_id,
-            Err(_) => {
-                let _ = join.join();
-                return Err("Windows overlay renderer stopped before becoming ready".into());
+            Err(error) => {
+                let _ = worker.join_timeout(STOP_TIMEOUT);
+                return Err(error);
             }
         };
         Ok(Self {
             shared,
             thread_id,
-            join: Some(join),
+            worker: Some(worker),
         })
     }
 
@@ -133,8 +136,8 @@ impl OverlayWorker {
         }
         self.wake_renderer()?;
         reply_rx
-            .recv()
-            .unwrap_or_else(|_| Err("Windows overlay renderer stopped unexpectedly".into()))
+            .recv_timeout(CONTROL_TIMEOUT)
+            .map_err(|error| format!("Windows overlay renderer did not reply: {error}"))?
     }
 
     fn wake_renderer(&self) -> Result<(), String> {
@@ -143,17 +146,23 @@ impl OverlayWorker {
     }
 
     fn stop(&mut self) -> Result<(), String> {
-        let result = if self.join.is_some() {
+        let result = if self.worker.is_some() {
             self.control(Control::Shutdown)
         } else {
             Ok(())
         };
-        if let Some(join) = self.join.take()
-            && join.join().is_err()
-        {
-            return Err("Windows overlay renderer panicked during shutdown".into());
+        let join_result = self
+            .worker
+            .as_mut()
+            .map_or(Ok(()), |worker| worker.join_timeout(STOP_TIMEOUT));
+        if join_result.is_ok() {
+            self.worker.take();
         }
-        result
+        if result.is_err() { result } else { join_result }
+    }
+
+    pub(super) fn shutdown(&mut self) -> Result<(), String> {
+        self.stop()
     }
 }
 

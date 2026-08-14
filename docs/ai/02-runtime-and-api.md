@@ -56,10 +56,12 @@ Engine 的 Frame、指针、按键等通用热路径直接调用借用式 `Mode:
 `src/app/runtime/mod.rs::Engine` 的状态分为几组：
 
 - 配置/主题：`Config`、`Palette`、当前 `Appearance`。
-- 模式：注册表、活动 Mode、modal stack、插件默认绑定和 verb 所有者。
+- 模式：稳定的连续 `ModeRegistry`/`ModeSlot`、缓存的活动 slot、modal stack、插件默认绑定
+  和 verb 所有者。slot 同时拥有该 Mode 的 binding table、temporary chords 和 pointer
+  interest；Frame/Pointer 的常见分派不再重复走树查找。
 - 输入：当前物理按键、每键 consume/forward disposition、held gesture、合成输入 latch。
-- 路由：每个 Mode 的 `CompiledKeymap`、预解析的 temporary-mode chord 和当前应用对应的
-  override profile key。
+- 路由：每个 ModeSlot 的 `CompiledKeymap`、预解析的 temporary-mode chord 和当前应用对应的
+  override profile key。`CompiledKeymap` 内部仍保持已经验证过的结构，不使用曾回退的排序 Vec。
 - 异步：动作序列、Mode timer、UI scan id -> owner、frame clock owner。
 - 环境：屏幕、权威光标坐标、当前应用。
 - 绘制：Mode 原始 scene、加装饰后的最后 scene、可见状态。
@@ -83,6 +85,15 @@ Engine 的 Frame、指针、按键等通用热路径直接调用借用式 `Mode:
 `InputCaptureLost` 可靠上报，并额外清空物理 pressed/disposition 状态，因为对应 KeyUp
 已经不可能到达；两者都会停止帧时钟、取消扫描、释放合成输入并回到 Idle。Quit 必须调用
 Backend 的幂等完整关闭流程；普通发布包返回主函数后不得保留 KeySteer 进程或线程。
+
+当 timer、延迟 sequence 和长按队列同时为空时，Engine 直接使用 50ms 上限，不读取单调
+时钟，也不进入三类到期扫描。重复 `KeyState::Down` 只在首次进入 `PressedKeys` 时 clone key；
+display mode 只在实际改变 temporary chord 成员的物理边沿上重算。
+
+Engine 始终更新权威 cursor 和动态 overlay 坐标；注册表仅对内置 Normal/Idle 标记“不派发
+物理 Pointer 事件”，因此高采样率鼠标不会让它们重复执行空 handler。Grid、Recursive、
+UIHint 和第三方 Mode 继续接收；该属性不进入公开 Mode vtable，避免改变插件接口或扰动所有
+Mode 的热分派布局。
 
 `Backend::poll` 最多阻塞 50ms 或到下一个 timer/sequence/长按截止时间。延迟序列和长按项
 按截止时间倒序保存，最近项位于 `Vec` 尾部；等待只读取尾项，到期只 `pop`，不得在每次
@@ -137,9 +148,10 @@ drop request-scoped Agent 及原生 TLS 连接。Windows 提示在线程内使�
 Alert。不得累积更新 worker、弹窗或连接。它不是启动任务，也没有定时轮询。
 更新 worker 使用 512 KiB 临时栈；`ureq` 显式编译完整的 `native-tls` HTTPS connector，
 macOS 整个 worker 运行在 autorelease pool 内，结束时集中释放原生临时对象。
-两端 Backend 持有更新任务的 cancel token、完成通知和 JoinHandle：正常完成会及时 reap；
-退出时先取消并最多等待 250ms；元数据请求和下载分别有 3 秒、60 秒的整体硬超时，
-阻塞中的原生网络调用不会无限存活或无限 join。
+两端 Backend 持有更新任务的 cancel token，并通过公共 `WorkerJoin` 管理完成通知和
+`JoinHandle`：正常完成会及时 reap；退出时先取消并最多等待 250ms。成功 shutdown 必须完成
+join；超时会作为关闭失败传播并令进程退出，不能在仍运行 worker 时继续驻留。元数据请求和
+下载分别有 3 秒、60 秒的整体硬超时。
 macOS 更新事件在 Hook 有界队列忙时转入 fallback channel，后台线程不会被状态事件阻塞。
 
 状态栏的 `OpenConfigSimulator` 同样先进入 Engine。Engine 从 `ConfigStore` 取得当前有效
@@ -151,7 +163,9 @@ macOS 更新事件在 Hook 有界队列忙时转入 fallback channel，后台线
 ## 可恢复输入失败
 
 合成输入在 Windows 高权限窗口等环境可能因权限被拒绝。`command_executor.rs` 把这类
-错误标记为 recoverable，Engine 会：
+错误记录为 crate-private `RuntimeError::RecoverableInput`，Engine 按类型而非错误字符串
+前缀决定是否恢复；平台文字即使包含相同内容也不能误触发。公开接口仍返回兼容的
+`String`。恢复时 Engine 会：
 
 - 清除动作序列、held gesture、timer、scan owner、modal stack 和 frame owner；
 - 尽力释放所有 latched 键/鼠标按钮；
