@@ -123,11 +123,15 @@ pub(crate) fn frontmost_pid() -> Option<libc::pid_t> {
 }
 
 pub(crate) fn focused_window_bounds(pid: libc::pid_t) -> Result<Rect, String> {
+    // SAFETY: AX returns a +1 application object for the pid; the owned wrapper
+    // takes that create-rule reference exactly once.
     let Some(application) =
         (unsafe { OwnedCf::from_create_rule(AXUIElementCreateApplication(pid).cast()) })
     else {
         return Err("cannot create AX application element".into());
     };
+    // SAFETY: `application` is a live AXUIElement and the finite timeout value
+    // is accepted by the synchronous AX API.
     unsafe { AXUIElementSetMessagingTimeout(application.as_ptr(), NODE_TIMEOUT_SECONDS) };
     let attributes = AxAttributes::new();
     let window = match copy_attribute(application.as_ptr(), &attributes.focused_window) {
@@ -145,11 +149,15 @@ pub(crate) fn scan_process_stream(
     is_current: impl Fn() -> bool,
     mut on_batch: impl FnMut(Vec<UiTarget>),
 ) -> Result<(), String> {
+    // SAFETY: AX returns a +1 application object for the pid; the owned wrapper
+    // takes that create-rule reference exactly once.
     let Some(application) =
         (unsafe { OwnedCf::from_create_rule(AXUIElementCreateApplication(pid).cast()) })
     else {
         return Err("cannot create AX application element".into());
     };
+    // SAFETY: `application` is a live AXUIElement and the finite timeout value
+    // is accepted by the synchronous AX API.
     unsafe {
         AXUIElementSetMessagingTimeout(application.as_ptr(), NODE_TIMEOUT_SECONDS);
     }
@@ -278,6 +286,8 @@ impl Scan<'_> {
 
 fn copy_attribute(element: AXUIElementRef, name: &CFString) -> Option<OwnedCf> {
     let mut value: CFTypeRef = ptr::null();
+    // SAFETY: `element` and `name` are live for the call and `value` is a valid
+    // out-pointer that receives a +1 object only on AX_OK.
     let error =
         unsafe { AXUIElementCopyAttributeValue(element, name.as_concrete_TypeRef(), &mut value) };
     if error != AX_OK {
@@ -373,6 +383,8 @@ fn intrinsically_clickable(role: &str) -> bool {
 
 fn has_actions(element: AXUIElementRef) -> bool {
     let mut actions = ptr::null();
+    // SAFETY: `element` is live and `actions` is a valid out-pointer receiving
+    // a +1 array only when AX_OK is returned.
     if unsafe { AXUIElementCopyActionNames(element, &mut actions) } != AX_OK || actions.is_null() {
         return false;
     }

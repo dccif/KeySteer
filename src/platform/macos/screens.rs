@@ -24,6 +24,8 @@ impl DisplayWatcher {
         let (sender, receiver) = mpsc::channel();
         let sender = Box::new(sender);
         let user_info = (&*sender as *const Sender<()>).cast::<c_void>();
+        // SAFETY: the callback ABI matches and the boxed sender stays at a
+        // stable address until it is unregistered during Drop.
         let registered = unsafe {
             CGDisplayRegisterReconfigurationCallback(display_changed, user_info) == kCGErrorSuccess
         };
@@ -47,6 +49,8 @@ impl Drop for DisplayWatcher {
     fn drop(&mut self) {
         if self.registered {
             let user_info = (&*self.sender as *const Sender<()>).cast::<c_void>();
+            // SAFETY: this unregisters the exact callback/pointer pair while
+            // the boxed sender is still alive and stable.
             unsafe {
                 CGDisplayRemoveReconfigurationCallback(display_changed, user_info);
             }

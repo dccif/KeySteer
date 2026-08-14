@@ -213,13 +213,7 @@ impl Engine {
                     self.recoverable_input_succeeded();
                 }
                 Command::SendChord { keys } => {
-                    let events = keys
-                        .iter()
-                        .cloned()
-                        .map(|key| (key, KeyState::Down))
-                        .chain(keys.iter().rev().cloned().map(|key| (key, KeyState::Up)))
-                        .collect::<Vec<_>>();
-                    if let Err(error) = backend.send_keys(events) {
+                    if let Err(error) = backend.send_chord(&keys) {
                         self.latched.extend(keys.into_iter().map(InputTarget::Key));
                         return Err(Self::recoverable_input_error("keyboard chord", error));
                     }

@@ -6,6 +6,8 @@
 - 低级 Hook callback 使用 `try_send`，队列忙时 fail-open；timeout warning 以原子单槽合并。
 - Vision result 由 Rust RAII owner 释放，读取 slice 前验证 count<=2000 和非空指针。
 - COM apartment 显式 `!Send/!Sync`，确保 `CoUninitialize` 回到初始化线程。
+- 两个平台入口不放行 undocumented unsafe；每个最小块记录 `SAFETY` 契约。机械门禁当前为
+  不高于 275 个 unsafe expression/23 个文件，portable 层继续保持零 unsafe。
 
 ## 共同契约
 
@@ -39,9 +41,9 @@ may open File Explorer instead of preserving the complete URL for the default br
   key-down/key-up 形成“Engine 等注入、Hook 等下一个 disposition”的锁环；相邻请求共用
   一次唤醒，不使用 sleep、轮询、额外线程或无限队列。连续光标移动仍直接使用
   `SetCursorPos`，不经过此队列。
-- 键盘事件批次由 Engine 转移所有权到 Hook FIFO。最多 16 个 `INPUT` 的常见序列使用栈内
-  缓冲，超长序列才分配；虚拟键正向查找由同一份定义表生成编译期 `match`，不在线性表中
-  逐项搜索，也不维护第二份运行时 map。
+- 键盘事件批次由 Engine 转移所有权到 Hook FIFO。Chord 最多 8 个原生键码直接内联在队列
+  请求中，再生成最多 16 个栈内 `INPUT`；超长序列才分配。虚拟键正向查找由同一份定义表
+  生成编译期 `match`，不在线性表中逐项搜索，也不维护第二份运行时 map。
 - 物理左右 Alt 始终立即透传，不延迟也不回放，因此 AHK、Quicker 和 `Alt+物理鼠标键` 能看到真实状态。若随后一个明确绑定的非修饰键被消费，Hook 将带自身标记的未分配 `0xE8` down/up 排入自己的消息循环，回调返回后再发送，以阻止 Alt 松开时激活菜单；失败只报告非致命 warning。
 - `accessibility.rs` 是持久 COM MTA UIA worker。
 - `frame_clock.rs` 有 DWM 等待 worker，one-slot channel 合并多余帧。

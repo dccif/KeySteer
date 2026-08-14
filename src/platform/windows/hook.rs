@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
-use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, LLKHF_UP, MSG,
     MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
@@ -70,6 +69,7 @@ pub(super) enum InjectionRequest {
         state: KeyState,
     },
     Keys(Vec<(Key, KeyState)>),
+    Chord(input::KeyChordBatch),
 }
 
 impl InjectionRequest {
@@ -147,6 +147,8 @@ impl InjectionRequest {
                     }
                 }
             }
+            Self::Chord(chord) => input::send_chord(&chord)
+                .map_err(|error| format!("request=keyboard_chord; {error}")),
         }
     }
 }
@@ -339,8 +341,10 @@ impl HookThread {
         input::prewarm_key_map();
         // Ensure the engine thread has a message queue before hook callbacks
         // try to wake it with PostThreadMessageW.
-        let owner_thread = unsafe { GetCurrentThreadId() };
+        let owner_thread = super::native::current_thread_id();
         let mut queue_probe = MSG::default();
+        // SAFETY: `queue_probe` is a valid out-parameter and PM_NOREMOVE only
+        // initializes this current thread's message queue.
         unsafe {
             let _ = PeekMessageW(&mut queue_probe, None, 0, 0, PM_NOREMOVE);
         }
@@ -449,6 +453,8 @@ impl HookThread {
         let mut stop_posted = true;
         if self.thread_id != 0 {
             if let Err(error) =
+                // SAFETY: `thread_id` belongs to the live hook message loop and
+                // WM_QUIT carries no pointer payload.
                 unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) }
             {
                 stop_posted = false;
@@ -487,6 +493,8 @@ fn hook_thread(
     wake_thread: u32,
 ) {
     let slot = EVENT_SENDER.get_or_init(|| Mutex::new(None));
+    // SAFETY: the callback has the required ABI, is process-lifetime code, and
+    // the resulting handle is immediately placed in its thread-bound guard.
     let keyboard_hook = match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), None, 0) }
     {
         Ok(hook) => OwnedHook::new(hook),
@@ -495,6 +503,8 @@ fn hook_thread(
             return;
         }
     };
+    // SAFETY: the callback has the required ABI, is process-lifetime code, and
+    // the resulting handle is immediately placed in its thread-bound guard.
     let mouse_hook = match unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0) }
     {
         Ok(hook) => OwnedHook::new(hook),
@@ -503,9 +513,11 @@ fn hook_thread(
             return;
         }
     };
-    let thread_id = unsafe { GetCurrentThreadId() };
+    let thread_id = super::native::current_thread_id();
     HOOK_THREAD.store(thread_id, Ordering::Release);
     let mut queue_probe = MSG::default();
+    // SAFETY: `queue_probe` is a valid out-parameter and PM_NOREMOVE only
+    // ensures this current hook thread owns an initialized message queue.
     unsafe {
         let _ = PeekMessageW(&mut queue_probe, None, 0, 0, PM_NOREMOVE);
     }
@@ -525,6 +537,8 @@ fn hook_thread(
 
     let mut message = MSG::default();
     loop {
+        // SAFETY: `message` is writable for the duration of the synchronous
+        // call and this function owns the current thread's message loop.
         let status = unsafe { GetMessageW(&mut message, None, 0, 0) }.0;
         if status == 0 {
             break;
@@ -567,6 +581,8 @@ fn hook_thread(
             }
             continue;
         }
+        // SAFETY: `message` was initialized by GetMessageW and is dispatched
+        // synchronously on the same owning thread.
         unsafe {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
@@ -656,6 +672,8 @@ fn wake_owner() {
     if wake_thread == 0 {
         return;
     }
+    // SAFETY: `wake_thread` is the initialized Engine queue and the wake
+    // message carries no borrowed pointer.
     unsafe {
         if PostThreadMessageW(wake_thread, WAKE_MESSAGE, WPARAM(0), LPARAM(0)).is_err() {
             WAKE_FAILED.store(true, Ordering::Release);
@@ -742,18 +760,24 @@ fn update_pressed_state(virtual_key: u32, state: KeyState) -> bool {
 
 unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code < 0 {
+        // SAFETY: forwarding the unchanged callback arguments is required by
+        // the hook contract when `code` is negative.
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
 
+    // SAFETY: for a non-negative low-level keyboard callback Windows supplies
+    // `lparam` as a valid KBDLLHOOKSTRUCT for this call's duration.
     let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
     // Ignore only events tagged by this process. Keyboard remappers,
     // accessibility tools and software keyboards also set the Windows
     // injected flag; those inputs are user-owned and must remain bindable.
     if is_our_input(info.dwExtraInfo) {
+        // SAFETY: the original callback arguments remain valid and unchanged.
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
 
     let Some(key) = input::key_for_virtual_key(info.vkCode) else {
+        // SAFETY: the original callback arguments remain valid and unchanged.
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     };
     let is_modifier = key.is_modifier();
@@ -803,14 +827,18 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         KeyDisposition::Consume => return LRESULT(1),
         KeyDisposition::Defer | KeyDisposition::Forward => {}
     }
+    // SAFETY: the original callback arguments remain valid and unchanged.
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 && wparam.0 as u32 == WM_MOUSEMOVE {
+        // SAFETY: for a non-negative low-level mouse callback Windows supplies
+        // `lparam` as a valid MSLLHOOKSTRUCT for this call's duration.
         let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
         store_latest_pointer(Point::new(info.pt.x as f64, info.pt.y as f64));
     }
+    // SAFETY: the original callback arguments remain valid and unchanged.
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 

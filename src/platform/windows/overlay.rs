@@ -19,7 +19,6 @@ use windows::Win32::Graphics::Gdi::{
     OUT_DEFAULT_PRECIS, SelectObject, SetBkMode, SetTextColor, TRANSPARENT, UpdateWindow,
     ValidateRect,
 };
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, HCURSOR, HICON, HWND_TOPMOST,
     RegisterClassExW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SetWindowPos, ShowWindow, ULW_ALPHA,
@@ -79,8 +78,8 @@ impl Overlay {
             return Ok(());
         }
         // SAFETY: a null module name yields this executable's handle.
-        let instance = unsafe { GetModuleHandleW(None) }
-            .map_err(|e| format!("GetModuleHandleW failed: {e}"))?;
+        let instance =
+            super::native::current_module().map_err(|e| format!("GetModuleHandleW failed: {e}"))?;
 
         let class = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -143,6 +142,8 @@ impl Overlay {
                 .remove(&old_key)
                 .ok_or("overlay window disappeared while repositioning")?;
             let hwnd = window.raw();
+            // SAFETY: `hwnd` remains owned by `window` for the synchronous
+            // move and the validated area converts to Win32 coordinates.
             unsafe {
                 SetWindowPos(
                     hwnd,
@@ -956,6 +957,8 @@ struct OwnedFont(HFONT);
 impl OwnedFont {
     fn new(key: &FontKey) -> Result<Self, String> {
         let family: Vec<u16> = key.family.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: `family` is NUL-terminated and remains live for the complete
+        // CreateFontW call; all numeric parameters are initialized values.
         let font = unsafe {
             CreateFontW(
                 -key.pixel_height,
@@ -988,6 +991,8 @@ impl OwnedFont {
 
 impl Drop for OwnedFont {
     fn drop(&mut self) {
+        // SAFETY: this HFONT came from CreateFontW and this guard is its sole
+        // owner, so DeleteObject is called exactly once.
         if !unsafe { DeleteObject(self.0.into()) }.as_bool() {
             crate::app::logging::report_error(
                 "windows-overlay",
@@ -1062,6 +1067,8 @@ impl TextRasterizer {
         scratch.clear_region(width, height);
         {
             let _selected_font = SelectedObject::new(scratch.dc, font.font.0.into())?;
+            // SAFETY: the selected DC and font remain alive for this scope and
+            // the color/background operations do not retain pointers.
             unsafe {
                 if SetBkMode(scratch.dc, TRANSPARENT) == 0 {
                     crate::app::logging::report_error(
@@ -1077,6 +1084,8 @@ impl TextRasterizer {
                 right: width as i32,
                 bottom: height as i32,
             };
+            // SAFETY: `utf16`, `draw_rect`, and the selected scratch DC remain
+            // valid and writable for this synchronous text draw.
             unsafe {
                 DrawTextW(
                     scratch.dc,
@@ -1147,16 +1156,21 @@ impl DibSurface {
             },
             ..Default::default()
         };
+        // SAFETY: a null source DC requests a memory DC with no borrowed data.
         let dc = unsafe { CreateCompatibleDC(None) };
         if dc.is_invalid() {
             return Err("CreateCompatibleDC failed".into());
         }
         let mut bits = std::ptr::null_mut();
+        // SAFETY: dimensions and byte length were checked, `info` describes a
+        // 32-bit top-down DIB, and `bits` is a valid out-pointer.
         let bitmap = match unsafe {
             CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0)
         } {
             Ok(bitmap) => bitmap,
             Err(error) => {
+                // SAFETY: `dc` was successfully created and no bitmap was
+                // selected, so this failure path owns the only release.
                 unsafe {
                     if !DeleteDC(dc).as_bool() {
                         crate::app::logging::report_error(
@@ -1168,9 +1182,13 @@ impl DibSurface {
                 return Err(format!("CreateDIBSection failed: {error}"));
             }
         };
+        // SAFETY: both handles are live and selection occurs on this thread;
+        // the returned previous object is retained for restoration in Drop.
         let old_bitmap = unsafe { SelectObject(dc, bitmap.into()) };
         let bits = NonNull::new(bits.cast::<u8>());
         if bits.is_none() || old_bitmap.0.is_null() || old_bitmap.0 as usize == usize::MAX {
+            // SAFETY: this branch owns every successfully created GDI object;
+            // a valid previous selection is restored before deletion.
             unsafe {
                 if !old_bitmap.0.is_null() && old_bitmap.0 as usize != usize::MAX {
                     let _ = SelectObject(dc, old_bitmap);
@@ -1248,6 +1266,8 @@ impl DibSurface {
 
 impl Drop for DibSurface {
     fn drop(&mut self) {
+        // SAFETY: all handles are owned by this thread-bound surface; restore
+        // the previous selection before deleting the bitmap and DC exactly once.
         unsafe {
             let _ = SelectObject(self.dc, self.old_bitmap);
             if !DeleteObject(self.bitmap.into()).as_bool() {
@@ -1270,6 +1290,8 @@ struct ScreenDc(HDC);
 
 impl ScreenDc {
     fn acquire() -> Result<Self, String> {
+        // SAFETY: a null HWND acquires the desktop DC and transfers the matching
+        // ReleaseDC obligation to this guard.
         let dc = unsafe { windows::Win32::Graphics::Gdi::GetDC(None) };
         if dc.is_invalid() {
             Err("GetDC failed".into())
@@ -1281,6 +1303,8 @@ impl ScreenDc {
 
 impl Drop for ScreenDc {
     fn drop(&mut self) {
+        // SAFETY: this is the desktop DC acquired by `ScreenDc::acquire`, and
+        // the guard releases it exactly once.
         unsafe {
             windows::Win32::Graphics::Gdi::ReleaseDC(None, self.0);
         }
@@ -1304,6 +1328,8 @@ fn upload(hwnd: HWND, area: Rect, surface: &DibSurface) -> Result<(), String> {
         SourceConstantAlpha: 255,
         AlphaFormat: AC_SRC_ALPHA as u8,
     };
+    // SAFETY: all handles and stack structures remain live for the synchronous
+    // upload, and the validated DIB exactly matches the supplied size.
     unsafe {
         UpdateLayeredWindow(
             hwnd,
@@ -1349,6 +1375,8 @@ unsafe extern "system" fn window_proc(
     match message {
         // Painting happens in `draw`; acknowledge to keep the queue clear.
         WM_PAINT => {
+            // SAFETY: `hwnd` and the paint region were supplied by Windows for
+            // this callback; no Rust pointer is retained.
             if !unsafe { ValidateRect(Some(hwnd), None) }.as_bool() {
                 crate::app::logging::report_error(
                     "windows-overlay",
@@ -1358,7 +1386,11 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_DESTROY => LRESULT(0),
-        _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+        _ => {
+            // SAFETY: forward the unchanged arguments supplied by Windows; no
+            // Rust state or unwind crosses the callback boundary.
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        }
     }
 }
 

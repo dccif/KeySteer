@@ -1,5 +1,11 @@
 # 更新日志 / Release Notes
 
+## 0.8.13
+
+UI Hint 扫描结果改为零拷贝传递，快捷键注入减少临时分配，并进一步收紧跨平台 Unsafe 边界。
+
+UI Hint now consumes scan results without cloning, chord injection avoids temporary allocations, and cross-platform unsafe boundaries are tighter.
+
 ## 0.8.12
 
 修复 Windows/macOS 检查更新失败、Windows 模拟器入口误开文件管理器及更新线程退出清理问题。

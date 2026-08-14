@@ -22,7 +22,6 @@ use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCancelCall, CoCreateInstance,
     CoDisableCallCancellation, CoEnableCallCancellation, CoInitializeEx, CoUninitialize,
 };
-use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::System::Variant::{VARIANT, VT_BOOL, VT_I4};
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomation2, IUIAutomationCacheRequest,
@@ -34,9 +33,8 @@ use windows::Win32::UI::Accessibility::{
     UIA_NamePropertyId, UIA_PROPERTY_ID,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumThreadWindows, EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetForegroundWindow,
-    GetWindow, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    EnumThreadWindows, EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetWindow, GetWindowLongW,
+    GetWindowRect, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{BOOL, Interface};
 
@@ -275,13 +273,17 @@ impl ComApartment {
 
 impl Drop for ComApartment {
     fn drop(&mut self) {
+        // SAFETY: this guard is dropped on the same thread that successfully
+        // enabled COM call cancellation.
         let _ = unsafe { CoDisableCallCancellation(None) };
+        // SAFETY: this balances the successful CoInitializeEx owned by this
+        // thread-bound guard after all COM interfaces were dropped.
         unsafe { CoUninitialize() };
     }
 }
 
 fn worker_main(shared: Arc<SharedQueue>, thread_id: Arc<AtomicU32>) {
-    thread_id.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+    thread_id.store(super::native::current_thread_id(), Ordering::Release);
     let apartment = match ComApartment::initialise() {
         Ok(apartment) => apartment,
         Err(error) => {
@@ -290,6 +292,8 @@ fn worker_main(shared: Arc<SharedQueue>, thread_id: Arc<AtomicU32>) {
             return;
         }
     };
+    // SAFETY: the current worker owns an initialized MTA apartment and requests
+    // the documented in-process UI Automation class/interface pair.
     let automation: IUIAutomation =
         match unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) } {
             Ok(automation) => automation,
@@ -395,12 +399,16 @@ fn run_scan(
 
     let timeout_ms = scan_timeout_ms(job.request.timeout_ms);
     if let Some(automation2) = automation2 {
+        // SAFETY: `automation2` is a live interface on its owning MTA thread and
+        // timeout_ms is clamped to the supported positive range.
         if let Err(error) = unsafe { automation2.SetConnectionTimeout(timeout_ms) } {
             crate::log_warning!(
                 "windows-uia",
                 "cannot set UIA connection timeout; continuing with provider defaults: {error}"
             );
         }
+        // SAFETY: `automation2` is a live interface on its owning MTA thread and
+        // timeout_ms is clamped to the supported positive range.
         if let Err(error) = unsafe { automation2.SetTransactionTimeout(timeout_ms) } {
             crate::log_warning!(
                 "windows-uia",
@@ -480,6 +488,8 @@ fn native_rect(rect: Rect) -> RECT {
 /// Fall back to GetWindowRect for classic controls and windows without DWM.
 fn window_bounds(hwnd: HWND) -> Option<Rect> {
     let mut rect = RECT::default();
+    // SAFETY: `rect` is a correctly sized writable out-buffer and `hwnd` is
+    // borrowed only for this synchronous DWM query.
     let dwm_rect = unsafe {
         DwmGetWindowAttribute(
             hwnd,
@@ -488,7 +498,11 @@ fn window_bounds(hwnd: HWND) -> Option<Rect> {
             std::mem::size_of::<RECT>() as u32,
         )
     };
-    if dwm_rect.is_err() && unsafe { GetWindowRect(hwnd, &mut rect) }.is_err() {
+    if dwm_rect.is_err()
+        // SAFETY: `rect` is a valid writable out-parameter and `hwnd` is only
+        // borrowed for this synchronous fallback query.
+        && unsafe { GetWindowRect(hwnd, &mut rect) }.is_err()
+    {
         return None;
     }
     rect_from_native(rect)
@@ -496,6 +510,8 @@ fn window_bounds(hwnd: HWND) -> Option<Rect> {
 
 fn is_cloaked(hwnd: HWND) -> bool {
     let mut cloaked = 0u32;
+    // SAFETY: `cloaked` is a correctly sized writable out-buffer and `hwnd` is
+    // borrowed only for this synchronous DWM query.
     unsafe {
         DwmGetWindowAttribute(
             hwnd,
@@ -517,6 +533,8 @@ unsafe extern "system" fn collect_monitor(
     _rect: *mut RECT,
     data: LPARAM,
 ) -> BOOL {
+    // SAFETY: EnumDisplayMonitors supplied the exact collector pointer passed
+    // by `monitors_intersecting`, valid for the callback duration.
     let collector = unsafe { &mut *(data.0 as *mut MonitorCollector) };
     collector.monitors.push(monitor);
     BOOL(1)
@@ -530,6 +548,8 @@ fn monitors_intersecting(hwnd: HWND) -> Vec<HMONITOR> {
     let mut collector = MonitorCollector {
         monitors: Vec::new(),
     };
+    // SAFETY: the callback ABI matches and the collector pointer remains valid
+    // for the complete synchronous enumeration.
     unsafe {
         let _ = EnumDisplayMonitors(
             None,
@@ -544,6 +564,8 @@ fn monitors_intersecting(hwnd: HWND) -> Vec<HMONITOR> {
 fn is_owned_by(mut hwnd: HWND, foreground: HWND) -> bool {
     // Owner chains are normally one link, but nested modal dialogs exist.
     for _ in 0..16 {
+        // SAFETY: `hwnd` is a borrowed top-level window handle and GW_OWNER
+        // returns another borrowed handle without retaining Rust data.
         let Ok(owner) = (unsafe { GetWindow(hwnd, GW_OWNER) }) else {
             return false;
         };
@@ -573,19 +595,25 @@ struct ThreadWindowCollector {
 }
 
 unsafe extern "system" fn collect_thread_window(hwnd: HWND, data: LPARAM) -> BOOL {
+    // SAFETY: EnumThreadWindows supplied the exact collector pointer passed by
+    // `foreground_and_popup_windows`, valid for this callback only.
     let collector = unsafe { &mut *(data.0 as *mut ThreadWindowCollector) };
     if hwnd == collector.foreground
-        || !unsafe { IsWindowVisible(hwnd) }.as_bool()
-        || unsafe { IsIconic(hwnd) }.as_bool()
+        || !super::native::is_window_visible(hwnd)
+        || super::native::is_window_iconic(hwnd)
         || is_cloaked(hwnd)
     {
         return BOOL(1);
     }
 
+    // SAFETY: `hwnd` is the live window supplied by EnumThreadWindows and the
+    // style query returns a value without retaining any pointer.
     let has_popup_style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32 & WS_POPUP.0 != 0;
     let owned = is_owned_by(hwnd, collector.foreground);
     let shares_monitor = window_bounds(hwnd).is_some_and(|bounds| {
         let rect = native_rect(bounds);
+        // SAFETY: `rect` is initialized and lives for the synchronous monitor
+        // lookup; the returned HMONITOR is borrowed.
         let monitor = unsafe { MonitorFromRect(&rect, MONITOR_DEFAULTTONULL) };
         !monitor.is_invalid() && collector.foreground_monitors.contains(&monitor)
     });
@@ -603,8 +631,10 @@ fn foreground_and_popup_windows(foreground: HWND) -> Vec<HWND> {
         foreground_monitors: monitors_intersecting(foreground),
         windows: vec![foreground],
     };
-    let thread_id = unsafe { GetWindowThreadProcessId(foreground, None) };
+    let thread_id = super::native::window_thread_process_id(foreground, None);
     if thread_id != 0 {
+        // SAFETY: callback ABI and collector pointer are valid for the complete
+        // synchronous enumeration of this live UI thread.
         unsafe {
             let _ = EnumThreadWindows(
                 thread_id,
@@ -625,13 +655,17 @@ struct ZOrderCollector {
 }
 
 unsafe extern "system" fn collect_z_order_window(hwnd: HWND, data: LPARAM) -> BOOL {
+    // SAFETY: EnumWindows supplied the exact collector pointer passed by
+    // `scan_windows_in_z_order`, valid for this callback only.
     let collector = unsafe { &mut *(data.0 as *mut ZOrderCollector) };
-    if !unsafe { IsWindowVisible(hwnd) }.as_bool()
-        || unsafe { IsIconic(hwnd) }.as_bool()
+    if !super::native::is_window_visible(hwnd)
+        || super::native::is_window_iconic(hwnd)
         || is_cloaked(hwnd)
     {
         return BOOL(1);
     }
+    // SAFETY: `hwnd` is the live window supplied by EnumWindows and this style
+    // query returns a value without retaining any pointer.
     let click_through =
         unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32 & WS_EX_TRANSPARENT.0 != 0;
     if click_through {
@@ -654,7 +688,7 @@ unsafe extern "system" fn collect_z_order_window(hwnd: HWND, data: LPARAM) -> BO
     }
 
     let mut process_id = 0;
-    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
+    super::native::window_thread_process_id(hwnd, Some(&mut process_id));
     // Our click-through overlay was already skipped above. Ignore any other
     // helper/tray HWND owned by this process so it cannot hide application UI.
     if candidate || process_id != collector.own_process_id {
@@ -668,10 +702,12 @@ fn scan_windows_in_z_order(foreground: HWND, scan_bounds: Rect) -> Result<Vec<Sc
     let mut collector = ZOrderCollector {
         candidates,
         scan_bounds,
-        own_process_id: unsafe { GetCurrentProcessId() },
+        own_process_id: super::native::current_process_id(),
         scan_windows: Vec::new(),
         occluders: Vec::new(),
     };
+    // SAFETY: callback ABI and collector pointer are valid for the complete
+    // synchronous top-level enumeration.
     unsafe {
         EnumWindows(
             Some(collect_z_order_window),
@@ -707,6 +743,8 @@ fn stream_scan(
                     "cannot create interactive UIA condition; scanning all descendants: {error}"
                 );
                 (
+                    // SAFETY: the live automation interface creates an owned
+                    // condition on its owning MTA thread.
                     unsafe { automation.CreateTrueCondition() }.map_err(|fallback| {
                         format!("cannot create fallback UIA condition: {fallback}")
                     })?,
@@ -716,6 +754,8 @@ fn stream_scan(
         }
     } else {
         (
+            // SAFETY: the live automation interface creates an owned condition
+            // on its owning MTA thread.
             unsafe { automation.CreateTrueCondition() }
                 .map_err(|error| format!("cannot create the UIA scan condition: {error}"))?,
             false,
@@ -773,6 +813,8 @@ fn stream_scan(
             break;
         }
 
+        // SAFETY: the HWND is live for this iteration and `cache` belongs to
+        // the same automation instance and MTA thread.
         let root = match unsafe { automation.ElementFromHandleBuildCache(window.hwnd, &cache) } {
             Ok(root) => root,
             Err(error) => {
@@ -787,6 +829,8 @@ fn stream_scan(
         };
         // A bulk descendant query is substantially more reliable for Chromium,
         // WebView2 and other virtualized trees than walking only Control View.
+        // SAFETY: root, condition and cache are live COM interfaces from this
+        // automation instance and remain borrowed through the bulk call.
         let elements =
             match unsafe { root.FindAllBuildCache(TreeScope_Descendants, &condition, &cache) } {
                 Ok(elements) => elements,
@@ -801,12 +845,15 @@ fn stream_scan(
                 }
             };
         queried_window = true;
+        // SAFETY: `elements` is a live array returned by the preceding query.
         let element_count = unsafe { elements.Length() }
             .map_err(|error| format!("cannot read UIA descendant count: {error}"))?
             .max(0) as usize;
         let remaining = MAX_VISITED_ELEMENTS - visited_count;
 
         for index in 0..element_count.min(remaining) {
+            // SAFETY: `index` is bounded by Length and the returned COM element
+            // is independently reference counted.
             let element = unsafe { elements.GetElement(index as i32) }
                 .map_err(|error| format!("cannot read UIA descendant {index}: {error}"))?;
             visited_count += 1;
@@ -889,6 +936,8 @@ fn send_partial(job: &ScanJob, targets: Vec<UiTarget>) {
 }
 
 fn create_cache_request(automation: &IUIAutomation) -> Result<IUIAutomationCacheRequest, String> {
+    // SAFETY: `automation` is live on its owning MTA and returns an owned cache
+    // request interface.
     let cache = unsafe { automation.CreateCacheRequest() }
         .map_err(|error| format!("cannot create UIA cache request: {error}"))?;
     for property in [
@@ -899,6 +948,8 @@ fn create_cache_request(automation: &IUIAutomation) -> Result<IUIAutomationCache
         UIA_IsOffscreenPropertyId,
         UIA_NamePropertyId,
     ] {
+        // SAFETY: every property id is a documented UIA property and `cache`
+        // remains live on its owning MTA thread.
         unsafe { cache.AddProperty(property) }
             .map_err(|error| format!("cannot configure UIA property cache: {error}"))?;
     }
@@ -907,6 +958,8 @@ fn create_cache_request(automation: &IUIAutomation) -> Result<IUIAutomationCache
 
 fn variant_bool(value: bool) -> VARIANT {
     let mut variant = VARIANT::default();
+    // SAFETY: the active VARIANT union field is selected by setting VT_BOOL,
+    // then initialized with the corresponding bool member.
     unsafe {
         let inner = &mut variant.Anonymous.Anonymous;
         inner.vt = VT_BOOL;
@@ -917,6 +970,8 @@ fn variant_bool(value: bool) -> VARIANT {
 
 fn variant_i32(value: i32) -> VARIANT {
     let mut variant = VARIANT::default();
+    // SAFETY: the active VARIANT union field is selected by setting VT_I4,
+    // then initialized with the corresponding integer member.
     unsafe {
         let inner = &mut variant.Anonymous.Anonymous;
         inner.vt = VT_I4;
@@ -1038,6 +1093,8 @@ fn target_from_element(
     // properties directly avoids a second provider call, which is important
     // for WebView2/Chromium providers where BuildUpdatedCache may time out or
     // return E_ELEMENTNOTAVAILABLE after the bulk query.
+    // SAFETY: the element came from a cache-populated array and the cached
+    // property call returns a value without retaining Rust data.
     let control_type = unsafe { element.CachedControlType() }.ok()?.0;
     // Windows applications often expose custom controls with a generic UIA
     // control type. Their interaction pattern is more reliable than the type,
@@ -1050,9 +1107,13 @@ fn target_from_element(
     if !role_matches && !interactive {
         return None;
     }
+    // SAFETY: the cached element remains live for this synchronous property
+    // read on the owning MTA thread.
     let visible = unsafe { element.CachedIsOffscreen() }
         .ok()
         .is_none_or(|offscreen| !offscreen.as_bool());
+    // SAFETY: the cached element remains live for this synchronous property
+    // read on the owning MTA thread.
     let enabled = unsafe { element.CachedIsEnabled() }
         .ok()
         .is_none_or(|value| value.as_bool());
@@ -1061,6 +1122,8 @@ fn target_from_element(
     {
         return None;
     }
+    // SAFETY: the cached element remains live and returns its rectangle by
+    // value on the owning MTA thread.
     let raw_rect = unsafe { element.CachedBoundingRectangle() }.ok()?;
     let rect = Rect::new(
         raw_rect.left as f64,
@@ -1068,6 +1131,8 @@ fn target_from_element(
         (raw_rect.right - raw_rect.left) as f64,
         (raw_rect.bottom - raw_rect.top) as f64,
     );
+    // SAFETY: the cached element remains live; the returned BSTR is converted
+    // to an owned Rust String before the COM value is released.
     let name = unsafe { element.CachedName() }
         .map(|name| name.to_string())
         .unwrap_or_default();
@@ -1076,6 +1141,8 @@ fn target_from_element(
 }
 
 fn is_interactive(element: &IUIAutomationElement) -> bool {
+    // SAFETY: the cached element remains live for this synchronous property
+    // read on the owning MTA thread.
     unsafe { element.CachedIsKeyboardFocusable() }.is_ok_and(|value| value.as_bool())
 }
 
@@ -1241,12 +1308,12 @@ impl SpatialDeduper {
 }
 
 fn foreground_context() -> Option<(HWND, u32)> {
-    let hwnd = unsafe { GetForegroundWindow() };
+    let hwnd = super::native::foreground_window();
     if hwnd.is_invalid() {
         return None;
     }
     let mut process_id = 0;
-    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
+    super::native::window_thread_process_id(hwnd, Some(&mut process_id));
     Some((hwnd, process_id))
 }
 

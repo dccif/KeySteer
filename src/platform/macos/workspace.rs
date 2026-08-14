@@ -20,6 +20,8 @@ unsafe extern "C" {
 /// Wake AppKit's main run loop after a backend producer queues an event.
 /// A Rust channel wake alone does not commit pending NSWindow/NSView updates.
 pub fn wake_main_run_loop() {
+    // SAFETY: Core Foundation returns a borrowed process-lifetime main run loop;
+    // the null check precedes the wake call and no ownership is transferred.
     unsafe {
         let run_loop = CFRunLoopGetMain();
         if !run_loop.is_null() {
@@ -36,6 +38,8 @@ pub fn wait_for_app_event(timeout: Duration) {
     }
     autoreleasepool(|_| {
         let deadline = NSDate::dateWithTimeIntervalSinceNow(timeout.as_secs_f64());
+        // SAFETY: NSDefaultRunLoopMode is a process-lifetime Foundation
+        // constant used for this synchronous main-thread pump.
         NSRunLoop::mainRunLoop().runMode_beforeDate(unsafe { NSDefaultRunLoopMode }, &deadline);
     });
 }
@@ -95,6 +99,8 @@ pub fn pump_app_events() {
         while let Some(event) = application.nextEventMatchingMask_untilDate_inMode_dequeue(
             NSEventMask::Any,
             Some(&expiration),
+            // SAFETY: NSDefaultRunLoopMode is a process-lifetime Foundation
+            // constant used only for this synchronous main-thread call.
             unsafe { NSDefaultRunLoopMode },
             true,
         ) {

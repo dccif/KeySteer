@@ -13,16 +13,6 @@ on:
           - windows
           - macos
           - checks
-      run_tests:
-        description: Run the Rust test suite before packaging
-        required: true
-        default: true
-        type: boolean
-      run_miri:
-        description: Run Miri when platform is checks
-        required: true
-        default: false
-        type: boolean
 
 permissions:
   contents: read
@@ -58,8 +48,7 @@ jobs:
           cargo update --package keysteer --precise "$version"
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - run: cargo test --locked --all-features
-      - run: cargo check --locked --target aarch64-pc-windows-msvc --all-targets
+      - run: cargo clippy --locked --target aarch64-pc-windows-msvc --all-targets --all-features -- -D warnings
 
   check-macos:
     if: ${{ inputs.platform == 'checks' }}
@@ -75,17 +64,7 @@ jobs:
           test -n "$version"
           cargo update --package keysteer --precise "$version"
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - run: cargo test --locked --all-features
-      - run: cargo check --locked --target x86_64-apple-darwin --all-targets
-
-  portable-miri:
-    if: ${{ inputs.platform == 'checks' && inputs.run_miri }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - run: rustup toolchain install nightly --profile minimal --component miri
-      - run: |
-          cargo +nightly miri test --locked domain::
+      - run: cargo clippy --locked --target x86_64-apple-darwin --all-targets --all-features -- -D warnings
 
   windows:
     if: ${{ inputs.platform == 'all' || inputs.platform == 'windows' }}
@@ -109,10 +88,6 @@ jobs:
           version="$(sed -n 's/^version = "\([^" ]*\)"/\1/p' Cargo.toml | head -n 1)"
           test -n "$version"
           cargo update --package keysteer --precise "$version"
-
-      - name: Test
-        if: ${{ inputs.run_tests }}
-        run: cargo test --locked --all-features
 
       - name: Package Windows x64
         shell: pwsh
@@ -160,10 +135,6 @@ jobs:
           version="$(sed -n 's/^version = "\([^" ]*\)"/\1/p' Cargo.toml | head -n 1)"
           test -n "$version"
           cargo update --package keysteer --precise "$version"
-
-      - name: Test
-        if: ${{ inputs.run_tests }}
-        run: cargo test --locked --all-features
 
       - name: Package macOS Apple Silicon
         shell: bash

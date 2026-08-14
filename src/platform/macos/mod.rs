@@ -1,7 +1,6 @@
 // Native AppKit/CoreGraphics services are being migrated file-by-file to
 // documented typed wrappers. The crate-wide deny remains active outside this
 // explicit platform boundary.
-#![allow(clippy::undocumented_unsafe_blocks)]
 
 //! macOS backend composed from isolated native services.
 
@@ -349,6 +348,10 @@ impl Backend for MacOsBackend {
         self.keyboard.send_keys(events)
     }
 
+    fn send_chord(&self, keys: &[Key]) -> Result<(), String> {
+        self.keyboard.send_chord(keys)
+    }
+
     fn set_frame_clock(&mut self, active: bool) -> Result<(), String> {
         if active {
             let source = self.overlay.display_link_source()?;
@@ -360,7 +363,9 @@ impl Backend for MacOsBackend {
     }
 
     fn present(&mut self, scene: Arc<OverlayScene>) -> Result<(), String> {
-        self.overlay.present(scene)
+        self.overlay.present(scene)?;
+        crate::app::perf_probe::mark("native_presented");
+        Ok(())
     }
 
     fn update_overlay_positions(
@@ -368,7 +373,11 @@ impl Backend for MacOsBackend {
         cursor: Option<Point>,
         indicator: Option<Point>,
     ) -> Result<bool, String> {
-        self.overlay.update_positions(cursor, indicator)
+        let updated = self.overlay.update_positions(cursor, indicator)?;
+        if updated {
+            crate::app::perf_probe::mark("native_presented");
+        }
+        Ok(updated)
     }
 
     fn dismiss(&mut self) -> Result<(), String> {

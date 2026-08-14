@@ -681,6 +681,15 @@ pub trait Mode: Send {
     /// Handle one event and return the commands it implies.
     fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch;
 
+    /// Handle an event whose payload can be consumed by the mode.
+    ///
+    /// The default preserves the borrowed API used by existing modes and
+    /// plugins. Modes with large owned payloads can override this to move
+    /// buffers and strings instead of cloning them out of the event.
+    fn handle_owned(&mut self, event: ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
+        self.handle(&event, ctx)
+    }
+
     /// Whether this mode wants exclusive use of the keyboard. When true the
     /// host swallows keys instead of passing them to the focused app — which
     /// is what grid and hint modes need, and idle does not.

@@ -151,6 +151,7 @@ impl Engine {
             return Ok(());
         }
         let scene = Arc::new(scene);
+        crate::app::perf_probe::mark("overlay_submitted");
         backend.present(Arc::clone(&scene))?;
         crate::app::perf_probe::mark("overlay_presented");
         self.trace(trace_overlay, "overlay", "backend present: ok");

@@ -226,8 +226,11 @@ fn render_loop(shared: &Shared, events: &EventSender, ready: SyncSender<u32>) {
                 std::borrow::Cow::Owned(scene) => Arc::new(scene),
             };
             match renderer.present(scene, frame.area) {
-                Ok(Some(notice)) => warn(events, notice),
-                Ok(None) => {}
+                Ok(Some(notice)) => {
+                    crate::app::perf_probe::mark("native_presented");
+                    warn(events, notice);
+                }
+                Ok(None) => crate::app::perf_probe::mark("native_presented"),
                 Err(error) => warn(
                     events,
                     format!("Windows overlay render failed; the next frame will retry: {error}"),
@@ -243,8 +246,11 @@ fn render_loop(shared: &Shared, events: &EventSender, ready: SyncSender<u32>) {
                 indicator.y = indicator.y.round();
             }
             match renderer.update_positions(positions.cursor, positions.indicator) {
-                Ok(Some(notice)) => warn(events, notice),
-                Ok(None) => {}
+                Ok(Some(notice)) => {
+                    crate::app::perf_probe::mark("native_presented");
+                    warn(events, notice);
+                }
+                Ok(None) => crate::app::perf_probe::mark("native_presented"),
                 Err(error) => warn(
                     events,
                     format!(

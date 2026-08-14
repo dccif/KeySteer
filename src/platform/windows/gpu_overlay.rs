@@ -35,7 +35,6 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::{IDXGIDevice, IDXGISurface};
 use windows::Win32::Graphics::Gdi::HBRUSH;
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, HCURSOR, HICON,
     HWND_TOPMOST, LWA_ALPHA, RegisterClassExW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
@@ -366,8 +365,12 @@ impl GpuOverlay {
         // dynamic visuals successively above it.
         let cursor_visual = unsafe { self.dcomp.CreateVisual() }
             .map_err(|error| format!("Create cursor visual failed: {error}"))?;
+        // SAFETY: the compositor device returns a newly owned visual on this
+        // renderer thread.
         let indicator_visual = unsafe { self.dcomp.CreateVisual() }
             .map_err(|error| format!("Create indicator visual failed: {error}"))?;
+        // SAFETY: all visuals and the target belong to `self.dcomp`, remain
+        // alive in WindowContent, and are attached outside BeginDraw.
         unsafe {
             visual
                 .AddVisual(&cursor_visual, false, None)
@@ -429,7 +432,7 @@ impl GpuOverlay {
             return Ok(());
         }
         // SAFETY: a null module name asks for the current executable.
-        let instance = unsafe { GetModuleHandleW(None) }
+        let instance = super::native::current_module()
             .map_err(|error| format!("GetModuleHandleW failed: {error}"))?;
         let class = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -1131,7 +1134,8 @@ unsafe extern "system" fn window_proc(
     if let Some(result) = super::native::click_through_hit_test(message) {
         return result;
     }
-    // No Rust state is accessed and `DefWindowProcW` cannot unwind into Rust.
+    // SAFETY: no Rust state is accessed and `DefWindowProcW` receives the exact
+    // arguments supplied by Windows; no unwind crosses the callback boundary.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 

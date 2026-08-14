@@ -105,6 +105,8 @@ impl DisplayFrameClock {
             unsafe { source.displayLinkWithTarget_selector(&self.target, sel!(displayFrame:)) };
         // Native cadence is the default. Registering in common modes keeps
         // motion synchronised during AppKit event/menu tracking as well.
+        // SAFETY: `link`, the main run loop and the process-lifetime common
+        // mode token remain live for the synchronous registration.
         unsafe {
             link.addToRunLoop_forMode(&NSRunLoop::mainRunLoop(), NSRunLoopCommonModes);
         }
@@ -136,6 +138,8 @@ impl DisplayFrameClock {
             if deadline.timeIntervalSinceNow() <= 0.0 {
                 return self.target.take_elapsed();
             }
+            // SAFETY: NSDefaultRunLoopMode is a process-lifetime Foundation
+            // constant used only for this synchronous main-thread call.
             let handled = run_loop.runMode_beforeDate(unsafe { NSDefaultRunLoopMode }, &deadline);
             if let Some(elapsed) = self.target.take_elapsed() {
                 return Some(elapsed);

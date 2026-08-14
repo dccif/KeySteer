@@ -33,6 +33,8 @@ impl WindowsAutostart {
 
     fn registered_command() -> Result<Option<Vec<u16>>, String> {
         let mut byte_count = 0u32;
+        // SAFETY: all registry names are static NUL-terminated strings and the
+        // first call supplies only a valid byte-count out-parameter.
         let result = unsafe {
             RegGetValueW(
                 HKEY_CURRENT_USER,
@@ -52,6 +54,8 @@ impl WindowsAutostart {
             .map_err(|error| format!("cannot read the Windows startup entry: {error}"))?;
 
         let mut command = vec![0u16; (byte_count as usize).div_ceil(2)];
+        // SAFETY: `command` is writable for exactly `byte_count` bytes and all
+        // other pointers have the same static lifetime as the first query.
         let result = unsafe {
             RegGetValueW(
                 HKEY_CURRENT_USER,
@@ -87,6 +91,8 @@ impl Autostart for WindowsAutostart {
     fn set_enabled(&self, enabled: bool) -> Result<(), String> {
         if enabled {
             let command = Self::command()?;
+            // SAFETY: the command buffer is valid for the advertised byte
+            // length and the registry API copies it before returning.
             unsafe {
                 RegSetKeyValueW(
                     HKEY_CURRENT_USER,
@@ -100,6 +106,7 @@ impl Autostart for WindowsAutostart {
             .ok()
             .map_err(|error| format!("cannot enable Windows startup: {error}"))
         } else {
+            // SAFETY: all key/value names are static NUL-terminated strings.
             let result = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, VALUE_NAME) };
             if result == ERROR_FILE_NOT_FOUND || result == ERROR_PATH_NOT_FOUND {
                 Ok(())

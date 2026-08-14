@@ -362,6 +362,8 @@ fn show_panel(
         ));
         content.addSubview(&details_label);
 
+        // SAFETY: both selectors are implemented by the retained target with
+        // matching Objective-C signatures; AppKit retains no Rust borrow.
         let (button, reveal_button) = unsafe {
             let button = NSButton::buttonWithTitle_target_action(
                 &NSString::from_str("OK"),
@@ -401,6 +403,8 @@ fn show_panel(
 }
 
 fn status_icon(size: f64) -> Option<Retained<NSImage>> {
+    // SAFETY: the static PNG byte slice is live for the complete call and
+    // NSData copies/retains the supplied bytes according to this initializer.
     let data = unsafe {
         NSData::dataWithBytes_length(STATUS_ICON_PNG.as_ptr().cast(), STATUS_ICON_PNG.len())
     };
@@ -432,6 +436,8 @@ fn menu_item(
     let item = NSMenuItem::new(mtm);
     item.setTitle(&NSString::from_str(title));
     item.setEnabled(true);
+    // SAFETY: `action` names a method with the menu-item action signature and
+    // `target` remains retained by StatusItem for the menu lifetime.
     unsafe {
         item.setAction(Some(action));
         item.setTarget(Some(target));

@@ -718,6 +718,17 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires live HTTPS access"]
+    fn native_tls_live_https_smoke() {
+        let agent: ureq::Agent = metadata_agent_config().into();
+        let response = agent
+            .get("https://github.com/dccif/KeySteer")
+            .call()
+            .expect("system NativeTls should complete a trusted HTTPS request");
+        assert!(response.status().is_success());
+    }
+
+    #[test]
     fn update_checks_are_single_flight_and_release_the_guard() {
         let first = UpdateCheckGuard::acquire().expect("first check should acquire the guard");
         assert!(UpdateCheckGuard::acquire().is_none());

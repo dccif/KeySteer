@@ -1174,6 +1174,7 @@ impl Engine {
     ) -> Result<(), String> {
         match event {
             BackendEvent::Input(input) => {
+                crate::app::perf_probe::mark("input_received");
                 self.handle_key(input, backend)?;
             }
             BackendEvent::InputInjectionFailed(message) => {
@@ -2520,19 +2521,13 @@ impl Engine {
 
     fn send_chord(&mut self, chord: &KeyChord, backend: &mut dyn Backend) -> Result<(), String> {
         // Do not emit an Up edge for a modifier held by `press`/`toggle`.
-        let keys: Vec<Key> = chord
+        let keys: SmallVec<[Key; 8]> = chord
             .keys()
             .iter()
             .filter(|key| !self.latched_key_matches(key))
             .map(Self::injected_key)
             .collect();
-        let events = keys
-            .iter()
-            .cloned()
-            .map(|key| (key, KeyState::Down))
-            .chain(keys.iter().rev().cloned().map(|key| (key, KeyState::Up)))
-            .collect::<Vec<_>>();
-        if let Err(error) = backend.send_keys(events) {
+        if let Err(error) = backend.send_chord(&keys) {
             // A batch failure may mean that Windows accepted only a prefix.
             // Record every member conservatively; redundant key-up events are
             // harmless and safer than leaving a modifier held.
@@ -2595,7 +2590,8 @@ impl Engine {
         let Some(mode) = self.modes.get_mut(owner) else {
             return Ok(());
         };
-        let commands = mode.handle(&event, &context);
+        let commands = mode.handle_owned(event, &context);
+        crate::app::perf_probe::mark("commands_ready");
         self.execute_for(owner, commands, backend)
     }
 

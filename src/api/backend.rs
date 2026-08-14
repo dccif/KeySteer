@@ -134,6 +134,26 @@ pub trait Backend {
         Ok(())
     }
 
+    /// Press every key in order, then release them in reverse order.
+    ///
+    /// Built-in backends override this to keep common chords inline. The
+    /// default remains source-compatible with external backends and preserves
+    /// the owned sequence semantics of [`Self::send_keys`].
+    fn send_chord(&self, keys: &[Key]) -> Result<(), String> {
+        let events = keys
+            .iter()
+            .cloned()
+            .map(|key| (key, super::input::KeyState::Down))
+            .chain(
+                keys.iter()
+                    .rev()
+                    .cloned()
+                    .map(|key| (key, super::input::KeyState::Up)),
+            )
+            .collect();
+        self.send_keys(events)
+    }
+
     /// Start or stop native display-synchronised frame delivery.
     ///
     /// Backends without a display-link implementation may reject activation;

@@ -144,6 +144,10 @@ UI Hint 按需为目标名缓存一次 lowercase 结果；退出后立即 drop �
 
 最终性能结论必须来自双 4K、高 DPI、高刷新率真机的 p95/p99、分配次数、峰值 RAM/VRAM 和截图容差数据；API 名称或 GPU 标签本身不构成性能证明。
 
+`perf-probe` 启用且设置输出路径时使用固定 4096 项的有界队列；Engine/Hook/renderer 只做
+非阻塞时间戳入队，JSONL 写入与 flush 在专用探针线程执行。队列满时丢探针记录而不是反压
+输入，shutdown 在非热路径等待写出完成；普通 release 不编译该模块。
+
 macOS 原生探针使用固定 AppKit fixture 子进程，运行：
 `bash tools/benchmark-macos-native.sh 709815c 5`。脚本在临时 detached worktree 构建同一探针，
 交替执行基线和当前分支，原始日志与中位数汇总写入 `target/macos-native-bench/`；正式数据

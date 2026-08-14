@@ -80,23 +80,59 @@ impl KeyboardInjector {
         }
         Ok(())
     }
+
+    pub(super) fn send_chord(&self, keys: &[Key]) -> Result<(), String> {
+        // Validate the complete chord before posting its first edge so an
+        // unsupported member cannot leave an earlier modifier pressed.
+        for key in keys {
+            if keycode_for(key).is_none() {
+                return Err(format!("no macOS keycode for {key}"));
+            }
+        }
+        let source = self.source()?;
+        for (pressed, key) in keys.iter().enumerate() {
+            if let Err(error) = post_key_event(source, key, KeyState::Down) {
+                for pressed_key in keys[..pressed].iter().rev() {
+                    let _ = post_key_event(source, pressed_key, KeyState::Up);
+                }
+                return Err(error);
+            }
+        }
+        for key in keys.iter().rev() {
+            if let Err(error) = post_key_event(source, key, KeyState::Up) {
+                // Key-up is idempotent. Releasing the complete chord is safer
+                // than trying to infer which native posts reached the session.
+                for pressed_key in keys.iter().rev() {
+                    let _ = post_key_event(source, pressed_key, KeyState::Up);
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
 }
 
 pub fn cursor_position() -> Result<Point, String> {
     // A NULL source is sufficient for reading the global cursor and avoids
     // allocating a separate CGEventSource for every mouse action.
+    // SAFETY: CGEventCreate returns a +1 event or null; the wrapper takes the
+    // create-rule reference exactly once.
     let Some(event) = (unsafe { OwnedCf::from_create_rule(CGEventCreate(std::ptr::null())) })
     else {
         return Err("cannot read the cursor position".into());
     };
+    // SAFETY: `event` is a live CGEvent for this value-returning query.
     let position = unsafe { CGEventGetLocation(event.as_ptr()) };
     Ok(Point::new(position.x, position.y))
 }
 
 pub fn warp_cursor(to: Point) -> Result<(), String> {
     // Decoupling briefly stops the hardware delta from fighting the warp.
+    // SAFETY: the global cursor association API has no pointer arguments.
     unsafe { CGAssociateMouseAndMouseCursorPosition(0) };
+    // SAFETY: CGPoint is initialized and passed by value.
     let status = unsafe { CGWarpMouseCursorPosition(CGPoint::new(to.x, to.y)) };
+    // SAFETY: this balances the preceding temporary disassociation.
     unsafe { CGAssociateMouseAndMouseCursorPosition(1) };
 
     if status == 0 {
@@ -172,6 +208,8 @@ fn movement_event(held_buttons: u8) -> MouseEventSpec {
 }
 
 fn create_mouse_event(spec: MouseEventSpec, at: Point, click_count: i64) -> Option<OwnedCf> {
+    // SAFETY: the event parameters are initialized enum/value types and the
+    // returned +1 object is transferred into OwnedCf exactly once.
     let event = unsafe {
         OwnedCf::from_create_rule(CGEventCreateMouseEvent(
             std::ptr::null(),
@@ -180,6 +218,8 @@ fn create_mouse_event(spec: MouseEventSpec, at: Point, click_count: i64) -> Opti
             spec.button,
         ))
     }?;
+    // SAFETY: `event` is live and exclusively owned while both integer fields
+    // are set synchronously.
     unsafe {
         CGEventSetIntegerValueField(
             event.as_mut_ptr(),
@@ -208,6 +248,7 @@ fn post_mouse_event(spec: MouseEventSpec, at: Point) -> Result<(), String> {
     let Some(event) = create_mouse_event(spec, at, 0) else {
         return Err("cannot create a macOS mouse movement event".into());
     };
+    // SAFETY: `event` is a live CGEvent and CGEventPost does not retain it.
     unsafe {
         CGEventPost(SESSION_EVENT_TAP, event.as_mut_ptr());
     }
@@ -281,6 +322,8 @@ pub fn mouse_button(
         }
     }
     for event in events[..step_count].iter().flatten() {
+        // SAFETY: every optional event is live for the synchronous post and is
+        // retained by its OwnedCf until the loop iteration ends.
         unsafe {
             CGEventPost(SESSION_EVENT_TAP, event.as_mut_ptr());
         }

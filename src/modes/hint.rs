@@ -14,7 +14,8 @@ use smallvec::SmallVec;
 
 use crate::api::binding::Binding;
 use crate::api::command::{
-    Command, CommandBatch, FinishCause, HostContext, Mode, ModeEvent, UiScanRequest, UiScanStatus,
+    Command, CommandBatch, FinishCause, HostContext, Mode, ModeEvent, UiScanRequest, UiScanResult,
+    UiScanStatus,
 };
 use crate::api::geometry::{Rect, UiTarget};
 use crate::api::input::{Key, KeyState, ModeId};
@@ -182,38 +183,163 @@ impl HintMode {
         })
     }
 
-    fn append_targets(&mut self, targets: &[UiTarget]) -> bool {
+    fn target_key(target: &UiTarget) -> (i64, i64, i64, i64) {
+        let rect = target.rect;
+        (
+            (rect.x * 4.0).round() as i64,
+            (rect.y * 4.0).round() as i64,
+            (rect.width * 4.0).round() as i64,
+            (rect.height * 4.0).round() as i64,
+        )
+    }
+
+    fn append_target(&mut self, target: UiTarget) -> bool {
+        if !self
+            .scan_bounds
+            .is_none_or(|bounds| bounds.contains(&target.rect.center()))
+        {
+            return false;
+        }
+        let key = Self::target_key(&target);
+        let duplicate = self.seen_targets.get(&key).is_some_and(|indices| {
+            indices.iter().any(|&index| {
+                let existing = &self.scanned[index];
+                existing.name == target.name && existing.role == target.role
+            })
+        });
+        if duplicate {
+            return false;
+        }
+        let index = self.scanned.len();
+        if self.search_names_initialized {
+            self.scanned_names_lower.push(target.name.to_lowercase());
+        }
+        self.scanned.push(target);
+        self.seen_targets.entry(key).or_default().push(index);
+        true
+    }
+
+    fn append_targets_owned(&mut self, targets: Vec<UiTarget>) -> bool {
         let before = self.scanned.len();
-        for target in targets {
-            if !self
-                .scan_bounds
-                .is_none_or(|bounds| bounds.contains(&target.rect.center()))
-            {
-                continue;
-            }
-            let rect = target.rect;
-            let key = (
-                (rect.x * 4.0).round() as i64,
-                (rect.y * 4.0).round() as i64,
-                (rect.width * 4.0).round() as i64,
-                (rect.height * 4.0).round() as i64,
-            );
-            let duplicate = self.seen_targets.get(&key).is_some_and(|indices| {
-                indices.iter().any(|&index| {
-                    let existing = &self.scanned[index];
-                    existing.name == target.name && existing.role == target.role
-                })
+
+        // On the first small result, take ownership of the platform Vec so the
+        // common 24/64/100-target path does not allocate a second backing
+        // buffer. A retained session buffer is already cheaper to fill by move.
+        if self.scanned.is_empty()
+            && self.scanned.capacity() == 0
+            && self.seen_targets.is_empty()
+            && !self.search_names_initialized
+            && targets.len() <= MAX_IDLE_RETAINED_TARGETS
+        {
+            self.scanned = targets;
+            self.scanned.retain(|target| {
+                self.scan_bounds
+                    .is_none_or(|bounds| bounds.contains(&target.rect.center()))
             });
-            if !duplicate {
-                let index = self.scanned.len();
-                if self.search_names_initialized {
-                    self.scanned_names_lower.push(target.name.to_lowercase());
+
+            let mut index = 0;
+            while index < self.scanned.len() {
+                let key = Self::target_key(&self.scanned[index]);
+                let duplicate = self.seen_targets.get(&key).is_some_and(|indices| {
+                    indices.iter().any(|&existing_index| {
+                        let existing = &self.scanned[existing_index];
+                        let candidate = &self.scanned[index];
+                        existing.name == candidate.name && existing.role == candidate.role
+                    })
+                });
+                if duplicate {
+                    self.scanned.remove(index);
+                } else {
+                    self.seen_targets.entry(key).or_default().push(index);
+                    index += 1;
                 }
-                self.scanned.push(target.clone());
-                self.seen_targets.entry(key).or_default().push(index);
             }
+            return !self.scanned.is_empty();
+        }
+
+        for target in targets {
+            self.append_target(target);
         }
         self.scanned.len() != before
+    }
+
+    fn handle_scan_result(&mut self, result: UiScanResult, ctx: &HostContext<'_>) -> CommandBatch {
+        if self.finished || result.id != self.scan_id {
+            return CommandBatch::new();
+        }
+        let UiScanResult {
+            targets, status, ..
+        } = result;
+        if status == UiScanStatus::ContextChanged {
+            self.scanning = false;
+            self.clear_scan_results(false);
+            self.status = Some("Focused window changed — Esc to exit".into());
+            return self.status_scene(ctx);
+        }
+
+        let added = self.append_targets_owned(targets);
+        // Once the user starts typing, preserve the labels they can already
+        // see and select. Later batches remain available after the next scan
+        // instead of changing codes under their fingers.
+        let labels_changed = if added && self.input.text().is_empty() {
+            if self.held_overlap_keys.is_empty() || self.hints.is_empty() {
+                self.relabel();
+                true
+            } else {
+                // Keep the currently raised label stable while the overlap key
+                // is held. The targets are labelled together on final release.
+                self.overlap_labels_dirty = true;
+                false
+            }
+        } else {
+            false
+        };
+
+        if status == UiScanStatus::Partial {
+            self.status = None;
+            return if labels_changed {
+                self.redraw(ctx)
+            } else {
+                CommandBatch::new()
+            };
+        }
+
+        let retryable_empty = self.hints.is_empty()
+            && matches!(status, UiScanStatus::Success | UiScanStatus::TimedOut)
+            && self.retry_attempt < self.config.scan_retry_count;
+        if retryable_empty {
+            self.scanning = true;
+            self.retry_pending = true;
+            self.status = Some(format!(
+                "UI scan is taking longer - retrying {}/{}",
+                self.retry_attempt + 1,
+                self.config.scan_retry_count
+            ));
+            let mut commands = self.status_scene(ctx);
+            commands.push(Command::SetTimer {
+                id: SCAN_RETRY_TIMER_ID.into(),
+                delay: Duration::from_millis(self.config.scan_retry_delay_ms),
+                repeating: false,
+            });
+            return commands;
+        }
+
+        self.scanning = false;
+        self.status = match &status {
+            UiScanStatus::Success if self.hints.is_empty() => {
+                Some("No accessible targets — Esc to exit".into())
+            }
+            UiScanStatus::Success => None,
+            UiScanStatus::PermissionDenied(message)
+            | UiScanStatus::Unsupported(message)
+            | UiScanStatus::Failed(message) => Some(format!("{message} — Esc to exit")),
+            UiScanStatus::TimedOut => Some("UI scan timed out — Esc to exit".into()),
+            UiScanStatus::Partial | UiScanStatus::ContextChanged => unreachable!(),
+        };
+        if self.hints.is_empty() {
+            return self.status_scene(ctx);
+        }
+        self.redraw(ctx)
     }
 
     /// Assign labels to the targets matching the current search query.
@@ -694,83 +820,10 @@ impl Mode for HintMode {
                     id: SCAN_RETRY_TIMER_ID.into(),
                 })
             }
-            ModeEvent::UiScanned(_) if self.finished => CommandBatch::new(),
-            ModeEvent::UiScanned(result) if result.id == self.scan_id => {
-                if result.status == UiScanStatus::ContextChanged {
-                    self.scanning = false;
-                    self.clear_scan_results(false);
-                    self.status = Some("Focused window changed — Esc to exit".into());
-                    return self.status_scene(ctx);
-                }
-
-                let added = self.append_targets(&result.targets);
-                // Once the user starts typing, preserve the labels they can
-                // already see and select. Later batches remain available after
-                // the next scan instead of changing codes under their fingers.
-                let labels_changed = if added && self.input.text().is_empty() {
-                    if self.held_overlap_keys.is_empty() || self.hints.is_empty() {
-                        self.relabel();
-                        true
-                    } else {
-                        // Keep the currently raised label stable while the
-                        // overlap key is held. The targets remain accumulated
-                        // and are labelled together on the final release edge.
-                        self.overlap_labels_dirty = true;
-                        false
-                    }
-                } else {
-                    false
-                };
-
-                if result.status == UiScanStatus::Partial {
-                    self.status = None;
-                    return if labels_changed {
-                        self.redraw(ctx)
-                    } else {
-                        CommandBatch::new()
-                    };
-                }
-
-                let retryable_empty = self.hints.is_empty()
-                    && matches!(
-                        result.status,
-                        UiScanStatus::Success | UiScanStatus::TimedOut
-                    )
-                    && self.retry_attempt < self.config.scan_retry_count;
-                if retryable_empty {
-                    self.scanning = true;
-                    self.retry_pending = true;
-                    self.status = Some(format!(
-                        "UI scan is taking longer - retrying {}/{}",
-                        self.retry_attempt + 1,
-                        self.config.scan_retry_count
-                    ));
-                    let mut commands = self.status_scene(ctx);
-                    commands.push(Command::SetTimer {
-                        id: SCAN_RETRY_TIMER_ID.into(),
-                        delay: Duration::from_millis(self.config.scan_retry_delay_ms),
-                        repeating: false,
-                    });
-                    return commands;
-                }
-
-                self.scanning = false;
-                self.status = match &result.status {
-                    UiScanStatus::Success if self.hints.is_empty() => {
-                        Some("No accessible targets — Esc to exit".into())
-                    }
-                    UiScanStatus::Success => None,
-                    UiScanStatus::PermissionDenied(message)
-                    | UiScanStatus::Unsupported(message)
-                    | UiScanStatus::Failed(message) => Some(format!("{message} — Esc to exit")),
-                    UiScanStatus::TimedOut => Some("UI scan timed out — Esc to exit".into()),
-                    UiScanStatus::Partial | UiScanStatus::ContextChanged => unreachable!(),
-                };
-                if self.hints.is_empty() {
-                    return self.status_scene(ctx);
-                }
-                self.redraw(ctx)
+            ModeEvent::UiScanned(result) if self.finished || result.id != self.scan_id => {
+                CommandBatch::new()
             }
+            ModeEvent::UiScanned(result) => self.handle_scan_result(result.clone(), ctx),
             ModeEvent::Timer { id, .. }
                 if id == SCAN_RETRY_TIMER_ID
                     && self.retry_pending
@@ -834,6 +887,13 @@ impl Mode for HintMode {
             _ => CommandBatch::new(),
         }
     }
+
+    fn handle_owned(&mut self, event: ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
+        match event {
+            ModeEvent::UiScanned(result) => self.handle_scan_result(result, ctx),
+            event => self.handle(&event, ctx),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -894,8 +954,8 @@ mod tests {
     }
 
     fn deliver(mode: &mut HintMode, env: &Env, targets: Vec<UiTarget>) -> Vec<Command> {
-        mode.handle(
-            &ModeEvent::UiScanned(crate::api::UiScanResult {
+        mode.handle_owned(
+            ModeEvent::UiScanned(crate::api::UiScanResult {
                 id: mode.scan_id,
                 targets,
                 status: UiScanStatus::Success,
@@ -1662,6 +1722,36 @@ mod tests {
         assert_eq!(mode.seen_targets.len(), 1);
         assert_eq!(mode.seen_targets.values().next().unwrap().len(), 3);
         assert!(mode.scanned_names_lower.is_empty());
+    }
+
+    #[test]
+    fn owned_first_partial_adopts_target_and_string_storage() {
+        let env = Env::new();
+        let mut mode = HintMode::new(&env.config);
+        activate(&mut mode, &env);
+
+        let targets = vec![target("Save 设置", 20.0), target("Cancel", 120.0)];
+        let targets_ptr = targets.as_ptr();
+        let name_ptr = targets[0].name.as_ptr();
+        let scan_id = mode.scan_id;
+        let _ = mode.handle_owned(
+            ModeEvent::UiScanned(UiScanResult {
+                id: scan_id,
+                targets,
+                status: UiScanStatus::Partial,
+            }),
+            &env.ctx(),
+        );
+
+        assert_eq!(mode.scanned.as_ptr(), targets_ptr);
+        assert_eq!(mode.scanned[0].name.as_ptr(), name_ptr);
+        assert_eq!(
+            mode.scanned
+                .iter()
+                .map(|target| target.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Save 设置", "Cancel"]
+        );
     }
 
     #[test]

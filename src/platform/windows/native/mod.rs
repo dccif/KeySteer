@@ -407,6 +407,38 @@ pub(crate) fn current_process_id() -> u32 {
     unsafe { GetCurrentProcessId() }
 }
 
+#[inline(always)]
+pub(crate) fn current_thread_id() -> u32 {
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+
+    // SAFETY: this call has no arguments or failure mode.
+    unsafe { GetCurrentThreadId() }
+}
+
+#[inline(always)]
+pub(crate) fn current_module() -> windows::core::Result<windows::Win32::Foundation::HMODULE> {
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+
+    // SAFETY: a null module name requests the current executable module.
+    unsafe { GetModuleHandleW(None) }
+}
+
+#[inline(always)]
+pub(crate) fn is_window_visible(hwnd: HWND) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+
+    // SAFETY: the borrowed HWND is used only for this synchronous query.
+    unsafe { IsWindowVisible(hwnd) }.as_bool()
+}
+
+#[inline(always)]
+pub(crate) fn is_window_iconic(hwnd: HWND) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::IsIconic;
+
+    // SAFETY: the borrowed HWND is used only for this synchronous query.
+    unsafe { IsIconic(hwnd) }.as_bool()
+}
+
 /// Return a window's creating thread and optionally its owning process.
 #[inline(always)]
 pub(crate) fn window_thread_process_id(hwnd: HWND, process_id: Option<&mut u32>) -> u32 {

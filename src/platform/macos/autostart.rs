@@ -65,17 +65,25 @@ impl MacosAutostart {
     }
 
     fn native_is_registered() -> bool {
+        // SAFETY: the Objective-C bridge function has no arguments and returns
+        // a value without transferring ownership.
         unsafe { NmkMainAppLoginItemIsRegistered() }
     }
 
     fn native_set_enabled(enabled: bool) -> Result<(), String> {
+        // SAFETY: the bridge copies the boolean and returns either null or one
+        // owned NUL-terminated error string.
         let error = unsafe { NmkSetMainAppLoginItemEnabled(enabled) };
         if error.is_null() {
             return Ok(());
         }
+        // SAFETY: the bridge contract guarantees a non-null NUL-terminated
+        // string here, retained until NmkFreeNativeString below.
         let message = unsafe { CStr::from_ptr(error) }
             .to_string_lossy()
             .into_owned();
+        // SAFETY: this is the exact owned pointer returned above and is freed
+        // once after the Rust String has copied its contents.
         unsafe { NmkFreeNativeString(error) };
         Err(format!("cannot update the macOS login item: {message}"))
     }

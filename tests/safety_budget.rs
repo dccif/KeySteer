@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 // Keep the current audited native surface from growing. Portable layers are
 // checked separately below and remain entirely safe Rust.
-const MAX_UNSAFE_EXPRESSIONS: usize = 287;
+const MAX_UNSAFE_EXPRESSIONS: usize = 275;
 const MAX_UNSAFE_FILES: usize = 23;
 const PER_FILE_BUDGET: &[(&str, usize)] = &[
     ("src/platform/macos/accessibility.rs", 12),
@@ -19,17 +19,17 @@ const PER_FILE_BUDGET: &[(&str, usize)] = &[
     ("src/platform/macos/status_item.rs", 4),
     ("src/platform/macos/vision.rs", 5),
     ("src/platform/macos/workspace.rs", 4),
-    ("src/platform/windows/accessibility.rs", 53),
+    ("src/platform/windows/accessibility.rs", 43),
     ("src/platform/windows/autostart.rs", 4),
     ("src/platform/windows/console_control.rs", 5),
-    ("src/platform/windows/gpu_overlay.rs", 40),
-    ("src/platform/windows/hook.rs", 20),
+    ("src/platform/windows/gpu_overlay.rs", 39),
+    ("src/platform/windows/hook.rs", 18),
     ("src/platform/windows/input.rs", 6),
-    ("src/platform/windows/overlay.rs", 26),
+    ("src/platform/windows/overlay.rs", 25),
     ("src/platform/windows/screens.rs", 8),
-    ("src/platform/windows/status_item.rs", 27),
+    ("src/platform/windows/status_item.rs", 25),
     ("src/platform/windows/system_events.rs", 4),
-    ("src/platform/windows/native/mod.rs", 30),
+    ("src/platform/windows/native/mod.rs", 34),
 ];
 
 fn rust_files(directory: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
@@ -113,6 +113,11 @@ fn unsafe_surface_does_not_regress() -> Result<(), Box<dyn std::error::Error>> {
         assert!(
             !source.contains("unsafe impl Send") && !source.contains("unsafe impl Sync"),
             "unsafe Send/Sync requires an explicit architecture review: {}",
+            path.display()
+        );
+        assert!(
+            !source.contains("allow(clippy::undocumented_unsafe_blocks)"),
+            "platform modules must document each unsafe block: {}",
             path.display()
         );
         if count > 0 {

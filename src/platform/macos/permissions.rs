@@ -32,6 +32,8 @@ pub fn is_trusted() -> bool {
 /// never for a process launched from a terminal that is itself untrusted, so a
 /// `false` return still needs the printed instructions below.
 pub fn prompt_for_trust() -> bool {
+    // SAFETY: the framework constant is a process-lifetime CFString borrowed
+    // under the get rule; the wrapper does not consume it.
     let key = unsafe { CFString::wrap_under_get_rule(kAXTrustedCheckOptionPrompt as *const _) };
     let options = CFDictionary::from_CFType_pairs(&[(key, CFBoolean::true_value())]);
     // SAFETY: `options` is a valid CFDictionary and outlives the call.

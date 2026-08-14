@@ -18,6 +18,8 @@ pub struct ForegroundWatcher(HWINEVENTHOOK);
 impl ForegroundWatcher {
     pub fn new(owner_thread: u32) -> Result<Self, String> {
         OWNER_THREAD.store(owner_thread, Ordering::Release);
+        // SAFETY: `win_event` has the required ABI and accesses only atomics;
+        // the returned hook is owned until this wrapper's Drop.
         let hook = unsafe {
             SetWinEventHook(
                 EVENT_SYSTEM_FOREGROUND,
@@ -44,6 +46,8 @@ impl ForegroundWatcher {
 
 impl Drop for ForegroundWatcher {
     fn drop(&mut self) {
+        // SAFETY: this handle came from this wrapper's successful hook install
+        // and is consumed exactly once during Drop.
         if !unsafe { UnhookWinEvent(self.0) }.as_bool() {
             crate::log_warning!(
                 "windows-events",
@@ -66,6 +70,8 @@ unsafe extern "system" fn win_event(
     FOCUS_CHANGED.store(true, Ordering::Release);
     let owner = OWNER_THREAD.load(Ordering::Acquire);
     if owner != 0
+        // SAFETY: `owner` is the live Engine thread id and the wake message has
+        // no pointer payload or cross-thread borrowed data.
         && let Err(error) = unsafe { PostThreadMessageW(owner, WAKE_MESSAGE, WPARAM(0), LPARAM(0)) }
     {
         crate::log_warning!(

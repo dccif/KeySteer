@@ -1,7 +1,6 @@
 // Native Win32 bindings are being migrated file-by-file to documented RAII
 // wrappers. Keep the crate-wide deny active everywhere outside this explicit
 // transitional boundary.
-#![allow(clippy::undocumented_unsafe_blocks)]
 
 //! The Windows backend.
 //!
@@ -505,6 +504,11 @@ impl Backend for WindowsBackend {
 
     fn send_keys(&self, events: Vec<(Key, KeyState)>) -> Result<(), String> {
         self.inject_input(hook::InjectionRequest::Keys(events))
+    }
+
+    fn send_chord(&self, keys: &[Key]) -> Result<(), String> {
+        let chord = input::KeyChordBatch::new(keys)?;
+        self.inject_input(hook::InjectionRequest::Chord(chord))
     }
 
     fn set_frame_clock(&mut self, active: bool) -> Result<(), String> {

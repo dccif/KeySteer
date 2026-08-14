@@ -22,7 +22,8 @@
 - `PermissionDenied` / `Unsupported` / `Failed`：可显示状态或重试。
 
 Engine 用 scan id 记录 owner；HintMode 也只接受当前 `scan_id`。旧 worker 即使晚返回也
-不会污染新的页面。
+不会污染新的页面。Engine 把当前 `UiScanResult` 按所有权交给 HintMode：常见首批可直接
+接管平台 Vec，后续目标逐项 move，名称、role 和 native role 不再跨层 clone。
 
 退出或完成 owner 时 Engine 显式取消 scan。取消不销毁常驻 worker，也不缓存旧目标；
 Hint 退出会 drop 目标、标签和字符串，下一次进入重新扫描。仅复用最多 128 项的空容器

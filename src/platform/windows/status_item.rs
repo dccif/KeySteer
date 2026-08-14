@@ -9,8 +9,6 @@ use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
     ShellExecuteW,
@@ -144,9 +142,13 @@ impl StatusItem {
         let mut posted = false;
         if self.thread_id != 0 {
             if !self.hwnd.is_invalid() {
+                // SAFETY: `hwnd` belongs to the tray thread; WM_CANCELMODE has
+                // no borrowed payload and only ends a possible menu loop.
                 let _ =
                     unsafe { PostMessageW(Some(self.hwnd), WM_CANCELMODE, WPARAM(0), LPARAM(0)) };
             }
+            // SAFETY: `thread_id` is the initialized tray message loop and
+            // WM_QUIT carries no pointer payload.
             match unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) } {
                 Ok(()) => posted = true,
                 Err(error) => {
@@ -202,7 +204,7 @@ fn tray_thread(ready: std::sync::mpsc::SyncSender<Result<(u32, isize), String>>)
             "Shell_NotifyIconW could not add the notification-area icon"
         );
     }
-    let thread_id = unsafe { GetCurrentThreadId() };
+    let thread_id = super::native::current_thread_id();
     if ready.send(Ok((thread_id, hwnd.0 as isize))).is_err() {
         destroy_window(hwnd);
         return;
@@ -210,19 +212,24 @@ fn tray_thread(ready: std::sync::mpsc::SyncSender<Result<(u32, isize), String>>)
 
     let mut message = MSG::default();
     loop {
+        // SAFETY: `message` is a valid writable out-parameter owned by this
+        // thread's message loop.
         let status = unsafe { GetMessageW(&mut message, None, 0, 0) }.0;
         if status == 0 {
             break;
         }
         if status == -1 {
+            // SAFETY: GetLastError has no arguments and is read immediately
+            // after the failed message retrieval.
+            let last_error = unsafe { windows::Win32::Foundation::GetLastError() };
             crate::app::logging::report_error(
                 "windows-tray",
-                format!("GetMessageW failed: {:?}", unsafe {
-                    windows::Win32::Foundation::GetLastError()
-                }),
+                format!("GetMessageW failed: {last_error:?}"),
             );
             break;
         }
+        // SAFETY: `message` was initialized by GetMessageW and is dispatched
+        // synchronously on this same tray thread.
         unsafe {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
@@ -232,12 +239,13 @@ fn tray_thread(ready: std::sync::mpsc::SyncSender<Result<(u32, isize), String>>)
 }
 
 fn create_window() -> Result<HWND, String> {
+    // SAFETY: the static message name is NUL-terminated and lives forever.
     let taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
     if taskbar_created == 0 {
         return Err("RegisterWindowMessageW(TaskbarCreated) failed".into());
     }
     TASKBAR_CREATED.store(taskbar_created, Ordering::Release);
-    let instance = unsafe { GetModuleHandleW(None) }
+    let instance = super::native::current_module()
         .map_err(|error| format!("GetModuleHandleW failed: {error}"))?;
     let class = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -249,13 +257,18 @@ fn create_window() -> Result<HWND, String> {
         hCursor: HCURSOR::default(),
         ..Default::default()
     };
+    // SAFETY: every class field is initialized and `window_proc` has the
+    // required ABI and process lifetime.
     if unsafe { RegisterClassExW(&class) } == 0 {
         const ERROR_CLASS_ALREADY_EXISTS: u32 = 1410;
+        // SAFETY: GetLastError has no arguments and follows the failed call.
         let last = unsafe { windows::Win32::Foundation::GetLastError() };
         if last.0 != ERROR_CLASS_ALREADY_EXISTS {
             return Err(format!("RegisterClassExW(status) failed: {last:?}"));
         }
     }
+    // SAFETY: the class was registered above, all strings are static, and the
+    // returned HWND is owned by this tray thread until `destroy_window`.
     unsafe {
         CreateWindowExW(
             WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
@@ -276,9 +289,12 @@ fn create_window() -> Result<HWND, String> {
 }
 
 fn destroy_window(hwnd: HWND) {
+    // SAFETY: `hwnd` owns the icon identified by `icon_data`; NIM_DELETE does
+    // not retain the stack structure.
     unsafe {
         let _ = Shell_NotifyIconW(NIM_DELETE, &icon_data(hwnd));
     }
+    // SAFETY: this tray thread owns `hwnd` and calls DestroyWindow once.
     if let Err(error) = unsafe { DestroyWindow(hwnd) } {
         crate::log_warning!("windows-tray", "cannot destroy tray event window: {error}");
     }
@@ -307,8 +323,10 @@ fn icon_data(hwnd: HWND) -> NOTIFYICONDATAW {
 }
 
 fn load_app_icon() -> HICON {
+    // SAFETY: the integer resource id is encoded using the Win32 MAKEINTRESOURCE
+    // convention and the module handle remains live for the process.
     let embedded = unsafe {
-        GetModuleHandleW(None).and_then(|module| {
+        super::native::current_module().and_then(|module| {
             LoadIconW(
                 Some(module.into()),
                 PCWSTR(APP_ICON_RESOURCE_ID as *const u16),
@@ -316,6 +334,8 @@ fn load_app_icon() -> HICON {
         })
     };
     embedded
+        // SAFETY: IDI_APPLICATION is a system-owned shared icon; no destroy is
+        // required or permitted for the returned handle.
         .or_else(|_| unsafe { LoadIconW(None, IDI_APPLICATION) })
         .unwrap_or_else(|error| {
             crate::log_warning!("windows-tray", "cannot load application icon: {error}");
@@ -324,6 +344,8 @@ fn load_app_icon() -> HICON {
 }
 
 fn add_icon(hwnd: HWND) -> bool {
+    // SAFETY: icon_data is fully initialized and remains live for the
+    // synchronous Shell_NotifyIconW copy.
     unsafe { Shell_NotifyIconW(NIM_ADD, &icon_data(hwnd)) }.as_bool()
 }
 
@@ -368,6 +390,8 @@ fn emit(event: BackendEvent) {
 }
 
 fn show_menu(hwnd: HWND) {
+    // SAFETY: CreatePopupMenu has no borrowed arguments; this function destroys
+    // the returned menu before leaving.
     let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
         return;
     };
@@ -395,6 +419,8 @@ fn show_menu(hwnd: HWND) {
     } else {
         MF_STRING | MF_GRAYED
     };
+    // SAFETY: `menu` remains live, all labels are static or NUL-terminated and
+    // each AppendMenuW copies its data synchronously.
     let menu_result = unsafe {
         AppendMenuW(menu, MF_STRING, CMD_TOGGLE as usize, toggle)
             .and_then(|_| {
@@ -440,12 +466,15 @@ fn show_menu(hwnd: HWND) {
         );
     }
     let mut point = POINT::default();
+    // SAFETY: `point` is a valid writable out-parameter.
     if let Err(error) = unsafe { GetCursorPos(&mut point) } {
         crate::app::logging::report_error(
             "windows-tray",
             format!("cannot position tray menu: {error}"),
         );
     }
+    // SAFETY: `menu` and `hwnd` belong to this tray thread and remain live
+    // throughout the modal call; no Rust pointer is retained.
     let (previous_foreground, command) = unsafe {
         let previous_foreground = GetForegroundWindow();
         let _ = SetForegroundWindow(hwnd);
@@ -617,6 +646,8 @@ fn show_message(
     // A detached MessageBox without an owner can remain inactive. This hidden
     // same-thread owner gives the dialog a complete native modal lifetime while
     // keeping the engine and tray threads unblocked.
+    // SAFETY: the temporary owner and all UTF-16 buffers remain live through
+    // the modal call; the same thread destroys the owner exactly once.
     let (response, destroy) = unsafe {
         let owner = CreateWindowExW(
             WS_EX_TOOLWINDOW,
@@ -716,7 +747,11 @@ unsafe extern "system" fn window_proc(
             APPEARANCE_CHANGED.store(true, Ordering::Release);
             LRESULT(0)
         }
-        _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+        _ => {
+            // SAFETY: forward the unchanged arguments supplied by Windows; no
+            // Rust state or unwind crosses the callback boundary.
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        }
     }
 }
 

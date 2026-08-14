@@ -304,6 +304,65 @@ pub fn send_key(key: &Key, state: KeyState) -> Result<(), String> {
     send(&[key_input(key, state)?])
 }
 
+/// Native key codes for one chord. Common chords remain entirely inline while
+/// the heap fallback preserves the public API's unbounded input length.
+const INLINE_CHORD_KEYS: usize = 8;
+
+pub(super) enum KeyChordBatch {
+    Inline {
+        keys: [u16; INLINE_CHORD_KEYS],
+        len: usize,
+    },
+    Heap(Box<[u16]>),
+}
+
+impl KeyChordBatch {
+    pub(super) fn new(keys: &[Key]) -> Result<Self, String> {
+        if keys.len() <= INLINE_CHORD_KEYS {
+            let mut native = [0; INLINE_CHORD_KEYS];
+            for (index, key) in keys.iter().enumerate() {
+                native[index] = virtual_key_for(key)
+                    .ok_or_else(|| format!("no Windows virtual key for {key}"))?;
+            }
+            return Ok(Self::Inline {
+                keys: native,
+                len: keys.len(),
+            });
+        }
+        Ok(Self::Heap(
+            keys.iter()
+                .map(|key| {
+                    virtual_key_for(key).ok_or_else(|| format!("no Windows virtual key for {key}"))
+                })
+                .collect::<Result<Box<_>, _>>()?,
+        ))
+    }
+
+    fn as_slice(&self) -> &[u16] {
+        match self {
+            Self::Inline { keys, len } => &keys[..*len],
+            Self::Heap(keys) => keys,
+        }
+    }
+}
+
+/// Submit one complete chord without materialising `(Key, KeyState)` pairs.
+/// If Windows accepts only a prefix, release every member defensively.
+pub(super) fn send_chord(chord: &KeyChordBatch) -> Result<(), String> {
+    let keys = chord.as_slice();
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let inputs = KeyInputBatch::from_chord(keys);
+    let failure = match try_send(inputs.as_slice()) {
+        Ok(()) => return Ok(()),
+        Err(failure) => failure,
+    };
+    let releases = KeyInputBatch::from_releases(keys);
+    let _ = send(releases.as_slice());
+    Err(failure.message())
+}
+
 /// Tell Windows that a forwarded Alt participated in a shortcut whose action
 /// KeySteer consumed. `0xE8` is unassigned, so the tagged pair cannot type or
 /// recursively enter our hook, but it prevents Alt-up from opening a menu.
@@ -383,6 +442,47 @@ impl KeyInputBatch {
                 .map(|(key, state)| key_input(key, *state))
                 .collect::<Result<Vec<_>, _>>()?,
         ))
+    }
+
+    fn from_chord(keys: &[u16]) -> Self {
+        let len = keys.len().saturating_mul(2);
+        if len <= INLINE_KEY_INPUTS {
+            let mut inputs = std::array::from_fn(|_| INPUT::default());
+            for (index, key) in keys.iter().enumerate() {
+                inputs[index] = virtual_key_input(*key, KeyState::Down);
+                inputs[len - 1 - index] = virtual_key_input(*key, KeyState::Up);
+            }
+            return Self::Inline { inputs, len };
+        }
+        Self::Heap(
+            keys.iter()
+                .map(|key| virtual_key_input(*key, KeyState::Down))
+                .chain(
+                    keys.iter()
+                        .rev()
+                        .map(|key| virtual_key_input(*key, KeyState::Up)),
+                )
+                .collect(),
+        )
+    }
+
+    fn from_releases(keys: &[u16]) -> Self {
+        if keys.len() <= INLINE_KEY_INPUTS {
+            let mut inputs = std::array::from_fn(|_| INPUT::default());
+            for (index, key) in keys.iter().rev().enumerate() {
+                inputs[index] = virtual_key_input(*key, KeyState::Up);
+            }
+            return Self::Inline {
+                inputs,
+                len: keys.len(),
+            };
+        }
+        Self::Heap(
+            keys.iter()
+                .rev()
+                .map(|key| virtual_key_input(*key, KeyState::Up))
+                .collect(),
+        )
     }
 
     fn as_slice(&self) -> &[INPUT] {
@@ -604,6 +704,15 @@ mod tests {
     }
 
     #[test]
+    fn common_chords_keep_key_codes_and_native_inputs_inline() {
+        let keys = ["left_ctrl", "left_shift", "left_alt", "a"].map(|name| Key::new(name).unwrap());
+        let chord = KeyChordBatch::new(&keys).unwrap();
+        assert!(matches!(chord, KeyChordBatch::Inline { len: 4, .. }));
+        let inputs = KeyInputBatch::from_chord(chord.as_slice());
+        assert!(matches!(inputs, KeyInputBatch::Inline { len: 8, .. }));
+    }
+
+    #[test]
     fn oversized_key_sequences_preserve_the_heap_fallback() {
         let event = (Key::new("a").unwrap(), KeyState::Down);
         let events = vec![event; INLINE_KEY_INPUTS + 1];
@@ -805,6 +914,7 @@ mod tests {
             assert_eq!(len, 2, "{button:?}");
             // SAFETY: mouse_button_inputs creates only INPUT_MOUSE values.
             let down = unsafe { inputs[0].Anonymous.mi };
+            // SAFETY: mouse_button_inputs creates only INPUT_MOUSE values.
             let up = unsafe { inputs[1].Anonymous.mi };
             assert_ne!(down.dwFlags, up.dwFlags, "{button:?}");
             assert_eq!(down.mouseData, up.mouseData, "{button:?}");
