@@ -41,8 +41,9 @@ Mode 不持有 Backend，也不能访问 HWND、NSWindow、UIA 或 AX。Backend 
 `ShowOverlay` 和 `ScanUi` 载荷分别使用 `Arc<OverlayScene>` 与 `Box<UiScanRequest>`，避免
 把每个 `Command` 枚举值撑大。调用方优先用 `Command::show_overlay`、`Command::scan_ui`
 构造这两个变体。`ModeEvent::Binding` 共享 Engine 已编译的 `Arc<Binding>`，不复制绑定树。
-Engine 通过带默认实现的 `Mode::handle_owned` 交付事件；现有 Mode/Plugin 仍可只实现借用式
-`handle`，UI Hint 则消费 `UiScanned` 的目标 Vec 和 String，避免从平台 mailbox 再复制一份。
+Engine 的 Frame、指针、按键等通用热路径直接调用借用式 `Mode::handle`；只有 `UiScanned`
+通过带默认实现的 `Mode::handle_owned` 交付。现有 Mode/Plugin 仍可只实现 `handle`，UI Hint
+则消费扫描目标的 Vec 和 String，避免从平台 mailbox 再复制一份。
 `Backend::send_keys` 接收拥有所有权的事件 `Vec`：Engine 只构造一次批次，Windows 等异步
 后端可直接把它移入原生队列，不需要为了跨线程生命周期再次复制；同步后端的默认实现仍按
 顺序逐事件发送。完整 chord 使用带默认实现的 `Backend::send_chord`；内置 Windows 后端把

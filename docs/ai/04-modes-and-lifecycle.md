@@ -13,7 +13,8 @@ fn captures_keyboard(&self) -> bool;
 
 Mode 是有状态但平台无关的对象。它可以读取屏幕、光标、前台应用、palette 和只读 host
 settings；不能注入输入、创建窗口或直接扫描 UI。
-只有需要消费大型事件载荷的 Mode 才覆盖 `handle_owned`；默认实现保证已有插件源码兼容。
+只有需要消费 `UiScanned` 大型载荷的 Mode 才覆盖 `handle_owned`；Frame、指针和按键仍直接走
+`handle`，默认实现保证已有插件源码兼容。
 
 ## 五个内置 Mode
 

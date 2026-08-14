@@ -684,8 +684,8 @@ pub trait Mode: Send {
     /// Handle an event whose payload can be consumed by the mode.
     ///
     /// The default preserves the borrowed API used by existing modes and
-    /// plugins. Modes with large owned payloads can override this to move
-    /// buffers and strings instead of cloning them out of the event.
+    /// plugins. The engine reserves this route for [`ModeEvent::UiScanned`],
+    /// whose target buffers and strings can be moved instead of cloned.
     fn handle_owned(&mut self, event: ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
         self.handle(&event, ctx)
     }

@@ -1262,8 +1262,8 @@ impl Engine {
                 } else {
                     self.scan_owners.remove(&result.id)
                 };
-                if owner.as_ref() == Some(&self.active) {
-                    self.dispatch(ModeEvent::UiScanned(result), backend)?;
+                if let Some(owner) = owner.filter(|owner| owner == &self.active) {
+                    self.dispatch_owned_to(&owner, ModeEvent::UiScanned(result), backend)?;
                 }
             }
             BackendEvent::ReloadConfig => {
@@ -2590,6 +2590,30 @@ impl Engine {
         let Some(mode) = self.modes.get_mut(owner) else {
             return Ok(());
         };
+        let commands = mode.handle(&event, &context);
+        crate::app::perf_probe::mark("commands_ready");
+        self.execute_for(owner, commands, backend)
+    }
+
+    /// Deliver the one event family whose platform-owned buffers are worth
+    /// consuming. Keeping this separate leaves frame, pointer and key dispatch
+    /// on the original single-vtable-call hot path.
+    fn dispatch_owned_to(
+        &mut self,
+        owner: &ModeId,
+        event: ModeEvent,
+        backend: &mut dyn Backend,
+    ) -> Result<(), String> {
+        let context = HostContext {
+            screens: &self.screens,
+            cursor: self.cursor,
+            focused_app: self.focused_app.as_ref(),
+            palette: &self.palette,
+            config: &self.config,
+        };
+        let Some(mode) = self.modes.get_mut(owner) else {
+            return Ok(());
+        };
         let commands = mode.handle_owned(event, &context);
         crate::app::perf_probe::mark("commands_ready");
         self.execute_for(owner, commands, backend)
@@ -3094,6 +3118,59 @@ mod tests {
                 _ => Vec::new(),
             })
         }
+    }
+
+    struct OwnedRouteProbe {
+        calls: Arc<Mutex<(usize, usize)>>,
+    }
+
+    impl Mode for OwnedRouteProbe {
+        fn id(&self) -> ModeId {
+            ModeId::idle()
+        }
+
+        fn handle(&mut self, _event: &ModeEvent, _ctx: &HostContext<'_>) -> CommandBatch {
+            self.calls.lock().unwrap().0 += 1;
+            CommandBatch::new()
+        }
+
+        fn handle_owned(&mut self, event: ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
+            self.calls.lock().unwrap().1 += 1;
+            self.handle(&event, ctx)
+        }
+    }
+
+    #[test]
+    fn only_ui_scan_results_use_the_owned_mode_route() {
+        let calls = Arc::new(Mutex::new((0, 0)));
+        let mut engine = Engine::new(Config::default(), Appearance::Dark);
+        engine.register(Box::new(OwnedRouteProbe {
+            calls: Arc::clone(&calls),
+        }));
+        let (mut backend, _) = FakeBackend::new(Vec::new());
+
+        engine
+            .dispatch(
+                ModeEvent::Frame {
+                    elapsed: Duration::from_millis(8),
+                },
+                &mut backend,
+            )
+            .unwrap();
+        assert_eq!(*calls.lock().unwrap(), (1, 0));
+
+        engine.scan_owners.insert(91, ModeId::idle());
+        engine
+            .handle_backend_event(
+                BackendEvent::UiScanned(crate::api::UiScanResult {
+                    id: 91,
+                    targets: Vec::new(),
+                    status: UiScanStatus::Success,
+                }),
+                &mut backend,
+            )
+            .unwrap();
+        assert_eq!(*calls.lock().unwrap(), (2, 1));
     }
 
     fn key_event(name: &str, state: KeyState) -> BackendEvent {
