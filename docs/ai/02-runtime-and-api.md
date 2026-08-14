@@ -120,11 +120,12 @@ Engine 为每个物理键保存 disposition，确保 key-up 与 key-down 使用�
 - `SetFrameClock` 使用原生显示帧，不使用 Mode timer 模拟移动帧率。
 
 状态栏的 `CheckForUpdates` 经 BackendEvent 进入 Engine，再由 Backend 启动独立 HTTPS
-worker。worker 只查询 GitHub 最新正式 Release，并以 SemVer 对比 `CARGO_PKG_VERSION`；
-结果通过 `UpdateChecked` 返回。发现更高版本时原生层直接打开 `/releases/latest`，否则显示
-“已经是最新版本”。更新客户端必须显式选择 Cargo 已启用的 `NativeTls` provider，并使用
-系统证书库；`ureq` 默认选择的是未启用的 Rustls，不能依赖其默认值。网络、TLS、HTTP 或
-响应解析失败统一返回 `Failed`，不得让 worker panic。检查是 single-flight；请求结束后立即
+worker。worker 优先查询 GitHub 最新正式 Release，并以 SemVer 对比 `CARGO_PKG_VERSION`；
+GitHub 不可用时从 jsDelivr 版本元数据选择最高稳定 SemVer。回退结果可以发现更高版本，但
+版本不高于当前程序时不能证明“已经是最新”，必须返回 `Failed` 让用户稍后重试。结果通过
+`UpdateChecked` 返回，发现更高版本后下载对应原生包。更新客户端必须显式选择 Cargo 已启用
+的 `NativeTls` provider，并使用系统证书库；`ureq` 默认选择的是未启用的 Rustls，不能依赖
+其默认值。网络、TLS、HTTP 或响应解析失败统一返回 `Failed`，不得让 worker panic。检查是 single-flight；请求结束后立即
 drop request-scoped Agent 及原生 TLS 连接。Windows 提示在线程内使用同线程临时 owner，
 关闭后销毁 owner 并结束线程；macOS 提示保持非 modal，OK action 关闭窗口并释放唯一 retained
 Alert。不得累积更新 worker、弹窗或连接。它不是启动任务，也没有定时轮询。

@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use crate::api::backend::{UpdateCheckResult, UpdateProgress};
 
 const LATEST_RELEASE_API: &str = "https://api.github.com/repos/dccif/KeySteer/releases/latest";
-const CDN_LATEST_MANIFEST: &str = "https://cdn.jsdelivr.net/gh/dccif/KeySteer@latest/Cargo.toml";
+const CDN_VERSIONS_API: &str = "https://data.jsdelivr.com/v1/package/gh/dccif/KeySteer";
 const RELEASE_DOWNLOAD_ROOT: &str = "https://github.com/dccif/KeySteer/releases/download";
 const GH_PROXY_ROOT: &str = "https://gh-proxy.com";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
@@ -123,18 +123,21 @@ struct LatestAsset {
 }
 
 #[derive(Deserialize)]
-struct CargoManifest {
-    package: CargoPackage,
-}
-
-#[derive(Deserialize)]
-struct CargoPackage {
-    version: String,
+struct CdnVersions {
+    #[serde(default)]
+    versions: Vec<String>,
 }
 
 struct ReleaseInfo {
     version: Version,
     asset: Option<ReleaseAsset>,
+    source: ReleaseSource,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReleaseSource {
+    GitHub,
+    JsDelivr,
 }
 
 struct ReleaseAsset {
@@ -229,7 +232,7 @@ fn check_latest_release(
     let latest = fetch_latest_release(target, cancel)?;
     ensure_not_cancelled(cancel)?;
 
-    if latest.version <= current {
+    if !update_available(&current, &latest)? {
         return Ok(UpdateCheckResult::UpToDate {
             current: current.to_string(),
         });
@@ -262,6 +265,7 @@ fn fetch_latest_release(target: &str, cancel: &AtomicBool) -> Result<ReleaseInfo
                 Ok(version) => Ok(ReleaseInfo {
                     version,
                     asset: None,
+                    source: ReleaseSource::JsDelivr,
                 }),
                 Err(cdn) => {
                     if github.timed_out && cdn.timed_out {
@@ -323,14 +327,15 @@ fn fetch_github_release(target: &str) -> Result<ReleaseInfo, FetchFailure> {
             size: asset.size,
             sha256,
         }),
+        source: ReleaseSource::GitHub,
     })
 }
 
 fn fetch_cdn_version() -> Result<Version, FetchFailure> {
     let agent: ureq::Agent = metadata_agent_config().into();
-    let manifest = agent
-        .get(CDN_LATEST_MANIFEST)
-        .header("Accept", "text/plain")
+    let response: CdnVersions = agent
+        .get(CDN_VERSIONS_API)
+        .header("Accept", "application/json")
         .header(
             "User-Agent",
             concat!("KeySteer/", env!("CARGO_PKG_VERSION")),
@@ -340,12 +345,32 @@ fn fetch_cdn_version() -> Result<Version, FetchFailure> {
         .body_mut()
         .with_config()
         .limit(MAX_RELEASE_RESPONSE_BYTES)
-        .read_to_string()
+        .read_json()
         .map_err(|error| FetchFailure::network("jsDelivr", error))?;
-    let manifest: CargoManifest = toml::from_str(&manifest)
-        .map_err(|error| FetchFailure::content("jsDelivr", error.to_string()))?;
-    Version::parse(&manifest.package.version)
-        .map_err(|error| FetchFailure::content("jsDelivr", error.to_string()))
+    latest_stable_version(&response.versions)
+        .map_err(|error| FetchFailure::content("jsDelivr", error))
+}
+
+fn latest_stable_version(versions: &[String]) -> Result<Version, String> {
+    versions
+        .iter()
+        .filter_map(|value| parse_release_version(value).ok())
+        .filter(|version| version.pre.is_empty())
+        .max()
+        .ok_or_else(|| "version metadata contains no stable SemVer release".into())
+}
+
+fn update_available(current: &Version, latest: &ReleaseInfo) -> Result<bool, String> {
+    if &latest.version > current {
+        return Ok(true);
+    }
+    if latest.source == ReleaseSource::GitHub {
+        return Ok(false);
+    }
+    Err(format!(
+        "Could not verify the latest release because GitHub was unavailable and jsDelivr currently reports version {}. Please retry later.",
+        latest.version
+    ))
 }
 
 fn parse_release_version(tag: &str) -> Result<Version, String> {
@@ -729,6 +754,13 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires live HTTPS access"]
+    fn jsdelivr_version_metadata_live_https_smoke() {
+        let version = fetch_cdn_version().expect("jsDelivr should return stable SemVer metadata");
+        assert!(version.pre.is_empty());
+    }
+
+    #[test]
     fn update_checks_are_single_flight_and_release_the_guard() {
         let first = UpdateCheckGuard::acquire().expect("first check should acquire the guard");
         assert!(UpdateCheckGuard::acquire().is_none());
@@ -832,6 +864,42 @@ mod tests {
     #[test]
     fn prerelease_order_uses_semver() {
         assert!(parse_release_version("v0.2.0").unwrap() > Version::parse("0.2.0-beta.1").unwrap());
+    }
+
+    #[test]
+    fn cdn_metadata_selects_the_highest_stable_semver() {
+        let versions = ["0.8.12", "0.9.0-beta.1", "not-a-release", "v0.8.13"].map(str::to_string);
+        assert_eq!(
+            latest_stable_version(&versions).unwrap(),
+            Version::new(0, 8, 13)
+        );
+    }
+
+    #[test]
+    fn newer_cdn_fallback_still_reports_an_available_update() {
+        let latest = ReleaseInfo {
+            version: Version::new(0, 8, 13),
+            asset: None,
+            source: ReleaseSource::JsDelivr,
+        };
+        assert!(update_available(&Version::new(0, 8, 12), &latest).unwrap());
+    }
+
+    #[test]
+    fn non_authoritative_fallback_never_claims_the_current_version_is_latest() {
+        let fallback = ReleaseInfo {
+            version: Version::new(0, 8, 12),
+            asset: None,
+            source: ReleaseSource::JsDelivr,
+        };
+        let error = update_available(&Version::new(0, 8, 12), &fallback).unwrap_err();
+        assert!(error.contains("Could not verify the latest release"));
+
+        let github = ReleaseInfo {
+            source: ReleaseSource::GitHub,
+            ..fallback
+        };
+        assert!(!update_available(&Version::new(0, 8, 12), &github).unwrap());
     }
 
     #[test]
