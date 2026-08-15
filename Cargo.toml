@@ -158,6 +158,9 @@ features = [
 [target.'cfg(target_os = "windows")'.dependencies.windows-numerics]
 version = "0.3.1"
 
+[target.'cfg(target_os = "windows")'.dependencies.windows-collections]
+version = "0.3.2"
+
 [target.'cfg(target_os = "windows")'.dependencies.windows-future]
 version = "0.3.2"
 

@@ -84,7 +84,7 @@ backing，以降低常见不足 100 个标签时的重入分配；大型扫描�
 
 - `axtree` 只调度 UIA；`vision` 只调度完整视觉管线；`hybrid` 同时调度两者。
 - `src/platform/windows/ui_scan.rs` 是唯一发布点：所有来源共用 64px 覆盖网格、24/48/96…累计边界和 2000 项上限。矩形只保存一次，覆盖超过 32 格的大矩形进入有界 oversize 列表；先显示的目标不被后到重复项替换。
-- Backend ready 后的首次事件轮询只异步执行一次 OCR discovery：系统探测在临时 MTA 中创建并立即销毁 `OcrEngine`，微信探测只缓存已验证的绝对路径与文件标识。这样 ready 热路径不承担探测线程创建；成功和失败结果都缓存到进程退出，不保留 OCR、helper、COM 或 vision worker。首次扫描若探测尚未完成，只由视觉协调线程等待同一个 single-flight 结果。
+- Backend ready 后的首次事件轮询只异步执行一次 OCR discovery：系统探测在临时 MTA 中创建并立即销毁 `OcrEngine`，微信探测只缓存已验证的绝对路径与文件标识。系统 OCR/WIC 通过本代拥有的 activation factory 调用，禁止使用会跨临时 MTA 残留悬空指针的投影静态 factory cache。这样 ready 热路径不承担探测线程创建；成功和失败结果都缓存到进程退出，不保留 OCR、helper、COM 或 vision worker。首次扫描若探测尚未完成，只由视觉协调线程等待同一个 single-flight 结果。
 - `src/platform/windows/vision.rs` 在有视觉请求时懒启动 generation-scoped coordinator。每个 generation 只取得一张 GDI top-down DIB 截图，并在提交和发布边界复核 HWND、PID 与 generation；当前与 latest pending 请求完成后 coordinator 自行退出。
 - 截图前由 `overlay_worker.rs` 建立 generation capture gate：渲染线程清空 GPU/CPU overlay、确认 DirectComposition commit 并等待一次 DWM 合成后才 ACK。ACK 前 UIA/OCR 提交只覆盖 latest deferred frame；截图复制完成立即释放 gate，只显示最新帧。旧 lease、取消和 shutdown 不能释放新 generation。
 - `detect_text=true` 时系统 OCR 与可用的微信 OCR 并行；已就绪批次按唯一项数量、耗时排序，单个先完成批次不等待另一个来源。两者最终发布空间并集。

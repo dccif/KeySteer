@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use semver::Version;
 use serde::Deserialize;
-use windows::Graphics::Imaging::{BitmapEncoder, SoftwareBitmap};
+use windows::Graphics::Imaging::SoftwareBitmap;
 use windows::Storage::Streams::IRandomAccessStream;
 
 use crate::api::geometry::{Rect, UiTarget};
@@ -513,13 +513,7 @@ fn encode_png(bitmap: &SoftwareBitmap, path: &Path) -> Result<(), String> {
     let stream: IRandomAccessStream = super::native::create_file_random_access_stream(path)
         .map_err(|error| format!("cannot create temporary PNG stream: {error}"))?;
     let result = (|| {
-        let encoder = BitmapEncoder::CreateAsync(
-            BitmapEncoder::PngEncoderId()
-                .map_err(|error| format!("cannot query PNG encoder: {error}"))?,
-            &stream,
-        )
-        .and_then(|operation| operation.join())
-        .map_err(|error| format!("cannot create WIC PNG encoder: {error}"))?;
+        let encoder = super::native::create_png_bitmap_encoder(&stream)?;
         encoder
             .SetSoftwareBitmap(bitmap)
             .map_err(|error| format!("cannot supply WIC bitmap: {error}"))?;

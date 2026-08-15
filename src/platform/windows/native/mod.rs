@@ -288,12 +288,26 @@ pub(crate) fn software_bitmap_bgra(
     if pixels.len() != dimensions.byte_len() {
         return Err("BGRA byte length does not match bitmap dimensions".into());
     }
-    let bitmap = SoftwareBitmap::CreateWithAlpha(
-        BitmapPixelFormat::Bgra8,
-        dimensions.width_i32(),
-        dimensions.height_i32(),
-        BitmapAlphaMode::Ignore,
-    )
+    let factory = windows::core::imp::load_factory::<
+        SoftwareBitmap,
+        windows::Graphics::Imaging::ISoftwareBitmapFactory,
+    >()
+    .map_err(|error| format!("cannot load SoftwareBitmap factory: {error}"))?;
+    // SAFETY: the factory was loaded for `SoftwareBitmap`, all value
+    // parameters use the generated ABI types, and `result` is a valid
+    // out-parameter converted into an owned projected object.
+    let bitmap: SoftwareBitmap = unsafe {
+        let mut result = core::ptr::null_mut();
+        (windows::core::Interface::vtable(&factory).CreateWithAlpha)(
+            windows::core::Interface::as_raw(&factory),
+            BitmapPixelFormat::Bgra8,
+            dimensions.width_i32(),
+            dimensions.height_i32(),
+            BitmapAlphaMode::Ignore,
+            &mut result,
+        )
+        .and_then(|| windows::core::Type::from_abi(result))
+    }
     .map_err(|error| format!("SoftwareBitmap creation failed: {error}"))?;
     let buffer = match bitmap.LockBuffer(BitmapBufferAccessMode::Write) {
         Ok(buffer) => buffer,
@@ -391,6 +405,114 @@ pub(crate) fn software_bitmap_bgra(
     }
 }
 
+/// Load and call the OCR activation factory without the projection's static
+/// `FactoryCache`. Windows can unload an in-process WinRT server when a
+/// temporary COM apartment ends, which would otherwise leave that process-wide
+/// cache pointing into freed code before the next UI Hint scan.
+type SystemOcrLanguages = windows_collections::IVectorView<windows::Globalization::Language>;
+type LoadedSystemOcr = (
+    windows::Media::Ocr::OcrEngine,
+    Option<(u32, SystemOcrLanguages)>,
+);
+
+fn load_system_ocr(include_metadata: bool) -> Result<LoadedSystemOcr, String> {
+    use windows::Media::Ocr::{IOcrEngineStatics, OcrEngine};
+
+    let factory = windows::core::imp::load_factory::<OcrEngine, IOcrEngineStatics>()
+        .map_err(|error| format!("cannot load OcrEngine factory: {error}"))?;
+    // SAFETY: the local factory implements `IOcrEngineStatics`. Every result
+    // slot has the exact generated ABI type and is converted immediately into
+    // an owned projection before the factory can be released.
+    unsafe {
+        let mut result = core::ptr::null_mut();
+        (windows::core::Interface::vtable(&factory).TryCreateFromUserProfileLanguages)(
+            windows::core::Interface::as_raw(&factory),
+            &mut result,
+        )
+        .ok()
+        .map_err(|error| format!("cannot create per-scan OcrEngine: {error}"))?;
+        let engine = windows::core::Type::from_abi(result)
+            .map_err(|error| format!("cannot own per-scan OcrEngine: {error}"))?;
+        if !include_metadata {
+            return Ok((engine, None));
+        }
+        let mut maximum = 0;
+        (windows::core::Interface::vtable(&factory).MaxImageDimension)(
+            windows::core::Interface::as_raw(&factory),
+            &mut maximum,
+        )
+        .ok()
+        .map_err(|error| format!("cannot read OcrEngine maximum image dimension: {error}"))?;
+        let mut languages = core::ptr::null_mut();
+        (windows::core::Interface::vtable(&factory).AvailableRecognizerLanguages)(
+            windows::core::Interface::as_raw(&factory),
+            &mut languages,
+        )
+        .ok()
+        .map_err(|error| format!("cannot enumerate OCR languages: {error}"))?;
+        let languages = windows::core::Type::from_abi(languages)
+            .map_err(|error| format!("cannot own OCR language collection: {error}"))?;
+        Ok((engine, Some((maximum, languages))))
+    }
+}
+
+pub(crate) fn create_system_ocr_engine() -> Result<windows::Media::Ocr::OcrEngine, String> {
+    load_system_ocr(false).map(|(engine, _)| engine)
+}
+
+pub(crate) fn probe_system_ocr_factory() -> Result<(u32, Vec<String>), String> {
+    let (engine, metadata) = load_system_ocr(true)?;
+    let (maximum, languages) =
+        metadata.ok_or_else(|| "OCR factory did not return discovery metadata".to_string())?;
+    let mut tags = Vec::with_capacity(languages.Size().unwrap_or_default() as usize);
+    for language in &languages {
+        tags.push(
+            language
+                .LanguageTag()
+                .map_err(|error| format!("cannot read OCR language tag: {error}"))?
+                .to_string(),
+        );
+    }
+    drop(engine);
+    Ok((maximum, tags))
+}
+
+pub(crate) fn create_png_bitmap_encoder(
+    stream: &windows::Storage::Streams::IRandomAccessStream,
+) -> Result<windows::Graphics::Imaging::BitmapEncoder, String> {
+    use windows::Graphics::Imaging::{BitmapEncoder, IBitmapEncoderStatics};
+
+    let factory = windows::core::imp::load_factory::<BitmapEncoder, IBitmapEncoderStatics>()
+        .map_err(|error| format!("cannot load BitmapEncoder factory: {error}"))?;
+    // SAFETY: the local factory implements `IBitmapEncoderStatics`, the stream
+    // stays alive through the synchronous `join`, and both output slots use
+    // the exact generated ABI types converted into owned values.
+    let operation: windows_future::IAsyncOperation<BitmapEncoder> = unsafe {
+        let mut result = windows::core::GUID::zeroed();
+        (windows::core::Interface::vtable(&factory).PngEncoderId)(
+            windows::core::Interface::as_raw(&factory),
+            &mut result,
+        )
+        .ok()
+        .map_err(|error| format!("cannot read PNG encoder id: {error}"))?;
+        let encoder_id = result;
+        let mut operation = core::ptr::null_mut();
+        (windows::core::Interface::vtable(&factory).CreateAsync)(
+            windows::core::Interface::as_raw(&factory),
+            encoder_id,
+            windows::core::Interface::as_raw(stream),
+            &mut operation,
+        )
+        .ok()
+        .map_err(|error| format!("cannot start PNG encoder creation: {error}"))?;
+        windows::core::Type::from_abi(operation)
+            .map_err(|error| format!("cannot own PNG encoder operation: {error}"))?
+    };
+    operation
+        .join()
+        .map_err(|error| format!("cannot create PNG encoder: {error}"))
+}
+
 pub(crate) fn create_file_random_access_stream(
     path: &Path,
 ) -> Result<windows::Storage::Streams::IRandomAccessStream, String> {
@@ -470,27 +592,23 @@ impl WechatBridge {
             .encode_wide()
             .chain(Some(0))
             .collect::<Vec<_>>();
-        // SAFETY: the absolute path is NUL terminated. Restricted search uses
-        // only the bridge directory and Windows safe default directories.
-        let module = unsafe {
-            LoadLibraryExW(
+        // SAFETY: the absolute path and symbol names are NUL terminated.
+        // Restricted search uses only the bridge directory and Windows safe
+        // defaults; the typed pointers use the bridge's documented C ABI and
+        // cannot outlive the returned module owner.
+        let (module, recognize, stop) = unsafe {
+            let module = LoadLibraryExW(
                 PCWSTR(wide.as_ptr()),
                 None,
                 LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
             )
-        }
-        .map_err(|error| format!("cannot load {}: {error}", path.display()))?;
-        // SAFETY: both symbol names are static NUL-terminated ASCII. Function
-        // pointers use the bridge's documented exported C ABI.
-        let recognize = unsafe {
+            .map_err(|error| format!("cannot load {}: {error}", path.display()))?;
             let address = GetProcAddress(module, PCSTR(c"wechat_ocr".as_ptr().cast()))
                 .ok_or_else(|| "wcocr.dll lacks wechat_ocr".to_string())?;
-            std::mem::transmute_copy(&address)
-        };
-        // SAFETY: same symbol lifetime/ABI contract as above; stop is optional.
-        let stop = unsafe {
-            GetProcAddress(module, PCSTR(c"stop_ocr".as_ptr().cast()))
-                .map(|address| std::mem::transmute_copy(&address))
+            let recognize = std::mem::transmute_copy(&address);
+            let stop = GetProcAddress(module, PCSTR(c"stop_ocr".as_ptr().cast()))
+                .map(|address| std::mem::transmute_copy(&address));
+            (module, recognize, stop)
         };
         Ok(Self {
             module,
@@ -550,14 +668,15 @@ impl Drop for WechatBridge {
     fn drop(&mut self) {
         use windows::Win32::Foundation::FreeLibrary;
 
-        if let Some(stop) = self.stop {
-            // SAFETY: no recognition call remains active when the helper loop
-            // drops this owner; symbol and module lifetimes still match.
-            unsafe { stop() };
+        // SAFETY: no recognition call remains active; all function pointers
+        // still belong to this live module and are discarded immediately after
+        // the balanced release.
+        unsafe {
+            if let Some(stop) = self.stop {
+                stop();
+            }
+            let _ = FreeLibrary(self.module);
         }
-        // SAFETY: this owner loaded the module and drops all function pointers
-        // immediately after this balanced release.
-        let _ = unsafe { FreeLibrary(self.module) };
     }
 }
 
@@ -1568,6 +1687,25 @@ mod tests {
         release_capture_surface();
         assert_eq!(first.pixels.len(), 64 * 64 * 4);
         assert_eq!(second.pixels.len(), first.pixels.len());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires the optional Windows OCR capability"]
+    fn system_ocr_factory_survives_transient_apartments() -> Result<(), String> {
+        for _ in 0..3 {
+            std::thread::spawn(|| -> Result<(), String> {
+                let apartment = ComApartment::initialise()?;
+                let (maximum, _) = probe_system_ocr_factory()?;
+                let engine = create_system_ocr_engine()?;
+                assert!(maximum > 0);
+                drop(engine);
+                drop(apartment);
+                Ok(())
+            })
+            .join()
+            .map_err(|_| "transient OCR apartment thread panicked".to_string())??;
+        }
         Ok(())
     }
 }

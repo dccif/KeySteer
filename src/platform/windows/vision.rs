@@ -670,9 +670,18 @@ fn run_scan_inner(
         return UiScanStatus::ContextChanged;
     }
 
-    let shared_bitmap = if provider_inputs.is_empty() {
+    let bitmap_apartment = if provider_inputs.is_empty() {
         None
     } else {
+        match super::native::ComApartment::initialise() {
+            Ok(apartment) => Some(apartment),
+            Err(error) => {
+                crate::app::logging::report_error("windows-vision", &error);
+                None
+            }
+        }
+    };
+    let shared_bitmap = bitmap_apartment.as_ref().and_then(|_| {
         match super::native::software_bitmap_bgra(&image.pixels, image.width, image.height) {
             Ok(bitmap) => Some(Arc::new(SharedSoftwareBitmap(bitmap))),
             Err(error) => {
@@ -680,7 +689,7 @@ fn run_scan_inner(
                 None
             }
         }
-    };
+    });
     if let Some(bitmap) = shared_bitmap.as_ref() {
         for input in provider_inputs.drain(..) {
             let _ = input.send(Arc::new(ProviderImage {
@@ -780,6 +789,7 @@ fn run_scan_inner(
         crate::app::logging::report_error("windows-vision", error);
     }
     drop(shared_bitmap);
+    drop(bitmap_apartment);
     if !current(shared, job.generation, original) {
         UiScanStatus::ContextChanged
     } else if timed_out {
@@ -819,8 +829,7 @@ fn recognize_system_provider(
     cancellation: &ScanCancellation,
 ) -> Result<Vec<UiTarget>, String> {
     let _apartment = super::native::ComApartment::initialise()?;
-    let engine = OcrEngine::TryCreateFromUserProfileLanguages()
-        .map_err(|error| format!("cannot create per-scan OcrEngine: {error}"))?;
+    let engine = super::native::create_system_ocr_engine()?;
     let input = wait_provider_image(receiver, deadline, cancellation)?;
     if input.image.width > descriptor.maximum_dimension
         || input.image.height > descriptor.maximum_dimension
@@ -1022,28 +1031,7 @@ fn probe_system_ocr(cancelled: impl Fn() -> bool) -> Result<SystemOcrDescriptor,
         if cancelled() {
             return Err("system OCR discovery cancelled".into());
         }
-        let engine = OcrEngine::TryCreateFromUserProfileLanguages()
-            .map_err(|error| format!("cannot create OcrEngine: {error}"))?;
-        let maximum = OcrEngine::MaxImageDimension()
-            .map_err(|error| format!("cannot query OCR image limit: {error}"))?;
-        let languages = OcrEngine::AvailableRecognizerLanguages()
-            .ok()
-            .and_then(|languages| {
-                let count = languages.Size().ok()?;
-                Some(
-                    (0..count)
-                        .filter_map(|index| {
-                            languages
-                                .GetAt(index)
-                                .and_then(|language| language.LanguageTag())
-                                .ok()
-                                .map(|tag| tag.to_string())
-                        })
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .unwrap_or_default();
-        drop(engine);
+        let (maximum, languages) = super::native::probe_system_ocr_factory()?;
         Ok(SystemOcrDescriptor {
             languages,
             maximum_dimension: maximum,
