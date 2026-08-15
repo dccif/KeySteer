@@ -4,28 +4,27 @@ use std::path::{Path, PathBuf};
 
 // Keep the current audited native surface from growing. Portable layers are
 // checked separately below and remain entirely safe Rust.
-const MAX_UNSAFE_EXPRESSIONS: usize = 250;
+const MAX_UNSAFE_EXPRESSIONS: usize = 240;
 const MAX_UNSAFE_FILES: usize = 18;
 const PER_FILE_BUDGET: &[(&str, usize)] = &[
     ("src/platform/macos/accessibility.rs", 12),
     ("src/platform/macos/autostart.rs", 5),
     ("src/platform/macos/display_link.rs", 4),
-    ("src/platform/macos/input.rs", 11),
     ("src/platform/macos/native.rs", 3),
     ("src/platform/macos/overlay.rs", 6),
     ("src/platform/macos/permissions.rs", 5),
     ("src/platform/macos/screens.rs", 4),
     ("src/platform/macos/status_item.rs", 4),
     ("src/platform/macos/vision.rs", 5),
-    ("src/platform/windows/accessibility.rs", 39),
+    ("src/platform/windows/accessibility.rs", 33),
     ("src/platform/windows/autostart.rs", 4),
     ("src/platform/windows/gpu_overlay.rs", 36),
     ("src/platform/windows/hook.rs", 8),
     ("src/platform/windows/input.rs", 6),
-    ("src/platform/windows/overlay.rs", 22),
-    ("src/platform/windows/screens.rs", 8),
-    ("src/platform/windows/status_item.rs", 17),
-    ("src/platform/windows/native/mod.rs", 62),
+    ("src/platform/windows/overlay.rs", 12),
+    ("src/platform/windows/screens.rs", 6),
+    ("src/platform/windows/status_item.rs", 16),
+    ("src/platform/windows/native/mod.rs", 72),
 ];
 
 fn rust_files(directory: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
@@ -92,8 +91,8 @@ fn unsafe_surface_does_not_regress() -> Result<(), Box<dyn std::error::Error>> {
             expression_count += count;
         }
         assert!(
-            !source.contains("transmute("),
-            "transmute is forbidden: {}",
+            !source.contains("transmute"),
+            "transmute and transmute_copy are forbidden: {}",
             path.display()
         );
         assert!(

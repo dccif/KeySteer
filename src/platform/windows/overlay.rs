@@ -7,17 +7,14 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::ptr::NonNull;
 use std::sync::Arc;
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BI_RGB, BITMAPINFO, BITMAPINFOHEADER,
-    BLENDFUNCTION, CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection, CreateFontW,
-    DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC,
-    DeleteObject, DrawTextW, FF_DONTCARE, FW_BOLD, FW_NORMAL, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ,
-    OUT_DEFAULT_PRECIS, SelectObject, SetBkMode, SetTextColor, TRANSPARENT, UpdateWindow,
-    ValidateRect,
+    AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BLENDFUNCTION, CLIP_DEFAULT_PRECIS,
+    CreateFontW, DEFAULT_CHARSET, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject,
+    DrawTextW, FF_DONTCARE, FW_BOLD, FW_NORMAL, HBRUSH, HFONT, OUT_DEFAULT_PRECIS, SetBkMode,
+    SetTextColor, TRANSPARENT, UpdateWindow, ValidateRect,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, HCURSOR, HICON, HWND_TOPMOST, SW_SHOWNOACTIVATE,
@@ -32,7 +29,7 @@ use crate::api::overlay::{
     Color, LabelStyle, OverlayItems, OverlayLabel, OverlayScene, OverlayShape,
 };
 
-use super::native::{NativeDimensions, OwnedWindow, SelectedObject};
+use super::native::{GdiDibSurface, NativeDimensions, OwnedWindow, SelectedObject};
 
 /// Renders scenes into layered click-through windows, one per monitor.
 pub struct Overlay {
@@ -47,7 +44,7 @@ pub struct Overlay {
     /// One persistent top-down DIB. Rendering writes directly into the pixels
     /// consumed by `UpdateLayeredWindow`, avoiding a second full-screen buffer,
     /// a memcpy and repeated GDI allocation on every frame.
-    dib: Option<DibSurface>,
+    dib: Option<GdiDibSurface>,
     /// Reuses the text DIB, UTF-16 buffer, mask and a strictly bounded set of
     /// native fonts across all labels in one overlay lifetime.
     text_rasterizer: TextRasterizer,
@@ -189,7 +186,7 @@ impl Overlay {
             && self
                 .dib
                 .as_ref()
-                .is_some_and(|surface| surface.width == width && surface.height == height);
+                .is_some_and(|surface| surface.width() == width && surface.height() == height);
         // `ensure_window` also translates an existing layered window. Do this
         // before the cache check so a pointer-follow scene still moves.
         let hwnd = self.ensure_window(area)?;
@@ -237,9 +234,12 @@ impl Overlay {
         let needs_surface = self
             .dib
             .as_ref()
-            .is_none_or(|surface| surface.width != width || surface.height != height);
+            .is_none_or(|surface| surface.width() != width || surface.height() != height);
         if needs_surface {
-            self.dib = Some(DibSurface::new(width, height)?);
+            self.dib = Some(GdiDibSurface::new(
+                None,
+                NativeDimensions::from_usize(width, height)?,
+            )?);
         }
         let Some(dib) = self.dib.as_mut() else {
             return Err("overlay DIB was not retained after creation".into());
@@ -991,7 +991,7 @@ impl Drop for OwnedFont {
 }
 
 struct TextRasterizer {
-    scratch: Option<DibSurface>,
+    scratch: Option<GdiDibSurface>,
     fonts: Vec<FontEntry>,
     utf16: Vec<u16>,
     mask: Vec<u8>,
@@ -1054,17 +1054,17 @@ impl TextRasterizer {
         };
         scratch.clear_region(width, height);
         {
-            let _selected_font = SelectedObject::new(scratch.dc, font.font.0.into())?;
+            let _selected_font = SelectedObject::new(scratch.dc(), font.font.0.into())?;
             // SAFETY: the selected DC and font remain alive for this scope and
             // the color/background operations do not retain pointers.
             unsafe {
-                if SetBkMode(scratch.dc, TRANSPARENT) == 0 {
+                if SetBkMode(scratch.dc(), TRANSPARENT) == 0 {
                     crate::app::logging::report_error(
                         "windows-overlay",
                         "SetBkMode failed while drawing text",
                     );
                 }
-                SetTextColor(scratch.dc, COLORREF(0x00FF_FFFF));
+                SetTextColor(scratch.dc(), COLORREF(0x00FF_FFFF));
             }
             let mut draw_rect = windows::Win32::Foundation::RECT {
                 left: 0,
@@ -1076,7 +1076,7 @@ impl TextRasterizer {
             // valid and writable for this synchronous text draw.
             unsafe {
                 DrawTextW(
-                    scratch.dc,
+                    scratch.dc(),
                     &mut self.utf16,
                     &mut draw_rect,
                     DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
@@ -1090,7 +1090,7 @@ impl TextRasterizer {
         self.fonts.push(font);
 
         self.mask.resize(width.saturating_mul(height), 0);
-        let stride = scratch.width;
+        let stride = scratch.width();
         let pixels = scratch.pixels();
         for y in 0..height {
             let source = &pixels[y * stride * 4..(y * stride + width) * 4];
@@ -1106,126 +1106,26 @@ impl TextRasterizer {
         let reusable = self
             .scratch
             .as_ref()
-            .is_some_and(|surface| surface.width >= width && surface.height >= height);
+            .is_some_and(|surface| surface.width() >= width && surface.height() >= height);
         if !reusable {
-            let old_width = self.scratch.as_ref().map_or(0, |surface| surface.width);
-            let old_height = self.scratch.as_ref().map_or(0, |surface| surface.height);
-            self.scratch = Some(DibSurface::new(
-                old_width.max(width),
-                old_height.max(height),
+            let old_width = self.scratch.as_ref().map_or(0, GdiDibSurface::width);
+            let old_height = self.scratch.as_ref().map_or(0, GdiDibSurface::height);
+            self.scratch = Some(GdiDibSurface::new(
+                None,
+                NativeDimensions::from_usize(old_width.max(width), old_height.max(height))?,
             )?);
         }
         Ok(())
     }
 }
 
-struct DibSurface {
-    width: usize,
-    height: usize,
-    dc: HDC,
-    bitmap: HBITMAP,
-    old_bitmap: HGDIOBJ,
-    bits: NonNull<u8>,
-    byte_len: usize,
+trait DibSurfaceExt {
+    fn clear(&mut self);
+    fn clear_with(&mut self, color: Color);
+    fn clear_region(&mut self, width: usize, height: usize);
 }
 
-impl DibSurface {
-    fn new(width: usize, height: usize) -> Result<Self, String> {
-        let dimensions = NativeDimensions::from_usize(width, height)?;
-        let info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: dimensions.width_i32(),
-                biHeight: -dimensions.height_i32(),
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        // SAFETY: a null source DC requests a memory DC with no borrowed data.
-        let dc = unsafe { CreateCompatibleDC(None) };
-        if dc.is_invalid() {
-            return Err("CreateCompatibleDC failed".into());
-        }
-        let mut bits = std::ptr::null_mut();
-        // SAFETY: dimensions and byte length were checked, `info` describes a
-        // 32-bit top-down DIB, and `bits` is a valid out-pointer.
-        let bitmap = match unsafe {
-            CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0)
-        } {
-            Ok(bitmap) => bitmap,
-            Err(error) => {
-                // SAFETY: `dc` was successfully created and no bitmap was
-                // selected, so this failure path owns the only release.
-                unsafe {
-                    if !DeleteDC(dc).as_bool() {
-                        crate::app::logging::report_error(
-                            "windows-overlay",
-                            "DeleteDC failed after CreateDIBSection failure",
-                        );
-                    }
-                }
-                return Err(format!("CreateDIBSection failed: {error}"));
-            }
-        };
-        // SAFETY: both handles are live and selection occurs on this thread;
-        // the returned previous object is retained for restoration in Drop.
-        let old_bitmap = unsafe { SelectObject(dc, bitmap.into()) };
-        let bits = NonNull::new(bits.cast::<u8>());
-        if bits.is_none() || old_bitmap.0.is_null() || old_bitmap.0 as usize == usize::MAX {
-            // SAFETY: this branch owns every successfully created GDI object;
-            // a valid previous selection is restored before deletion.
-            unsafe {
-                if !old_bitmap.0.is_null() && old_bitmap.0 as usize != usize::MAX {
-                    let _ = SelectObject(dc, old_bitmap);
-                }
-                if !DeleteObject(bitmap.into()).as_bool() {
-                    crate::app::logging::report_error(
-                        "windows-overlay",
-                        "DeleteObject(DIB) failed after SelectObject failure",
-                    );
-                }
-                if !DeleteDC(dc).as_bool() {
-                    crate::app::logging::report_error(
-                        "windows-overlay",
-                        "DeleteDC failed after SelectObject failure",
-                    );
-                }
-            }
-            return Err(if bits.is_none() {
-                "CreateDIBSection returned a null pixel buffer".into()
-            } else {
-                "SelectObject(DIB) failed".into()
-            });
-        }
-        let bits =
-            bits.ok_or_else(|| "CreateDIBSection returned a null pixel buffer".to_string())?;
-        Ok(Self {
-            width,
-            height,
-            dc,
-            bitmap,
-            old_bitmap,
-            bits,
-            byte_len: dimensions.byte_len(),
-        })
-    }
-
-    fn pixels(&self) -> &[u8] {
-        // SAFETY: `bits` is non-null and points to the DIB allocation owned by
-        // `self`. `byte_len` was checked before the native allocation and the
-        // immutable borrow prevents mutable access for the returned lifetime.
-        unsafe { std::slice::from_raw_parts(self.bits.as_ptr(), self.byte_len) }
-    }
-
-    fn pixels_mut(&mut self) -> &mut [u8] {
-        // SAFETY: `self` exclusively owns the DIB and `&mut self` guarantees no
-        // aliases. The validated allocation length is at most `isize::MAX`.
-        unsafe { std::slice::from_raw_parts_mut(self.bits.as_ptr(), self.byte_len) }
-    }
-
+impl DibSurfaceExt for GdiDibSurface {
     fn clear(&mut self) {
         self.pixels_mut().fill(0);
     }
@@ -1243,8 +1143,8 @@ impl DibSurface {
     }
 
     fn clear_region(&mut self, width: usize, height: usize) {
-        debug_assert!(width <= self.width && height <= self.height);
-        let stride = self.width;
+        debug_assert!(width <= self.width() && height <= self.height());
+        let stride = self.width();
         let pixels = self.pixels_mut();
         for row in pixels.chunks_exact_mut(stride * 4).take(height) {
             row[..width * 4].fill(0);
@@ -1252,62 +1152,15 @@ impl DibSurface {
     }
 }
 
-impl Drop for DibSurface {
-    fn drop(&mut self) {
-        // SAFETY: all handles are owned by this thread-bound surface; restore
-        // the previous selection before deleting the bitmap and DC exactly once.
-        unsafe {
-            let _ = SelectObject(self.dc, self.old_bitmap);
-            if !DeleteObject(self.bitmap.into()).as_bool() {
-                crate::app::logging::report_error(
-                    "windows-overlay",
-                    "DeleteObject(DIB) failed during drop",
-                );
-            }
-            if !DeleteDC(self.dc).as_bool() {
-                crate::app::logging::report_error(
-                    "windows-overlay",
-                    "DeleteDC(DIB) failed during drop",
-                );
-            }
-        }
-    }
-}
-
-struct ScreenDc(HDC);
-
-impl ScreenDc {
-    fn acquire() -> Result<Self, String> {
-        // SAFETY: a null HWND acquires the desktop DC and transfers the matching
-        // ReleaseDC obligation to this guard.
-        let dc = unsafe { windows::Win32::Graphics::Gdi::GetDC(None) };
-        if dc.is_invalid() {
-            Err("GetDC failed".into())
-        } else {
-            Ok(Self(dc))
-        }
-    }
-}
-
-impl Drop for ScreenDc {
-    fn drop(&mut self) {
-        // SAFETY: this is the desktop DC acquired by `ScreenDc::acquire`, and
-        // the guard releases it exactly once.
-        unsafe {
-            windows::Win32::Graphics::Gdi::ReleaseDC(None, self.0);
-        }
-    }
-}
-
-fn upload(hwnd: HWND, area: Rect, surface: &DibSurface) -> Result<(), String> {
-    let screen = ScreenDc::acquire()?;
+fn upload(hwnd: HWND, area: Rect, surface: &GdiDibSurface) -> Result<(), String> {
+    let screen = super::native::ScreenDc::acquire()?;
     let destination = POINT {
         x: area.x.round() as i32,
         y: area.y.round() as i32,
     };
     let size = SIZE {
-        cx: surface.width as i32,
-        cy: surface.height as i32,
+        cx: surface.width() as i32,
+        cy: surface.height() as i32,
     };
     let source = POINT { x: 0, y: 0 };
     let blend = BLENDFUNCTION {
@@ -1321,10 +1174,10 @@ fn upload(hwnd: HWND, area: Rect, surface: &DibSurface) -> Result<(), String> {
     unsafe {
         UpdateLayeredWindow(
             hwnd,
-            Some(screen.0),
+            Some(screen.raw()),
             Some(&destination),
             Some(&size),
-            Some(surface.dc),
+            Some(surface.dc()),
             Some(&source),
             COLORREF(0),
             Some(&blend),
@@ -1351,7 +1204,7 @@ impl Drop for Overlay {
     }
 }
 
-unsafe extern "system" fn window_proc(
+extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,

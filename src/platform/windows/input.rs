@@ -359,8 +359,13 @@ pub(super) fn send_chord(chord: &KeyChordBatch) -> Result<(), String> {
         Err(failure) => failure,
     };
     let releases = KeyInputBatch::from_releases(keys);
-    let _ = send(releases.as_slice());
-    Err(failure.message())
+    match send(releases.as_slice()) {
+        Ok(()) => Err(failure.message()),
+        Err(release) => Err(format!(
+            "{}; compensatory chord release failed: {release}",
+            failure.message()
+        )),
+    }
 }
 
 /// Tell Windows that a forwarded Alt participated in a shortcut whose action
@@ -400,10 +405,21 @@ pub fn send_keys(events: &[(Key, KeyState)]) -> Result<(), String> {
     let releases = held
         .iter()
         .rev()
-        .filter_map(|key| key_input(key, KeyState::Up).ok())
-        .collect::<Vec<_>>();
+        .map(|key| key_input(key, KeyState::Up))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|release| {
+            format!(
+                "{}; cannot build compensatory key release: {release}",
+                failure.message()
+            )
+        })?;
     if !releases.is_empty() {
-        let _ = send(&releases);
+        send(&releases).map_err(|release| {
+            format!(
+                "{}; compensatory key release failed: {release}",
+                failure.message()
+            )
+        })?;
     }
     Err(failure.message())
 }

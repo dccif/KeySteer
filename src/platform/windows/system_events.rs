@@ -32,7 +32,7 @@ impl ForegroundWatcher {
 impl Drop for ForegroundWatcher {
     fn drop(&mut self) {
         if !super::native::uninstall_event_hook(self.0) {
-            crate::report_warning!(
+            crate::report_error!(
                 "windows-events",
                 "UnhookWinEvent failed while stopping foreground notifications"
             );
@@ -55,7 +55,7 @@ extern "system" fn win_event(
     if owner != 0
         && let Err(error) = super::native::post_thread_message(owner, WAKE_MESSAGE, 0)
     {
-        crate::report_warning!(
+        crate::report_error!(
             "windows-events",
             "cannot wake engine for foreground change: {error}"
         );

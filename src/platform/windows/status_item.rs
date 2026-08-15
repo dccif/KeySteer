@@ -8,16 +8,16 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
     ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow, DispatchMessageW,
-    GetCursorPos, GetForegroundWindow, HCURSOR, HICON, IDI_APPLICATION, IDYES, LoadIconW,
-    MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MB_YESNO, MF_CHECKED, MF_GRAYED,
-    MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, PostMessageW, RegisterWindowMessageW, SW_SHOWNORMAL,
+    GetForegroundWindow, HCURSOR, HICON, IDI_APPLICATION, IDYES, LoadIconW, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MB_YESNO, MF_CHECKED, MF_GRAYED, MF_SEPARATOR,
+    MF_STRING, MSG, MessageBoxW, PostMessageW, RegisterWindowMessageW, SW_SHOWNORMAL,
     SetForegroundWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
     TrackPopupMenu, TranslateMessage, WM_APP, WM_CANCELMODE, WM_DISPLAYCHANGE, WM_LBUTTONUP,
     WM_NULL, WM_QUIT, WM_RBUTTONUP, WM_SETTINGCHANGE, WNDCLASSEXW, WS_EX_NOACTIVATE,
@@ -157,7 +157,7 @@ impl StatusItem {
             match super::native::post_thread_message(self.thread_id, WM_QUIT, 0) {
                 Ok(()) => posted = true,
                 Err(error) => {
-                    crate::report_warning!("windows-tray", "cannot request tray shutdown: {error}")
+                    crate::report_error!("windows-tray", "cannot request tray shutdown: {error}")
                 }
             }
             self.thread_id = 0;
@@ -291,7 +291,7 @@ fn destroy_window(hwnd: HWND) {
         let _ = Shell_NotifyIconW(NIM_DELETE, &icon_data(hwnd));
     }
     if let Err(error) = super::native::OwnedWindow::new(hwnd).destroy() {
-        crate::report_warning!("windows-tray", "cannot destroy tray event window: {error}");
+        crate::report_error!("windows-tray", "cannot destroy tray event window: {error}");
     }
 }
 
@@ -460,14 +460,10 @@ fn show_menu(hwnd: HWND) {
             format!("cannot build tray menu: {error}"),
         );
     }
-    let mut point = POINT::default();
-    // SAFETY: `point` is a valid writable out-parameter.
-    if let Err(error) = unsafe { GetCursorPos(&mut point) } {
-        crate::app::logging::report_error(
-            "windows-tray",
-            format!("cannot position tray menu: {error}"),
-        );
-    }
+    let point = super::input::cursor_position().unwrap_or_else(|error| {
+        crate::app::logging::report_error("windows-tray", error);
+        crate::api::geometry::Point::new(0.0, 0.0)
+    });
     // SAFETY: `menu` and `hwnd` belong to this tray thread and remain live
     // throughout the modal call; no Rust pointer is retained.
     let (previous_foreground, command) = unsafe {
@@ -476,8 +472,8 @@ fn show_menu(hwnd: HWND) {
         let command = TrackPopupMenu(
             menu,
             TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_BOTTOMALIGN,
-            point.x,
-            point.y,
+            point.x.round() as i32,
+            point.y.round() as i32,
             None,
             hwnd,
             None,
@@ -488,7 +484,7 @@ fn show_menu(hwnd: HWND) {
     // through this cleanup; the foreground HWND is only compared/restored.
     unsafe {
         if let Err(error) = DestroyMenu(menu) {
-            crate::report_warning!("windows-tray", "cannot destroy tray menu: {error}");
+            crate::report_error!("windows-tray", "cannot destroy tray menu: {error}");
         }
         let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
         if !previous_foreground.is_invalid() && GetForegroundWindow() == hwnd {

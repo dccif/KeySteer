@@ -60,6 +60,7 @@ struct State {
     capture: Option<CaptureGate>,
     phase: OverlayPhase,
     alive: bool,
+    wake_pending: bool,
 }
 
 impl Default for State {
@@ -71,6 +72,7 @@ impl Default for State {
             capture: None,
             phase: OverlayPhase::Normal,
             alive: true,
+            wake_pending: false,
         }
     }
 }
@@ -78,6 +80,19 @@ impl Default for State {
 #[derive(Default)]
 struct Shared {
     state: Mutex<State>,
+}
+
+fn mark_wake_pending(state: &mut State) -> Result<bool, String> {
+    if !state.alive {
+        return Err("Windows overlay renderer has already stopped".into());
+    }
+    if state.wake_pending
+        || (state.control.is_none() && state.latest.is_none() && state.positions.is_none())
+    {
+        return Ok(false);
+    }
+    state.wake_pending = true;
+    Ok(true)
 }
 
 pub(super) struct OverlayWorker {
@@ -89,6 +104,7 @@ pub(super) struct OverlayWorker {
 /// A generation-scoped permit which keeps overlay frames off-screen until the
 /// vision worker has copied the desktop pixels. Dropping a stale lease can
 /// never release a newer generation.
+#[must_use = "the capture gate remains hidden until this generation lease is released"]
 pub(super) struct CaptureLease {
     shared: Arc<Shared>,
     thread_id: u32,
@@ -158,11 +174,17 @@ impl CaptureLease {
                 state.positions = gate.deferred_positions;
             }
             state.phase = OverlayPhase::Normal;
-            state.alive && (state.latest.is_some() || state.positions.is_some())
+            mark_wake_pending(&mut state)?
         };
-        if should_wake {
-            native::post_thread_wake(self.thread_id, RENDER_WAKE_MESSAGE)
-                .map_err(|error| format!("cannot wake Windows overlay renderer: {error}"))?;
+        if should_wake
+            && let Err(error) = native::post_thread_wake(self.thread_id, RENDER_WAKE_MESSAGE)
+        {
+            self.shared
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .wake_pending = false;
+            return Err(format!("cannot wake Windows overlay renderer: {error}"));
         }
         Ok(())
     }
@@ -208,7 +230,7 @@ impl OverlayWorker {
         area: Rect,
         scale: f64,
     ) -> Result<(), String> {
-        {
+        let should_wake = {
             let mut state = self
                 .shared
                 .state
@@ -222,8 +244,9 @@ impl OverlayWorker {
             }
             state.latest = Some(frame);
             state.positions = None;
-        }
-        self.wake_renderer()
+            mark_wake_pending(&mut state)?
+        };
+        self.post_wake(should_wake)
     }
 
     /// Coalesce dynamic positions independently from complete frames.
@@ -232,7 +255,7 @@ impl OverlayWorker {
         cursor: Option<Point>,
         indicator: Option<Point>,
     ) -> Result<(), String> {
-        {
+        let should_wake = {
             let mut state = self
                 .shared
                 .state
@@ -244,8 +267,9 @@ impl OverlayWorker {
                 return Ok(());
             }
             state.positions = Some(positions);
-        }
-        self.wake_renderer()
+            mark_wake_pending(&mut state)?
+        };
+        self.post_wake(should_wake)
     }
 
     pub(super) fn dismiss(&self) -> Result<(), String> {
@@ -262,7 +286,8 @@ impl OverlayWorker {
             return Err("Windows overlay renderer is not running".into());
         }
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        {
+        crate::app::perf_probe::mark("capture_gate_started");
+        let should_wake = {
             let mut state = self
                 .shared
                 .state
@@ -286,8 +311,9 @@ impl OverlayWorker {
             });
             state.phase = OverlayPhase::HidingForCapture(generation);
             state.control = Some(Control::BeginCapture(generation));
-        }
-        if let Err(error) = self.wake_renderer() {
+            mark_wake_pending(&mut state)?
+        };
+        if let Err(error) = self.post_wake(should_wake) {
             cancel_capture(&self.shared, generation, &error);
             return Err(error);
         }
@@ -305,7 +331,7 @@ impl OverlayWorker {
         make: impl FnOnce(SyncSender<Result<(), String>>) -> Control,
     ) -> Result<(), String> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        {
+        let should_wake = {
             let mut state = self
                 .shared
                 .state
@@ -321,25 +347,27 @@ impl OverlayWorker {
                 OverlayPhase::Normal
             };
             state.control = Some(control);
-        }
-        self.wake_renderer()?;
+            mark_wake_pending(&mut state)?
+        };
+        self.post_wake(should_wake)?;
         reply_rx
             .recv_timeout(CONTROL_TIMEOUT)
             .map_err(|error| format!("Windows overlay renderer did not reply: {error}"))?
     }
 
-    fn wake_renderer(&self) -> Result<(), String> {
-        let alive = self
-            .shared
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .alive;
-        if !alive {
-            return Err("Windows overlay renderer has already stopped".into());
+    fn post_wake(&self, should_wake: bool) -> Result<(), String> {
+        if !should_wake {
+            return Ok(());
         }
-        native::post_thread_wake(self.thread_id, RENDER_WAKE_MESSAGE)
-            .map_err(|error| format!("cannot wake Windows overlay renderer: {error}"))
+        if let Err(error) = native::post_thread_wake(self.thread_id, RENDER_WAKE_MESSAGE) {
+            self.shared
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .wake_pending = false;
+            return Err(format!("cannot wake Windows overlay renderer: {error}"));
+        }
+        Ok(())
     }
 
     fn stop(&mut self) -> Result<(), String> {
@@ -390,6 +418,7 @@ fn render_loop(shared: &Shared, events: &EventSender, ready: SyncSender<u32>) {
                 .state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
+            state.wake_pending = false;
             (
                 state.control.take(),
                 state.latest.take(),
@@ -611,6 +640,10 @@ impl AdaptiveRenderer {
     }
 
     fn dismiss_for_capture(&mut self) -> Result<(), String> {
+        // GPU dismiss only queues the tree removal. DwmFlush is the one
+        // compositor barrier for capture and confirms that the removed tree is
+        // no longer part of the desktop frame. CPU dismiss destroys its HWND
+        // synchronously, then uses the same barrier for a common ACK contract.
         self.dismiss()?;
         native::wait_for_dwm_frame()
             .map_err(|error| format!("DWM did not confirm the hidden overlay frame: {error}"))
@@ -669,6 +702,7 @@ fn mark_renderer_stopped(shared: &Shared, reason: &str) {
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     state.alive = false;
+    state.wake_pending = false;
     state.phase = OverlayPhase::Stopping;
     cancel_capture_locked(&mut state, reason);
 }
@@ -748,7 +782,7 @@ mod tests {
         let area = Rect::new(0.0, 0.0, 32.0, 32.0);
         {
             let mut state = shared.state.lock().expect("capture state");
-            state.alive = false;
+            state.wake_pending = true;
             state.capture = Some(CaptureGate {
                 generation: 7,
                 ready: None,
@@ -779,6 +813,24 @@ mod tests {
             Some(Point::new(9.0, 10.0))
         );
         assert_eq!(state.phase, OverlayPhase::Normal);
+    }
+
+    #[test]
+    fn position_burst_requires_one_wake_and_keeps_only_the_last_value() {
+        let mut state = State::default();
+        let mut wakes = 0;
+        for index in 0..8_000 {
+            state.positions = Some(Positions {
+                cursor: Some(Point::new(index as f64, 1.0)),
+                indicator: None,
+            });
+            wakes += usize::from(mark_wake_pending(&mut state).expect("live renderer"));
+        }
+        assert_eq!(wakes, 1);
+        assert_eq!(
+            state.positions.and_then(|positions| positions.cursor),
+            Some(Point::new(7_999.0, 1.0))
+        );
     }
 
     #[test]

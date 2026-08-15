@@ -1,11 +1,14 @@
 //! Optional, auto-discovered WeChat OCR bridge isolated in a helper process.
 
 use std::ffi::CString;
-use std::fs::{File, Metadata};
+use std::fs::{File, Metadata, OpenOptions};
 use std::io::{Read, Write};
+use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -18,13 +21,14 @@ use windows::Storage::Streams::IRandomAccessStream;
 use crate::api::geometry::{Rect, UiTarget};
 use crate::app::worker::WorkerJoin;
 
-use super::vision::{CapturedImage, image_to_desktop, valid_target_rect};
+use super::vision::{CaptureGeometry, image_to_desktop, valid_target_rect};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
 const MAX_MESSAGE: usize = 8 * 1024 * 1024;
 const READY_TIMEOUT: Duration = Duration::from_secs(3);
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static STALE_TEMP_CLEANUP: OnceLock<()> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub(crate) struct HelperPaths {
@@ -133,16 +137,20 @@ pub(super) struct WechatOcr {
 }
 
 impl WechatOcr {
-    pub(super) fn start(descriptor: &WechatDescriptor) -> Result<Self, String> {
+    pub(super) fn start(
+        descriptor: &WechatDescriptor,
+        deadline: Instant,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<Self, String> {
         descriptor.validate()?;
         Ok(Self {
-            helper: Some(Helper::start(&descriptor.paths)?),
+            helper: Some(Helper::start(&descriptor.paths, deadline, cancelled)?),
         })
     }
 
     pub(super) fn recognize(
         &mut self,
-        image: &CapturedImage,
+        image: CaptureGeometry,
         bitmap: &SoftwareBitmap,
         timeout: Duration,
         minimum_confidence: f64,
@@ -160,7 +168,13 @@ impl WechatOcr {
             .as_mut()
             .ok_or_else(|| "WeChat OCR helper is unavailable".to_string())?
             .request(&temporary.path, timeout, &cancelled);
-        let helper_cleanup = self.helper.as_mut().map_or(Ok(()), Helper::shutdown);
+        let helper_cleanup = self.helper.as_mut().map_or(Ok(()), |helper| {
+            if response.is_ok() {
+                helper.shutdown()
+            } else {
+                helper.shutdown_immediate()
+            }
+        });
         let cleanup = temporary.cleanup();
         let mut result =
             response.and_then(|response| parse_response(&response, image, minimum_confidence));
@@ -192,6 +206,7 @@ impl Drop for WechatOcr {
 
 struct Helper {
     child: Child,
+    job: Option<super::native::KillOnCloseJob>,
     input: Option<ChildStdin>,
     responses: mpsc::Receiver<Result<Vec<u8>, String>>,
     reader: Option<WorkerJoin>,
@@ -245,9 +260,14 @@ impl Drop for StartingChild {
 }
 
 impl Helper {
-    fn start(paths: &HelperPaths) -> Result<Self, String> {
+    fn start(
+        paths: &HelperPaths,
+        deadline: Instant,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<Self, String> {
         let executable = std::env::current_exe()
             .map_err(|error| format!("cannot locate KeySteer executable: {error}"))?;
+        let job = super::native::KillOnCloseJob::create()?;
         let child = Command::new(executable)
             .arg("--internal-wechat-ocr-helper")
             .arg(&paths.bridge)
@@ -260,6 +280,10 @@ impl Helper {
             .spawn()
             .map_err(|error| format!("cannot start hidden WeChat OCR helper: {error}"))?;
         let mut starting = StartingChild(Some(child));
+        let process = windows::Win32::Foundation::HANDLE(
+            starting.child()?.as_raw_handle().cast::<std::ffi::c_void>(),
+        );
+        job.assign(process)?;
         let input = starting
             .child()?
             .stdin
@@ -284,30 +308,45 @@ impl Helper {
         )?;
         let mut helper = Self {
             child: starting.finish()?,
+            job: Some(job),
             input: Some(input),
             responses,
             reader: Some(reader),
             stopped: false,
         };
-        match helper.responses.recv_timeout(READY_TIMEOUT) {
-            Ok(Ok(message)) if message == b"ready" => Ok(helper),
-            Ok(Ok(_)) => {
-                if let Err(error) = helper.shutdown() {
+        let ready_deadline = deadline.min(Instant::now() + READY_TIMEOUT);
+        let ready = loop {
+            if cancelled() {
+                break Err("WeChat OCR helper readiness cancelled".to_string());
+            }
+            let remaining = ready_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break Err("WeChat OCR helper readiness timed out".to_string());
+            }
+            match helper
+                .responses
+                .recv_timeout(remaining.min(Duration::from_millis(10)))
+            {
+                Ok(result) => break result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break Err("WeChat OCR helper closed its readiness pipe".into());
+                }
+            }
+        };
+        match ready {
+            Ok(message) if message == b"ready" => Ok(helper),
+            Ok(_) => {
+                if let Err(error) = helper.shutdown_immediate() {
                     crate::app::logging::report_error("windows-vision", error);
                 }
                 Err("WeChat OCR helper returned an invalid readiness frame".into())
             }
-            Ok(Err(error)) => {
-                if let Err(cleanup) = helper.shutdown() {
+            Err(error) => {
+                if let Err(cleanup) = helper.shutdown_immediate() {
                     crate::app::logging::report_error("windows-vision", cleanup);
                 }
                 Err(error)
-            }
-            Err(error) => {
-                if let Err(cleanup) = helper.shutdown() {
-                    crate::app::logging::report_error("windows-vision", cleanup);
-                }
-                Err(format!("WeChat OCR helper readiness timed out: {error}"))
             }
         }
     }
@@ -348,16 +387,31 @@ impl Helper {
     }
 
     fn shutdown(&mut self) -> Result<(), String> {
+        self.shutdown_with_mode(true)
+    }
+
+    fn shutdown_immediate(&mut self) -> Result<(), String> {
+        self.shutdown_with_mode(false)
+    }
+
+    fn shutdown_with_mode(&mut self, graceful: bool) -> Result<(), String> {
         if self.stopped {
             return Ok(());
         }
-        let mut first_error = None;
-        if let Some(mut input) = self.input.take()
+        let mut failures = Vec::new();
+        if graceful
+            && let Some(mut input) = self.input.take()
             && let Err(error) = write_frame(&mut input, &[])
         {
-            first_error = Some(error);
+            failures.push(error);
         }
-        let deadline = Instant::now() + Duration::from_millis(250);
+        self.input.take();
+        let deadline = Instant::now()
+            + if graceful {
+                Duration::from_millis(250)
+            } else {
+                Duration::ZERO
+            };
         let mut exited = false;
         while Instant::now() < deadline {
             match self.child.try_wait() {
@@ -367,9 +421,7 @@ impl Helper {
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(5)),
                 Err(error) => {
-                    first_error.get_or_insert_with(|| {
-                        format!("cannot query WeChat OCR helper state: {error}")
-                    });
+                    failures.push(format!("cannot query WeChat OCR helper state: {error}"));
                     break;
                 }
             }
@@ -379,29 +431,35 @@ impl Helper {
                 Ok(()) => true,
                 Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => true,
                 Err(error) => {
-                    first_error.get_or_insert_with(|| {
-                        format!("cannot terminate WeChat OCR helper: {error}")
-                    });
+                    failures.push(format!("cannot terminate WeChat OCR helper: {error}"));
+                    // Closing a kill-on-close job is the final bounded
+                    // termination path when Child::kill itself fails.
+                    self.job.take();
                     false
                 }
             };
             if can_wait && let Err(error) = self.child.wait() {
-                first_error
-                    .get_or_insert_with(|| format!("cannot wait for WeChat OCR helper: {error}"));
+                failures.push(format!("cannot wait for WeChat OCR helper: {error}"));
             }
         }
         if let Some(reader) = self.reader.as_mut() {
-            match reader.join_timeout(Duration::from_secs(2)) {
+            match reader.join_timeout(Duration::from_millis(500)) {
                 Ok(()) => {
                     self.reader.take();
                 }
                 Err(error) => {
-                    first_error.get_or_insert(error);
+                    failures.push(error);
                 }
             }
         }
         self.stopped = self.reader.is_none();
-        first_error.map_or(Ok(()), Err)
+        if self.stopped {
+            self.job.take();
+        }
+        failures
+            .is_empty()
+            .then_some(())
+            .ok_or_else(|| failures.join("; "))
     }
 }
 
@@ -443,35 +501,63 @@ fn read_frame(reader: &mut impl Read) -> Result<Vec<u8>, String> {
 }
 
 struct TemporaryPng {
+    directory: PathBuf,
     path: PathBuf,
+    owner_path: PathBuf,
+    owner: Option<File>,
     removed: bool,
 }
 
 impl TemporaryPng {
     fn create(bitmap: &SoftwareBitmap) -> Result<Self, String> {
+        STALE_TEMP_CLEANUP.get_or_init(cleanup_stale_temporary_directories);
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "keysteer-ocr-{}-{sequence}.png",
-            std::process::id()
-        ));
-        if let Err(error) = encode_png(bitmap, &path) {
-            if let Err(cleanup) = std::fs::remove_file(&path)
-                && cleanup.kind() != std::io::ErrorKind::NotFound
-            {
-                crate::app::logging::report_error(
-                    "windows-vision",
-                    format!(
-                        "cannot remove incomplete temporary OCR image {}: {cleanup}",
-                        path.display()
-                    ),
-                );
+        let directory =
+            std::env::temp_dir().join(format!("keysteer-ocr-{}-{sequence}", std::process::id()));
+        std::fs::create_dir(&directory).map_err(|error| {
+            format!(
+                "cannot create private OCR directory {}: {error}",
+                directory.display()
+            )
+        })?;
+        let owner_path = directory.join(".owner");
+        let owner = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .share_mode(0)
+            .open(&owner_path)
+        {
+            Ok(owner) => owner,
+            Err(error) => {
+                if let Err(cleanup) = std::fs::remove_dir(&directory) {
+                    crate::app::logging::report_error(
+                        "windows-vision",
+                        format!(
+                            "cannot remove unlocked OCR directory {}: {cleanup}",
+                            directory.display()
+                        ),
+                    );
+                }
+                return Err(format!("cannot lock private OCR directory: {error}"));
             }
+        };
+        let path = directory.join("frame.png");
+        let mut temporary = Self {
+            directory,
+            path,
+            owner_path,
+            owner: Some(owner),
+            removed: false,
+        };
+        if let Err(error) = encode_png(bitmap, &temporary.path) {
+            if let Err(cleanup) = temporary.remove() {
+                crate::app::logging::report_error("windows-vision", cleanup);
+            }
+            temporary.removed = true;
             return Err(error);
         }
-        Ok(Self {
-            path,
-            removed: false,
-        })
+        Ok(temporary)
     }
 
     fn cleanup(mut self) -> Result<(), String> {
@@ -484,19 +570,79 @@ impl TemporaryPng {
         if self.removed {
             return Ok(());
         }
-        match std::fs::remove_file(&self.path) {
-            Ok(()) => {
-                self.removed = true;
-                Ok(())
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                self.removed = true;
-                Ok(())
-            }
-            Err(error) => Err(format!(
-                "cannot remove temporary OCR image {}: {error}",
-                self.path.display()
-            )),
+        let mut failures = Vec::new();
+        remove_known_file(&self.path, &mut failures);
+        self.owner.take();
+        remove_known_file(&self.owner_path, &mut failures);
+        if let Err(error) = std::fs::remove_dir(&self.directory)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            failures.push(format!(
+                "cannot remove private OCR directory {}: {error}",
+                self.directory.display()
+            ));
+        }
+        self.removed = failures.is_empty();
+        failures
+            .is_empty()
+            .then_some(())
+            .ok_or_else(|| failures.join("; "))
+    }
+}
+
+fn remove_known_file(path: &Path, failures: &mut Vec<String>) {
+    if let Err(error) = std::fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        failures.push(format!("cannot remove {}: {error}", path.display()));
+    }
+}
+
+fn cleanup_stale_temporary_directories() {
+    let root = std::env::temp_dir();
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+    let Ok(entries) = root.read_dir() else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("keysteer-ocr-")
+            || !entry.file_type().is_ok_and(|kind| kind.is_dir())
+        {
+            continue;
+        }
+        let directory = entry.path();
+        let safely_scoped = directory
+            .canonicalize()
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .is_some_and(|parent| parent == canonical_root);
+        if !safely_scoped {
+            continue;
+        }
+        let owner_path = directory.join(".owner");
+        let Ok(owner) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&owner_path)
+        else {
+            continue;
+        };
+        drop(owner);
+        let mut failures = Vec::new();
+        remove_known_file(&directory.join("frame.png"), &mut failures);
+        remove_known_file(&owner_path, &mut failures);
+        if let Err(error) = std::fs::remove_dir(&directory)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            failures.push(format!(
+                "cannot remove stale OCR directory {}: {error}",
+                directory.display()
+            ));
+        }
+        for failure in failures {
+            crate::report_warning!("windows-vision", "{failure}");
         }
     }
 }
@@ -545,6 +691,8 @@ struct WechatResponse {
     #[serde(default)]
     errcode: i64,
     #[serde(default)]
+    errmsg: Option<String>,
+    #[serde(default)]
     ocr_response: Vec<WechatItem>,
 }
 
@@ -566,39 +714,42 @@ fn default_confidence() -> f64 {
 
 fn parse_response(
     value: &[u8],
-    image: &CapturedImage,
+    image: CaptureGeometry,
     minimum_confidence: f64,
 ) -> Result<Vec<UiTarget>, String> {
     let response: WechatResponse = serde_json::from_slice(value)
         .map_err(|error| format!("invalid WeChat OCR JSON: {error}"))?;
     if response.errcode != 0 {
-        return Err(format!("WeChat OCR returned error {}", response.errcode));
+        return Err(response.errmsg.map_or_else(
+            || format!("WeChat OCR returned error {}", response.errcode),
+            |message| format!("WeChat OCR returned error {}: {message}", response.errcode),
+        ));
     }
-    let targets = response
-        .ocr_response
-        .into_iter()
-        .filter_map(|item| {
-            let text = item.text.trim();
-            let rect = image_to_desktop(
-                image,
-                Rect::new(
-                    item.left,
-                    item.top,
-                    item.right - item.left,
-                    item.bottom - item.top,
-                ),
-            );
-            (!text.is_empty()
-                && item.rate >= minimum_confidence
-                && valid_target_rect(rect, image.desktop_bounds))
-            .then(|| UiTarget {
+    let mut targets = Vec::with_capacity(response.ocr_response.len().min(2_000));
+    for mut item in response.ocr_response {
+        super::vision::trim_string_in_place(&mut item.text);
+        let rect = image_to_desktop(
+            image,
+            Rect::new(
+                item.left,
+                item.top,
+                item.right - item.left,
+                item.bottom - item.top,
+            ),
+        );
+        if !item.text.is_empty()
+            && item.rate >= minimum_confidence
+            && valid_target_rect(rect, image.desktop_bounds)
+            && targets.len() < 2_000
+        {
+            targets.push(UiTarget {
                 rect,
-                name: text.to_string(),
+                name: item.text,
                 role: "static_text".into(),
                 native_role: Some("vision:wechat-ocr".into()),
-            })
-        })
-        .collect();
+            });
+        }
+    }
     Ok(merge_text_lines(targets))
 }
 
@@ -832,7 +983,15 @@ pub(crate) fn run_helper(paths: HelperPaths) -> Result<(), String> {
             .map_err(|_| "temporary OCR path contains an interior NUL".to_string())?;
         match bridge.recognize(&paths.component, &paths.runtime, &path) {
             Ok(value) => write_frame(&mut output, &value)?,
-            Err(_) => write_frame(&mut output, br#"{"errcode":-1,"ocr_response":[]}"#)?,
+            Err(error) => {
+                let response = serde_json::to_vec(&serde_json::json!({
+                    "errcode": -1,
+                    "errmsg": error,
+                    "ocr_response": [],
+                }))
+                .map_err(|error| format!("cannot encode helper error response: {error}"))?;
+                write_frame(&mut output, &response)?;
+            }
         }
     }
     Ok(())
@@ -865,8 +1024,7 @@ mod tests {
 
     #[test]
     fn parses_and_maps_wechat_results() {
-        let image = CapturedImage {
-            pixels: Vec::new(),
+        let image = CaptureGeometry {
             width: 100,
             height: 100,
             desktop_bounds: Rect::new(-100.0, 20.0, 200.0, 200.0),
@@ -875,7 +1033,7 @@ mod tests {
         let targets = parse_response(
             r#"{"errcode":0,"ocr_response":[{"left":10,"top":5,"right":30,"bottom":15,"text":"确定"}]}"#
                 .as_bytes(),
-            &image,
+            image,
             0.0,
         )
         .unwrap();
@@ -912,14 +1070,22 @@ mod tests {
 
     #[test]
     fn temporary_png_owner_removes_its_file_idempotently() {
-        let path = test_path("ocr-image");
+        let directory = test_path("ocr-image");
+        std::fs::create_dir(&directory).unwrap();
+        let owner_path = directory.join(".owner");
+        let owner = File::create(&owner_path).unwrap();
+        let path = directory.join("frame.png");
         std::fs::write(&path, b"png").unwrap();
         let mut temporary = TemporaryPng {
+            directory: directory.clone(),
             path: path.clone(),
+            owner_path,
+            owner: Some(owner),
             removed: false,
         };
         temporary.remove().unwrap();
         temporary.remove().unwrap();
         assert!(!path.exists());
+        assert!(!directory.exists());
     }
 }

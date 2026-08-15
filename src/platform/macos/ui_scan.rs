@@ -285,7 +285,7 @@ fn run_scan(job: ScanJob) {
                 .unwrap_or_else(|_| UiScanStatus::Failed("AX scan worker panicked".into()));
             combined_status(ax_status, vision_status)
         }),
-        (false, false) => unreachable!("every UI scan strategy has a source"),
+        (false, false) => UiScanStatus::Failed("UI scan strategy has no enabled source".into()),
     };
 
     let status = if scan_is_current(job.generation, pid) {

@@ -352,7 +352,8 @@ impl HintMode {
             | UiScanStatus::Unsupported(message)
             | UiScanStatus::Failed(message) => Some(format!("{message} — Esc to exit")),
             UiScanStatus::TimedOut => Some("UI scan timed out — Esc to exit".into()),
-            UiScanStatus::Partial | UiScanStatus::ContextChanged => unreachable!(),
+            UiScanStatus::Partial => self.status.clone(),
+            UiScanStatus::ContextChanged => Some("Focused window changed - Esc to exit".into()),
         };
         if self.hints.is_empty() {
             return self.status_scene(ctx);

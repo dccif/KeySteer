@@ -1,5 +1,7 @@
 //! Display enumeration via `EnumDisplayMonitors`, DPI-aware.
 
+use std::cell::RefCell;
+
 use windows::Win32::Foundation::{LPARAM, RECT, TRUE};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
@@ -32,41 +34,28 @@ fn rect_to_api(r: RECT) -> Rect {
     Rect::new(r.left as f64, r.top as f64, width as f64, height as f64)
 }
 
-/// Collects monitors during enumeration.
-struct Collector {
-    screens: Vec<Screen>,
+thread_local! {
+    static SCREENS: RefCell<Vec<Screen>> = const { RefCell::new(Vec::new()) };
 }
 
 pub fn list_screens() -> Result<Vec<Screen>, String> {
-    let mut collector = Collector {
-        screens: Vec::new(),
-    };
+    SCREENS.with_borrow_mut(Vec::clear);
 
     // SAFETY: the callback matches the expected signature and the pointer we
     // pass stays valid for the duration of the call.
-    unsafe {
-        EnumDisplayMonitors(
-            None,
-            None,
-            Some(enum_callback),
-            LPARAM(&mut collector as *mut Collector as isize),
-        )
-    }
-    .ok()
-    .map_err(|e| format!("EnumDisplayMonitors failed: {e}"))?;
+    unsafe { EnumDisplayMonitors(None, None, Some(enum_callback), LPARAM(0)) }
+        .ok()
+        .map_err(|e| format!("EnumDisplayMonitors failed: {e}"))?;
 
-    Ok(collector.screens)
+    Ok(SCREENS.with_borrow_mut(std::mem::take))
 }
 
-unsafe extern "system" fn enum_callback(
+extern "system" fn enum_callback(
     monitor: HMONITOR,
     _hdc: HDC,
     _rect: *mut RECT,
-    data: LPARAM,
+    _data: LPARAM,
 ) -> BOOL {
-    // SAFETY: `data` is the collector pointer supplied to EnumDisplayMonitors.
-    let collector = unsafe { &mut *(data.0 as *mut Collector) };
-
     let mut info = MONITORINFOEXW {
         monitorInfo: MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
@@ -104,16 +93,18 @@ unsafe extern "system" fn enum_callback(
         );
     }
 
-    collector.screens.push(Screen {
-        bounds: rect_to_api(info.monitorInfo.rcMonitor),
-        work_area: rect_to_api(info.monitorInfo.rcWork),
-        is_primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
-        scale: dpi_x as f64 / 96.0,
-        name: Some(
-            String::from_utf16_lossy(&info.szDevice)
-                .trim_end_matches('\0')
-                .to_string(),
-        ),
+    SCREENS.with_borrow_mut(|screens| {
+        screens.push(Screen {
+            bounds: rect_to_api(info.monitorInfo.rcMonitor),
+            work_area: rect_to_api(info.monitorInfo.rcWork),
+            is_primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
+            scale: dpi_x as f64 / 96.0,
+            name: Some(
+                String::from_utf16_lossy(&info.szDevice)
+                    .trim_end_matches('\0')
+                    .to_string(),
+            ),
+        })
     });
     TRUE
 }

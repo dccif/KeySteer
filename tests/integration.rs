@@ -402,3 +402,29 @@ fn every_mode_has_a_binding_table_including_plugins() {
     assert!(config.bindings_for("plugin:screen-selector").is_some());
     config.validate().unwrap();
 }
+
+#[test]
+fn windows_visual_capture_keeps_one_barrier_and_an_unscaled_copy_path() {
+    let gpu = include_str!("../src/platform/windows/gpu_overlay.rs");
+    let worker = include_str!("../src/platform/windows/overlay_worker.rs");
+    let native = include_str!("../src/platform/windows/native/mod.rs");
+
+    assert!(
+        !gpu.contains("WaitForCommitCompletion"),
+        "ordinary overlay dismiss must not wait for the compositor"
+    );
+    assert_eq!(
+        worker.matches("native::wait_for_dwm_frame()").count(),
+        1,
+        "capture must have exactly one explicit DWM barrier"
+    );
+    assert!(
+        native.contains("BitBlt(") && native.contains("StretchBlt("),
+        "capture must retain separate unscaled and scaled GDI paths"
+    );
+    assert!(
+        native.contains("source_width == self.dimensions.width_i32()")
+            && native.contains("source_height == self.dimensions.height_i32()"),
+        "the BitBlt path must be restricted to exact-size copies"
+    );
+}

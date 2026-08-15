@@ -333,7 +333,7 @@ impl Drop for OwnedHook {
         // this non-Send guard remains on the installing thread, and Drop is
         // the only unhook path.
         if let Err(error) = unsafe { UnhookWindowsHookEx(self.raw) } {
-            crate::report_warning!("windows-hook", "cannot remove hook: {error}");
+            crate::report_error!("windows-hook", "cannot remove hook: {error}");
         }
     }
 }

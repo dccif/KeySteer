@@ -95,7 +95,7 @@ impl EventSender {
         if self.wake_thread != 0
             && let Err(error) = native::post_thread_wake(self.wake_thread, WAKE_MESSAGE)
         {
-            crate::report_warning!(
+            crate::report_error!(
                 "windows-events",
                 "cannot wake engine for asynchronous event: {error}"
             );
@@ -264,13 +264,13 @@ impl WindowsBackend {
     }
 
     fn try_event(&mut self) -> Result<Option<BackendEvent>, String> {
-        self.vision.begin_discovery();
-        self.vision.reap_finished();
         // Synchronous hook callbacks are blocked waiting for disposition, so
         // physical input must outrank scans, tray events and frame clocks.
         if let Some(event) = self.next_hook_event()? {
             return Ok(Some(event));
         }
+        self.vision.begin_discovery();
+        self.vision.reap_finished();
         if let Some(event) = self.pending.pop_front() {
             return Ok(Some(event));
         }

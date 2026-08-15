@@ -4,6 +4,7 @@
 //! deliberately incremental: usable targets are published before the full tree
 //! has been visited, while input and tray handling remain responsive.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -58,7 +59,9 @@ fn request_call_cancellation(thread_id: u32) {
         // SAFETY: `thread_id` belongs to the live worker thread, which enabled
         // COM call cancellation before accepting jobs. A zero-second timeout
         // requests cancellation without blocking the engine thread.
-        let _ = unsafe { CoCancelCall(thread_id, 0) };
+        if let Err(error) = unsafe { CoCancelCall(thread_id, 0) } {
+            crate::report_error!("windows-uia", "cannot cancel blocked UIA call: {error}");
+        }
     }
 }
 
@@ -257,7 +260,12 @@ impl Drop for ComApartment {
     fn drop(&mut self) {
         // SAFETY: this guard is dropped on the same thread that successfully
         // enabled COM call cancellation.
-        let _ = unsafe { CoDisableCallCancellation(None) };
+        if let Err(error) = unsafe { CoDisableCallCancellation(None) } {
+            crate::report_error!(
+                "windows-uia",
+                "cannot disable UIA call cancellation: {error}"
+            );
+        }
         // SAFETY: this balances the successful CoInitializeEx owned by this
         // thread-bound guard after all COM interfaces were dropped.
         unsafe { CoUninitialize() };
@@ -570,20 +578,19 @@ fn is_cloaked(hwnd: HWND) -> bool {
     .is_ok_and(|_| cloaked != 0)
 }
 
-struct MonitorCollector {
-    monitors: Vec<HMONITOR>,
+thread_local! {
+    static MONITOR_COLLECTOR: RefCell<Vec<HMONITOR>> = const { RefCell::new(Vec::new()) };
+    static THREAD_WINDOW_COLLECTOR: RefCell<Option<ThreadWindowCollector>> = const { RefCell::new(None) };
+    static Z_ORDER_COLLECTOR: RefCell<Option<ZOrderCollector>> = const { RefCell::new(None) };
 }
 
-unsafe extern "system" fn collect_monitor(
+extern "system" fn collect_monitor(
     monitor: HMONITOR,
     _dc: HDC,
     _rect: *mut RECT,
-    data: LPARAM,
+    _data: LPARAM,
 ) -> BOOL {
-    // SAFETY: EnumDisplayMonitors supplied the exact collector pointer passed
-    // by `monitors_intersecting`, valid for the callback duration.
-    let collector = unsafe { &mut *(data.0 as *mut MonitorCollector) };
-    collector.monitors.push(monitor);
+    MONITOR_COLLECTOR.with_borrow_mut(|monitors| monitors.push(monitor));
     BOOL(1)
 }
 
@@ -592,20 +599,13 @@ fn monitors_intersecting(hwnd: HWND) -> Vec<HMONITOR> {
         return Vec::new();
     };
     let clip = native_rect(bounds);
-    let mut collector = MonitorCollector {
-        monitors: Vec::new(),
-    };
+    MONITOR_COLLECTOR.with_borrow_mut(Vec::clear);
     // SAFETY: the callback ABI matches and the collector pointer remains valid
     // for the complete synchronous enumeration.
     unsafe {
-        let _ = EnumDisplayMonitors(
-            None,
-            Some(&clip),
-            Some(collect_monitor),
-            LPARAM((&mut collector as *mut MonitorCollector) as isize),
-        );
+        let _ = EnumDisplayMonitors(None, Some(&clip), Some(collect_monitor), LPARAM(0));
     };
-    collector.monitors
+    MONITOR_COLLECTOR.with_borrow_mut(std::mem::take)
 }
 
 fn is_owned_by(mut hwnd: HWND, foreground: HWND) -> bool {
@@ -641,54 +641,55 @@ struct ThreadWindowCollector {
     windows: Vec<HWND>,
 }
 
-unsafe extern "system" fn collect_thread_window(hwnd: HWND, data: LPARAM) -> BOOL {
-    // SAFETY: EnumThreadWindows supplied the exact collector pointer passed by
-    // `foreground_and_popup_windows`, valid for this callback only.
-    let collector = unsafe { &mut *(data.0 as *mut ThreadWindowCollector) };
-    if hwnd == collector.foreground
-        || !super::native::is_window_visible(hwnd)
-        || super::native::is_window_iconic(hwnd)
-        || is_cloaked(hwnd)
-    {
-        return BOOL(1);
-    }
+extern "system" fn collect_thread_window(hwnd: HWND, _data: LPARAM) -> BOOL {
+    THREAD_WINDOW_COLLECTOR.with_borrow_mut(|slot| {
+        let Some(collector) = slot.as_mut() else {
+            return BOOL(0);
+        };
+        if hwnd == collector.foreground
+            || !super::native::is_window_visible(hwnd)
+            || super::native::is_window_iconic(hwnd)
+            || is_cloaked(hwnd)
+        {
+            return BOOL(1);
+        }
 
-    let has_popup_style = super::native::window_long(hwnd, GWL_STYLE) as u32 & WS_POPUP.0 != 0;
-    let owned = is_owned_by(hwnd, collector.foreground);
-    let shares_monitor = window_bounds(hwnd).is_some_and(|bounds| {
-        let rect = native_rect(bounds);
-        // SAFETY: `rect` is initialized and lives for the synchronous monitor
-        // lookup; the returned HMONITOR is borrowed.
-        let monitor = unsafe { MonitorFromRect(&rect, MONITOR_DEFAULTTONULL) };
-        !monitor.is_invalid() && collector.foreground_monitors.contains(&monitor)
-    });
-    if collector.windows.len() < MAX_SCAN_WINDOWS
-        && popup_relationship_is_scannable(has_popup_style, owned, shares_monitor)
-    {
-        collector.windows.push(hwnd);
-    }
-    BOOL(1)
+        let has_popup_style = super::native::window_long(hwnd, GWL_STYLE) as u32 & WS_POPUP.0 != 0;
+        let owned = is_owned_by(hwnd, collector.foreground);
+        let shares_monitor = window_bounds(hwnd).is_some_and(|bounds| {
+            let rect = native_rect(bounds);
+            // SAFETY: `rect` is initialized and lives for the synchronous monitor
+            // lookup; the returned HMONITOR is borrowed.
+            let monitor = unsafe { MonitorFromRect(&rect, MONITOR_DEFAULTTONULL) };
+            !monitor.is_invalid() && collector.foreground_monitors.contains(&monitor)
+        });
+        if collector.windows.len() < MAX_SCAN_WINDOWS
+            && popup_relationship_is_scannable(has_popup_style, owned, shares_monitor)
+        {
+            collector.windows.push(hwnd);
+        }
+        BOOL(1)
+    })
 }
 
 fn foreground_and_popup_windows(foreground: HWND) -> Vec<HWND> {
-    let mut collector = ThreadWindowCollector {
+    let collector = ThreadWindowCollector {
         foreground,
         foreground_monitors: monitors_intersecting(foreground),
         windows: vec![foreground],
     };
+    THREAD_WINDOW_COLLECTOR.with_borrow_mut(|slot| *slot = Some(collector));
     let thread_id = super::native::window_thread_process_id(foreground, None);
     if thread_id != 0 {
         // SAFETY: callback ABI and collector pointer are valid for the complete
         // synchronous enumeration of this live UI thread.
         unsafe {
-            let _ = EnumThreadWindows(
-                thread_id,
-                Some(collect_thread_window),
-                LPARAM((&mut collector as *mut ThreadWindowCollector) as isize),
-            );
+            let _ = EnumThreadWindows(thread_id, Some(collect_thread_window), LPARAM(0));
         };
     }
-    collector.windows
+    THREAD_WINDOW_COLLECTOR
+        .with_borrow_mut(Option::take)
+        .map_or_else(Vec::new, |collector| collector.windows)
 }
 
 struct ZOrderCollector {
@@ -699,65 +700,67 @@ struct ZOrderCollector {
     occluders: Vec<Rect>,
 }
 
-unsafe extern "system" fn collect_z_order_window(hwnd: HWND, data: LPARAM) -> BOOL {
-    // SAFETY: EnumWindows supplied the exact collector pointer passed by
-    // `scan_windows_in_z_order`, valid for this callback only.
-    let collector = unsafe { &mut *(data.0 as *mut ZOrderCollector) };
-    if !super::native::is_window_visible(hwnd)
-        || super::native::is_window_iconic(hwnd)
-        || is_cloaked(hwnd)
-    {
-        return BOOL(1);
-    }
-    let click_through =
-        super::native::window_long(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TRANSPARENT.0 != 0;
-    if click_through {
-        return BOOL(1);
-    }
-    let Some(bounds) = window_bounds(hwnd) else {
-        return BOOL(1);
-    };
-    let Some(bounds_in_scan) = bounds.intersect(&collector.scan_bounds) else {
-        return BOOL(1);
-    };
+extern "system" fn collect_z_order_window(hwnd: HWND, _data: LPARAM) -> BOOL {
+    Z_ORDER_COLLECTOR.with_borrow_mut(|slot| {
+        let Some(collector) = slot.as_mut() else {
+            return BOOL(0);
+        };
+        if !super::native::is_window_visible(hwnd)
+            || super::native::is_window_iconic(hwnd)
+            || is_cloaked(hwnd)
+        {
+            return BOOL(1);
+        }
+        let click_through =
+            super::native::window_long(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TRANSPARENT.0 != 0;
+        if click_through {
+            return BOOL(1);
+        }
+        let Some(bounds) = window_bounds(hwnd) else {
+            return BOOL(1);
+        };
+        let Some(bounds_in_scan) = bounds.intersect(&collector.scan_bounds) else {
+            return BOOL(1);
+        };
 
-    let candidate = collector.candidates.contains(&hwnd);
-    if candidate {
-        collector.scan_windows.push(ScanWindow {
-            hwnd,
-            bounds: bounds_in_scan,
-            occluders: collector.occluders.clone(),
-        });
-    }
+        let candidate = collector.candidates.contains(&hwnd);
+        if candidate {
+            collector.scan_windows.push(ScanWindow {
+                hwnd,
+                bounds: bounds_in_scan,
+                occluders: collector.occluders.clone(),
+            });
+        }
 
-    let mut process_id = 0;
-    super::native::window_thread_process_id(hwnd, Some(&mut process_id));
-    // Our click-through overlay was already skipped above. Ignore any other
-    // helper/tray HWND owned by this process so it cannot hide application UI.
-    if candidate || process_id != collector.own_process_id {
-        collector.occluders.push(bounds_in_scan);
-    }
-    BOOL(1)
+        let mut process_id = 0;
+        super::native::window_thread_process_id(hwnd, Some(&mut process_id));
+        // Our click-through overlay was already skipped above. Ignore any other
+        // helper/tray HWND owned by this process so it cannot hide application UI.
+        if candidate || process_id != collector.own_process_id {
+            collector.occluders.push(bounds_in_scan);
+        }
+        BOOL(1)
+    })
 }
 
 fn scan_windows_in_z_order(foreground: HWND, scan_bounds: Rect) -> Result<Vec<ScanWindow>, String> {
     let candidates = foreground_and_popup_windows(foreground);
-    let mut collector = ZOrderCollector {
+    let collector = ZOrderCollector {
         candidates,
         scan_bounds,
         own_process_id: super::native::current_process_id(),
         scan_windows: Vec::new(),
         occluders: Vec::new(),
     };
+    Z_ORDER_COLLECTOR.with_borrow_mut(|slot| *slot = Some(collector));
     // SAFETY: callback ABI and collector pointer are valid for the complete
     // synchronous top-level enumeration.
-    unsafe {
-        EnumWindows(
-            Some(collect_z_order_window),
-            LPARAM((&mut collector as *mut ZOrderCollector) as isize),
-        )
-    }
-    .map_err(|error| format!("cannot enumerate top-level windows: {error}"))?;
+    let enumeration = unsafe { EnumWindows(Some(collect_z_order_window), LPARAM(0)) }
+        .map_err(|error| format!("cannot enumerate top-level windows: {error}"));
+    let collector = Z_ORDER_COLLECTOR
+        .with_borrow_mut(Option::take)
+        .ok_or_else(|| "top-level window collector disappeared".to_string())?;
+    enumeration?;
     Ok(collector.scan_windows)
 }
 

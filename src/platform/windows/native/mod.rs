@@ -11,6 +11,63 @@ use windows::Win32::Graphics::Gdi::{HBITMAP, HDC, HGDIOBJ};
 
 pub(crate) struct ComApartment(PhantomData<Rc<()>>);
 
+#[must_use = "closing the job is the fail-safe that terminates its helper process"]
+pub(crate) struct KillOnCloseJob(HANDLE);
+
+impl KillOnCloseJob {
+    pub(crate) fn create() -> Result<Self, String> {
+        use windows::Win32::System::JobObjects::{
+            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+
+        // SAFETY: no security attributes or name are supplied. The returned
+        // handle transfers immediately into the owner before configuration.
+        let job = Self(
+            unsafe { CreateJobObjectW(None, None) }
+                .map_err(|error| format!("cannot create WeChat OCR job object: {error}"))?,
+        );
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: the pointer and byte count describe the exact initialized
+        // information struct and remain valid for this synchronous call.
+        unsafe {
+            SetInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&limits).cast(),
+                std::mem::size_of_val(&limits) as u32,
+            )
+        }
+        .map_err(|error| format!("cannot configure WeChat OCR job object: {error}"))?;
+        Ok(job)
+    }
+
+    pub(crate) fn assign(&self, process: HANDLE) -> Result<(), String> {
+        use windows::Win32::System::JobObjects::AssignProcessToJobObject;
+
+        // SAFETY: both handles are live for the duration of this synchronous
+        // call; ownership of the process handle remains with `Child`.
+        unsafe { AssignProcessToJobObject(self.0, process) }
+            .map_err(|error| format!("cannot contain WeChat OCR helper in job object: {error}"))
+    }
+}
+
+impl Drop for KillOnCloseJob {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::CloseHandle;
+
+        // SAFETY: this owner holds the unique job handle returned at creation.
+        if let Err(error) = unsafe { CloseHandle(self.0) } {
+            crate::app::logging::report_error(
+                "windows-native",
+                format!("cannot close WeChat OCR job object: {error}"),
+            );
+        }
+    }
+}
+
 impl ComApartment {
     pub(crate) fn initialise() -> Result<Self, String> {
         use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
@@ -34,20 +91,15 @@ impl Drop for ComApartment {
     }
 }
 
-pub(crate) struct CapturedBgra {
-    pub(crate) pixels: Vec<u8>,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-}
-
 thread_local! {
-    static CAPTURE_SURFACE: RefCell<Option<CaptureSurface>> = const { RefCell::new(None) };
+    static CAPTURE_SURFACE: RefCell<Option<GdiDibSurface>> = const { RefCell::new(None) };
 }
 
-struct ScreenDc(HDC);
+#[must_use = "the desktop DC must be released on its acquiring thread"]
+pub(crate) struct ScreenDc(HDC);
 
 impl ScreenDc {
-    fn acquire() -> Result<Self, String> {
+    pub(crate) fn acquire() -> Result<Self, String> {
         use windows::Win32::Graphics::Gdi::GetDC;
 
         // SAFETY: a null HWND requests the desktop DC. This guard balances the
@@ -58,6 +110,10 @@ impl ScreenDc {
         } else {
             Ok(Self(dc))
         }
+    }
+
+    pub(crate) fn raw(&self) -> HDC {
+        self.0
     }
 }
 
@@ -75,7 +131,8 @@ impl Drop for ScreenDc {
     }
 }
 
-struct CaptureSurface {
+#[must_use = "the selected GDI bitmap and memory DC must be restored and released"]
+pub(crate) struct GdiDibSurface {
     memory: HDC,
     bitmap: HBITMAP,
     previous: HGDIOBJ,
@@ -84,8 +141,11 @@ struct CaptureSurface {
     _thread: PhantomData<Rc<()>>,
 }
 
-impl CaptureSurface {
-    fn new(screen: HDC, dimensions: NativeDimensions) -> Result<Self, String> {
+impl GdiDibSurface {
+    pub(crate) fn new(
+        reference: Option<HDC>,
+        dimensions: NativeDimensions,
+    ) -> Result<Self, String> {
         use windows::Win32::Graphics::Gdi::{
             BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection,
             DIB_RGB_COLORS, DeleteDC, DeleteObject, SelectObject,
@@ -108,24 +168,29 @@ impl CaptureSurface {
         // or are destroyed before returning an error. The selected top-down
         // DIB remains selected until Drop restores `previous`.
         unsafe {
-            let memory = CreateCompatibleDC(Some(screen));
+            let memory = CreateCompatibleDC(reference);
             if memory.is_invalid() {
                 return Err("CreateCompatibleDC failed".into());
             }
-            let bitmap =
-                match CreateDIBSection(Some(screen), &info, DIB_RGB_COLORS, &mut raw_bits, None, 0)
-                {
-                    Ok(bitmap) => bitmap,
-                    Err(error) => {
-                        if !DeleteDC(memory).as_bool() {
-                            crate::app::logging::report_error(
-                                "windows-native",
-                                "cannot delete failed GDI capture DC",
-                            );
-                        }
-                        return Err(format!("CreateDIBSection failed: {error}"));
+            let bitmap = match CreateDIBSection(
+                reference.or(Some(memory)),
+                &info,
+                DIB_RGB_COLORS,
+                &mut raw_bits,
+                None,
+                0,
+            ) {
+                Ok(bitmap) => bitmap,
+                Err(error) => {
+                    if !DeleteDC(memory).as_bool() {
+                        crate::app::logging::report_error(
+                            "windows-native",
+                            "cannot delete failed GDI capture DC",
+                        );
                     }
-                };
+                    return Err(format!("CreateDIBSection failed: {error}"));
+                }
+            };
             let Some(bits) = NonNull::new(raw_bits.cast::<u8>()) else {
                 if !DeleteObject(HGDIOBJ(bitmap.0)).as_bool() {
                     crate::app::logging::report_error(
@@ -168,54 +233,98 @@ impl CaptureSurface {
         }
     }
 
-    fn copy_from(
+    pub(crate) fn width(&self) -> usize {
+        self.dimensions.width_u32() as usize
+    }
+
+    pub(crate) fn height(&self) -> usize {
+        self.dimensions.height_u32() as usize
+    }
+
+    pub(crate) fn dc(&self) -> HDC {
+        self.memory
+    }
+
+    pub(crate) fn pixels(&self) -> &[u8] {
+        // SAFETY: the surface owns a non-null DIB allocation of the validated
+        // byte length, and the shared borrow prevents mutation.
+        unsafe { std::slice::from_raw_parts(self.bits.as_ptr(), self.dimensions.byte_len()) }
+    }
+
+    pub(crate) fn pixels_mut(&mut self) -> &mut [u8] {
+        // SAFETY: the surface uniquely owns the validated DIB allocation and
+        // `&mut self` prevents aliases for the returned lifetime.
+        unsafe { std::slice::from_raw_parts_mut(self.bits.as_ptr(), self.dimensions.byte_len()) }
+    }
+
+    fn copy_from<R>(
         &mut self,
         screen: HDC,
         source_x: i32,
         source_y: i32,
         source_width: i32,
         source_height: i32,
-    ) -> Result<CapturedBgra, String> {
+        consume: impl FnOnce(&[u8], u32, u32) -> Result<R, String>,
+    ) -> Result<R, String> {
         use windows::Win32::Graphics::Gdi::{
-            CAPTUREBLT, HALFTONE, SRCCOPY, SetStretchBltMode, StretchBlt,
+            BitBlt, CAPTUREBLT, HALFTONE, SRCCOPY, SetStretchBltMode, StretchBlt,
         };
 
-        // SAFETY: the cached DC owns a selected DIB of `dimensions`; StretchBlt
-        // completes before its validated bytes are copied into the result Vec.
+        let copy_without_scaling = source_width == self.dimensions.width_i32()
+            && source_height == self.dimensions.height_i32();
+        // SAFETY: the cached DC owns a selected DIB of `dimensions`; BitBlt or
+        // StretchBlt completes before a validated, temporary byte slice is
+        // exposed to the caller. The callback cannot retain the slice beyond
+        // this borrow.
         unsafe {
-            SetStretchBltMode(self.memory, HALFTONE);
-            if !StretchBlt(
-                self.memory,
-                0,
-                0,
-                self.dimensions.width_i32(),
-                self.dimensions.height_i32(),
-                Some(screen),
-                source_x,
-                source_y,
-                source_width,
-                source_height,
-                SRCCOPY | CAPTUREBLT,
-            )
-            .as_bool()
-            {
-                return Err(format!(
-                    "StretchBlt failed for visual capture: {}",
-                    windows::core::Error::from_thread()
-                ));
+            let copied = if copy_without_scaling {
+                BitBlt(
+                    self.memory,
+                    0,
+                    0,
+                    self.dimensions.width_i32(),
+                    self.dimensions.height_i32(),
+                    Some(screen),
+                    source_x,
+                    source_y,
+                    SRCCOPY | CAPTUREBLT,
+                )
+            } else {
+                SetStretchBltMode(self.memory, HALFTONE);
+                StretchBlt(
+                    self.memory,
+                    0,
+                    0,
+                    self.dimensions.width_i32(),
+                    self.dimensions.height_i32(),
+                    Some(screen),
+                    source_x,
+                    source_y,
+                    source_width,
+                    source_height,
+                    SRCCOPY | CAPTUREBLT,
+                )
+                .ok()
+            };
+            if let Err(error) = copied {
+                let operation = if copy_without_scaling {
+                    "BitBlt"
+                } else {
+                    "StretchBlt"
+                };
+                return Err(format!("{operation} failed for visual capture: {error}"));
             }
-            let pixels =
-                std::slice::from_raw_parts(self.bits.as_ptr(), self.dimensions.byte_len()).to_vec();
-            Ok(CapturedBgra {
+            let pixels = std::slice::from_raw_parts(self.bits.as_ptr(), self.dimensions.byte_len());
+            consume(
                 pixels,
-                width: self.dimensions.width_u32(),
-                height: self.dimensions.height_u32(),
-            })
+                self.dimensions.width_u32(),
+                self.dimensions.height_u32(),
+            )
         }
     }
 }
 
-impl Drop for CaptureSurface {
+impl Drop for GdiDibSurface {
     fn drop(&mut self) {
         use windows::Win32::Graphics::Gdi::{DeleteDC, DeleteObject, SelectObject};
 
@@ -243,14 +352,15 @@ impl Drop for CaptureSurface {
     }
 }
 
-pub(crate) fn capture_bgra(
+pub(crate) fn capture_bgra_with<R>(
     source_x: i32,
     source_y: i32,
     source_width: i32,
     source_height: i32,
     width: i32,
     height: i32,
-) -> Result<CapturedBgra, String> {
+    consume: impl FnOnce(&[u8], u32, u32) -> Result<R, String>,
+) -> Result<R, String> {
     let dimensions = NativeDimensions::from_usize(width as usize, height as usize)?;
     let screen = ScreenDc::acquire()?;
     CAPTURE_SURFACE.with(|slot| {
@@ -259,11 +369,18 @@ pub(crate) fn capture_bgra(
             .as_ref()
             .is_none_or(|surface| surface.dimensions != dimensions)
         {
-            *slot = Some(CaptureSurface::new(screen.0, dimensions)?);
+            *slot = Some(GdiDibSurface::new(Some(screen.0), dimensions)?);
         }
         slot.as_mut()
             .ok_or_else(|| "visual capture surface was not initialized".to_string())?
-            .copy_from(screen.0, source_x, source_y, source_width, source_height)
+            .copy_from(
+                screen.0,
+                source_x,
+                source_y,
+                source_width,
+                source_height,
+                consume,
+            )
     })
 }
 
@@ -572,10 +689,66 @@ unsafe extern "C" fn capture_wechat_callback(value: windows::core::PCSTR) {
     }
 }
 
+#[must_use = "the module must stay loaded while exported function pointers are used"]
+struct OwnedModule(windows::Win32::Foundation::HMODULE);
+
+impl Drop for OwnedModule {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::FreeLibrary;
+
+        // SAFETY: this guard uniquely owns the successful LoadLibraryExW
+        // result and is destroyed only after all exported pointers are dead.
+        if let Err(error) = unsafe { FreeLibrary(self.0) } {
+            crate::app::logging::report_error(
+                "windows-native",
+                format!("cannot unload WeChat OCR bridge: {error}"),
+            );
+        }
+    }
+}
+
 pub(crate) struct WechatBridge {
-    module: windows::Win32::Foundation::HMODULE,
+    _module: OwnedModule,
     recognize: WechatOcrFn,
     stop: Option<StopOcrFn>,
+}
+
+fn wechat_recognize_export(
+    address: windows::Win32::Foundation::FARPROC,
+) -> Result<WechatOcrFn, String> {
+    const _: () = assert!(
+        std::mem::size_of::<windows::Win32::Foundation::FARPROC>()
+            == std::mem::size_of::<WechatOcrFn>()
+    );
+    #[repr(C)]
+    union Export {
+        raw: windows::Win32::Foundation::FARPROC,
+        typed: WechatOcrFn,
+    }
+    if address.is_none() {
+        return Err("wcocr.dll returned a null wechat_ocr export".into());
+    }
+    // SAFETY: GetProcAddress returned this exact symbol from the architecture-
+    // checked bridge. The compile-time size assertion and dedicated union keep
+    // the only ABI reinterpretation local to this audited loader.
+    Ok(unsafe { Export { raw: address }.typed })
+}
+
+fn wechat_stop_export(address: windows::Win32::Foundation::FARPROC) -> Option<StopOcrFn> {
+    const _: () = assert!(
+        std::mem::size_of::<windows::Win32::Foundation::FARPROC>()
+            == std::mem::size_of::<StopOcrFn>()
+    );
+    #[repr(C)]
+    union Export {
+        raw: windows::Win32::Foundation::FARPROC,
+        typed: StopOcrFn,
+    }
+    address.map(|raw| {
+        // SAFETY: this optional address is the exact `stop_ocr` export from
+        // the same architecture-checked module and has the asserted size.
+        unsafe { Export { raw: Some(raw) }.typed }
+    })
 }
 
 impl WechatBridge {
@@ -596,22 +769,28 @@ impl WechatBridge {
         // Restricted search uses only the bridge directory and Windows safe
         // defaults; the typed pointers use the bridge's documented C ABI and
         // cannot outlive the returned module owner.
-        let (module, recognize, stop) = unsafe {
-            let module = LoadLibraryExW(
-                PCWSTR(wide.as_ptr()),
-                None,
-                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+        let module = unsafe {
+            OwnedModule(
+                LoadLibraryExW(
+                    PCWSTR(wide.as_ptr()),
+                    None,
+                    LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+                )
+                .map_err(|error| format!("cannot load {}: {error}", path.display()))?,
             )
-            .map_err(|error| format!("cannot load {}: {error}", path.display()))?;
-            let address = GetProcAddress(module, PCSTR(c"wechat_ocr".as_ptr().cast()))
+        };
+        // SAFETY: symbol names are static NUL-terminated C strings and the
+        // owned module remains loaded through all returned function pointers.
+        let (recognize, stop) = unsafe {
+            let address = GetProcAddress(module.0, PCSTR(c"wechat_ocr".as_ptr().cast()))
                 .ok_or_else(|| "wcocr.dll lacks wechat_ocr".to_string())?;
-            let recognize = std::mem::transmute_copy(&address);
-            let stop = GetProcAddress(module, PCSTR(c"stop_ocr".as_ptr().cast()))
-                .map(|address| std::mem::transmute_copy(&address));
-            (module, recognize, stop)
+            let recognize = wechat_recognize_export(Some(address))?;
+            let stop =
+                wechat_stop_export(GetProcAddress(module.0, PCSTR(c"stop_ocr".as_ptr().cast())));
+            (recognize, stop)
         };
         Ok(Self {
-            module,
+            _module: module,
             recognize,
             stop,
         })
@@ -651,13 +830,12 @@ impl WechatBridge {
                 capture_wechat_callback,
             )
         };
-        let value = WECHAT_CALLBACK_VALUE
+        let mut value = WECHAT_CALLBACK_VALUE
             .get_or_init(|| std::sync::Mutex::new(Vec::new()))
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone();
+            .unwrap_or_else(|error| error.into_inner());
         if success && !value.is_empty() {
-            Ok(value)
+            Ok(std::mem::take(&mut *value))
         } else {
             Err("WeChat OCR bridge returned no response".into())
         }
@@ -666,16 +844,12 @@ impl WechatBridge {
 
 impl Drop for WechatBridge {
     fn drop(&mut self) {
-        use windows::Win32::Foundation::FreeLibrary;
-
         // SAFETY: no recognition call remains active; all function pointers
-        // still belong to this live module and are discarded immediately after
-        // the balanced release.
+        // still belong to the live `OwnedModule`, which is dropped afterwards.
         unsafe {
             if let Some(stop) = self.stop {
                 stop();
             }
-            let _ = FreeLibrary(self.module);
         }
     }
 }
@@ -819,7 +993,7 @@ impl Drop for OwnedHandle {
         // SAFETY: this wrapper is created only from an owned successful handle
         // and Drop is its sole close path.
         if let Err(error) = unsafe { CloseHandle(self.0) } {
-            crate::report_warning!("windows-native", "CloseHandle failed: {error}");
+            crate::report_error!("windows-native", "CloseHandle failed: {error}");
         }
     }
 }
@@ -868,7 +1042,7 @@ impl Drop for OwnedWindow {
             // SAFETY: the wrapper is the sole owner and remains on the window
             // thread for its complete lifetime.
             if let Err(error) = unsafe { DestroyWindow(self.raw) } {
-                crate::report_warning!("windows-native", "DestroyWindow failed: {error}");
+                crate::report_error!("windows-native", "DestroyWindow failed: {error}");
             }
         }
     }
@@ -907,7 +1081,10 @@ impl Drop for SelectedObject {
         use windows::Win32::Graphics::Gdi::SelectObject;
 
         // SAFETY: `previous` came from selecting into this same live DC.
-        let _ = unsafe { SelectObject(self.dc, self.previous) };
+        let restored = unsafe { SelectObject(self.dc, self.previous) };
+        if restored.0.is_null() || restored.0 as usize == usize::MAX {
+            crate::report_error!("windows-native", "cannot restore selected GDI object");
+        }
     }
 }
 
@@ -999,7 +1176,9 @@ pub(crate) fn prefer_dynamic_vblank() {
         if let Some(disable) = GetProcAddress(module, s!("DXGIDisableVBlankVirtualization")) {
             let _ = disable();
         }
-        let _ = FreeLibrary(module);
+        if let Err(error) = FreeLibrary(module) {
+            crate::report_error!("windows-native", "cannot unload dxgi.dll: {error}");
+        }
     }
 }
 
@@ -1682,11 +1861,15 @@ mod tests {
     #[test]
     #[ignore = "requires an interactive Windows desktop"]
     fn visual_capture_reuses_and_releases_thread_bound_surface() -> Result<(), String> {
-        let first = capture_bgra(0, 0, 64, 64, 64, 64)?;
-        let second = capture_bgra(0, 0, 64, 64, 64, 64)?;
+        let first = capture_bgra_with(0, 0, 64, 64, 64, 64, |pixels, width, height| {
+            Ok((pixels.len(), width, height))
+        })?;
+        let second = capture_bgra_with(0, 0, 64, 64, 64, 64, |pixels, width, height| {
+            Ok((pixels.len(), width, height))
+        })?;
         release_capture_surface();
-        assert_eq!(first.pixels.len(), 64 * 64 * 4);
-        assert_eq!(second.pixels.len(), first.pixels.len());
+        assert_eq!(first, (64 * 64 * 4, 64, 64));
+        assert_eq!(second, first);
         Ok(())
     }
 

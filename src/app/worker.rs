@@ -4,6 +4,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{Builder, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[must_use = "workers must be joined or transferred to an explicit quarantine owner"]
 pub(crate) struct WorkerJoin {
     name: &'static str,
     finished: Receiver<()>,

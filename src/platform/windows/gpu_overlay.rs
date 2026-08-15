@@ -323,7 +323,10 @@ impl GpuOverlay {
     }
 
     /// Release all screen-sized GPU resources immediately. Device and compact
-    /// brush/font caches remain warm for the next mode entry.
+    /// brush/font caches remain warm for the next mode entry. The commit is
+    /// intentionally asynchronous: capture callers add the single DWM barrier
+    /// needed before reading desktop pixels, while an ordinary mode exit must
+    /// not wait for the compositor.
     pub(super) fn dismiss(&mut self) -> Result<(), String> {
         // SAFETY: detaching a target is valid outside BeginDraw. Clearing the
         // owned tree before Commit releases every compositor reference.
@@ -332,10 +335,7 @@ impl GpuOverlay {
             self.content = None;
             self.dcomp
                 .Commit()
-                .map_err(|error| format!("DirectComposition dismiss commit failed: {error}"))?;
-            self.dcomp.WaitForCommitCompletion().map_err(|error| {
-                format!("DirectComposition did not confirm the hidden tree: {error}")
-            })
+                .map_err(|error| format!("DirectComposition dismiss commit failed: {error}"))
         }
     }
 
@@ -1005,7 +1005,12 @@ fn create_window(area: Rect) -> Result<HWND, String> {
         // DirectComposition supplies per-pixel alpha. WS_EX_TRANSPARENT then
         // routes mouse input to windows underneath.
         if let Err(error) = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA) {
-            let _ = DestroyWindow(hwnd);
+            if let Err(cleanup) = DestroyWindow(hwnd) {
+                crate::report_error!(
+                    "windows-overlay",
+                    "cannot destroy failed GPU overlay window: {cleanup}"
+                );
+            }
             return Err(format!("SetLayeredWindowAttributes failed: {error}"));
         }
         hwnd

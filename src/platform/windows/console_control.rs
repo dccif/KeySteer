@@ -34,7 +34,7 @@ impl Drop for ConsoleControl {
     fn drop(&mut self) {
         ENGINE_THREAD.store(0, Ordering::Release);
         if let Err(error) = super::native::set_console_control_handler(Some(handler), false) {
-            crate::report_warning!(
+            crate::report_error!(
                 "windows-console",
                 "cannot unregister console control handler: {error}"
             );

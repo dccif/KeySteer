@@ -35,6 +35,20 @@ vision coordinator 在当前与 latest pending 请求完成后直接退出，不
 重新扫描。仅复用最多 128 项的空容器
 backing，以降低常见不足 100 个标签时的重入分配；大型扫描容量不会留在 Idle。
 
+Windows 每个 generation 的 GDI top-down DIB 只截图一次。视觉线程在 DIB 借用仍有效时直接
+构造唯一一份 `SoftwareBitmap`，并直接下采样 fallback 灰度图；不会再复制或让 provider 持有
+一份完整 BGRA `Vec`。DIB 字节稳定且前台 HWND/PID/generation 复核通过后立即释放 overlay
+capture gate，OCR 与 fallback 使用生成的只读工件继续运行。源窗口与目标 DIB 尺寸相同时使用
+`BitBlt` 直接复制；只有安全像素上限要求缩放时才使用 `StretchBlt + HALFTONE`。不拆分截图或
+OCR 请求；1080p、2K、4K、8K 及多显示器窗口都维持每 generation 一次截图，超过安全上限时
+仍以单张图片等比缩放。
+
+系统 OCR、微信 OCR 都在 provider 内最多保留 2000 个有效目标。任一 provider 返回非空有效
+结果便取消并丢弃 fallback；这个判定发生在 UIA/空间索引去重之前，因此 Hybrid 中 OCR 与
+UIA 重叠也不会误跑纯像素检测。系统 OCR 使用 WinRT completion handler 唤醒，不做固定 5ms
+状态轮询。provider 取消后按绝对 deadline join；违反取消契约的线程转入有 owner 的 quarantine，
+本进程后续禁用视觉扫描，不能阻塞 Engine 或静默 detach。
+
 ## HintMode 端
 
 `src/modes/hint.rs` 的职责：

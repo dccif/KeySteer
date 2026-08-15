@@ -2665,7 +2665,9 @@ impl Engine {
             | Binding::Scroll(..)
             | Binding::Speed(_)
             | Binding::ToggleCursorFollowSelection
-            | Binding::RescanUi => unreachable!("stateful bindings are dispatched above"),
+            | Binding::RescanUi => {
+                Err("stateful binding reached the stateless runtime dispatch boundary".into())
+            }
 
             // Filtered out when the table was built.
             Binding::Disabled => Ok(false),

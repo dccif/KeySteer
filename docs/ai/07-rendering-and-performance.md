@@ -4,13 +4,15 @@
 
 Windows DirectComposition 保持设备、字体和紧致 cursor/indicator surface 预热，但 cursor-only Normal 不创建全屏 static surface。只有 backdrop、shape 或 label 存在时才挂载 static visual；回到无静态内容时立即释放 screen-sized surface。
 
-Windows OCR 不属于预热常驻集。Backend ready 后首次事件轮询派发的 discovery 只缓存能力与路径，临时 `OcrEngine`/COM 在探测线程结束前释放；视觉 coordinator、截图、`SoftwareBitmap`、fallback scratch、微信 helper/reader 和临时 PNG 都是 generation-scoped，并在 terminal 结果进入 Engine 前完成清理。Idle working set 仍会包含预热的 DirectComposition/D3D/字体资源，不能用 `SetProcessWorkingSetSize` 人为压低任务管理器数字。
+Windows OCR 不属于预热常驻集。Backend ready 后首次事件轮询派发的 discovery 只缓存能力与路径，临时 `OcrEngine`/COM 在探测线程结束前释放；视觉 coordinator、截图、`SoftwareBitmap`、fallback scratch、微信 helper/reader 和临时 PNG 都是 generation-scoped，并在 terminal 结果进入 Engine 前完成清理。15 秒空闲基线约为 35.5 MiB working set、51.4 MiB private bytes、343 handles、30 threads，采样保持平稳；高于早期 18 MiB 的主要部分是预热的 DirectComposition/D3D/字体资源及系统工作集缓存，不能用 `SetProcessWorkingSetSize` 人为压低任务管理器数字。
 
 热路径使用 inline storage：`CommandBatch` 的 0/1/2 命令不分配，Normal held-key map inline 4 项，Grid/Recursive stack/path inline 12 项，继承 visited inline 8 项。
 
 ## 提交模型
 
-`Backend::present` 接收 `Arc<OverlayScene>`。Windows 使用 latest-frame 单槽队列：Engine 只替换待绘制帧并立即返回，已经过期的帧不会进入原生绘制。同一输入批次中的 Warp、Show、Finish、Click、Hide 会先合并覆盖层意图；输入注入保持立即执行，批次结束只提交一次最终画面。
+`Backend::present` 接收 `Arc<OverlayScene>`。Windows 使用 latest-frame 单槽队列：Engine 只替换待绘制帧并立即返回，已经过期的帧不会进入原生绘制。frame/position 更新与 empty→ready 判定在同一次锁内完成，并用 outstanding-wake 合并突发提交；渲染线程每次 drain 才清除标志，8000 次积压位置更新只需要一个 wake 并只保留最终位置。同一输入批次中的 Warp、Show、Finish、Click、Hide 会先合并覆盖层意图；输入注入保持立即执行，批次结束只提交一次最终画面。
+
+Windows 截图不再生成约 32 MiB 的 4K BGRA `Vec`。GDI DIB 在所属线程上以验证过长度的临时 slice 借出，直接生成 OCR bitmap 和不超过 2,073,600 像素的灰度 fallback，随后立即销毁。源/目标尺寸相同时走一次 `BitBlt`；只有实际缩放才使用 `StretchBlt + HALFTONE`。截图和 OCR 请求都不分块，超过安全上限时仍生成一张等比缩放图片。fallback 的 edge allocation 在闭运算后复用为 visited，并用最多 2000 项的紧凑 top-K，只有最终候选才构造 role 字符串。
 
 Engine 保存最后一次 scene 并跳过完全相同的提交。`OverlayScene` 的静态 shapes/labels 使用
 `OverlayItems<T>` 写时复制存储：移动 cursor/indicator 时 clone 只增加 `Arc` 引用计数，
@@ -59,7 +61,7 @@ mode scene，也不重建静态 Grid/Hint 内容。latched 的真实按钮状态
 - 静态 surface 只在静态 scene 或覆盖区域原点变化时访问和重绘；区域不变的逐帧提交不会
   重复调用全屏 `SetWindowPos`，也不会为静态 surface 产生 COM AddRef/Release。
 - GPU HWND 使用 `WS_EX_LAYERED | WS_EX_TRANSPARENT | NOACTIVATE | TOOLWINDOW | TOPMOST`；layered + transparent 才保证跨进程点击穿透，`HTTRANSPARENT` 仅作为额外防线，因为它只能继续命中同线程窗口。
-- overlay 不使用 capture affinity。视觉扫描控制优先于普通帧：generation gate 期间完整帧和位置更新各只保留最新一份，GPU 清空 tree 后等待 commit、CPU 销毁 layered HWND，随后用 `DwmFlush` 确认隐藏；Engine、Hook 和普通 overlay 提交路径不等待该屏障。
+- overlay 不使用 capture affinity。视觉扫描控制优先于普通帧：generation gate 期间完整帧和位置更新各只保留最新一份。GPU 清空 tree 并异步 `Commit`，CPU 销毁 layered HWND，截图路径随后只用一次 `DwmFlush` 确认隐藏；普通 dismiss、Engine、Hook 和普通 overlay 提交路径都不等待 compositor。
 - 渲染线程使用 Win32 消息队列作为 latest-frame/control 唤醒源；即使 normal 覆盖层静止也会
   持续响应窗口消息，并对 `WM_NCHITTEST` 返回 `HTTRANSPARENT`。禁止让全屏 HWND 在
   Condvar/普通 channel 上无限等待，否则 Windows 会将其判为挂起并阻塞底层窗口输入。
