@@ -30,7 +30,7 @@ pub fn run_cli() -> ExitCode {
     let log_path = match super::logging::init() {
         Ok(path) => Some(path.to_path_buf()),
         Err(error) => {
-            eprintln!("KeySteer: {error}");
+            crate::report_error!("logging", "{error}");
             None
         }
     };
@@ -50,9 +50,12 @@ pub fn run_cli() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => {
-            super::logging::report_error("cli", &error);
+            crate::report_error!("cli", "{error}");
             if let Some(log_path) = log_path {
-                eprintln!("KeySteer: diagnostic log: {}", log_path.display());
+                super::logging::emergency_console(format_args!(
+                    "diagnostic log: {}",
+                    log_path.display()
+                ));
             }
             super::logging::flush();
             ExitCode::FAILURE

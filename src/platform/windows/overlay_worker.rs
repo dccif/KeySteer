@@ -4,7 +4,7 @@
 //! normal-priority thread owns every HWND and GDI resource, so a dense scene
 //! cannot delay the synchronous hook disposition or native click injection.
 
-use std::sync::mpsc::{self, SyncSender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,15 +32,47 @@ struct Positions {
 }
 
 enum Control {
+    BeginCapture(u64),
     Dismiss(SyncSender<Result<(), String>>),
     Shutdown(SyncSender<Result<(), String>>),
 }
 
-#[derive(Default)]
+struct CaptureGate {
+    generation: u64,
+    ready: Option<SyncSender<Result<(), String>>>,
+    deferred_frame: Option<Frame>,
+    deferred_positions: Option<Positions>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OverlayPhase {
+    Normal,
+    HidingForCapture(u64),
+    HiddenForCapture(u64),
+    Releasing(u64),
+    Stopping,
+}
+
 struct State {
     latest: Option<Frame>,
     positions: Option<Positions>,
     control: Option<Control>,
+    capture: Option<CaptureGate>,
+    phase: OverlayPhase,
+    alive: bool,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            latest: None,
+            positions: None,
+            control: None,
+            capture: None,
+            phase: OverlayPhase::Normal,
+            alive: true,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -52,6 +84,96 @@ pub(super) struct OverlayWorker {
     shared: Arc<Shared>,
     thread_id: u32,
     worker: Option<WorkerJoin>,
+}
+
+/// A generation-scoped permit which keeps overlay frames off-screen until the
+/// vision worker has copied the desktop pixels. Dropping a stale lease can
+/// never release a newer generation.
+pub(super) struct CaptureLease {
+    shared: Arc<Shared>,
+    thread_id: u32,
+    generation: u64,
+    ready: Option<Receiver<Result<(), String>>>,
+    released: bool,
+}
+
+impl CaptureLease {
+    pub(super) fn wait_hidden(
+        &mut self,
+        deadline: Instant,
+        mut canceled: impl FnMut() -> bool,
+    ) -> Result<(), String> {
+        let ready = self
+            .ready
+            .take()
+            .ok_or("capture lease hidden acknowledgement was already consumed")?;
+        loop {
+            if canceled() {
+                return Err("capture lease was canceled".into());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err("timed out waiting for the overlay capture barrier".into());
+            }
+            match ready.recv_timeout((deadline - now).min(Duration::from_millis(10))) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("overlay renderer stopped before hiding for capture".into());
+                }
+            }
+        }
+    }
+
+    /// Release the gate and display only the latest frame deferred while the
+    /// screenshot was pending.
+    pub(super) fn release(mut self) -> Result<(), String> {
+        self.release_inner(true)
+    }
+
+    fn release_inner(&mut self, show_deferred: bool) -> Result<(), String> {
+        if self.released {
+            return Ok(());
+        }
+        self.released = true;
+        let should_wake = {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let Some(gate) = state
+                .capture
+                .take_if(|gate| gate.generation == self.generation)
+            else {
+                return Ok(());
+            };
+            state.phase = OverlayPhase::Releasing(self.generation);
+            if matches!(state.control, Some(Control::BeginCapture(generation)) if generation == self.generation)
+            {
+                state.control = None;
+            }
+            if show_deferred {
+                state.latest = gate.deferred_frame;
+                state.positions = gate.deferred_positions;
+            }
+            state.phase = OverlayPhase::Normal;
+            state.alive && (state.latest.is_some() || state.positions.is_some())
+        };
+        if should_wake {
+            native::post_thread_wake(self.thread_id, RENDER_WAKE_MESSAGE)
+                .map_err(|error| format!("cannot wake Windows overlay renderer: {error}"))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CaptureLease {
+    fn drop(&mut self) {
+        if let Err(error) = self.release_inner(false) {
+            crate::report_error!("windows-overlay", "{error}");
+        }
+    }
 }
 
 impl OverlayWorker {
@@ -92,7 +214,13 @@ impl OverlayWorker {
                 .state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            state.latest = Some(Frame { scene, area, scale });
+            let frame = Frame { scene, area, scale };
+            if let Some(gate) = state.capture.as_mut() {
+                gate.deferred_frame = Some(frame);
+                gate.deferred_positions = None;
+                return Ok(());
+            }
+            state.latest = Some(frame);
             state.positions = None;
         }
         self.wake_renderer()
@@ -110,7 +238,12 @@ impl OverlayWorker {
                 .state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            state.positions = Some(Positions { cursor, indicator });
+            let positions = Positions { cursor, indicator };
+            if let Some(gate) = state.capture.as_mut() {
+                gate.deferred_positions = Some(positions);
+                return Ok(());
+            }
+            state.positions = Some(positions);
         }
         self.wake_renderer()
     }
@@ -120,6 +253,51 @@ impl OverlayWorker {
             return Ok(());
         }
         self.control(Control::Dismiss)
+    }
+
+    /// Begin hiding the overlay for a single scan generation. This method only
+    /// enqueues renderer work and never waits for DWM on the engine thread.
+    pub(super) fn begin_capture(&self, generation: u64) -> Result<CaptureLease, String> {
+        if self.worker.is_none() {
+            return Err("Windows overlay renderer is not running".into());
+        }
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if !state.alive || matches!(state.control, Some(Control::Shutdown(_))) {
+                return Err("Windows overlay renderer is stopping".into());
+            }
+            if let Some(mut previous) = state.capture.take()
+                && let Some(reply) = previous.ready.take()
+            {
+                let _ = reply.send(Err("capture generation was superseded".into()));
+            }
+            state.latest = None;
+            state.positions = None;
+            state.capture = Some(CaptureGate {
+                generation,
+                ready: Some(ready_tx),
+                deferred_frame: None,
+                deferred_positions: None,
+            });
+            state.phase = OverlayPhase::HidingForCapture(generation);
+            state.control = Some(Control::BeginCapture(generation));
+        }
+        if let Err(error) = self.wake_renderer() {
+            cancel_capture(&self.shared, generation, &error);
+            return Err(error);
+        }
+        Ok(CaptureLease {
+            shared: Arc::clone(&self.shared),
+            thread_id: self.thread_id,
+            generation,
+            ready: Some(ready_rx),
+            released: false,
+        })
     }
 
     fn control(
@@ -135,7 +313,14 @@ impl OverlayWorker {
                 .unwrap_or_else(|error| error.into_inner());
             state.latest = None;
             state.positions = None;
-            state.control = Some(make(reply_tx));
+            cancel_capture_locked(&mut state, "overlay was dismissed");
+            let control = make(reply_tx);
+            state.phase = if matches!(control, Control::Shutdown(_)) {
+                OverlayPhase::Stopping
+            } else {
+                OverlayPhase::Normal
+            };
+            state.control = Some(control);
         }
         self.wake_renderer()?;
         reply_rx
@@ -144,6 +329,15 @@ impl OverlayWorker {
     }
 
     fn wake_renderer(&self) -> Result<(), String> {
+        let alive = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .alive;
+        if !alive {
+            return Err("Windows overlay renderer has already stopped".into());
+        }
         native::post_thread_wake(self.thread_id, RENDER_WAKE_MESSAGE)
             .map_err(|error| format!("cannot wake Windows overlay renderer: {error}"))
     }
@@ -181,6 +375,7 @@ impl Drop for OverlayWorker {
 fn render_loop(shared: &Shared, events: &EventSender, ready: SyncSender<u32>) {
     let thread_id = native::prepare_thread_message_queue();
     if ready.send(thread_id).is_err() {
+        mark_renderer_stopped(shared, "overlay renderer startup was abandoned");
         return;
     }
     let (mut renderer, startup_notice) = AdaptiveRenderer::new();
@@ -205,29 +400,45 @@ fn render_loop(shared: &Shared, events: &EventSender, ready: SyncSender<u32>) {
         if control.is_none() && frame.is_none() && positions.is_none() {
             match native::wait_and_dispatch_window_message() {
                 Ok(true) => continue,
-                Ok(false) => return,
+                Ok(false) => {
+                    mark_renderer_stopped(shared, "overlay renderer message loop stopped");
+                    return;
+                }
                 Err(error) => {
-                    warn(
-                        events,
-                        format!("Windows overlay message loop failed: {error}"),
+                    crate::report_error!(
+                        "windows-overlay",
+                        "Windows overlay message loop failed: {error}"
                     );
+                    mark_renderer_stopped(shared, "overlay renderer message loop failed");
                     return;
                 }
             }
         }
 
         if let Some(control) = control {
-            let result = renderer.dismiss();
+            let capture_generation = match control {
+                Control::BeginCapture(generation) => Some(generation),
+                Control::Dismiss(_) | Control::Shutdown(_) => None,
+            };
+            let result = if capture_generation.is_some() {
+                renderer.dismiss_for_capture()
+            } else {
+                renderer.dismiss()
+            };
             // Drop both the source and scaled copies of a potentially large
             // grid as soon as the overlay leaves the screen.
             dpi_cache.clear();
             let shutdown = matches!(control, Control::Shutdown(_));
             match control {
+                Control::BeginCapture(generation) => {
+                    acknowledge_capture(shared, generation, result);
+                }
                 Control::Dismiss(reply) | Control::Shutdown(reply) => {
                     let _ = reply.send(result);
                 }
             }
             if shutdown {
+                mark_renderer_stopped(shared, "overlay renderer shut down");
                 return;
             }
         }
@@ -244,9 +455,9 @@ fn render_loop(shared: &Shared, events: &EventSender, ready: SyncSender<u32>) {
                     warn(events, notice);
                 }
                 Ok(None) => crate::app::perf_probe::mark("native_presented"),
-                Err(error) => warn(
-                    events,
-                    format!("Windows overlay render failed; the next frame will retry: {error}"),
+                Err(error) => crate::report_error!(
+                    "windows-overlay",
+                    "Windows overlay render failed; the next frame will retry: {error}"
                 ),
             }
         }
@@ -264,11 +475,9 @@ fn render_loop(shared: &Shared, events: &EventSender, ready: SyncSender<u32>) {
                     warn(events, notice);
                 }
                 Ok(None) => crate::app::perf_probe::mark("native_presented"),
-                Err(error) => warn(
-                    events,
-                    format!(
-                        "Windows overlay position update failed; the next frame will retry: {error}"
-                    ),
+                Err(error) => crate::report_error!(
+                    "windows-overlay",
+                    "Windows overlay position update failed; the next frame will retry: {error}"
                 ),
             }
         }
@@ -276,6 +485,7 @@ fn render_loop(shared: &Shared, events: &EventSender, ready: SyncSender<u32>) {
         // frames. Leaving the full-screen HWND on a Condvar makes Windows mark
         // it hung and blocks every click beneath it while normal mode is idle.
         if !native::pump_window_messages() {
+            mark_renderer_stopped(shared, "overlay renderer window was destroyed");
             return;
         }
     }
@@ -399,6 +609,68 @@ impl AdaptiveRenderer {
         self.last_area = None;
         result
     }
+
+    fn dismiss_for_capture(&mut self) -> Result<(), String> {
+        self.dismiss()?;
+        native::wait_for_dwm_frame()
+            .map_err(|error| format!("DWM did not confirm the hidden overlay frame: {error}"))
+    }
+}
+
+fn acknowledge_capture(shared: &Shared, generation: u64, result: Result<(), String>) {
+    let reply = {
+        let mut state = shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let reply = state
+            .capture
+            .as_mut()
+            .filter(|gate| gate.generation == generation)
+            .and_then(|gate| gate.ready.take());
+        if reply.is_some() && result.is_ok() {
+            state.phase = OverlayPhase::HiddenForCapture(generation);
+        }
+        reply
+    };
+    if let Some(reply) = reply {
+        let _ = reply.send(result);
+    }
+}
+
+fn cancel_capture(shared: &Shared, generation: u64, reason: &str) {
+    let mut state = shared
+        .state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if state
+        .capture
+        .as_ref()
+        .is_some_and(|gate| gate.generation == generation)
+    {
+        cancel_capture_locked(&mut state, reason);
+    }
+}
+
+fn cancel_capture_locked(state: &mut State, reason: &str) {
+    if let Some(mut gate) = state.capture.take()
+        && let Some(reply) = gate.ready.take()
+    {
+        let _ = reply.send(Err(reason.into()));
+    }
+    if state.phase != OverlayPhase::Stopping {
+        state.phase = OverlayPhase::Normal;
+    }
+}
+
+fn mark_renderer_stopped(shared: &Shared, reason: &str) {
+    let mut state = shared
+        .state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    state.alive = false;
+    state.phase = OverlayPhase::Stopping;
+    cancel_capture_locked(&mut state, reason);
 }
 
 fn warn(events: &EventSender, message: String) {
@@ -428,6 +700,85 @@ mod tests {
             Some(now - Duration::from_secs(60)),
             now
         ));
+    }
+
+    #[test]
+    fn stale_capture_lease_never_releases_new_generation() {
+        for generation in 1..=1_000 {
+            let shared = Arc::new(Shared::default());
+            {
+                let mut state = shared.state.lock().expect("capture state");
+                state.alive = false;
+                state.capture = Some(CaptureGate {
+                    generation: generation + 1,
+                    ready: None,
+                    deferred_frame: None,
+                    deferred_positions: None,
+                });
+                state.phase = OverlayPhase::HidingForCapture(generation + 1);
+            }
+            let mut stale = CaptureLease {
+                shared: Arc::clone(&shared),
+                thread_id: 0,
+                generation,
+                ready: None,
+                released: false,
+            };
+            stale.release_inner(true).expect("stale release");
+            assert_eq!(
+                shared
+                    .state
+                    .lock()
+                    .expect("capture state")
+                    .capture
+                    .as_ref()
+                    .map(|gate| gate.generation),
+                Some(generation + 1)
+            );
+            assert_eq!(
+                shared.state.lock().expect("capture state").phase,
+                OverlayPhase::HidingForCapture(generation + 1)
+            );
+        }
+    }
+
+    #[test]
+    fn capture_gate_keeps_only_latest_deferred_frame() {
+        let shared = Arc::new(Shared::default());
+        let area = Rect::new(0.0, 0.0, 32.0, 32.0);
+        {
+            let mut state = shared.state.lock().expect("capture state");
+            state.alive = false;
+            state.capture = Some(CaptureGate {
+                generation: 7,
+                ready: None,
+                deferred_frame: Some(Frame {
+                    scene: Arc::new(OverlayScene::new()),
+                    area,
+                    scale: 2.0,
+                }),
+                deferred_positions: Some(Positions {
+                    cursor: Some(Point::new(9.0, 10.0)),
+                    indicator: None,
+                }),
+            });
+            state.phase = OverlayPhase::HiddenForCapture(7);
+        }
+        let mut lease = CaptureLease {
+            shared: Arc::clone(&shared),
+            thread_id: 0,
+            generation: 7,
+            ready: None,
+            released: false,
+        };
+        lease.release_inner(true).expect("capture release");
+        let state = shared.state.lock().expect("capture state");
+        assert_eq!(state.latest.as_ref().map(|frame| frame.scale), Some(2.0));
+        assert_eq!(
+            state.positions.and_then(|positions| positions.cursor),
+            Some(Point::new(9.0, 10.0))
+        );
+        assert_eq!(state.phase, OverlayPhase::Normal);
     }
 
     #[test]

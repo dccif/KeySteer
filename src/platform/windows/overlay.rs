@@ -20,9 +20,8 @@ use windows::Win32::Graphics::Gdi::{
     ValidateRect,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, HCURSOR, HICON, HWND_TOPMOST,
-    RegisterClassExW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SetWindowDisplayAffinity, SetWindowPos,
-    ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WDA_EXCLUDEFROMCAPTURE, WM_DESTROY, WM_PAINT,
+    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, HCURSOR, HICON, HWND_TOPMOST, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SetWindowPos, ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WM_DESTROY, WM_PAINT,
     WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_POPUP,
 };
@@ -94,19 +93,7 @@ impl Overlay {
             ..Default::default()
         };
 
-        // SAFETY: every field of `class` is initialised above.
-        if unsafe { RegisterClassExW(&class) } == 0 {
-            // SAFETY: GetLastError takes no arguments and is always callable.
-            let last = unsafe { windows::Win32::Foundation::GetLastError() };
-            // A duplicate registration is harmless: the class already exists.
-            const ERROR_CLASS_ALREADY_EXISTS: u32 = 1410;
-            if last.0 != ERROR_CLASS_ALREADY_EXISTS {
-                return Err(format!(
-                    "RegisterClassExW failed: {}",
-                    windows::core::Error::from_hresult(last.to_hresult())
-                ));
-            }
-        }
+        super::native::register_window_class(&class)?;
         self.class_registered = true;
         Ok(())
     }
@@ -186,12 +173,6 @@ impl Overlay {
 
         // SAFETY: `hwnd` was just created successfully.
         unsafe {
-            if let Err(error) = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) {
-                crate::log_warning!(
-                    "windows-overlay",
-                    "cannot exclude CPU overlay from capture: {error}"
-                );
-            }
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
         self.windows.insert(key, OwnedWindow::new(hwnd));
@@ -1393,11 +1374,7 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_DESTROY => LRESULT(0),
-        _ => {
-            // SAFETY: forward the unchanged arguments supplied by Windows; no
-            // Rust state or unwind crosses the callback boundary.
-            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
-        }
+        _ => super::native::default_window_proc(hwnd, message, wparam, lparam),
     }
 }
 

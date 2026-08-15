@@ -33,8 +33,8 @@ use windows::Win32::UI::Accessibility::{
     UIA_NamePropertyId, UIA_PROPERTY_ID,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumThreadWindows, EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetWindow, GetWindowLongW,
-    GetWindowRect, WS_EX_TRANSPARENT, WS_POPUP,
+    EnumThreadWindows, EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetWindow, GetWindowRect,
+    WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{BOOL, Interface};
 
@@ -284,7 +284,7 @@ impl UiaQueryPlan {
         let interactive = match create_interactive_condition(automation) {
             Ok(condition) => Some(condition),
             Err(error) => {
-                crate::log_warning!(
+                crate::report_warning!(
                     "windows-uia",
                     "cannot create interactive UIA condition; clickable scans will filter cached properties locally: {error}"
                 );
@@ -334,7 +334,7 @@ fn worker_main(shared: Arc<SharedQueue>, thread_id: Arc<AtomicU32>) {
     let automation2 = match automation.cast::<IUIAutomation2>() {
         Ok(automation2) => Some(automation2),
         Err(error) => {
-            crate::log_warning!(
+            crate::report_warning!(
                 "windows-uia",
                 "IUIAutomation2 is unavailable; continuing with base UI Automation: {error}"
             );
@@ -441,7 +441,7 @@ fn run_scan(
         // timeout_ms is clamped to the supported positive range.
         let connection_set = unsafe { automation2.SetConnectionTimeout(timeout_ms) };
         if let Err(error) = &connection_set {
-            crate::log_warning!(
+            crate::report_warning!(
                 "windows-uia",
                 "cannot set UIA connection timeout; continuing with provider defaults: {error}"
             );
@@ -450,7 +450,7 @@ fn run_scan(
         // timeout_ms is clamped to the supported positive range.
         let transaction_set = unsafe { automation2.SetTransactionTimeout(timeout_ms) };
         if let Err(error) = &transaction_set {
-            crate::log_warning!(
+            crate::report_warning!(
                 "windows-uia",
                 "cannot set UIA transaction timeout; continuing with provider defaults: {error}"
             );
@@ -653,9 +653,7 @@ unsafe extern "system" fn collect_thread_window(hwnd: HWND, data: LPARAM) -> BOO
         return BOOL(1);
     }
 
-    // SAFETY: `hwnd` is the live window supplied by EnumThreadWindows and the
-    // style query returns a value without retaining any pointer.
-    let has_popup_style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32 & WS_POPUP.0 != 0;
+    let has_popup_style = super::native::window_long(hwnd, GWL_STYLE) as u32 & WS_POPUP.0 != 0;
     let owned = is_owned_by(hwnd, collector.foreground);
     let shares_monitor = window_bounds(hwnd).is_some_and(|bounds| {
         let rect = native_rect(bounds);
@@ -711,10 +709,8 @@ unsafe extern "system" fn collect_z_order_window(hwnd: HWND, data: LPARAM) -> BO
     {
         return BOOL(1);
     }
-    // SAFETY: `hwnd` is the live window supplied by EnumWindows and this style
-    // query returns a value without retaining any pointer.
     let click_through =
-        unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32 & WS_EX_TRANSPARENT.0 != 0;
+        super::native::window_long(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TRANSPARENT.0 != 0;
     if click_through {
         return BOOL(1);
     }
@@ -840,7 +836,7 @@ fn stream_scan(
             Ok(root) => root,
             Err(error) => {
                 provider_timed_out |= is_timeout_error(&error);
-                crate::log_warning!(
+                crate::report_warning!(
                     "windows-uia",
                     "cannot inspect popup/top-level window {:?}; continuing: {error}",
                     window.hwnd
@@ -857,7 +853,7 @@ fn stream_scan(
                 Ok(elements) => elements,
                 Err(error) => {
                     provider_timed_out |= is_timeout_error(&error);
-                    crate::log_warning!(
+                    crate::report_warning!(
                         "windows-uia",
                         "cannot query UIA descendants for {:?}; continuing: {error}",
                         window.hwnd

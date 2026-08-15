@@ -18,7 +18,6 @@ fn rust_files(directory: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()>
 fn application_diagnostics_use_the_unified_logger() -> Result<(), Box<dyn std::error::Error>> {
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let logging = source_root.join("app/logging.rs");
-    let cli = source_root.join("app/cli.rs");
     let mut files = Vec::new();
     rust_files(&source_root, &mut files)?;
 
@@ -29,13 +28,18 @@ fn application_diagnostics_use_the_unified_logger() -> Result<(), Box<dyn std::e
             "use logging::report_error for unconditional error reporting: {}",
             path.display()
         );
-        if path != logging && path != cli {
+        if path != logging {
             assert!(
                 !source.contains("eprintln!(") && !source.contains("std::io::stderr("),
                 "diagnostics must go through app::logging: {}",
                 path.display()
             );
         }
+        assert!(
+            !source.contains("log_warning!"),
+            "warnings must use report_warning!: {}",
+            path.display()
+        );
     }
     Ok(())
 }

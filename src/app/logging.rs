@@ -260,13 +260,6 @@ pub(crate) fn info_args(target: &str, message: fmt::Arguments<'_>) {
     }
 }
 
-#[cfg(target_os = "windows")]
-pub(crate) fn warning_args(target: &str, message: fmt::Arguments<'_>) {
-    if level_enabled(Level::Warning) {
-        log_args(Level::Warning, target, message);
-    }
-}
-
 fn report(level: Level, target: &str, message: &str) {
     debug_assert!(level >= Level::Warning);
     eprintln!("KeySteer: {message}");
@@ -280,6 +273,18 @@ pub fn report_error(target: &str, message: impl AsRef<str>) {
     report(Level::Error, target, message);
 }
 
+pub(crate) fn report_error_args(target: &str, message: fmt::Arguments<'_>) {
+    let message = message.to_string();
+    report(Level::Error, target, &message);
+}
+
+/// Central emergency console path used before the persistent logger exists or
+/// for CLI-only location hints. Platform and application modules must not
+/// write stderr directly.
+pub(crate) fn emergency_console(message: impl fmt::Display) {
+    eprintln!("KeySteer: {message}");
+}
+
 pub(crate) fn report_warning_args(target: &str, message: fmt::Arguments<'_>) {
     if level_enabled(Level::Warning) {
         let message = message.to_string();
@@ -288,7 +293,7 @@ pub(crate) fn report_warning_args(target: &str, message: fmt::Arguments<'_>) {
 }
 
 /// Formatting macros keep disabled warning/info paths allocation-free. Errors
-/// intentionally use the existing eager APIs so they always reach the log.
+/// bypass the non-error switch, reach stderr and the file, and flush eagerly.
 #[macro_export]
 macro_rules! log_info {
     ($target:expr, $($arg:tt)*) => {
@@ -297,16 +302,16 @@ macro_rules! log_info {
 }
 
 #[macro_export]
-macro_rules! log_warning {
+macro_rules! report_warning {
     ($target:expr, $($arg:tt)*) => {
-        $crate::app::logging::warning_args($target, format_args!($($arg)*))
+        $crate::app::logging::report_warning_args($target, format_args!($($arg)*))
     };
 }
 
 #[macro_export]
-macro_rules! report_warning {
+macro_rules! report_error {
     ($target:expr, $($arg:tt)*) => {
-        $crate::app::logging::report_warning_args($target, format_args!($($arg)*))
+        $crate::app::logging::report_error_args($target, format_args!($($arg)*))
     };
 }
 
@@ -526,6 +531,19 @@ mod tests {
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("[ERROR] [test-target]"), "{text}");
         assert!(text.contains("first line\n    second line"), "{text}");
+        drop(logger);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn error_is_visible_and_flushed_when_non_error_logging_is_disabled() {
+        let path = temporary_log();
+        let logger = Logger::open(path.clone()).unwrap();
+        set_non_error_enabled(false);
+        assert!(level_enabled(Level::Error));
+        logger.write(Level::Error, "test-target", "unconditional error");
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("unconditional error"), "{text}");
         drop(logger);
         fs::remove_file(path).unwrap();
     }

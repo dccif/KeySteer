@@ -30,8 +30,8 @@ Engine 用 scan id 记录 owner；HintMode 也只接受当前 `scan_id`。旧 wo
 接管平台 Vec，后续目标逐项 move，名称、role 和 native role 不再跨层 clone。
 
 退出或完成 owner 时 Engine 显式取消 scan。Windows 会取消进行中的 WinRT OCR、终止微信
-helper、让纯 Rust fallback 在行/连通区域边界退出，并 join 本次 provider 线程；常驻 vision
-worker 随后只阻塞等待任务，不占用 CPU。Hint 退出会 drop 目标、标签和字符串，下一次进入
+helper、让纯 Rust fallback 在行/连通区域边界退出，并 join 本次 provider 线程；generation-scoped
+vision coordinator 在当前与 latest pending 请求完成后直接退出，不留常驻视觉线程。Hint 退出会 drop 目标、标签和字符串，下一次进入
 重新扫描。仅复用最多 128 项的空容器
 backing，以降低常见不足 100 个标签时的重入分配；大型扫描容量不会留在 Idle。
 
@@ -83,12 +83,14 @@ backing，以降低常见不足 100 个标签时的重入分配；大型扫描�
 ### Windows strategy 与视觉管线
 
 - `axtree` 只调度 UIA；`vision` 只调度完整视觉管线；`hybrid` 同时调度两者。
-- `src/platform/windows/ui_scan.rs` 是唯一发布点：所有来源共用空间索引、24/48/96…累计边界和 2000 项上限。先显示的目标不被后到重复项替换。
-- `src/platform/windows/vision.rs` 的 worker 在 backend 构造时启动，但系统 `OcrEngine` 和微信组件探测完全在后台完成。每次扫描复用同一张 GDI top-down DIB 截图，并在提交和发布边界复核 HWND、PID 与 generation。
+- `src/platform/windows/ui_scan.rs` 是唯一发布点：所有来源共用 64px 覆盖网格、24/48/96…累计边界和 2000 项上限。矩形只保存一次，覆盖超过 32 格的大矩形进入有界 oversize 列表；先显示的目标不被后到重复项替换。
+- Backend ready 后的首次事件轮询只异步执行一次 OCR discovery：系统探测在临时 MTA 中创建并立即销毁 `OcrEngine`，微信探测只缓存已验证的绝对路径与文件标识。这样 ready 热路径不承担探测线程创建；成功和失败结果都缓存到进程退出，不保留 OCR、helper、COM 或 vision worker。首次扫描若探测尚未完成，只由视觉协调线程等待同一个 single-flight 结果。
+- `src/platform/windows/vision.rs` 在有视觉请求时懒启动 generation-scoped coordinator。每个 generation 只取得一张 GDI top-down DIB 截图，并在提交和发布边界复核 HWND、PID 与 generation；当前与 latest pending 请求完成后 coordinator 自行退出。
+- 截图前由 `overlay_worker.rs` 建立 generation capture gate：渲染线程清空 GPU/CPU overlay、确认 DirectComposition commit 并等待一次 DWM 合成后才 ACK。ACK 前 UIA/OCR 提交只覆盖 latest deferred frame；截图复制完成立即释放 gate，只显示最新帧。旧 lease、取消和 shutdown 不能释放新 generation。
 - `detect_text=true` 时系统 OCR 与可用的微信 OCR 并行；已就绪批次按唯一项数量、耗时排序，单个先完成批次不等待另一个来源。两者最终发布空间并集。
-- `detect_rectangles=true` 时并行计算灰度、局部对比/梯度、形态闭合和八邻域连通区域。任一 OCR 产生有效目标就立即取消这项 CPU-heavy 工作；只有全部 OCR 没有有效目标时才发布缓存。
+- `detect_rectangles=true` 时并行计算灰度、局部对比/梯度、形态闭合和八邻域连通区域。分析图限制为 2,073,600 像素、最长边 2560，候选最小边为 6px；scratch 只属于本次 generation，连通队列使用 `u32` 索引。任一 OCR 产生有效目标就立即取消这项 CPU-heavy 工作；只有全部 OCR 没有有效目标时才发布缓存。
 - `src/platform/windows/wechat_ocr.rs` 自动查找可执行文件旁的 `wcocr.dll` 以及微信 4/3 组件，验证 PE 架构，并只在隐藏 helper 子进程中加载。IPC 与响应有界，超时/崩溃/owner 取消会终止 helper，临时 WIC PNG 总会清理；组件不进入发行包。
-- overlay HWND 使用 `WDA_EXCLUDEFROMCAPTURE`，同时保留 HintMode 扫描前隐藏覆盖层的顺序。
+- 每次扫描才创建本次专用的系统 `OcrEngine` 与微信 helper；两者的冷启动和 overlay 隐藏重叠。系统 OCR 与微信 WIC PNG 编码共享同一个 `SoftwareBitmap`；BGRA 只复制一次，微信 PNG 直接编码到临时文件而不生成完整内存 PNG。terminal 发布前必须删除 PNG、关闭 IPC、终止并等待 helper、join reader/provider、关闭 `SoftwareBitmap`、释放截图与 GDI surface 并 drop 本次 COM apartment。源码禁止 `SetWindowDisplayAffinity`/`WDA_EXCLUDEFROMCAPTURE`，避免自捕获只依赖上述隐藏确认屏障。
 
 这里不增加公共 OCR provider/path 配置；运行时状态只进入日志和 `--doctor`。
 

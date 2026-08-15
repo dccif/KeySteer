@@ -1,18 +1,17 @@
 //! Dedicated low-level keyboard hook with per-event disposition handshakes.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, LLKHF_UP, MSG,
-    MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
+    DispatchMessageW, HHOOK, KBDLLHOOKSTRUCT, LLKHF_UP, MSG, MSLLHOOKSTRUCT, SetWindowsHookExW,
     TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_MOUSEMOVE,
     WM_QUIT,
 };
@@ -39,11 +38,14 @@ struct EventSink {
     mailbox: Arc<DispositionMailbox>,
 }
 
-static EVENT_SENDER: OnceLock<Mutex<Option<EventSink>>> = OnceLock::new();
+thread_local! {
+    static EVENT_SINK: RefCell<Option<EventSink>> = const { RefCell::new(None) };
+}
 static WAKE_THREAD: AtomicU32 = AtomicU32::new(0);
 static HOOK_THREAD: AtomicU32 = AtomicU32::new(0);
 static WAKE_FAILED: AtomicBool = AtomicBool::new(false);
 static TIMEOUT_WARNING_PENDING: AtomicBool = AtomicBool::new(false);
+static POINTER_WAKE_ENABLED: AtomicBool = AtomicBool::new(false);
 static POINTER_PENDING: AtomicU64 = AtomicU64::new(0);
 static POINTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static CONSUMED_POINTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -331,7 +333,7 @@ impl Drop for OwnedHook {
         // this non-Send guard remains on the installing thread, and Drop is
         // the only unhook path.
         if let Err(error) = unsafe { UnhookWindowsHookEx(self.raw) } {
-            crate::log_warning!("windows-hook", "cannot remove hook: {error}");
+            crate::report_warning!("windows-hook", "cannot remove hook: {error}");
         }
     }
 }
@@ -343,13 +345,7 @@ impl HookThread {
         input::prewarm_key_map();
         // Ensure the engine thread has a message queue before hook callbacks
         // try to wake it with PostThreadMessageW.
-        let owner_thread = super::native::current_thread_id();
-        let mut queue_probe = MSG::default();
-        // SAFETY: `queue_probe` is a valid out-parameter and PM_NOREMOVE only
-        // initializes this current thread's message queue.
-        unsafe {
-            let _ = PeekMessageW(&mut queue_probe, None, 0, 0, PM_NOREMOVE);
-        }
+        let owner_thread = super::native::prepare_thread_message_queue();
         // The hook is synchronous, so at most a small bounded burst can be
         // outstanding. Preallocate the queue instead of growing an unbounded
         // linked channel on physical key edges.
@@ -466,11 +462,7 @@ impl HookThread {
         }
         let mut stop_posted = true;
         if self.thread_id != 0 {
-            if let Err(error) =
-                // SAFETY: `thread_id` belongs to the live hook message loop and
-                // WM_QUIT carries no pointer payload.
-                unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) }
-            {
+            if let Err(error) = super::native::post_thread_message(self.thread_id, WM_QUIT, 0) {
                 stop_posted = false;
                 crate::app::logging::report_error(
                     "windows-hook",
@@ -508,7 +500,6 @@ fn hook_thread(
     ready: SyncSender<Result<u32, String>>,
     wake_thread: u32,
 ) {
-    let slot = EVENT_SENDER.get_or_init(|| Mutex::new(None));
     // SAFETY: the callback has the required ABI, is process-lifetime code, and
     // the resulting handle is immediately placed in its thread-bound guard.
     let keyboard_hook = match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), None, 0) }
@@ -529,23 +520,13 @@ fn hook_thread(
             return;
         }
     };
-    let thread_id = super::native::current_thread_id();
+    let thread_id = super::native::prepare_thread_message_queue();
     HOOK_THREAD.store(thread_id, Ordering::Release);
-    let mut queue_probe = MSG::default();
-    // SAFETY: `queue_probe` is a valid out-parameter and PM_NOREMOVE only
-    // ensures this current hook thread owns an initialized message queue.
-    unsafe {
-        let _ = PeekMessageW(&mut queue_probe, None, 0, 0, PM_NOREMOVE);
-    }
-    if let Ok(mut current) = slot.lock() {
-        *current = Some(EventSink { sender, mailbox });
-    }
+    EVENT_SINK.with(|current| *current.borrow_mut() = Some(EventSink { sender, mailbox }));
     WAKE_THREAD.store(wake_thread, Ordering::Release);
     POINTER_PENDING.store(0, Ordering::Release);
     if ready.send(Ok(thread_id)).is_err() {
-        if let Ok(mut current) = slot.lock() {
-            *current = None;
-        }
+        EVENT_SINK.with(|current| current.borrow_mut().take());
         WAKE_THREAD.store(0, Ordering::Release);
         HOOK_THREAD.store(0, Ordering::Release);
         return;
@@ -553,9 +534,7 @@ fn hook_thread(
 
     let mut message = MSG::default();
     loop {
-        // SAFETY: `message` is writable for the duration of the synchronous
-        // call and this function owns the current thread's message loop.
-        let status = unsafe { GetMessageW(&mut message, None, 0, 0) }.0;
+        let status = super::native::get_window_message(&mut message);
         if status == 0 {
             break;
         }
@@ -616,27 +595,19 @@ fn hook_thread(
             generation: None,
         });
     }
-    if let Ok(mut current) = slot.lock() {
-        *current = None;
-    }
+    EVENT_SINK.with(|current| current.borrow_mut().take());
     WAKE_THREAD.store(0, Ordering::Release);
     HOOK_THREAD.store(0, Ordering::Release);
     POINTER_PENDING.store(0, Ordering::Release);
 }
 
 fn send_envelope(envelope: Envelope) -> bool {
-    let Some(slot) = EVENT_SENDER.get() else {
-        return false;
-    };
-    let delivered = {
-        let Ok(sender) = slot.try_lock() else {
-            return false;
-        };
-        let Some(sender) = sender.as_ref() else {
-            return false;
-        };
-        try_deliver(&sender.sender, envelope)
-    };
+    let delivered = EVENT_SINK.with(|current| {
+        current
+            .borrow()
+            .as_ref()
+            .is_some_and(|sink| try_deliver(&sink.sender, envelope))
+    });
     if !delivered {
         return false;
     }
@@ -645,9 +616,8 @@ fn send_envelope(envelope: Envelope) -> bool {
 }
 
 fn begin_disposition(event: BackendEvent) -> Option<(Arc<DispositionMailbox>, u64)> {
-    let slot = EVENT_SENDER.get()?;
-    let (mailbox, generation) = {
-        let sink = slot.try_lock().ok()?;
+    let result = EVENT_SINK.with(|current| {
+        let sink = current.borrow();
         let sink = sink.as_ref()?;
         let generation = sink.mailbox.begin();
         try_deliver(
@@ -658,9 +628,10 @@ fn begin_disposition(event: BackendEvent) -> Option<(Arc<DispositionMailbox>, u6
             },
         )
         .then(|| (Arc::clone(&sink.mailbox), generation))?
-    };
+        .into()
+    });
     wake_owner();
-    Some((mailbox, generation))
+    result
 }
 
 #[inline(always)]
@@ -688,12 +659,8 @@ fn wake_owner() {
     if wake_thread == 0 {
         return;
     }
-    // SAFETY: `wake_thread` is the initialized Engine queue and the wake
-    // message carries no borrowed pointer.
-    unsafe {
-        if PostThreadMessageW(wake_thread, WAKE_MESSAGE, WPARAM(0), LPARAM(0)).is_err() {
-            WAKE_FAILED.store(true, Ordering::Release);
-        }
+    if super::native::post_thread_message(wake_thread, WAKE_MESSAGE, 0).is_err() {
+        WAKE_FAILED.store(true, Ordering::Release);
     }
 }
 
@@ -708,8 +675,15 @@ fn store_latest_pointer(point: Point) {
     LATEST_POINTER.store(x | (y << 32), Ordering::Relaxed);
     fence(Ordering::Release);
     POINTER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    if mark_pointer_pending() {
+    if POINTER_WAKE_ENABLED.load(Ordering::Relaxed) && mark_pointer_pending() {
         wake_owner();
+    }
+}
+
+pub(super) fn set_pointer_wake_enabled(enabled: bool) {
+    POINTER_WAKE_ENABLED.store(enabled, Ordering::Release);
+    if !enabled {
+        POINTER_PENDING.store(0, Ordering::Release);
     }
 }
 
@@ -776,9 +750,7 @@ fn update_pressed_state(virtual_key: u32, state: KeyState) -> bool {
 
 unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code < 0 {
-        // SAFETY: forwarding the unchanged callback arguments is required by
-        // the hook contract when `code` is negative.
-        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+        return super::native::call_next_hook(code, wparam, lparam);
     }
 
     // SAFETY: for a non-negative low-level keyboard callback Windows supplies
@@ -788,13 +760,11 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     // accessibility tools and software keyboards also set the Windows
     // injected flag; those inputs are user-owned and must remain bindable.
     if is_our_input(info.dwExtraInfo) {
-        // SAFETY: the original callback arguments remain valid and unchanged.
-        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+        return super::native::call_next_hook(code, wparam, lparam);
     }
 
     let Some(key) = input::key_for_virtual_key(info.vkCode) else {
-        // SAFETY: the original callback arguments remain valid and unchanged.
-        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+        return super::native::call_next_hook(code, wparam, lparam);
     };
     let is_modifier = key.is_modifier();
     let state = if info.flags.0 & LLKHF_UP.0 != 0 {
@@ -843,8 +813,7 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         KeyDisposition::Consume => return LRESULT(1),
         KeyDisposition::Defer | KeyDisposition::Forward => {}
     }
-    // SAFETY: the original callback arguments remain valid and unchanged.
-    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+    super::native::call_next_hook(code, wparam, lparam)
 }
 
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -854,8 +823,7 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
         store_latest_pointer(Point::new(info.pt.x as f64, info.pt.y as f64));
     }
-    // SAFETY: the original callback arguments remain valid and unchanged.
-    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+    super::native::call_next_hook(code, wparam, lparam)
 }
 
 #[cfg(test)]
@@ -1100,6 +1068,7 @@ mod tests {
 
     #[test]
     fn pointer_burst_uses_one_latest_value_slot() {
+        POINTER_WAKE_ENABLED.store(true, Ordering::Release);
         POINTER_PENDING.store(0, Ordering::Release);
         assert!(mark_pointer_pending());
         assert!(
@@ -1116,6 +1085,15 @@ mod tests {
         // A repeated edge position is still a real native event.
         store_latest_pointer(Point::new(1920.0, 1080.0));
         assert_eq!(take_latest_pointer(), Some(Point::new(1920.0, 1080.0)));
+        POINTER_WAKE_ENABLED.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn idle_pointer_updates_latest_value_without_waking_engine() {
+        POINTER_WAKE_ENABLED.store(false, Ordering::Release);
+        POINTER_PENDING.store(0, Ordering::Release);
+        store_latest_pointer(Point::new(321.0, 654.0));
+        assert_eq!(POINTER_PENDING.load(Ordering::Acquire), 0);
     }
 }
 

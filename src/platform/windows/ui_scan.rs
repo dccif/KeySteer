@@ -162,7 +162,7 @@ impl ScanSource {
 impl Drop for ScanSource {
     fn drop(&mut self) {
         if !self.complete {
-            crate::log_warning!(
+            crate::report_warning!(
                 "windows-ui-scan",
                 "{} provider exited without a terminal status",
                 self.name
@@ -203,34 +203,33 @@ fn combined_status(statuses: &[UiScanStatus]) -> UiScanStatus {
         .unwrap_or(UiScanStatus::Success)
 }
 
-#[derive(Clone)]
-struct IndexedRect {
-    rect: Rect,
-}
-
 struct SpatialIndex {
     cell_size: f64,
+    minimum_spacing: f64,
     iou_threshold: f64,
-    count: usize,
-    cells: HashMap<(i32, i32), SmallVec<[IndexedRect; 4]>>,
-    large: Vec<IndexedRect>,
-    all: Vec<IndexedRect>,
+    cells: HashMap<(i32, i32), SmallVec<[usize; 4]>>,
+    oversize: SmallVec<[usize; 16]>,
+    rects: Vec<Rect>,
+    marks: Vec<u32>,
+    query_generation: u32,
 }
 
 impl SpatialIndex {
-    fn new(cell_size: f64, iou_threshold: f64) -> Self {
+    fn new(minimum_spacing: f64, iou_threshold: f64) -> Self {
         Self {
-            cell_size: cell_size.max(1.0),
+            cell_size: 64.0,
+            minimum_spacing: minimum_spacing.max(1.0),
             iou_threshold,
-            count: 0,
             cells: HashMap::new(),
-            large: Vec::new(),
-            all: Vec::new(),
+            oversize: SmallVec::new(),
+            rects: Vec::new(),
+            marks: Vec::new(),
+            query_generation: 0,
         }
     }
 
     fn len(&self) -> usize {
-        self.count
+        self.rects.len()
     }
 
     fn insert(&mut self, target: &UiTarget) -> bool {
@@ -238,44 +237,70 @@ impl SpatialIndex {
         if !usable_rect(rect) {
             return false;
         }
-        let center = rect.center();
-        let cell = self.cell(center.x, center.y);
-        let is_large = rect.width > self.cell_size * 2.0 || rect.height > self.cell_size * 2.0;
-        let broad_matches = if is_large { &self.all } else { &self.large };
-        if broad_matches
-            .iter()
-            .any(|entry| rectangles_match(entry.rect, rect, self.iou_threshold, self.cell_size))
-        {
-            return false;
-        }
-        for y in cell.1.saturating_sub(1)..=cell.1.saturating_add(1) {
-            for x in cell.0.saturating_sub(1)..=cell.0.saturating_add(1) {
-                if self.cells.get(&(x, y)).is_some_and(|entries| {
-                    entries.iter().any(|entry| {
-                        rectangles_match(entry.rect, rect, self.iou_threshold, self.cell_size)
-                    })
-                }) {
-                    return false;
+        let range = self.covered_cells(rect);
+        let cell_count =
+            i64::from(range.2 - range.0 + 1).saturating_mul(i64::from(range.3 - range.1 + 1));
+        let oversize = cell_count > 32;
+        self.next_query_generation();
+        let mut candidates = SmallVec::<[usize; 64]>::new();
+        candidates.extend(self.oversize.iter().copied());
+        if oversize {
+            candidates.extend(0..self.rects.len());
+        } else {
+            for y in range.1..=range.3 {
+                for x in range.0..=range.2 {
+                    if let Some(entries) = self.cells.get(&(x, y)) {
+                        candidates.extend(entries.iter().copied());
+                    }
                 }
             }
         }
-        self.cells
-            .entry(cell)
-            .or_default()
-            .push(IndexedRect { rect });
-        if is_large {
-            self.large.push(IndexedRect { rect });
+        for candidate in candidates {
+            if self.marks[candidate] == self.query_generation {
+                continue;
+            }
+            self.marks[candidate] = self.query_generation;
+            if rectangles_match(
+                self.rects[candidate],
+                rect,
+                self.iou_threshold,
+                self.minimum_spacing,
+            ) {
+                return false;
+            }
         }
-        self.all.push(IndexedRect { rect });
-        self.count += 1;
+        let index = self.rects.len();
+        self.rects.push(rect);
+        self.marks.push(0);
+        if oversize {
+            self.oversize.push(index);
+        } else {
+            for y in range.1..=range.3 {
+                for x in range.0..=range.2 {
+                    self.cells.entry((x, y)).or_default().push(index);
+                }
+            }
+        }
         true
     }
 
-    fn cell(&self, x: f64, y: f64) -> (i32, i32) {
+    fn covered_cells(&self, rect: Rect) -> (i32, i32, i32, i32) {
+        let spacing = self.minimum_spacing;
+        let cell = |value: f64| (value / self.cell_size).floor() as i32;
         (
-            (x / self.cell_size).floor() as i32,
-            (y / self.cell_size).floor() as i32,
+            cell(rect.x - spacing),
+            cell(rect.y - spacing),
+            cell(rect.right() + spacing),
+            cell(rect.bottom() + spacing),
         )
+    }
+
+    fn next_query_generation(&mut self) {
+        self.query_generation = self.query_generation.wrapping_add(1);
+        if self.query_generation == 0 {
+            self.marks.fill(0);
+            self.query_generation = 1;
+        }
     }
 }
 

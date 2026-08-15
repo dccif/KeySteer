@@ -20,10 +20,11 @@ main.rs
 Windows 二进制默认无控制台；只有携带 CLI 参数时才尝试附加父控制台。无配置文件不是
 错误：程序使用 `Config::default()` 静默进入托盘/菜单栏和 `idle`。
 
-诊断统一经过 `app::logging`：`report_error` 与 panic 不受 debug 配置控制，始终写入并
+诊断统一经过 `app::logging`：`report_error!`/`report_error` 与 panic 不受 debug 配置控制，始终写入 stderr 和日志文件并
 立即 flush；debug/info/warning（包括 `report_warning`）继续受 `debug.enabled` 控制。
 首选日志目录不可写时退到系统临时目录的 `KeySteer/keysteer.log`，并把这次降级本身
-记录为 ERROR。除日志模块自身的 I/O 故障和 CLI 最后兜底外，应用代码不得直接写 stderr。
+记录为 ERROR。包括 CLI 在内的应用代码不得直接写 stderr；初始化和日志 I/O 失败也只能
+通过 `logging.rs` 内部的 emergency console 路径输出。
 
 ## API 边界
 

@@ -84,7 +84,7 @@ unsafe extern "system" fn enum_callback(
     };
     if !ok.as_bool() {
         // Skip this monitor but keep enumerating the rest.
-        crate::log_warning!(
+        crate::report_warning!(
             "windows-screen",
             "GetMonitorInfoW failed for monitor {monitor:?}"
         );
@@ -98,7 +98,7 @@ unsafe extern "system" fn enum_callback(
         // pointers refer to initialized writable integers.
         unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }
     {
-        crate::log_warning!(
+        crate::report_warning!(
             "windows-screen",
             "GetDpiForMonitor failed; using 96 DPI: {error}"
         );
@@ -134,7 +134,7 @@ pub fn primary_scale() -> f64 {
         // pointers refer to initialized writable integers.
         unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }
     {
-        crate::log_warning!(
+        crate::report_warning!(
             "windows-screen",
             "primary GetDpiForMonitor failed; using 96 DPI: {error}"
         );

@@ -95,7 +95,7 @@ impl EventSender {
         if self.wake_thread != 0
             && let Err(error) = native::post_thread_wake(self.wake_thread, WAKE_MESSAGE)
         {
-            crate::log_warning!(
+            crate::report_warning!(
                 "windows-events",
                 "cannot wake engine for asynchronous event: {error}"
             );
@@ -123,6 +123,7 @@ pub struct WindowsBackend {
     vision: vision::VisionWorker,
     update_worker: Option<crate::app::update::UpdateWorker>,
     held_buttons: Cell<u8>,
+    shutdown_complete: bool,
 }
 
 impl WindowsBackend {
@@ -135,7 +136,7 @@ impl WindowsBackend {
         // systems keep DXGI's compatible virtualized cadence.
         frame_clock::prefer_dynamic_vblank();
         if let Err(error) = native::prefer_input_latency() {
-            crate::log_warning!(
+            crate::report_warning!(
                 "windows-input",
                 "cannot raise engine thread priority: {error}"
             );
@@ -182,7 +183,7 @@ impl WindowsBackend {
             );
             Vec::new()
         });
-        let vision = vision::VisionWorker::start()?;
+        let vision = vision::VisionWorker::start();
         Ok(Self {
             hook: None,
             overlay,
@@ -201,6 +202,7 @@ impl WindowsBackend {
             vision,
             update_worker: None,
             held_buttons: Cell::new(0),
+            shutdown_complete: false,
         })
     }
 
@@ -262,6 +264,8 @@ impl WindowsBackend {
     }
 
     fn try_event(&mut self) -> Result<Option<BackendEvent>, String> {
+        self.vision.begin_discovery();
+        self.vision.reap_finished();
         // Synchronous hook callbacks are blocked waiting for disposition, so
         // physical input must outrank scans, tray events and frame clocks.
         if let Some(event) = self.next_hook_event()? {
@@ -339,49 +343,52 @@ impl WindowsBackend {
     /// active provider call, drop its COM interfaces, and call
     /// `CoUninitialize` on the worker thread before it is joined.
     fn shutdown_resources(&mut self) -> Result<(), String> {
+        if self.shutdown_complete {
+            return Ok(());
+        }
         let mut first_error = None;
+        let record = |first_error: &mut Option<String>, stage: &str, error: String| {
+            let message = format!("{stage}: {error}");
+            if first_error.is_none() {
+                *first_error = Some(message);
+            } else {
+                crate::report_error!("windows-backend", "cleanup failure: {message}");
+            }
+        };
         if let Some(worker) = self.update_worker.as_mut() {
             match worker.cancel_and_wait() {
                 Ok(()) => {
                     self.update_worker.take();
                 }
-                Err(error) => first_error = Some(error),
+                Err(error) => record(&mut first_error, "update worker", error),
             }
         }
         // Stop visual providers before tearing down the hook and overlay. The
         // vision worker cancels WinRT OCR, terminates the optional WeChat
         // helper, and joins pure-Rust fallback work before returning.
-        if let Err(error) = self.vision.stop()
-            && first_error.is_none()
-        {
-            first_error = Some(error);
+        if let Err(error) = self.vision.stop() {
+            record(&mut first_error, "vision worker", error);
         }
         if let Some(worker) = self.ui_automation.as_mut() {
             match worker.stop() {
                 Ok(()) => {
                     self.ui_automation.take();
                 }
-                Err(error) if first_error.is_none() => first_error = Some(error),
-                Err(_) => {}
+                Err(error) => record(&mut first_error, "UI Automation worker", error),
             }
         }
-        if let Err(error) = self.release_held_buttons()
-            && first_error.is_none()
-        {
-            first_error = Some(error);
+        if let Err(error) = self.release_held_buttons() {
+            record(&mut first_error, "held mouse buttons", error);
         }
-        if let Err(error) = self.frame_clock.stop()
-            && first_error.is_none()
-        {
-            first_error = Some(error);
+        if let Err(error) = self.frame_clock.stop() {
+            record(&mut first_error, "frame clock", error);
         }
         if let Some(hook) = self.hook.as_mut() {
             match hook.stop() {
                 Ok(()) => {
                     self.hook.take();
                 }
-                Err(error) if first_error.is_none() => first_error = Some(error),
-                Err(_) => {}
+                Err(error) => record(&mut first_error, "input hook", error),
             }
         }
         if let Some(status_item) = self.status_item.as_mut() {
@@ -389,26 +396,22 @@ impl WindowsBackend {
                 Ok(()) => {
                     self.status_item.take();
                 }
-                Err(error) if first_error.is_none() => first_error = Some(error),
-                Err(_) => {}
+                Err(error) => record(&mut first_error, "tray worker", error),
             }
         }
         self.foreground_watcher.take();
-        if let Err(error) = self.overlay.dismiss()
-            && first_error.is_none()
-        {
-            first_error = Some(error);
+        if let Err(error) = self.overlay.dismiss() {
+            record(&mut first_error, "overlay dismiss", error);
         }
-        if let Err(error) = self.overlay.shutdown()
-            && first_error.is_none()
-        {
-            first_error = Some(error);
+        if let Err(error) = self.overlay.shutdown() {
+            record(&mut first_error, "overlay shutdown", error);
         }
         if first_error.is_none() {
             if let Some(control) = self.console_control.as_ref() {
                 control.mark_shutdown_complete();
             }
             self.console_control.take();
+            self.shutdown_complete = true;
         }
         first_error.map_or(Ok(()), Err)
     }
@@ -585,6 +588,7 @@ impl Backend for WindowsBackend {
     }
 
     fn set_frame_clock(&mut self, active: bool) -> Result<(), String> {
+        hook::set_pointer_wake_enabled(active);
         if active {
             if let Ok(pointer) = input::cursor_position() {
                 self.frame_clock.retarget(pointer.x, pointer.y);
@@ -596,6 +600,7 @@ impl Backend for WindowsBackend {
     }
 
     fn present(&mut self, scene: Arc<OverlayScene>) -> Result<(), String> {
+        hook::set_pointer_wake_enabled(true);
         let area = scene.clip.unwrap_or_else(|| self.virtual_bounds());
         let center = area.center();
         let scale = self
@@ -617,6 +622,7 @@ impl Backend for WindowsBackend {
     }
 
     fn dismiss(&mut self) -> Result<(), String> {
+        hook::set_pointer_wake_enabled(false);
         self.overlay.dismiss()
     }
 
@@ -636,6 +642,17 @@ impl Backend for WindowsBackend {
         }
         let request_id = request.id;
         let generation = self.scan_mailbox.begin(request.id);
+        let capture = if wants_vision {
+            match self.overlay.begin_capture(generation) {
+                Ok(capture) => Some(capture),
+                Err(error) => {
+                    self.scan_mailbox.cancel(request_id);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         let sources = usize::from(wants_uia) + usize::from(wants_vision);
         let session = ui_scan::ScanSession::new(
             request.id,
@@ -653,13 +670,21 @@ impl Backend for WindowsBackend {
                 worker.submit(request.clone(), generation, session.source("UI Automation"))?;
             }
             if wants_vision {
-                self.vision
-                    .submit(request, generation, session.source("visual scan"))?;
+                self.vision.submit(
+                    request,
+                    generation,
+                    session.source("visual scan"),
+                    capture.ok_or_else(|| "visual capture lease was not created".to_string())?,
+                )?;
             }
             Ok(())
         })();
         if result.is_err() {
             self.scan_mailbox.cancel(request_id);
+            if let Some(worker) = self.ui_automation.as_ref() {
+                worker.cancel(request_id);
+            }
+            self.vision.cancel(request_id);
         }
         result
     }
@@ -744,7 +769,7 @@ fn focused_app_for(hwnd: HWND, window_title: String) -> FocusedApp {
         match native::process_executable_name(process_id) {
             Some(name) => name,
             None => {
-                crate::log_warning!(
+                crate::report_warning!(
                     "windows-focus",
                     "cannot resolve executable name for foreground pid {process_id}"
                 );

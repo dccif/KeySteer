@@ -134,7 +134,7 @@ fn send_mouse_batch(
         Ok(MouseBatchPath::Atomic) => Ok(()),
         Ok(MouseBatchPath::Individual { batch_failure }) => {
             if !MOUSE_EDGE_FALLBACK_REPORTED.swap(true, Ordering::Relaxed) {
-                crate::log_warning!(
+                crate::report_warning!(
                     "windows-input",
                     "SendInput rejected atomic mouse batch button={button:?} action={action:?} events={} with last_error=0x{:08X}; all individual-event compatibility attempts succeeded",
                     batch_failure.expected,

@@ -4,6 +4,8 @@
 
 Windows DirectComposition 保持设备、字体和紧致 cursor/indicator surface 预热，但 cursor-only Normal 不创建全屏 static surface。只有 backdrop、shape 或 label 存在时才挂载 static visual；回到无静态内容时立即释放 screen-sized surface。
 
+Windows OCR 不属于预热常驻集。Backend ready 后首次事件轮询派发的 discovery 只缓存能力与路径，临时 `OcrEngine`/COM 在探测线程结束前释放；视觉 coordinator、截图、`SoftwareBitmap`、fallback scratch、微信 helper/reader 和临时 PNG 都是 generation-scoped，并在 terminal 结果进入 Engine 前完成清理。Idle working set 仍会包含预热的 DirectComposition/D3D/字体资源，不能用 `SetProcessWorkingSetSize` 人为压低任务管理器数字。
+
 热路径使用 inline storage：`CommandBatch` 的 0/1/2 命令不分配，Normal held-key map inline 4 项，Grid/Recursive stack/path inline 12 项，继承 visited inline 8 项。
 
 ## 提交模型
@@ -57,10 +59,12 @@ mode scene，也不重建静态 Grid/Hint 内容。latched 的真实按钮状态
 - 静态 surface 只在静态 scene 或覆盖区域原点变化时访问和重绘；区域不变的逐帧提交不会
   重复调用全屏 `SetWindowPos`，也不会为静态 surface 产生 COM AddRef/Release。
 - GPU HWND 使用 `WS_EX_LAYERED | WS_EX_TRANSPARENT | NOACTIVATE | TOOLWINDOW | TOPMOST`；layered + transparent 才保证跨进程点击穿透，`HTTRANSPARENT` 仅作为额外防线，因为它只能继续命中同线程窗口。
+- overlay 不使用 capture affinity。视觉扫描控制优先于普通帧：generation gate 期间完整帧和位置更新各只保留最新一份，GPU 清空 tree 后等待 commit、CPU 销毁 layered HWND，随后用 `DwmFlush` 确认隐藏；Engine、Hook 和普通 overlay 提交路径不等待该屏障。
 - 渲染线程使用 Win32 消息队列作为 latest-frame/control 唤醒源；即使 normal 覆盖层静止也会
   持续响应窗口消息，并对 `WM_NCHITTEST` 返回 `HTTRANSPARENT`。禁止让全屏 HWND 在
   Condvar/普通 channel 上无限等待，否则 Windows 会将其判为挂起并阻塞底层窗口输入。
 - Hide 销毁 HWND/visual/surface，只保留轻量 device、brush 和字体描述缓存。
+- Idle 的物理鼠标移动只更新 Hook 的原子 latest-pointer，不唤醒 Engine；进入非 Idle 模式前由 Engine 调用 `Backend::pointer()` 刷新权威坐标。Hook 的事件 sink 是线程私有状态，不在每个按键边缘获取全局 mutex。
 - Windows 高 DPI 标签缩放由渲染线程按“源标签共享存储 + scale”缓存。cursor/indicator
   更新复用已缩放静态标签；源场景变化、缩放变化时才重建。进入空场景、回到 100%
   缩放、Hide 和 Shutdown 都会清空该缓存，不能把上一张大型 Grid 留在 Normal 中。

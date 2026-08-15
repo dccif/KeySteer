@@ -36,11 +36,10 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Graphics::Dxgi::{IDXGIDevice, IDXGISurface};
 use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, HCURSOR, HICON,
-    HWND_TOPMOST, LWA_ALPHA, RegisterClassExW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-    SetLayeredWindowAttributes, SetWindowDisplayAffinity, SetWindowPos, ShowWindow,
-    WDA_EXCLUDEFROMCAPTURE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DestroyWindow, HCURSOR, HICON, HWND_TOPMOST,
+    LWA_ALPHA, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SetLayeredWindowAttributes, SetWindowPos,
+    ShowWindow, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{Interface, PCWSTR, w};
 use windows_numerics::Vector2;
@@ -333,7 +332,10 @@ impl GpuOverlay {
             self.content = None;
             self.dcomp
                 .Commit()
-                .map_err(|error| format!("DirectComposition dismiss commit failed: {error}"))
+                .map_err(|error| format!("DirectComposition dismiss commit failed: {error}"))?;
+            self.dcomp.WaitForCommitCompletion().map_err(|error| {
+                format!("DirectComposition did not confirm the hidden tree: {error}")
+            })
         }
     }
 
@@ -446,18 +448,7 @@ impl GpuOverlay {
             hbrBackground: HBRUSH::default(),
             ..Default::default()
         };
-        // SAFETY: all fields above are initialized and the callback obeys the
-        // Win32 ABI without allowing a Rust panic to cross it.
-        if unsafe { RegisterClassExW(&class) } == 0 {
-            // SAFETY: GetLastError has no preconditions.
-            let last = unsafe { windows::Win32::Foundation::GetLastError() };
-            if last.0 != 1410 {
-                return Err(format!(
-                    "RegisterClassExW failed: {}",
-                    windows::core::Error::from_hresult(last.to_hresult())
-                ));
-            }
-        }
+        super::native::register_window_class(&class)?;
         self.class_registered = true;
         Ok(())
     }
@@ -1017,12 +1008,6 @@ fn create_window(area: Rect) -> Result<HWND, String> {
             let _ = DestroyWindow(hwnd);
             return Err(format!("SetLayeredWindowAttributes failed: {error}"));
         }
-        if let Err(error) = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) {
-            crate::log_warning!(
-                "windows-overlay",
-                "cannot exclude GPU overlay from capture: {error}"
-            );
-        }
         hwnd
     };
     Ok(hwnd)
@@ -1141,9 +1126,7 @@ unsafe extern "system" fn window_proc(
     if let Some(result) = super::native::click_through_hit_test(message) {
         return result;
     }
-    // SAFETY: no Rust state is accessed and `DefWindowProcW` receives the exact
-    // arguments supplied by Windows; no unwind crosses the callback boundary.
-    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+    super::native::default_window_proc(hwnd, message, wparam, lparam)
 }
 
 #[cfg(test)]

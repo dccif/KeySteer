@@ -1,11 +1,13 @@
 //! Minimal Win32 safety boundary for process-wide utilities.
 
+use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::path::Path;
+use std::ptr::NonNull;
 use std::rc::Rc;
 
 use windows::Win32::Foundation::{HANDLE, HWND};
-use windows::Win32::Graphics::Gdi::{HDC, HGDIOBJ};
+use windows::Win32::Graphics::Gdi::{HBITMAP, HDC, HGDIOBJ};
 
 pub(crate) struct ComApartment(PhantomData<Rc<()>>);
 
@@ -38,6 +40,209 @@ pub(crate) struct CapturedBgra {
     pub(crate) height: u32,
 }
 
+thread_local! {
+    static CAPTURE_SURFACE: RefCell<Option<CaptureSurface>> = const { RefCell::new(None) };
+}
+
+struct ScreenDc(HDC);
+
+impl ScreenDc {
+    fn acquire() -> Result<Self, String> {
+        use windows::Win32::Graphics::Gdi::GetDC;
+
+        // SAFETY: a null HWND requests the desktop DC. This guard balances the
+        // successful acquisition on the same visual worker thread.
+        let dc = unsafe { GetDC(None) };
+        if dc.is_invalid() {
+            Err("GetDC failed for visual capture".into())
+        } else {
+            Ok(Self(dc))
+        }
+    }
+}
+
+impl Drop for ScreenDc {
+    fn drop(&mut self) {
+        use windows::Win32::Graphics::Gdi::ReleaseDC;
+
+        // SAFETY: this is the exact desktop DC acquired by `ScreenDc::acquire`.
+        if unsafe { ReleaseDC(None, self.0) } == 0 {
+            crate::app::logging::report_error(
+                "windows-native",
+                "ReleaseDC failed for visual capture",
+            );
+        }
+    }
+}
+
+struct CaptureSurface {
+    memory: HDC,
+    bitmap: HBITMAP,
+    previous: HGDIOBJ,
+    bits: NonNull<u8>,
+    dimensions: NativeDimensions,
+    _thread: PhantomData<Rc<()>>,
+}
+
+impl CaptureSurface {
+    fn new(screen: HDC, dimensions: NativeDimensions) -> Result<Self, String> {
+        use windows::Win32::Graphics::Gdi::{
+            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection,
+            DIB_RGB_COLORS, DeleteDC, DeleteObject, SelectObject,
+        };
+
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: dimensions.width_i32(),
+                biHeight: -dimensions.height_i32(),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut raw_bits = std::ptr::null_mut();
+        // SAFETY: all GDI objects created here either transfer into the guard
+        // or are destroyed before returning an error. The selected top-down
+        // DIB remains selected until Drop restores `previous`.
+        unsafe {
+            let memory = CreateCompatibleDC(Some(screen));
+            if memory.is_invalid() {
+                return Err("CreateCompatibleDC failed".into());
+            }
+            let bitmap =
+                match CreateDIBSection(Some(screen), &info, DIB_RGB_COLORS, &mut raw_bits, None, 0)
+                {
+                    Ok(bitmap) => bitmap,
+                    Err(error) => {
+                        if !DeleteDC(memory).as_bool() {
+                            crate::app::logging::report_error(
+                                "windows-native",
+                                "cannot delete failed GDI capture DC",
+                            );
+                        }
+                        return Err(format!("CreateDIBSection failed: {error}"));
+                    }
+                };
+            let Some(bits) = NonNull::new(raw_bits.cast::<u8>()) else {
+                if !DeleteObject(HGDIOBJ(bitmap.0)).as_bool() {
+                    crate::app::logging::report_error(
+                        "windows-native",
+                        "cannot delete null-buffer GDI capture bitmap",
+                    );
+                }
+                if !DeleteDC(memory).as_bool() {
+                    crate::app::logging::report_error(
+                        "windows-native",
+                        "cannot delete null-buffer GDI capture DC",
+                    );
+                }
+                return Err("CreateDIBSection returned a null pixel buffer".into());
+            };
+            let previous = SelectObject(memory, HGDIOBJ(bitmap.0));
+            if previous.0.is_null() || previous.0 as usize == usize::MAX {
+                if !DeleteObject(HGDIOBJ(bitmap.0)).as_bool() {
+                    crate::app::logging::report_error(
+                        "windows-native",
+                        "cannot delete unselected GDI capture bitmap",
+                    );
+                }
+                if !DeleteDC(memory).as_bool() {
+                    crate::app::logging::report_error(
+                        "windows-native",
+                        "cannot delete unselected GDI capture DC",
+                    );
+                }
+                return Err("SelectObject failed for visual capture".into());
+            }
+            Ok(Self {
+                memory,
+                bitmap,
+                previous,
+                bits,
+                dimensions,
+                _thread: PhantomData,
+            })
+        }
+    }
+
+    fn copy_from(
+        &mut self,
+        screen: HDC,
+        source_x: i32,
+        source_y: i32,
+        source_width: i32,
+        source_height: i32,
+    ) -> Result<CapturedBgra, String> {
+        use windows::Win32::Graphics::Gdi::{
+            CAPTUREBLT, HALFTONE, SRCCOPY, SetStretchBltMode, StretchBlt,
+        };
+
+        // SAFETY: the cached DC owns a selected DIB of `dimensions`; StretchBlt
+        // completes before its validated bytes are copied into the result Vec.
+        unsafe {
+            SetStretchBltMode(self.memory, HALFTONE);
+            if !StretchBlt(
+                self.memory,
+                0,
+                0,
+                self.dimensions.width_i32(),
+                self.dimensions.height_i32(),
+                Some(screen),
+                source_x,
+                source_y,
+                source_width,
+                source_height,
+                SRCCOPY | CAPTUREBLT,
+            )
+            .as_bool()
+            {
+                return Err(format!(
+                    "StretchBlt failed for visual capture: {}",
+                    windows::core::Error::from_thread()
+                ));
+            }
+            let pixels =
+                std::slice::from_raw_parts(self.bits.as_ptr(), self.dimensions.byte_len()).to_vec();
+            Ok(CapturedBgra {
+                pixels,
+                width: self.dimensions.width_u32(),
+                height: self.dimensions.height_u32(),
+            })
+        }
+    }
+}
+
+impl Drop for CaptureSurface {
+    fn drop(&mut self) {
+        use windows::Win32::Graphics::Gdi::{DeleteDC, DeleteObject, SelectObject};
+
+        // SAFETY: the guard owns these objects on this thread; restore the
+        // previous selection before destroying the DIB and compatible DC.
+        let (restored, bitmap_deleted, dc_deleted) = unsafe {
+            (
+                SelectObject(self.memory, self.previous),
+                DeleteObject(HGDIOBJ(self.bitmap.0)).as_bool(),
+                DeleteDC(self.memory).as_bool(),
+            )
+        };
+        if restored.0.is_null() || restored.0 as usize == usize::MAX {
+            crate::app::logging::report_error(
+                "windows-native",
+                "cannot restore selected GDI capture object",
+            );
+        }
+        if !bitmap_deleted {
+            crate::app::logging::report_error("windows-native", "cannot delete GDI capture bitmap");
+        }
+        if !dc_deleted {
+            crate::app::logging::report_error("windows-native", "cannot delete GDI capture DC");
+        }
+    }
+}
+
 pub(crate) fn capture_bgra(
     source_x: i32,
     source_y: i32,
@@ -46,83 +251,26 @@ pub(crate) fn capture_bgra(
     width: i32,
     height: i32,
 ) -> Result<CapturedBgra, String> {
-    use windows::Win32::Graphics::Gdi::{
-        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CAPTUREBLT, CreateCompatibleDC, CreateDIBSection,
-        DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HALFTONE, HGDIOBJ, ReleaseDC, SRCCOPY,
-        SelectObject, SetStretchBltMode, StretchBlt,
-    };
-
     let dimensions = NativeDimensions::from_usize(width as usize, height as usize)?;
-    let info = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: width,
-            biHeight: -height,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let mut bits = std::ptr::null_mut();
-    // SAFETY: every acquired DC/bitmap is released on all paths. The selected
-    // top-down DIB remains alive while its validated byte range is copied.
-    unsafe {
-        let screen = GetDC(None);
-        if screen.is_invalid() {
-            return Err("GetDC failed for visual capture".into());
-        }
-        let memory = CreateCompatibleDC(Some(screen));
-        if memory.is_invalid() {
-            let _ = ReleaseDC(None, screen);
-            return Err("CreateCompatibleDC failed".into());
-        }
-        let bitmap = match CreateDIBSection(Some(screen), &info, DIB_RGB_COLORS, &mut bits, None, 0)
+    let screen = ScreenDc::acquire()?;
+    CAPTURE_SURFACE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot
+            .as_ref()
+            .is_none_or(|surface| surface.dimensions != dimensions)
         {
-            Ok(bitmap) => bitmap,
-            Err(error) => {
-                let _ = DeleteDC(memory);
-                let _ = ReleaseDC(None, screen);
-                return Err(format!("CreateDIBSection failed: {error}"));
-            }
-        };
-        let previous = SelectObject(memory, HGDIOBJ(bitmap.0));
-        SetStretchBltMode(memory, HALFTONE);
-        let copied = StretchBlt(
-            memory,
-            0,
-            0,
-            width,
-            height,
-            Some(screen),
-            source_x,
-            source_y,
-            source_width,
-            source_height,
-            SRCCOPY | CAPTUREBLT,
-        )
-        .as_bool();
-        let pixels = if copied && !bits.is_null() {
-            std::slice::from_raw_parts(bits.cast::<u8>(), dimensions.byte_len()).to_vec()
-        } else {
-            Vec::new()
-        };
-        if !previous.is_invalid() {
-            SelectObject(memory, previous);
+            *slot = Some(CaptureSurface::new(screen.0, dimensions)?);
         }
-        let _ = DeleteObject(HGDIOBJ(bitmap.0));
-        let _ = DeleteDC(memory);
-        let _ = ReleaseDC(None, screen);
-        if pixels.len() != dimensions.byte_len() {
-            return Err("StretchBlt failed for visual capture".into());
-        }
-        Ok(CapturedBgra {
-            pixels,
-            width: dimensions.width_u32(),
-            height: dimensions.height_u32(),
-        })
-    }
+        slot.as_mut()
+            .ok_or_else(|| "visual capture surface was not initialized".to_string())?
+            .copy_from(screen.0, source_x, source_y, source_width, source_height)
+    })
+}
+
+pub(crate) fn release_capture_surface() {
+    CAPTURE_SURFACE.with(|slot| {
+        slot.borrow_mut().take();
+    });
 }
 
 pub(crate) fn software_bitmap_bgra(
@@ -130,66 +278,137 @@ pub(crate) fn software_bitmap_bgra(
     width: u32,
     height: u32,
 ) -> Result<windows::Graphics::Imaging::SoftwareBitmap, String> {
-    use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap};
-    use windows::Storage::Streams::Buffer;
-    use windows::Win32::System::WinRT::IBufferByteAccess;
+    use windows::Graphics::Imaging::{
+        BitmapAlphaMode, BitmapBufferAccessMode, BitmapPixelFormat, SoftwareBitmap,
+    };
+    use windows::Win32::System::WinRT::IMemoryBufferByteAccess;
     use windows::core::Interface;
 
     let dimensions = NativeDimensions::from_usize(width as usize, height as usize)?;
     if pixels.len() != dimensions.byte_len() {
         return Err("BGRA byte length does not match bitmap dimensions".into());
     }
-    let length = u32::try_from(pixels.len())
-        .map_err(|_| "captured bitmap is too large for WinRT".to_string())?;
-    let buffer = Buffer::Create(length).map_err(|error| format!("Buffer::Create: {error}"))?;
-    buffer
-        .SetLength(length)
-        .map_err(|error| format!("Buffer::SetLength: {error}"))?;
-    let access: IBufferByteAccess = buffer
-        .cast()
-        .map_err(|error| format!("IBufferByteAccess: {error}"))?;
-    // SAFETY: the WinRT buffer has exactly `length` writable bytes and stays
-    // alive through this non-overlapping copy.
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            pixels.as_ptr(),
-            access
-                .Buffer()
-                .map_err(|error| format!("IBufferByteAccess::Buffer: {error}"))?,
-            pixels.len(),
-        );
-    }
-    SoftwareBitmap::CreateCopyWithAlphaFromBuffer(
-        &buffer,
+    let bitmap = SoftwareBitmap::CreateWithAlpha(
         BitmapPixelFormat::Bgra8,
         dimensions.width_i32(),
         dimensions.height_i32(),
         BitmapAlphaMode::Ignore,
     )
-    .map_err(|error| format!("SoftwareBitmap creation failed: {error}"))
+    .map_err(|error| format!("SoftwareBitmap creation failed: {error}"))?;
+    let buffer = match bitmap.LockBuffer(BitmapBufferAccessMode::Write) {
+        Ok(buffer) => buffer,
+        Err(error) => {
+            let error = format!("cannot lock SoftwareBitmap pixels: {error}");
+            if let Err(close_error) = bitmap.Close() {
+                crate::app::logging::report_error(
+                    "windows-native",
+                    format!("cannot close unlocked SoftwareBitmap: {close_error}"),
+                );
+            }
+            return Err(error);
+        }
+    };
+    let copy = (|| -> Result<(), String> {
+        let plane = buffer
+            .GetPlaneDescription(0)
+            .map_err(|error| format!("cannot describe SoftwareBitmap plane: {error}"))?;
+        let reference = buffer
+            .CreateReference()
+            .map_err(|error| format!("cannot reference SoftwareBitmap memory: {error}"))?;
+        let copied = (|| -> Result<(), String> {
+            let access: IMemoryBufferByteAccess = reference
+                .cast()
+                .map_err(|error| format!("cannot access SoftwareBitmap memory: {error}"))?;
+            let start = usize::try_from(plane.StartIndex)
+                .map_err(|_| "SoftwareBitmap returned a negative start index".to_string())?;
+            let stride = usize::try_from(plane.Stride)
+                .map_err(|_| "SoftwareBitmap returned a negative stride".to_string())?;
+            let bitmap_width = dimensions.width_u32() as usize;
+            let bitmap_height = dimensions.height_u32() as usize;
+            let row_bytes = bitmap_width
+                .checked_mul(4)
+                .ok_or_else(|| "SoftwareBitmap row byte length overflowed".to_string())?;
+            let required = start
+                .checked_add(
+                    stride
+                        .checked_mul(bitmap_height.saturating_sub(1))
+                        .and_then(|offset| offset.checked_add(row_bytes))
+                        .ok_or_else(|| "SoftwareBitmap plane size overflowed".to_string())?,
+                )
+                .ok_or_else(|| "SoftwareBitmap plane range overflowed".to_string())?;
+            let mut destination = std::ptr::null_mut();
+            let mut capacity = 0u32;
+            // SAFETY: `reference` keeps the memory buffer alive, `required` is
+            // checked against its capacity, and destination rows are disjoint.
+            unsafe {
+                access
+                    .GetBuffer(&mut destination, &mut capacity)
+                    .map_err(|error| format!("cannot get SoftwareBitmap memory: {error}"))?;
+                if destination.is_null() || required > capacity as usize || stride < row_bytes {
+                    return Err("SoftwareBitmap returned an invalid writable plane".into());
+                }
+                for row in 0..bitmap_height {
+                    std::ptr::copy_nonoverlapping(
+                        pixels.as_ptr().add(row * row_bytes),
+                        destination.add(start + row * stride),
+                        row_bytes,
+                    );
+                }
+            }
+            Ok(())
+        })();
+        let closed = reference
+            .Close()
+            .map_err(|error| format!("cannot close SoftwareBitmap reference: {error}"));
+        match (copied, closed) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(error), Err(close_error)) => {
+                crate::app::logging::report_error("windows-native", close_error);
+                Err(error)
+            }
+        }
+    })();
+    let closed = buffer
+        .Close()
+        .map_err(|error| format!("cannot close SoftwareBitmap buffer: {error}"));
+    let fail = |error| {
+        if let Err(close_error) = bitmap.Close() {
+            crate::app::logging::report_error(
+                "windows-native",
+                format!("cannot close failed SoftwareBitmap: {close_error}"),
+            );
+        }
+        Err(error)
+    };
+    match (copy, closed) {
+        (Ok(()), Ok(())) => Ok(bitmap),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => fail(error),
+        (Err(error), Err(close_error)) => {
+            crate::app::logging::report_error("windows-native", close_error);
+            fail(error)
+        }
+    }
 }
 
-pub(crate) fn buffer_bytes(buffer: &windows::Storage::Streams::IBuffer) -> Result<Vec<u8>, String> {
-    use windows::Win32::System::WinRT::IBufferByteAccess;
-    use windows::core::Interface;
+pub(crate) fn create_file_random_access_stream(
+    path: &Path,
+) -> Result<windows::Storage::Streams::IRandomAccessStream, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::System::Com::{STGM_CREATE, STGM_SHARE_EXCLUSIVE, STGM_WRITE};
+    use windows::Win32::System::WinRT::CreateRandomAccessStreamOnFile;
+    use windows::core::PCWSTR;
 
-    let length = buffer
-        .Length()
-        .map_err(|error| format!("cannot read buffer length: {error}"))? as usize;
-    let access: IBufferByteAccess = buffer
-        .cast()
-        .map_err(|error| format!("cannot access buffer bytes: {error}"))?;
-    // SAFETY: the WinRT buffer owns at least `length` readable bytes for the
-    // duration of this immediate copy into an owned Vec.
-    let bytes = unsafe {
-        std::slice::from_raw_parts(
-            access
-                .Buffer()
-                .map_err(|error| format!("cannot access buffer pointer: {error}"))?,
-            length,
-        )
-    };
-    Ok(bytes.to_vec())
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let access = STGM_CREATE.0 | STGM_WRITE.0 | STGM_SHARE_EXCLUSIVE.0;
+    // SAFETY: `wide` is a NUL-terminated path retained for this call and the
+    // requested interface type matches the documented WinRT stream factory.
+    unsafe { CreateRandomAccessStreamOnFile(PCWSTR(wide.as_ptr()), access) }
+        .map_err(|error| format!("cannot create random-access file stream: {error}"))
 }
 
 type OcrCallback = unsafe extern "C" fn(windows::core::PCSTR);
@@ -481,7 +700,7 @@ impl Drop for OwnedHandle {
         // SAFETY: this wrapper is created only from an owned successful handle
         // and Drop is its sole close path.
         if let Err(error) = unsafe { CloseHandle(self.0) } {
-            crate::log_warning!("windows-native", "CloseHandle failed: {error}");
+            crate::report_warning!("windows-native", "CloseHandle failed: {error}");
         }
     }
 }
@@ -530,7 +749,7 @@ impl Drop for OwnedWindow {
             // SAFETY: the wrapper is the sole owner and remains on the window
             // thread for its complete lifetime.
             if let Err(error) = unsafe { DestroyWindow(self.raw) } {
-                crate::log_warning!("windows-native", "DestroyWindow failed: {error}");
+                crate::report_warning!("windows-native", "DestroyWindow failed: {error}");
             }
         }
     }
@@ -726,6 +945,115 @@ pub(crate) fn post_thread_message(
     // SAFETY: the payload contains no pointers and the receiver treats this as
     // an integer generation attached to an application-owned message.
     unsafe { PostThreadMessageW(thread, message, WPARAM(payload), LPARAM(0)) }
+}
+
+/// Register a process-lifetime window class. Re-registering an existing class
+/// is idempotent for independently constructed renderer/tray workers.
+pub(crate) fn register_window_class(
+    class: &windows::Win32::UI::WindowsAndMessaging::WNDCLASSEXW,
+) -> Result<(), String> {
+    use windows::Win32::UI::WindowsAndMessaging::RegisterClassExW;
+
+    // SAFETY: callers provide a fully initialized class whose callback and
+    // static strings remain alive for the process lifetime.
+    if unsafe { RegisterClassExW(class) } != 0 {
+        return Ok(());
+    }
+    let last = windows::core::Error::from_thread();
+    if last.code() == windows::core::HRESULT::from_win32(1410) {
+        Ok(())
+    } else {
+        Err(format!("RegisterClassExW failed: {last}"))
+    }
+}
+
+#[inline(always)]
+pub(crate) fn default_window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::DefWindowProcW;
+
+    // SAFETY: this forwards the unchanged callback arguments to User32.
+    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+}
+
+#[inline(always)]
+pub(crate) fn get_window_message(
+    message: &mut windows::Win32::UI::WindowsAndMessaging::MSG,
+) -> i32 {
+    use windows::Win32::UI::WindowsAndMessaging::GetMessageW;
+
+    // SAFETY: `message` is a valid writable out-parameter owned by the caller.
+    unsafe { GetMessageW(message, None, 0, 0) }.0
+}
+
+#[inline(always)]
+pub(crate) fn window_long(
+    hwnd: HWND,
+    index: windows::Win32::UI::WindowsAndMessaging::WINDOW_LONG_PTR_INDEX,
+) -> i32 {
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowLongW;
+
+    // SAFETY: this reads one documented integer field from a borrowed HWND.
+    unsafe { GetWindowLongW(hwnd, index) }
+}
+
+#[inline(always)]
+pub(crate) fn call_next_hook(
+    code: i32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::CallNextHookEx;
+
+    // SAFETY: the low-level hook forwards the original callback arguments
+    // unchanged and retains no pointer from `lparam`.
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+pub(crate) fn set_console_control_handler(
+    handler: windows::Win32::System::Console::PHANDLER_ROUTINE,
+    enabled: bool,
+) -> windows::core::Result<()> {
+    use windows::Win32::System::Console::SetConsoleCtrlHandler;
+
+    // SAFETY: the callback has process lifetime and the same value is used to
+    // unregister it before backend teardown completes.
+    unsafe { SetConsoleCtrlHandler(handler, enabled) }
+}
+
+pub(crate) fn install_foreground_event_hook(
+    callback: windows::Win32::UI::Accessibility::WINEVENTPROC,
+) -> windows::Win32::UI::Accessibility::HWINEVENTHOOK {
+    use windows::Win32::UI::Accessibility::SetWinEventHook;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EVENT_SYSTEM_FOREGROUND, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    };
+
+    // SAFETY: the callback accesses only process-lifetime atomics and the
+    // returned owned hook is uninstalled by the matching wrapper below.
+    unsafe {
+        SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            None,
+            callback,
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        )
+    }
+}
+
+pub(crate) fn uninstall_event_hook(hook: windows::Win32::UI::Accessibility::HWINEVENTHOOK) -> bool {
+    use windows::Win32::UI::Accessibility::UnhookWinEvent;
+
+    // SAFETY: `hook` came from `install_foreground_event_hook` and is consumed
+    // once during owner Drop.
+    unsafe { UnhookWinEvent(hook) }.as_bool()
 }
 
 /// Return the current foreground window, which may be null while focus changes.
@@ -1230,5 +1558,16 @@ mod tests {
             wait_for_compositor_frame(signal.token()),
             CompositorWait::Interrupted
         );
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop"]
+    fn visual_capture_reuses_and_releases_thread_bound_surface() -> Result<(), String> {
+        let first = capture_bgra(0, 0, 64, 64, 64, 64)?;
+        let second = capture_bgra(0, 0, 64, 64, 64, 64)?;
+        release_capture_surface();
+        assert_eq!(first.pixels.len(), 64 * 64 * 4);
+        assert_eq!(second.pixels.len(), first.pixels.len());
+        Ok(())
     }
 }

@@ -2,9 +2,9 @@
 
 ## 0.9.0
 
-Windows UI Hint 新增双 OCR 视觉识别。
+Windows UI Hint 新增按需双 OCR 视觉识别，扫描结束即清理 OCR 资源，并修复覆盖层截图竞态。
 
-Windows UI Hint adds dual-OCR vision recognition.
+Windows UI Hint adds on-demand dual-OCR vision, cleans up OCR resources after each scan, and fixes the overlay capture race.
 
 ## 0.8.14
 

@@ -2,11 +2,8 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
-use windows::Win32::UI::WindowsAndMessaging::{
-    EVENT_SYSTEM_FOREGROUND, PostThreadMessageW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
-};
+use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 
 use super::WAKE_MESSAGE;
 
@@ -18,19 +15,7 @@ pub struct ForegroundWatcher(HWINEVENTHOOK);
 impl ForegroundWatcher {
     pub fn new(owner_thread: u32) -> Result<Self, String> {
         OWNER_THREAD.store(owner_thread, Ordering::Release);
-        // SAFETY: `win_event` has the required ABI and accesses only atomics;
-        // the returned hook is owned until this wrapper's Drop.
-        let hook = unsafe {
-            SetWinEventHook(
-                EVENT_SYSTEM_FOREGROUND,
-                EVENT_SYSTEM_FOREGROUND,
-                None,
-                Some(win_event),
-                0,
-                0,
-                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-            )
-        };
+        let hook = super::native::install_foreground_event_hook(Some(win_event));
         if hook.is_invalid() {
             OWNER_THREAD.store(0, Ordering::Release);
             Err("SetWinEventHook(EVENT_SYSTEM_FOREGROUND) failed".into())
@@ -46,10 +31,8 @@ impl ForegroundWatcher {
 
 impl Drop for ForegroundWatcher {
     fn drop(&mut self) {
-        // SAFETY: this handle came from this wrapper's successful hook install
-        // and is consumed exactly once during Drop.
-        if !unsafe { UnhookWinEvent(self.0) }.as_bool() {
-            crate::log_warning!(
+        if !super::native::uninstall_event_hook(self.0) {
+            crate::report_warning!(
                 "windows-events",
                 "UnhookWinEvent failed while stopping foreground notifications"
             );
@@ -58,7 +41,7 @@ impl Drop for ForegroundWatcher {
     }
 }
 
-unsafe extern "system" fn win_event(
+extern "system" fn win_event(
     _hook: HWINEVENTHOOK,
     _event: u32,
     _hwnd: HWND,
@@ -70,11 +53,9 @@ unsafe extern "system" fn win_event(
     FOCUS_CHANGED.store(true, Ordering::Release);
     let owner = OWNER_THREAD.load(Ordering::Acquire);
     if owner != 0
-        // SAFETY: `owner` is the live Engine thread id and the wake message has
-        // no pointer payload or cross-thread borrowed data.
-        && let Err(error) = unsafe { PostThreadMessageW(owner, WAKE_MESSAGE, WPARAM(0), LPARAM(0)) }
+        && let Err(error) = super::native::post_thread_message(owner, WAKE_MESSAGE, 0)
     {
-        crate::log_warning!(
+        crate::report_warning!(
             "windows-events",
             "cannot wake engine for foreground change: {error}"
         );

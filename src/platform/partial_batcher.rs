@@ -50,6 +50,7 @@ impl<T> PartialBatcher<T> {
     ///
     /// If 10 items are flushed before the first 24-item boundary, the next
     /// boundary contains the following 14 items and still lands at total 24.
+    #[cfg(any(target_os = "windows", test))]
     pub(crate) fn flush_pending(&mut self) -> Option<Vec<T>> {
         if self.pending.is_empty() {
             return None;

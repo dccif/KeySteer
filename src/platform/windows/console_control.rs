@@ -2,13 +2,11 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use windows::Win32::Foundation::{FALSE, LPARAM, TRUE, WPARAM};
+use windows::Win32::Foundation::{FALSE, TRUE};
 use windows::Win32::System::Console::{
     CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
-    SetConsoleCtrlHandler,
 };
-use windows::Win32::System::Threading::Sleep;
-use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
+use windows::Win32::UI::WindowsAndMessaging::WM_QUIT;
 use windows::core::BOOL;
 
 static ENGINE_THREAD: AtomicU32 = AtomicU32::new(0);
@@ -20,9 +18,7 @@ impl ConsoleControl {
     pub fn new(engine_thread: u32) -> Result<Self, String> {
         SHUTDOWN_COMPLETE.store(false, Ordering::Release);
         ENGINE_THREAD.store(engine_thread, Ordering::Release);
-        // SAFETY: `handler` has the required system ABI and remains available
-        // for the process lifetime; Drop unregisters the same function.
-        if let Err(error) = unsafe { SetConsoleCtrlHandler(Some(handler), true) } {
+        if let Err(error) = super::native::set_console_control_handler(Some(handler), true) {
             ENGINE_THREAD.store(0, Ordering::Release);
             return Err(format!("SetConsoleCtrlHandler failed: {error}"));
         }
@@ -37,10 +33,8 @@ impl ConsoleControl {
 impl Drop for ConsoleControl {
     fn drop(&mut self) {
         ENGINE_THREAD.store(0, Ordering::Release);
-        // SAFETY: this unregisters the exact process-lifetime callback that the
-        // successful constructor registered.
-        if let Err(error) = unsafe { SetConsoleCtrlHandler(Some(handler), false) } {
-            crate::log_warning!(
+        if let Err(error) = super::native::set_console_control_handler(Some(handler), false) {
+            crate::report_warning!(
                 "windows-console",
                 "cannot unregister console control handler: {error}"
             );
@@ -48,7 +42,7 @@ impl Drop for ConsoleControl {
     }
 }
 
-unsafe extern "system" fn handler(control: u32) -> BOOL {
+extern "system" fn handler(control: u32) -> BOOL {
     if !matches!(
         control,
         CTRL_C_EVENT
@@ -63,9 +57,7 @@ unsafe extern "system" fn handler(control: u32) -> BOOL {
     if thread == 0 {
         return FALSE;
     }
-    // SAFETY: `thread` identifies the initialized Engine message queue and the
-    // message carries no borrowed pointer payload.
-    if unsafe { PostThreadMessageW(thread, WM_QUIT, WPARAM(0), LPARAM(0)) }.is_err() {
+    if super::native::post_thread_message(thread, WM_QUIT, 0).is_err() {
         return FALSE;
     }
     if matches!(
@@ -78,8 +70,7 @@ unsafe extern "system" fn handler(control: u32) -> BOOL {
             if SHUTDOWN_COMPLETE.load(Ordering::Acquire) {
                 break;
             }
-            // SAFETY: Sleep has no pointer arguments or ownership contract.
-            unsafe { Sleep(10) };
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
     TRUE

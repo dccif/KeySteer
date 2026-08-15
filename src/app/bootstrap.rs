@@ -219,7 +219,7 @@ fn doctor(config: &Config) -> Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
-        println!("overlay: layered RGBA, topmost, click-through, excluded from capture");
+        println!("overlay: layered RGBA, topmost, click-through, hidden behind capture gate");
         println!("UI scan: UI Automation plus native dual-OCR visual pipeline");
         for line in platform::windows_vision_diagnostics() {
             println!("  {line}");

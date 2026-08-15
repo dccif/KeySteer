@@ -29,7 +29,7 @@ import ModeVideo from '../.vitepress/components/ModeVideo'
 - Windows 的 `axtree` 使用 UI Automation；`vision` 使用系统/微信 OCR 与内置像素区域回退；`hybrid` 并行合并两条管线。
 - macOS 支持 `axtree`、`vision` 和 `hybrid`。
 
-Vision 需要 macOS 的“屏幕录制”权限；键盘捕获仍需要“辅助功能”权限。Windows 会在启动后异步探测系统 OCR 和本机已有的微信 OCR 组件，无需增加配置；两者都不可用或没有有效结果时，使用不依赖 OpenCV 的内置区域识别。
+Vision 需要 macOS 的“屏幕录制”权限；键盘捕获仍需要“辅助功能”权限。Windows 会在启动后异步探测系统 OCR 和本机已有的微信 OCR 组件，无需增加配置；OCR 引擎与微信 helper 仅在扫描时创建并在结束前清理，不会在 UI Hint 退出后继续后台识别。两者都不可用或没有有效结果时，使用不依赖 OpenCV 的内置区域识别。
 
 ## 常用配置
 
