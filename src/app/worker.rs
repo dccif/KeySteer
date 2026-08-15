@@ -1,6 +1,7 @@
 //! Shared ownership and bounded joining for background workers.
 
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Mutex, OnceLock};
 use std::thread::{Builder, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -11,12 +12,20 @@ pub(crate) struct WorkerJoin {
     join: Option<JoinHandle<()>>,
 }
 
+struct QuarantinedJoin {
+    name: &'static str,
+    join: JoinHandle<()>,
+}
+
+static QUARANTINED: OnceLock<Mutex<Vec<QuarantinedJoin>>> = OnceLock::new();
+
 impl WorkerJoin {
     pub(crate) fn spawn(
         name: &'static str,
         builder: Builder,
         work: impl FnOnce() + Send + 'static,
     ) -> Result<Self, String> {
+        reap_quarantined();
         let (finished_tx, finished) = mpsc::channel();
         let join = builder
             .spawn(move || {
@@ -99,10 +108,39 @@ impl WorkerJoin {
 
 impl Drop for WorkerJoin {
     fn drop(&mut self) {
-        if self.join.take().is_some() {
+        if let Some(join) = self.join.take() {
             crate::app::logging::report_error(
                 "worker",
                 format!("{} was dropped without a completed join", self.name),
+            );
+            QUARANTINED
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(QuarantinedJoin {
+                    name: self.name,
+                    join,
+                });
+        }
+    }
+}
+
+fn reap_quarantined() {
+    let Some(workers) = QUARANTINED.get() else {
+        return;
+    };
+    let mut workers = workers.lock().unwrap_or_else(|error| error.into_inner());
+    let mut index = 0;
+    while index < workers.len() {
+        if !workers[index].join.is_finished() {
+            index += 1;
+            continue;
+        }
+        let worker = workers.swap_remove(index);
+        if worker.join.join().is_err() {
+            crate::app::logging::report_error(
+                "worker",
+                format!("{} quarantined worker panicked", worker.name),
             );
         }
     }

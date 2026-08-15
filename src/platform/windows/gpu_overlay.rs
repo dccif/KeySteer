@@ -54,6 +54,44 @@ use super::native::{NativeDimensions, OwnedWindow};
 const MAX_BRUSHES: usize = 64;
 const MAX_TEXT_FORMATS: usize = 32;
 
+/// Keep the unsafe DirectComposition creation contract in one typed boundary.
+/// The returned interface is owned by COM and cannot outlive its device through
+/// a borrowed raw pointer.
+fn create_composition_visual(
+    device: &IDCompositionDevice,
+) -> windows::core::Result<IDCompositionVisual> {
+    // SAFETY: the borrowed COM device is live for the synchronous call and the
+    // method returns a separately reference-counted interface.
+    unsafe { device.CreateVisual() }
+}
+
+fn clear_visual_content(visual: &IDCompositionVisual) -> windows::core::Result<()> {
+    // SAFETY: clearing content does not retain a caller-owned pointer; the
+    // visual remains owned by the active composition tree.
+    unsafe { visual.SetContent(None) }
+}
+
+fn fill_rounded_rectangle(
+    context: &ID2D1DeviceContext,
+    rectangle: &D2D1_ROUNDED_RECT,
+    brush: &ID2D1SolidColorBrush,
+) {
+    // SAFETY: all interfaces and geometry are borrowed for this synchronous
+    // call, and callers invoke it only inside an active BeginDraw/EndDraw pair.
+    unsafe { context.FillRoundedRectangle(rectangle, brush) };
+}
+
+fn draw_rounded_rectangle(
+    context: &ID2D1DeviceContext,
+    rectangle: &D2D1_ROUNDED_RECT,
+    brush: &ID2D1SolidColorBrush,
+    width: f32,
+) {
+    // SAFETY: all interfaces and geometry are borrowed for this synchronous
+    // call, and callers invoke it only inside an active BeginDraw/EndDraw pair.
+    unsafe { context.DrawRoundedRectangle(rectangle, brush, width, None) };
+}
+
 /// A GPU-rendered overlay. COM interface wrappers release themselves; the
 /// window wrapper below provides the same single-owner rule for HWND.
 pub(super) struct GpuOverlay {
@@ -328,6 +366,9 @@ impl GpuOverlay {
     /// needed before reading desktop pixels, while an ordinary mode exit must
     /// not wait for the compositor.
     pub(super) fn dismiss(&mut self) -> Result<(), String> {
+        if self.content.is_none() {
+            return Ok(());
+        }
         // SAFETY: detaching a target is valid outside BeginDraw. Clearing the
         // owned tree before Commit releases every compositor reference.
         unsafe {
@@ -361,16 +402,16 @@ impl GpuOverlay {
         let target = unsafe { self.dcomp.CreateTargetForHwnd(window.raw(), true) }
             .map_err(|error| format!("CreateTargetForHwnd failed: {error}"))?;
         // SAFETY: device methods return owned COM interfaces.
-        let visual = unsafe { self.dcomp.CreateVisual() }
+        let visual = create_composition_visual(&self.dcomp)
             .map_err(|error| format!("CreateVisual failed: {error}"))?;
         // SAFETY: every interface belongs to this device and stays alive in
         // WindowContent. Null reference visuals place static at the bottom and
         // dynamic visuals successively above it.
-        let cursor_visual = unsafe { self.dcomp.CreateVisual() }
+        let cursor_visual = create_composition_visual(&self.dcomp)
             .map_err(|error| format!("Create cursor visual failed: {error}"))?;
         // SAFETY: the compositor device returns a newly owned visual on this
         // renderer thread.
-        let indicator_visual = unsafe { self.dcomp.CreateVisual() }
+        let indicator_visual = create_composition_visual(&self.dcomp)
             .map_err(|error| format!("Create indicator visual failed: {error}"))?;
         // SAFETY: all visuals and the target belong to `self.dcomp`, remain
         // alive in WindowContent, and are attached outside BeginDraw.
@@ -531,7 +572,7 @@ impl GpuOverlay {
         let Some(marker) = marker else {
             if let Some(content) = self.content.as_mut() {
                 // SAFETY: clearing content releases the visual's surface.
-                unsafe { content.cursor_visual.SetContent(None) }
+                clear_visual_content(&content.cursor_visual)
                     .map_err(|error| format!("cannot clear cursor visual: {error}"))?;
                 content.cursor_surface = None;
             }
@@ -598,7 +639,7 @@ impl GpuOverlay {
         let Some(indicator) = indicator else {
             if let Some(content) = self.content.as_mut() {
                 // SAFETY: clearing content releases the visual's surface.
-                unsafe { content.indicator_visual.SetContent(None) }
+                clear_visual_content(&content.indicator_visual)
                     .map_err(|error| format!("cannot clear indicator visual: {error}"))?;
                 content.indicator_surface = None;
             }
@@ -678,15 +719,12 @@ impl GpuOverlay {
                 if !fill.is_transparent() {
                     let brush = self.brush(*fill)?;
                     // SAFETY: drawing is active and both pointers are live.
-                    unsafe { self.d2d.FillRoundedRectangle(&rounded, &brush) };
+                    fill_rounded_rectangle(&self.d2d, &rounded, &brush);
                 }
                 if !stroke.is_transparent() && *stroke_width > 0.0 {
                     let brush = self.brush(*stroke)?;
                     // SAFETY: drawing is active and both pointers are live.
-                    unsafe {
-                        self.d2d
-                            .DrawRoundedRectangle(&rounded, &brush, *stroke_width as f32, None)
-                    };
+                    draw_rounded_rectangle(&self.d2d, &rounded, &brush, *stroke_width as f32);
                 }
             }
             OverlayShape::Line {
@@ -735,15 +773,12 @@ impl GpuOverlay {
         if !style.background.is_transparent() {
             let brush = self.brush(style.background)?;
             // SAFETY: drawing is active and both objects are live.
-            unsafe { self.d2d.FillRoundedRectangle(&rounded, &brush) };
+            fill_rounded_rectangle(&self.d2d, &rounded, &brush);
         }
         if !style.border_color.is_transparent() && style.border_width > 0.0 {
             let brush = self.brush(style.border_color)?;
             // SAFETY: drawing is active and both objects are live.
-            unsafe {
-                self.d2d
-                    .DrawRoundedRectangle(&rounded, &brush, style.border_width as f32, None)
-            };
+            draw_rounded_rectangle(&self.d2d, &rounded, &brush, style.border_width as f32);
         }
         let format = self.text_format(style)?;
         let normal = self.brush(style.text_color)?;

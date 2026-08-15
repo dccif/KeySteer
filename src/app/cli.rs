@@ -22,11 +22,13 @@ pub(crate) struct CliOptions {
     pub(crate) check_only: bool,
     pub(crate) dump_config: bool,
     pub(crate) doctor: bool,
-    #[cfg(target_os = "windows")]
-    internal_wechat_ocr: Option<(PathBuf, PathBuf, PathBuf)>,
 }
 
 pub fn run_cli() -> ExitCode {
+    #[cfg(target_os = "windows")]
+    if let Some(exit) = run_internal_wechat_helper() {
+        return exit;
+    }
     let log_path = match super::logging::init() {
         Ok(path) => Some(path.to_path_buf()),
         Err(error) => {
@@ -35,15 +37,7 @@ pub fn run_cli() -> ExitCode {
         }
     };
     super::logging::install_panic_hook();
-    match parse_args().and_then(|args| {
-        args.map_or(Ok(()), |args| {
-            #[cfg(target_os = "windows")]
-            if let Some((bridge, component, runtime)) = args.internal_wechat_ocr {
-                return crate::platform::run_internal_wechat_ocr_helper(bridge, component, runtime);
-            }
-            super::bootstrap::run(args)
-        })
-    }) {
+    match parse_args().and_then(|args| args.map_or(Ok(()), super::bootstrap::run)) {
         Ok(()) => {
             crate::log_info!("session", "session ended normally");
             super::logging::flush();
@@ -69,8 +63,6 @@ fn parse_args() -> Result<Option<CliOptions>, String> {
         check_only: false,
         dump_config: false,
         doctor: false,
-        #[cfg(target_os = "windows")]
-        internal_wechat_ocr: None,
     };
     let mut iter = std::env::args().skip(1);
 
@@ -93,27 +85,43 @@ fn parse_args() -> Result<Option<CliOptions>, String> {
             "--check" => args.check_only = true,
             "--dump-config" => args.dump_config = true,
             "--doctor" => args.doctor = true,
-            #[cfg(target_os = "windows")]
-            "--internal-wechat-ocr-helper" => {
-                let bridge = iter
-                    .next()
-                    .ok_or_else(|| "internal helper requires a bridge path".to_string())?;
-                let component = iter
-                    .next()
-                    .ok_or_else(|| "internal helper requires a component path".to_string())?;
-                let runtime = iter
-                    .next()
-                    .ok_or_else(|| "internal helper requires a runtime path".to_string())?;
-                args.internal_wechat_ocr = Some((
-                    PathBuf::from(bridge),
-                    PathBuf::from(component),
-                    PathBuf::from(runtime),
-                ));
-            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
     Ok(Some(args))
+}
+
+#[cfg(target_os = "windows")]
+fn run_internal_wechat_helper() -> Option<ExitCode> {
+    let mut arguments = std::env::args_os().skip(1);
+    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--internal-wechat-ocr-helper")) {
+        return None;
+    }
+    let Some(bridge) = arguments.next() else {
+        return Some(ExitCode::FAILURE);
+    };
+    let Some(component) = arguments.next() else {
+        return Some(ExitCode::FAILURE);
+    };
+    let Some(runtime) = arguments.next() else {
+        return Some(ExitCode::FAILURE);
+    };
+    if arguments.next().is_some() {
+        return Some(ExitCode::FAILURE);
+    }
+    Some(
+        if crate::platform::run_internal_wechat_ocr_helper(
+            PathBuf::from(bridge),
+            PathBuf::from(component),
+            PathBuf::from(runtime),
+        )
+        .is_ok()
+        {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        },
+    )
 }
 
 fn print_help() {

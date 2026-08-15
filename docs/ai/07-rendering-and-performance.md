@@ -12,7 +12,7 @@ Windows OCR 不属于预热常驻集。Backend ready 后首次事件轮询派发
 
 `Backend::present` 接收 `Arc<OverlayScene>`。Windows 使用 latest-frame 单槽队列：Engine 只替换待绘制帧并立即返回，已经过期的帧不会进入原生绘制。frame/position 更新与 empty→ready 判定在同一次锁内完成，并用 outstanding-wake 合并突发提交；渲染线程每次 drain 才清除标志，8000 次积压位置更新只需要一个 wake 并只保留最终位置。同一输入批次中的 Warp、Show、Finish、Click、Hide 会先合并覆盖层意图；输入注入保持立即执行，批次结束只提交一次最终画面。
 
-Windows 截图不再生成约 32 MiB 的 4K BGRA `Vec`。GDI DIB 在所属线程上以验证过长度的临时 slice 借出，直接生成 OCR bitmap 和不超过 2,073,600 像素的灰度 fallback，随后立即销毁。源/目标尺寸相同时走一次 `BitBlt`；只有实际缩放才使用 `StretchBlt + HALFTONE`。截图和 OCR 请求都不分块，超过安全上限时仍生成一张等比缩放图片。fallback 的 edge allocation 在闭运算后复用为 visited，并用最多 2000 项的紧凑 top-K，只有最终候选才构造 role 字符串。
+Windows 截图不再生成约 32 MiB 的 4K BGRA `Vec`。GDI DIB 在所属线程上以验证过长度的临时 slice 借出；截图仍始终只有一次。系统 OCR 从该 slice 构造按逻辑线程与至少 64px 核心边长自适应的重叠小块，完成一块即发布；微信 OCR 使用一张完整 bitmap；fallback 直接生成不超过 2,073,600 像素的灰度图，随后销毁 DIB。8,388,608 像素上限让 UHD 4K 原生命中一次 `BitBlt`；只有 5K/8K 等实际超限画面才使用 `StretchBlt + HALFTONE`。fallback 灰度映射使用商余数步进，连通区域按 scanline run 维护活跃组件；形态位图复用并使用最多 2000 项的紧凑 top-K，只有最终候选才构造 role 字符串。
 
 Engine 保存最后一次 scene 并跳过完全相同的提交。`OverlayScene` 的静态 shapes/labels 使用
 `OverlayItems<T>` 写时复制存储：移动 cursor/indicator 时 clone 只增加 `Arc` 引用计数，
@@ -25,6 +25,11 @@ Engine 另外缓存自己生成的 cursor/indicator 几何。普通指针移动�
 `Backend::update_overlay_positions`，不再克隆 scene、重新生成 held 文字或比较静态内容；
 跨屏 clip、appearance、样式、held 状态和模式内容变化仍提交完整 scene。未实现快路径、
 首帧未就绪或原生更新失败时立即退回完整 `present`。
+
+Windows 低级鼠标 Hook 是 pointer seqlock 的唯一写者，因此写侧使用 odd/payload/even 的普通
+原子 store 与 Release fence，不再为每个移动执行两次 locked RMW。release 交错微测中每批
+8,000 次写入的 p99 从约 63.1µs 降到 11.1µs；pointer wake 关闭时仍只更新 packed 坐标，
+模式切换继续通过 `Backend::pointer()` 获取权威位置。
 
 Normal 的活动方向使用四位 mask，而不是每个显示帧收集一个 `BTreeSet`。移动距离仍由
 真实 elapsed 的解析积分决定；这个优化只消除逐帧堆分配，不改变对向抵消、对角线归一化
@@ -61,7 +66,7 @@ mode scene，也不重建静态 Grid/Hint 内容。latched 的真实按钮状态
 - 静态 surface 只在静态 scene 或覆盖区域原点变化时访问和重绘；区域不变的逐帧提交不会
   重复调用全屏 `SetWindowPos`，也不会为静态 surface 产生 COM AddRef/Release。
 - GPU HWND 使用 `WS_EX_LAYERED | WS_EX_TRANSPARENT | NOACTIVATE | TOOLWINDOW | TOPMOST`；layered + transparent 才保证跨进程点击穿透，`HTTRANSPARENT` 仅作为额外防线，因为它只能继续命中同线程窗口。
-- overlay 不使用 capture affinity。视觉扫描控制优先于普通帧：generation gate 期间完整帧和位置更新各只保留最新一份。GPU 清空 tree 并异步 `Commit`，CPU 销毁 layered HWND，截图路径随后只用一次 `DwmFlush` 确认隐藏；普通 dismiss、Engine、Hook 和普通 overlay 提交路径都不等待 compositor。
+- overlay 不使用 capture affinity。视觉扫描控制优先于普通帧：generation gate 期间完整帧和位置更新各只保留最新一份。GPU 仅在存在 content 时清空 tree 并异步 `Commit`，CPU 销毁 layered HWND。renderer 维护 capture-clean 状态：从未显示或上次隐藏已经确认时跳过屏障；只有可能仍有标签像素参与合成时，截图路径才执行且只执行一次 `DwmFlush`。普通 dismiss、Engine、Hook 和普通 overlay 提交路径都不等待 compositor。
 - 渲染线程使用 Win32 消息队列作为 latest-frame/control 唤醒源；即使 normal 覆盖层静止也会
   持续响应窗口消息，并对 `WM_NCHITTEST` 返回 `HTTRANSPARENT`。禁止让全屏 HWND 在
   Condvar/普通 channel 上无限等待，否则 Windows 会将其判为挂起并阻塞底层窗口输入。

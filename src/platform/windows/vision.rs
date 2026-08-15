@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use windows::Media::Ocr::OcrEngine;
+use windows::Media::Ocr::{OcrEngine, OcrResult};
 use windows::Win32::Foundation::HWND;
-use windows_future::{AsyncOperationCompletedHandler, AsyncStatus};
+use windows_future::{AsyncOperationCompletedHandler, AsyncStatus, IAsyncOperation};
 
 use crate::api::command::{UiScanRequest, UiScanStatus};
 use crate::api::geometry::{Rect, UiTarget};
@@ -19,12 +19,18 @@ use super::overlay_worker::CaptureLease;
 use super::ui_scan::ScanSource;
 use super::wechat_ocr::{WechatDescriptor, WechatOcr};
 
-const MAX_CAPTURE_PIXELS: f64 = 8_000_000.0;
+// Covers a native 3840x2160 desktop so common 4K scans use the BitBlt fast
+// path. Larger 5K/8K images are still scaled as a single capture.
+const MAX_CAPTURE_PIXELS: f64 = 8_388_608.0;
 const MAX_CAPTURE_EDGE: f64 = 4_096.0;
 const MAX_FALLBACK_PIXELS: f64 = 2_073_600.0;
 const MAX_FALLBACK_EDGE: f64 = 2_560.0;
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const PROVIDER_STOP_TIMEOUT: Duration = Duration::from_millis(500);
+const PROVIDER_BATCH_SIZE: usize = 24;
+const MAX_OCR_TARGETS: usize = 2_000;
+const MIN_SYSTEM_OCR_TILE_SIDE: u32 = 64;
+const SYSTEM_OCR_TILE_OVERLAP: u32 = 64;
 
 #[derive(Debug)]
 enum VisionError {
@@ -599,15 +605,45 @@ struct OcrFrame {
     bitmap: Arc<SharedSoftwareBitmap>,
 }
 
-struct SharedSoftwareBitmap(windows::Graphics::Imaging::SoftwareBitmap);
+struct SystemOcrTile {
+    geometry: CaptureGeometry,
+    core_bounds: Rect,
+    bitmap: SharedSoftwareBitmap,
+}
+
+enum SystemOcrInput {
+    Begin { tile_count: usize },
+    Tile(SystemOcrTile),
+    Failed(String),
+    Done,
+}
+
+struct SharedSoftwareBitmap {
+    bitmap: Option<windows::Graphics::Imaging::SoftwareBitmap>,
+    _ledger: crate::app::perf_probe::ResourceGuard,
+}
+
+impl SharedSoftwareBitmap {
+    fn bitmap(&self) -> Result<&windows::Graphics::Imaging::SoftwareBitmap, VisionError> {
+        self.bitmap
+            .as_ref()
+            .ok_or_else(|| VisionError::Cleanup("OCR SoftwareBitmap was already closed".into()))
+    }
+
+    fn close(&mut self) -> Result<(), String> {
+        let Some(bitmap) = self.bitmap.take() else {
+            return Ok(());
+        };
+        bitmap
+            .Close()
+            .map_err(|error| format!("cannot close OCR SoftwareBitmap: {error}"))
+    }
+}
 
 impl Drop for SharedSoftwareBitmap {
     fn drop(&mut self) {
-        if let Err(error) = self.0.Close() {
-            crate::app::logging::report_error(
-                "windows-vision",
-                format!("cannot close OCR SoftwareBitmap: {error}"),
-            );
+        if let Err(error) = self.close() {
+            crate::app::logging::report_error("windows-vision", error);
         }
     }
 }
@@ -623,6 +659,9 @@ fn run_scan_inner(
     shared: &Arc<SharedQueue>,
     discovery: &DiscoveryHandle,
 ) -> UiScanStatus {
+    let _coordinator_ledger = crate::app::perf_probe::ResourceGuard::new(
+        crate::app::perf_probe::ResourceKind::Coordinator,
+    );
     let deadline = Instant::now()
         + Duration::from_millis(
             job.request
@@ -666,25 +705,35 @@ fn run_scan_inner(
 
     let (tx, rx) = mpsc::sync_channel(3);
     let mut providers = ProviderThreads::new(cancellation.clone(), shared);
-    let mut provider_inputs = Vec::with_capacity(2);
+    let mut system_input = None;
+    let mut wechat_input = None;
     let mut pending_ocr = 0usize;
     if let Some(descriptor) = discovery_snapshot.system {
         let (image_tx, image_rx) = mpsc::sync_channel(1);
         let result_tx = tx.clone();
         let provider_cancellation = cancellation.clone();
         if providers.spawn("keysteer-system-ocr", move || {
+            let _provider_ledger = crate::app::perf_probe::ResourceGuard::new(
+                crate::app::perf_probe::ResourceKind::Provider,
+            );
             crate::app::perf_probe::mark("system_ocr_started");
             let started = Instant::now();
-            let result =
-                recognize_system_provider(descriptor, image_rx, deadline, &provider_cancellation);
-            let _ = result_tx.send(ProviderEvent::Ocr {
+            let result = recognize_system_provider(
+                descriptor,
+                image_rx,
+                deadline,
+                &provider_cancellation,
+                &result_tx,
+                started,
+            );
+            let _ = result_tx.send(ProviderEvent::OcrDone {
                 provider: "system",
                 elapsed: started.elapsed(),
                 result,
             });
             crate::app::perf_probe::mark("system_ocr_finished");
         }) {
-            provider_inputs.push(image_tx);
+            system_input = Some(image_tx);
             pending_ocr += 1;
         }
     }
@@ -694,6 +743,9 @@ fn run_scan_inner(
         let provider_cancellation = cancellation.clone();
         let minimum_confidence = job.request.vision.minimum_confidence;
         if providers.spawn("keysteer-wechat-ocr", move || {
+            let _provider_ledger = crate::app::perf_probe::ResourceGuard::new(
+                crate::app::perf_probe::ResourceKind::Provider,
+            );
             crate::app::perf_probe::mark("wechat_ocr_started");
             let started = Instant::now();
             let result = recognize_wechat_provider(
@@ -702,21 +754,70 @@ fn run_scan_inner(
                 deadline,
                 minimum_confidence,
                 &provider_cancellation,
+                &result_tx,
+                started,
             );
-            let _ = result_tx.send(ProviderEvent::Ocr {
+            let _ = result_tx.send(ProviderEvent::OcrDone {
                 provider: "wechat",
                 elapsed: started.elapsed(),
                 result,
             });
             crate::app::perf_probe::mark("wechat_ocr_finished");
         }) {
-            provider_inputs.push(image_tx);
+            wechat_input = Some(image_tx);
             pending_ocr += 1;
         }
     }
 
     let Some(mut capture_lease) = job.capture.take() else {
         return UiScanStatus::Failed("visual capture lease was not created".into());
+    };
+    // Geometry, the thread-bound DIB and the WinRT apartment are prepared
+    // while the renderer is independently hiding its tree. No desktop pixels
+    // are read before the hidden ACK.
+    let geometry = match capture_geometry(bounds) {
+        Ok(geometry) => geometry,
+        Err(error) => {
+            let mut errors = crate::app::errors::ErrorBundle::default();
+            errors.push("capture geometry", error);
+            errors.record("capture gate release", capture_lease.release());
+            return UiScanStatus::Failed(
+                errors
+                    .into_result()
+                    .err()
+                    .unwrap_or_else(|| "capture geometry failed without details".into()),
+            );
+        }
+    };
+    let mut prepared_capture =
+        match super::native::PreparedCapture::new(geometry.width, geometry.height) {
+            Ok(capture) => capture,
+            Err(error) => {
+                let mut errors = crate::app::errors::ErrorBundle::default();
+                errors.push("capture DIB preparation", error);
+                errors.record("capture gate release", capture_lease.release());
+                return UiScanStatus::Failed(
+                    errors
+                        .into_result()
+                        .err()
+                        .unwrap_or_else(|| "capture DIB preparation failed without details".into()),
+                );
+            }
+        };
+    let gdi_ledger = crate::app::perf_probe::ResourceGuard::new(
+        crate::app::perf_probe::ResourceKind::GdiSurface,
+    );
+    crate::app::perf_probe::mark("capture_dib_prepared");
+    let bitmap_apartment = if system_input.is_none() && wechat_input.is_none() {
+        None
+    } else {
+        match super::native::ComApartment::initialise() {
+            Ok(apartment) => Some(apartment),
+            Err(error) => {
+                crate::app::logging::report_error("windows-vision", &error);
+                None
+            }
+        }
     };
     if let Err(error) =
         capture_lease.wait_hidden(deadline, || !current(shared, job.generation, original))
@@ -731,7 +832,6 @@ fn run_scan_inner(
         if Instant::now() >= deadline {
             return UiScanStatus::TimedOut;
         }
-        crate::app::logging::report_error("windows-vision", &error);
         return UiScanStatus::Failed(error);
     }
     if !current(shared, job.generation, original) {
@@ -741,35 +841,13 @@ fn run_scan_inner(
         return UiScanStatus::ContextChanged;
     }
     crate::app::perf_probe::mark("capture_hidden_ack");
-    let geometry = match capture_geometry(bounds) {
-        Ok(geometry) => geometry,
-        Err(error) => {
-            if let Err(release_error) = capture_lease.release() {
-                crate::app::logging::report_error("windows-overlay", release_error);
-            }
-            return UiScanStatus::Failed(error);
-        }
-    };
-    let bitmap_apartment = if provider_inputs.is_empty() {
-        None
-    } else {
-        match super::native::ComApartment::initialise() {
-            Ok(apartment) => Some(apartment),
-            Err(error) => {
-                crate::app::logging::report_error("windows-vision", &error);
-                None
-            }
-        }
-    };
     let mut capture_lease = Some(capture_lease);
     let mut context_changed_during_capture = false;
-    let captured = super::native::capture_bgra_with(
+    let captured = prepared_capture.capture_with(
         bounds.x.floor() as i32,
         bounds.y.floor() as i32,
         bounds.width.ceil() as i32,
         bounds.height.ceil() as i32,
-        geometry.width as i32,
-        geometry.height as i32,
         |pixels, width, height| {
             crate::app::perf_probe::mark("capture_gdi_ready");
             if width != geometry.width || height != geometry.height {
@@ -785,26 +863,44 @@ fn run_scan_inner(
             if let Some(lease) = capture_lease.take() {
                 lease.release()?;
             }
-            let bitmap = bitmap_apartment.as_ref().and_then(|_| {
-                match super::native::software_bitmap_bgra(pixels, width, height) {
-                    Ok(bitmap) => Some(Arc::new(SharedSoftwareBitmap(bitmap))),
-                    Err(error) => {
-                        crate::app::logging::report_error("windows-vision", error);
-                        None
+            if let Some(input) = system_input.take() {
+                if bitmap_apartment.is_some() {
+                    if let Err(error) = stream_system_ocr_tiles(pixels, geometry, &input) {
+                        let _ = input.send(SystemOcrInput::Failed(error));
+                        let _ = input.send(SystemOcrInput::Done);
                     }
+                } else {
+                    let _ = input.send(SystemOcrInput::Failed(
+                        "cannot create the COM apartment for system OCR tiles".into(),
+                    ));
+                    let _ = input.send(SystemOcrInput::Done);
                 }
+            }
+            let bitmap = wechat_input.as_ref().and_then(|_| {
+                bitmap_apartment.as_ref().and_then(|_| {
+                    match super::native::software_bitmap_bgra(pixels, width, height) {
+                        Ok(bitmap) => Some(Arc::new(SharedSoftwareBitmap {
+                            bitmap: Some(bitmap),
+                            _ledger: crate::app::perf_probe::ResourceGuard::new(
+                                crate::app::perf_probe::ResourceKind::Bitmap,
+                            ),
+                        })),
+                        Err(error) => {
+                            crate::app::logging::report_error("windows-vision", error);
+                            None
+                        }
+                    }
+                })
             });
             if bitmap.is_some() {
                 crate::app::perf_probe::mark("ocr_bitmap_ready");
             }
-            if let Some(bitmap) = bitmap.as_ref() {
+            if let (Some(bitmap), Some(input)) = (bitmap.as_ref(), wechat_input.take()) {
                 let frame = Arc::new(OcrFrame {
                     geometry,
                     bitmap: Arc::clone(bitmap),
                 });
-                for input in provider_inputs.drain(..) {
-                    let _ = input.send(Arc::clone(&frame));
-                }
+                let _ = input.send(frame);
             }
             let fallback = job
                 .request
@@ -815,7 +911,8 @@ fn run_scan_inner(
             Ok((bitmap, fallback))
         },
     );
-    super::native::release_capture_surface();
+    drop(prepared_capture);
+    drop(gdi_ledger);
     if let Some(lease) = capture_lease.take()
         && let Err(error) = lease.release()
     {
@@ -830,7 +927,8 @@ fn run_scan_inner(
         return UiScanStatus::ContextChanged;
     }
 
-    drop(provider_inputs);
+    drop(system_input);
+    drop(wechat_input);
 
     let fallback_cancelled = Arc::new(AtomicBool::new(false));
     let fallback_pending = if let Some(fallback_input) = fallback_input {
@@ -839,6 +937,9 @@ fn run_scan_inner(
         let provider_cancellation = cancellation.clone();
         let fallback_cancelled = Arc::clone(&fallback_cancelled);
         providers.spawn("keysteer-vision-fallback", move || {
+            let _provider_ledger = crate::app::perf_probe::ResourceGuard::new(
+                crate::app::perf_probe::ResourceKind::Provider,
+            );
             crate::app::perf_probe::mark("vision_fallback_started");
             let mut scratch = FallbackScratch::default();
             let targets = detect_regions(&fallback_input, &options, &mut scratch, || {
@@ -855,6 +956,7 @@ fn run_scan_inner(
     let mut fallback = None;
     let mut ocr_had_valid_targets = false;
     let mut timed_out = false;
+    let mut cleanup_failure = None;
     while pending_ocr != 0 || (fallback_pending && fallback.is_none()) {
         if !current(shared, job.generation, original) {
             cancellation.cancel();
@@ -874,37 +976,45 @@ fn run_scan_inner(
         let mut events = VecDeque::from([first]);
         events.extend(rx.try_iter());
         let mut ocr_ready = Vec::new();
+        let mut ocr_done = Vec::new();
         while let Some(event) = events.pop_front() {
             match event {
                 ProviderEvent::Fallback(targets) => fallback = Some(targets),
-                ProviderEvent::Ocr {
+                ProviderEvent::OcrBatch {
+                    provider,
+                    elapsed,
+                    targets,
+                } => ocr_ready.push((provider, elapsed, targets)),
+                ProviderEvent::OcrDone {
                     provider,
                     elapsed,
                     result,
-                } => ocr_ready.push((provider, elapsed, result)),
+                } => ocr_done.push((provider, elapsed, result)),
             }
         }
-        ocr_ready.sort_by(|a, b| {
-            let ac = a.2.as_ref().map_or(0, Vec::len);
-            let bc = b.2.as_ref().map_or(0, Vec::len);
-            compare_ready(ac, a.1, bc, b.1)
-        });
-        for (provider, elapsed, result) in ocr_ready {
+        ocr_ready.sort_by(|a, b| compare_ready(a.2.len(), a.1, b.2.len(), b.1));
+        for (provider, _elapsed, targets) in ocr_ready {
+            let count = targets.len();
+            if count != 0 {
+                ocr_had_valid_targets = true;
+                fallback_cancelled.store(true, Ordering::Release);
+            }
+            let accepted = job.source.push(targets);
+            if accepted != 0 {
+                crate::app::perf_probe::mark("vision_targets_accepted");
+            }
+            crate::log_info!(
+                "windows-vision",
+                "{provider} OCR streamed {count} valid targets ({accepted} new)"
+            );
+        }
+        for (provider, elapsed, result) in ocr_done {
             pending_ocr = pending_ocr.saturating_sub(1);
             match result {
-                Ok(targets) => {
-                    let count = targets.len();
-                    if count != 0 {
-                        ocr_had_valid_targets = true;
-                        fallback_cancelled.store(true, Ordering::Release);
-                    }
-                    let accepted = job.source.push(targets);
-                    if accepted != 0 {
-                        crate::app::perf_probe::mark("vision_targets_accepted");
-                    }
+                Ok(count) => {
                     crate::log_info!(
                         "windows-vision",
-                        "{provider} OCR completed in {elapsed:?} with {count} valid targets ({accepted} new)"
+                        "{provider} OCR completed in {elapsed:?} with {count} valid targets"
                     );
                 }
                 Err(error) if error.is_control_flow() => {}
@@ -912,10 +1022,21 @@ fn run_scan_inner(
                     "windows-vision",
                     "{provider} OCR failed after {elapsed:?}: {error}"
                 ),
-                Err(error) => crate::report_error!(
-                    "windows-vision",
-                    "{provider} OCR failed after {elapsed:?}: {error}"
-                ),
+                Err(error) => {
+                    if matches!(error, VisionError::Cleanup(_)) && cleanup_failure.is_none() {
+                        cleanup_failure = Some(format!(
+                            "{provider} OCR cleanup failed after {elapsed:?}: {error}"
+                        ));
+                    } else {
+                        // Operational provider failures can be masked by the
+                        // other OCR or the Rust fallback, so this coordinator
+                        // is their final reporting boundary.
+                        crate::report_error!(
+                            "windows-vision",
+                            "{provider} OCR failed after {elapsed:?}: {error}"
+                        );
+                    }
+                }
             }
         }
     }
@@ -926,14 +1047,29 @@ fn run_scan_inner(
         job.source.push(targets);
     }
     if let Err(error) = providers.join_all(Instant::now() + PROVIDER_STOP_TIMEOUT) {
-        crate::app::logging::report_error("windows-vision", error);
+        cleanup_failure.get_or_insert(error);
     }
-    drop(shared_bitmap);
+    if let Some(bitmap) = shared_bitmap {
+        match Arc::try_unwrap(bitmap) {
+            Ok(mut bitmap) => {
+                if let Err(error) = bitmap.close() {
+                    cleanup_failure.get_or_insert(error);
+                }
+            }
+            Err(_) => {
+                cleanup_failure.get_or_insert_with(|| {
+                    "OCR SoftwareBitmap remained shared after provider cleanup".into()
+                });
+            }
+        }
+    }
     drop(bitmap_apartment);
     if !current(shared, job.generation, original) {
         UiScanStatus::ContextChanged
     } else if timed_out {
         UiScanStatus::TimedOut
+    } else if let Some(error) = cleanup_failure {
+        UiScanStatus::Failed(error)
     } else {
         UiScanStatus::Success
     }
@@ -968,33 +1104,234 @@ fn wait_provider_image(
 
 fn recognize_system_provider(
     descriptor: SystemOcrDescriptor,
-    receiver: mpsc::Receiver<Arc<OcrFrame>>,
+    receiver: mpsc::Receiver<SystemOcrInput>,
     deadline: Instant,
     cancellation: &ScanCancellation,
-) -> Result<Vec<UiTarget>, VisionError> {
+    result_tx: &mpsc::SyncSender<ProviderEvent>,
+    started: Instant,
+) -> Result<usize, VisionError> {
     let _apartment = super::native::ComApartment::initialise().map_err(VisionError::Operational)?;
-    let engine = super::native::create_system_ocr_engine().map_err(VisionError::Unavailable)?;
-    let input = wait_provider_image(receiver, deadline, cancellation)?;
-    if input.geometry.width > descriptor.maximum_dimension
-        || input.geometry.height > descriptor.maximum_dimension
-    {
-        return Err(VisionError::Operational(format!(
-            "captured image exceeds system OCR limit {}",
-            descriptor.maximum_dimension
-        )));
-    }
-    recognize_system(&engine, &input.bitmap.0, input.geometry, || {
-        cancellation.is_cancelled()
-    })
-    .map_err(|error| {
+    // Preserve the existing overlap between OCR cold start and the overlay
+    // hide/capture barrier. The remaining engines are created as tiles arrive.
+    let mut first_engine =
+        Some(super::native::create_system_ocr_engine().map_err(VisionError::Unavailable)?);
+    let mut expected_tiles = None;
+    let mut completion_sender = None;
+    let mut completion_receiver = None;
+    let mut active: Vec<Option<ActiveSystemOcrTile>> = Vec::new();
+    let mut pending = 0usize;
+    let mut operational_failures = Vec::new();
+    let mut cleanup_failures = Vec::new();
+    loop {
         if cancellation.is_cancelled() {
-            VisionError::Cancelled
-        } else if Instant::now() >= deadline {
-            VisionError::TimedOut
-        } else {
-            VisionError::Operational(error)
+            cancel_active_system_tiles(&mut active, deadline, &mut cleanup_failures);
+            return if cleanup_failures.is_empty() {
+                Err(VisionError::Cancelled)
+            } else {
+                Err(VisionError::Cleanup(cleanup_failures.join("; ")))
+            };
         }
-    })
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            cancel_active_system_tiles(&mut active, deadline, &mut cleanup_failures);
+            return if cleanup_failures.is_empty() {
+                Err(VisionError::TimedOut)
+            } else {
+                Err(VisionError::Cleanup(cleanup_failures.join("; ")))
+            };
+        }
+        let input = match receiver.recv_timeout(remaining.min(Duration::from_millis(2))) {
+            Ok(input) => input,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                operational_failures.push("system OCR tile stream disconnected".into());
+                break;
+            }
+        };
+        match input {
+            SystemOcrInput::Begin { tile_count } => {
+                if expected_tiles.replace(tile_count).is_some() {
+                    operational_failures.push("system OCR received a duplicate tile header".into());
+                    continue;
+                }
+                let (sender, receiver) = mpsc::sync_channel(tile_count.max(1));
+                completion_sender = Some(sender);
+                completion_receiver = Some(receiver);
+                active.reserve(tile_count);
+            }
+            SystemOcrInput::Tile(mut tile) => {
+                let Some(notifier) = completion_sender.as_ref() else {
+                    operational_failures
+                        .push("system OCR received a tile before its header".into());
+                    if let Err(error) = tile.bitmap.close() {
+                        cleanup_failures.push(error);
+                    }
+                    continue;
+                };
+                let index = active.len();
+                if tile.geometry.width > descriptor.maximum_dimension
+                    || tile.geometry.height > descriptor.maximum_dimension
+                {
+                    operational_failures.push(format!(
+                        "system OCR tile {}x{} exceeds the OCR limit {}",
+                        tile.geometry.width, tile.geometry.height, descriptor.maximum_dimension
+                    ));
+                    if let Err(error) = tile.bitmap.close() {
+                        cleanup_failures.push(error);
+                    }
+                    active.push(None);
+                    continue;
+                }
+                let engine = match first_engine
+                    .take()
+                    .map_or_else(super::native::create_system_ocr_engine, Ok)
+                {
+                    Ok(engine) => engine,
+                    Err(error) => {
+                        operational_failures.push(error);
+                        if let Err(error) = tile.bitmap.close() {
+                            cleanup_failures.push(error);
+                        }
+                        active.push(None);
+                        continue;
+                    }
+                };
+                let operation = match tile.bitmap.bitmap().and_then(|bitmap| {
+                    OcrOperationGuard::start_notified(&engine, bitmap, index, notifier.clone())
+                        .map_err(VisionError::Operational)
+                }) {
+                    Ok(operation) => operation,
+                    Err(error) => {
+                        operational_failures.push(error.to_string());
+                        if let Err(error) = tile.bitmap.close() {
+                            cleanup_failures.push(error);
+                        }
+                        active.push(None);
+                        continue;
+                    }
+                };
+                active.push(Some(ActiveSystemOcrTile {
+                    _engine: engine,
+                    operation,
+                    tile,
+                }));
+                pending += 1;
+            }
+            SystemOcrInput::Failed(error) => operational_failures.push(error),
+            SystemOcrInput::Done => break,
+        }
+    }
+    drop(first_engine);
+    if let Some(expected) = expected_tiles
+        && active.len() != expected
+    {
+        operational_failures.push(format!(
+            "system OCR expected {expected} tiles but received {}",
+            active.len()
+        ));
+    }
+
+    let mut accepted = 0usize;
+    while pending != 0 && accepted < MAX_OCR_TARGETS {
+        if cancellation.is_cancelled() || Instant::now() >= deadline {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let completion = completion_receiver
+            .as_ref()
+            .ok_or_else(|| VisionError::Operational("system OCR has no completion channel".into()))?
+            .recv_timeout(remaining.min(Duration::from_millis(2)));
+        let (index, status) = match completion {
+            Ok(completion) => completion,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                operational_failures.push("system OCR completion channel disconnected".into());
+                break;
+            }
+        };
+        let Some(slot) = active.get_mut(index) else {
+            operational_failures.push(format!(
+                "system OCR returned an invalid tile completion index {index}"
+            ));
+            continue;
+        };
+        let Some(mut completed) = slot.take() else {
+            operational_failures.push(format!(
+                "system OCR returned a duplicate tile completion index {index}"
+            ));
+            continue;
+        };
+        pending = pending.saturating_sub(1);
+        match completed.operation.complete(status, deadline) {
+            Ok(result) => match system_targets_from_result(
+                &result,
+                completed.tile.geometry,
+                MAX_OCR_TARGETS - accepted,
+            ) {
+                Ok(mut targets) => {
+                    targets.retain(|target| {
+                        completed.tile.core_bounds.contains(&target.rect.center())
+                    });
+                    match send_ocr_batches(result_tx, "system", started, targets) {
+                        Ok(count) => accepted += count,
+                        Err(error) => {
+                            cancel_active_system_tiles(
+                                &mut active,
+                                deadline,
+                                &mut cleanup_failures,
+                            );
+                            return if cleanup_failures.is_empty() {
+                                Err(error)
+                            } else {
+                                Err(VisionError::Cleanup(cleanup_failures.join("; ")))
+                            };
+                        }
+                    }
+                }
+                Err(error) => operational_failures.push(error),
+            },
+            Err(error) => operational_failures.push(format!("system OCR tile {index}: {error}")),
+        }
+        if let Err(error) = completed.tile.bitmap.close() {
+            cleanup_failures.push(error);
+        }
+    }
+    cancel_active_system_tiles(&mut active, deadline, &mut cleanup_failures);
+    if !cleanup_failures.is_empty() {
+        Err(VisionError::Cleanup(cleanup_failures.join("; ")))
+    } else if cancellation.is_cancelled() {
+        Err(VisionError::Cancelled)
+    } else if Instant::now() >= deadline {
+        Err(VisionError::TimedOut)
+    } else if !operational_failures.is_empty() {
+        Err(VisionError::Operational(operational_failures.join("; ")))
+    } else {
+        Ok(accepted)
+    }
+}
+
+struct ActiveSystemOcrTile {
+    _engine: OcrEngine,
+    operation: OcrOperationGuard,
+    tile: SystemOcrTile,
+}
+
+fn cancel_active_system_tiles(
+    active: &mut [Option<ActiveSystemOcrTile>],
+    deadline: Instant,
+    cleanup_failures: &mut Vec<String>,
+) {
+    for slot in active {
+        let Some(mut tile) = slot.take() else {
+            continue;
+        };
+        if let Err(error) = tile.operation.cancel(deadline) {
+            cleanup_failures.push(error);
+        }
+        if let Err(error) = tile.tile.bitmap.close() {
+            cleanup_failures.push(error);
+        }
+    }
 }
 
 fn recognize_wechat_provider(
@@ -1003,7 +1340,9 @@ fn recognize_wechat_provider(
     deadline: Instant,
     minimum_confidence: f64,
     cancellation: &ScanCancellation,
-) -> Result<Vec<UiTarget>, VisionError> {
+    result_tx: &mpsc::SyncSender<ProviderEvent>,
+    started: Instant,
+) -> Result<usize, VisionError> {
     let _apartment = super::native::ComApartment::initialise().map_err(VisionError::Operational)?;
     let mut provider = WechatOcr::start(&descriptor, deadline, &|| cancellation.is_cancelled())
         .map_err(VisionError::Unavailable)?;
@@ -1011,10 +1350,14 @@ fn recognize_wechat_provider(
         provider
             .recognize(
                 input.geometry,
-                &input.bitmap.0,
+                input.bitmap.bitmap()?,
                 deadline.saturating_duration_since(Instant::now()),
                 minimum_confidence,
                 || cancellation.is_cancelled(),
+                |targets| {
+                    send_ocr_batches(result_tx, "wechat", started, targets)
+                        .map_err(|error| error.to_string())
+                },
             )
             .map_err(|error| {
                 if cancellation.is_cancelled() {
@@ -1063,12 +1406,49 @@ pub(super) fn diagnostic_lines() -> Vec<String> {
 }
 
 enum ProviderEvent {
-    Ocr {
+    OcrBatch {
         provider: &'static str,
         elapsed: Duration,
-        result: Result<Vec<UiTarget>, VisionError>,
+        targets: Vec<UiTarget>,
+    },
+    OcrDone {
+        provider: &'static str,
+        elapsed: Duration,
+        result: Result<usize, VisionError>,
     },
     Fallback(Vec<UiTarget>),
+}
+
+fn send_ocr_batches(
+    sender: &mpsc::SyncSender<ProviderEvent>,
+    provider: &'static str,
+    started: Instant,
+    targets: Vec<UiTarget>,
+) -> Result<usize, VisionError> {
+    let count = targets.len();
+    let mut batch = Vec::with_capacity(PROVIDER_BATCH_SIZE);
+    for target in targets {
+        batch.push(target);
+        if batch.len() == PROVIDER_BATCH_SIZE {
+            sender
+                .send(ProviderEvent::OcrBatch {
+                    provider,
+                    elapsed: started.elapsed(),
+                    targets: std::mem::replace(&mut batch, Vec::with_capacity(PROVIDER_BATCH_SIZE)),
+                })
+                .map_err(|_| VisionError::Cancelled)?;
+        }
+    }
+    if !batch.is_empty() {
+        sender
+            .send(ProviderEvent::OcrBatch {
+                provider,
+                elapsed: started.elapsed(),
+                targets: batch,
+            })
+            .map_err(|_| VisionError::Cancelled)?;
+    }
+    Ok(count)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1103,6 +1483,139 @@ fn capture_geometry(bounds: Rect) -> Result<CaptureGeometry, String> {
     })
 }
 
+fn system_ocr_grid_for_parallelism(width: u32, height: u32, parallelism: usize) -> u32 {
+    let cpu_grid = parallelism.max(1).isqrt().saturating_add(1);
+    let size_grid = (width / MIN_SYSTEM_OCR_TILE_SIDE)
+        .min(height / MIN_SYSTEM_OCR_TILE_SIDE)
+        .max(1) as usize;
+    cpu_grid.min(size_grid).max(1) as u32
+}
+
+fn system_ocr_grid(width: u32, height: u32) -> u32 {
+    let parallelism = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(8);
+    system_ocr_grid_for_parallelism(width, height, parallelism)
+}
+
+fn scaled_partition(value: u32, index: u32, divisions: u32) -> u32 {
+    ((u64::from(value) * u64::from(index)) / u64::from(divisions)) as u32
+}
+
+fn capture_pixel_rect(geometry: CaptureGeometry, x: u32, y: u32, width: u32, height: u32) -> Rect {
+    image_to_desktop(
+        geometry,
+        Rect::new(
+            f64::from(x),
+            f64::from(y),
+            f64::from(width),
+            f64::from(height),
+        ),
+    )
+}
+
+fn system_ocr_tile_from_bgra(
+    pixels: &[u8],
+    geometry: CaptureGeometry,
+    core_x: u32,
+    core_y: u32,
+    core_right: u32,
+    core_bottom: u32,
+) -> Result<SystemOcrTile, String> {
+    let bitmap_x = core_x.saturating_sub(SYSTEM_OCR_TILE_OVERLAP);
+    let bitmap_y = core_y.saturating_sub(SYSTEM_OCR_TILE_OVERLAP);
+    let bitmap_right = core_right
+        .saturating_add(SYSTEM_OCR_TILE_OVERLAP)
+        .min(geometry.width);
+    let bitmap_bottom = core_bottom
+        .saturating_add(SYSTEM_OCR_TILE_OVERLAP)
+        .min(geometry.height);
+    let tile_width = bitmap_right - bitmap_x;
+    let tile_height = bitmap_bottom - bitmap_y;
+    let source_stride = geometry.width as usize * 4;
+    let tile_stride = tile_width as usize * 4;
+    let tile_length = tile_stride
+        .checked_mul(tile_height as usize)
+        .ok_or_else(|| "system OCR tile byte length overflowed".to_string())?;
+    let mut tile_pixels = vec![0; tile_length];
+    for tile_row in 0..tile_height as usize {
+        let source_start = (bitmap_y as usize + tile_row)
+            .checked_mul(source_stride)
+            .and_then(|offset| offset.checked_add(bitmap_x as usize * 4))
+            .ok_or_else(|| "system OCR source row offset overflowed".to_string())?;
+        let source_end = source_start
+            .checked_add(tile_stride)
+            .ok_or_else(|| "system OCR source row length overflowed".to_string())?;
+        let destination_start = tile_row * tile_stride;
+        let source = pixels
+            .get(source_start..source_end)
+            .ok_or_else(|| "system OCR tile exceeds the captured BGRA frame".to_string())?;
+        tile_pixels[destination_start..destination_start + tile_stride].copy_from_slice(source);
+    }
+    let bitmap = super::native::software_bitmap_bgra(&tile_pixels, tile_width, tile_height)?;
+    let desktop_bounds = capture_pixel_rect(geometry, bitmap_x, bitmap_y, tile_width, tile_height);
+    Ok(SystemOcrTile {
+        geometry: CaptureGeometry {
+            width: tile_width,
+            height: tile_height,
+            desktop_bounds,
+            scale: geometry.scale,
+        },
+        core_bounds: capture_pixel_rect(
+            geometry,
+            core_x,
+            core_y,
+            core_right - core_x,
+            core_bottom - core_y,
+        ),
+        bitmap: SharedSoftwareBitmap {
+            bitmap: Some(bitmap),
+            _ledger: crate::app::perf_probe::ResourceGuard::new(
+                crate::app::perf_probe::ResourceKind::Bitmap,
+            ),
+        },
+    })
+}
+
+fn stream_system_ocr_tiles(
+    pixels: &[u8],
+    geometry: CaptureGeometry,
+    sender: &mpsc::SyncSender<SystemOcrInput>,
+) -> Result<(), String> {
+    let expected = geometry.width as usize * geometry.height as usize * 4;
+    if pixels.len() != expected {
+        return Err("captured BGRA byte length does not match system OCR geometry".into());
+    }
+    let grid = system_ocr_grid(geometry.width, geometry.height);
+    let tile_count = (grid as usize)
+        .checked_mul(grid as usize)
+        .ok_or_else(|| "system OCR tile count overflowed".to_string())?;
+    if sender.send(SystemOcrInput::Begin { tile_count }).is_err() {
+        return Ok(());
+    }
+    for row in 0..grid {
+        for column in 0..grid {
+            let core_x = scaled_partition(geometry.width, column, grid);
+            let core_right = scaled_partition(geometry.width, column + 1, grid);
+            let core_y = scaled_partition(geometry.height, row, grid);
+            let core_bottom = scaled_partition(geometry.height, row + 1, grid);
+            let tile = system_ocr_tile_from_bgra(
+                pixels,
+                geometry,
+                core_x,
+                core_y,
+                core_right,
+                core_bottom,
+            )?;
+            if sender.send(SystemOcrInput::Tile(tile)).is_err() {
+                return Ok(());
+            }
+        }
+    }
+    let _ = sender.send(SystemOcrInput::Done);
+    Ok(())
+}
+
 fn fallback_input_from_bgra(
     pixels: &[u8],
     geometry: CaptureGeometry,
@@ -1123,11 +1636,11 @@ fn fallback_input_from_bgra(
     let analysis_scale = edge_scale.min(pixel_scale);
     let width = (source_width as f64 * analysis_scale).round().max(2.0) as usize;
     let height = (source_height as f64 * analysis_scale).round().max(2.0) as usize;
+    let source_x_offsets = nearest_offsets(source_width, width);
+    let source_y_offsets = nearest_offsets(source_height, height);
     let mut gray = vec![0; width * height];
-    for y in 0..height {
-        let source_y = (y * source_height / height).min(source_height - 1);
-        for x in 0..width {
-            let source_x = (x * source_width / width).min(source_width - 1);
+    for (y, source_y) in source_y_offsets.into_iter().enumerate() {
+        for (x, source_x) in source_x_offsets.iter().copied().enumerate() {
             let source = (source_y * source_width + source_x) * 4;
             gray[y * width + x] = ((u16::from(pixels[source + 2]) * 77
                 + u16::from(pixels[source + 1]) * 150
@@ -1141,6 +1654,27 @@ fn fallback_input_from_bgra(
         height,
         desktop_bounds: geometry.desktop_bounds,
     })
+}
+
+/// Return the exact `floor(output * source / destination)` mapping without a
+/// division in the per-pixel conversion loop.
+fn nearest_offsets(source: usize, destination: usize) -> Vec<usize> {
+    debug_assert!(source != 0 && destination != 0);
+    let step = source / destination;
+    let remainder_step = source % destination;
+    let mut source_index = 0usize;
+    let mut remainder = 0usize;
+    let mut offsets = Vec::with_capacity(destination);
+    for _ in 0..destination {
+        offsets.push(source_index.min(source - 1));
+        source_index += step;
+        remainder += remainder_step;
+        if remainder >= destination {
+            source_index += 1;
+            remainder -= destination;
+        }
+    }
+    offsets
 }
 
 fn discover_ocr(shared: Arc<DiscoveryShared>) {
@@ -1238,82 +1772,20 @@ fn probe_system_ocr(cancelled: impl Fn() -> bool) -> Result<SystemOcrDescriptor,
     result
 }
 
-fn recognize_system(
-    engine: &OcrEngine,
-    bitmap: &windows::Graphics::Imaging::SoftwareBitmap,
+fn system_targets_from_result(
+    result: &OcrResult,
     geometry: CaptureGeometry,
-    cancelled: impl Fn() -> bool,
+    maximum: usize,
 ) -> Result<Vec<UiTarget>, String> {
-    let operation = engine
-        .RecognizeAsync(bitmap)
-        .map_err(|error| format!("OcrEngine::RecognizeAsync failed: {error}"))?;
-    let (completed_tx, completed_rx) = mpsc::sync_channel(1);
-    operation
-        .SetCompleted(&AsyncOperationCompletedHandler::new(move |_, status| {
-            let _ = completed_tx.try_send(status);
-            Ok(())
-        }))
-        .map_err(|error| format!("cannot register system OCR completion: {error}"))?;
-    let async_result = loop {
-        if cancelled() {
-            let cancel = operation
-                .Cancel()
-                .map_err(|error| format!("cannot cancel system OCR operation: {error}"));
-            let _ = completed_rx.recv_timeout(Duration::from_millis(100));
-            let close = operation
-                .Close()
-                .map_err(|error| format!("cannot close cancelled system OCR operation: {error}"));
-            return match (cancel, close) {
-                (Ok(()), Ok(())) => Err("system OCR cancelled".into()),
-                (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-                (Err(error), Err(close)) => Err(format!("{error}; cleanup: {close}")),
-            };
-        }
-        match completed_rx.recv_timeout(Duration::from_millis(2)) {
-            Ok(AsyncStatus::Completed) => break operation.GetResults(),
-            Ok(AsyncStatus::Canceled) => {
-                break Err(windows::core::Error::new(
-                    windows::core::HRESULT(0x8007_04C7u32 as i32),
-                    "system OCR cancelled",
-                ));
-            }
-            Ok(AsyncStatus::Error) => {
-                let error = operation
-                    .ErrorCode()
-                    .map_err(|error| format!("cannot read system OCR error: {error}"))?;
-                break Err(error.into());
-            }
-            Ok(AsyncStatus::Started) | Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Ok(_) => return Err("system OCR returned an unknown asynchronous status".into()),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("system OCR completion handler disconnected".into());
-            }
-        }
-    };
-    let close = operation
-        .Close()
-        .map_err(|error| format!("cannot close system OCR operation: {error}"));
-    let result = match (async_result, close) {
-        (Ok(result), Ok(())) => result,
-        (Err(error), Ok(())) => {
-            return Err(format!("OcrEngine::RecognizeAsync failed: {error}"));
-        }
-        (Ok(_), Err(error)) => return Err(error),
-        (Err(error), Err(close)) => {
-            return Err(format!(
-                "OcrEngine::RecognizeAsync failed: {error}; cleanup: {close}"
-            ));
-        }
-    };
     let lines = result
         .Lines()
         .map_err(|error| format!("cannot read OCR lines: {error}"))?;
     let count = lines
         .Size()
         .map_err(|error| format!("cannot read OCR line count: {error}"))?;
-    let mut targets = Vec::with_capacity((count as usize).min(2_000));
+    let mut targets = Vec::with_capacity((count as usize).min(maximum));
     for index in 0..count {
-        if targets.len() == 2_000 {
+        if targets.len() == maximum {
             break;
         }
         let line = lines
@@ -1362,6 +1834,139 @@ fn recognize_system(
     Ok(targets)
 }
 
+#[must_use = "system OCR operations must be cancelled or closed explicitly"]
+struct OcrOperationGuard {
+    operation: IAsyncOperation<OcrResult>,
+    completed: mpsc::Receiver<AsyncStatus>,
+    closed: bool,
+}
+
+impl OcrOperationGuard {
+    fn start_notified(
+        engine: &OcrEngine,
+        bitmap: &windows::Graphics::Imaging::SoftwareBitmap,
+        index: usize,
+        notifier: mpsc::SyncSender<(usize, AsyncStatus)>,
+    ) -> Result<Self, String> {
+        let operation = engine
+            .RecognizeAsync(bitmap)
+            .map_err(|error| format!("OcrEngine::RecognizeAsync failed: {error}"))?;
+        let (completed_tx, completed) = mpsc::sync_channel(1);
+        let mut guard = Self {
+            operation,
+            completed,
+            closed: false,
+        };
+        if let Err(error) = guard
+            .operation
+            .SetCompleted(&AsyncOperationCompletedHandler::new(move |_, status| {
+                let _ = completed_tx.try_send(status);
+                let _ = notifier.try_send((index, status));
+                Ok(())
+            }))
+        {
+            return Err(guard.finish_error(
+                format!("cannot register tiled system OCR completion: {error}"),
+                true,
+                Instant::now() + Duration::from_millis(100),
+            ));
+        }
+        Ok(guard)
+    }
+
+    fn complete(mut self, status: AsyncStatus, deadline: Instant) -> Result<OcrResult, String> {
+        let (result, cancel) = match status {
+            AsyncStatus::Completed => (
+                self.operation
+                    .GetResults()
+                    .map_err(|error| format!("OcrEngine::RecognizeAsync failed: {error}")),
+                false,
+            ),
+            AsyncStatus::Canceled => (Err("system OCR cancelled".into()), false),
+            AsyncStatus::Error => (
+                self.operation.ErrorCode().map_or_else(
+                    |error| Err(format!("cannot read system OCR error: {error}")),
+                    |error| Err(format!("OcrEngine::RecognizeAsync failed: {error}")),
+                ),
+                false,
+            ),
+            AsyncStatus::Started => (
+                Err("system OCR completed callback reported Started".into()),
+                true,
+            ),
+            _ => (
+                Err("system OCR returned an unknown asynchronous status".into()),
+                true,
+            ),
+        };
+        self.finish(result, cancel, deadline)
+    }
+
+    fn cancel(mut self, deadline: Instant) -> Result<(), String> {
+        self.finish(Ok(()), true, deadline)
+    }
+
+    fn finish<T>(
+        &mut self,
+        result: Result<T, String>,
+        cancel: bool,
+        deadline: Instant,
+    ) -> Result<T, String> {
+        let mut cleanup = Vec::new();
+        if cancel {
+            if let Err(error) = self.operation.Cancel() {
+                cleanup.push(format!("cannot cancel system OCR operation: {error}"));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                let _ = self
+                    .completed
+                    .recv_timeout(remaining.min(Duration::from_millis(100)));
+            }
+        }
+        if let Err(error) = self.operation.Close() {
+            cleanup.push(format!("cannot close system OCR operation: {error}"));
+        }
+        self.closed = true;
+        combine_result_and_cleanup(result, cleanup)
+    }
+
+    fn finish_error(&mut self, error: String, cancel: bool, deadline: Instant) -> String {
+        match self.finish::<()>(Err(error), cancel, deadline) {
+            Ok(()) => "system OCR cleanup lost its primary error".into(),
+            Err(error) => error,
+        }
+    }
+}
+
+impl Drop for OcrOperationGuard {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        let error = self.finish::<()>(
+            Err("system OCR operation left its explicit owner".into()),
+            true,
+            Instant::now() + Duration::from_millis(100),
+        );
+        if let Err(error) = error {
+            crate::app::logging::report_error("windows-vision", error);
+        }
+    }
+}
+
+fn combine_result_and_cleanup<T>(
+    result: Result<T, String>,
+    cleanup: Vec<String>,
+) -> Result<T, String> {
+    match (result, cleanup.is_empty()) {
+        (Ok(value), true) => Ok(value),
+        (Ok(_), false) => Err(cleanup.join("; ")),
+        (Err(error), true) => Err(error),
+        (Err(error), false) => Err(format!("{error}; cleanup: {}", cleanup.join("; "))),
+    }
+}
+
 pub(super) fn trim_string_in_place(value: &mut String) {
     let start = value.len() - value.trim_start().len();
     let end = value.trim_end().len();
@@ -1403,8 +2008,12 @@ fn detect_regions(
     let FallbackScratch {
         edge,
         dilated,
-        closed,
-        queue,
+        previous_runs,
+        current_runs,
+        components,
+        next_components,
+        root_remap,
+        active_roots,
     } = scratch;
     let gray = &image.gray;
     edge.resize(width * height, false);
@@ -1451,105 +2060,132 @@ fn detect_regions(
             });
         }
     }
-    closed.clone_from(dilated);
+    // `edge` is dead after dilation; reuse it for the closed image.
+    edge.fill(false);
     for y in 1..height - 1 {
         if cancelled() {
             return Vec::new();
         }
         for x in 1..width - 1 {
             let i = y * width + x;
-            closed[i] = (-1isize..=1).all(|dy| {
+            edge[i] = (-1isize..=1).all(|dy| {
                 (-1isize..=1).all(|dx| {
                     dilated[((y as isize + dy) as usize) * width + (x as isize + dx) as usize]
                 })
             });
         }
     }
-    // `edge` is dead after the close pass; reuse its allocation as the visited
-    // bitmap instead of retaining a fifth full analysis-plane buffer.
-    edge.fill(false);
-    let visited = edge;
     let candidate_limit = options.rectangle_max_candidates.min(2_000);
     let mut candidates = BinaryHeap::with_capacity(candidate_limit);
     let configured_minimum =
         (options.rectangle_min_size * width.min(height) as f64).ceil() as usize;
     let minimum_side = configured_minimum.max(6);
+    previous_runs.clear();
+    components.clear();
     for y in 1..height - 1 {
         if cancelled() {
             return Vec::new();
         }
-        for x in 1..width - 1 {
-            let start = y * width + x;
-            if !closed[start] || visited[start] {
+        current_runs.clear();
+        let mut x = 1usize;
+        while x < width - 1 {
+            if !edge[y * width + x] {
+                x += 1;
                 continue;
             }
-            queue.clear();
-            queue.push_back(start as u32);
-            visited[start] = true;
-            let (mut min_x, mut max_x, mut min_y, mut max_y, mut pixels) = (x, x, y, y, 0usize);
-            while let Some(index) = queue.pop_front().map(|index| index as usize) {
-                if pixels & 0x03ff == 0 && cancelled() {
-                    return Vec::new();
-                }
-                pixels += 1;
-                let px = index % width;
-                let py = index / width;
-                min_x = min_x.min(px);
-                max_x = max_x.max(px);
-                min_y = min_y.min(py);
-                max_y = max_y.max(py);
-                for ny in py.saturating_sub(1)..=(py + 1).min(height - 1) {
-                    for nx in px.saturating_sub(1)..=(px + 1).min(width - 1) {
-                        let next = ny * width + nx;
-                        if closed[next] && !visited[next] {
-                            visited[next] = true;
-                            queue.push_back(next as u32);
-                        }
-                    }
-                }
+            let start = x;
+            while x + 1 < width - 1 && edge[y * width + x + 1] {
+                x += 1;
             }
-            let box_width = max_x - min_x + 1;
-            let box_height = max_y - min_y + 1;
-            let aspect = box_width as f64 / box_height as f64;
-            let perimeter = (2 * (box_width + box_height)).max(1);
-            if box_width < minimum_side
-                || box_height < minimum_side
-                || pixels < 16
-                || !(options.rectangle_min_aspect..=options.rectangle_max_aspect).contains(&aspect)
+            current_runs.push(ComponentRun {
+                start,
+                end: x,
+                label: usize::MAX,
+            });
+            x += 1;
+        }
+
+        let mut previous_start = 0usize;
+        for run in current_runs.iter_mut() {
+            while previous_start < previous_runs.len()
+                && previous_runs[previous_start].end.saturating_add(1) < run.start
             {
-                continue;
+                previous_start += 1;
             }
-            let confidence = (pixels as f64 / perimeter as f64).min(1.0);
-            if confidence < options.minimum_confidence {
-                continue;
+            let mut previous = previous_start;
+            let mut label = None;
+            while previous < previous_runs.len()
+                && previous_runs[previous].start <= run.end.saturating_add(1)
+            {
+                let previous_label = previous_runs[previous].label;
+                label = Some(match label {
+                    Some(current) => union_components(components, current, previous_label),
+                    None => component_root(components, previous_label),
+                });
+                previous += 1;
             }
-            let rect = Rect::new(
-                image.desktop_bounds.x + min_x as f64 * image.desktop_bounds.width / width as f64,
-                image.desktop_bounds.y + min_y as f64 * image.desktop_bounds.height / height as f64,
-                box_width as f64 * image.desktop_bounds.width / width as f64,
-                box_height as f64 * image.desktop_bounds.height / height as f64,
-            );
-            if valid_target_rect(rect, image.desktop_bounds) {
-                let role = classify_region(rect, confidence, options);
-                if let Some((role, native_role)) = role {
-                    let candidate = Reverse(RegionCandidate {
-                        confidence,
-                        rect,
-                        role,
-                        native_role,
-                    });
-                    if candidates.len() < candidate_limit {
-                        candidates.push(candidate);
-                    } else if candidates
-                        .peek()
-                        .is_some_and(|current| candidate.0 > current.0)
-                    {
-                        candidates.pop();
-                        candidates.push(candidate);
-                    }
-                }
+            let label = label.unwrap_or_else(|| {
+                let label = components.len();
+                components.push(ActiveComponent::new(label, run.start, run.end, y));
+                label
+            });
+            let root = component_root(components, label);
+            components[root].stats.add_run(run.start, run.end, y);
+            run.label = root;
+        }
+
+        active_roots.clear();
+        active_roots.resize(components.len(), false);
+        for run in current_runs.iter_mut() {
+            let root = component_root(components, run.label);
+            run.label = root;
+            active_roots[root] = true;
+        }
+        for index in 0..components.len() {
+            let root = component_root(components, index);
+            if root == index && !active_roots[root] {
+                consider_region(
+                    components[root].stats,
+                    image,
+                    options,
+                    minimum_side,
+                    candidate_limit,
+                    &mut candidates,
+                );
             }
         }
+
+        root_remap.clear();
+        root_remap.resize(components.len(), usize::MAX);
+        next_components.clear();
+        next_components.reserve(current_runs.len());
+        for run in current_runs.iter_mut() {
+            let root = run.label;
+            let mapped = if root_remap[root] == usize::MAX {
+                let mapped = next_components.len();
+                root_remap[root] = mapped;
+                next_components.push(ActiveComponent {
+                    parent: mapped,
+                    stats: components[root].stats,
+                });
+                mapped
+            } else {
+                root_remap[root]
+            };
+            run.label = mapped;
+        }
+        std::mem::swap(components, next_components);
+        std::mem::swap(previous_runs, current_runs);
+    }
+    for component in components.iter() {
+        consider_region(
+            component.stats,
+            image,
+            options,
+            minimum_side,
+            candidate_limit,
+            &mut candidates,
+        );
     }
     if cancelled() {
         return Vec::new();
@@ -1570,8 +2206,153 @@ fn detect_regions(
 struct FallbackScratch {
     edge: Vec<bool>,
     dilated: Vec<bool>,
-    closed: Vec<bool>,
-    queue: VecDeque<u32>,
+    previous_runs: Vec<ComponentRun>,
+    current_runs: Vec<ComponentRun>,
+    components: Vec<ActiveComponent>,
+    next_components: Vec<ActiveComponent>,
+    root_remap: Vec<usize>,
+    active_roots: Vec<bool>,
+}
+
+#[derive(Clone, Copy)]
+struct ComponentRun {
+    start: usize,
+    end: usize,
+    label: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ActiveComponent {
+    parent: usize,
+    stats: ComponentStats,
+}
+
+impl ActiveComponent {
+    fn new(parent: usize, start: usize, end: usize, y: usize) -> Self {
+        Self {
+            parent,
+            // The run is added after any unions so merged and new components
+            // share the same update path.
+            stats: ComponentStats {
+                min_x: start,
+                max_x: end,
+                min_y: y,
+                max_y: y,
+                pixels: 0,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ComponentStats {
+    min_x: usize,
+    max_x: usize,
+    min_y: usize,
+    max_y: usize,
+    pixels: usize,
+}
+
+impl ComponentStats {
+    fn add_run(&mut self, start: usize, end: usize, y: usize) {
+        self.min_x = self.min_x.min(start);
+        self.max_x = self.max_x.max(end);
+        self.min_y = self.min_y.min(y);
+        self.max_y = self.max_y.max(y);
+        self.pixels += end - start + 1;
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.min_x = self.min_x.min(other.min_x);
+        self.max_x = self.max_x.max(other.max_x);
+        self.min_y = self.min_y.min(other.min_y);
+        self.max_y = self.max_y.max(other.max_y);
+        self.pixels += other.pixels;
+    }
+}
+
+fn component_root(components: &mut [ActiveComponent], mut index: usize) -> usize {
+    let mut root = index;
+    while components[root].parent != root {
+        root = components[root].parent;
+    }
+    while components[index].parent != index {
+        let parent = components[index].parent;
+        components[index].parent = root;
+        index = parent;
+    }
+    root
+}
+
+fn union_components(components: &mut [ActiveComponent], first: usize, second: usize) -> usize {
+    let first = component_root(components, first);
+    let second = component_root(components, second);
+    if first == second {
+        return first;
+    }
+    let (root, merged) = if first < second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let merged_stats = components[merged].stats;
+    components[merged].parent = root;
+    components[root].stats.merge(merged_stats);
+    root
+}
+
+fn consider_region(
+    stats: ComponentStats,
+    image: &FallbackInput,
+    options: &crate::api::VisionOptions,
+    minimum_side: usize,
+    candidate_limit: usize,
+    candidates: &mut BinaryHeap<Reverse<RegionCandidate>>,
+) {
+    let box_width = stats.max_x - stats.min_x + 1;
+    let box_height = stats.max_y - stats.min_y + 1;
+    let aspect = box_width as f64 / box_height as f64;
+    let perimeter = (2 * (box_width + box_height)).max(1);
+    if box_width < minimum_side
+        || box_height < minimum_side
+        || stats.pixels < 16
+        || !(options.rectangle_min_aspect..=options.rectangle_max_aspect).contains(&aspect)
+    {
+        return;
+    }
+    let confidence = (stats.pixels as f64 / perimeter as f64).min(1.0);
+    if confidence < options.minimum_confidence {
+        return;
+    }
+    let rect = Rect::new(
+        image.desktop_bounds.x
+            + stats.min_x as f64 * image.desktop_bounds.width / image.width as f64,
+        image.desktop_bounds.y
+            + stats.min_y as f64 * image.desktop_bounds.height / image.height as f64,
+        box_width as f64 * image.desktop_bounds.width / image.width as f64,
+        box_height as f64 * image.desktop_bounds.height / image.height as f64,
+    );
+    if !valid_target_rect(rect, image.desktop_bounds) {
+        return;
+    }
+    let Some((role, native_role)) = classify_region(rect, confidence, options) else {
+        return;
+    };
+    let candidate = Reverse(RegionCandidate {
+        confidence,
+        rect,
+        role,
+        native_role,
+    });
+    if candidates.len() < candidate_limit {
+        candidates.push(candidate);
+    } else if candidates
+        .peek()
+        .is_some_and(|current| candidate.0 > current.0)
+    {
+        candidates.pop();
+        candidates.push(candidate);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1629,6 +2410,7 @@ fn classify_region(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::sync::atomic::AtomicUsize;
 
     #[test]
@@ -1643,6 +2425,141 @@ mod tests {
             image_to_desktop(image, Rect::new(25.0, 10.0, 50.0, 20.0)),
             Rect::new(-950.0, -180.0, 100.0, 40.0)
         );
+    }
+
+    #[test]
+    fn standard_uhd_capture_keeps_native_bitblt_dimensions() {
+        let geometry = capture_geometry(Rect::new(0.0, 0.0, 3_840.0, 2_160.0)).unwrap();
+        assert_eq!(geometry.width, 3_840);
+        assert_eq!(geometry.height, 2_160);
+        assert_eq!(geometry.scale, 1.0);
+    }
+
+    #[test]
+    fn system_ocr_grid_uses_the_next_cpu_square_and_a_64px_size_floor() {
+        assert_eq!(system_ocr_grid_for_parallelism(3_840, 2_160, 16), 5);
+        assert_eq!(system_ocr_grid_for_parallelism(7_680, 4_320, 64), 9);
+        assert_eq!(system_ocr_grid_for_parallelism(320, 200, 16), 3);
+        assert_eq!(system_ocr_grid_for_parallelism(200, 100, 16), 1);
+    }
+
+    #[test]
+    fn system_ocr_core_tiles_cover_pixels_once_and_never_drop_below_64px() {
+        let width = 3_841;
+        let height = 2_161;
+        let grid = system_ocr_grid_for_parallelism(width, height, 16);
+        let mut previous_bottom = 0;
+        for row in 0..grid {
+            let mut previous_right = 0;
+            for column in 0..grid {
+                let left = scaled_partition(width, column, grid);
+                let right = scaled_partition(width, column + 1, grid);
+                let top = scaled_partition(height, row, grid);
+                let bottom = scaled_partition(height, row + 1, grid);
+                assert_eq!(left, previous_right);
+                assert_eq!(top, previous_bottom);
+                assert!(right - left >= MIN_SYSTEM_OCR_TILE_SIDE);
+                assert!(bottom - top >= MIN_SYSTEM_OCR_TILE_SIDE);
+                previous_right = right;
+            }
+            assert_eq!(previous_right, width);
+            previous_bottom = scaled_partition(height, row + 1, grid);
+        }
+        assert_eq!(previous_bottom, height);
+    }
+
+    #[test]
+    fn overlapping_system_ocr_tiles_map_a_seam_target_to_one_desktop_owner() {
+        let parent = CaptureGeometry {
+            width: 1_000,
+            height: 500,
+            desktop_bounds: Rect::new(-1_000.0, -200.0, 2_000.0, 1_000.0),
+            scale: 0.5,
+        };
+        let seam = 500;
+        let left_bitmap_right = seam + SYSTEM_OCR_TILE_OVERLAP;
+        let right_bitmap_x = seam - SYSTEM_OCR_TILE_OVERLAP;
+        let left_geometry = CaptureGeometry {
+            width: left_bitmap_right,
+            height: parent.height,
+            desktop_bounds: capture_pixel_rect(parent, 0, 0, left_bitmap_right, parent.height),
+            scale: parent.scale,
+        };
+        let right_geometry = CaptureGeometry {
+            width: parent.width - right_bitmap_x,
+            height: parent.height,
+            desktop_bounds: capture_pixel_rect(
+                parent,
+                right_bitmap_x,
+                0,
+                parent.width - right_bitmap_x,
+                parent.height,
+            ),
+            scale: parent.scale,
+        };
+        let global_pixel_rect = Rect::new(490.0, 120.0, 20.0, 12.0);
+        let from_left = image_to_desktop(left_geometry, global_pixel_rect);
+        let from_right = image_to_desktop(
+            right_geometry,
+            Rect::new(
+                global_pixel_rect.x - f64::from(right_bitmap_x),
+                global_pixel_rect.y,
+                global_pixel_rect.width,
+                global_pixel_rect.height,
+            ),
+        );
+        assert_eq!(from_left, from_right);
+
+        let left_core = capture_pixel_rect(parent, 0, 0, seam, parent.height);
+        let right_core = capture_pixel_rect(parent, seam, 0, parent.width - seam, parent.height);
+        let center = from_left.center();
+        assert!(!left_core.contains(&center));
+        assert!(right_core.contains(&center));
+    }
+
+    #[test]
+    fn division_free_nearest_offsets_match_reference_mapping() {
+        for (source, destination) in [
+            (3usize, 2usize),
+            (17, 7),
+            (100, 100),
+            (3_840, 2_560),
+            (2_160, 1_440),
+        ] {
+            assert_eq!(
+                nearest_offsets(source, destination),
+                (0..destination)
+                    .map(|output| output * source / destination)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn provider_targets_move_in_bounded_batches() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let targets = (0..49)
+            .map(|index| UiTarget {
+                rect: Rect::new(index as f64, 0.0, 4.0, 4.0),
+                name: index.to_string(),
+                role: "static_text".into(),
+                native_role: None,
+            })
+            .collect();
+        assert_eq!(
+            send_ocr_batches(&sender, "test", Instant::now(), targets)
+                .expect("test receiver is live"),
+            49
+        );
+        drop(sender);
+        let sizes = receiver
+            .into_iter()
+            .map(|event| match event {
+                ProviderEvent::OcrBatch { targets, .. } => targets.len(),
+                _ => 0,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sizes, [24, 24, 1]);
     }
 
     #[test]
@@ -1783,5 +2700,280 @@ mod tests {
     #[ignore = "requires an installed Windows OCR language pack"]
     fn live_system_ocr_runtime_probe_creates_and_drops_an_engine() {
         assert!(probe_system_ocr(|| false).is_ok());
+    }
+
+    #[derive(Clone, Copy)]
+    struct OcrTileProbe {
+        bitmap_x: u32,
+        bitmap_y: u32,
+        core_x: u32,
+        core_y: u32,
+        core_right: u32,
+        core_bottom: u32,
+    }
+
+    struct OcrTileProbeResult {
+        elapsed: Duration,
+        raw_words: usize,
+        owned_words: usize,
+    }
+
+    fn prepare_tile_probe(
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        grid: u32,
+        overlap: u32,
+    ) -> Result<Vec<(windows::Graphics::Imaging::SoftwareBitmap, OcrTileProbe)>, String> {
+        let mut tiles = Vec::with_capacity((grid * grid) as usize);
+        for row in 0..grid {
+            for column in 0..grid {
+                let core_x = column * width / grid;
+                let core_right = (column + 1) * width / grid;
+                let core_y = row * height / grid;
+                let core_bottom = (row + 1) * height / grid;
+                let bitmap_x = core_x.saturating_sub(overlap);
+                let bitmap_y = core_y.saturating_sub(overlap);
+                let bitmap_right = core_right.saturating_add(overlap).min(width);
+                let bitmap_bottom = core_bottom.saturating_add(overlap).min(height);
+                let tile_width = bitmap_right - bitmap_x;
+                let tile_height = bitmap_bottom - bitmap_y;
+                let source_stride = width as usize * 4;
+                let tile_stride = tile_width as usize * 4;
+                let mut tile_pixels = vec![0; tile_stride * tile_height as usize];
+                for tile_row in 0..tile_height as usize {
+                    let source_start =
+                        (bitmap_y as usize + tile_row) * source_stride + bitmap_x as usize * 4;
+                    let destination_start = tile_row * tile_stride;
+                    tile_pixels[destination_start..destination_start + tile_stride]
+                        .copy_from_slice(&pixels[source_start..source_start + tile_stride]);
+                }
+                let bitmap = super::super::native::software_bitmap_bgra(
+                    &tile_pixels,
+                    tile_width,
+                    tile_height,
+                )?;
+                tiles.push((
+                    bitmap,
+                    OcrTileProbe {
+                        bitmap_x,
+                        bitmap_y,
+                        core_x,
+                        core_y,
+                        core_right,
+                        core_bottom,
+                    },
+                ));
+            }
+        }
+        Ok(tiles)
+    }
+
+    fn run_tile_probe(
+        tiles: &[(windows::Graphics::Imaging::SoftwareBitmap, OcrTileProbe)],
+    ) -> Result<Vec<OcrTileProbeResult>, String> {
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            let workers = tiles
+                .iter()
+                .map(|(bitmap, tile)| {
+                    let bitmap = bitmap.clone();
+                    scope.spawn(move || {
+                        let _apartment = super::super::native::ComApartment::initialise()?;
+                        let engine = super::super::native::create_system_ocr_engine()?;
+                        let result = engine
+                            .RecognizeAsync(&bitmap)
+                            .and_then(|operation| operation.join())
+                            .map_err(|error| format!("tiled OcrEngine failed: {error}"))?;
+                        let mut raw_words = 0usize;
+                        let mut owned_words = 0usize;
+                        let lines = result
+                            .Lines()
+                            .map_err(|error| format!("cannot enumerate OCR lines: {error}"))?;
+                        for line in &lines {
+                            let words = line
+                                .Words()
+                                .map_err(|error| format!("cannot enumerate OCR words: {error}"))?;
+                            for word in &words {
+                                raw_words += 1;
+                                let rect = word.BoundingRect().map_err(|error| {
+                                    format!("cannot read OCR word bounds: {error}")
+                                })?;
+                                let center_x = tile.bitmap_x as f32 + rect.X + rect.Width * 0.5;
+                                let center_y = tile.bitmap_y as f32 + rect.Y + rect.Height * 0.5;
+                                if center_x >= tile.core_x as f32
+                                    && center_x < tile.core_right as f32
+                                    && center_y >= tile.core_y as f32
+                                    && center_y < tile.core_bottom as f32
+                                {
+                                    owned_words += 1;
+                                }
+                            }
+                        }
+                        Ok(OcrTileProbeResult {
+                            elapsed: started.elapsed(),
+                            raw_words,
+                            owned_words,
+                        })
+                    })
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| {
+                    worker
+                        .join()
+                        .map_err(|_| "tiled OCR worker panicked".to_string())?
+                })
+                .collect::<Result<Vec<_>, String>>()
+        })
+    }
+
+    fn tile_probe_percentile(values: &mut [Duration], percentile: usize) -> Duration {
+        values.sort_unstable();
+        values[(values.len() - 1) * percentile / 100]
+    }
+
+    #[test]
+    #[ignore = "manual Windows OCR tiling benchmark; set KEYSTEER_OCR_TILE_IMAGE if needed"]
+    fn live_system_ocr_tiling_probe() -> Result<(), String> {
+        use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapDecoder, BitmapPixelFormat};
+        use windows::Storage::Streams::{
+            Buffer, DataReader, DataWriter, InMemoryRandomAccessStream,
+        };
+
+        const OVERLAP: u32 = 64;
+        const WARMUPS: usize = 2;
+        const SAMPLES: usize = 10;
+
+        let _apartment = super::super::native::ComApartment::initialise()?;
+        let image_path = std::env::var_os("KEYSTEER_OCR_TILE_IMAGE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("browser.jpg"));
+        let encoded = std::fs::read(&image_path)
+            .map_err(|error| format!("cannot read {}: {error}", image_path.display()))?;
+        let stream = InMemoryRandomAccessStream::new()
+            .map_err(|error| format!("cannot create image stream: {error}"))?;
+        let writer = DataWriter::CreateDataWriter(&stream)
+            .map_err(|error| format!("cannot create image writer: {error}"))?;
+        writer
+            .WriteBytes(&encoded)
+            .map_err(|error| format!("cannot stage image bytes: {error}"))?;
+        writer
+            .StoreAsync()
+            .and_then(|operation| operation.join())
+            .map_err(|error| format!("cannot store image bytes: {error}"))?;
+        writer
+            .DetachStream()
+            .map_err(|error| format!("cannot detach image stream: {error}"))?;
+        writer
+            .Close()
+            .map_err(|error| format!("cannot close image writer: {error}"))?;
+        stream
+            .Seek(0)
+            .map_err(|error| format!("cannot rewind image stream: {error}"))?;
+        let decoder = BitmapDecoder::CreateAsync(&stream)
+            .and_then(|operation| operation.join())
+            .map_err(|error| format!("cannot decode {}: {error}", image_path.display()))?;
+        let width = decoder
+            .PixelWidth()
+            .map_err(|error| format!("cannot read image width: {error}"))?;
+        let height = decoder
+            .PixelHeight()
+            .map_err(|error| format!("cannot read image height: {error}"))?;
+        let full_bitmap = decoder
+            .GetSoftwareBitmapConvertedAsync(BitmapPixelFormat::Bgra8, BitmapAlphaMode::Ignore)
+            .and_then(|operation| operation.join())
+            .map_err(|error| format!("cannot convert probe image to BGRA: {error}"))?;
+        let byte_length = width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| "probe image byte length overflowed".to_string())?;
+        let buffer = Buffer::Create(byte_length)
+            .map_err(|error| format!("cannot create probe pixel buffer: {error}"))?;
+        full_bitmap
+            .CopyToBuffer(&buffer)
+            .map_err(|error| format!("cannot copy probe bitmap pixels: {error}"))?;
+        let reader = DataReader::FromBuffer(&buffer)
+            .map_err(|error| format!("cannot create probe pixel reader: {error}"))?;
+        let mut pixels = vec![0; byte_length as usize];
+        reader
+            .ReadBytes(&mut pixels)
+            .map_err(|error| format!("cannot read probe bitmap pixels: {error}"))?;
+        reader
+            .Close()
+            .map_err(|error| format!("cannot close probe pixel reader: {error}"))?;
+        full_bitmap
+            .Close()
+            .map_err(|error| format!("cannot close decoded probe bitmap: {error}"))?;
+        println!(
+            "ocr_tile_probe image={} dimensions={}x{} overlap={}px samples={}",
+            image_path.display(),
+            width,
+            height,
+            OVERLAP,
+            SAMPLES
+        );
+
+        for grid in 1..=7 {
+            let preparation_started = Instant::now();
+            let tiles = prepare_tile_probe(&pixels, width, height, grid, OVERLAP)?;
+            let preparation = preparation_started.elapsed();
+            for _ in 0..WARMUPS {
+                run_tile_probe(&tiles)?;
+            }
+            let mut first_samples = Vec::with_capacity(SAMPLES);
+            let mut total_samples = Vec::with_capacity(SAMPLES);
+            let mut raw_words = 0usize;
+            let mut owned_words = 0usize;
+            for _ in 0..SAMPLES {
+                let results = run_tile_probe(&tiles)?;
+                first_samples.push(
+                    results
+                        .iter()
+                        .map(|result| result.elapsed)
+                        .min()
+                        .ok_or_else(|| "tile probe produced no result".to_string())?,
+                );
+                total_samples.push(
+                    results
+                        .iter()
+                        .map(|result| result.elapsed)
+                        .max()
+                        .ok_or_else(|| "tile probe produced no result".to_string())?,
+                );
+                raw_words += results.iter().map(|result| result.raw_words).sum::<usize>();
+                owned_words += results
+                    .iter()
+                    .map(|result| result.owned_words)
+                    .sum::<usize>();
+            }
+            let first_p50 = tile_probe_percentile(&mut first_samples, 50);
+            let first_p95 = tile_probe_percentile(&mut first_samples, 95);
+            let total_p50 = tile_probe_percentile(&mut total_samples, 50);
+            let total_p95 = tile_probe_percentile(&mut total_samples, 95);
+            println!(
+                "ocr_tile_probe grid={}x{} tiles={} prepare_ms={:.3} first_p50_ms={:.3} first_p95_ms={:.3} total_p50_ms={:.3} total_p95_ms={:.3} raw_words_avg={} owned_words_avg={}",
+                grid,
+                grid,
+                tiles.len(),
+                preparation.as_secs_f64() * 1_000.0,
+                first_p50.as_secs_f64() * 1_000.0,
+                first_p95.as_secs_f64() * 1_000.0,
+                total_p50.as_secs_f64() * 1_000.0,
+                total_p95.as_secs_f64() * 1_000.0,
+                raw_words / SAMPLES,
+                owned_words / SAMPLES,
+            );
+            for (bitmap, _) in tiles {
+                bitmap
+                    .Close()
+                    .map_err(|error| format!("cannot close OCR tile bitmap: {error}"))?;
+            }
+        }
+        stream
+            .Close()
+            .map_err(|error| format!("cannot close image stream: {error}"))?;
+        Ok(())
     }
 }

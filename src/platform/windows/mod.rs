@@ -295,7 +295,7 @@ impl WindowsBackend {
         if mask == 0 {
             return Ok(());
         }
-        let mut first_error = None;
+        let mut errors = crate::app::errors::ErrorBundle::default();
         for button in [
             MouseButton::Left,
             MouseButton::Right,
@@ -314,11 +314,10 @@ impl WindowsBackend {
                 Ok(()) => {
                     self.held_buttons.set(self.held_buttons.get() & !bit);
                 }
-                Err(error) if first_error.is_none() => first_error = Some(error),
-                Err(_) => {}
+                Err(error) => errors.push(format!("release {button:?}"), error),
             }
         }
-        first_error.map_or(Ok(()), Err)
+        errors.into_result()
     }
 
     fn release_held_buttons(&self) -> Result<(), String> {
@@ -346,49 +345,39 @@ impl WindowsBackend {
         if self.shutdown_complete {
             return Ok(());
         }
-        let mut first_error = None;
-        let record = |first_error: &mut Option<String>, stage: &str, error: String| {
-            let message = format!("{stage}: {error}");
-            if first_error.is_none() {
-                *first_error = Some(message);
-            } else {
-                crate::report_error!("windows-backend", "cleanup failure: {message}");
-            }
-        };
+        let mut errors = crate::app::errors::ErrorBundle::default();
         if let Some(worker) = self.update_worker.as_mut() {
             match worker.cancel_and_wait() {
                 Ok(()) => {
                     self.update_worker.take();
                 }
-                Err(error) => record(&mut first_error, "update worker", error),
+                Err(error) => errors.push("update worker", error),
             }
         }
         // Stop visual providers before tearing down the hook and overlay. The
         // vision worker cancels WinRT OCR, terminates the optional WeChat
         // helper, and joins pure-Rust fallback work before returning.
         if let Err(error) = self.vision.stop() {
-            record(&mut first_error, "vision worker", error);
+            errors.push("vision worker", error);
         }
         if let Some(worker) = self.ui_automation.as_mut() {
             match worker.stop() {
                 Ok(()) => {
                     self.ui_automation.take();
                 }
-                Err(error) => record(&mut first_error, "UI Automation worker", error),
+                Err(error) => errors.push("UI Automation worker", error),
             }
         }
         if let Err(error) = self.release_held_buttons() {
-            record(&mut first_error, "held mouse buttons", error);
+            errors.push("held mouse buttons", error);
         }
-        if let Err(error) = self.frame_clock.stop() {
-            record(&mut first_error, "frame clock", error);
-        }
+        errors.record("frame clock", self.frame_clock.stop());
         if let Some(hook) = self.hook.as_mut() {
             match hook.stop() {
                 Ok(()) => {
                     self.hook.take();
                 }
-                Err(error) => record(&mut first_error, "input hook", error),
+                Err(error) => errors.push("input hook", error),
             }
         }
         if let Some(status_item) = self.status_item.as_mut() {
@@ -396,24 +385,24 @@ impl WindowsBackend {
                 Ok(()) => {
                     self.status_item.take();
                 }
-                Err(error) => record(&mut first_error, "tray worker", error),
+                Err(error) => errors.push("tray worker", error),
             }
         }
         self.foreground_watcher.take();
         if let Err(error) = self.overlay.dismiss() {
-            record(&mut first_error, "overlay dismiss", error);
+            errors.push("overlay dismiss", error);
         }
         if let Err(error) = self.overlay.shutdown() {
-            record(&mut first_error, "overlay shutdown", error);
+            errors.push("overlay shutdown", error);
         }
-        if first_error.is_none() {
+        if errors.is_empty() {
             if let Some(control) = self.console_control.as_ref() {
                 control.mark_shutdown_complete();
             }
             self.console_control.take();
             self.shutdown_complete = true;
         }
-        first_error.map_or(Ok(()), Err)
+        errors.into_result()
     }
 
     fn reap_update_worker(&mut self) {

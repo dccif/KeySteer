@@ -1,6 +1,6 @@
 #[cfg(not(target_os = "macos"))]
 fn main() {
-    eprintln!("macos_native_probe must run on macOS 14 or later");
+    println!("macos_native_probe must run on macOS 14 or later");
     std::process::exit(2);
 }
 

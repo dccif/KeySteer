@@ -211,7 +211,12 @@ impl OverlayWorker {
         let thread_id = match worker.wait_ready(&ready_rx, STOP_TIMEOUT) {
             Ok(thread_id) => thread_id,
             Err(error) => {
-                let _ = worker.join_timeout(STOP_TIMEOUT);
+                if let Err(cleanup) = worker.join_timeout(STOP_TIMEOUT) {
+                    crate::report_error!(
+                        "windows-overlay",
+                        "overlay startup cleanup failed: {cleanup}"
+                    );
+                }
                 return Err(error);
             }
         };
@@ -530,6 +535,41 @@ struct AdaptiveRenderer {
     last_gpu_rebuild: Option<Instant>,
     last_scene: Option<Arc<OverlayScene>>,
     last_area: Option<Rect>,
+    /// True only when DWM has confirmed that no KeySteer pixels can be part of
+    /// the desktop frame. An ordinary dismiss is intentionally asynchronous,
+    /// so it cannot make the renderer capture-clean by itself.
+    capture_state: CaptureState,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CaptureState {
+    clean: bool,
+}
+
+impl CaptureState {
+    const fn new() -> Self {
+        Self { clean: true }
+    }
+
+    fn presented(&mut self, has_visible_pixels: bool) {
+        if has_visible_pixels {
+            self.clean = false;
+        }
+    }
+
+    fn dismissed_asynchronously(&mut self, had_visible_pixels: bool, failed: bool) {
+        if had_visible_pixels || failed {
+            self.clean = false;
+        }
+    }
+
+    const fn needs_barrier(self) -> bool {
+        !self.clean
+    }
+
+    fn confirm_hidden(&mut self) {
+        self.clean = true;
+    }
 }
 
 impl AdaptiveRenderer {
@@ -541,6 +581,7 @@ impl AdaptiveRenderer {
                     last_gpu_rebuild: None,
                     last_scene: None,
                     last_area: None,
+                    capture_state: CaptureState::new(),
                 },
                 None,
             ),
@@ -550,6 +591,7 @@ impl AdaptiveRenderer {
                     last_gpu_rebuild: None,
                     last_scene: None,
                     last_area: None,
+                    capture_state: CaptureState::new(),
                 },
                 Some(format!(
                     "DirectComposition is unavailable; using the DIB renderer: {error}"
@@ -559,11 +601,13 @@ impl AdaptiveRenderer {
     }
 
     fn present(&mut self, scene: Arc<OverlayScene>, area: Rect) -> Result<Option<String>, String> {
+        let has_visible_pixels = scene_has_visible_pixels(scene.as_ref());
         let gpu_error = match &mut self.renderer {
             Renderer::Gpu(gpu) => match gpu.present(Arc::clone(&scene), area) {
                 Ok(()) => {
                     self.last_scene = Some(scene);
                     self.last_area = Some(area);
+                    self.capture_state.presented(has_visible_pixels);
                     return Ok(None);
                 }
                 Err(error) => error,
@@ -572,6 +616,7 @@ impl AdaptiveRenderer {
                 cpu.present(Arc::clone(&scene), area)?;
                 self.last_scene = Some(scene);
                 self.last_area = Some(area);
+                self.capture_state.presented(has_visible_pixels);
                 return Ok(None);
             }
         };
@@ -585,6 +630,7 @@ impl AdaptiveRenderer {
                 self.renderer = Renderer::Gpu(replacement);
                 self.last_scene = Some(scene);
                 self.last_area = Some(area);
+                self.capture_state.presented(has_visible_pixels);
                 return Ok(Some(format!(
                     "DirectComposition device was rebuilt after a render failure: {gpu_error}"
                 )));
@@ -596,6 +642,7 @@ impl AdaptiveRenderer {
         self.renderer = Renderer::Cpu(cpu);
         self.last_scene = Some(scene);
         self.last_area = Some(area);
+        self.capture_state.presented(has_visible_pixels);
         Ok(Some(format!(
             "DirectComposition failed repeatedly; using the DIB renderer for this session: {gpu_error}"
         )))
@@ -630,12 +677,18 @@ impl AdaptiveRenderer {
     }
 
     fn dismiss(&mut self) -> Result<(), String> {
+        let had_visible_scene = self
+            .last_scene
+            .as_deref()
+            .is_some_and(scene_has_visible_pixels);
         let result = match &mut self.renderer {
             Renderer::Gpu(gpu) => gpu.dismiss(),
             Renderer::Cpu(cpu) => cpu.dismiss(),
         };
         self.last_scene = None;
         self.last_area = None;
+        self.capture_state
+            .dismissed_asynchronously(had_visible_scene, result.is_err());
         result
     }
 
@@ -645,9 +698,20 @@ impl AdaptiveRenderer {
         // no longer part of the desktop frame. CPU dismiss destroys its HWND
         // synchronously, then uses the same barrier for a common ACK contract.
         self.dismiss()?;
+        if !self.capture_state.needs_barrier() {
+            crate::app::perf_probe::mark("capture_barrier_skipped");
+            return Ok(());
+        }
+        crate::app::perf_probe::mark("capture_barrier_started");
         native::wait_for_dwm_frame()
-            .map_err(|error| format!("DWM did not confirm the hidden overlay frame: {error}"))
+            .map_err(|error| format!("DWM did not confirm the hidden overlay frame: {error}"))?;
+        self.capture_state.confirm_hidden();
+        Ok(())
     }
+}
+
+fn scene_has_visible_pixels(scene: &OverlayScene) -> bool {
+    !scene.is_empty() || scene.backdrop.is_some()
 }
 
 fn acknowledge_capture(shared: &Shared, generation: u64, result: Result<(), String>) {
@@ -734,6 +798,27 @@ mod tests {
             Some(now - Duration::from_secs(60)),
             now
         ));
+    }
+
+    #[test]
+    fn capture_state_skips_only_confirmed_clean_frames() {
+        for _ in 0..1_000 {
+            let mut state = CaptureState::new();
+            assert!(!state.needs_barrier());
+
+            state.presented(false);
+            assert!(!state.needs_barrier());
+
+            state.presented(true);
+            assert!(state.needs_barrier());
+            state.dismissed_asynchronously(true, false);
+            assert!(state.needs_barrier());
+
+            state.confirm_hidden();
+            assert!(!state.needs_barrier());
+            state.dismissed_asynchronously(false, false);
+            assert!(!state.needs_barrier());
+        }
     }
 
     #[test]

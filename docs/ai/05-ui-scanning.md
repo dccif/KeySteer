@@ -35,13 +35,12 @@ vision coordinator 在当前与 latest pending 请求完成后直接退出，不
 重新扫描。仅复用最多 128 项的空容器
 backing，以降低常见不足 100 个标签时的重入分配；大型扫描容量不会留在 Idle。
 
-Windows 每个 generation 的 GDI top-down DIB 只截图一次。视觉线程在 DIB 借用仍有效时直接
-构造唯一一份 `SoftwareBitmap`，并直接下采样 fallback 灰度图；不会再复制或让 provider 持有
-一份完整 BGRA `Vec`。DIB 字节稳定且前台 HWND/PID/generation 复核通过后立即释放 overlay
-capture gate，OCR 与 fallback 使用生成的只读工件继续运行。源窗口与目标 DIB 尺寸相同时使用
-`BitBlt` 直接复制；只有安全像素上限要求缩放时才使用 `StretchBlt + HALFTONE`。不拆分截图或
-OCR 请求；1080p、2K、4K、8K 及多显示器窗口都维持每 generation 一次截图，超过安全上限时
-仍以单张图片等比缩放。
+Windows 每个 generation 的 GDI top-down DIB 只截图一次。视觉线程不会再复制或让 provider
+持有一份完整 BGRA `Vec`。DIB 字节稳定且前台 HWND/PID/generation 复核通过后立即释放 overlay
+capture gate；系统 OCR 从同一个 DIB 构造重叠小块，微信 OCR 构造一份完整 `SoftwareBitmap`，
+fallback 直接下采样灰度图。源窗口与目标 DIB 尺寸相同时使用 `BitBlt` 直接复制；8,388,608
+像素的上限完整覆盖 3840x2160，只有 5K/8K 或更大的跨屏交集才使用
+`StretchBlt + HALFTONE`。截图始终是一张完整图片，绝不对桌面重复截图。
 
 系统 OCR、微信 OCR 都在 provider 内最多保留 2000 个有效目标。任一 provider 返回非空有效
 结果便取消并丢弃 fallback；这个判定发生在 UIA/空间索引去重之前，因此 Hybrid 中 OCR 与
@@ -100,11 +99,11 @@ UIA 重叠也不会误跑纯像素检测。系统 OCR 使用 WinRT completion ha
 - `src/platform/windows/ui_scan.rs` 是唯一发布点：所有来源共用 64px 覆盖网格、24/48/96…累计边界和 2000 项上限。矩形只保存一次，覆盖超过 32 格的大矩形进入有界 oversize 列表；先显示的目标不被后到重复项替换。
 - Backend ready 后的首次事件轮询只异步执行一次 OCR discovery：系统探测在临时 MTA 中创建并立即销毁 `OcrEngine`，微信探测只缓存已验证的绝对路径与文件标识。系统 OCR/WIC 通过本代拥有的 activation factory 调用，禁止使用会跨临时 MTA 残留悬空指针的投影静态 factory cache。这样 ready 热路径不承担探测线程创建；成功和失败结果都缓存到进程退出，不保留 OCR、helper、COM 或 vision worker。首次扫描若探测尚未完成，只由视觉协调线程等待同一个 single-flight 结果。
 - `src/platform/windows/vision.rs` 在有视觉请求时懒启动 generation-scoped coordinator。每个 generation 只取得一张 GDI top-down DIB 截图，并在提交和发布边界复核 HWND、PID 与 generation；当前与 latest pending 请求完成后 coordinator 自行退出。
-- 截图前由 `overlay_worker.rs` 建立 generation capture gate：渲染线程清空 GPU/CPU overlay、确认 DirectComposition commit 并等待一次 DWM 合成后才 ACK。ACK 前 UIA/OCR 提交只覆盖 latest deferred frame；截图复制完成立即释放 gate，只显示最新帧。旧 lease、取消和 shutdown 不能释放新 generation。
-- `detect_text=true` 时系统 OCR 与可用的微信 OCR 并行；已就绪批次按唯一项数量、耗时排序，单个先完成批次不等待另一个来源。两者最终发布空间并集。
-- `detect_rectangles=true` 时并行计算灰度、局部对比/梯度、形态闭合和八邻域连通区域。分析图限制为 2,073,600 像素、最长边 2560，候选最小边为 6px；scratch 只属于本次 generation，连通队列使用 `u32` 索引。任一 OCR 产生有效目标就立即取消这项 CPU-heavy 工作；只有全部 OCR 没有有效目标时才发布缓存。
-- `src/platform/windows/wechat_ocr.rs` 自动查找可执行文件旁的 `wcocr.dll` 以及微信 4/3 组件，验证 PE 架构，并只在隐藏 helper 子进程中加载。IPC 与响应有界，超时/崩溃/owner 取消会终止 helper，临时 WIC PNG 总会清理；组件不进入发行包。
-- 每次扫描才创建本次专用的系统 `OcrEngine` 与微信 helper；两者的冷启动和 overlay 隐藏重叠。系统 OCR 与微信 WIC PNG 编码共享同一个 `SoftwareBitmap`；BGRA 只复制一次，微信 PNG 直接编码到临时文件而不生成完整内存 PNG。terminal 发布前必须删除 PNG、关闭 IPC、终止并等待 helper、join reader/provider、关闭 `SoftwareBitmap`、释放截图与 GDI surface 并 drop 本次 COM apartment。源码禁止 `SetWindowDisplayAffinity`/`WDA_EXCLUDEFROMCAPTURE`，避免自捕获只依赖上述隐藏确认屏障。
+- 截图前由 `overlay_worker.rs` 建立 generation capture gate：渲染线程清空 GPU/CPU overlay。若 overlay 从未显示，或上次隐藏已经由 DWM 确认，则直接 ACK；仅在存在尚未确认消失的可见像素时执行一次 `DwmFlush`。ACK 前 UIA/OCR 提交只覆盖 latest deferred frame；截图复制完成立即释放 gate，只显示最新帧。旧 lease、取消和 shutdown 不能释放新 generation。
+- `detect_text=true` 时系统 OCR 与可用的微信 OCR 并行。系统 OCR 按可用逻辑线程的下一个平方数选择 `N×N` 网格，并由图片尺寸限制核心块的宽、高都至少为 64px；没有固定 `7×7` 上限。各块向相邻核心区重叠 64px，bitmap 就绪后立即提交独立 `RecognizeAsync`，完成一块就按最多 24 项发布。块内坐标先映射回桌面，目标中心只归属于一个半开核心矩形，因此接缝文字不会漏掉或重复发布。微信仍识别完整图片，结果先发布、再清理 helper 与 PNG；terminal 严格等待全部块和 helper 清理完成。两者最终发布空间并集。
+- `detect_rectangles=true` 时并行计算灰度、局部对比/梯度、形态闭合和八邻域连通区域。分析图限制为 2,073,600 像素、最长边 2560，候选最小边为 6px；scratch 只属于本次 generation，连通区域使用逐行 run-length 和活跃组件，不保留最坏覆盖全图的像素队列。形态位图复用且候选维持有界 top-K。任一 OCR 产生有效目标就立即取消这项 CPU-heavy 工作；只有全部 OCR 没有有效目标时才发布缓存。
+- `src/platform/windows/wechat_ocr.rs` 自动查找可执行文件旁的 `wcocr.dll`，以及 `%APPDATA%\Tencent\xwechat\XPlugin\plugins\WeChatOcr\<版本>\extracted\wxocr.dll` 中版本最高的微信 4 OCR 组件；微信 4 运行目录按 `Weixin.dll`、`WeixinExt.exe` 或旧布局的 `Weixin.exe` 验证，不要求版本子目录内必须存在主程序。微信 3 继续作为后备。所有 PE 架构都会验证，并且组件只在隐藏 helper 子进程中加载。IPC 与响应有界，超时/崩溃/owner 取消会终止 helper，临时 WIC PNG 总会清理；组件不进入发行包。
+- 每次扫描才创建本次专用的系统 `OcrEngine` 与微信 helper；两者的冷启动和 overlay 隐藏重叠。系统 OCR 各块拥有独立的 `SoftwareBitmap` 与 operation，使用有界 completion 队列流式回收；微信 WIC PNG 使用完整 `SoftwareBitmap` 直接编码到临时文件，不生成完整内存 PNG。WinRT OCR 与 WIC create/flush 都由异步 owner 在所有出口执行有 deadline 的 cancel/wait/close。terminal 发布前必须删除 PNG、关闭 IPC、终止并等待 helper、join reader/provider、关闭所有块与完整 `SoftwareBitmap`、释放截图与 GDI surface 并 drop 本次 COM apartment。源码禁止 `SetWindowDisplayAffinity`/`WDA_EXCLUDEFROMCAPTURE`，避免自捕获只依赖上述隐藏确认屏障。
 
 这里不增加公共 OCR provider/path 配置；运行时状态只进入日志和 `--doctor`。
 

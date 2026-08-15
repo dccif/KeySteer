@@ -14,9 +14,14 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use semver::Version;
-use serde::Deserialize;
+use serde::de::{SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use windows::Graphics::Imaging::SoftwareBitmap;
 use windows::Storage::Streams::IRandomAccessStream;
+use windows_future::{
+    AsyncActionCompletedHandler, AsyncOperationCompletedHandler, AsyncStatus, IAsyncAction,
+    IAsyncOperation,
+};
 
 use crate::api::geometry::{Rect, UiTarget};
 use crate::app::worker::WorkerJoin;
@@ -26,7 +31,12 @@ use super::vision::{CaptureGeometry, image_to_desktop, valid_target_rect};
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
 const MAX_MESSAGE: usize = 8 * 1024 * 1024;
+const MAX_OCR_TARGETS: usize = 2_000;
+const MAX_OCR_TEXT_BYTES: usize = 4 * 1024;
+const MAX_OCR_BATCH_TEXT_BYTES: usize = 2 * 1024 * 1024;
 const READY_TIMEOUT: Duration = Duration::from_secs(3);
+const WECHAT4_RUNTIME_PE_FILES: &[&str] = &["Weixin.dll", "WeixinExt.exe", "Weixin.exe"];
+const WECHAT3_RUNTIME_PE_FILES: &[&str] = &["WeChat.exe"];
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static STALE_TEMP_CLEANUP: OnceLock<()> = OnceLock::new();
 
@@ -103,15 +113,12 @@ impl WechatDescriptor {
             .runtime
             .canonicalize()
             .map_err(|error| format!("cannot canonicalize WeChat runtime: {error}"))?;
-        let runtime_executable = ["Weixin.exe", "WeChat.exe"]
-            .into_iter()
-            .map(|name| paths.runtime.join(name))
-            .find(|path| path.is_file())
-            .ok_or_else(|| "cached WeChat runtime executable disappeared".to_string())?;
+        let runtime_binary = runtime_identity_file(&paths.runtime)
+            .ok_or_else(|| "cached WeChat runtime binary disappeared".to_string())?;
         let files = [
             paths.bridge.as_path(),
             paths.component.as_path(),
-            runtime_executable.as_path(),
+            runtime_binary.as_path(),
         ]
         .into_iter()
         .map(FileIdentity::read)
@@ -155,11 +162,13 @@ impl WechatOcr {
         timeout: Duration,
         minimum_confidence: f64,
         cancelled: impl Fn() -> bool,
-    ) -> Result<Vec<UiTarget>, String> {
+        publish: impl FnOnce(Vec<UiTarget>) -> Result<usize, String>,
+    ) -> Result<usize, String> {
         if cancelled() {
             return Err("WeChat OCR cancelled".into());
         }
-        let temporary = TemporaryPng::create(bitmap)?;
+        let deadline = Instant::now() + timeout.max(Duration::from_millis(1));
+        let temporary = TemporaryPng::create(bitmap, deadline, &cancelled)?;
         if cancelled() {
             return Err("WeChat OCR cancelled".into());
         }
@@ -167,26 +176,33 @@ impl WechatOcr {
             .helper
             .as_mut()
             .ok_or_else(|| "WeChat OCR helper is unavailable".to_string())?
-            .request(&temporary.path, timeout, &cancelled);
+            .request(
+                &temporary.path,
+                deadline.saturating_duration_since(Instant::now()),
+                &cancelled,
+            );
+        let result = response
+            .and_then(|response| parse_response(&response, image, minimum_confidence))
+            .and_then(publish);
+        // Valid targets have already been handed to the coordinator. Cleanup
+        // stays on this provider thread and must complete before ProviderDone,
+        // but it no longer delays the first Partial.
         let helper_cleanup = self.helper.as_mut().map_or(Ok(()), |helper| {
-            if response.is_ok() {
+            if result.is_ok() {
                 helper.shutdown()
             } else {
                 helper.shutdown_immediate()
             }
         });
         let cleanup = temporary.cleanup();
-        let mut result =
-            response.and_then(|response| parse_response(&response, image, minimum_confidence));
+        let mut cleanup_failures = Vec::new();
         if let Err(helper_cleanup) = helper_cleanup {
-            crate::app::logging::report_error("windows-vision", &helper_cleanup);
-            result = result.and(Err(helper_cleanup));
+            cleanup_failures.push(helper_cleanup);
         }
         if let Err(cleanup) = cleanup {
-            crate::app::logging::report_error("windows-vision", &cleanup);
-            return result.and(Err(cleanup));
+            cleanup_failures.push(cleanup);
         }
-        result
+        combine_async_result(result, cleanup_failures)
     }
 
     pub(super) fn shutdown(&mut self) -> Result<(), String> {
@@ -211,6 +227,7 @@ struct Helper {
     responses: mpsc::Receiver<Result<Vec<u8>, String>>,
     reader: Option<WorkerJoin>,
     stopped: bool,
+    _ledger: crate::app::perf_probe::ResourceGuard,
 }
 
 struct StartingChild(Option<Child>);
@@ -301,8 +318,16 @@ impl Helper {
             move || loop {
                 let message = read_frame(&mut output);
                 let stop = message.is_err();
-                if tx.send(message).is_err() || stop {
-                    break;
+                match tx.try_send(message) {
+                    Ok(()) if !stop => {}
+                    Ok(()) => break,
+                    Err(mpsc::TrySendError::Full(_)) => {
+                        let _ = tx.try_send(Err(
+                            "WeChat OCR helper sent more than one unconsumed frame".into(),
+                        ));
+                        break;
+                    }
+                    Err(mpsc::TrySendError::Disconnected(_)) => break,
                 }
             },
         )?;
@@ -313,6 +338,9 @@ impl Helper {
             responses,
             reader: Some(reader),
             stopped: false,
+            _ledger: crate::app::perf_probe::ResourceGuard::new(
+                crate::app::perf_probe::ResourceKind::Helper,
+            ),
         };
         let ready_deadline = deadline.min(Instant::now() + READY_TIMEOUT);
         let ready = loop {
@@ -337,16 +365,13 @@ impl Helper {
         match ready {
             Ok(message) if message == b"ready" => Ok(helper),
             Ok(_) => {
-                if let Err(error) = helper.shutdown_immediate() {
-                    crate::app::logging::report_error("windows-vision", error);
-                }
-                Err("WeChat OCR helper returned an invalid readiness frame".into())
+                let result = Err("WeChat OCR helper returned an invalid readiness frame".into());
+                let cleanup = helper.shutdown_immediate().err().into_iter().collect();
+                combine_async_result(result, cleanup)
             }
             Err(error) => {
-                if let Err(cleanup) = helper.shutdown_immediate() {
-                    crate::app::logging::report_error("windows-vision", cleanup);
-                }
-                Err(error)
+                let cleanup = helper.shutdown_immediate().err().into_iter().collect();
+                combine_async_result(Err(error), cleanup)
             }
         }
     }
@@ -506,10 +531,15 @@ struct TemporaryPng {
     owner_path: PathBuf,
     owner: Option<File>,
     removed: bool,
+    _ledger: crate::app::perf_probe::ResourceGuard,
 }
 
 impl TemporaryPng {
-    fn create(bitmap: &SoftwareBitmap) -> Result<Self, String> {
+    fn create(
+        bitmap: &SoftwareBitmap,
+        deadline: Instant,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<Self, String> {
         STALE_TEMP_CLEANUP.get_or_init(cleanup_stale_temporary_directories);
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let directory =
@@ -530,16 +560,14 @@ impl TemporaryPng {
         {
             Ok(owner) => owner,
             Err(error) => {
-                if let Err(cleanup) = std::fs::remove_dir(&directory) {
-                    crate::app::logging::report_error(
-                        "windows-vision",
-                        format!(
-                            "cannot remove unlocked OCR directory {}: {cleanup}",
-                            directory.display()
-                        ),
-                    );
-                }
-                return Err(format!("cannot lock private OCR directory: {error}"));
+                let primary = format!("cannot lock private OCR directory: {error}");
+                return match std::fs::remove_dir(&directory) {
+                    Ok(()) => Err(primary),
+                    Err(cleanup) => Err(format!(
+                        "{primary}; cleanup: cannot remove unlocked OCR directory {}: {cleanup}",
+                        directory.display()
+                    )),
+                };
             }
         };
         let path = directory.join("frame.png");
@@ -549,13 +577,17 @@ impl TemporaryPng {
             owner_path,
             owner: Some(owner),
             removed: false,
+            _ledger: crate::app::perf_probe::ResourceGuard::new(
+                crate::app::perf_probe::ResourceKind::TempFile,
+            ),
         };
-        if let Err(error) = encode_png(bitmap, &temporary.path) {
-            if let Err(cleanup) = temporary.remove() {
-                crate::app::logging::report_error("windows-vision", cleanup);
-            }
+        if let Err(error) = encode_png(bitmap, &temporary.path, deadline, cancelled) {
+            let cleanup = temporary.remove();
             temporary.removed = true;
-            return Err(error);
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(format!("{error}; cleanup: {cleanup}")),
+            };
         }
         Ok(temporary)
     }
@@ -655,22 +687,43 @@ impl Drop for TemporaryPng {
     }
 }
 
-fn encode_png(bitmap: &SoftwareBitmap, path: &Path) -> Result<(), String> {
+fn encode_png(
+    bitmap: &SoftwareBitmap,
+    path: &Path,
+    deadline: Instant,
+    cancelled: &impl Fn() -> bool,
+) -> Result<(), String> {
     let stream: IRandomAccessStream = super::native::create_file_random_access_stream(path)
         .map_err(|error| format!("cannot create temporary PNG stream: {error}"))?;
     let result = (|| {
-        let encoder = super::native::create_png_bitmap_encoder(&stream)?;
+        let encoder = wait_async_operation(
+            super::native::create_png_bitmap_encoder_operation(&stream)?,
+            deadline,
+            cancelled,
+            "PNG encoder creation",
+        )?;
         encoder
             .SetSoftwareBitmap(bitmap)
             .map_err(|error| format!("cannot supply WIC bitmap: {error}"))?;
-        encoder
-            .FlushAsync()
-            .and_then(|operation| operation.join())
-            .map_err(|error| format!("cannot encode temporary PNG: {error}"))?;
-        stream
-            .FlushAsync()
-            .and_then(|operation| operation.join())
-            .map_err(|error| format!("cannot flush temporary PNG: {error}"))?;
+        wait_async_action(
+            encoder
+                .FlushAsync()
+                .map_err(|error| format!("cannot start temporary PNG encoding: {error}"))?,
+            deadline,
+            cancelled,
+            "temporary PNG encoding",
+        )?;
+        let flushed = wait_async_operation(
+            stream
+                .FlushAsync()
+                .map_err(|error| format!("cannot start temporary PNG flush: {error}"))?,
+            deadline,
+            cancelled,
+            "temporary PNG stream flush",
+        )?;
+        if !flushed {
+            return Err("temporary PNG stream reported an incomplete flush".into());
+        }
         Ok(())
     })();
     let close = stream
@@ -679,10 +732,180 @@ fn encode_png(bitmap: &SoftwareBitmap, path: &Path) -> Result<(), String> {
     match (result, close) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Err(error), Err(close_error)) => {
-            crate::app::logging::report_error("windows-vision", close_error);
-            Err(error)
+        (Err(error), Err(close_error)) => Err(format!("{error}; cleanup: {close_error}")),
+    }
+}
+
+fn wait_async_operation<T>(
+    operation: IAsyncOperation<T>,
+    deadline: Instant,
+    cancelled: &impl Fn() -> bool,
+    stage: &str,
+) -> Result<T, String>
+where
+    T: windows::core::RuntimeType + 'static,
+{
+    let (completed_tx, completed_rx) = mpsc::sync_channel(1);
+    let registration = operation.SetCompleted(&AsyncOperationCompletedHandler::<T>::new(
+        move |_, status| {
+            let _ = completed_tx.try_send(status);
+            Ok(())
+        },
+    ));
+    let (result, should_cancel) = if let Err(error) = registration {
+        (
+            Err(format!("cannot register {stage} completion: {error}")),
+            true,
+        )
+    } else {
+        wait_async_status(&completed_rx, deadline, cancelled, stage)
+            .and_then(|status| match status {
+                AsyncStatus::Completed => operation
+                    .GetResults()
+                    .map_err(|error| format!("{stage} failed: {error}")),
+                AsyncStatus::Canceled => Err(format!("{stage} was cancelled")),
+                AsyncStatus::Error => operation.ErrorCode().map_or_else(
+                    |error| Err(format!("cannot read {stage} error: {error}")),
+                    |error| Err(format!("{stage} failed: {error}")),
+                ),
+                _ => Err(format!("{stage} returned an unknown asynchronous status")),
+            })
+            .map_or_else(|error| (Err(error), true), |value| (Ok(value), false))
+    };
+    finish_async_operation(
+        &operation,
+        result,
+        should_cancel,
+        deadline,
+        &completed_rx,
+        stage,
+    )
+}
+
+fn wait_async_action(
+    operation: IAsyncAction,
+    deadline: Instant,
+    cancelled: &impl Fn() -> bool,
+    stage: &str,
+) -> Result<(), String> {
+    let (completed_tx, completed_rx) = mpsc::sync_channel(1);
+    let registration =
+        operation.SetCompleted(&AsyncActionCompletedHandler::new(move |_, status| {
+            let _ = completed_tx.try_send(status);
+            Ok(())
+        }));
+    let (result, should_cancel) = if let Err(error) = registration {
+        (
+            Err(format!("cannot register {stage} completion: {error}")),
+            true,
+        )
+    } else {
+        wait_async_status(&completed_rx, deadline, cancelled, stage)
+            .and_then(|status| match status {
+                AsyncStatus::Completed => operation
+                    .GetResults()
+                    .map_err(|error| format!("{stage} failed: {error}")),
+                AsyncStatus::Canceled => Err(format!("{stage} was cancelled")),
+                AsyncStatus::Error => operation.ErrorCode().map_or_else(
+                    |error| Err(format!("cannot read {stage} error: {error}")),
+                    |error| Err(format!("{stage} failed: {error}")),
+                ),
+                _ => Err(format!("{stage} returned an unknown asynchronous status")),
+            })
+            .map_or_else(|error| (Err(error), true), |value| (Ok(value), false))
+    };
+    finish_async_action(
+        &operation,
+        result,
+        should_cancel,
+        deadline,
+        &completed_rx,
+        stage,
+    )
+}
+
+fn wait_async_status(
+    completed: &mpsc::Receiver<AsyncStatus>,
+    deadline: Instant,
+    cancelled: &impl Fn() -> bool,
+    stage: &str,
+) -> Result<AsyncStatus, String> {
+    loop {
+        if cancelled() {
+            return Err(format!("{stage} was cancelled"));
         }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!("{stage} timed out"));
+        }
+        match completed.recv_timeout(remaining.min(Duration::from_millis(2))) {
+            Ok(AsyncStatus::Started) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(status) => return Ok(status),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(format!("{stage} completion handler disconnected"));
+            }
+        }
+    }
+}
+
+fn finish_async_operation<T>(
+    operation: &IAsyncOperation<T>,
+    result: Result<T, String>,
+    cancel: bool,
+    deadline: Instant,
+    completed: &mpsc::Receiver<AsyncStatus>,
+    stage: &str,
+) -> Result<T, String>
+where
+    T: windows::core::RuntimeType + 'static,
+{
+    let mut cleanup = Vec::new();
+    if cancel {
+        if let Err(error) = operation.Cancel() {
+            cleanup.push(format!("cannot cancel {stage}: {error}"));
+        }
+        wait_cancelled_completion(completed, deadline);
+    }
+    if let Err(error) = operation.Close() {
+        cleanup.push(format!("cannot close {stage}: {error}"));
+    }
+    combine_async_result(result, cleanup)
+}
+
+fn finish_async_action(
+    operation: &IAsyncAction,
+    result: Result<(), String>,
+    cancel: bool,
+    deadline: Instant,
+    completed: &mpsc::Receiver<AsyncStatus>,
+    stage: &str,
+) -> Result<(), String> {
+    let mut cleanup = Vec::new();
+    if cancel {
+        if let Err(error) = operation.Cancel() {
+            cleanup.push(format!("cannot cancel {stage}: {error}"));
+        }
+        wait_cancelled_completion(completed, deadline);
+    }
+    if let Err(error) = operation.Close() {
+        cleanup.push(format!("cannot close {stage}: {error}"));
+    }
+    combine_async_result(result, cleanup)
+}
+
+fn wait_cancelled_completion(completed: &mpsc::Receiver<AsyncStatus>, deadline: Instant) {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if !remaining.is_zero() {
+        let _ = completed.recv_timeout(remaining.min(Duration::from_millis(100)));
+    }
+}
+
+fn combine_async_result<T>(result: Result<T, String>, cleanup: Vec<String>) -> Result<T, String> {
+    match (result, cleanup.is_empty()) {
+        (Ok(value), true) => Ok(value),
+        (Ok(_), false) => Err(cleanup.join("; ")),
+        (Err(error), true) => Err(error),
+        (Err(error), false) => Err(format!("{error}; cleanup: {}", cleanup.join("; "))),
     }
 }
 
@@ -692,7 +915,7 @@ struct WechatResponse {
     errcode: i64,
     #[serde(default)]
     errmsg: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_wechat_items")]
     ocr_response: Vec<WechatItem>,
 }
 
@@ -702,7 +925,7 @@ struct WechatItem {
     top: f64,
     right: f64,
     bottom: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bounded_text")]
     text: String,
     #[serde(default = "default_confidence")]
     rate: f64,
@@ -710,6 +933,105 @@ struct WechatItem {
 
 fn default_confidence() -> f64 {
     1.0
+}
+
+fn deserialize_bounded_text<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedTextVisitor;
+
+    impl Visitor<'_> for BoundedTextVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a UTF-8 OCR string")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(truncated_utf8(value, MAX_OCR_TEXT_BYTES).to_owned())
+        }
+
+        fn visit_string<E>(self, mut value: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            truncate_string_utf8(&mut value, MAX_OCR_TEXT_BYTES);
+            Ok(value)
+        }
+    }
+
+    deserializer.deserialize_string(BoundedTextVisitor)
+}
+
+fn deserialize_wechat_items<'de, D>(deserializer: D) -> Result<Vec<WechatItem>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ItemsVisitor;
+
+    impl<'de> Visitor<'de> for ItemsVisitor {
+        type Value = Vec<WechatItem>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an array of WeChat OCR items")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut items = Vec::with_capacity(64);
+            let mut text_bytes = 0usize;
+            while let Some(mut item) = sequence.next_element::<WechatItem>()? {
+                super::vision::trim_string_in_place(&mut item.text);
+                let plausible = !item.text.is_empty()
+                    && item.left.is_finite()
+                    && item.top.is_finite()
+                    && item.right.is_finite()
+                    && item.bottom.is_finite()
+                    && item.rate.is_finite()
+                    && item.right > item.left
+                    && item.bottom > item.top;
+                if !plausible
+                    || items.len() >= MAX_OCR_TARGETS
+                    || text_bytes >= MAX_OCR_BATCH_TEXT_BYTES
+                {
+                    continue;
+                }
+                let remaining = MAX_OCR_BATCH_TEXT_BYTES - text_bytes;
+                truncate_string_utf8(&mut item.text, remaining);
+                if item.text.is_empty() {
+                    continue;
+                }
+                text_bytes += item.text.len();
+                items.push(item);
+            }
+            Ok(items)
+        }
+    }
+
+    deserializer.deserialize_seq(ItemsVisitor)
+}
+
+fn truncate_string_utf8(value: &mut String, maximum: usize) {
+    let end = utf8_boundary(value, maximum);
+    value.truncate(end);
+}
+
+fn truncated_utf8(value: &str, maximum: usize) -> &str {
+    &value[..utf8_boundary(value, maximum)]
+}
+
+fn utf8_boundary(value: &str, maximum: usize) -> usize {
+    let mut end = value.len().min(maximum);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 fn parse_response(
@@ -725,9 +1047,8 @@ fn parse_response(
             |message| format!("WeChat OCR returned error {}: {message}", response.errcode),
         ));
     }
-    let mut targets = Vec::with_capacity(response.ocr_response.len().min(2_000));
-    for mut item in response.ocr_response {
-        super::vision::trim_string_in_place(&mut item.text);
+    let mut targets = Vec::with_capacity(response.ocr_response.len());
+    for item in response.ocr_response {
         let rect = image_to_desktop(
             image,
             Rect::new(
@@ -740,7 +1061,6 @@ fn parse_response(
         if !item.text.is_empty()
             && item.rate >= minimum_confidence
             && valid_target_rect(rect, image.desktop_bounds)
-            && targets.len() < 2_000
         {
             targets.push(UiTarget {
                 rect,
@@ -815,15 +1135,15 @@ fn discover() -> Result<Option<HelperPaths>, String> {
 
     let wx4_component = std::env::var_os("APPDATA")
         .map(PathBuf::from)
-        .map(|root| root.join("Tencent/xwechat/XPlugin/plugins/WeChatOcr"))
+        .map(|root| wechat4_component_root(&root))
         .and_then(|root| highest_versioned_file(&root, Path::new("extracted/wxocr.dll")));
     let wx4_runtime = std::env::var_os("ProgramFiles")
         .map(PathBuf::from)
         .map(|root| root.join("Tencent/Weixin"))
-        .and_then(|root| highest_runtime(&root, &["Weixin.exe"]));
+        .and_then(|root| highest_runtime(&root, WECHAT4_RUNTIME_PE_FILES));
     if let (Some(component), Some(runtime)) = (wx4_component, wx4_runtime)
         && pe_machine(&component).is_ok_and(|machine| machine == current_machine())
-        && runtime_matches(&runtime, &["Weixin.exe"])
+        && runtime_matches(&runtime, WECHAT4_RUNTIME_PE_FILES)
     {
         return Ok(Some(HelperPaths {
             bridge,
@@ -841,10 +1161,10 @@ fn discover() -> Result<Option<HelperPaths>, String> {
             .is_file()
             .then_some(adjacent_component)
             .or_else(|| highest_versioned_file(&root, Path::new("WeChatOCR.exe")));
-        let runtime = highest_runtime(&root, &["WeChat.exe"]);
+        let runtime = highest_runtime(&root, WECHAT3_RUNTIME_PE_FILES);
         if let (Some(component), Some(runtime)) = (component, runtime)
             && pe_machine(&component).is_ok_and(|machine| machine == current_machine())
-            && runtime_matches(&runtime, &["WeChat.exe"])
+            && runtime_matches(&runtime, WECHAT3_RUNTIME_PE_FILES)
         {
             return Ok(Some(HelperPaths {
                 bridge,
@@ -864,6 +1184,23 @@ fn runtime_matches(runtime: &Path, expected: &[&str]) -> bool {
     expected.iter().any(|name| {
         pe_machine(&runtime.join(name)).is_ok_and(|machine| machine == current_machine())
     })
+}
+
+fn runtime_identity_file(runtime: &Path) -> Option<PathBuf> {
+    WECHAT4_RUNTIME_PE_FILES
+        .iter()
+        .chain(WECHAT3_RUNTIME_PE_FILES)
+        .map(|name| runtime.join(name))
+        .find(|path| path.is_file())
+}
+
+fn wechat4_component_root(appdata: &Path) -> PathBuf {
+    appdata
+        .join("Tencent")
+        .join("xwechat")
+        .join("XPlugin")
+        .join("plugins")
+        .join("WeChatOcr")
 }
 
 pub(super) fn diagnostic_line() -> String {
@@ -1016,10 +1353,81 @@ mod tests {
     }
 
     #[test]
+    fn wechat4_component_root_matches_the_roaming_plugin_layout() {
+        let appdata = Path::new(r"C:\Users\yourname\AppData\Roaming");
+        assert_eq!(
+            wechat4_component_root(appdata),
+            PathBuf::from(
+                r"C:\Users\yourname\AppData\Roaming\Tencent\xwechat\XPlugin\plugins\WeChatOcr"
+            )
+        );
+    }
+
+    #[test]
+    fn discovers_the_highest_wechat4_plugin_and_dll_based_runtime() {
+        let root = test_path("wechat4-discovery");
+        let plugins = root.join("plugins");
+        let older_component = plugins.join("8011/extracted/wxocr.dll");
+        let newer_component = plugins.join("8092/extracted/wxocr.dll");
+        std::fs::create_dir_all(older_component.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(newer_component.parent().unwrap()).unwrap();
+        std::fs::write(&older_component, b"older").unwrap();
+        std::fs::write(&newer_component, b"newer").unwrap();
+
+        let runtimes = root.join("runtimes");
+        let older_runtime = runtimes.join("4.0.0.26");
+        let newer_runtime = runtimes.join("4.1.12.26");
+        std::fs::create_dir_all(&older_runtime).unwrap();
+        std::fs::create_dir_all(&newer_runtime).unwrap();
+        std::fs::write(older_runtime.join("Weixin.exe"), b"older").unwrap();
+        std::fs::write(newer_runtime.join("Weixin.dll"), b"newer").unwrap();
+
+        assert_eq!(
+            highest_versioned_file(&plugins, Path::new("extracted/wxocr.dll")),
+            Some(newer_component)
+        );
+        assert_eq!(
+            highest_runtime(&runtimes, WECHAT4_RUNTIME_PE_FILES),
+            Some(newer_runtime.clone())
+        );
+        assert_eq!(
+            runtime_identity_file(&newer_runtime),
+            Some(newer_runtime.join("Weixin.dll"))
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn rejects_oversized_ipc_frames_before_allocation() {
         let encoded = ((MAX_MESSAGE as u32) + 1).to_le_bytes();
         let mut bytes = encoded.as_slice();
         assert!(read_frame(&mut bytes).is_err());
+    }
+
+    #[test]
+    fn json_deserializer_caps_retained_items_and_text() {
+        let item = r#"{"left":1,"top":1,"right":3,"bottom":3,"text":"x"}"#;
+        let json = format!(
+            "{{\"errcode\":0,\"ocr_response\":[{}]}}",
+            std::iter::repeat_n(item, MAX_OCR_TARGETS + 25)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let response: WechatResponse = serde_json::from_slice(json.as_bytes()).unwrap();
+        assert_eq!(response.ocr_response.len(), MAX_OCR_TARGETS);
+
+        let long = "测".repeat(MAX_OCR_TEXT_BYTES);
+        let json = format!(
+            "{{\"errcode\":0,\"ocr_response\":[{{\"left\":1,\"top\":1,\"right\":3,\"bottom\":3,\"text\":\"{long}\"}}]}}"
+        );
+        let response: WechatResponse = serde_json::from_slice(json.as_bytes()).unwrap();
+        assert!(response.ocr_response[0].text.len() <= MAX_OCR_TEXT_BYTES);
+        assert!(
+            response.ocr_response[0]
+                .text
+                .is_char_boundary(response.ocr_response[0].text.len())
+        );
     }
 
     #[test]
@@ -1082,6 +1490,9 @@ mod tests {
             owner_path,
             owner: Some(owner),
             removed: false,
+            _ledger: crate::app::perf_probe::ResourceGuard::new(
+                crate::app::perf_probe::ResourceKind::TempFile,
+            ),
         };
         temporary.remove().unwrap();
         temporary.remove().unwrap();

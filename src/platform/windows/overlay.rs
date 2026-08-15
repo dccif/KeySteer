@@ -29,7 +29,7 @@ use crate::api::overlay::{
     Color, LabelStyle, OverlayItems, OverlayLabel, OverlayScene, OverlayShape,
 };
 
-use super::native::{GdiDibSurface, NativeDimensions, OwnedWindow, SelectedObject};
+use super::native::{GdiDibSurface, NativeDimensions, OwnedWindow};
 
 /// Renders scenes into layered click-through windows, one per monitor.
 pub struct Overlay {
@@ -1054,7 +1054,7 @@ impl TextRasterizer {
         };
         scratch.clear_region(width, height);
         {
-            let _selected_font = SelectedObject::new(scratch.dc(), font.font.0.into())?;
+            let _selected_font = scratch.select_object(font.font.0.into())?;
             // SAFETY: the selected DC and font remain alive for this scope and
             // the color/background operations do not retain pointers.
             unsafe {

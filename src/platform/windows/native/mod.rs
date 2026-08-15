@@ -1,6 +1,5 @@
 //! Minimal Win32 safety boundary for process-wide utilities.
 
-use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::path::Path;
 use std::ptr::NonNull;
@@ -89,10 +88,6 @@ impl Drop for ComApartment {
         // successfully initialized the apartment.
         unsafe { CoUninitialize() };
     }
-}
-
-thread_local! {
-    static CAPTURE_SURFACE: RefCell<Option<GdiDibSurface>> = const { RefCell::new(None) };
 }
 
 #[must_use = "the desktop DC must be released on its acquiring thread"]
@@ -352,42 +347,37 @@ impl Drop for GdiDibSurface {
     }
 }
 
-pub(crate) fn capture_bgra_with<R>(
-    source_x: i32,
-    source_y: i32,
-    source_width: i32,
-    source_height: i32,
-    width: i32,
-    height: i32,
-    consume: impl FnOnce(&[u8], u32, u32) -> Result<R, String>,
-) -> Result<R, String> {
-    let dimensions = NativeDimensions::from_usize(width as usize, height as usize)?;
-    let screen = ScreenDc::acquire()?;
-    CAPTURE_SURFACE.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot
-            .as_ref()
-            .is_none_or(|surface| surface.dimensions != dimensions)
-        {
-            *slot = Some(GdiDibSurface::new(Some(screen.0), dimensions)?);
-        }
-        slot.as_mut()
-            .ok_or_else(|| "visual capture surface was not initialized".to_string())?
-            .copy_from(
-                screen.0,
-                source_x,
-                source_y,
-                source_width,
-                source_height,
-                consume,
-            )
-    })
+#[must_use = "prepared capture resources must remain on their acquiring thread"]
+pub(crate) struct PreparedCapture {
+    screen: ScreenDc,
+    surface: GdiDibSurface,
 }
 
-pub(crate) fn release_capture_surface() {
-    CAPTURE_SURFACE.with(|slot| {
-        slot.borrow_mut().take();
-    });
+impl PreparedCapture {
+    pub(crate) fn new(width: u32, height: u32) -> Result<Self, String> {
+        let dimensions = NativeDimensions::from_usize(width as usize, height as usize)?;
+        let screen = ScreenDc::acquire()?;
+        let surface = GdiDibSurface::new(Some(screen.raw()), dimensions)?;
+        Ok(Self { screen, surface })
+    }
+
+    pub(crate) fn capture_with<R>(
+        &mut self,
+        source_x: i32,
+        source_y: i32,
+        source_width: i32,
+        source_height: i32,
+        consume: impl FnOnce(&[u8], u32, u32) -> Result<R, String>,
+    ) -> Result<R, String> {
+        self.surface.copy_from(
+            self.screen.raw(),
+            source_x,
+            source_y,
+            source_width,
+            source_height,
+            consume,
+        )
+    }
 }
 
 pub(crate) fn software_bitmap_bgra(
@@ -594,16 +584,16 @@ pub(crate) fn probe_system_ocr_factory() -> Result<(u32, Vec<String>), String> {
     Ok((maximum, tags))
 }
 
-pub(crate) fn create_png_bitmap_encoder(
+pub(crate) fn create_png_bitmap_encoder_operation(
     stream: &windows::Storage::Streams::IRandomAccessStream,
-) -> Result<windows::Graphics::Imaging::BitmapEncoder, String> {
+) -> Result<windows_future::IAsyncOperation<windows::Graphics::Imaging::BitmapEncoder>, String> {
     use windows::Graphics::Imaging::{BitmapEncoder, IBitmapEncoderStatics};
 
     let factory = windows::core::imp::load_factory::<BitmapEncoder, IBitmapEncoderStatics>()
         .map_err(|error| format!("cannot load BitmapEncoder factory: {error}"))?;
-    // SAFETY: the local factory implements `IBitmapEncoderStatics`, the stream
-    // stays alive through the synchronous `join`, and both output slots use
-    // the exact generated ABI types converted into owned values.
+    // SAFETY: the local factory implements `IBitmapEncoderStatics`, the caller
+    // keeps the stream alive through completion, and both output slots use the
+    // exact generated ABI types converted into owned values.
     let operation: windows_future::IAsyncOperation<BitmapEncoder> = unsafe {
         let mut result = windows::core::GUID::zeroed();
         (windows::core::Interface::vtable(&factory).PngEncoderId)(
@@ -625,9 +615,7 @@ pub(crate) fn create_png_bitmap_encoder(
         windows::core::Type::from_abi(operation)
             .map_err(|error| format!("cannot own PNG encoder operation: {error}"))?
     };
-    operation
-        .join()
-        .map_err(|error| format!("cannot create PNG encoder: {error}"))
+    Ok(operation)
 }
 
 pub(crate) fn create_file_random_access_stream(
@@ -1049,33 +1037,35 @@ impl Drop for OwnedWindow {
 }
 
 /// Restores the previously selected GDI object when the guard leaves scope.
-pub(crate) struct SelectedObject {
+pub(crate) struct SelectedObject<'dc> {
     dc: HDC,
     previous: HGDIOBJ,
+    _dc: PhantomData<&'dc GdiDibSurface>,
     _thread: PhantomData<Rc<()>>,
 }
 
-impl SelectedObject {
+impl GdiDibSurface {
     #[inline(always)]
-    pub(crate) fn new(dc: HDC, object: HGDIOBJ) -> Result<Self, String> {
+    pub(crate) fn select_object(&self, object: HGDIOBJ) -> Result<SelectedObject<'_>, String> {
         use windows::Win32::Graphics::Gdi::SelectObject;
 
         // SAFETY: both handles are live for the guard lifetime. Drop restores
         // the exact object returned by this call.
-        let previous = unsafe { SelectObject(dc, object) };
+        let previous = unsafe { SelectObject(self.memory, object) };
         if previous.0.is_null() || previous.0 as usize == usize::MAX {
             Err("SelectObject failed".into())
         } else {
-            Ok(Self {
-                dc,
+            Ok(SelectedObject {
+                dc: self.memory,
                 previous,
+                _dc: PhantomData,
                 _thread: PhantomData,
             })
         }
     }
 }
 
-impl Drop for SelectedObject {
+impl Drop for SelectedObject<'_> {
     #[inline(always)]
     fn drop(&mut self) {
         use windows::Win32::Graphics::Gdi::SelectObject;
@@ -1860,14 +1850,15 @@ mod tests {
 
     #[test]
     #[ignore = "requires an interactive Windows desktop"]
-    fn visual_capture_reuses_and_releases_thread_bound_surface() -> Result<(), String> {
-        let first = capture_bgra_with(0, 0, 64, 64, 64, 64, |pixels, width, height| {
+    fn visual_capture_prepares_and_releases_thread_bound_surface() -> Result<(), String> {
+        let mut capture = PreparedCapture::new(64, 64)?;
+        let first = capture.capture_with(0, 0, 64, 64, |pixels, width, height| {
             Ok((pixels.len(), width, height))
         })?;
-        let second = capture_bgra_with(0, 0, 64, 64, 64, 64, |pixels, width, height| {
+        let second = capture.capture_with(0, 0, 64, 64, |pixels, width, height| {
             Ok((pixels.len(), width, height))
         })?;
-        release_capture_surface();
+        drop(capture);
         assert_eq!(first, (64 * 64 * 4, 64, 64));
         assert_eq!(second, first);
         Ok(())

@@ -29,11 +29,22 @@ fn application_diagnostics_use_the_unified_logger() -> Result<(), Box<dyn std::e
             path.display()
         );
         if path != logging {
-            assert!(
-                !source.contains("eprintln!(") && !source.contains("std::io::stderr("),
-                "diagnostics must go through app::logging: {}",
-                path.display()
-            );
+            for forbidden in [
+                "eprintln!(",
+                "eprint!(",
+                "std::io::stderr(",
+                "io::stderr(",
+                "dbg!(",
+                "OutputDebugString",
+                "WriteConsole",
+                "STD_ERROR_HANDLE",
+            ] {
+                assert!(
+                    !source.contains(forbidden),
+                    "diagnostics must go through app::logging ({forbidden}): {}",
+                    path.display()
+                );
+            }
         }
         assert!(
             !source.contains("log_warning!"),

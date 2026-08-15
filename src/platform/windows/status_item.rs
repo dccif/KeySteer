@@ -117,12 +117,16 @@ impl StatusItem {
                 worker: Some(worker),
             }),
             Ok(Err(error)) => {
-                let _ = worker.join_timeout(TRAY_STOP_TIMEOUT);
+                if let Err(cleanup) = worker.join_timeout(TRAY_STOP_TIMEOUT) {
+                    crate::report_error!("windows-tray", "tray startup cleanup failed: {cleanup}");
+                }
                 clear_sender();
                 Err(error)
             }
             Err(error) => {
-                let _ = worker.join_timeout(TRAY_STOP_TIMEOUT);
+                if let Err(cleanup) = worker.join_timeout(TRAY_STOP_TIMEOUT) {
+                    crate::report_error!("windows-tray", "tray startup cleanup failed: {cleanup}");
+                }
                 clear_sender();
                 Err(error)
             }

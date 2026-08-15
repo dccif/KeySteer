@@ -1,10 +1,16 @@
 # 更新日志 / Release Notes
 
+## 0.9.1
+
+Windows 系统 OCR 会按 CPU 与图片尺寸自动并行切分，使用重叠接缝并在每块完成时流式显示结果。
+
+Windows system OCR now tiles work according to CPU and image size, overlaps seams, and streams each completed region.
+
 ## 0.9.0
 
-Windows UI Hint 使用 OCR 更快、更省峰值内存。
+Windows UI Hint 新增按需双 OCR，扫描结果更完整；同时降低截图延迟与峰值内存，退出后立即清理识别资源。
 
-Windows UI Hint use OCR is faster and uses less peak memory.
+Windows UI Hint adds on-demand dual OCR with lower capture latency, lower peak memory, and immediate cleanup after scanning.
 
 ## 0.8.14
 

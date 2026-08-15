@@ -133,7 +133,7 @@ impl ScanSource {
 
     pub(super) fn finish(mut self, status: UiScanStatus) {
         self.complete = true;
-        let (tail, terminal) = {
+        let (tail, terminal, masked_failures) = {
             let mut state = self
                 .session
                 .state
@@ -150,8 +150,26 @@ impl ScanSource {
             state.finished = true;
             let tail = state.batcher.finish();
             let terminal = combined_status(&state.statuses);
-            (tail, terminal)
+            let masked_failures = if terminal == UiScanStatus::Success {
+                state
+                    .statuses
+                    .iter()
+                    .filter_map(|status| match status {
+                        UiScanStatus::Failed(error) => Some(error.clone()),
+                        _ => None,
+                    })
+                    .collect::<SmallVec<[String; 1]>>()
+            } else {
+                SmallVec::new()
+            };
+            (tail, terminal, masked_failures)
         };
+        for error in masked_failures {
+            crate::report_error!(
+                "windows-ui-scan",
+                "a provider failed while another provider completed the hybrid scan: {error}"
+            );
+        }
         if let Some(batch) = tail {
             self.session.publish(batch, UiScanStatus::Partial);
         }
@@ -162,7 +180,7 @@ impl ScanSource {
 impl Drop for ScanSource {
     fn drop(&mut self) {
         if !self.complete {
-            crate::report_warning!(
+            crate::report_error!(
                 "windows-ui-scan",
                 "{} provider exited without a terminal status",
                 self.name

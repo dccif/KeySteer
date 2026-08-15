@@ -26,6 +26,11 @@ Windows 二进制默认无控制台；只有携带 CLI 参数时才尝试附加�
 记录为 ERROR。包括 CLI 在内的应用代码不得直接写 stderr；初始化和日志 I/O 失败也只能
 通过 `logging.rs` 内部的 emergency console 路径输出。
 
+清理和 shutdown 使用安全 Rust `ErrorBundle` 保存带阶段名的全部失败：主流程继续向上返回的
+错误只在最终边界记录一次；已经被吞掉并继续运行的真实错误立即调用 `report_error!`。关闭
+不能因第一项失败而跳过后续按键、鼠标、扫描或原生 owner 的释放。日志轮换前必须成功 flush；
+emergency stderr 使用不 panic 的 `Write` 路径，且不创建后台日志线程。
+
 ## API 边界
 
 `src/api/` 是唯一允许跨层传递的词汇：

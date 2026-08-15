@@ -783,16 +783,14 @@ impl Engine {
             .iter()
             .filter_map(|(&id, candidate)| (candidate == owner).then_some(id))
             .collect::<SmallVec<[u64; 1]>>();
-        let mut first_error = None;
+        let mut errors = crate::app::errors::ErrorBundle::default();
         for id in ids {
             self.scan_owners.remove(&id);
-            if let Err(error) = backend.cancel_ui_scan(id)
-                && first_error.is_none()
-            {
-                first_error = Some(error);
+            if let Err(error) = backend.cancel_ui_scan(id) {
+                errors.push(format!("cancel UI scan {id}"), error);
             }
         }
-        first_error.map_or(Ok(()), Err)
+        errors.into_result()
     }
 
     fn cancel_all_scans(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
@@ -802,15 +800,13 @@ impl Engine {
             .copied()
             .collect::<SmallVec<[u64; 2]>>();
         self.scan_owners.clear();
-        let mut first_error = None;
+        let mut errors = crate::app::errors::ErrorBundle::default();
         for id in ids {
-            if let Err(error) = backend.cancel_ui_scan(id)
-                && first_error.is_none()
-            {
-                first_error = Some(error);
+            if let Err(error) = backend.cancel_ui_scan(id) {
+                errors.push(format!("cancel UI scan {id}"), error);
             }
         }
-        first_error.map_or(Ok(()), Err)
+        errors.into_result()
     }
 
     fn recover_from_input_error(&mut self, error: &str, backend: &mut dyn Backend) -> bool {
@@ -2752,7 +2748,7 @@ impl Engine {
         force: bool,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
-        let mut first_error = None;
+        let mut errors = crate::app::errors::ErrorBundle::default();
         for target in targets.iter().rev() {
             let matched = self.matching_latched_target(target);
             if !force && matched.is_none() {
@@ -2766,13 +2762,12 @@ impl Engine {
                 Ok(()) => {
                     self.latched.remove(&actual);
                 }
-                Err(error) if first_error.is_none() => first_error = Some(error),
-                Err(_) => {}
+                Err(error) => errors.push(format!("release {actual:?}"), error),
             }
         }
-        first_error.map_or(Ok(()), |error| {
-            Err(self.recoverable_input_error("input release", error))
-        })
+        errors
+            .into_result()
+            .map_err(|error| self.recoverable_input_error("input release", error))
     }
 
     fn toggle_targets(

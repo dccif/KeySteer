@@ -1,6 +1,6 @@
 [package]
 name = "keysteer"
-version = "0.9.0"
+version = "0.9.1"
 authors = ["dccif"]
 edition = "2024"
 rust-version = "1.97"
@@ -17,6 +17,8 @@ unsafe_op_in_unsafe_fn = "deny"
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"
 missing_safety_doc = "deny"
+dbg_macro = "deny"
+print_stderr = "deny"
 unwrap_used = "deny"
 expect_used = "deny"
 

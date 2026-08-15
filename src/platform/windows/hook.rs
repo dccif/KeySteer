@@ -129,22 +129,21 @@ impl InjectionRequest {
                         // that had a Down edge is safe even when Windows
                         // accepted none of them, and keeps late asynchronous
                         // failures from leaving a modifier latched.
-                        let mut release_failure = None;
+                        let mut release_failures = crate::app::errors::ErrorBundle::default();
                         for (key, state) in events.iter().rev() {
                             if *state != KeyState::Down {
                                 continue;
                             }
-                            if let Err(cleanup_error) = input::send_key(key, KeyState::Up)
-                                && release_failure.is_none()
-                            {
-                                release_failure = Some(cleanup_error);
+                            if let Err(cleanup_error) = input::send_key(key, KeyState::Up) {
+                                release_failures
+                                    .push(format!("release synthetic {key}"), cleanup_error);
                             }
                         }
-                        match release_failure {
-                            Some(cleanup_error) => Err(format!(
+                        match release_failures.into_result() {
+                            Err(cleanup_error) => Err(format!(
                                 "request=keyboard_chord events={event_count}; {error}; defensive key release also failed: {cleanup_error}"
                             )),
-                            None => Err(format!(
+                            Ok(()) => Err(format!(
                                 "request=keyboard_chord events={event_count}; {error}; defensive key releases completed"
                             )),
                         }
@@ -371,11 +370,21 @@ impl HookThread {
         let thread_id = match worker.wait_ready(&ready_rx, HOOK_STOP_TIMEOUT) {
             Ok(Ok(thread_id)) => thread_id,
             Ok(Err(error)) => {
-                let _ = worker.join_timeout(HOOK_STOP_TIMEOUT);
+                if let Err(cleanup) = worker.join_timeout(HOOK_STOP_TIMEOUT) {
+                    crate::report_error!(
+                        "windows-hook",
+                        "input-hook startup cleanup failed: {cleanup}"
+                    );
+                }
                 return Err(error);
             }
             Err(error) => {
-                let _ = worker.join_timeout(HOOK_STOP_TIMEOUT);
+                if let Err(cleanup) = worker.join_timeout(HOOK_STOP_TIMEOUT) {
+                    crate::report_error!(
+                        "windows-hook",
+                        "input-hook startup cleanup failed: {cleanup}"
+                    );
+                }
                 return Err(error);
             }
         };
@@ -460,16 +469,11 @@ impl HookThread {
         if self.worker.is_none() {
             return Ok(());
         }
-        let mut stop_posted = true;
-        if self.thread_id != 0 {
-            if let Err(error) = super::native::post_thread_message(self.thread_id, WM_QUIT, 0) {
-                stop_posted = false;
-                crate::app::logging::report_error(
-                    "windows-hook",
-                    format!("cannot request input hook shutdown: {error}"),
-                );
-            }
-            self.thread_id = 0;
+        let mut post_failure = None;
+        if self.thread_id != 0
+            && let Err(error) = super::native::post_thread_message(self.thread_id, WM_QUIT, 0)
+        {
+            post_failure = Some(format!("cannot request input hook shutdown: {error}"));
         }
         let result = self
             .worker
@@ -477,11 +481,16 @@ impl HookThread {
             .map_or(Ok(()), |worker| worker.join_timeout(HOOK_STOP_TIMEOUT));
         if result.is_ok() {
             self.worker.take();
+            self.thread_id = 0;
         }
-        if !stop_posted && result.is_ok() {
-            return Err("Windows rejected the input-hook shutdown wake-up".into());
+        match (result, post_failure) {
+            // ERROR_INVALID_THREAD_ID commonly means the worker completed
+            // between the shutdown check and PostThreadMessage. A successful
+            // join proves that no native resource remains.
+            (Ok(()), _) => Ok(()),
+            (Err(join), Some(post)) => Err(format!("{post}; cleanup: {join}")),
+            (Err(join), None) => Err(join),
         }
-        result
     }
 }
 
@@ -670,11 +679,15 @@ fn store_latest_pointer(point: Point) {
     // Release fences order the odd marker before the payload and the payload
     // before the final even marker. Readers only accept a value bracketed by
     // the same even sequence number.
-    POINTER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    // Windows invokes this low-level mouse hook serially on its owner thread.
+    // Ordinary stores preserve the seqlock protocol without locked RMW
+    // instructions on every physical mouse edge.
+    let odd = POINTER_SEQUENCE.load(Ordering::Relaxed).wrapping_add(1) | 1;
+    POINTER_SEQUENCE.store(odd, Ordering::Relaxed);
     fence(Ordering::Release);
     LATEST_POINTER.store(x | (y << 32), Ordering::Relaxed);
     fence(Ordering::Release);
-    POINTER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    POINTER_SEQUENCE.store(odd.wrapping_add(1), Ordering::Relaxed);
     if POINTER_WAKE_ENABLED.load(Ordering::Relaxed) && mark_pointer_pending() {
         wake_owner();
     }
@@ -840,6 +853,53 @@ mod tests {
             samples[last * 95 / 100],
             samples[last * 99 / 100],
         )
+    }
+
+    #[test]
+    #[ignore = "native release performance probe"]
+    fn physical_pointer_store_performance_probe() {
+        const SAMPLES: usize = 60;
+        const MOVES: usize = 8_000;
+
+        fn legacy_store(point: Point) {
+            let x = point.x as i32 as u32 as u64;
+            let y = point.y as i32 as u32 as u64;
+            POINTER_SEQUENCE.fetch_add(1, Ordering::Release);
+            LATEST_POINTER.store(x | (y << 32), Ordering::Relaxed);
+            POINTER_SEQUENCE.fetch_add(1, Ordering::Release);
+            if POINTER_WAKE_ENABLED.load(Ordering::Relaxed) && mark_pointer_pending() {
+                wake_owner();
+            }
+        }
+
+        POINTER_WAKE_ENABLED.store(false, Ordering::Release);
+        let mut current = Vec::with_capacity(SAMPLES);
+        let mut legacy = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES + 4 {
+            let measure = |store: fn(Point)| {
+                let started = Instant::now();
+                for index in 0..MOVES {
+                    store(black_box(Point::new(index as f64, (index ^ sample) as f64)));
+                }
+                started.elapsed().as_nanos()
+            };
+            let (current_ns, legacy_ns) = if sample % 2 == 0 {
+                (measure(store_latest_pointer), measure(legacy_store))
+            } else {
+                let legacy_ns = measure(legacy_store);
+                (measure(store_latest_pointer), legacy_ns)
+            };
+            if sample >= 4 {
+                current.push(current_ns);
+                legacy.push(legacy_ns);
+            }
+        }
+        let current = percentiles(current);
+        let legacy = percentiles(legacy);
+        println!(
+            "pointer_store_8khz current_p50={}ns current_p95={}ns current_p99={}ns legacy_p50={}ns legacy_p95={}ns legacy_p99={}ns",
+            current.0, current.1, current.2, legacy.0, legacy.1, legacy.2
+        );
     }
 
     #[test]
@@ -1119,11 +1179,12 @@ mod pointer_mailbox_loom_tests {
         }
 
         fn store(&self, value: u64) {
-            self.sequence.fetch_add(1, Ordering::Relaxed);
+            let odd = self.sequence.load(Ordering::Relaxed).wrapping_add(1) | 1;
+            self.sequence.store(odd, Ordering::Relaxed);
             fence(Ordering::Release);
             self.value.store(value, Ordering::Relaxed);
             fence(Ordering::Release);
-            self.sequence.fetch_add(1, Ordering::Relaxed);
+            self.sequence.store(odd.wrapping_add(1), Ordering::Relaxed);
             self.pending.fetch_add(1, Ordering::Release);
         }
 

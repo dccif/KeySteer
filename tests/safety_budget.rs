@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 // Keep the current audited native surface from growing. Portable layers are
 // checked separately below and remain entirely safe Rust.
-const MAX_UNSAFE_EXPRESSIONS: usize = 240;
+const MAX_UNSAFE_EXPRESSIONS: usize = 235;
 const MAX_UNSAFE_FILES: usize = 18;
 const PER_FILE_BUDGET: &[(&str, usize)] = &[
     ("src/platform/macos/accessibility.rs", 12),
@@ -18,7 +18,7 @@ const PER_FILE_BUDGET: &[(&str, usize)] = &[
     ("src/platform/macos/vision.rs", 5),
     ("src/platform/windows/accessibility.rs", 33),
     ("src/platform/windows/autostart.rs", 4),
-    ("src/platform/windows/gpu_overlay.rs", 36),
+    ("src/platform/windows/gpu_overlay.rs", 31),
     ("src/platform/windows/hook.rs", 8),
     ("src/platform/windows/input.rs", 6),
     ("src/platform/windows/overlay.rs", 12),

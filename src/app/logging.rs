@@ -80,10 +80,10 @@ impl Logger {
                     state.file = Some(file);
                 }
                 Err(error) => {
-                    eprintln!(
-                        "KeySteer: cannot reopen diagnostic log {}: {error}",
+                    write_emergency_stderr(format_args!(
+                        "cannot reopen diagnostic log {}: {error}",
                         self.path.display()
-                    );
+                    ));
                     return;
                 }
             }
@@ -91,10 +91,10 @@ impl Logger {
         if state.bytes.saturating_add(line.len() as u64 + 1) > MAX_LOG_BYTES
             && let Err(error) = self.rotate(&mut state)
         {
-            eprintln!(
-                "KeySteer: cannot rotate diagnostic log {}: {error}",
+            write_emergency_stderr(format_args!(
+                "cannot rotate diagnostic log {}: {error}",
                 self.path.display()
-            );
+            ));
         }
         let write_result = match state.file.as_mut() {
             Some(file) => {
@@ -103,20 +103,20 @@ impl Logger {
                     && level >= Level::Warning
                     && let Err(error) = file.flush()
                 {
-                    eprintln!(
-                        "KeySteer: cannot flush diagnostic log {}: {error}",
+                    write_emergency_stderr(format_args!(
+                        "cannot flush diagnostic log {}: {error}",
                         self.path.display()
-                    );
+                    ));
                 }
                 result
             }
             None => return,
         };
         if let Err(error) = write_result {
-            eprintln!(
-                "KeySteer: cannot write diagnostic log {}: {error}",
+            write_emergency_stderr(format_args!(
+                "cannot write diagnostic log {}: {error}",
                 self.path.display()
-            );
+            ));
             state.file = None;
             return;
         }
@@ -125,7 +125,7 @@ impl Logger {
 
     fn rotate(&self, state: &mut LoggerState) -> io::Result<()> {
         if let Some(mut file) = state.file.take() {
-            let _ = file.flush();
+            file.flush()?;
         }
         let rotation = rotate_files(&self.path);
         match open_append(&self.path) {
@@ -156,10 +156,10 @@ impl Logger {
         if let Some(file) = state.file.as_mut()
             && let Err(error) = file.flush()
         {
-            eprintln!(
-                "KeySteer: cannot flush diagnostic log {}: {error}",
+            write_emergency_stderr(format_args!(
+                "cannot flush diagnostic log {}: {error}",
                 self.path.display()
-            );
+            ));
         }
     }
 }
@@ -262,7 +262,7 @@ pub(crate) fn info_args(target: &str, message: fmt::Arguments<'_>) {
 
 fn report(level: Level, target: &str, message: &str) {
     debug_assert!(level >= Level::Warning);
-    eprintln!("KeySteer: {message}");
+    write_emergency_stderr(format_args!("{message}"));
     if let Some(logger) = LOGGER.get() {
         logger.write(level, target, message);
     }
@@ -282,7 +282,18 @@ pub(crate) fn report_error_args(target: &str, message: fmt::Arguments<'_>) {
 /// for CLI-only location hints. Platform and application modules must not
 /// write stderr directly.
 pub(crate) fn emergency_console(message: impl fmt::Display) {
-    eprintln!("KeySteer: {message}");
+    write_emergency_stderr(format_args!("{message}"));
+}
+
+/// Best-effort emergency output must never panic while reporting another
+/// failure. There is deliberately no recursive fallback after stderr itself
+/// rejects a write.
+fn write_emergency_stderr(message: fmt::Arguments<'_>) {
+    let mut stderr = io::stderr().lock();
+    let _ = stderr.write_all(b"KeySteer: ");
+    let _ = stderr.write_fmt(message);
+    let _ = stderr.write_all(b"\n");
+    let _ = stderr.flush();
 }
 
 pub(crate) fn report_warning_args(target: &str, message: fmt::Arguments<'_>) {
