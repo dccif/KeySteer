@@ -2,9 +2,9 @@
 
 ## 0.9.0
 
-Windows UI Hint OCR 更快、更省峰值内存。
+Windows UI Hint 使用 OCR 更快、更省峰值内存。
 
-Windows UI Hint dual OCR is faster and uses less peak memory.
+Windows UI Hint use OCR is faster and uses less peak memory.
 
 ## 0.8.14
 
