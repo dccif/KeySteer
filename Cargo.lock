@@ -492,6 +492,7 @@ dependencies = [
  "toml_edit",
  "ureq",
  "windows",
+ "windows-future",
  "windows-numerics",
  "winresource",
 ]

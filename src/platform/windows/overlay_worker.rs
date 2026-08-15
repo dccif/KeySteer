@@ -116,6 +116,9 @@ impl OverlayWorker {
     }
 
     pub(super) fn dismiss(&self) -> Result<(), String> {
+        if self.worker.is_none() {
+            return Ok(());
+        }
         self.control(Control::Dismiss)
     }
 
@@ -157,6 +160,7 @@ impl OverlayWorker {
             .map_or(Ok(()), |worker| worker.join_timeout(STOP_TIMEOUT));
         if join_result.is_ok() {
             self.worker.take();
+            self.thread_id = 0;
         }
         if result.is_err() { result } else { join_result }
     }

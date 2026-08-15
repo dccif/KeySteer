@@ -29,8 +29,10 @@ Engine 用 scan id 记录 owner；HintMode 也只接受当前 `scan_id`。旧 wo
 不会污染新的页面。Engine 把当前 `UiScanResult` 按所有权交给 HintMode：常见首批可直接
 接管平台 Vec，后续目标逐项 move，名称、role 和 native role 不再跨层 clone。
 
-退出或完成 owner 时 Engine 显式取消 scan。取消不销毁常驻 worker，也不缓存旧目标；
-Hint 退出会 drop 目标、标签和字符串，下一次进入重新扫描。仅复用最多 128 项的空容器
+退出或完成 owner 时 Engine 显式取消 scan。Windows 会取消进行中的 WinRT OCR、终止微信
+helper、让纯 Rust fallback 在行/连通区域边界退出，并 join 本次 provider 线程；常驻 vision
+worker 随后只阻塞等待任务，不占用 CPU。Hint 退出会 drop 目标、标签和字符串，下一次进入
+重新扫描。仅复用最多 128 项的空容器
 backing，以降低常见不足 100 个标签时的重入分配；大型扫描容量不会留在 Idle。
 
 ## HintMode 端
@@ -84,8 +86,8 @@ backing，以降低常见不足 100 个标签时的重入分配；大型扫描�
 - `src/platform/windows/ui_scan.rs` 是唯一发布点：所有来源共用空间索引、24/48/96…累计边界和 2000 项上限。先显示的目标不被后到重复项替换。
 - `src/platform/windows/vision.rs` 的 worker 在 backend 构造时启动，但系统 `OcrEngine` 和微信组件探测完全在后台完成。每次扫描复用同一张 GDI top-down DIB 截图，并在提交和发布边界复核 HWND、PID 与 generation。
 - `detect_text=true` 时系统 OCR 与可用的微信 OCR 并行；已就绪批次按唯一项数量、耗时排序，单个先完成批次不等待另一个来源。两者最终发布空间并集。
-- `detect_rectangles=true` 时并行计算灰度、局部对比/梯度、形态闭合和八邻域连通区域。只有全部 OCR 没有有效目标时才发布这份缓存。
-- `src/platform/windows/wechat_ocr.rs` 自动查找可执行文件旁的 `wcocr.dll` 以及微信 4/3 组件，验证 PE 架构，并只在隐藏 helper 子进程中加载。IPC 与响应有界，超时/崩溃可终止，临时 WIC PNG 总会清理；组件不进入发行包。
+- `detect_rectangles=true` 时并行计算灰度、局部对比/梯度、形态闭合和八邻域连通区域。任一 OCR 产生有效目标就立即取消这项 CPU-heavy 工作；只有全部 OCR 没有有效目标时才发布缓存。
+- `src/platform/windows/wechat_ocr.rs` 自动查找可执行文件旁的 `wcocr.dll` 以及微信 4/3 组件，验证 PE 架构，并只在隐藏 helper 子进程中加载。IPC 与响应有界，超时/崩溃/owner 取消会终止 helper，临时 WIC PNG 总会清理；组件不进入发行包。
 - overlay HWND 使用 `WDA_EXCLUDEFROMCAPTURE`，同时保留 HintMode 扫描前隐藏覆盖层的顺序。
 
 这里不增加公共 OCR provider/path 配置；运行时状态只进入日志和 `--doctor`。

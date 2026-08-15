@@ -47,17 +47,19 @@ may open File Explorer instead of preserving the complete URL for the default br
   生成编译期 `match`，不在线性表中逐项搜索，也不维护第二份运行时 map。
 - 物理左右 Alt 始终立即透传，不延迟也不回放，因此 AHK、Quicker 和 `Alt+物理鼠标键` 能看到真实状态。若随后一个明确绑定的非修饰键被消费，Hook 将带自身标记的未分配 `0xE8` down/up 排入自己的消息循环，回调返回后再发送，以阻止 Alt 松开时激活菜单；失败只报告非致命 warning。
 - `accessibility.rs` 是持久 COM MTA UIA worker，并在 MTA 内复用只读 query plan。
-- `vision.rs` 是启动后异步预热的视觉 worker；`ui_scan.rs` 统一 UIA/OCR/fallback 的流式发布和空间去重；`wechat_ocr.rs` 只在隐藏 helper 中加载可选桥接 DLL。
+- `vision.rs` 是启动后异步预热的视觉 worker；每次扫描拥有可取消并可 join 的 system OCR、WeChat OCR 和 fallback provider，Idle 时 worker 只等待条件变量。`ui_scan.rs` 统一流式发布和空间去重；`wechat_ocr.rs` 只在隐藏 helper 中加载可选桥接 DLL。
 - `frame_clock.rs` 有 DWM 等待 worker，one-slot channel 合并多余帧。
 - worker 和 tray 通过 `EventSender` 发 channel，并用自定义 `WM_APP` 唤醒 engine thread。
 - Windows Hook、overlay renderer 和 tray 的 readiness 由 `WorkerJoin` 设置 deadline；平台初始化
   失败必须返回错误，不能在 `recv()` 上无限等待。
-- overlay、frame clock、Hook、tray、UIA 和 update 都通过公共 `WorkerJoin` 记录 completion、panic
+- overlay、frame clock、Hook、tray、UIA、vision 和 update 都通过公共 `WorkerJoin` 记录 completion、panic
   与 shutdown deadline。frame-clock 的 compositor event 由 worker 自己拥有，Engine 只读取其
   临时 token 发出 interrupt；即使 deadline 失败也不会关闭仍被 worker 使用的 HANDLE。
   `WorkerJoin` 等待超时会保留 `JoinHandle`，调用者可以在同一绝对 deadline 内继续回收，不能
   因第一次短等待超时就静默 detach。
 - `MsgWaitForMultipleObjects`/message pump 保持原生窗口与 Engine poll 集成。
+- Windows Backend shutdown 先主动停止并等待 vision/UIA，再释放 Hook、tray 和 overlay；重复
+  shutdown/dismiss 必须幂等，不得向已经退出的渲染线程继续发送唤醒消息。
 
 ### 子模块
 

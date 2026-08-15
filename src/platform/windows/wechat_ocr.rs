@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use semver::Version;
 use serde::Deserialize;
@@ -40,6 +40,7 @@ struct WechatState {
     paths: HelperPaths,
     helper: Option<Helper>,
     restart_budget: u8,
+    paused: bool,
 }
 
 impl WechatOcr {
@@ -77,6 +78,7 @@ impl WechatOcr {
                 paths,
                 helper,
                 restart_budget: 1,
+                paused: false,
             })),
         })
     }
@@ -86,10 +88,21 @@ impl WechatOcr {
         image: &CapturedImage,
         timeout: Duration,
         minimum_confidence: f64,
+        cancelled: impl Fn() -> bool,
     ) -> Result<Vec<UiTarget>, String> {
+        if cancelled() {
+            return Err("WeChat OCR cancelled".into());
+        }
         let temporary = TemporaryPng::create(image)?;
+        if cancelled() {
+            return Err("WeChat OCR cancelled".into());
+        }
         let response = {
             let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            if state.helper.is_none() && state.paused {
+                state.helper = Helper::start(&state.paths).ok();
+                state.paused = false;
+            }
             if state.helper.is_none() && state.restart_budget != 0 {
                 state.restart_budget -= 1;
                 if let Ok(Some(paths)) = discover() {
@@ -101,7 +114,7 @@ impl WechatOcr {
                 .helper
                 .as_mut()
                 .ok_or_else(|| "WeChat OCR helper is unavailable".to_string())?;
-            match helper.request(&temporary.path, timeout) {
+            match helper.request(&temporary.path, timeout, &cancelled) {
                 Ok(response) => response,
                 Err(error) => {
                     helper.terminate();
@@ -111,6 +124,16 @@ impl WechatOcr {
             }
         };
         parse_response(&response, image, minimum_confidence)
+    }
+
+    /// Stop the optional helper while UI Hint is inactive. The next visual
+    /// scan may start it again without consuming the crash-restart budget.
+    pub(super) fn pause(&self) {
+        let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(mut helper) = state.helper.take() {
+            helper.terminate();
+        }
+        state.paused = true;
     }
 }
 
@@ -175,19 +198,32 @@ impl Helper {
         }
     }
 
-    fn request(&mut self, path: &Path, timeout: Duration) -> Result<Vec<u8>, String> {
+    fn request(
+        &mut self,
+        path: &Path,
+        timeout: Duration,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<Vec<u8>, String> {
         let value = path.to_string_lossy();
         write_frame(&mut self.input, value.as_bytes())?;
-        match self
-            .responses
-            .recv_timeout(timeout.max(Duration::from_millis(1)))
-        {
-            Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                Err(format!("WeChat OCR helper exceeded {timeout:?}"))
+        let deadline = Instant::now() + timeout.max(Duration::from_millis(1));
+        loop {
+            if cancelled() {
+                return Err("WeChat OCR cancelled".into());
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err("WeChat OCR helper crashed or closed its pipe".into())
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(format!("WeChat OCR helper exceeded {timeout:?}"));
+            }
+            match self
+                .responses
+                .recv_timeout(remaining.min(Duration::from_millis(10)))
+            {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("WeChat OCR helper crashed or closed its pipe".into());
+                }
             }
         }
     }

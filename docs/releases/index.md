@@ -2,9 +2,9 @@
 
 ## 0.9.0
 
-Windows UI Hint 新增双 OCR 视觉识别
+Windows UI Hint 新增双 OCR 视觉识别。
 
-Windows UI Hint adds dual-OCR vision.
+Windows UI Hint adds dual-OCR vision recognition.
 
 ## 0.8.14
 

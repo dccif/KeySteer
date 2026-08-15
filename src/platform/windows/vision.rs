@@ -3,10 +3,12 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use windows::Media::Ocr::OcrEngine;
 use windows::Win32::Foundation::HWND;
+use windows_future::AsyncStatus;
 
 use crate::api::command::{UiScanRequest, UiScanStatus};
 use crate::api::geometry::{Rect, UiTarget};
@@ -30,6 +32,7 @@ struct ScanJob {
 #[derive(Default)]
 struct QueueState {
     pending: Option<ScanJob>,
+    pause_requested: bool,
     stopping: bool,
 }
 
@@ -39,6 +42,97 @@ struct SharedQueue {
     ready: Condvar,
     latest_generation: AtomicU64,
     stopping: AtomicBool,
+}
+
+#[derive(Clone)]
+struct ScanCancellation {
+    shared: Arc<SharedQueue>,
+    generation: u64,
+}
+
+impl ScanCancellation {
+    fn new(shared: &Arc<SharedQueue>, generation: u64) -> Self {
+        Self {
+            shared: Arc::clone(shared),
+            generation,
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.shared.stopping.load(Ordering::Acquire)
+            || self.shared.latest_generation.load(Ordering::Acquire) != self.generation
+    }
+
+    fn cancel(&self) {
+        let _ = self.shared.latest_generation.compare_exchange(
+            self.generation,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
+/// Own every provider thread started for one scan. Dropping a scan first
+/// invalidates its cancellation token and then joins all providers, so leaving
+/// UI Hint cannot strand OCR or pixel-analysis work in normal mode.
+struct ProviderThreads {
+    cancellation: ScanCancellation,
+    threads: Vec<JoinHandle<()>>,
+}
+
+impl ProviderThreads {
+    fn new(cancellation: ScanCancellation) -> Self {
+        Self {
+            cancellation,
+            threads: Vec::with_capacity(3),
+        }
+    }
+
+    fn spawn(&mut self, name: &'static str, work: impl FnOnce() + Send + 'static) -> bool {
+        let background_work = move || {
+            if let Err(error) = super::native::prefer_background_work() {
+                crate::log_warning!(
+                    "windows-vision",
+                    "cannot lower {name} provider priority: {error}"
+                );
+            }
+            work();
+        };
+        match std::thread::Builder::new()
+            .name(name.into())
+            .spawn(background_work)
+        {
+            Ok(thread) => {
+                self.threads.push(thread);
+                true
+            }
+            Err(error) => {
+                crate::log_warning!("windows-vision", "cannot start {name} provider: {error}");
+                false
+            }
+        }
+    }
+}
+
+impl Drop for ProviderThreads {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        for thread in self.threads.drain(..) {
+            if thread.join().is_err() {
+                crate::app::logging::report_error(
+                    "windows-vision",
+                    "visual scan provider thread panicked",
+                );
+            }
+        }
+    }
+}
+
+enum WorkerAction {
+    Scan(Box<ScanJob>),
+    Pause,
+    Stop,
 }
 
 pub(super) struct VisionWorker {
@@ -103,10 +197,12 @@ impl VisionWorker {
         {
             state.pending.take();
         }
+        state.pause_requested = true;
         self.shared.latest_generation.store(0, Ordering::Release);
+        self.shared.ready.notify_all();
     }
 
-    fn stop(&mut self) -> Result<(), String> {
+    pub(super) fn stop(&mut self) -> Result<(), String> {
         if self.worker.is_none() {
             return Ok(());
         }
@@ -145,7 +241,11 @@ fn worker_main(shared: Arc<SharedQueue>) {
             return;
         }
     };
-    let system_ocr = prewarm_system_ocr();
+    let system_ocr = prewarm_system_ocr(|| shared.stopping.load(Ordering::Acquire));
+    if shared.stopping.load(Ordering::Acquire) {
+        drop(apartment);
+        return;
+    }
     let wechat_ocr = WechatOcr::discover_and_start();
     crate::log_info!(
         "windows-vision",
@@ -154,8 +254,18 @@ fn worker_main(shared: Arc<SharedQueue>) {
         wechat_ocr.is_some()
     );
 
-    while let Some(job) = next_job(&shared) {
-        run_scan(job, &shared, system_ocr.clone(), wechat_ocr.clone());
+    loop {
+        match next_action(&shared) {
+            WorkerAction::Scan(job) => {
+                run_scan(*job, &shared, system_ocr.clone(), wechat_ocr.clone());
+            }
+            WorkerAction::Pause => {
+                if let Some(wechat) = wechat_ocr.as_ref() {
+                    wechat.pause();
+                }
+            }
+            WorkerAction::Stop => break,
+        }
     }
     drop(wechat_ocr);
     drop(system_ocr);
@@ -163,23 +273,40 @@ fn worker_main(shared: Arc<SharedQueue>) {
 }
 
 fn fail_pending_until_stopped(shared: &SharedQueue, error: &str) {
-    while let Some(job) = next_job(shared) {
-        job.source.finish(UiScanStatus::Failed(error.to_string()));
+    loop {
+        match next_action(shared) {
+            WorkerAction::Scan(job) => {
+                job.source.finish(UiScanStatus::Failed(error.to_string()));
+            }
+            WorkerAction::Pause => {}
+            WorkerAction::Stop => break,
+        }
     }
 }
 
-fn next_job(shared: &SharedQueue) -> Option<ScanJob> {
+fn next_action(shared: &SharedQueue) -> WorkerAction {
     let mut state = shared
         .state
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    while state.pending.is_none() && !state.stopping {
+    while state.pending.is_none() && !state.pause_requested && !state.stopping {
         state = shared
             .ready
             .wait(state)
             .unwrap_or_else(|error| error.into_inner());
     }
-    (!state.stopping).then(|| state.pending.take()).flatten()
+    if state.stopping {
+        WorkerAction::Stop
+    } else if state.pause_requested {
+        state.pause_requested = false;
+        WorkerAction::Pause
+    } else if let Some(job) = state.pending.take() {
+        WorkerAction::Scan(Box::new(job))
+    } else {
+        // A poisoned lock recovery or spurious wake can only request another
+        // idle pass; no scan work exists to run.
+        WorkerAction::Pause
+    }
 }
 
 fn current(shared: &SharedQueue, generation: u64, context: Option<(HWND, u32)>) -> bool {
@@ -190,7 +317,7 @@ fn current(shared: &SharedQueue, generation: u64, context: Option<(HWND, u32)>) 
 
 fn run_scan(
     job: ScanJob,
-    shared: &SharedQueue,
+    shared: &Arc<SharedQueue>,
     system_ocr: Option<OcrEngine>,
     wechat_ocr: Option<WechatOcr>,
 ) {
@@ -242,55 +369,69 @@ fn run_scan(
                 .clamp(250, 30_000),
         );
     let (tx, rx) = mpsc::channel();
+    let cancellation = ScanCancellation::new(shared, job.generation);
+    let mut providers = ProviderThreads::new(cancellation.clone());
+    let fallback_cancelled = Arc::new(AtomicBool::new(false));
     let mut pending_ocr = 0usize;
     if job.request.vision.detect_text {
         if let Some(engine) = system_ocr {
-            pending_ocr += 1;
             let tx = tx.clone();
             let image = Arc::clone(&image);
-            std::thread::spawn(move || {
+            let cancellation = cancellation.clone();
+            pending_ocr += usize::from(providers.spawn("keysteer-system-ocr", move || {
                 let started = Instant::now();
-                let result = super::native::ComApartment::initialise()
-                    .and_then(|_apartment| recognize_system(&engine, &image));
+                let result = super::native::ComApartment::initialise().and_then(|_apartment| {
+                    recognize_system(&engine, &image, || cancellation.is_cancelled())
+                });
                 let _ = tx.send(ProviderEvent::Ocr {
                     provider: "system",
                     elapsed: started.elapsed(),
                     result,
                 });
-            });
+            }));
         }
         if let Some(wechat) = wechat_ocr {
-            pending_ocr += 1;
             let tx = tx.clone();
             let image = Arc::clone(&image);
             let timeout = deadline.saturating_duration_since(Instant::now());
             let minimum_confidence = job.request.vision.minimum_confidence;
-            std::thread::spawn(move || {
+            let cancellation = cancellation.clone();
+            pending_ocr += usize::from(providers.spawn("keysteer-wechat-ocr", move || {
                 let started = Instant::now();
-                let result = super::native::ComApartment::initialise()
-                    .and_then(|_apartment| wechat.recognize(&image, timeout, minimum_confidence));
+                let result = super::native::ComApartment::initialise().and_then(|_apartment| {
+                    wechat.recognize(&image, timeout, minimum_confidence, || {
+                        cancellation.is_cancelled()
+                    })
+                });
                 let _ = tx.send(ProviderEvent::Ocr {
                     provider: "wechat",
                     elapsed: started.elapsed(),
                     result,
                 });
-            });
+            }));
         }
     }
-    if job.request.vision.detect_rectangles {
+    let fallback_pending = if job.request.vision.detect_rectangles {
         let tx = tx.clone();
         let image = Arc::clone(&image);
         let options = job.request.vision.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(ProviderEvent::Fallback(detect_regions(&image, &options)));
-        });
-    }
+        let cancellation = cancellation.clone();
+        let fallback_cancelled = Arc::clone(&fallback_cancelled);
+        providers.spawn("keysteer-vision-fallback", move || {
+            let targets = detect_regions(&image, &options, || {
+                cancellation.is_cancelled() || fallback_cancelled.load(Ordering::Acquire)
+            });
+            let _ = tx.send(ProviderEvent::Fallback(targets));
+        })
+    } else {
+        false
+    };
     drop(tx);
 
     let mut fallback = None;
     let mut accepted_ocr = 0usize;
     let mut timed_out = false;
-    while pending_ocr != 0 || (job.request.vision.detect_rectangles && fallback.is_none()) {
+    while pending_ocr != 0 || (fallback_pending && fallback.is_none()) {
         if !current(shared, job.generation, original) {
             job.source.finish(UiScanStatus::ContextChanged);
             return;
@@ -300,7 +441,7 @@ fn run_scan(
             timed_out = true;
             break;
         }
-        let first = match rx.recv_timeout(remaining.min(Duration::from_millis(50))) {
+        let first = match rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
             Ok(event) => event,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -333,6 +474,11 @@ fn run_scan(
                     let count = targets.len();
                     for batch in targets.chunks(OCR_BATCH) {
                         accepted_ocr += job.source.push(batch.to_vec());
+                    }
+                    if accepted_ocr != 0 {
+                        // OCR won this scan. Stop the CPU-heavy fallback now;
+                        // the other OCR provider may still append unique text.
+                        fallback_cancelled.store(true, Ordering::Release);
                     }
                     crate::log_info!(
                         "windows-vision",
@@ -435,8 +581,11 @@ fn capture(bounds: Rect) -> Result<CapturedImage, String> {
     })
 }
 
-fn prewarm_system_ocr() -> Option<OcrEngine> {
+fn prewarm_system_ocr(cancelled: impl Fn() -> bool) -> Option<OcrEngine> {
     let result = (|| -> Result<OcrEngine, String> {
+        if cancelled() {
+            return Err("system OCR prewarm cancelled".into());
+        }
         let engine = OcrEngine::TryCreateFromUserProfileLanguages()
             .map_err(|error| format!("cannot create OcrEngine: {error}"))?;
         let maximum = OcrEngine::MaxImageDimension()
@@ -465,7 +614,7 @@ fn prewarm_system_ocr() -> Option<OcrEngine> {
             desktop_bounds: Rect::new(0.0, 0.0, 64.0, 64.0),
             scale: 1.0,
         };
-        recognize_system(&engine, &blank)?;
+        recognize_system(&engine, &blank, &cancelled)?;
         crate::log_info!(
             "windows-vision",
             "system OCR prewarmed (languages [{}], maximum image dimension {maximum})",
@@ -482,12 +631,37 @@ fn prewarm_system_ocr() -> Option<OcrEngine> {
     }
 }
 
-fn recognize_system(engine: &OcrEngine, image: &CapturedImage) -> Result<Vec<UiTarget>, String> {
+fn recognize_system(
+    engine: &OcrEngine,
+    image: &CapturedImage,
+    cancelled: impl Fn() -> bool,
+) -> Result<Vec<UiTarget>, String> {
     let bitmap = super::native::software_bitmap_bgra(&image.pixels, image.width, image.height)?;
-    let result = engine
+    let operation = engine
         .RecognizeAsync(&bitmap)
-        .and_then(|operation| operation.join())
         .map_err(|error| format!("OcrEngine::RecognizeAsync failed: {error}"))?;
+    let result = loop {
+        if cancelled() {
+            let _ = operation.Cancel();
+            return Err("system OCR cancelled".into());
+        }
+        match operation
+            .Status()
+            .map_err(|error| format!("cannot read system OCR status: {error}"))?
+        {
+            AsyncStatus::Started => std::thread::sleep(Duration::from_millis(5)),
+            AsyncStatus::Completed => break operation.GetResults(),
+            AsyncStatus::Canceled => return Err("system OCR cancelled".into()),
+            AsyncStatus::Error => {
+                let error = operation
+                    .ErrorCode()
+                    .map_err(|error| format!("cannot read system OCR error: {error}"))?;
+                return Err(format!("OcrEngine::RecognizeAsync failed: {error}"));
+            }
+            _ => return Err("system OCR returned an unknown asynchronous status".into()),
+        }
+    }
+    .map_err(|error| format!("OcrEngine::RecognizeAsync failed: {error}"))?;
     let lines = result
         .Lines()
         .map_err(|error| format!("cannot read OCR lines: {error}"))?;
@@ -559,14 +733,21 @@ pub(super) fn valid_target_rect(rect: Rect, bounds: Rect) -> bool {
         && !(rect.width >= bounds.width && rect.height >= bounds.height)
 }
 
-fn detect_regions(image: &CapturedImage, options: &crate::api::VisionOptions) -> Vec<UiTarget> {
+fn detect_regions(
+    image: &CapturedImage,
+    options: &crate::api::VisionOptions,
+    cancelled: impl Fn() -> bool,
+) -> Vec<UiTarget> {
     let width = image.width as usize;
     let height = image.height as usize;
-    if width < 3 || height < 3 {
+    if width < 3 || height < 3 || cancelled() {
         return Vec::new();
     }
     let mut gray = vec![0u8; width * height];
     for (index, pixel) in image.pixels.chunks_exact(4).enumerate() {
+        if index & 0x0fff == 0 && cancelled() {
+            return Vec::new();
+        }
         gray[index] = ((u16::from(pixel[2]) * 77
             + u16::from(pixel[1]) * 150
             + u16::from(pixel[0]) * 29)
@@ -574,6 +755,9 @@ fn detect_regions(image: &CapturedImage, options: &crate::api::VisionOptions) ->
     }
     let mut edge = vec![false; width * height];
     for y in 1..height - 1 {
+        if cancelled() {
+            return Vec::new();
+        }
         for x in 1..width - 1 {
             let i = y * width + x;
             let gx = i16::from(gray[i + 1]) - i16::from(gray[i - 1]);
@@ -600,6 +784,9 @@ fn detect_regions(image: &CapturedImage, options: &crate::api::VisionOptions) ->
     // neighbouring controls as distinct components.
     let mut dilated = edge.clone();
     for y in 1..height - 1 {
+        if cancelled() {
+            return Vec::new();
+        }
         for x in 1..width - 1 {
             let i = y * width + x;
             dilated[i] = (-1isize..=1).any(|dy| {
@@ -611,6 +798,9 @@ fn detect_regions(image: &CapturedImage, options: &crate::api::VisionOptions) ->
     }
     let mut closed = dilated.clone();
     for y in 1..height - 1 {
+        if cancelled() {
+            return Vec::new();
+        }
         for x in 1..width - 1 {
             let i = y * width + x;
             closed[i] = (-1isize..=1).all(|dy| {
@@ -626,6 +816,9 @@ fn detect_regions(image: &CapturedImage, options: &crate::api::VisionOptions) ->
         (options.rectangle_min_size * width.min(height) as f64).ceil() as usize;
     let minimum_side = configured_minimum.max(4);
     for y in 1..height - 1 {
+        if cancelled() {
+            return Vec::new();
+        }
         for x in 1..width - 1 {
             let start = y * width + x;
             if !closed[start] || visited[start] {
@@ -635,6 +828,9 @@ fn detect_regions(image: &CapturedImage, options: &crate::api::VisionOptions) ->
             visited[start] = true;
             let (mut min_x, mut max_x, mut min_y, mut max_y, mut pixels) = (x, x, y, y, 0usize);
             while let Some(index) = queue.pop_front() {
+                if pixels & 0x03ff == 0 && cancelled() {
+                    return Vec::new();
+                }
                 pixels += 1;
                 let px = index % width;
                 let py = index / width;
@@ -692,6 +888,9 @@ fn detect_regions(image: &CapturedImage, options: &crate::api::VisionOptions) ->
             }
         }
     }
+    if cancelled() {
+        return Vec::new();
+    }
     candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
     candidates
         .into_iter()
@@ -727,6 +926,7 @@ fn classify_region(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn maps_scaled_negative_desktop_coordinates() {
@@ -761,7 +961,7 @@ mod tests {
             desktop_bounds: Rect::new(0.0, 0.0, 120.0, 80.0),
             scale: 1.0,
         };
-        let targets = detect_regions(&image, &crate::api::VisionOptions::default());
+        let targets = detect_regions(&image, &crate::api::VisionOptions::default(), || false);
         assert!(targets.iter().any(|target| target.role == "button"));
     }
 
@@ -783,12 +983,62 @@ mod tests {
         let mut worker = VisionWorker::start().unwrap();
         assert!(started.elapsed() < Duration::from_millis(500));
         worker.stop().unwrap();
+        worker.stop().unwrap();
+    }
+
+    #[test]
+    fn cancellation_requests_an_idle_provider_pause() {
+        let shared = Arc::new(SharedQueue::default());
+        shared.latest_generation.store(17, Ordering::Release);
+        let worker = VisionWorker {
+            shared: Arc::clone(&shared),
+            worker: None,
+        };
+        worker.cancel(91);
+        assert_eq!(shared.latest_generation.load(Ordering::Acquire), 0);
+        assert!(matches!(next_action(&shared), WorkerAction::Pause));
+    }
+
+    #[test]
+    fn provider_group_cancels_and_joins_every_thread() {
+        let shared = Arc::new(SharedQueue::default());
+        shared.latest_generation.store(23, Ordering::Release);
+        let cancellation = ScanCancellation::new(&shared, 23);
+        let provider_cancellation = cancellation.clone();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let provider_stopped = Arc::clone(&stopped);
+        let mut providers = ProviderThreads::new(cancellation);
+        providers.spawn("keysteer-cancellation-test", move || {
+            while !provider_cancellation.is_cancelled() {
+                std::thread::yield_now();
+            }
+            provider_stopped.store(true, Ordering::Release);
+        });
+        drop(providers);
+        assert!(stopped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn pure_rust_detector_stops_at_cancellation_checkpoints() {
+        let image = CapturedImage {
+            pixels: vec![255; 256 * 256 * 4],
+            width: 256,
+            height: 256,
+            desktop_bounds: Rect::new(0.0, 0.0, 256.0, 256.0),
+            scale: 1.0,
+        };
+        let checks = AtomicUsize::new(0);
+        let targets = detect_regions(&image, &crate::api::VisionOptions::default(), || {
+            checks.fetch_add(1, Ordering::Relaxed) >= 2
+        });
+        assert!(targets.is_empty());
+        assert!(checks.load(Ordering::Relaxed) >= 3);
     }
 
     #[test]
     #[ignore = "requires an installed Windows OCR language pack"]
     fn live_system_ocr_runtime_probe_recognizes_a_blank_bitmap() {
         let _apartment = super::super::native::ComApartment::initialise().unwrap();
-        assert!(prewarm_system_ocr().is_some());
+        assert!(prewarm_system_ocr(|| false).is_some());
     }
 }

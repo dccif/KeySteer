@@ -348,6 +348,14 @@ impl WindowsBackend {
                 Err(error) => first_error = Some(error),
             }
         }
+        // Stop visual providers before tearing down the hook and overlay. The
+        // vision worker cancels WinRT OCR, terminates the optional WeChat
+        // helper, and joins pure-Rust fallback work before returning.
+        if let Err(error) = self.vision.stop()
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
         if let Some(worker) = self.ui_automation.as_mut() {
             match worker.stop() {
                 Ok(()) => {
@@ -774,5 +782,13 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert_eq!(actual.to_lowercase(), expected.to_lowercase());
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop"]
+    fn backend_shutdown_stops_vision_and_is_idempotent() -> Result<(), String> {
+        let mut backend = WindowsBackend::new()?;
+        backend.shutdown_resources()?;
+        backend.shutdown_resources()
     }
 }

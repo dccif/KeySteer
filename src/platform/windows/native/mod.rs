@@ -1133,14 +1133,26 @@ pub(crate) fn pump_window_messages() -> bool {
 /// Prefer the engine's synchronous input work without entering real-time
 /// priority classes that could starve the compositor or system services.
 pub(crate) fn prefer_input_latency() -> std::io::Result<()> {
-    use windows::Win32::System::Threading::{
-        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
-    };
+    use windows::Win32::System::Threading::THREAD_PRIORITY_HIGHEST;
+
+    set_current_thread_priority(THREAD_PRIORITY_HIGHEST)
+}
+
+/// Keep OCR and pixel analysis below interactive input/compositor work.
+pub(crate) fn prefer_background_work() -> std::io::Result<()> {
+    use windows::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL;
+
+    set_current_thread_priority(THREAD_PRIORITY_BELOW_NORMAL)
+}
+
+fn set_current_thread_priority(
+    priority: windows::Win32::System::Threading::THREAD_PRIORITY,
+) -> std::io::Result<()> {
+    use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
 
     // SAFETY: The pseudo-handle always identifies the calling thread and does
-    // not need closing. `HIGHEST` remains below time-critical priority.
-    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) }
-        .map_err(std::io::Error::other)
+    // not need closing. Callers select non-realtime documented priorities.
+    unsafe { SetThreadPriority(GetCurrentThread(), priority) }.map_err(std::io::Error::other)
 }
 
 /// Attach the parent console when possible, otherwise allocate one.
