@@ -1,6 +1,6 @@
 [package]
 name = "keysteer"
-version = "0.8.14"
+version = "0.9.0"
 authors = ["dccif"]
 edition = "2024"
 rust-version = "1.97"
@@ -36,6 +36,7 @@ path = "src/main.rs"
 base64 = "0.23"
 miniz_oxide = "0.8"
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0"
 semver = "1.0"
 sha2 = { version = "0.11", default-features = false }
 smallvec = "1.15"
@@ -120,6 +121,11 @@ libc = "0.2.189"
 [target.'cfg(target_os = "windows")'.dependencies.windows]
 version = "0.62.2"
 features = [
+    "Foundation",
+    "Globalization",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Storage_Streams",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Graphics_Direct2D",
@@ -141,6 +147,7 @@ features = [
     "Win32_System_RemoteDesktop",
     "Win32_Storage_FileSystem",
     "Win32_System_Threading",
+    "Win32_System_WinRT",
     "Win32_UI_Accessibility",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",

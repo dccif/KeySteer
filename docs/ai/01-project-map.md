@@ -66,7 +66,7 @@ Windows：
 - `hook.rs` 键盘 Hook 与同步 consume/forward 握手。
 - `input.rs` 鼠标、滚轮、键盘注入。
 - `overlay.rs` click-through layered window 与软件栅格化。
-- `accessibility.rs` UIA 流式扫描、popup HWND、遮挡过滤。
+- `accessibility.rs` UIA 流式扫描、popup HWND、遮挡过滤；`ui_scan.rs` 统一 UIA/视觉流式发布与空间去重；`vision.rs` 负责 GDI 截图、系统 OCR 和纯 Rust 区域检测；`wechat_ocr.rs` 负责微信组件发现与隔离 helper。
 - `frame_clock.rs` DWM 合成帧时钟。
 - `status_item.rs` 托盘菜单、更新提示与浏览器打开；`autostart.rs` 登录启动；`system_events.rs` 前台/显示事件。
 

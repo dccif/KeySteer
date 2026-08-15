@@ -7,6 +7,341 @@ use std::rc::Rc;
 use windows::Win32::Foundation::{HANDLE, HWND};
 use windows::Win32::Graphics::Gdi::{HDC, HGDIOBJ};
 
+pub(crate) struct ComApartment(PhantomData<Rc<()>>);
+
+impl ComApartment {
+    pub(crate) fn initialise() -> Result<Self, String> {
+        use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
+
+        // SAFETY: the returned !Send guard binds the successful COM apartment
+        // initialization to this thread and balances it in Drop.
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+            .ok()
+            .map_err(|error| format!("cannot initialize COM apartment: {error}"))?;
+        Ok(Self(PhantomData))
+    }
+}
+
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        use windows::Win32::System::Com::CoUninitialize;
+
+        // SAFETY: this !Send guard is dropped on the same thread that
+        // successfully initialized the apartment.
+        unsafe { CoUninitialize() };
+    }
+}
+
+pub(crate) struct CapturedBgra {
+    pub(crate) pixels: Vec<u8>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+pub(crate) fn capture_bgra(
+    source_x: i32,
+    source_y: i32,
+    source_width: i32,
+    source_height: i32,
+    width: i32,
+    height: i32,
+) -> Result<CapturedBgra, String> {
+    use windows::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CAPTUREBLT, CreateCompatibleDC, CreateDIBSection,
+        DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HALFTONE, HGDIOBJ, ReleaseDC, SRCCOPY,
+        SelectObject, SetStretchBltMode, StretchBlt,
+    };
+
+    let dimensions = NativeDimensions::from_usize(width as usize, height as usize)?;
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits = std::ptr::null_mut();
+    // SAFETY: every acquired DC/bitmap is released on all paths. The selected
+    // top-down DIB remains alive while its validated byte range is copied.
+    unsafe {
+        let screen = GetDC(None);
+        if screen.is_invalid() {
+            return Err("GetDC failed for visual capture".into());
+        }
+        let memory = CreateCompatibleDC(Some(screen));
+        if memory.is_invalid() {
+            let _ = ReleaseDC(None, screen);
+            return Err("CreateCompatibleDC failed".into());
+        }
+        let bitmap = match CreateDIBSection(Some(screen), &info, DIB_RGB_COLORS, &mut bits, None, 0)
+        {
+            Ok(bitmap) => bitmap,
+            Err(error) => {
+                let _ = DeleteDC(memory);
+                let _ = ReleaseDC(None, screen);
+                return Err(format!("CreateDIBSection failed: {error}"));
+            }
+        };
+        let previous = SelectObject(memory, HGDIOBJ(bitmap.0));
+        SetStretchBltMode(memory, HALFTONE);
+        let copied = StretchBlt(
+            memory,
+            0,
+            0,
+            width,
+            height,
+            Some(screen),
+            source_x,
+            source_y,
+            source_width,
+            source_height,
+            SRCCOPY | CAPTUREBLT,
+        )
+        .as_bool();
+        let pixels = if copied && !bits.is_null() {
+            std::slice::from_raw_parts(bits.cast::<u8>(), dimensions.byte_len()).to_vec()
+        } else {
+            Vec::new()
+        };
+        if !previous.is_invalid() {
+            SelectObject(memory, previous);
+        }
+        let _ = DeleteObject(HGDIOBJ(bitmap.0));
+        let _ = DeleteDC(memory);
+        let _ = ReleaseDC(None, screen);
+        if pixels.len() != dimensions.byte_len() {
+            return Err("StretchBlt failed for visual capture".into());
+        }
+        Ok(CapturedBgra {
+            pixels,
+            width: dimensions.width_u32(),
+            height: dimensions.height_u32(),
+        })
+    }
+}
+
+pub(crate) fn software_bitmap_bgra(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<windows::Graphics::Imaging::SoftwareBitmap, String> {
+    use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap};
+    use windows::Storage::Streams::Buffer;
+    use windows::Win32::System::WinRT::IBufferByteAccess;
+    use windows::core::Interface;
+
+    let dimensions = NativeDimensions::from_usize(width as usize, height as usize)?;
+    if pixels.len() != dimensions.byte_len() {
+        return Err("BGRA byte length does not match bitmap dimensions".into());
+    }
+    let length = u32::try_from(pixels.len())
+        .map_err(|_| "captured bitmap is too large for WinRT".to_string())?;
+    let buffer = Buffer::Create(length).map_err(|error| format!("Buffer::Create: {error}"))?;
+    buffer
+        .SetLength(length)
+        .map_err(|error| format!("Buffer::SetLength: {error}"))?;
+    let access: IBufferByteAccess = buffer
+        .cast()
+        .map_err(|error| format!("IBufferByteAccess: {error}"))?;
+    // SAFETY: the WinRT buffer has exactly `length` writable bytes and stays
+    // alive through this non-overlapping copy.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            pixels.as_ptr(),
+            access
+                .Buffer()
+                .map_err(|error| format!("IBufferByteAccess::Buffer: {error}"))?,
+            pixels.len(),
+        );
+    }
+    SoftwareBitmap::CreateCopyWithAlphaFromBuffer(
+        &buffer,
+        BitmapPixelFormat::Bgra8,
+        dimensions.width_i32(),
+        dimensions.height_i32(),
+        BitmapAlphaMode::Ignore,
+    )
+    .map_err(|error| format!("SoftwareBitmap creation failed: {error}"))
+}
+
+pub(crate) fn buffer_bytes(buffer: &windows::Storage::Streams::IBuffer) -> Result<Vec<u8>, String> {
+    use windows::Win32::System::WinRT::IBufferByteAccess;
+    use windows::core::Interface;
+
+    let length = buffer
+        .Length()
+        .map_err(|error| format!("cannot read buffer length: {error}"))? as usize;
+    let access: IBufferByteAccess = buffer
+        .cast()
+        .map_err(|error| format!("cannot access buffer bytes: {error}"))?;
+    // SAFETY: the WinRT buffer owns at least `length` readable bytes for the
+    // duration of this immediate copy into an owned Vec.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            access
+                .Buffer()
+                .map_err(|error| format!("cannot access buffer pointer: {error}"))?,
+            length,
+        )
+    };
+    Ok(bytes.to_vec())
+}
+
+type OcrCallback = unsafe extern "C" fn(windows::core::PCSTR);
+type WechatOcrFn = unsafe extern "C" fn(
+    windows::core::PCWSTR,
+    windows::core::PCWSTR,
+    windows::core::PCSTR,
+    OcrCallback,
+) -> bool;
+type StopOcrFn = unsafe extern "C" fn();
+static WECHAT_CALLBACK_VALUE: std::sync::OnceLock<std::sync::Mutex<Vec<u8>>> =
+    std::sync::OnceLock::new();
+const MAX_WECHAT_RESPONSE: usize = 8 * 1024 * 1024;
+
+unsafe extern "C" fn capture_wechat_callback(value: windows::core::PCSTR) {
+    if value.is_null() {
+        return;
+    }
+    // SAFETY: wcocr documents a readable NUL-terminated callback string valid
+    // for this callback. Scan no farther than the IPC ceiling and copy before
+    // returning to the bridge.
+    let bytes = unsafe {
+        let mut length = 0usize;
+        while length <= MAX_WECHAT_RESPONSE && *value.0.add(length) != 0 {
+            length += 1;
+        }
+        if length > MAX_WECHAT_RESPONSE {
+            return;
+        }
+        std::slice::from_raw_parts(value.0, length)
+    };
+    let mut output = WECHAT_CALLBACK_VALUE
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    output.clear();
+    if bytes.len() <= MAX_WECHAT_RESPONSE {
+        output.extend_from_slice(bytes);
+    }
+}
+
+pub(crate) struct WechatBridge {
+    module: windows::Win32::Foundation::HMODULE,
+    recognize: WechatOcrFn,
+    stop: Option<StopOcrFn>,
+}
+
+impl WechatBridge {
+    pub(crate) fn load(path: &Path) -> Result<Self, String> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::System::LibraryLoader::{
+            GetProcAddress, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+            LoadLibraryExW,
+        };
+        use windows::core::{PCSTR, PCWSTR};
+
+        let wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        // SAFETY: the absolute path is NUL terminated. Restricted search uses
+        // only the bridge directory and Windows safe default directories.
+        let module = unsafe {
+            LoadLibraryExW(
+                PCWSTR(wide.as_ptr()),
+                None,
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+            )
+        }
+        .map_err(|error| format!("cannot load {}: {error}", path.display()))?;
+        // SAFETY: both symbol names are static NUL-terminated ASCII. Function
+        // pointers use the bridge's documented exported C ABI.
+        let recognize = unsafe {
+            let address = GetProcAddress(module, PCSTR(c"wechat_ocr".as_ptr().cast()))
+                .ok_or_else(|| "wcocr.dll lacks wechat_ocr".to_string())?;
+            std::mem::transmute_copy(&address)
+        };
+        // SAFETY: same symbol lifetime/ABI contract as above; stop is optional.
+        let stop = unsafe {
+            GetProcAddress(module, PCSTR(c"stop_ocr".as_ptr().cast()))
+                .map(|address| std::mem::transmute_copy(&address))
+        };
+        Ok(Self {
+            module,
+            recognize,
+            stop,
+        })
+    }
+
+    pub(crate) fn recognize(
+        &self,
+        component: &Path,
+        runtime: &Path,
+        image: &std::ffi::CStr,
+    ) -> Result<Vec<u8>, String> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::{PCSTR, PCWSTR};
+
+        let component = component
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let runtime = runtime
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        WECHAT_CALLBACK_VALUE
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        // SAFETY: all path buffers remain NUL terminated for the synchronous
+        // call and the callback copies its result before returning.
+        let success = unsafe {
+            (self.recognize)(
+                PCWSTR(component.as_ptr()),
+                PCWSTR(runtime.as_ptr()),
+                PCSTR(image.as_ptr().cast()),
+                capture_wechat_callback,
+            )
+        };
+        let value = WECHAT_CALLBACK_VALUE
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if success && !value.is_empty() {
+            Ok(value)
+        } else {
+            Err("WeChat OCR bridge returned no response".into())
+        }
+    }
+}
+
+impl Drop for WechatBridge {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::FreeLibrary;
+
+        if let Some(stop) = self.stop {
+            // SAFETY: no recognition call remains active when the helper loop
+            // drops this owner; symbol and module lifetimes still match.
+            unsafe { stop() };
+        }
+        // SAFETY: this owner loaded the module and drops all function pointers
+        // immediately after this balanced release.
+        let _ = unsafe { FreeLibrary(self.module) };
+    }
+}
+
 /// Dimensions that are representable by Win32 APIs and by a Rust byte slice.
 ///
 /// Construction performs every narrowing conversion and length calculation so

@@ -28,7 +28,7 @@ KeySteer 是 Windows 和 macOS 上使用键盘操控鼠标的工具。
 - **长按,拖拽**：可将鼠标左/中/右键转为按下状态，适合拖拽。
 - **Grid**：快速定位二键组合。
 - **Recursive Grid**：区域持续递归细分。
-- **UI Hint**：为按钮、链接、菜单和输入框显示可键入标签；macOS 支持 Accessibility Tree、Vision 和 Hybrid，Windows 使用 UI Automation。
+- **UI Hint**：为按钮、链接、菜单和输入框显示可键入标签；macOS 支持 Accessibility Tree、Vision 和 Hybrid，Windows 支持 UI Automation、双 OCR 视觉识别和 Hybrid。
 - **多显示器**：`Primary+S` 切换到下一块显示器。
 - **外观与配置**：`Grid`/`Hint` 标签样式、指示器等可通过 TOML 调整。
 

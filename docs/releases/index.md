@@ -1,5 +1,11 @@
 # 更新日志 / Release Notes
 
+## 0.9.0
+
+Windows UI Hint 新增双 OCR 视觉识别
+
+Windows UI Hint adds dual-OCR vision.
+
 ## 0.8.14
 
 进一步降低普通输入与 UI Hint 的尾延迟和临时分配，并收紧 Windows/macOS 原生线程与 Unsafe 安全边界。

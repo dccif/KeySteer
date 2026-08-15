@@ -466,7 +466,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "keysteer"
-version = "0.8.14"
+version = "0.9.0"
 dependencies = [
  "base64",
  "cc",
@@ -484,6 +484,7 @@ dependencies = [
  "objc2-quartz-core",
  "semver",
  "serde",
+ "serde_json",
  "sha2",
  "smallvec",
  "stats_alloc",

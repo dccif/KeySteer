@@ -21,6 +21,9 @@ mod overlay_worker;
 mod screens;
 mod status_item;
 mod system_events;
+mod ui_scan;
+mod vision;
+mod wechat_ocr;
 
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -44,6 +47,22 @@ use self::overlay_worker::OverlayWorker;
 const WAKE_MESSAGE: u32 = WM_APP + 0x4C;
 
 pub(crate) use native::{atomic_replace, prepare_console_for_cli};
+
+pub(crate) fn run_internal_wechat_ocr_helper(
+    bridge: std::path::PathBuf,
+    component: std::path::PathBuf,
+    runtime: std::path::PathBuf,
+) -> Result<(), String> {
+    wechat_ocr::run_helper(wechat_ocr::HelperPaths {
+        bridge,
+        component,
+        runtime,
+    })
+}
+
+pub(crate) fn vision_diagnostics() -> Vec<String> {
+    vision::diagnostic_lines()
+}
 
 /// Routes worker and tray events into the engine queue and wakes its native
 /// message wait immediately. The queue remains empty while idle.
@@ -101,6 +120,7 @@ pub struct WindowsBackend {
     status_item: Option<status_item::StatusItem>,
     console_control: Option<console_control::ConsoleControl>,
     ui_automation: Option<accessibility::UiAutomationWorker>,
+    vision: vision::VisionWorker,
     update_worker: Option<crate::app::update::UpdateWorker>,
     held_buttons: Cell<u8>,
 }
@@ -162,6 +182,7 @@ impl WindowsBackend {
             );
             Vec::new()
         });
+        let vision = vision::VisionWorker::start()?;
         Ok(Self {
             hook: None,
             overlay,
@@ -177,6 +198,7 @@ impl WindowsBackend {
             status_item,
             console_control,
             ui_automation: None,
+            vision,
             update_worker: None,
             held_buttons: Cell::new(0),
         })
@@ -591,20 +613,43 @@ impl Backend for WindowsBackend {
     }
 
     fn request_ui_scan(&mut self, request: crate::api::UiScanRequest) -> Result<(), String> {
-        if self.ui_automation.is_none() {
+        use crate::api::UiScanStrategy;
+
+        let wants_uia = matches!(
+            request.strategy,
+            UiScanStrategy::AxTree | UiScanStrategy::Hybrid
+        );
+        let wants_vision = matches!(
+            request.strategy,
+            UiScanStrategy::Vision | UiScanStrategy::Hybrid
+        );
+        if wants_uia && self.ui_automation.is_none() {
             self.ui_automation = Some(accessibility::UiAutomationWorker::start()?);
         }
-        let Some(worker) = self.ui_automation.as_ref() else {
-            return Err("UI Automation worker was not retained after startup".into());
-        };
         let request_id = request.id;
         let generation = self.scan_mailbox.begin(request.id);
-        let result = worker.submit(
-            request,
+        let sources = usize::from(wants_uia) + usize::from(wants_vision);
+        let session = ui_scan::ScanSession::new(
+            request.id,
             generation,
+            sources,
+            &request.vision,
             Arc::clone(&self.scan_mailbox),
             self.event_tx.clone(),
         );
+        let result = (|| {
+            if wants_uia {
+                let worker = self.ui_automation.as_ref().ok_or_else(|| {
+                    "UI Automation worker was not retained after startup".to_string()
+                })?;
+                worker.submit(request.clone(), generation, session.source("UI Automation"))?;
+            }
+            if wants_vision {
+                self.vision
+                    .submit(request, generation, session.source("visual scan"))?;
+            }
+            Ok(())
+        })();
         if result.is_err() {
             self.scan_mailbox.cancel(request_id);
         }
@@ -612,10 +657,11 @@ impl Backend for WindowsBackend {
     }
 
     fn cancel_ui_scan(&mut self, id: u64) -> Result<(), String> {
-        if self.scan_mailbox.cancel(id)
-            && let Some(worker) = self.ui_automation.as_ref()
-        {
-            worker.cancel(id);
+        if self.scan_mailbox.cancel(id) {
+            if let Some(worker) = self.ui_automation.as_ref() {
+                worker.cancel(id);
+            }
+            self.vision.cancel(id);
         }
         Ok(())
     }

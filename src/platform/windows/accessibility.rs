@@ -38,13 +38,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{BOOL, Interface};
 
-use crate::api::command::{UiScanRequest, UiScanStatus, UiScanStrategy};
+use super::ui_scan::ScanSource;
+use crate::api::command::{UiScanRequest, UiScanStatus};
 use crate::api::geometry::{Rect, UiTarget};
 use crate::app::worker::WorkerJoin;
 use crate::platform::partial_batcher::PartialBatcher;
-use crate::platform::scan_mailbox::ScanMailbox;
-
-use super::EventSender;
 
 const PARTIAL_BATCH_SIZE: usize = 24;
 const MAX_TARGETS: usize = 2_000;
@@ -54,8 +52,6 @@ const MINIMUM_SPACING: f64 = 8.0;
 const MIN_SCAN_TIMEOUT_MS: u64 = 250;
 const MAX_SCAN_TIMEOUT_MS: u64 = 30_000;
 const UIA_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
-
-static STRATEGY_FALLBACK_REPORTED: AtomicBool = AtomicBool::new(false);
 
 fn request_call_cancellation(thread_id: u32) {
     if thread_id != 0 {
@@ -69,18 +65,18 @@ fn request_call_cancellation(thread_id: u32) {
 struct ScanJob {
     request: UiScanRequest,
     generation: u64,
-    mailbox: Arc<ScanMailbox>,
-    wake: EventSender,
+    source: ScanSource,
 }
 
 impl ScanJob {
     fn publish(&self, targets: Vec<UiTarget>, status: UiScanStatus) {
-        if self
-            .mailbox
-            .publish(self.generation, self.request.id, targets, status)
-        {
-            self.wake.wake();
+        if status == UiScanStatus::Partial {
+            self.source.push(targets);
         }
+    }
+
+    fn finish(self, status: UiScanStatus) {
+        self.source.finish(status);
     }
 }
 
@@ -138,8 +134,7 @@ impl UiAutomationWorker {
         &self,
         request: UiScanRequest,
         generation: u64,
-        mailbox: Arc<ScanMailbox>,
-        wake: EventSender,
+        source: ScanSource,
     ) -> Result<(), String> {
         let mut state = self
             .shared
@@ -155,8 +150,7 @@ impl UiAutomationWorker {
         let replaced = state.pending.replace(ScanJob {
             request,
             generation,
-            mailbox,
-            wake,
+            source,
         });
         let cancel_active = state
             .active
@@ -413,7 +407,7 @@ fn finish_job(shared: &SharedQueue, id: u64, generation: u64) {
 
 fn fail_jobs_until_stopped(shared: &SharedQueue, error: String) {
     while let Some(job) = next_job(shared) {
-        job.publish(Vec::new(), UiScanStatus::Failed(error.clone()));
+        job.finish(UiScanStatus::Failed(error.clone()));
     }
 }
 
@@ -439,17 +433,6 @@ fn run_scan(
     shared: &SharedQueue,
     configured_timeout: &mut Option<u32>,
 ) {
-    if matches!(
-        job.request.strategy,
-        UiScanStrategy::Vision | UiScanStrategy::Hybrid
-    ) && !STRATEGY_FALLBACK_REPORTED.swap(true, Ordering::AcqRel)
-    {
-        crate::log_warning!(
-            "windows-uia",
-            "Vision/Hybrid UI hints are using Windows UI Automation for this configuration"
-        );
-    }
-
     let timeout_ms = scan_timeout_ms(job.request.timeout_ms);
     if let Some(automation2) = automation2
         && timeout_needs_configuration(*configured_timeout, timeout_ms)
@@ -484,14 +467,13 @@ fn run_scan(
         .as_ref()
         .is_some_and(|app| original.is_none_or(|(_, pid)| pid != app.process_id));
     if request_context_changed {
-        job.publish(Vec::new(), UiScanStatus::ContextChanged);
+        job.finish(UiScanStatus::ContextChanged);
         return;
     }
     let Some((hwnd, _)) = original else {
-        job.publish(
-            Vec::new(),
-            UiScanStatus::Failed("No foreground window is available".into()),
-        );
+        job.finish(UiScanStatus::Failed(
+            "No foreground window is available".into(),
+        ));
         return;
     };
 
@@ -499,7 +481,7 @@ fn run_scan(
         Ok(status) => status,
         Err(error) => UiScanStatus::Failed(format!("UI Automation scan failed: {error}")),
     };
-    job.publish(Vec::new(), status);
+    job.finish(status);
 }
 
 fn scan_timeout_ms(requested: u64) -> u32 {
@@ -551,7 +533,7 @@ fn native_rect(rect: Rect) -> RECT {
 
 /// DWM's extended frame excludes the invisible resize border and drop shadow.
 /// Fall back to GetWindowRect for classic controls and windows without DWM.
-fn window_bounds(hwnd: HWND) -> Option<Rect> {
+pub(super) fn window_bounds(hwnd: HWND) -> Option<Rect> {
     let mut rect = RECT::default();
     // SAFETY: `rect` is a correctly sized writable out-buffer and `hwnd` is
     // borrowed only for this synchronous DWM query.
@@ -1341,7 +1323,7 @@ impl SpatialDeduper {
     }
 }
 
-fn foreground_context() -> Option<(HWND, u32)> {
+pub(super) fn foreground_context() -> Option<(HWND, u32)> {
     let hwnd = super::native::foreground_window();
     if hwnd.is_invalid() {
         return None;

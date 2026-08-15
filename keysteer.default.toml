@@ -227,9 +227,9 @@ y = "end"
 
 [ui_hint]
 enabled = true
-# Element detection: macOS supports "axtree", "vision", and "hybrid".
-# Windows uses UI Automation; "vision"/"hybrid" safely fall back to UIA so
-# this same configuration file remains portable across platforms.
+# Element detection: both macOS and Windows support "axtree", "vision", and
+# "hybrid". Windows vision probes system/WeChat OCR internally and falls back
+# to built-in pixel-region detection; it adds no OCR configuration fields.
 strategy = "vision"
 # Characters used to build hint labels.
 hint_characters = "asdfghjkl"

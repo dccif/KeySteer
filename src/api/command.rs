@@ -514,8 +514,8 @@ pub enum UiScanStrategy {
     AxTree,
     #[default]
     Vision,
-    /// Run accessibility and visual detection concurrently and merge their
-    /// incremental results in the hint mode.
+    /// Run accessibility and visual detection concurrently; the backend
+    /// streams their de-duplicated spatial union.
     Hybrid,
 }
 

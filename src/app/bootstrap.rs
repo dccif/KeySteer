@@ -219,8 +219,11 @@ fn doctor(config: &Config) -> Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
-        println!("overlay: layered RGBA, topmost, click-through");
-        println!("UI scan: Windows UI Automation control view");
+        println!("overlay: layered RGBA, topmost, click-through, excluded from capture");
+        println!("UI scan: UI Automation plus native dual-OCR visual pipeline");
+        for line in platform::windows_vision_diagnostics() {
+            println!("  {line}");
+        }
         println!("hook: low-level keyboard handshake and coalesced pointer tracking");
     }
 

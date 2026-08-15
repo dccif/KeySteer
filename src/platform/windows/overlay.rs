@@ -21,9 +21,10 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, HCURSOR, HICON, HWND_TOPMOST,
-    RegisterClassExW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SetWindowPos, ShowWindow, ULW_ALPHA,
-    UpdateLayeredWindow, WM_DESTROY, WM_PAINT, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    RegisterClassExW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SetWindowDisplayAffinity, SetWindowPos,
+    ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WDA_EXCLUDEFROMCAPTURE, WM_DESTROY, WM_PAINT,
+    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -185,6 +186,12 @@ impl Overlay {
 
         // SAFETY: `hwnd` was just created successfully.
         unsafe {
+            if let Err(error) = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) {
+                crate::log_warning!(
+                    "windows-overlay",
+                    "cannot exclude CPU overlay from capture: {error}"
+                );
+            }
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
         self.windows.insert(key, OwnedWindow::new(hwnd));

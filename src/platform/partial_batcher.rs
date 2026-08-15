@@ -46,6 +46,22 @@ impl<T> PartialBatcher<T> {
         (!self.pending.is_empty()).then(|| std::mem::take(&mut self.pending))
     }
 
+    /// Publish an early provider batch without losing the cumulative boundary.
+    ///
+    /// If 10 items are flushed before the first 24-item boundary, the next
+    /// boundary contains the following 14 items and still lands at total 24.
+    pub(crate) fn flush_pending(&mut self) -> Option<Vec<T>> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let following_capacity = self
+            .next_total
+            .saturating_sub(self.published.saturating_add(self.pending.len()));
+        let batch = std::mem::replace(&mut self.pending, Vec::with_capacity(following_capacity));
+        self.published += batch.len();
+        Some(batch)
+    }
+
     fn take_boundary(&mut self) -> Vec<T> {
         let current_total = self.next_total;
         let following_total = current_total.saturating_mul(2).min(self.maximum);
@@ -107,5 +123,14 @@ mod tests {
         let ready = batches.extend(0..1_536);
         assert_eq!(ready.iter().map(Vec::len).sum::<usize>(), 1_536);
         assert_eq!(batches.pending_capacity(), 464);
+    }
+
+    #[test]
+    fn early_flush_preserves_the_next_cumulative_boundary() {
+        let mut batches = PartialBatcher::new(24, 2_000);
+        assert!(batches.extend(0..10).is_empty());
+        assert_eq!(batches.flush_pending(), Some(Vec::from_iter(0..10)));
+        assert!(batches.extend(10..23).is_empty());
+        assert_eq!(batches.push_one(23), Some(Vec::from_iter(10..24)));
     }
 }

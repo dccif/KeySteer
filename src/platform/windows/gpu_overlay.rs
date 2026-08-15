@@ -38,8 +38,9 @@ use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, HCURSOR, HICON,
     HWND_TOPMOST, LWA_ALPHA, RegisterClassExW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-    SetLayeredWindowAttributes, SetWindowPos, ShowWindow, WNDCLASSEXW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    SetLayeredWindowAttributes, SetWindowDisplayAffinity, SetWindowPos, ShowWindow,
+    WDA_EXCLUDEFROMCAPTURE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{Interface, PCWSTR, w};
 use windows_numerics::Vector2;
@@ -1015,6 +1016,12 @@ fn create_window(area: Rect) -> Result<HWND, String> {
         if let Err(error) = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA) {
             let _ = DestroyWindow(hwnd);
             return Err(format!("SetLayeredWindowAttributes failed: {error}"));
+        }
+        if let Err(error) = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) {
+            crate::log_warning!(
+                "windows-overlay",
+                "cannot exclude GPU overlay from capture: {error}"
+            );
         }
         hwnd
     };

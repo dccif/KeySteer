@@ -26,10 +26,10 @@ import ModeVideo from '../.vitepress/components/ModeVideo'
 
 ## 扫描方式
 
-- Windows 使用 UI Automation。
+- Windows 的 `axtree` 使用 UI Automation；`vision` 使用系统/微信 OCR 与内置像素区域回退；`hybrid` 并行合并两条管线。
 - macOS 支持 `axtree`、`vision` 和 `hybrid`。
 
-Vision 需要 macOS 的“屏幕录制”权限；键盘捕获仍需要“辅助功能”权限。Windows 配置 `vision` 或 `hybrid` 时会回退到 UI Automation，因此同一份配置可以跨平台使用。
+Vision 需要 macOS 的“屏幕录制”权限；键盘捕获仍需要“辅助功能”权限。Windows 会在启动后异步探测系统 OCR 和本机已有的微信 OCR 组件，无需增加配置；两者都不可用或没有有效结果时，使用不依赖 OpenCV 的内置区域识别。
 
 ## 常用配置
 
@@ -70,6 +70,6 @@ position = "bottom_center"
 width = 320
 ```
 
-## macOS 特有功能
+## 视觉识别建议
 
-如果页面没有可用无障碍信息，优先尝试 `strategy = "vision"` 或 `"hybrid"`；如果标签太多，可以尝试缩小 `clickable_roles` 范围。
+如果页面没有可用无障碍信息，优先尝试 `strategy = "vision"` 或 `"hybrid"`；如果标签太多，可以尝试缩小 `clickable_roles` 范围。Windows 微信 OCR 是可选的本机增强项，KeySteer 不下载、复制或打包微信二进制。
