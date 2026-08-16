@@ -228,9 +228,10 @@ y = "end"
 [ui_hint]
 enabled = true
 # Element detection: both macOS and Windows support "axtree", "vision", and
-# "hybrid". Windows vision probes system/WeChat OCR internally and falls back
-# to built-in pixel-region detection; it adds no OCR configuration fields.
-strategy = "vision"
+# "hybrid". The default runs the accessibility tree and visual pipeline in
+# parallel, then merges their unique targets. Windows vision probes available
+# OCR internally and falls back to built-in pixel-region detection.
+strategy = "hybrid"
 # Characters used to build hint labels.
 hint_characters = "asdfghjkl"
 # Keep label keys available; hold either modifier for normal pointer controls.

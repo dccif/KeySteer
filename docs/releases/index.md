@@ -2,9 +2,9 @@
 
 ## 0.9.2
 
-进一步加快 Windows UI Hint 分块 OCR 的首批显示与覆盖层响应，修复重扫期间的位置更新竞态和错误日志，并收紧扫描资源清理、错误聚合与 Unsafe 安全边界。
+Windows UI Hint 默认改用 Hybrid，并行合并 UI Automation 与视觉结果以补足窗口控制按钮；同时进一步加快分块 OCR 的首批显示与覆盖层响应，修复重扫位置更新竞态，并收紧资源清理与安全边界。
 
-Windows UI Hint now shows the first tiled OCR results sooner, responds faster in the overlay, fixes a rescan position-update race and its erroneous log, and tightens scan cleanup, error aggregation, and unsafe boundaries.
+Windows UI Hint now defaults to Hybrid, merging UI Automation and visual results in parallel to cover window controls, while showing the first tiled OCR results sooner, improving overlay response, fixing a rescan position race, and tightening cleanup and safety boundaries.
 
 ## 0.9.1
 

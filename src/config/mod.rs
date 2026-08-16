@@ -788,7 +788,7 @@ impl Default for UiHint {
         };
         Self {
             enabled: true,
-            strategy: UiScanStrategy::Vision,
+            strategy: UiScanStrategy::Hybrid,
             vision: VisionOptions::default(),
             hint_characters: "asdfghjkl".into(),
             label_direction: LabelDirection::Normal,
@@ -3135,7 +3135,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_strategy_defaults_to_vision_and_allows_per_app_hybrid() {
+    fn scan_strategy_defaults_to_hybrid_and_allows_per_app_overrides() {
         let vision = VisionOptions::default();
         assert!(vision.detect_text && vision.detect_rectangles);
         assert_eq!(vision.request_timeout_ms, 5_000);
@@ -3147,7 +3147,8 @@ mod tests {
         assert_eq!(vision.checkbox_max_size, 32.0);
         assert_eq!(vision.generic_clickable_min_confidence, 0.5);
 
-        assert_eq!(Config::default().ui_hint.strategy, UiScanStrategy::Vision);
+        assert_eq!(UiScanStrategy::default(), UiScanStrategy::Hybrid);
+        assert_eq!(Config::default().ui_hint.strategy, UiScanStrategy::Hybrid);
 
         let config = Config::parse(
             r#"

@@ -512,10 +512,10 @@ pub struct FocusedApp {
 pub enum UiScanStrategy {
     #[serde(rename = "axtree")]
     AxTree,
-    #[default]
     Vision,
     /// Run accessibility and visual detection concurrently; the backend
     /// streams their de-duplicated spatial union.
+    #[default]
     Hybrid,
 }
 

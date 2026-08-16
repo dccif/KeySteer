@@ -39,7 +39,7 @@ fn the_shipped_config_parses_and_validates() {
     config
         .validate()
         .expect("keysteer.default.toml should validate");
-    assert_eq!(config.ui_hint.strategy, UiScanStrategy::Vision);
+    assert_eq!(config.ui_hint.strategy, UiScanStrategy::Hybrid);
 }
 
 #[test]

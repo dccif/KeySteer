@@ -221,7 +221,7 @@ layers = [
 
 ```toml
 [ui_hint]
-strategy = "vision" # axtree、vision 或 hybrid
+strategy = "hybrid" # axtree、vision 或 hybrid
 hint_characters = "asdfghjkl"
 scan_timeout_ms = 2500
 scan_retry_count = 1
@@ -234,7 +234,7 @@ after_finish = "normal"
 after_click = "normal"
 ```
 
-macOS 支持 Accessibility tree、Vision 和 Hybrid。Windows 的 `axtree` 使用 UI Automation，`vision` 并行使用可用的系统 OCR 与自动发现的微信 OCR，并在 OCR 无结果时回退内置像素区域识别；`hybrid` 将 UIA 与完整视觉管线并行合并。OCR 不增加配置字段，也不随发行包分发微信组件。`clickable_roles` 是跨平台语义角色，也可以用 `ax:` 或 `uia:` 指定原生角色。
+macOS 支持 Accessibility tree、Vision 和 Hybrid。Windows 默认使用 `hybrid`，将 UIA 与完整视觉管线并行执行、流式显示并去重合并；这能补足最小化、最大化、关闭等原生窗口按钮。`vision` 并行使用可用的系统 OCR 与自动发现的微信 OCR，并在 OCR 无结果时回退内置像素区域识别。OCR 不增加配置字段，也不随发行包分发微信组件。`clickable_roles` 是跨平台语义角色，也可以用 `ax:` 或 `uia:` 指定原生角色。
 
 ## 指针、滚动和主题
 
