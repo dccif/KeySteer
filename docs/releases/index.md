@@ -1,5 +1,11 @@
 # 更新日志 / Release Notes
 
+## 0.9.3
+
+UI Hint 标签进一步收紧边距并校正文字垂直居中，输入前缀现在按实际字符范围精确变色，避免窄字母高亮残缺或溢出。
+
+UI Hint labels now use tighter spacing and improved vertical centering, while typed prefixes are colored by their exact character ranges to prevent incomplete or overflowing highlights.
+
 ## 0.9.2
 
 Windows UI Hint 默认改用 Hybrid，并行合并 UI Automation 与视觉结果以补足窗口控制按钮；标签更紧凑易读且位置略微上移，同时进一步加快分块 OCR 的首批显示与覆盖层响应，修复重扫位置更新竞态，并收紧资源清理与安全边界。

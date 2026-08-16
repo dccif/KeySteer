@@ -12,9 +12,9 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_TARGET,
-    D2D1_BITMAP_PROPERTIES1, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_NONE,
-    D2D1_ROUNDED_RECT, D2D1CreateDevice, ID2D1DeviceContext, ID2D1SolidColorBrush,
+    D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
+    D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ROUNDED_RECT,
+    D2D1CreateDevice, ID2D1DeviceContext, ID2D1SolidColorBrush,
 };
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
@@ -27,8 +27,8 @@ use windows::Win32::Graphics::DirectComposition::{
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
     DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_MEASURING_MODE_NATURAL,
-    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_WORD_WRAPPING_NO_WRAP,
-    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
+    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_RANGE,
+    DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -764,7 +764,7 @@ impl GpuOverlay {
         matched_prefix_len: usize,
         origin: Point,
     ) -> Result<(), String> {
-        let rect = local_rect(label_rect, origin);
+        let mut rect = local_rect(label_rect, origin);
         let rounded = D2D1_ROUNDED_RECT {
             rect,
             radiusX: style.border_radius as f32,
@@ -780,42 +780,66 @@ impl GpuOverlay {
             // SAFETY: drawing is active and both objects are live.
             draw_rounded_rectangle(&self.d2d, &rounded, &brush, style.border_width as f32);
         }
+        let text_offset_y = style.optical_text_offset_y(text) as f32;
+        rect.top += text_offset_y;
+        rect.bottom += text_offset_y;
         let format = self.text_format(style)?;
         let normal = self.brush(style.text_color)?;
         self.utf16.clear();
         self.utf16.extend(text.encode_utf16());
-        // SAFETY: UTF-16 data, format, brush and layout rectangle remain live
-        // for the complete call.
-        unsafe {
-            self.d2d.DrawText(
-                &self.utf16,
-                &format,
-                &rect,
-                &normal,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-                DWRITE_MEASURING_MODE_NATURAL,
-            )
-        };
-        if matched_prefix_len > 0 && !style.matched_text_color.is_transparent() {
-            let total = text.chars().count().max(1);
-            let matched = matched_prefix_len.min(total);
-            let mut clip = rect;
-            clip.right = clip.left + (clip.right - clip.left) * matched as f32 / total as f32;
+        let prefix_utf16_len = text
+            .chars()
+            .take(matched_prefix_len)
+            .map(char::len_utf16)
+            .sum::<usize>();
+        if prefix_utf16_len > 0 && !style.matched_text_color.is_transparent() {
             let matched_brush = self.brush(style.matched_text_color)?;
-            // SAFETY: the clip is finite and Push/Pop are balanced.
+            let layout_origin = Vector2 {
+                X: rect.left,
+                Y: rect.top,
+            };
+            // SAFETY: UTF-16 data, format, brushes and resulting COM layout
+            // remain live through the draw. The text range was derived from
+            // the same UTF-16 buffer and cannot exceed it.
             unsafe {
-                self.d2d
-                    .PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                let layout = self
+                    .dwrite
+                    .CreateTextLayout(
+                        &self.utf16,
+                        &format,
+                        (rect.right - rect.left).max(1.0),
+                        (rect.bottom - rect.top).max(1.0),
+                    )
+                    .map_err(|error| format!("CreateTextLayout failed: {error}"))?;
+                layout
+                    .SetDrawingEffect(
+                        &matched_brush,
+                        DWRITE_TEXT_RANGE {
+                            startPosition: 0,
+                            length: prefix_utf16_len as u32,
+                        },
+                    )
+                    .map_err(|error| format!("SetDrawingEffect failed: {error}"))?;
+                self.d2d.DrawTextLayout(
+                    layout_origin,
+                    &layout,
+                    &normal,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                );
+            }
+        } else {
+            // SAFETY: UTF-16 data, format, brush and layout rectangle remain
+            // live for the complete call.
+            unsafe {
                 self.d2d.DrawText(
                     &self.utf16,
                     &format,
                     &rect,
-                    &matched_brush,
+                    &normal,
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
                     DWRITE_MEASURING_MODE_NATURAL,
-                );
-                self.d2d.PopAxisAlignedClip();
-            }
+                )
+            };
         }
         Ok(())
     }

@@ -158,6 +158,24 @@ impl Default for LabelStyle {
 }
 
 impl LabelStyle {
+    /// Optical correction for font metrics that make a mathematically centred
+    /// line look low inside a compact label. Descenders need one extra unit.
+    pub(crate) fn optical_text_offset_y(&self, text: &str) -> f64 {
+        const REFERENCE_FONT_SIZE: f64 = 17.0;
+        const REFERENCE_BASE_SHIFT: f64 = 1.0;
+        const REFERENCE_DESCENDER_EXTRA_SHIFT: f64 = 1.0;
+
+        let descender_shift = if text
+            .bytes()
+            .any(|character| matches!(character, b'g' | b'j' | b'p' | b'q' | b'y'))
+        {
+            REFERENCE_DESCENDER_EXTRA_SHIFT
+        } else {
+            0.0
+        };
+        -self.font_size * (REFERENCE_BASE_SHIFT + descender_shift) / REFERENCE_FONT_SIZE
+    }
+
     /// Scale text and its surrounding metrics to occupy at most 80% of `rect`.
     /// The estimate deliberately matches the cross-platform label layout used
     /// by the overlay backends, so nested grid labels remain inside their cell.
@@ -551,6 +569,24 @@ mod tests {
         assert!(fitted.font_size < style.font_size);
         assert!(width <= rect.width * 0.8 + f64::EPSILON);
         assert!(height <= rect.height * 0.8 + f64::EPSILON);
+    }
+
+    #[test]
+    fn all_text_is_optically_centred_and_descenders_move_one_extra_unit() {
+        let style = LabelStyle {
+            font_size: 17.0,
+            ..Default::default()
+        };
+
+        assert_eq!(style.optical_text_offset_y("aaf"), -1.0);
+        assert_eq!(style.optical_text_offset_y("中文"), -1.0);
+        assert_eq!(style.optical_text_offset_y("aag"), -2.0);
+
+        let large = LabelStyle {
+            font_size: 80.0,
+            ..Default::default()
+        };
+        assert!((large.optical_text_offset_y("ssj") + 160.0 / 17.0).abs() < f64::EPSILON);
     }
 
     #[test]

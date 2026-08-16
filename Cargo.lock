@@ -467,7 +467,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "keysteer"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "base64",
  "cc",

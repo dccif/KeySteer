@@ -13,8 +13,8 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, SIZE, W
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BLENDFUNCTION, CLIP_DEFAULT_PRECIS,
     CreateFontW, DEFAULT_CHARSET, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject,
-    DrawTextW, FF_DONTCARE, FW_BOLD, FW_NORMAL, HBRUSH, HFONT, OUT_DEFAULT_PRECIS, SetBkMode,
-    SetTextColor, TRANSPARENT, UpdateWindow, ValidateRect,
+    DrawTextW, FF_DONTCARE, FW_BOLD, FW_NORMAL, GetTextExtentExPointW, HBRUSH, HFONT,
+    OUT_DEFAULT_PRECIS, SetBkMode, SetTextColor, TRANSPARENT, UpdateWindow, ValidateRect,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, HCURSOR, HICON, HWND_TOPMOST, SW_SHOWNOACTIVATE,
@@ -897,19 +897,15 @@ impl<'a> Surface<'a> {
         let rect = self.local_rect(label_rect);
         let width = rect.width.max(1.0).ceil() as usize;
         let height = rect.height.max(1.0).ceil() as usize;
-        let mask = rasterizer.rasterize(text, style, width, height)?;
-        let matched_ratio = if text.is_empty() {
-            0.0
-        } else {
-            matched_prefix_len as f64 / text.chars().count() as f64
-        };
+        let (mask, matched_boundary) =
+            rasterizer.rasterize(text, style, width, height, matched_prefix_len)?;
         for y in 0..height {
             for x in 0..width {
                 let coverage = mask[y * width + x];
                 if coverage == 0 {
                     continue;
                 }
-                let color = if x as f64 <= width as f64 * matched_ratio {
+                let color = if matched_boundary.is_some_and(|boundary| x < boundary) {
                     style.matched_text_color
                 } else {
                     style.text_color
@@ -994,6 +990,7 @@ struct TextRasterizer {
     scratch: Option<GdiDibSurface>,
     fonts: Vec<FontEntry>,
     utf16: Vec<u16>,
+    advances: Vec<i32>,
     mask: Vec<u8>,
 }
 
@@ -1003,6 +1000,7 @@ impl TextRasterizer {
             scratch: None,
             fonts: Vec::with_capacity(MAX_CACHED_FONTS),
             utf16: Vec::new(),
+            advances: Vec::new(),
             mask: Vec::new(),
         }
     }
@@ -1011,6 +1009,7 @@ impl TextRasterizer {
         self.scratch = None;
         self.fonts.clear();
         self.utf16 = Vec::new();
+        self.advances = Vec::new();
         self.mask = Vec::new();
     }
 
@@ -1020,7 +1019,8 @@ impl TextRasterizer {
         style: &LabelStyle,
         width: usize,
         height: usize,
-    ) -> Result<&[u8], String> {
+        matched_prefix_len: usize,
+    ) -> Result<(&[u8], Option<usize>), String> {
         self.ensure_scratch(width, height)?;
         self.utf16.clear();
         self.utf16.extend(text.encode_utf16());
@@ -1053,6 +1053,7 @@ impl TextRasterizer {
             return Err("text scratch DIB was not retained after creation".into());
         };
         scratch.clear_region(width, height);
+        let mut matched_boundary = None;
         {
             let _selected_font = scratch.select_object(font.font.0.into())?;
             // SAFETY: the selected DC and font remain alive for this scope and
@@ -1066,15 +1067,47 @@ impl TextRasterizer {
                 }
                 SetTextColor(scratch.dc(), COLORREF(0x00FF_FFFF));
             }
+            let text_offset_y = style.optical_text_offset_y(text).round() as i32;
             let mut draw_rect = windows::Win32::Foundation::RECT {
                 left: 0,
-                top: 0,
+                top: text_offset_y,
                 right: width as i32,
-                bottom: height as i32,
+                bottom: height as i32 + text_offset_y,
             };
             // SAFETY: `utf16`, `draw_rect`, and the selected scratch DC remain
             // valid and writable for this synchronous text draw.
             unsafe {
+                let prefix_utf16_len = text
+                    .chars()
+                    .take(matched_prefix_len)
+                    .map(char::len_utf16)
+                    .sum::<usize>();
+                if prefix_utf16_len > 0 {
+                    let utf16_len = i32::try_from(self.utf16.len())
+                        .map_err(|_| "overlay text is too long for GDI measurement")?;
+                    self.advances.resize(self.utf16.len(), 0);
+                    let mut text_size = SIZE::default();
+                    if !GetTextExtentExPointW(
+                        scratch.dc(),
+                        PCWSTR(self.utf16.as_ptr()),
+                        utf16_len,
+                        i32::MAX,
+                        None,
+                        Some(self.advances.as_mut_ptr()),
+                        &mut text_size,
+                    )
+                    .as_bool()
+                    {
+                        return Err("GetTextExtentExPointW failed while measuring hint text".into());
+                    }
+                    let prefix_width = self
+                        .advances
+                        .get(prefix_utf16_len - 1)
+                        .copied()
+                        .ok_or("GDI returned no matched-prefix advance")?;
+                    let left = (width as i32 - text_size.cx) / 2;
+                    matched_boundary = Some((left + prefix_width).clamp(0, width as i32) as usize);
+                }
                 DrawTextW(
                     scratch.dc(),
                     &mut self.utf16,
@@ -1099,7 +1132,7 @@ impl TextRasterizer {
                 *coverage = pixel[0].max(pixel[1]).max(pixel[2]);
             }
         }
-        Ok(&self.mask)
+        Ok((&self.mask, matched_boundary))
     }
 
     fn ensure_scratch(&mut self, width: usize, height: usize) -> Result<(), String> {

@@ -30,7 +30,7 @@ const SCAN_RETRY_TIMER_ID: &str = "ui_hint.scan_retry";
 /// is retained, and larger scans cannot become an Idle high-water mark.
 const MAX_IDLE_RETAINED_TARGETS: usize = 128;
 const MAX_SCAN_TIMEOUT_MS: u64 = 30_000;
-const AUTO_HINT_PADDING_X_RATIO: f64 = 0.25;
+const AUTO_HINT_PADDING_X_RATIO: f64 = 2.0 / 17.0;
 const AUTO_HINT_PADDING_Y_RATIO: f64 = 0.06;
 
 /// What the keyboard is currently doing.
@@ -1073,7 +1073,7 @@ mod tests {
         assert_eq!(mode.config.ui.padding_x, AUTO);
         assert_eq!(mode.config.ui.padding_y, AUTO);
         assert_eq!(style.font_size, 17.0);
-        assert_eq!(style.padding_x, 4.0);
+        assert_eq!(style.padding_x, 2.0);
         assert_eq!(style.padding_y, 1.0);
     }
 
