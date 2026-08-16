@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Windows UI-scan result coordination.
 //!
 //! UI Automation and visual providers run on independent workers. This

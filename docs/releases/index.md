@@ -1,10 +1,16 @@
 # 更新日志 / Release Notes
 
+## 0.9.2
+
+进一步加快 Windows UI Hint 分块 OCR 的首批显示与覆盖层响应，修复重扫期间的位置更新竞态和错误日志，并收紧扫描资源清理、错误聚合与 Unsafe 安全边界。
+
+Windows UI Hint now shows the first tiled OCR results sooner, responds faster in the overlay, fixes a rescan position-update race and its erroneous log, and tightens scan cleanup, error aggregation, and unsafe boundaries.
+
 ## 0.9.1
 
-Windows 系统 OCR 会按 CPU 与图片尺寸自动并行切分，使用重叠接缝并在每块完成时流式显示结果。
+Windows 系统 OCR 会按 CPU 与图片尺寸自动并行切分、流式显示每块结果，并按实际可用能力跳过不需要的识别资源。
 
-Windows system OCR now tiles work according to CPU and image size, overlaps seams, and streams each completed region.
+Windows system OCR now tiles by CPU and image size, streams completed regions, and skips unavailable OCR resources entirely.
 
 ## 0.9.0
 

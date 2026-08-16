@@ -124,9 +124,10 @@ impl Logger {
     }
 
     fn rotate(&self, state: &mut LoggerState) -> io::Result<()> {
-        if let Some(mut file) = state.file.take() {
+        if let Some(file) = state.file.as_mut() {
             file.flush()?;
         }
+        drop(state.file.take());
         let rotation = rotate_files(&self.path);
         match open_append(&self.path) {
             Ok(file) => {

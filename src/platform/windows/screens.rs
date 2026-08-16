@@ -34,6 +34,12 @@ fn rect_to_api(r: RECT) -> Rect {
     Rect::new(r.left as f64, r.top as f64, width as f64, height as f64)
 }
 
+fn monitor_dpi(monitor: HMONITOR, dpi_x: &mut u32, dpi_y: &mut u32) -> windows::core::Result<()> {
+    // SAFETY: callers retain the live monitor handle and both output pointers
+    // refer to initialized writable integers for this synchronous query.
+    unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, dpi_x, dpi_y) }
+}
+
 thread_local! {
     static SCREENS: RefCell<Vec<Screen>> = const { RefCell::new(Vec::new()) };
 }
@@ -82,11 +88,7 @@ extern "system" fn enum_callback(
 
     let mut dpi_x = 96u32;
     let mut dpi_y = 96u32;
-    if let Err(error) =
-        // SAFETY: `monitor` is the callback's live monitor and both output
-        // pointers refer to initialized writable integers.
-        unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }
-    {
+    if let Err(error) = monitor_dpi(monitor, &mut dpi_x, &mut dpi_y) {
         crate::report_warning!(
             "windows-screen",
             "GetDpiForMonitor failed; using 96 DPI: {error}"
@@ -120,11 +122,7 @@ pub fn primary_scale() -> f64 {
     let monitor = unsafe { MonitorFromPoint(Default::default(), MONITOR_DEFAULTTOPRIMARY) };
     let mut dpi_x = 96u32;
     let mut dpi_y = 96u32;
-    if let Err(error) =
-        // SAFETY: the primary fallback yielded a live monitor and both output
-        // pointers refer to initialized writable integers.
-        unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }
-    {
+    if let Err(error) = monitor_dpi(monitor, &mut dpi_x, &mut dpi_y) {
         crate::report_warning!(
             "windows-screen",
             "primary GetDpiForMonitor failed; using 96 DPI: {error}"

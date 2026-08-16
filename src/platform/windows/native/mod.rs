@@ -11,7 +11,7 @@ use windows::Win32::Graphics::Gdi::{HBITMAP, HDC, HGDIOBJ};
 pub(crate) struct ComApartment(PhantomData<Rc<()>>);
 
 #[must_use = "closing the job is the fail-safe that terminates its helper process"]
-pub(crate) struct KillOnCloseJob(HANDLE);
+pub(crate) struct KillOnCloseJob(OwnedHandle);
 
 impl KillOnCloseJob {
     pub(crate) fn create() -> Result<Self, String> {
@@ -23,17 +23,17 @@ impl KillOnCloseJob {
 
         // SAFETY: no security attributes or name are supplied. The returned
         // handle transfers immediately into the owner before configuration.
-        let job = Self(
+        let job = Self(OwnedHandle::new(
             unsafe { CreateJobObjectW(None, None) }
                 .map_err(|error| format!("cannot create WeChat OCR job object: {error}"))?,
-        );
+        ));
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         // SAFETY: the pointer and byte count describe the exact initialized
         // information struct and remain valid for this synchronous call.
         unsafe {
             SetInformationJobObject(
-                job.0,
+                job.0.raw(),
                 JobObjectExtendedLimitInformation,
                 std::ptr::from_ref(&limits).cast(),
                 std::mem::size_of_val(&limits) as u32,
@@ -48,22 +48,8 @@ impl KillOnCloseJob {
 
         // SAFETY: both handles are live for the duration of this synchronous
         // call; ownership of the process handle remains with `Child`.
-        unsafe { AssignProcessToJobObject(self.0, process) }
+        unsafe { AssignProcessToJobObject(self.0.raw(), process) }
             .map_err(|error| format!("cannot contain WeChat OCR helper in job object: {error}"))
-    }
-}
-
-impl Drop for KillOnCloseJob {
-    fn drop(&mut self) {
-        use windows::Win32::Foundation::CloseHandle;
-
-        // SAFETY: this owner holds the unique job handle returned at creation.
-        if let Err(error) = unsafe { CloseHandle(self.0) } {
-            crate::app::logging::report_error(
-                "windows-native",
-                format!("cannot close WeChat OCR job object: {error}"),
-            );
-        }
     }
 }
 
@@ -380,10 +366,76 @@ impl PreparedCapture {
     }
 }
 
-pub(crate) fn software_bitmap_bgra(
+#[must_use = "the factory must stay in its creating COM apartment"]
+pub(crate) struct SoftwareBitmapFactory {
+    factory: windows::Graphics::Imaging::ISoftwareBitmapFactory,
+}
+
+impl SoftwareBitmapFactory {
+    pub(crate) fn load() -> Result<Self, String> {
+        let factory = windows::core::imp::load_factory::<
+            windows::Graphics::Imaging::SoftwareBitmap,
+            windows::Graphics::Imaging::ISoftwareBitmapFactory,
+        >()
+        .map_err(|error| format!("cannot load SoftwareBitmap factory: {error}"))?;
+        Ok(Self { factory })
+    }
+
+    pub(crate) fn bgra(
+        &self,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<windows::Graphics::Imaging::SoftwareBitmap, String> {
+        self.bgra_region(pixels, width, height, 0, 0, width, height)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bgra_region(
+        &self,
+        pixels: &[u8],
+        source_width: u32,
+        source_height: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<windows::Graphics::Imaging::SoftwareBitmap, String> {
+        let source = NativeDimensions::from_usize(source_width as usize, source_height as usize)?;
+        if pixels.len() != source.byte_len() {
+            return Err("BGRA byte length does not match source dimensions".into());
+        }
+        let right = x
+            .checked_add(width)
+            .ok_or_else(|| "SoftwareBitmap source x range overflowed".to_string())?;
+        let bottom = y
+            .checked_add(height)
+            .ok_or_else(|| "SoftwareBitmap source y range overflowed".to_string())?;
+        if right > source_width || bottom > source_height {
+            return Err("SoftwareBitmap source region exceeds captured pixels".into());
+        }
+        let dimensions = NativeDimensions::from_usize(width as usize, height as usize)?;
+        let source_stride = source_width as usize * 4;
+        let source_offset = (y as usize)
+            .checked_mul(source_stride)
+            .and_then(|offset| offset.checked_add(x as usize * 4))
+            .ok_or_else(|| "SoftwareBitmap source offset overflowed".to_string())?;
+        software_bitmap_from_rows(
+            &self.factory,
+            pixels,
+            source_stride,
+            source_offset,
+            dimensions,
+        )
+    }
+}
+
+fn software_bitmap_from_rows(
+    factory: &windows::Graphics::Imaging::ISoftwareBitmapFactory,
     pixels: &[u8],
-    width: u32,
-    height: u32,
+    source_stride: usize,
+    source_offset: usize,
+    dimensions: NativeDimensions,
 ) -> Result<windows::Graphics::Imaging::SoftwareBitmap, String> {
     use windows::Graphics::Imaging::{
         BitmapAlphaMode, BitmapBufferAccessMode, BitmapPixelFormat, SoftwareBitmap,
@@ -391,22 +443,13 @@ pub(crate) fn software_bitmap_bgra(
     use windows::Win32::System::WinRT::IMemoryBufferByteAccess;
     use windows::core::Interface;
 
-    let dimensions = NativeDimensions::from_usize(width as usize, height as usize)?;
-    if pixels.len() != dimensions.byte_len() {
-        return Err("BGRA byte length does not match bitmap dimensions".into());
-    }
-    let factory = windows::core::imp::load_factory::<
-        SoftwareBitmap,
-        windows::Graphics::Imaging::ISoftwareBitmapFactory,
-    >()
-    .map_err(|error| format!("cannot load SoftwareBitmap factory: {error}"))?;
     // SAFETY: the factory was loaded for `SoftwareBitmap`, all value
     // parameters use the generated ABI types, and `result` is a valid
     // out-parameter converted into an owned projected object.
     let bitmap: SoftwareBitmap = unsafe {
         let mut result = core::ptr::null_mut();
-        (windows::core::Interface::vtable(&factory).CreateWithAlpha)(
-            windows::core::Interface::as_raw(&factory),
+        (windows::core::Interface::vtable(factory).CreateWithAlpha)(
+            windows::core::Interface::as_raw(factory),
             BitmapPixelFormat::Bgra8,
             dimensions.width_i32(),
             dimensions.height_i32(),
@@ -469,8 +512,15 @@ pub(crate) fn software_bitmap_bgra(
                     return Err("SoftwareBitmap returned an invalid writable plane".into());
                 }
                 for row in 0..bitmap_height {
+                    let source = source_offset
+                        .checked_add(row * source_stride)
+                        .and_then(|start| start.checked_add(row_bytes).map(|end| (start, end)))
+                        .and_then(|(start, end)| pixels.get(start..end))
+                        .ok_or_else(|| {
+                            "SoftwareBitmap source row exceeds captured pixels".to_string()
+                        })?;
                     std::ptr::copy_nonoverlapping(
-                        pixels.as_ptr().add(row * row_bytes),
+                        source.as_ptr(),
                         destination.add(start + row * stride),
                         row_bytes,
                     );
@@ -522,53 +572,69 @@ type LoadedSystemOcr = (
     Option<(u32, SystemOcrLanguages)>,
 );
 
-fn load_system_ocr(include_metadata: bool) -> Result<LoadedSystemOcr, String> {
-    use windows::Media::Ocr::{IOcrEngineStatics, OcrEngine};
+#[must_use = "the factory must stay in its creating COM apartment"]
+pub(crate) struct SystemOcrFactory {
+    factory: windows::Media::Ocr::IOcrEngineStatics,
+}
 
-    let factory = windows::core::imp::load_factory::<OcrEngine, IOcrEngineStatics>()
-        .map_err(|error| format!("cannot load OcrEngine factory: {error}"))?;
-    // SAFETY: the local factory implements `IOcrEngineStatics`. Every result
-    // slot has the exact generated ABI type and is converted immediately into
-    // an owned projection before the factory can be released.
-    unsafe {
-        let mut result = core::ptr::null_mut();
-        (windows::core::Interface::vtable(&factory).TryCreateFromUserProfileLanguages)(
-            windows::core::Interface::as_raw(&factory),
-            &mut result,
-        )
-        .ok()
-        .map_err(|error| format!("cannot create per-scan OcrEngine: {error}"))?;
-        let engine = windows::core::Type::from_abi(result)
-            .map_err(|error| format!("cannot own per-scan OcrEngine: {error}"))?;
-        if !include_metadata {
-            return Ok((engine, None));
+impl SystemOcrFactory {
+    pub(crate) fn load() -> Result<Self, String> {
+        use windows::Media::Ocr::{IOcrEngineStatics, OcrEngine};
+
+        let factory = windows::core::imp::load_factory::<OcrEngine, IOcrEngineStatics>()
+            .map_err(|error| format!("cannot load OcrEngine factory: {error}"))?;
+        Ok(Self { factory })
+    }
+
+    pub(crate) fn create_engine(&self) -> Result<windows::Media::Ocr::OcrEngine, String> {
+        self.query(false).map(|(engine, _)| engine)
+    }
+
+    fn query(&self, include_metadata: bool) -> Result<LoadedSystemOcr, String> {
+        // SAFETY: the local factory implements `IOcrEngineStatics`. Every result
+        // slot has the exact generated ABI type and is converted immediately into
+        // an owned projection before the factory can be released.
+        unsafe {
+            let mut result = core::ptr::null_mut();
+            (windows::core::Interface::vtable(&self.factory).TryCreateFromUserProfileLanguages)(
+                windows::core::Interface::as_raw(&self.factory),
+                &mut result,
+            )
+            .ok()
+            .map_err(|error| format!("cannot create per-scan OcrEngine: {error}"))?;
+            let engine = windows::core::Type::from_abi(result)
+                .map_err(|error| format!("cannot own per-scan OcrEngine: {error}"))?;
+            if !include_metadata {
+                return Ok((engine, None));
+            }
+            let mut maximum = 0;
+            (windows::core::Interface::vtable(&self.factory).MaxImageDimension)(
+                windows::core::Interface::as_raw(&self.factory),
+                &mut maximum,
+            )
+            .ok()
+            .map_err(|error| format!("cannot read OcrEngine maximum image dimension: {error}"))?;
+            let mut languages = core::ptr::null_mut();
+            (windows::core::Interface::vtable(&self.factory).AvailableRecognizerLanguages)(
+                windows::core::Interface::as_raw(&self.factory),
+                &mut languages,
+            )
+            .ok()
+            .map_err(|error| format!("cannot enumerate OCR languages: {error}"))?;
+            let languages = windows::core::Type::from_abi(languages)
+                .map_err(|error| format!("cannot own OCR language collection: {error}"))?;
+            Ok((engine, Some((maximum, languages))))
         }
-        let mut maximum = 0;
-        (windows::core::Interface::vtable(&factory).MaxImageDimension)(
-            windows::core::Interface::as_raw(&factory),
-            &mut maximum,
-        )
-        .ok()
-        .map_err(|error| format!("cannot read OcrEngine maximum image dimension: {error}"))?;
-        let mut languages = core::ptr::null_mut();
-        (windows::core::Interface::vtable(&factory).AvailableRecognizerLanguages)(
-            windows::core::Interface::as_raw(&factory),
-            &mut languages,
-        )
-        .ok()
-        .map_err(|error| format!("cannot enumerate OCR languages: {error}"))?;
-        let languages = windows::core::Type::from_abi(languages)
-            .map_err(|error| format!("cannot own OCR language collection: {error}"))?;
-        Ok((engine, Some((maximum, languages))))
     }
 }
 
+#[cfg(test)]
 pub(crate) fn create_system_ocr_engine() -> Result<windows::Media::Ocr::OcrEngine, String> {
-    load_system_ocr(false).map(|(engine, _)| engine)
+    SystemOcrFactory::load()?.create_engine()
 }
 
 pub(crate) fn probe_system_ocr_factory() -> Result<(u32, Vec<String>), String> {
-    let (engine, metadata) = load_system_ocr(true)?;
+    let (engine, metadata) = SystemOcrFactory::load()?.query(true)?;
     let (maximum, languages) =
         metadata.ok_or_else(|| "OCR factory did not return discovery metadata".to_string())?;
     let mut tags = Vec::with_capacity(languages.Size().unwrap_or_default() as usize);
@@ -993,6 +1059,14 @@ pub(crate) struct OwnedWindow {
     _thread: PhantomData<Rc<()>>,
 }
 
+fn destroy_owned_window(hwnd: HWND) -> windows::core::Result<()> {
+    use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
+
+    // SAFETY: callers transfer a KeySteer-owned HWND on its creating thread;
+    // the function consumes the final native ownership edge exactly once.
+    unsafe { DestroyWindow(hwnd) }
+}
+
 impl OwnedWindow {
     #[inline(always)]
     pub(crate) fn new(hwnd: HWND) -> Self {
@@ -1009,29 +1083,21 @@ impl OwnedWindow {
 
     #[inline(always)]
     pub(crate) fn destroy(mut self) -> windows::core::Result<()> {
-        use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
-
         let hwnd = std::mem::take(&mut self.raw);
         if hwnd.is_invalid() {
             return Ok(());
         }
-        // SAFETY: ownership was transferred into this wrapper and the caller
-        // invokes destroy on the thread that created the window.
-        unsafe { DestroyWindow(hwnd) }
+        destroy_owned_window(hwnd)
     }
 }
 
 impl Drop for OwnedWindow {
     #[inline(always)]
     fn drop(&mut self) {
-        use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
-
-        if !self.raw.is_invalid() {
-            // SAFETY: the wrapper is the sole owner and remains on the window
-            // thread for its complete lifetime.
-            if let Err(error) = unsafe { DestroyWindow(self.raw) } {
-                crate::report_error!("windows-native", "DestroyWindow failed: {error}");
-            }
+        if !self.raw.is_invalid()
+            && let Err(error) = destroy_owned_window(self.raw)
+        {
+            crate::report_error!("windows-native", "DestroyWindow failed: {error}");
         }
     }
 }

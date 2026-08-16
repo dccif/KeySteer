@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Optional, auto-discovered WeChat OCR bridge isolated in a helper process.
 
 use std::ffi::CString;
@@ -8,8 +10,9 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -158,19 +161,38 @@ impl WechatOcr {
     pub(super) fn recognize(
         &mut self,
         image: CaptureGeometry,
-        bitmap: &SoftwareBitmap,
+        bitmap: SoftwareBitmap,
         timeout: Duration,
         minimum_confidence: f64,
         cancelled: impl Fn() -> bool,
         publish: impl FnOnce(Vec<UiTarget>) -> Result<usize, String>,
     ) -> Result<usize, String> {
+        let close_bitmap = |bitmap: &SoftwareBitmap| {
+            bitmap
+                .Close()
+                .map_err(|error| format!("cannot close encoded WeChat OCR bitmap: {error}"))
+        };
         if cancelled() {
-            return Err("WeChat OCR cancelled".into());
+            let cleanup = close_bitmap(&bitmap).err().into_iter().collect();
+            return combine_async_result(Err("WeChat OCR cancelled".into()), cleanup);
         }
         let deadline = Instant::now() + timeout.max(Duration::from_millis(1));
-        let temporary = TemporaryPng::create(bitmap, deadline, &cancelled)?;
+        let temporary = TemporaryPng::create(&bitmap, deadline, &cancelled);
+        let bitmap_cleanup = close_bitmap(&bitmap);
+        let temporary = match temporary {
+            Ok(temporary) => temporary,
+            Err(error) => {
+                return combine_async_result(
+                    Err(error),
+                    bitmap_cleanup.err().into_iter().collect(),
+                );
+            }
+        };
+        let mut cleanup_failures = bitmap_cleanup.err().into_iter().collect::<Vec<_>>();
         if cancelled() {
-            return Err("WeChat OCR cancelled".into());
+            let cleanup = temporary.cleanup();
+            cleanup_failures.extend(cleanup.err());
+            return combine_async_result(Err("WeChat OCR cancelled".into()), cleanup_failures);
         }
         let response = self
             .helper
@@ -195,7 +217,6 @@ impl WechatOcr {
             }
         });
         let cleanup = temporary.cleanup();
-        let mut cleanup_failures = Vec::new();
         if let Err(helper_cleanup) = helper_cleanup {
             cleanup_failures.push(helper_cleanup);
         }
@@ -226,6 +247,7 @@ struct Helper {
     input: Option<ChildStdin>,
     responses: mpsc::Receiver<Result<Vec<u8>, String>>,
     reader: Option<WorkerJoin>,
+    protocol_violation: Arc<AtomicBool>,
     stopped: bool,
     _ledger: crate::app::perf_probe::ResourceGuard,
 }
@@ -261,11 +283,16 @@ impl Drop for StartingChild {
                     );
                     return;
                 }
-                if let Err(error) = child.wait() {
-                    crate::app::logging::report_error(
+                match child.try_wait() {
+                    Ok(Some(_)) => {}
+                    Ok(None) => crate::app::logging::report_error(
                         "windows-vision",
-                        format!("cannot wait for unready WeChat OCR helper: {error}"),
-                    );
+                        "unready WeChat OCR helper did not exit immediately after termination",
+                    ),
+                    Err(error) => crate::app::logging::report_error(
+                        "windows-vision",
+                        format!("cannot query terminated WeChat OCR helper: {error}"),
+                    ),
                 }
             }
             Err(error) => crate::app::logging::report_error(
@@ -312,6 +339,8 @@ impl Helper {
             .take()
             .ok_or_else(|| "WeChat OCR helper stdout was not piped".to_string())?;
         let (tx, responses) = mpsc::sync_channel(1);
+        let protocol_violation = Arc::new(AtomicBool::new(false));
+        let reader_violation = Arc::clone(&protocol_violation);
         let reader = WorkerJoin::spawn(
             "WeChat OCR helper reader",
             std::thread::Builder::new().name("keysteer-wechat-reader".into()),
@@ -322,9 +351,7 @@ impl Helper {
                     Ok(()) if !stop => {}
                     Ok(()) => break,
                     Err(mpsc::TrySendError::Full(_)) => {
-                        let _ = tx.try_send(Err(
-                            "WeChat OCR helper sent more than one unconsumed frame".into(),
-                        ));
+                        reader_violation.store(true, Ordering::Release);
                         break;
                     }
                     Err(mpsc::TrySendError::Disconnected(_)) => break,
@@ -337,6 +364,7 @@ impl Helper {
             input: Some(input),
             responses,
             reader: Some(reader),
+            protocol_violation,
             stopped: false,
             _ledger: crate::app::perf_probe::ResourceGuard::new(
                 crate::app::perf_probe::ResourceKind::Helper,
@@ -394,6 +422,9 @@ impl Helper {
             if cancelled() {
                 return Err("WeChat OCR cancelled".into());
             }
+            if self.protocol_violation.load(Ordering::Acquire) {
+                return Err("WeChat OCR helper sent more than one unconsumed frame".into());
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(format!("WeChat OCR helper exceeded {timeout:?}"));
@@ -405,6 +436,9 @@ impl Helper {
                 Ok(result) => return result,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if self.protocol_violation.load(Ordering::Acquire) {
+                        return Err("WeChat OCR helper sent more than one unconsumed frame".into());
+                    }
                     return Err("WeChat OCR helper crashed or closed its pipe".into());
                 }
             }
@@ -431,44 +465,36 @@ impl Helper {
             failures.push(error);
         }
         self.input.take();
-        let deadline = Instant::now()
-            + if graceful {
-                Duration::from_millis(250)
-            } else {
-                Duration::ZERO
-            };
-        let mut exited = false;
-        while Instant::now() < deadline {
-            match self.child.try_wait() {
-                Ok(Some(_)) => {
-                    exited = true;
-                    break;
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-                Err(error) => {
-                    failures.push(format!("cannot query WeChat OCR helper state: {error}"));
-                    break;
-                }
-            }
+        let graceful_deadline = Instant::now() + Duration::from_millis(250);
+        if graceful
+            && let Some(reader) = self.reader.as_mut()
+            && reader.join_until(graceful_deadline).is_ok()
+        {
+            self.reader.take();
         }
+        let mut exited = match self.child.try_wait() {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(error) => {
+                failures.push(format!("cannot query WeChat OCR helper state: {error}"));
+                false
+            }
+        };
         if !exited {
-            let can_wait = match self.child.kill() {
-                Ok(()) => true,
-                Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => true,
+            match self.child.kill() {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {}
                 Err(error) => {
                     failures.push(format!("cannot terminate WeChat OCR helper: {error}"));
-                    // Closing a kill-on-close job is the final bounded
-                    // termination path when Child::kill itself fails.
-                    self.job.take();
-                    false
                 }
-            };
-            if can_wait && let Err(error) = self.child.wait() {
-                failures.push(format!("cannot wait for WeChat OCR helper: {error}"));
             }
+            // Closing the kill-on-close job is the final non-blocking
+            // termination path and also covers a failed Child::kill call.
+            self.job.take();
         }
+        let cleanup_deadline = Instant::now() + Duration::from_millis(500);
         if let Some(reader) = self.reader.as_mut() {
-            match reader.join_timeout(Duration::from_millis(500)) {
+            match reader.join_until(cleanup_deadline) {
                 Ok(()) => {
                     self.reader.take();
                 }
@@ -477,7 +503,18 @@ impl Helper {
                 }
             }
         }
-        self.stopped = self.reader.is_none();
+        exited = match self.child.try_wait() {
+            Ok(Some(_)) => true,
+            Ok(None) => exited,
+            Err(error) => {
+                failures.push(format!("cannot query cleaned WeChat OCR helper: {error}"));
+                false
+            }
+        };
+        if !exited {
+            failures.push("WeChat OCR helper did not exit before cleanup completed".into());
+        }
+        self.stopped = self.reader.is_none() && exited;
         if self.stopped {
             self.job.take();
         }
@@ -531,6 +568,7 @@ struct TemporaryPng {
     owner_path: PathBuf,
     owner: Option<File>,
     removed: bool,
+    cleanup_delegated: bool,
     _ledger: crate::app::perf_probe::ResourceGuard,
 }
 
@@ -577,13 +615,14 @@ impl TemporaryPng {
             owner_path,
             owner: Some(owner),
             removed: false,
+            cleanup_delegated: false,
             _ledger: crate::app::perf_probe::ResourceGuard::new(
                 crate::app::perf_probe::ResourceKind::TempFile,
             ),
         };
         if let Err(error) = encode_png(bitmap, &temporary.path, deadline, cancelled) {
             let cleanup = temporary.remove();
-            temporary.removed = true;
+            temporary.cleanup_delegated = cleanup.is_err();
             return match cleanup {
                 Ok(()) => Err(error),
                 Err(cleanup) => Err(format!("{error}; cleanup: {cleanup}")),
@@ -594,7 +633,7 @@ impl TemporaryPng {
 
     fn cleanup(mut self) -> Result<(), String> {
         let result = self.remove();
-        self.removed = true;
+        self.cleanup_delegated = result.is_err();
         result
     }
 
@@ -681,7 +720,9 @@ fn cleanup_stale_temporary_directories() {
 
 impl Drop for TemporaryPng {
     fn drop(&mut self) {
-        if let Err(error) = self.remove() {
+        if let Err(error) = self.remove()
+            && !self.cleanup_delegated
+        {
             crate::app::logging::report_error("windows-vision", error);
         }
     }
@@ -1490,6 +1531,7 @@ mod tests {
             owner_path,
             owner: Some(owner),
             removed: false,
+            cleanup_delegated: false,
             _ledger: crate::app::perf_probe::ResourceGuard::new(
                 crate::app::perf_probe::ResourceKind::TempFile,
             ),

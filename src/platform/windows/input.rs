@@ -688,6 +688,12 @@ mod tests {
     use std::hint::black_box;
     use std::time::Instant;
 
+    fn mouse_data(input: &INPUT) -> MOUSEINPUT {
+        // SAFETY: every caller passes an INPUT value built by
+        // `mouse_button_inputs`, which activates the `mi` union variant.
+        unsafe { input.Anonymous.mi }
+    }
+
     fn percentiles(mut samples: Vec<u128>) -> (u128, u128, u128) {
         samples.sort_unstable();
         let last = samples.len() - 1;
@@ -895,9 +901,7 @@ mod tests {
             inputs
                 .into_iter()
                 .take(len)
-                // SAFETY: every item was constructed above with the `mi`
-                // variant of INPUT_0 active.
-                .map(|input| unsafe { input.Anonymous.mi.dwFlags })
+                .map(|input| mouse_data(&input).dwFlags)
                 .collect::<Vec<_>>()
         };
         assert_eq!(
@@ -928,10 +932,8 @@ mod tests {
         ] {
             let (inputs, len) = mouse_button_inputs(button, ButtonAction::Click);
             assert_eq!(len, 2, "{button:?}");
-            // SAFETY: mouse_button_inputs creates only INPUT_MOUSE values.
-            let down = unsafe { inputs[0].Anonymous.mi };
-            // SAFETY: mouse_button_inputs creates only INPUT_MOUSE values.
-            let up = unsafe { inputs[1].Anonymous.mi };
+            let down = mouse_data(&inputs[0]);
+            let up = mouse_data(&inputs[1]);
             assert_ne!(down.dwFlags, up.dwFlags, "{button:?}");
             assert_eq!(down.mouseData, up.mouseData, "{button:?}");
         }

@@ -1210,7 +1210,7 @@ impl Engine {
             return Err(error);
         }
 
-        let mut result = (|| {
+        let result = (|| {
             while !self.should_quit {
                 let timeout = self.next_timeout();
                 // A timeout returns `None`, which is our chance to run timers.
@@ -1244,47 +1244,25 @@ impl Engine {
             Ok(())
         })();
 
+        let mut errors = crate::app::errors::ErrorBundle::default();
+        errors.record("runtime", result);
         self.pending_sequences.clear();
         self.pending_long_press_toggles.clear();
         self.active_click_indicators.clear();
-        if let Err(error) = self.cancel_all_scans(backend) {
-            crate::app::logging::report_error("ui-scan", format!("cannot cancel scans: {error}"));
-            if result.is_ok() {
-                result = Err(error);
-            }
-        }
-        if let Err(error) = self.release_latched(backend) {
-            crate::app::logging::report_error(
-                "action",
-                format!("cannot release held inputs: {error}"),
-            );
-            if result.is_ok() {
-                result = Err(error);
-            }
-        }
-        if let Err(error) = backend.dismiss() {
-            crate::app::logging::report_error(
-                "backend",
-                format!("cannot dismiss overlay: {error}"),
-            );
-            if result.is_ok() {
-                result = Err(error);
-            }
-        }
-        if let Err(error) = backend.shutdown() {
-            if result.is_ok() {
-                result = Err(error);
-            } else {
-                crate::app::logging::report_error("backend", format!("shutdown failed: {error}"));
-            }
-        } else {
+        errors.record("cancel scans", self.cancel_all_scans(backend));
+        errors.record("release held inputs", self.release_latched(backend));
+        errors.record("dismiss overlay", backend.dismiss());
+        let shutdown = backend.shutdown();
+        let shutdown_succeeded = shutdown.is_ok();
+        errors.record("backend shutdown", shutdown);
+        if shutdown_succeeded {
             crate::app::perf_probe::mark("shutdown_complete");
             crate::app::logging::info_args(
                 "backend",
                 format_args!("{} backend stopped", backend.name()),
             );
         }
-        result
+        errors.into_result()
     }
 
     /// How long we may block before a timer needs servicing.
