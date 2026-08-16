@@ -1110,7 +1110,7 @@ mod tests {
         assert!(request.roles.contains(&"button".to_string()));
         assert_eq!(
             request.strategy,
-            crate::api::command::UiScanStrategy::Vision
+            crate::api::command::UiScanStrategy::Hybrid
         );
     }
 
