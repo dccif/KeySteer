@@ -19,7 +19,8 @@ use crate::api::command::{
 };
 use crate::api::geometry::{Rect, UiTarget};
 use crate::api::input::{Key, KeyChord, KeyState, ModeId};
-use crate::api::overlay::{Color, OverlayLabel, OverlayScene, OverlayShape};
+use crate::api::overlay::{Color, LabelStyle, OverlayLabel, OverlayScene, OverlayShape};
+use crate::config::style::AUTO;
 use crate::config::{Config, Palette, UiHint as HintsConfig};
 use crate::hints::{self, CompactHint, Match};
 
@@ -29,6 +30,8 @@ const SCAN_RETRY_TIMER_ID: &str = "ui_hint.scan_retry";
 /// is retained, and larger scans cannot become an Idle high-water mark.
 const MAX_IDLE_RETAINED_TARGETS: usize = 128;
 const MAX_SCAN_TIMEOUT_MS: u64 = 30_000;
+const AUTO_HINT_PADDING_X_RATIO: f64 = 0.25;
+const AUTO_HINT_PADDING_Y_RATIO: f64 = 0.06;
 
 /// What the keyboard is currently doing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +135,25 @@ impl HintMode {
                 self.seen_targets = HashMap::new();
             }
         }
+    }
+
+    fn resolved_hint_label_style(&self, palette: &Palette) -> LabelStyle {
+        let mut style = self.config.ui.resolve(
+            palette,
+            palette.surface_label(),
+            palette.text,
+            palette.accent,
+        );
+        // UI Hint labels are deliberately denser than larger grid cells and
+        // badges. Keep -1 as a font-relative auto value without changing the
+        // shared LabelUi auto rules used by those other components.
+        if self.config.ui.padding_x == AUTO {
+            style.padding_x = (style.font_size * AUTO_HINT_PADDING_X_RATIO).round();
+        }
+        if self.config.ui.padding_y == AUTO {
+            style.padding_y = (style.font_size * AUTO_HINT_PADDING_Y_RATIO).round();
+        }
+        style
     }
 
     fn request_scan(&mut self, ctx: &HostContext<'_>) -> CommandBatch {
@@ -464,12 +486,7 @@ impl HintMode {
         let mut scene = OverlayScene::with_capacity(shape_capacity, label_capacity);
         scene.clip = self.scan_bounds.or_else(|| Some(ctx.active_bounds()));
 
-        let mut label_style = self.config.ui.resolve(
-            palette,
-            palette.surface_label(),
-            palette.text,
-            palette.accent,
-        );
+        let mut label_style = self.resolved_hint_label_style(palette);
         // This highlight belongs specifically to UI Hint's typed-prefix
         // interaction. Keep the generic overlay/config defaults unchanged.
         if self.config.ui.matched_text_color.is_none() {
@@ -1045,6 +1062,32 @@ mod tests {
                 _ => None,
             })
             .expect("expected an overlay")
+    }
+
+    #[test]
+    fn default_auto_padding_resolves_to_compact_hint_spacing() {
+        let env = Env::new();
+        let mode = HintMode::new(&env.config);
+        let style = mode.resolved_hint_label_style(&env.palette);
+
+        assert_eq!(mode.config.ui.padding_x, AUTO);
+        assert_eq!(mode.config.ui.padding_y, AUTO);
+        assert_eq!(style.font_size, 17.0);
+        assert_eq!(style.padding_x, 4.0);
+        assert_eq!(style.padding_y, 1.0);
+    }
+
+    #[test]
+    fn explicit_hint_padding_still_overrides_compact_auto_spacing() {
+        let mut config = Config::default();
+        config.ui_hint.ui.padding_x = 7;
+        config.ui_hint.ui.padding_y = 3;
+        let env = Env::with(config);
+        let mode = HintMode::new(&env.config);
+        let style = mode.resolved_hint_label_style(&env.palette);
+
+        assert_eq!(style.padding_x, 7.0);
+        assert_eq!(style.padding_y, 3.0);
     }
 
     #[test]

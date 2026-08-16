@@ -776,7 +776,7 @@ impl UiHint {
 impl Default for UiHint {
     fn default() -> Self {
         let ui = LabelUi {
-            font_size: 15,
+            font_size: 17,
             ..Default::default()
         };
         let search_input_ui = SearchInputUi {
@@ -801,7 +801,7 @@ impl Default for UiHint {
             visible_check_enabled: false,
             placement: HintPlacement::Bottom,
             label_x_offset: 0,
-            label_y_offset: -4,
+            label_y_offset: -8,
             ui,
             boundary_highlight: BoundaryHighlight::default(),
             search_input_ui,

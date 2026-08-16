@@ -40,6 +40,10 @@ fn the_shipped_config_parses_and_validates() {
         .validate()
         .expect("keysteer.default.toml should validate");
     assert_eq!(config.ui_hint.strategy, UiScanStrategy::Hybrid);
+    assert_eq!(config.ui_hint.ui.font_size, 17);
+    assert_eq!(config.ui_hint.ui.padding_x, -1);
+    assert_eq!(config.ui_hint.ui.padding_y, -1);
+    assert_eq!(config.ui_hint.label_y_offset, -8);
 }
 
 #[test]

@@ -43,7 +43,7 @@ scan_retry_delay_ms = 200
 visible_check_enabled = false
 placement = "bottom"
 label_x_offset = 0
-label_y_offset = -4
+label_y_offset = -8
 clickable_roles = ["button", "link", "checkbox", "text_field", "menu_item"]
 
 [ui_hint.lifecycle]
@@ -58,7 +58,9 @@ after_click = "normal"
 
 ```toml
 [ui_hint.ui]
-font_size = 15
+font_size = 17
+padding_x = -1
+padding_y = -1
 border_width = 1
 
 [ui_hint.boundary_highlight]

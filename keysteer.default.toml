@@ -259,7 +259,7 @@ visible_check_enabled = false
 placement = "bottom"
 # Fine adjustment after placement. Negative y moves labels upward.
 label_x_offset = 0
-label_y_offset = -4
+label_y_offset = -8
 # Semantic roles that receive a hint. These are platform-independent; the
 # backend maps them to AX roles or UIA control types. Prefix with `ax:` or
 # `uia:` to name a native role directly.
@@ -316,7 +316,7 @@ checkbox_max_size = 32
 generic_clickable_min_confidence = 0.5
 
 [ui_hint.ui]
-font_size = 15
+font_size = 17
 # Empty means the platform default UI font.
 font_family = ""
 border_width = 1
