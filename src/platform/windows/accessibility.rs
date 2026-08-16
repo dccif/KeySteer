@@ -12,7 +12,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use smallvec::SmallVec;
-use windows::Win32::Foundation::{HWND, LPARAM, RECT, VARIANT_FALSE, VARIANT_TRUE};
+use windows::Win32::Foundation::{
+    HWND, LPARAM, RECT, RPC_E_CALL_COMPLETE, RPC_E_NO_CONTEXT, VARIANT_FALSE, VARIANT_TRUE,
+};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
 };
@@ -59,10 +61,16 @@ fn request_call_cancellation(thread_id: u32) {
         // SAFETY: `thread_id` belongs to the live worker thread, which enabled
         // COM call cancellation before accepting jobs. A zero-second timeout
         // requests cancellation without blocking the engine thread.
-        if let Err(error) = unsafe { CoCancelCall(thread_id, 0) } {
+        if let Err(error) = unsafe { CoCancelCall(thread_id, 0) }
+            && !cancellation_context_is_gone(error.code())
+        {
             crate::report_error!("windows-uia", "cannot cancel blocked UIA call: {error}");
         }
     }
+}
+
+fn cancellation_context_is_gone(code: windows::core::HRESULT) -> bool {
+    code == RPC_E_NO_CONTEXT || code == RPC_E_CALL_COMPLETE
 }
 
 struct ScanJob {
@@ -173,28 +181,25 @@ impl UiAutomationWorker {
     }
 
     pub fn cancel(&self, request_id: u64) {
-        let cancel_active = {
-            let mut state = self
-                .shared
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if state
-                .pending
-                .as_ref()
-                .is_some_and(|job| job.request.id == request_id)
-            {
-                state.pending.take();
-            }
-            let cancel_active = state
-                .active
-                .is_some_and(|(active_id, _)| active_id == request_id);
-            if cancel_active {
-                self.shared.latest_generation.store(0, Ordering::Release);
-            }
-            cancel_active
-        };
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state
+            .pending
+            .as_ref()
+            .is_some_and(|job| job.request.id == request_id)
+        {
+            state.pending.take();
+        }
+        let cancel_active = state
+            .active
+            .is_some_and(|(active_id, _)| active_id == request_id);
         if cancel_active {
+            self.shared.latest_generation.store(0, Ordering::Release);
+            // Keep the queue lock until the request is sent, so this worker
+            // cannot finish the old job and begin a newer generation first.
             let thread_id = self.thread_id.load(Ordering::Acquire);
             request_call_cancellation(thread_id);
         }
@@ -204,7 +209,7 @@ impl UiAutomationWorker {
         if self.worker.is_none() {
             return Ok(());
         }
-        let pending = {
+        let (pending, cancel_active) = {
             let mut state = self
                 .shared
                 .state
@@ -213,12 +218,15 @@ impl UiAutomationWorker {
             state.stopping = true;
             self.shared.stopping.store(true, Ordering::Release);
             let pending = state.pending.take();
+            let cancel_active = state.active.is_some();
             self.shared.ready.notify_all();
-            pending
+            (pending, cancel_active)
         };
         drop(pending);
-        let thread_id = self.thread_id.load(Ordering::Acquire);
-        request_call_cancellation(thread_id);
+        if cancel_active {
+            let thread_id = self.thread_id.load(Ordering::Acquire);
+            request_call_cancellation(thread_id);
+        }
         let Some(worker) = self.worker.as_mut() else {
             return Ok(());
         };
@@ -1336,6 +1344,15 @@ pub(super) fn foreground_context() -> Option<(HWND, u32)> {
 mod tests {
     use super::*;
     use stats_alloc::{INSTRUMENTED_SYSTEM, Region};
+
+    #[test]
+    fn completed_com_cancellation_contexts_are_control_flow() {
+        assert!(cancellation_context_is_gone(RPC_E_NO_CONTEXT));
+        assert!(cancellation_context_is_gone(RPC_E_CALL_COMPLETE));
+        assert!(!cancellation_context_is_gone(
+            windows::Win32::Foundation::E_FAIL
+        ));
+    }
 
     fn target(x: f64, y: f64, name: &str, role: &str) -> UiTarget {
         UiTarget {

@@ -69,8 +69,10 @@ UIA 重叠也不会误跑纯像素检测。系统 OCR 使用 WinRT completion ha
 实现：`src/platform/windows/accessibility.rs`。
 
 - 一个 backend-owned MTA worker 长期持有 COM/UIA；新任务替换 pending 旧任务。
-- 退出 owner 时使 generation 失效、清 pending，并以 `CoCancelCall(thread, 0)` 非阻塞请求
-  取消 provider call；COM apartment 与 Automation 对象继续保持温热。
+- 退出 owner 时使 generation 失效、清 pending，并仅在 active job 存在时以
+  `CoCancelCall(thread, 0)` 非阻塞请求取消 provider call；取消请求与 active generation
+  受同一队列锁保护，`RPC_E_NO_CONTEXT`/call-complete 表示调用已自然结束，按控制流处理。
+  COM apartment 与 Automation 对象继续保持温热。
 - `IUIAutomation2` 可用时设置 connection/transaction timeout；不可用时退回基础 UIA。
 - worker 初始化时构建一次并复用 `CacheRequest`、true condition 和 clickable condition；每轮
   仍重新查询 ElementArray，不缓存旧控件或窗口。
