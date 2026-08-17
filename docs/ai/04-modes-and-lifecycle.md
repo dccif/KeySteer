@@ -62,7 +62,8 @@ settings；不能注入输入、创建窗口或直接扫描 UI。
 - 激活后发送 `ScanUi`；按 scan id 接收多个 Partial 和一个终态。
 - 累积/去重 `UiTarget`，使用 `domain/hints` 重新分配短标签。
 - 普通输入筛 label prefix；`/` 进入 accessible-name 搜索。
-- overlap cycle key 轮换重叠标签层级。
+- overlap cycle key 将全部相交标签一次扫描分配到全局非相交层，并逐次整体显示一个层；
+  不同重叠区域不会再按各自组大小独立取模。
 - 选中后 warp 到目标并 Finish；默认返回 Normal，不自动点击、不重新扫描。
 - 没有标签且扫描终止时按配置安排有上限的自动 retry。
 - 离开或完成本轮 UI Hint 时取消仍在进行的原生扫描；再次进入始终重新获取目标，不能复用

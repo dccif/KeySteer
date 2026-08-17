@@ -128,8 +128,10 @@ UI Hint 按需为目标名缓存一次 lowercase 结果；退出后立即 drop �
 空 `scanned`/`hints`/dedup backing；超过上限的 request-scoped backing 立即释放，因此大型
 扫描不会成为 Idle 常驻内存。搜索重标记不得逐目标重新分配小写字符串。目标去重使用矩形
 到 canonical index 的小碰撞表，标签重叠分组使用按左边界排序的扫描线与并查集。
-重叠轮换的 parents/ranks/order/positions 等工作表使用 inline 128 的 `SmallVec`；常见不足
-100 项的 Shift 堆叠切换不触发临时堆分配，超出 128 项仍安全 spill。
+重叠轮换使用一次横向扫描和贪心层标记，将全部相交标签分配到全局非相交层；每次 Shift
+整体提升一个层。order/layers/active/marks 工作表使用 inline 128 的 `SmallVec`，常见不足
+100 项的切换不触发临时堆分配，超出 128 项仍安全 spill；不再维护并查集或对每个连通组
+单独取模。
 
 ## 帧时钟
 

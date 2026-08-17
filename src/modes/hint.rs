@@ -763,69 +763,74 @@ fn match_compact_input(hints: &[CompactHint<usize>], input: &str) -> Match<usize
     }
 }
 
-/// Treat intersecting label rectangles as connected overlap groups. While
-/// the configured cycle modifier is held, one member of each group is raised.
-/// The stable default order is untouched, so releasing it restores that order.
+/// Greedily assign every intersecting label to a global, non-overlapping
+/// display layer. While the configured cycle modifier is held, every label in
+/// one layer is raised together. The stable default order is untouched, so
+/// releasing it restores that order.
 fn rotate_overlapping_labels(labels: &mut [OverlayLabel], cycle: usize) {
-    fn root(parents: &mut [usize], mut index: usize) -> usize {
-        while parents[index] != index {
-            parents[index] = parents[parents[index]];
-            index = parents[index];
-        }
-        index
-    }
-
     let count = labels.len();
-    let mut parents: SmallVec<[usize; 128]> = (0..count).collect();
-    let mut ranks: SmallVec<[u8; 128]> = std::iter::repeat_n(0, count).collect();
     let mut order: SmallVec<[usize; 128]> = (0..count).collect();
     order.sort_unstable_by(|left, right| {
         labels[*left]
             .rect
             .left()
             .total_cmp(&labels[*right].rect.left())
+            .then_with(|| {
+                labels[*left]
+                    .rect
+                    .top()
+                    .total_cmp(&labels[*right].rect.top())
+            })
+            .then_with(|| left.cmp(right))
     });
 
-    // Sweep from left to right. Only rectangles whose right edge still
-    // reaches the current label can intersect it, avoiding the previous full
-    // n-by-n scan for ordinary sparse UI layouts.
+    let mut layers: SmallVec<[usize; 128]> = std::iter::repeat_n(0, count).collect();
+    let mut overlaps: SmallVec<[bool; 128]> = std::iter::repeat_n(false, count).collect();
+    let mut layer_marks: SmallVec<[usize; 128]> = SmallVec::new();
     let mut active: SmallVec<[usize; 128]> = SmallVec::new();
+    let mut layer_count = 0usize;
+    let mut stamp = 0usize;
+
+    // Sweep from left to right. Active rectangles are the only possible
+    // conflicts. Generation marks find the smallest free layer without
+    // clearing a scratch bitset for every label.
     for index in order {
         let left = labels[index].rect.left();
         active.retain(|other| labels[*other].rect.right() >= left);
+        stamp = stamp.wrapping_add(1);
+        if stamp == 0 {
+            layer_marks.fill(0);
+            stamp = 1;
+        }
         for &other in &active {
             if labels[index].rect.intersect(&labels[other].rect).is_none() {
                 continue;
             }
-            let mut left_root = root(&mut parents, index);
-            let mut right_root = root(&mut parents, other);
-            if left_root == right_root {
-                continue;
+            overlaps[index] = true;
+            overlaps[other] = true;
+            let occupied = layers[other];
+            if layer_marks.len() <= occupied {
+                layer_marks.resize(occupied + 1, 0);
             }
-            if ranks[left_root] < ranks[right_root] {
-                std::mem::swap(&mut left_root, &mut right_root);
-            }
-            parents[right_root] = left_root;
-            if ranks[left_root] == ranks[right_root] {
-                ranks[left_root] = ranks[left_root].saturating_add(1);
-            }
+            layer_marks[occupied] = stamp;
         }
+        let layer = layer_marks
+            .iter()
+            .position(|marked| *marked != stamp)
+            .unwrap_or(layer_marks.len());
+        layers[index] = layer;
+        layer_count = layer_count.max(layer + 1);
         active.push(index);
     }
 
-    let mut sizes: SmallVec<[usize; 128]> = std::iter::repeat_n(0, count).collect();
-    for index in 0..count {
-        let component = root(&mut parents, index);
-        sizes[component] += 1;
+    if !overlaps.iter().any(|overlap| *overlap) {
+        return;
     }
-    let mut positions: SmallVec<[usize; 128]> = std::iter::repeat_n(0, count).collect();
+    let selected_layer = (cycle + layer_count - 1) % layer_count;
     for (index, label) in labels.iter_mut().enumerate() {
-        let component = root(&mut parents, index);
-        let size = sizes[component];
-        if size > 1 && positions[component] == (cycle + size - 1) % size {
+        if overlaps[index] && layers[index] == selected_layer {
             label.z_index = 3;
         }
-        positions[component] += 1;
     }
 }
 
@@ -1463,6 +1468,100 @@ mod tests {
             .expect("one overlapping label should be raised");
         assert_ne!(first_top, third_top);
         assert_ne!(second_top, third_top);
+    }
+
+    #[test]
+    fn overlap_cycle_raises_one_global_non_intersecting_layer() {
+        let label = |text: &str, rect: Rect| {
+            OverlayLabel::new(text, rect, LabelStyle::default()).with_z_index(2)
+        };
+        let labels = vec![
+            label("a", Rect::new(0.0, 0.0, 20.0, 20.0)),
+            label("b", Rect::new(0.0, 0.0, 20.0, 20.0)),
+            label("c", Rect::new(100.0, 0.0, 20.0, 20.0)),
+            label("d", Rect::new(100.0, 0.0, 20.0, 20.0)),
+        ];
+
+        let mut first = labels.clone();
+        rotate_overlapping_labels(&mut first, 1);
+        assert_eq!(
+            first
+                .iter()
+                .filter(|label| label.z_index == 3)
+                .map(|label| label.text.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "c"]
+        );
+
+        let mut second = labels;
+        rotate_overlapping_labels(&mut second, 2);
+        assert_eq!(
+            second
+                .iter()
+                .filter(|label| label.z_index == 3)
+                .map(|label| label.text.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "d"]
+        );
+    }
+
+    #[test]
+    fn overlap_layers_reuse_space_for_non_intersecting_chain_members() {
+        let mut labels = vec![
+            OverlayLabel::new(
+                "left",
+                Rect::new(0.0, 0.0, 10.0, 10.0),
+                LabelStyle::default(),
+            )
+            .with_z_index(2),
+            OverlayLabel::new(
+                "middle",
+                Rect::new(8.0, 0.0, 10.0, 10.0),
+                LabelStyle::default(),
+            )
+            .with_z_index(2),
+            OverlayLabel::new(
+                "right",
+                Rect::new(16.0, 0.0, 10.0, 10.0),
+                LabelStyle::default(),
+            )
+            .with_z_index(2),
+        ];
+
+        rotate_overlapping_labels(&mut labels, 1);
+        assert_eq!(
+            labels
+                .iter()
+                .filter(|label| label.z_index == 3)
+                .map(|label| label.text.as_str())
+                .collect::<Vec<_>>(),
+            ["left", "right"]
+        );
+    }
+
+    #[test]
+    fn shallow_groups_do_not_wrap_into_a_deeper_global_layer() {
+        let label = |text: &str, x: f64| {
+            OverlayLabel::new(text, Rect::new(x, 0.0, 20.0, 20.0), LabelStyle::default())
+                .with_z_index(2)
+        };
+        let mut labels = vec![
+            label("two-0", 0.0),
+            label("two-1", 0.0),
+            label("three-0", 100.0),
+            label("three-1", 100.0),
+            label("three-2", 100.0),
+        ];
+
+        rotate_overlapping_labels(&mut labels, 3);
+        assert_eq!(
+            labels
+                .iter()
+                .filter(|label| label.z_index == 3)
+                .map(|label| label.text.as_str())
+                .collect::<Vec<_>>(),
+            ["three-2"]
+        );
     }
 
     #[test]
