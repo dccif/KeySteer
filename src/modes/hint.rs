@@ -32,6 +32,24 @@ const MAX_IDLE_RETAINED_TARGETS: usize = 128;
 const MAX_SCAN_TIMEOUT_MS: u64 = 30_000;
 const AUTO_HINT_PADDING_X_RATIO: f64 = 2.0 / 17.0;
 const AUTO_HINT_PADDING_Y_RATIO: f64 = 0.06;
+/// Edge contact and tiny corner intersections are still readable and should
+/// not create an extra user-visible stack layer.
+const MIN_VISUAL_STACK_AREA_RATIO: f64 = 0.20;
+
+#[derive(Debug, Default)]
+struct OverlapPlan {
+    layers: SmallVec<[u8; 128]>,
+    layer_count: u8,
+    ready: bool,
+}
+
+impl OverlapPlan {
+    fn clear(&mut self) {
+        self.layers.clear();
+        self.layer_count = 0;
+        self.ready = false;
+    }
+}
 
 /// What the keyboard is currently doing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,10 +97,9 @@ pub struct HintMode {
     scan_bounds: Option<Rect>,
     held_overlap_keys: SmallVec<[Key; 2]>,
     overlap_cycle: usize,
-    /// New scan targets are accumulated while the overlap modifier is held,
-    /// but the visible labels stay pinned until release. Otherwise every
-    /// streamed partial can change the selected member of a growing stack.
-    overlap_labels_dirty: bool,
+    /// Source-agnostic visual layers, built once at scan terminal so the first
+    /// post-scan overlap-cycle input only reads compact cached layer numbers.
+    overlap_plan: OverlapPlan,
     selected: Option<usize>,
     finished: bool,
 }
@@ -108,7 +125,7 @@ impl HintMode {
             scan_bounds: None,
             held_overlap_keys: SmallVec::new(),
             overlap_cycle: 0,
-            overlap_labels_dirty: false,
+            overlap_plan: OverlapPlan::default(),
             selected: None,
             finished: false,
         }
@@ -120,7 +137,7 @@ impl HintMode {
         self.search_names_initialized = false;
         self.seen_targets.clear();
         self.hints.clear();
-        self.overlap_labels_dirty = false;
+        self.overlap_plan.clear();
         if release_large_buffers {
             if self.scanned.capacity() > MAX_IDLE_RETAINED_TARGETS {
                 self.scanned = Vec::new();
@@ -130,6 +147,9 @@ impl HintMode {
             }
             if self.hints.capacity() > MAX_IDLE_RETAINED_TARGETS {
                 self.hints = Vec::new();
+            }
+            if self.overlap_plan.layers.capacity() > MAX_IDLE_RETAINED_TARGETS {
+                self.overlap_plan = OverlapPlan::default();
             }
             if self.seen_targets.capacity() > MAX_IDLE_RETAINED_TARGETS {
                 self.seen_targets = HashMap::new();
@@ -310,18 +330,12 @@ impl HintMode {
 
         let added = self.append_targets_owned(targets);
         // Once the user starts typing, preserve the labels they can already
-        // see and select. Later batches remain available after the next scan
-        // instead of changing codes under their fingers.
+        // see and select. With no input, every partial remains visible even
+        // while the overlap modifier is held. Layer planning waits for the
+        // terminal batch because the scan is normally faster than interaction.
         let labels_changed = if added && self.input.text().is_empty() {
-            if self.held_overlap_keys.is_empty() || self.hints.is_empty() {
-                self.relabel();
-                true
-            } else {
-                // Keep the currently raised label stable while the overlap key
-                // is held. The targets are labelled together on final release.
-                self.overlap_labels_dirty = true;
-                false
-            }
+            self.relabel(ctx);
+            true
         } else {
             false
         };
@@ -361,10 +375,16 @@ impl HintMode {
             && self.status.is_none()
         {
             self.scanning = false;
+            if !self.overlap_plan.ready {
+                self.rebuild_overlap_plan(ctx);
+            }
             return CommandBatch::new();
         }
 
         self.scanning = false;
+        if !self.hints.is_empty() && !self.overlap_plan.ready {
+            self.rebuild_overlap_plan(ctx);
+        }
         self.status = match &status {
             UiScanStatus::Success if self.hints.is_empty() => {
                 Some("No accessible targets — Esc to exit".into())
@@ -384,7 +404,7 @@ impl HintMode {
     }
 
     /// Assign labels to the targets matching the current search query.
-    fn relabel(&mut self) {
+    fn relabel(&mut self, ctx: &HostContext<'_>) {
         let query = match &self.input {
             // Key names are normalized to lowercase before Mode delivery, so
             // the accumulated search query is already canonical.
@@ -417,7 +437,20 @@ impl HintMode {
         {
             self.hints.clear();
         }
-        self.overlap_labels_dirty = false;
+        self.overlap_plan.clear();
+        if !self.scanning && !self.held_overlap_keys.is_empty() {
+            self.rebuild_overlap_plan(ctx);
+        }
+    }
+
+    fn rebuild_overlap_plan(&mut self, ctx: &HostContext<'_>) {
+        let style = self.resolved_hint_label_style(ctx.palette);
+        let rects: SmallVec<[Rect; 128]> = self
+            .hints
+            .iter()
+            .map(|hint| placed_hint_rect(&self.config, hint, &style))
+            .collect();
+        build_overlap_plan(&rects, &mut self.overlap_plan);
     }
 
     fn hint_is_visible(&self, hint: &CompactHint<usize>) -> bool {
@@ -433,6 +466,9 @@ impl HintMode {
         state: KeyState,
         ctx: &HostContext<'_>,
     ) -> CommandBatch {
+        if self.scanning {
+            return CommandBatch::new();
+        }
         let changed = match state {
             KeyState::Down => {
                 let was_released = self.held_overlap_keys.is_empty();
@@ -454,15 +490,10 @@ impl HintMode {
                 .map(|index| self.held_overlap_keys.swap_remove(index))
                 .is_some(),
         };
-        if changed
-            && state == KeyState::Up
-            && self.held_overlap_keys.is_empty()
-            && self.overlap_labels_dirty
-            && self.input.text().is_empty()
-        {
-            self.relabel();
+        if changed && state == KeyState::Down && !self.scanning && !self.overlap_plan.ready {
+            self.rebuild_overlap_plan(ctx);
         }
-        if changed && !self.hints.is_empty() {
+        if changed && !self.hints.is_empty() && !self.scanning {
             self.redraw(ctx)
         } else {
             CommandBatch::new()
@@ -471,7 +502,6 @@ impl HintMode {
 
     fn scene(&self, ctx: &HostContext<'_>) -> OverlayScene {
         let palette = ctx.palette;
-        let placement = self.config.placement;
         let visible_count = self
             .hints
             .iter()
@@ -516,24 +546,15 @@ impl HintMode {
         };
         let matched_prefix_len = typed.chars().count();
         for hint in self.hints.iter().filter(|hint| self.hint_is_visible(hint)) {
-            let width = label_style.font_size * 0.75 * hint.label.as_str().chars().count() as f64
-                + label_style.padding_x * 2.0;
-            let height = label_style.font_size * 1.4 + label_style.padding_y * 2.0;
-            let placed = placement.place(&hint.bounds, width, height);
-            let rect = Rect::new(
-                placed.x + self.config.label_x_offset as f64,
-                placed.y + self.config.label_y_offset as f64,
-                placed.width,
-                placed.height,
-            );
+            let rect = placed_hint_rect(&self.config, hint, &label_style);
             scene.push_label(
                 OverlayLabel::new(hint.label.as_str(), rect, label_style.clone())
                     .with_matched_prefix(matched_prefix_len)
                     .with_z_index(2),
             );
         }
-        if !self.held_overlap_keys.is_empty() {
-            rotate_overlapping_labels(&mut scene.labels, self.overlap_cycle);
+        if !self.held_overlap_keys.is_empty() && self.overlap_plan.ready {
+            apply_overlap_layer(&mut scene.labels, &self.overlap_plan, self.overlap_cycle);
         }
 
         // Search box, shown only while searching.
@@ -664,7 +685,7 @@ impl HintMode {
                 return match &self.input {
                     Input::Search(_) => {
                         self.input = Input::Labels(String::new());
-                        self.relabel();
+                        self.relabel(ctx);
                         self.redraw(ctx)
                     }
                     Input::Labels(_) => self.cancel(),
@@ -672,7 +693,7 @@ impl HintMode {
             }
             "/" if matches!(self.input, Input::Labels(_)) => {
                 self.input = Input::Search(String::new());
-                self.relabel();
+                self.relabel(ctx);
                 return self.redraw(ctx);
             }
             "backspace" => {
@@ -682,7 +703,7 @@ impl HintMode {
                     return match &self.input {
                         Input::Search(_) => {
                             self.input = Input::Labels(String::new());
-                            self.relabel();
+                            self.relabel(ctx);
                             self.redraw(ctx)
                         }
                         Input::Labels(_) => self.cancel(),
@@ -694,7 +715,7 @@ impl HintMode {
                     }
                 }
                 if matches!(self.input, Input::Search(_)) {
-                    self.relabel();
+                    self.relabel(ctx);
                 }
                 return self.redraw(ctx);
             }
@@ -717,7 +738,7 @@ impl HintMode {
             Input::Search(query) => {
                 if ch.is_alphanumeric() || ch == ' ' {
                     query.push(ch);
-                    self.relabel();
+                    self.relabel(ctx);
                     return self.redraw(ctx);
                 }
                 CommandBatch::new()
@@ -763,75 +784,127 @@ fn match_compact_input(hints: &[CompactHint<usize>], input: &str) -> Match<usize
     }
 }
 
-/// Greedily assign every intersecting label to a global, non-overlapping
-/// display layer. While the configured cycle modifier is held, every label in
-/// one layer is raised together. The stable default order is untouched, so
-/// releasing it restores that order.
-fn rotate_overlapping_labels(labels: &mut [OverlayLabel], cycle: usize) {
-    let count = labels.len();
-    let mut order: SmallVec<[usize; 128]> = (0..count).collect();
+fn placed_hint_rect(config: &HintsConfig, hint: &CompactHint<usize>, style: &LabelStyle) -> Rect {
+    let width =
+        style.font_size * 0.75 * hint.label.as_str().chars().count() as f64 + style.padding_x * 2.0;
+    let height = style.font_size * 1.4 + style.padding_y * 2.0;
+    let placed = config.placement.place(&hint.bounds, width, height);
+    Rect::new(
+        placed.x + config.label_x_offset as f64,
+        placed.y + config.label_y_offset as f64,
+        placed.width,
+        placed.height,
+    )
+}
+
+fn visually_stacked(left: Rect, right: Rect) -> bool {
+    let Some(intersection) = left.intersect(&right) else {
+        return false;
+    };
+    if left.contains(&right.center()) || right.contains(&left.center()) {
+        return true;
+    }
+    let intersection_area = intersection.width * intersection.height;
+    let smaller_area = (left.width * left.height).min(right.width * right.height);
+    smaller_area > 0.0 && intersection_area >= smaller_area * MIN_VISUAL_STACK_AREA_RATIO
+}
+
+/// Build a source-agnostic visual plan from the final placed label rectangles.
+/// Tiny edge intersections remain readable and do not consume another Shift
+/// layer. The cached u8 layer number is the only per-label retained state.
+fn build_overlap_plan(rects: &[Rect], plan: &mut OverlapPlan) {
+    plan.clear();
+    let count = rects.len();
+    if u16::try_from(count).is_err() {
+        return;
+    }
+    plan.layers.resize(count, 0);
+    let mut order: SmallVec<[u16; 128]> = (0..count).map(|index| index as u16).collect();
     order.sort_unstable_by(|left, right| {
-        labels[*left]
-            .rect
+        let left = usize::from(*left);
+        let right = usize::from(*right);
+        rects[left]
             .left()
-            .total_cmp(&labels[*right].rect.left())
-            .then_with(|| {
-                labels[*left]
-                    .rect
-                    .top()
-                    .total_cmp(&labels[*right].rect.top())
-            })
-            .then_with(|| left.cmp(right))
+            .total_cmp(&rects[right].left())
+            .then_with(|| rects[left].top().total_cmp(&rects[right].top()))
+            .then_with(|| left.cmp(&right))
     });
 
-    let mut layers: SmallVec<[usize; 128]> = std::iter::repeat_n(0, count).collect();
     let mut overlaps: SmallVec<[bool; 128]> = std::iter::repeat_n(false, count).collect();
-    let mut layer_marks: SmallVec<[usize; 128]> = SmallVec::new();
-    let mut active: SmallVec<[usize; 128]> = SmallVec::new();
+    let mut active: SmallVec<[u16; 128]> = SmallVec::new();
     let mut layer_count = 0usize;
-    let mut stamp = 0usize;
 
     // Sweep from left to right. Active rectangles are the only possible
-    // conflicts. Generation marks find the smallest free layer without
-    // clearing a scratch bitset for every label.
-    for index in order {
-        let left = labels[index].rect.left();
-        active.retain(|other| labels[*other].rect.right() >= left);
-        stamp = stamp.wrapping_add(1);
-        if stamp == 0 {
-            layer_marks.fill(0);
-            stamp = 1;
-        }
-        for &other in &active {
-            if labels[index].rect.intersect(&labels[other].rect).is_none() {
+    // conflicts. Four words cover every representable retained layer while
+    // keeping the per-label scratch state in 32 stack bytes.
+    for compact_index in order {
+        let index = usize::from(compact_index);
+        let left = rects[index].left();
+        active.retain(|other| rects[usize::from(*other)].right() >= left);
+        let mut occupied_layers = [0u64; 4];
+        for &compact_other in &active {
+            let other = usize::from(compact_other);
+            if !visually_stacked(rects[index], rects[other]) {
                 continue;
             }
             overlaps[index] = true;
             overlaps[other] = true;
-            let occupied = layers[other];
-            if layer_marks.len() <= occupied {
-                layer_marks.resize(occupied + 1, 0);
-            }
-            layer_marks[occupied] = stamp;
+            let occupied = usize::from(plan.layers[other]);
+            occupied_layers[occupied / 64] |= 1u64 << (occupied % 64);
         }
-        let layer = layer_marks
+        let layer = occupied_layers
             .iter()
-            .position(|marked| *marked != stamp)
-            .unwrap_or(layer_marks.len());
-        layers[index] = layer;
+            .enumerate()
+            .find_map(|(word_index, occupied)| {
+                (*occupied != u64::MAX)
+                    .then(|| word_index * 64 + (!occupied).trailing_zeros() as usize)
+            })
+            .unwrap_or(usize::from(u8::MAX) + 1);
+        let Ok(compact_layer) = u8::try_from(layer) else {
+            plan.clear();
+            return;
+        };
+        plan.layers[index] = compact_layer;
         layer_count = layer_count.max(layer + 1);
-        active.push(index);
+        active.push(compact_index);
     }
 
     if !overlaps.iter().any(|overlap| *overlap) {
+        plan.layers.clear();
+        plan.ready = true;
         return;
     }
-    let selected_layer = (cycle + layer_count - 1) % layer_count;
+    let Ok(compact_count) = u8::try_from(layer_count) else {
+        plan.clear();
+        return;
+    };
+    plan.layer_count = compact_count;
+    plan.ready = true;
+    for (layer, overlaps) in plan.layers.iter_mut().zip(overlaps) {
+        if !overlaps {
+            *layer = u8::MAX;
+        }
+    }
+}
+
+fn apply_overlap_layer(labels: &mut [OverlayLabel], plan: &OverlapPlan, cycle: usize) {
+    if plan.layer_count == 0 || plan.layers.len() != labels.len() {
+        return;
+    }
+    let selected_layer = cycle.wrapping_sub(1) % usize::from(plan.layer_count);
     for (index, label) in labels.iter_mut().enumerate() {
-        if overlaps[index] && layers[index] == selected_layer {
+        if usize::from(plan.layers[index]) == selected_layer {
             label.z_index = 3;
         }
     }
+}
+
+#[cfg(test)]
+fn rotate_overlapping_labels(labels: &mut [OverlayLabel], cycle: usize) {
+    let rects: SmallVec<[Rect; 128]> = labels.iter().map(|label| label.rect).collect();
+    let mut plan = OverlapPlan::default();
+    build_overlap_plan(&rects, &mut plan);
+    apply_overlap_layer(labels, &plan, cycle);
 }
 
 impl Mode for HintMode {
@@ -1103,10 +1176,12 @@ mod tests {
         mode.scanned_names_lower.reserve(1_024);
         mode.seen_targets.reserve(1_024);
         mode.hints.reserve(1_024);
+        mode.overlap_plan.layers.reserve(1_024);
         assert!(mode.scanned.capacity() >= 1_024);
         assert!(mode.scanned_names_lower.capacity() >= 1_024);
         assert!(mode.seen_targets.capacity() >= 1_024);
         assert!(mode.hints.capacity() >= 1_024);
+        assert!(mode.overlap_plan.layers.capacity() >= 1_024);
 
         mode.handle(&ModeEvent::Deactivated, &env.ctx());
 
@@ -1114,6 +1189,7 @@ mod tests {
         assert_eq!(mode.scanned_names_lower.capacity(), 0);
         assert_eq!(mode.seen_targets.capacity(), 0);
         assert_eq!(mode.hints.capacity(), 0);
+        assert_eq!(mode.overlap_plan.layers.capacity(), 128);
     }
 
     #[test]
@@ -1139,6 +1215,7 @@ mod tests {
         assert!(mode.seen_targets.capacity() >= 100);
         assert!(mode.hints.is_empty());
         assert!(mode.hints.capacity() >= 100);
+        assert!(mode.overlap_plan.layers.capacity() <= 128);
     }
 
     #[test]
@@ -1231,12 +1308,13 @@ mod tests {
         let second = mode.handle(
             &ModeEvent::UiScanned(crate::api::UiScanResult {
                 id: mode.scan_id,
-                targets: vec![target("Second", 300.0)],
+                targets: vec![target("Second", 100.0)],
                 status: UiScanStatus::Partial,
             }),
             &env.ctx(),
         );
         assert_eq!(scene_of(&second).labels.len(), 2);
+        assert!(mode.overlap_plan.layers.is_empty());
 
         let completed = deliver(&mut mode, &env, Vec::new());
         assert!(!mode.scanning);
@@ -1245,6 +1323,20 @@ mod tests {
             "an unchanged terminal must not redraw"
         );
         assert_eq!(mode.hints.len(), 2);
+        assert!(mode.overlap_plan.ready);
+        assert_eq!(mode.overlap_plan.layers.len(), 2);
+        assert_eq!(mode.overlap_plan.layer_count, 2);
+
+        let cycled = press(&mut mode, &env, "left_shift");
+        assert_eq!(
+            scene_of(&cycled)
+                .labels
+                .iter()
+                .filter(|label| label.z_index == 3)
+                .count(),
+            1
+        );
+        release(&mut mode, &env, "left_shift");
     }
 
     #[test]
@@ -1506,6 +1598,45 @@ mod tests {
     }
 
     #[test]
+    fn tiny_edge_contacts_do_not_invent_extra_visual_layers() {
+        let label = |text: &str, x: f64| {
+            OverlayLabel::new(text, Rect::new(x, 0.0, 20.0, 20.0), LabelStyle::default())
+                .with_z_index(2)
+        };
+        // Each pair is a real two-label stack. The pairs only touch across a
+        // 2px strip, which remains readable and must not turn this into four
+        // Shift layers.
+        let labels = vec![
+            label("left-0", 0.0),
+            label("left-1", 0.0),
+            label("right-0", 18.0),
+            label("right-1", 18.0),
+        ];
+
+        let mut first = labels.clone();
+        rotate_overlapping_labels(&mut first, 1);
+        assert_eq!(
+            first
+                .iter()
+                .filter(|label| label.z_index == 3)
+                .map(|label| label.text.as_str())
+                .collect::<Vec<_>>(),
+            ["left-0", "right-0"]
+        );
+
+        let mut second = labels;
+        rotate_overlapping_labels(&mut second, 2);
+        assert_eq!(
+            second
+                .iter()
+                .filter(|label| label.z_index == 3)
+                .map(|label| label.text.as_str())
+                .collect::<Vec<_>>(),
+            ["left-1", "right-1"]
+        );
+    }
+
+    #[test]
     fn overlap_layers_reuse_space_for_non_intersecting_chain_members() {
         let mut labels = vec![
             OverlayLabel::new(
@@ -1565,7 +1696,7 @@ mod tests {
     }
 
     #[test]
-    fn held_overlap_key_pins_streamed_stack_until_release() {
+    fn overlap_key_during_scan_is_ignored_without_blocking_stream() {
         let env = Env::new();
         let mut mode = HintMode::new(&env.config);
         activate(&mut mode, &env);
@@ -1578,13 +1709,11 @@ mod tests {
             &env.ctx(),
         );
 
-        let raised = press(&mut mode, &env, "left_shift");
-        let raised_text = scene_of(&raised)
-            .labels
-            .iter()
-            .find(|label| label.z_index == 3)
-            .map(|label| label.text.clone())
-            .expect("one overlapping label should be raised immediately");
+        let held = press(&mut mode, &env, "left_shift");
+        assert!(held.is_empty(), "scanning Shift does not add a redraw");
+        assert!(mode.held_overlap_keys.is_empty());
+        assert_eq!(mode.overlap_cycle, 0);
+        assert!(!mode.overlap_plan.ready);
 
         let streamed = mode.handle(
             &ModeEvent::UiScanned(crate::api::UiScanResult {
@@ -1594,23 +1723,29 @@ mod tests {
             }),
             &env.ctx(),
         );
-        assert!(
-            streamed.is_empty(),
-            "a held stack must not redraw per partial"
-        );
-        assert_eq!(mode.hints.len(), 2, "visible labels stay pinned while held");
+        let streamed_scene = scene_of(&streamed);
+        assert_eq!(streamed_scene.labels.len(), 4);
+        assert_eq!(mode.hints.len(), 4, "new partial labels remain visible");
+        assert!(!mode.overlap_plan.ready);
         assert_eq!(
-            mode.scene(&env.ctx())
+            streamed_scene
                 .labels
                 .iter()
-                .find(|label| label.z_index == 3)
-                .map(|label| label.text.as_str()),
-            Some(raised_text.as_str())
+                .filter(|label| label.z_index == 3)
+                .count(),
+            0,
+            "partial batches do not spend time applying a provisional layer"
         );
 
+        let completed = deliver(&mut mode, &env, Vec::new());
+        assert!(completed.is_empty());
+        assert!(!mode.scanning);
+        assert!(mode.overlap_plan.ready);
+        assert_eq!(mode.overlap_plan.layers.len(), 4);
+        assert_eq!(mode.overlap_plan.layer_count, 4);
+
         let released = release(&mut mode, &env, "left_shift");
-        assert_eq!(scene_of(&released).labels.len(), 4);
-        assert!(!mode.overlap_labels_dirty);
+        assert!(released.is_empty(), "the ignored key has no held state");
 
         let mut raised_labels = HashSet::new();
         for key in ["left_shift", "right_shift", "left_shift", "right_shift"] {
