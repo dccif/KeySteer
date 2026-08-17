@@ -2,9 +2,9 @@
 
 ## 0.9.4
 
-跨平台 UI Hint 统一使用零分配文字分析和精确前缀高亮；macOS 同时校正文字垂直位置，并以单层渲染减少原生图层与内存开销。
+跨平台 UI Hint 统一使用零分配文字分析和精确前缀高亮；macOS 同时校正文字垂直位置，修复逐键高亮闪烁，并让按住 Shift 的重叠标签切换稳定保持。
 
-Cross-platform UI Hint now shares allocation-free text analysis and exact prefix highlighting, while macOS gains corrected vertical positioning and a single-layer renderer with lower native-layer and memory overhead.
+Cross-platform UI Hint now shares allocation-free text analysis and exact prefix highlighting, while macOS gains corrected vertical positioning, flicker-free typed highlights, and stable overlap cycling while Shift is held.
 
 ## 0.9.3
 

@@ -6,23 +6,27 @@
 //! every native lifetime.
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::Arc;
 
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::AnyObject;
-use objc2::{MainThreadMarker, MainThreadOnly};
+use objc2::{AnyThread, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSBackingStoreType, NSBaselineOffsetAttributeName, NSColor, NSFont, NSFontAttributeName,
-    NSForegroundColorAttributeName, NSPanel, NSScreenSaverWindowLevel, NSView,
-    NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSAttributedStringNSStringDrawing, NSBackingStoreType, NSBaselineOffsetAttributeName, NSColor,
+    NSFont, NSFontAttributeName, NSForegroundColorAttributeName, NSKernAttributeName,
+    NSLigatureAttributeName, NSPanel, NSScreenSaverWindowLevel, NSView, NSWindowCollectionBehavior,
+    NSWindowStyleMask,
 };
 use objc2_core_foundation::{CFRetained, CFString};
 use objc2_core_graphics::{CGColor, CGMutablePath};
 use objc2_core_text::{CTFont, CTFontSymbolicTraits, CTFontUIFontType};
 use objc2_foundation::{
-    NSMutableAttributedString, NSNumber, NSPoint, NSRange, NSRect, NSSize, NSString,
+    NSAttributedString, NSMutableAttributedString, NSNumber, NSPoint, NSRange, NSRect, NSSize,
+    NSString,
 };
 use objc2_quartz_core::{CALayer, CAShapeLayer, CATextLayer, CATransaction, kCAAlignmentCenter};
+use smallvec::SmallVec;
 
 use crate::api::geometry::{Point, Rect, Screen};
 use crate::api::overlay::{
@@ -59,7 +63,31 @@ struct WindowContent {
 
 struct LabelLayers {
     base: Retained<CATextLayer>,
+    matched_clip: Retained<CALayer>,
+    matched: Retained<CATextLayer>,
+    metrics: LabelTextMetrics,
     configured: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PrefixOffset {
+    utf16_len: u32,
+    x: f32,
+}
+
+#[derive(Debug, Default)]
+struct LabelTextMetrics {
+    width: f32,
+    prefix_offsets: SmallVec<[PrefixOffset; 4]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct LabelIdentity<'a> {
+    text: &'a str,
+    x: u64,
+    y: u64,
+    width: u64,
+    height: u64,
 }
 
 #[derive(Clone)]
@@ -364,11 +392,11 @@ impl WindowContent {
             shape.setHidden(true);
         }
 
-        self.trim_labels(scene.labels.len());
-        self.ensure_labels(scene.labels.len());
+        let previous_labels = previous.map_or(&[][..], |scene| scene.labels.as_slice());
+        let previous_indices = self.reconcile_labels(previous_labels, scene.labels.as_slice());
         for (index, label) in scene.labels.iter().enumerate() {
-            let rebuild_text = previous
-                .and_then(|scene| scene.labels.get(index))
+            let rebuild_text = previous_indices[index]
+                .and_then(|previous_index| previous_labels.get(previous_index))
                 .is_none_or(|previous| !label_text_content_eq(previous, label));
             let spec = LabelSpec {
                 text: &label.text,
@@ -423,6 +451,66 @@ impl WindowContent {
             let label = LabelLayers::new(&self.indicator_root, self.scale);
             self.indicator_labels.push(label);
         }
+    }
+
+    /// Keep a native text layer attached to the same logical label when the
+    /// portable scene is reordered by z-index (for example while Shift holds
+    /// an overlapping UI Hint above its siblings). Prefix filtering can also
+    /// remove arbitrary labels, so surviving slots are compacted in place.
+    fn reconcile_labels(
+        &mut self,
+        previous: &[OverlayLabel],
+        current: &[OverlayLabel],
+    ) -> SmallVec<[Option<usize>; 128]> {
+        let old_count = self.labels.len();
+        let previous_indices = matched_previous_indices(previous, current, old_count);
+
+        let mut desired_slots = SmallVec::<[Option<usize>; 128]>::new();
+        desired_slots.resize(current.len(), None);
+        let mut used = SmallVec::<[bool; 128]>::new();
+        used.resize(old_count.max(current.len()), false);
+
+        for (index, previous_index) in previous_indices.iter().copied().enumerate() {
+            let Some(previous_index) = previous_index else {
+                continue;
+            };
+            desired_slots[index] = Some(previous_index);
+            used[previous_index] = true;
+        }
+
+        self.ensure_labels(current.len());
+        used.resize(self.labels.len(), false);
+        let mut next_unused = 0;
+        for desired in &mut desired_slots {
+            if desired.is_some() {
+                continue;
+            }
+            while used[next_unused] {
+                next_unused += 1;
+            }
+            *desired = Some(next_unused);
+            used[next_unused] = true;
+        }
+
+        let mut old_at_position: SmallVec<[usize; 128]> = (0..self.labels.len()).collect();
+        let mut position_of_old = old_at_position.clone();
+        for (target_position, desired) in desired_slots.iter().enumerate() {
+            let Some(desired_old) = *desired else {
+                debug_assert!(false, "every current label must have a native slot");
+                continue;
+            };
+            let source_position = position_of_old[desired_old];
+            if source_position == target_position {
+                continue;
+            }
+            let displaced_old = old_at_position[target_position];
+            self.labels.swap(target_position, source_position);
+            old_at_position.swap(target_position, source_position);
+            position_of_old[desired_old] = target_position;
+            position_of_old[displaced_old] = source_position;
+        }
+        self.trim_labels(current.len());
+        previous_indices
     }
 
     fn trim_indicator_labels(&mut self, count: usize) {
@@ -535,14 +623,16 @@ impl WindowContent {
             let foreground = self.color(spec.style.text_color);
             let matched_foreground = self.color(spec.style.matched_text_color);
             let font = self.font(spec.style);
-            attributed_label_text(
+            let (base, matched) = attributed_label_text_pair(
                 spec.text,
                 spec.style,
                 spec.analysis,
                 &font,
                 &foreground.cocoa,
                 &matched_foreground.cocoa,
-            )
+            );
+            let metrics = label_text_metrics(&base, spec.text);
+            (base, matched, metrics)
         });
         let layer = match slot {
             LabelSlot::Static(index) => &mut self.labels[index],
@@ -569,12 +659,21 @@ impl WindowContent {
             .setCornerRadius(spec.style.border_radius.max(0.0));
         layer.base.setContentsScale(self.scale);
         layer.base.setZPosition(f64::from(spec.z_index) * 2.0 + 1.0);
-        if let Some(attributed) = attributed {
+        layer
+            .matched
+            .setFrame(NSRect::new(NSPoint::new(0.0, 0.0), frame.size));
+        layer.matched.setContentsScale(self.scale);
+        if let Some((base, matched, metrics)) = attributed {
             // SAFETY: NSMutableAttributedString is a documented CATextLayer
-            // string type. The setter copies it before the autorelease pool
-            // releases the temporary builder.
-            unsafe { layer.base.setString(Some(&attributed)) };
+            // string type. Both setters copy before the autorelease pool
+            // releases the temporary builders.
+            unsafe {
+                layer.base.setString(Some(&base));
+                layer.matched.setString(Some(&matched));
+            }
+            layer.metrics = metrics;
         }
+        layer.update_matched_prefix(spec.analysis.matched_utf16_len, frame.size);
         layer.configured = true;
     }
 
@@ -761,21 +860,55 @@ impl WindowContent {
 impl LabelLayers {
     fn new(parent: &CALayer, scale: f64) -> Self {
         let base = CATextLayer::layer();
+        let matched_clip = CALayer::new();
+        let matched = CATextLayer::layer();
         // SAFETY: QuartzCore exports this process-lifetime immutable
         // alignment-mode object on every supported macOS version.
         let center = unsafe { kCAAlignmentCenter };
         base.setAlignmentMode(center);
+        matched.setAlignmentMode(center);
         base.setWrapped(false);
+        matched.setWrapped(false);
         base.setContentsScale(scale);
+        matched.setContentsScale(scale);
+        matched.setBackgroundColor(None);
+        matched_clip.setMasksToBounds(true);
+        matched_clip.setBackgroundColor(None);
+        matched_clip.addSublayer(&matched);
+        base.addSublayer(&matched_clip);
         base.setHidden(true);
         parent.addSublayer(&base);
         Self {
             base,
+            matched_clip,
+            matched,
+            metrics: LabelTextMetrics::default(),
             configured: false,
         }
     }
 
+    fn update_matched_prefix(&self, matched_utf16_len: usize, frame: NSSize) {
+        self.matched_clip.setHidden(matched_utf16_len == 0);
+        if matched_utf16_len == 0 {
+            return;
+        }
+        let prefix_x = self
+            .metrics
+            .prefix_offsets
+            .iter()
+            .find(|offset| usize::try_from(offset.utf16_len) == Ok(matched_utf16_len))
+            .map_or(f64::from(self.metrics.width), |offset| f64::from(offset.x));
+        let text_origin = (frame.width - f64::from(self.metrics.width)) / 2.0;
+        let clip_width = (text_origin + prefix_x).clamp(0.0, frame.width);
+        self.matched_clip.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(clip_width, frame.height),
+        ));
+    }
+
     fn detach(self) {
+        self.matched.removeFromSuperlayer();
+        self.matched_clip.removeFromSuperlayer();
         self.base.removeFromSuperlayer();
     }
 }
@@ -870,7 +1003,6 @@ fn scene_changes(previous: Option<&OverlayScene>, current: &OverlayScene) -> Sce
 
 fn label_text_content_eq(previous: &OverlayLabel, current: &OverlayLabel) -> bool {
     previous.text == current.text
-        && previous.matched_prefix_len == current.matched_prefix_len
         && previous.style.font_size.to_bits() == current.style.font_size.to_bits()
         && previous.style.font_family == current.style.font_family
         && previous.style.bold == current.style.bold
@@ -878,31 +1010,44 @@ fn label_text_content_eq(previous: &OverlayLabel, current: &OverlayLabel) -> boo
         && previous.style.matched_text_color == current.style.matched_text_color
 }
 
-fn attributed_label_text(
+fn attributed_label_text_pair(
     text: &str,
     style: &LabelStyle,
     analysis: LabelTextAnalysis,
     font: &CTFont,
     foreground: &NSColor,
     matched_foreground: &NSColor,
-) -> Retained<NSMutableAttributedString> {
+) -> (
+    Retained<NSMutableAttributedString>,
+    Retained<NSMutableAttributedString>,
+) {
     let string = NSString::from_str(text);
     let attributed = NSMutableAttributedString::from_nsstring(&string);
     if analysis.utf16_len == 0 {
-        return attributed;
+        let immutable: &NSAttributedString = &attributed;
+        let matched = NSMutableAttributedString::initWithAttributedString(
+            NSMutableAttributedString::alloc(),
+            immutable,
+        );
+        return (attributed, matched);
     }
 
     let full_range = NSRange::new(0, analysis.utf16_len);
     let cocoa_font: &NSFont = font.as_ref();
     let baseline = NSNumber::numberWithDouble(macos_text_baseline_offset(style, analysis));
+    let zero = NSNumber::numberWithInteger(0);
     let font_object: &AnyObject = cocoa_font.as_ref();
     let foreground_object: &AnyObject = foreground.as_ref();
     let matched_foreground_object: &AnyObject = matched_foreground.as_ref();
     let baseline_number: &NSNumber = &baseline;
     let baseline_object: &AnyObject = baseline_number.as_ref();
-    // SAFETY: each AppKit attribute receives its documented object type and
-    // both ranges were derived from this exact string's UTF-16 length.
-    unsafe {
+    let zero_number: &NSNumber = &zero;
+    let zero_object: &AnyObject = zero_number.as_ref();
+    // SAFETY: every AppKit attribute receives its documented object type and
+    // all ranges were derived from this exact string's UTF-16 length. The
+    // mutable copy is created after the shared layout attributes are applied,
+    // then only its foreground color is replaced.
+    let matched = unsafe {
         attributed.addAttribute_value_range(NSFontAttributeName, font_object, full_range);
         attributed.addAttribute_value_range(
             NSForegroundColorAttributeName,
@@ -914,15 +1059,101 @@ fn attributed_label_text(
             baseline_object,
             full_range,
         );
-        if analysis.matched_utf16_len > 0 {
-            attributed.addAttribute_value_range(
-                NSForegroundColorAttributeName,
-                matched_foreground_object,
-                NSRange::new(0, analysis.matched_utf16_len),
-            );
-        }
+        // Hint codes are key sequences rather than prose. Disabling ligature
+        // and kerning substitutions makes every UTF-16 prefix a stable glyph
+        // boundary shared by the full text and its measured substring.
+        attributed.addAttribute_value_range(NSLigatureAttributeName, zero_object, full_range);
+        attributed.addAttribute_value_range(NSKernAttributeName, zero_object, full_range);
+        let immutable: &NSAttributedString = &attributed;
+        let matched = NSMutableAttributedString::initWithAttributedString(
+            NSMutableAttributedString::alloc(),
+            immutable,
+        );
+        matched.addAttribute_value_range(
+            NSForegroundColorAttributeName,
+            matched_foreground_object,
+            full_range,
+        );
+        matched
+    };
+    (attributed, matched)
+}
+
+fn label_text_metrics(attributed: &NSMutableAttributedString, text: &str) -> LabelTextMetrics {
+    let immutable: &NSAttributedString = attributed;
+    let width = immutable.size().width.max(0.0) as f32;
+    let mut prefix_offsets = SmallVec::new();
+    let mut utf16_len = 0usize;
+    for character in text.chars() {
+        utf16_len += character.len_utf16();
+        let prefix = immutable.attributedSubstringFromRange(NSRange::new(0, utf16_len));
+        let Ok(compact_len) = u32::try_from(utf16_len) else {
+            break;
+        };
+        let x = prefix.size().width.max(0.0) as f32;
+        prefix_offsets.push(PrefixOffset {
+            utf16_len: compact_len,
+            x,
+        });
     }
-    attributed
+    LabelTextMetrics {
+        width,
+        prefix_offsets,
+    }
+}
+
+fn label_identity(label: &OverlayLabel) -> LabelIdentity<'_> {
+    LabelIdentity {
+        text: &label.text,
+        x: label.rect.x.to_bits(),
+        y: label.rect.y.to_bits(),
+        width: label.rect.width.to_bits(),
+        height: label.rect.height.to_bits(),
+    }
+}
+
+fn matched_previous_indices(
+    previous: &[OverlayLabel],
+    current: &[OverlayLabel],
+    old_count: usize,
+) -> SmallVec<[Option<usize>; 128]> {
+    let mut matched = SmallVec::new();
+    matched.resize(current.len(), None);
+    let previous_limit = previous.len().min(old_count);
+    let mut previous_cursor = 0;
+    let remains_in_order = current.iter().enumerate().all(|(current_index, label)| {
+        while previous_cursor < previous_limit
+            && label_identity(&previous[previous_cursor]) != label_identity(label)
+        {
+            previous_cursor += 1;
+        }
+        if previous_cursor == previous_limit {
+            return false;
+        }
+        matched[current_index] = Some(previous_cursor);
+        previous_cursor += 1;
+        true
+    });
+    if remains_in_order {
+        return matched;
+    }
+
+    matched.fill(None);
+    let mut previous_by_identity: HashMap<LabelIdentity<'_>, SmallVec<[usize; 2]>> =
+        HashMap::with_capacity(previous_limit);
+    for (index, label) in previous.iter().take(previous_limit).enumerate() {
+        previous_by_identity
+            .entry(label_identity(label))
+            .or_default()
+            .push(index);
+    }
+    for (index, label) in current.iter().enumerate() {
+        let Some(candidates) = previous_by_identity.get_mut(&label_identity(label)) else {
+            continue;
+        };
+        matched[index] = candidates.pop();
+    }
+    matched
 }
 
 #[inline]
@@ -1194,7 +1425,7 @@ mod tests {
     }
 
     #[test]
-    fn label_text_cache_ignores_geometry_but_tracks_paint_changes() {
+    fn label_text_cache_ignores_prefix_geometry_and_z_but_tracks_paint_changes() {
         let first = OverlayLabel::new(
             "aff",
             Rect::new(0.0, 0.0, 30.0, 20.0),
@@ -1206,6 +1437,48 @@ mod tests {
         assert!(label_text_content_eq(&first, &moved));
 
         moved.matched_prefix_len = 1;
+        moved.z_index = 99;
+        assert!(label_text_content_eq(&first, &moved));
+
+        moved.style.matched_text_color = Color::rgb(9, 8, 7);
         assert!(!label_text_content_eq(&first, &moved));
+    }
+
+    #[test]
+    fn label_identity_survives_prefix_and_overlap_z_changes() {
+        let first = OverlayLabel::new(
+            "adj",
+            Rect::new(10.0, 20.0, 30.0, 24.0),
+            LabelStyle::default(),
+        );
+        let mut raised = first.clone();
+        raised.matched_prefix_len = 2;
+        raised.z_index = 3;
+        assert_eq!(label_identity(&first), label_identity(&raised));
+
+        raised.rect.y += 1.0;
+        assert_ne!(label_identity(&first), label_identity(&raised));
+    }
+
+    #[test]
+    fn native_slots_follow_filtered_and_overlap_reordered_labels() {
+        let label = |text: &str, x: f64| {
+            OverlayLabel::new(text, Rect::new(x, 20.0, 30.0, 24.0), LabelStyle::default())
+        };
+        let previous = vec![label("aa", 10.0), label("ab", 20.0), label("ac", 30.0)];
+        let mut filtered = vec![previous[0].clone(), previous[2].clone()];
+        filtered[0].matched_prefix_len = 1;
+        filtered[1].matched_prefix_len = 1;
+        assert_eq!(
+            matched_previous_indices(&previous, &filtered, previous.len()).as_slice(),
+            [Some(0), Some(2)]
+        );
+
+        filtered.swap(0, 1);
+        filtered[0].z_index = 3;
+        assert_eq!(
+            matched_previous_indices(&previous, &filtered, previous.len()).as_slice(),
+            [Some(2), Some(0)]
+        );
     }
 }
