@@ -435,10 +435,7 @@ impl HintMode {
         {
             self.hints.clear();
         }
-        self.overlap_plan.clear();
-        if !self.scanning && !self.held_overlap_keys.is_empty() {
-            self.rebuild_overlap_plan(ctx);
-        }
+        self.refresh_overlap_plan(ctx);
     }
 
     fn rebuild_overlap_plan(&mut self, ctx: &HostContext<'_>) {
@@ -446,9 +443,18 @@ impl HintMode {
         let rects: SmallVec<[Rect; 128]> = self
             .hints
             .iter()
+            .filter(|hint| self.hint_is_visible(hint))
             .map(|hint| placed_hint_rect(&self.config, hint, &style))
             .collect();
         build_overlap_plan(&rects, &mut self.overlap_plan);
+    }
+
+    fn refresh_overlap_plan(&mut self, ctx: &HostContext<'_>) {
+        if self.scanning {
+            self.overlap_plan.clear();
+        } else {
+            self.rebuild_overlap_plan(ctx);
+        }
     }
 
     fn hint_is_visible(&self, hint: &CompactHint<usize>) -> bool {
@@ -714,6 +720,8 @@ impl HintMode {
                 }
                 if matches!(self.input, Input::Search(_)) {
                     self.relabel(ctx);
+                } else {
+                    self.refresh_overlap_plan(ctx);
                 }
                 return self.redraw(ctx);
             }
@@ -748,7 +756,10 @@ impl HintMode {
                 typed.push(ch);
                 match match_compact_input(&self.hints, typed) {
                     Match::Complete(index) => self.select(index),
-                    Match::Partial { .. } => self.redraw(ctx),
+                    Match::Partial { .. } => {
+                        self.refresh_overlap_plan(ctx);
+                        self.redraw(ctx)
+                    }
                     // Dead end: drop the character and keep the hints up.
                     Match::None => {
                         if let Input::Labels(typed) = &mut self.input {
@@ -1460,6 +1471,58 @@ mod tests {
     }
 
     #[test]
+    fn typed_prefix_rebuilds_overlap_layers_for_visible_labels() {
+        let env = Env::new();
+        let mut mode = HintMode::new(&env.config);
+        activate(&mut mode, &env);
+        deliver(
+            &mut mode,
+            &env,
+            (0..30)
+                .map(|index| target(&format!("Target {index}"), 100.0))
+                .collect(),
+        );
+        let total = mode.hints.len();
+        let prefix = mode
+            .alphabet
+            .iter()
+            .copied()
+            .find(|prefix| {
+                let prefix = prefix.to_string();
+                mode.hints
+                    .iter()
+                    .filter(|hint| hint.label.starts_with(&prefix))
+                    .count()
+                    > 1
+                    && mode.hints.iter().all(|hint| hint.label != prefix)
+            })
+            .expect("test data should produce a partial prefix");
+
+        let filtered = press(&mut mode, &env, &prefix.to_string());
+        let visible = scene_of(&filtered).labels.len();
+        assert!(visible > 1 && visible < total);
+        assert!(mode.overlap_plan.ready);
+        assert_eq!(mode.overlap_plan.layers.len(), visible);
+        assert_eq!(usize::from(mode.overlap_plan.layer_count), visible);
+
+        let cycled = press(&mut mode, &env, "left_shift");
+        assert_eq!(scene_of(&cycled).labels.len(), visible);
+        assert_eq!(
+            scene_of(&cycled)
+                .labels
+                .iter()
+                .filter(|label| label.z_index == 3)
+                .count(),
+            1
+        );
+        release(&mut mode, &env, "left_shift");
+
+        let restored = press(&mut mode, &env, "backspace");
+        assert_eq!(scene_of(&restored).labels.len(), total);
+        assert_eq!(mode.overlap_plan.layers.len(), total);
+    }
+
+    #[test]
     fn matched_prefix_color_defaults_inside_ui_hint_and_allows_an_override() {
         let env = Env::new();
         let mut mode = HintMode::new(&env.config);
@@ -2160,6 +2223,35 @@ mod tests {
         assert!(
             scene_of(&out).labels.iter().any(|l| l.text == "/c"),
             "search box missing"
+        );
+    }
+
+    #[test]
+    fn name_search_rebuilds_overlap_layers_for_each_query() {
+        let env = Env::new();
+        let mut mode = HintMode::new(&env.config);
+        activate(&mut mode, &env);
+        deliver(
+            &mut mode,
+            &env,
+            vec![target("Save", 100.0), target("Cancel", 100.0)],
+        );
+
+        press(&mut mode, &env, "/");
+        let filtered = press(&mut mode, &env, "a");
+        assert_eq!(mode.hints.len(), 2);
+        assert_eq!(mode.overlap_plan.layers.len(), 2);
+        // Two hint labels plus the search input label.
+        assert_eq!(scene_of(&filtered).labels.len(), 3);
+
+        let cycled = press(&mut mode, &env, "left_shift");
+        assert_eq!(
+            scene_of(&cycled)
+                .labels
+                .iter()
+                .filter(|label| label.z_index == 3)
+                .count(),
+            1
         );
     }
 

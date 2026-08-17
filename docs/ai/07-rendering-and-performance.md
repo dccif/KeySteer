@@ -134,7 +134,8 @@ UI Hint 按需为目标名缓存一次 lowercase 结果；退出后立即 drop �
 开销。计划每标签只保留一个 `u8` 层号，128 项占 128 B；重复 Shift 只线性更新 z-index，不重新排序
 或分组。overlap 工作表使用 inline 128 的 `SmallVec`，层占用使用 4 个 `u64` 的固定 bitset；
 常见场景不产生临时堆分配，超出 128 项仍安全 spill；退出 UI Hint 后清空请求级计划。Shift
-前后只允许 z-index 改变。
+前后只允许 z-index 改变。扫描结束后的Hint前缀、Backspace或名称查询改变可见集合时，输入
+事件会从当前可见标签重建一次计划，后续Shift继续只执行缓存的线性z-index更新。
 
 ## 帧时钟
 
