@@ -158,24 +158,6 @@ impl Default for LabelStyle {
 }
 
 impl LabelStyle {
-    /// Optical correction for font metrics that make a mathematically centred
-    /// line look low inside a compact label. Descenders need one extra unit.
-    pub(crate) fn optical_text_offset_y(&self, text: &str) -> f64 {
-        const REFERENCE_FONT_SIZE: f64 = 17.0;
-        const REFERENCE_BASE_SHIFT: f64 = 1.0;
-        const REFERENCE_DESCENDER_EXTRA_SHIFT: f64 = 1.0;
-
-        let descender_shift = if text
-            .bytes()
-            .any(|character| matches!(character, b'g' | b'j' | b'p' | b'q' | b'y'))
-        {
-            REFERENCE_DESCENDER_EXTRA_SHIFT
-        } else {
-            0.0
-        };
-        -self.font_size * (REFERENCE_BASE_SHIFT + descender_shift) / REFERENCE_FONT_SIZE
-    }
-
     /// Scale text and its surrounding metrics to occupy at most 80% of `rect`.
     /// The estimate deliberately matches the cross-platform label layout used
     /// by the overlay backends, so nested grid labels remain inside their cell.
@@ -201,6 +183,57 @@ impl LabelStyle {
 
     pub fn fit_to(&self, text: &str, rect: Rect) -> Self {
         self.scaled(self.fit_scale(text, rect))
+    }
+}
+
+/// Allocation-free text facts shared by native overlay renderers.
+///
+/// The public prefix length is measured in Unicode scalar values, while both
+/// DirectWrite and attributed Cocoa text use UTF-16 ranges. Keeping this
+/// conversion here prevents platform implementations from drifting apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LabelTextAnalysis {
+    pub(crate) utf16_len: usize,
+    pub(crate) matched_utf16_len: usize,
+    pub(crate) has_descender: bool,
+}
+
+impl LabelTextAnalysis {
+    pub(crate) const REFERENCE_FONT_SIZE: f64 = 17.0;
+
+    #[inline]
+    pub(crate) fn analyze(text: &str, matched_prefix_len: usize) -> Self {
+        if text.is_ascii() {
+            return Self {
+                utf16_len: text.len(),
+                matched_utf16_len: matched_prefix_len.min(text.len()),
+                has_descender: text
+                    .bytes()
+                    .any(|character| matches!(character, b'g' | b'j' | b'p' | b'q' | b'y')),
+            };
+        }
+
+        let mut utf16_len = 0usize;
+        let mut matched_utf16_len = 0usize;
+        let mut has_descender = false;
+        for (index, character) in text.chars().enumerate() {
+            let character_len = character.len_utf16();
+            utf16_len += character_len;
+            if index < matched_prefix_len {
+                matched_utf16_len += character_len;
+            }
+            has_descender |= matches!(character, 'g' | 'j' | 'p' | 'q' | 'y');
+        }
+        Self {
+            utf16_len,
+            matched_utf16_len,
+            has_descender,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn scaled_units(self, font_size: f64, units: f64) -> f64 {
+        font_size * units / Self::REFERENCE_FONT_SIZE
     }
 }
 
@@ -235,6 +268,11 @@ impl OverlayLabel {
     pub fn with_matched_prefix(mut self, len: usize) -> Self {
         self.matched_prefix_len = len.min(self.text.chars().count());
         self
+    }
+
+    #[inline]
+    pub(crate) fn text_analysis(&self) -> LabelTextAnalysis {
+        LabelTextAnalysis::analyze(&self.text, self.matched_prefix_len)
     }
 
     pub fn with_z_index(mut self, z: i32) -> Self {
@@ -572,21 +610,37 @@ mod tests {
     }
 
     #[test]
-    fn all_text_is_optically_centred_and_descenders_move_one_extra_unit() {
-        let style = LabelStyle {
-            font_size: 17.0,
-            ..Default::default()
-        };
+    fn label_text_analysis_uses_exact_utf16_ranges_without_allocating() {
+        assert_eq!(
+            LabelTextAnalysis::analyze("aag", 2),
+            LabelTextAnalysis {
+                utf16_len: 3,
+                matched_utf16_len: 2,
+                has_descender: true,
+            }
+        );
+        assert_eq!(
+            LabelTextAnalysis::analyze("中😀y", 2),
+            LabelTextAnalysis {
+                utf16_len: 4,
+                matched_utf16_len: 3,
+                has_descender: true,
+            }
+        );
+        assert_eq!(
+            LabelTextAnalysis::analyze("中文", usize::MAX),
+            LabelTextAnalysis {
+                utf16_len: 2,
+                matched_utf16_len: 2,
+                has_descender: false,
+            }
+        );
+        for descender in ["g", "j", "p", "q", "y"] {
+            assert!(LabelTextAnalysis::analyze(descender, 0).has_descender);
+        }
 
-        assert_eq!(style.optical_text_offset_y("aaf"), -1.0);
-        assert_eq!(style.optical_text_offset_y("中文"), -1.0);
-        assert_eq!(style.optical_text_offset_y("aag"), -2.0);
-
-        let large = LabelStyle {
-            font_size: 80.0,
-            ..Default::default()
-        };
-        assert!((large.optical_text_offset_y("ssj") + 160.0 / 17.0).abs() < f64::EPSILON);
+        let analysis = LabelTextAnalysis::analyze("ssj", 0);
+        assert!((analysis.scaled_units(80.0, 2.0) - 160.0 / 17.0).abs() < f64::EPSILON);
     }
 
     #[test]

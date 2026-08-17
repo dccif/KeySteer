@@ -1,10 +1,16 @@
 # 更新日志 / Release Notes
 
+## 0.9.4
+
+跨平台 UI Hint 统一使用零分配文字分析和精确前缀高亮；macOS 同时校正文字垂直位置，并以单层渲染减少原生图层与内存开销。
+
+Cross-platform UI Hint now shares allocation-free text analysis and exact prefix highlighting, while macOS gains corrected vertical positioning and a single-layer renderer with lower native-layer and memory overhead.
+
 ## 0.9.3
 
-UI Hint 标签进一步收紧边距并校正文字垂直居中，输入前缀现在按实际字符范围精确变色，避免窄字母高亮残缺或溢出。
+UI Hint 标签进一步收紧边距并校正跨平台文字垂直居中，输入前缀现在按实际字符范围精确变色；macOS 同时减少每个标签的原生图层，避免窄字母高亮残缺或溢出。
 
-UI Hint labels now use tighter spacing and improved vertical centering, while typed prefixes are colored by their exact character ranges to prevent incomplete or overflowing highlights.
+UI Hint labels now use tighter spacing and improved cross-platform vertical centering, while exact typed-prefix coloring on macOS also uses fewer native layers to prevent incomplete or overflowing highlights.
 
 ## 0.9.2
 

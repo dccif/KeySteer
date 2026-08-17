@@ -107,8 +107,11 @@ working set、private bytes、handle 和 thread 数。
   `NSPanel`/root view/root layer frame；已显示的 panel 不重复 `orderFrontRegardless`。
 - cursor 的内容与中心点分开缓存，普通移动只写一次 frame。indicator 使用独立容器 layer，
   普通移动只写容器 frame；文字、held、样式、尺寸或 Retina scale 改变才配置内部文字层。
-- CALayer/CATextLayer 按当前 scene 所需槽位复用，文字内容不变时不重新创建 `NSString`；
-  scene 缩小时，多余 shape 会从 root layer 移除，多余 label 会先断开 mask、子层与父层再释放。
+- CALayer/CATextLayer 按当前 scene 所需槽位复用。每个标签只使用一个 attributed
+  `CATextLayer`；普通颜色、准确的 UTF-16 输入前缀颜色与平台基线补偿在同一个文字对象中完成，
+  不再保留第二个文字层、比例 mask 或重复 Rust String。公共层一次无分配分析 UTF-16 范围和
+  下伸字母，Windows/macOS 只应用各自的垂直策略；位置、背景或边框变化不会重建文字对象。
+  scene 缩小时，多余 shape 与 label 会从父层移除并释放。
   因此 Grid 首屏的二级预览层不会在返回 Normal 后继续成为常驻高水位缓存。
 - 所有属性更新放在禁用隐式动画的 `CATransaction` 中，避免输入后出现动画拖尾。
 - 每次 present/dismiss 都有独立 autorelease pool，AppKit/QuartzCore 的临时对象不会依赖

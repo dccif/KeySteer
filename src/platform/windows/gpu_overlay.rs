@@ -46,7 +46,8 @@ use windows_numerics::Vector2;
 
 use crate::api::geometry::{Point, Rect};
 use crate::api::overlay::{
-    Color, CursorMarker, Indicator, LabelStyle, OverlayLabel, OverlayScene, OverlayShape,
+    Color, CursorMarker, Indicator, LabelStyle, LabelTextAnalysis, OverlayLabel, OverlayScene,
+    OverlayShape,
 };
 
 use super::native::{NativeDimensions, OwnedWindow};
@@ -687,11 +688,17 @@ impl GpuOverlay {
                         &indicator.text,
                         first,
                         &indicator.style,
-                        0,
+                        LabelTextAnalysis::analyze(&indicator.text, 0),
                         origin,
                     )?;
                     if let (Some(text), Some(rect)) = (&indicator.held_text, held) {
-                        renderer.draw_label_parts(text, rect, &indicator.style, 0, origin)?;
+                        renderer.draw_label_parts(
+                            text,
+                            rect,
+                            &indicator.style,
+                            LabelTextAnalysis::analyze(text, 0),
+                            origin,
+                        )?;
                     }
                     Ok(())
                 },
@@ -751,7 +758,7 @@ impl GpuOverlay {
             &label.text,
             label.rect,
             &label.style,
-            label.matched_prefix_len,
+            label.text_analysis(),
             origin,
         )
     }
@@ -761,7 +768,7 @@ impl GpuOverlay {
         text: &str,
         label_rect: Rect,
         style: &LabelStyle,
-        matched_prefix_len: usize,
+        analysis: LabelTextAnalysis,
         origin: Point,
     ) -> Result<(), String> {
         let mut rect = local_rect(label_rect, origin);
@@ -780,18 +787,14 @@ impl GpuOverlay {
             // SAFETY: drawing is active and both objects are live.
             draw_rounded_rectangle(&self.d2d, &rounded, &brush, style.border_width as f32);
         }
-        let text_offset_y = style.optical_text_offset_y(text) as f32;
+        let text_offset_y = super::label_text_offset_y(style, analysis) as f32;
         rect.top += text_offset_y;
         rect.bottom += text_offset_y;
         let format = self.text_format(style)?;
         let normal = self.brush(style.text_color)?;
         self.utf16.clear();
         self.utf16.extend(text.encode_utf16());
-        let prefix_utf16_len = text
-            .chars()
-            .take(matched_prefix_len)
-            .map(char::len_utf16)
-            .sum::<usize>();
+        let prefix_utf16_len = analysis.matched_utf16_len;
         if prefix_utf16_len > 0 && !style.matched_text_color.is_transparent() {
             let matched_brush = self.brush(style.matched_text_color)?;
             let layout_origin = Vector2 {

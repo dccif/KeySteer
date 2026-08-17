@@ -467,7 +467,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "keysteer"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "base64",
  "cc",
@@ -624,6 +624,7 @@ dependencies = [
  "objc2",
  "objc2-core-foundation",
  "objc2-core-graphics",
+ "objc2-core-text",
  "objc2-foundation",
  "objc2-quartz-core",
 ]
@@ -660,6 +661,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cde0dfb48d25d2b4862161a4d5fcc0e3c24367869ad306b0c9ec0073bfed92d"
 dependencies = [
  "bitflags",
+ "objc2",
  "objc2-core-foundation",
  "objc2-core-graphics",
 ]

@@ -9,20 +9,25 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use objc2::rc::{Retained, autoreleasepool};
+use objc2::runtime::AnyObject;
 use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSBackingStoreType, NSColor, NSPanel, NSScreenSaverWindowLevel, NSView,
+    NSBackingStoreType, NSBaselineOffsetAttributeName, NSColor, NSFont, NSFontAttributeName,
+    NSForegroundColorAttributeName, NSPanel, NSScreenSaverWindowLevel, NSView,
     NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_core_foundation::{CFRetained, CFString};
 use objc2_core_graphics::{CGColor, CGMutablePath};
 use objc2_core_text::{CTFont, CTFontSymbolicTraits, CTFontUIFontType};
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{
+    NSMutableAttributedString, NSNumber, NSPoint, NSRange, NSRect, NSSize, NSString,
+};
 use objc2_quartz_core::{CALayer, CAShapeLayer, CATextLayer, CATransaction, kCAAlignmentCenter};
 
 use crate::api::geometry::{Point, Rect, Screen};
 use crate::api::overlay::{
-    Color, CursorMarker, Indicator, LabelStyle, OverlayLabel, OverlayScene, OverlayShape,
+    Color, CursorMarker, Indicator, LabelStyle, LabelTextAnalysis, OverlayLabel, OverlayScene,
+    OverlayShape,
 };
 
 const MAX_CACHED_COLORS: usize = 64;
@@ -47,16 +52,20 @@ struct WindowContent {
     indicator_root: Retained<CALayer>,
     indicator_labels: Vec<LabelLayers>,
     indicator_size: (f64, f64),
-    colors: HashMap<u32, Retained<CGColor>>,
+    colors: HashMap<u32, CachedColor>,
     fonts: Vec<FontEntry>,
     scale: f64,
 }
 
 struct LabelLayers {
     base: Retained<CATextLayer>,
-    matched: Retained<CATextLayer>,
-    mask: Retained<CALayer>,
-    text: String,
+    configured: bool,
+}
+
+#[derive(Clone)]
+struct CachedColor {
+    cocoa: Retained<NSColor>,
+    core_graphics: Retained<CGColor>,
 }
 
 struct FontEntry {
@@ -70,7 +79,7 @@ struct LabelSpec<'a> {
     text: &'a str,
     rect: Rect,
     style: &'a LabelStyle,
-    matched_prefix_len: usize,
+    analysis: LabelTextAnalysis,
     z_index: i32,
 }
 
@@ -195,7 +204,7 @@ impl Overlay {
                 .ok_or("macOS overlay window was not retained after creation")?;
             let _transaction = DisabledActions::begin();
             if changes.static_content {
-                content.update_static(scene.as_ref(), area);
+                content.update_static(self.scene.as_deref(), scene.as_ref(), area);
             }
             content.update_dynamic(scene.as_ref(), area, changes);
             if !was_visible {
@@ -342,9 +351,10 @@ impl Default for Overlay {
 }
 
 impl WindowContent {
-    fn update_static(&mut self, scene: &OverlayScene, area: Rect) {
+    fn update_static(&mut self, previous: Option<&OverlayScene>, scene: &OverlayScene, area: Rect) {
         let backdrop = scene.backdrop.map(|color| self.color(color));
-        self.root_layer.setBackgroundColor(backdrop.as_deref());
+        self.root_layer
+            .setBackgroundColor(backdrop.as_ref().map(|color| color.core_graphics.as_ref()));
         self.trim_shapes(scene.shapes.len());
         self.ensure_shapes(scene.shapes.len());
         for (index, shape) in scene.shapes.iter().enumerate() {
@@ -357,14 +367,17 @@ impl WindowContent {
         self.trim_labels(scene.labels.len());
         self.ensure_labels(scene.labels.len());
         for (index, label) in scene.labels.iter().enumerate() {
+            let rebuild_text = previous
+                .and_then(|scene| scene.labels.get(index))
+                .is_none_or(|previous| !label_text_content_eq(previous, label));
             let spec = LabelSpec {
                 text: &label.text,
                 rect: effective_label_rect(label),
                 style: &label.style,
-                matched_prefix_len: label.matched_prefix_len,
+                analysis: label.text_analysis(),
                 z_index: label.z_index,
             };
-            self.configure_label(LabelSlot::Static(index), spec, area);
+            self.configure_label(LabelSlot::Static(index), spec, area, rebuild_text);
         }
     }
 
@@ -396,9 +409,8 @@ impl WindowContent {
 
     fn ensure_labels(&mut self, count: usize) {
         while self.labels.len() < count {
-            let opaque = self.color(Color::rgb(0, 0, 0));
             self.labels
-                .push(LabelLayers::new(&self.root_layer, self.scale, &opaque));
+                .push(LabelLayers::new(&self.root_layer, self.scale));
         }
     }
 
@@ -408,8 +420,7 @@ impl WindowContent {
 
     fn ensure_indicator_labels(&mut self, count: usize) {
         while self.indicator_labels.len() < count {
-            let opaque = self.color(Color::rgb(0, 0, 0));
-            let label = LabelLayers::new(&self.indicator_root, self.scale, &opaque);
+            let label = LabelLayers::new(&self.indicator_root, self.scale);
             self.indicator_labels.push(label);
         }
     }
@@ -454,8 +465,8 @@ impl WindowContent {
                     (!stroke.is_transparent() && *stroke_width > 0.0).then(|| self.color(*stroke));
                 layer.setPath(None);
                 layer.setFrame(to_window_rect(*rect, area));
-                layer.setBackgroundColor(fill.as_deref());
-                layer.setBorderColor(stroke.as_deref());
+                layer.setBackgroundColor(fill.as_ref().map(|color| color.core_graphics.as_ref()));
+                layer.setBorderColor(stroke.as_ref().map(|color| color.core_graphics.as_ref()));
                 layer.setBorderWidth(if stroke.is_some() {
                     stroke_width.max(0.0)
                 } else {
@@ -496,7 +507,7 @@ impl WindowContent {
                 layer.setBorderWidth(0.0);
                 layer.setCornerRadius(0.0);
                 layer.setFillColor(None);
-                layer.setStrokeColor(Some(&stroke));
+                layer.setStrokeColor(Some(&stroke.core_graphics));
                 layer.setLineWidth(width.max(0.0));
                 layer.setPath(Some(&path));
                 layer.setZPosition(f64::from(*z_index) * 2.0);
@@ -504,14 +515,35 @@ impl WindowContent {
         }
     }
 
-    fn configure_label(&mut self, slot: LabelSlot, spec: LabelSpec<'_>, area: Rect) {
+    fn configure_label(
+        &mut self,
+        slot: LabelSlot,
+        spec: LabelSpec<'_>,
+        area: Rect,
+        rebuild_text: bool,
+    ) {
+        let configured = match slot {
+            LabelSlot::Static(index) => self.labels[index].configured,
+            LabelSlot::Indicator(index) => self.indicator_labels[index].configured,
+        };
+        let rebuild_text = rebuild_text || !configured;
         let background =
             (!spec.style.background.is_transparent()).then(|| self.color(spec.style.background));
         let border = (!spec.style.border_color.is_transparent() && spec.style.border_width > 0.0)
             .then(|| self.color(spec.style.border_color));
-        let foreground = self.color(spec.style.text_color);
-        let matched_foreground = self.color(spec.style.matched_text_color);
-        let font = self.font(spec.style);
+        let attributed = rebuild_text.then(|| {
+            let foreground = self.color(spec.style.text_color);
+            let matched_foreground = self.color(spec.style.matched_text_color);
+            let font = self.font(spec.style);
+            attributed_label_text(
+                spec.text,
+                spec.style,
+                spec.analysis,
+                &font,
+                &foreground.cocoa,
+                &matched_foreground.cocoa,
+            )
+        });
         let layer = match slot {
             LabelSlot::Static(index) => &mut self.labels[index],
             LabelSlot::Indicator(index) => &mut self.indicator_labels[index],
@@ -519,8 +551,14 @@ impl WindowContent {
         let frame = to_window_rect(spec.rect, area);
         layer.base.setHidden(false);
         layer.base.setFrame(frame);
-        layer.base.setBackgroundColor(background.as_deref());
-        layer.base.setBorderColor(border.as_deref());
+        layer.base.setBackgroundColor(
+            background
+                .as_ref()
+                .map(|color| color.core_graphics.as_ref()),
+        );
+        layer
+            .base
+            .setBorderColor(border.as_ref().map(|color| color.core_graphics.as_ref()));
         layer.base.setBorderWidth(if border.is_some() {
             spec.style.border_width.max(0.0)
         } else {
@@ -529,48 +567,15 @@ impl WindowContent {
         layer
             .base
             .setCornerRadius(spec.style.border_radius.max(0.0));
-        layer.base.setForegroundColor(Some(&foreground));
-        // SAFETY: CTFont is a documented CATextLayer font type. The layer
-        // retains it and the cache also owns a CFRetained reference.
-        unsafe {
-            layer.base.setFont(Some(&font));
-            layer.matched.setFont(Some(&font));
-        }
-        layer.base.setFontSize(spec.style.font_size.max(1.0));
         layer.base.setContentsScale(self.scale);
         layer.base.setZPosition(f64::from(spec.z_index) * 2.0 + 1.0);
-
-        layer
-            .matched
-            .setFrame(NSRect::new(NSPoint::new(0.0, 0.0), frame.size));
-        layer.matched.setForegroundColor(Some(&matched_foreground));
-        layer.matched.setFontSize(spec.style.font_size.max(1.0));
-        layer.matched.setContentsScale(self.scale);
-        layer.matched.setBackgroundColor(None);
-        if layer.text != spec.text {
-            let string = NSString::from_str(spec.text);
-            // SAFETY: NSString is one of CATextLayer's documented string
-            // object types and is copied by the property setter.
-            unsafe {
-                layer.base.setString(Some(&string));
-                layer.matched.setString(Some(&string));
-            }
-            layer.text.clear();
-            layer.text.push_str(spec.text);
+        if let Some(attributed) = attributed {
+            // SAFETY: NSMutableAttributedString is a documented CATextLayer
+            // string type. The setter copies it before the autorelease pool
+            // releases the temporary builder.
+            unsafe { layer.base.setString(Some(&attributed)) };
         }
-
-        let total = spec.text.chars().count().max(1);
-        let matched = spec.matched_prefix_len.min(total);
-        layer.matched.setHidden(matched == 0);
-        if matched > 0 {
-            layer.mask.setFrame(NSRect::new(
-                NSPoint::new(0.0, 0.0),
-                NSSize::new(
-                    frame.size.width * matched as f64 / total as f64,
-                    frame.size.height,
-                ),
-            ));
-        }
+        layer.configured = true;
     }
 
     fn configure_cursor(
@@ -595,8 +600,10 @@ impl WindowContent {
             let fill = (!marker.fill.is_transparent()).then(|| self.color(marker.fill));
             let stroke = (!marker.stroke.is_transparent() && marker.stroke_width > 0.0)
                 .then(|| self.color(marker.stroke));
-            self.cursor.setBackgroundColor(fill.as_deref());
-            self.cursor.setBorderColor(stroke.as_deref());
+            self.cursor
+                .setBackgroundColor(fill.as_ref().map(|color| color.core_graphics.as_ref()));
+            self.cursor
+                .setBorderColor(stroke.as_ref().map(|color| color.core_graphics.as_ref()));
             self.cursor.setBorderWidth(if stroke.is_some() {
                 marker.stroke_width.max(0.0)
             } else {
@@ -636,10 +643,11 @@ impl WindowContent {
                     text: &indicator.text,
                     rect: main,
                     style: &indicator.style,
-                    matched_prefix_len: 0,
+                    analysis: LabelTextAnalysis::analyze(&indicator.text, 0),
                     z_index: 0,
                 },
                 local_area,
+                true,
             );
             if let (Some(text), Some(rect)) = (&indicator.held_text, held) {
                 self.configure_label(
@@ -648,10 +656,11 @@ impl WindowContent {
                         text,
                         rect,
                         style: &indicator.style,
-                        matched_prefix_len: 0,
+                        analysis: LabelTextAnalysis::analyze(text, 0),
                         z_index: 1,
                     },
                     local_area,
+                    true,
                 );
             }
             self.indicator_root.setContentsScale(self.scale);
@@ -668,7 +677,7 @@ impl WindowContent {
         self.indicator_root.setFrame(to_window_rect(frame, area));
     }
 
-    fn color(&mut self, color: Color) -> Retained<CGColor> {
+    fn color(&mut self, color: Color) -> CachedColor {
         let key = u32::from_be_bytes([color.r, color.g, color.b, color.a]);
         if let Some(cached) = self.colors.get(&key) {
             return cached.clone();
@@ -676,15 +685,18 @@ impl WindowContent {
         if self.colors.len() >= MAX_CACHED_COLORS {
             self.colors.clear();
         }
-        let color = NSColor::colorWithSRGBRed_green_blue_alpha(
+        let cocoa = NSColor::colorWithSRGBRed_green_blue_alpha(
             f64::from(color.r) / 255.0,
             f64::from(color.g) / 255.0,
             f64::from(color.b) / 255.0,
             f64::from(color.a) / 255.0,
-        )
-        .CGColor();
-        self.colors.insert(key, color.clone());
-        color
+        );
+        let cached = CachedColor {
+            core_graphics: cocoa.CGColor(),
+            cocoa,
+        };
+        self.colors.insert(key, cached.clone());
+        cached
     }
 
     fn font(&mut self, style: &LabelStyle) -> CFRetained<CTFont> {
@@ -747,39 +759,23 @@ impl WindowContent {
 }
 
 impl LabelLayers {
-    fn new(parent: &CALayer, scale: f64, opaque: &CGColor) -> Self {
+    fn new(parent: &CALayer, scale: f64) -> Self {
         let base = CATextLayer::layer();
-        let matched = CATextLayer::layer();
-        let mask = CALayer::new();
         // SAFETY: QuartzCore exports this process-lifetime immutable
         // alignment-mode object on every supported macOS version.
         let center = unsafe { kCAAlignmentCenter };
         base.setAlignmentMode(center);
-        matched.setAlignmentMode(center);
         base.setWrapped(false);
-        matched.setWrapped(false);
         base.setContentsScale(scale);
-        matched.setContentsScale(scale);
-        mask.setBackgroundColor(Some(opaque));
-        // SAFETY: `mask` is retained by LabelLayers and Core Animation; it is
-        // a CALayer as required by the property contract.
-        unsafe { matched.setMask(Some(&mask)) };
-        base.addSublayer(&matched);
         base.setHidden(true);
         parent.addSublayer(&base);
         Self {
             base,
-            matched,
-            mask,
-            text: String::new(),
+            configured: false,
         }
     }
 
     fn detach(self) {
-        // Disconnect both parent relationships explicitly. The mask is owned
-        // only by `matched` and this value, so it is released with the detached
-        // label tree without another Objective-C mutation.
-        self.matched.removeFromSuperlayer();
         self.base.removeFromSuperlayer();
     }
 }
@@ -870,6 +866,69 @@ fn scene_changes(previous: Option<&OverlayScene>, current: &OverlayScene) -> Sce
                 .as_ref()
                 .map(|indicator| indicator.position),
     }
+}
+
+fn label_text_content_eq(previous: &OverlayLabel, current: &OverlayLabel) -> bool {
+    previous.text == current.text
+        && previous.matched_prefix_len == current.matched_prefix_len
+        && previous.style.font_size.to_bits() == current.style.font_size.to_bits()
+        && previous.style.font_family == current.style.font_family
+        && previous.style.bold == current.style.bold
+        && previous.style.text_color == current.style.text_color
+        && previous.style.matched_text_color == current.style.matched_text_color
+}
+
+fn attributed_label_text(
+    text: &str,
+    style: &LabelStyle,
+    analysis: LabelTextAnalysis,
+    font: &CTFont,
+    foreground: &NSColor,
+    matched_foreground: &NSColor,
+) -> Retained<NSMutableAttributedString> {
+    let string = NSString::from_str(text);
+    let attributed = NSMutableAttributedString::from_nsstring(&string);
+    if analysis.utf16_len == 0 {
+        return attributed;
+    }
+
+    let full_range = NSRange::new(0, analysis.utf16_len);
+    let cocoa_font: &NSFont = font.as_ref();
+    let baseline = NSNumber::numberWithDouble(macos_text_baseline_offset(style, analysis));
+    let font_object: &AnyObject = cocoa_font.as_ref();
+    let foreground_object: &AnyObject = foreground.as_ref();
+    let matched_foreground_object: &AnyObject = matched_foreground.as_ref();
+    let baseline_number: &NSNumber = &baseline;
+    let baseline_object: &AnyObject = baseline_number.as_ref();
+    // SAFETY: each AppKit attribute receives its documented object type and
+    // both ranges were derived from this exact string's UTF-16 length.
+    unsafe {
+        attributed.addAttribute_value_range(NSFontAttributeName, font_object, full_range);
+        attributed.addAttribute_value_range(
+            NSForegroundColorAttributeName,
+            foreground_object,
+            full_range,
+        );
+        attributed.addAttribute_value_range(
+            NSBaselineOffsetAttributeName,
+            baseline_object,
+            full_range,
+        );
+        if analysis.matched_utf16_len > 0 {
+            attributed.addAttribute_value_range(
+                NSForegroundColorAttributeName,
+                matched_foreground_object,
+                NSRange::new(0, analysis.matched_utf16_len),
+            );
+        }
+    }
+    attributed
+}
+
+#[inline]
+fn macos_text_baseline_offset(style: &LabelStyle, analysis: LabelTextAnalysis) -> f64 {
+    let units = if analysis.has_descender { -1.0 } else { -2.0 };
+    analysis.scaled_units(style.font_size.max(1.0), units)
 }
 
 fn effective_label_rect(label: &OverlayLabel) -> Rect {
@@ -1107,5 +1166,46 @@ mod tests {
         assert!(width >= main.width);
         assert!(height > main.height);
         assert!(held.y > main.y + main.height);
+    }
+
+    #[test]
+    fn macos_baseline_moves_plain_text_down_two_units_and_descenders_one() {
+        let style = LabelStyle {
+            font_size: 17.0,
+            ..LabelStyle::default()
+        };
+        assert_eq!(
+            macos_text_baseline_offset(&style, LabelTextAnalysis::analyze("asa", 0)),
+            -2.0
+        );
+        assert_eq!(
+            macos_text_baseline_offset(&style, LabelTextAnalysis::analyze("aag", 0)),
+            -1.0
+        );
+
+        let large = LabelStyle {
+            font_size: 34.0,
+            ..style
+        };
+        assert_eq!(
+            macos_text_baseline_offset(&large, LabelTextAnalysis::analyze("ssj", 0)),
+            -2.0
+        );
+    }
+
+    #[test]
+    fn label_text_cache_ignores_geometry_but_tracks_paint_changes() {
+        let first = OverlayLabel::new(
+            "aff",
+            Rect::new(0.0, 0.0, 30.0, 20.0),
+            LabelStyle::default(),
+        );
+        let mut moved = first.clone();
+        moved.rect.x = 100.0;
+        moved.style.background = Color::rgb(1, 2, 3);
+        assert!(label_text_content_eq(&first, &moved));
+
+        moved.matched_prefix_len = 1;
+        assert!(!label_text_content_eq(&first, &moved));
     }
 }

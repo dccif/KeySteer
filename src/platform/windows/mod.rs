@@ -39,12 +39,18 @@ use crate::api::backend::{Appearance, Backend, BackendEvent, KeyDisposition};
 use crate::api::command::{ButtonAction, FocusedApp, MouseButton};
 use crate::api::geometry::{Point, Rect, Screen};
 use crate::api::input::{Key, KeyState};
-use crate::api::overlay::OverlayScene;
+use crate::api::overlay::{LabelStyle, LabelTextAnalysis, OverlayScene};
 use crate::platform::scan_mailbox::ScanMailbox;
 
 use self::overlay_worker::OverlayWorker;
 
 const WAKE_MESSAGE: u32 = WM_APP + 0x4C;
+
+#[inline]
+fn label_text_offset_y(style: &LabelStyle, analysis: LabelTextAnalysis) -> f64 {
+    let units = if analysis.has_descender { -2.0 } else { -1.0 };
+    analysis.scaled_units(style.font_size, units)
+}
 
 pub(crate) use native::{atomic_replace, prepare_console_for_cli};
 
@@ -796,6 +802,22 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert_eq!(actual.to_lowercase(), expected.to_lowercase());
+    }
+
+    #[test]
+    fn windows_text_position_keeps_the_existing_upward_optical_offsets() {
+        let style = LabelStyle {
+            font_size: 17.0,
+            ..LabelStyle::default()
+        };
+        assert_eq!(
+            label_text_offset_y(&style, LabelTextAnalysis::analyze("asa", 0)),
+            -1.0
+        );
+        assert_eq!(
+            label_text_offset_y(&style, LabelTextAnalysis::analyze("aag", 0)),
+            -2.0
+        );
     }
 
     #[test]

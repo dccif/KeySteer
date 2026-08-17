@@ -1,6 +1,6 @@
 [package]
 name = "keysteer"
-version = "0.9.3"
+version = "0.9.4"
 authors = ["dccif"]
 edition = "2024"
 rust-version = "1.97"
@@ -59,7 +59,7 @@ perf-probe = []
 core-graphics = "0.25"
 core-foundation = "0.10"
 objc2 = { version = "0.6", default-features = false, features = ["std"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSDate", "NSEnumerator", "NSRunLoop", "NSString", "NSURL", "NSUserDefaults", "objc2-core-foundation"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSAttributedString", "NSDate", "NSEnumerator", "NSRange", "NSRunLoop", "NSString", "NSValue", "NSURL", "NSUserDefaults", "objc2-core-foundation"] }
 objc2-quartz-core = { version = "0.3", default-features = false, features = [
     "std",
     "CADisplayLink",
@@ -93,6 +93,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "libc",
     "objc2-quartz-core",
     "NSApplication",
+    "NSAttributedString",
     "NSButton",
     "NSCell",
     "NSColor",
@@ -117,6 +118,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSWorkspace",
     "objc2-core-foundation",
     "objc2-core-graphics",
+    "objc2-core-text",
 ] }
 libc = "0.2.189"
 

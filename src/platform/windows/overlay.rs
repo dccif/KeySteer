@@ -26,7 +26,7 @@ use windows::core::{PCWSTR, w};
 
 use crate::api::geometry::{Point, Rect};
 use crate::api::overlay::{
-    Color, LabelStyle, OverlayItems, OverlayLabel, OverlayScene, OverlayShape,
+    Color, LabelStyle, LabelTextAnalysis, OverlayItems, OverlayLabel, OverlayScene, OverlayShape,
 };
 
 use super::native::{GdiDibSurface, NativeDimensions, OwnedWindow};
@@ -1024,6 +1024,7 @@ impl TextRasterizer {
         self.ensure_scratch(width, height)?;
         self.utf16.clear();
         self.utf16.extend(text.encode_utf16());
+        let analysis = LabelTextAnalysis::analyze(text, matched_prefix_len);
 
         let family = if style.font_family.is_empty() {
             "Segoe UI"
@@ -1067,7 +1068,7 @@ impl TextRasterizer {
                 }
                 SetTextColor(scratch.dc(), COLORREF(0x00FF_FFFF));
             }
-            let text_offset_y = style.optical_text_offset_y(text).round() as i32;
+            let text_offset_y = super::label_text_offset_y(style, analysis).round() as i32;
             let mut draw_rect = windows::Win32::Foundation::RECT {
                 left: 0,
                 top: text_offset_y,
@@ -1077,11 +1078,7 @@ impl TextRasterizer {
             // SAFETY: `utf16`, `draw_rect`, and the selected scratch DC remain
             // valid and writable for this synchronous text draw.
             unsafe {
-                let prefix_utf16_len = text
-                    .chars()
-                    .take(matched_prefix_len)
-                    .map(char::len_utf16)
-                    .sum::<usize>();
+                let prefix_utf16_len = analysis.matched_utf16_len;
                 if prefix_utf16_len > 0 {
                     let utf16_len = i32::try_from(self.utf16.len())
                         .map_err(|_| "overlay text is too long for GDI measurement")?;
