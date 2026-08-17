@@ -94,6 +94,19 @@ impl WorkerJoin {
                 ));
             }
         }
+        // The completion signal is emitted when the Rust worker closure
+        // returns, immediately before the OS thread runs TLS destructors. Do
+        // not turn that signal into an unbounded join if a native TLS owner is
+        // still cleaning up.
+        while !join.is_finished() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        if !join.is_finished() {
+            return Err(format!(
+                "{} did not finish thread-local cleanup before the shutdown deadline",
+                self.name
+            ));
+        }
         self.join_finished()
     }
 
@@ -188,6 +201,29 @@ mod tests {
         release_tx.send(()).unwrap();
         worker.join_timeout(Duration::from_secs(1)).unwrap();
         assert!(worker.reap_finished().unwrap());
+    }
+
+    #[test]
+    fn completion_signal_does_not_make_tls_cleanup_unbounded() {
+        let (release_tx, release_rx) = mpsc::channel();
+        let (finished_tx, finished) = mpsc::channel();
+        finished_tx.send(()).unwrap();
+        let join = Builder::new()
+            .spawn(move || {
+                let _ = release_rx.recv();
+            })
+            .unwrap();
+        let mut worker = WorkerJoin {
+            name: "tls-cleanup",
+            finished,
+            join: Some(join),
+        };
+
+        let error = worker.join_timeout(Duration::from_millis(10)).unwrap_err();
+        assert!(error.contains("thread-local cleanup"));
+        assert!(worker.join.is_some());
+        release_tx.send(()).unwrap();
+        worker.join_timeout(Duration::from_secs(1)).unwrap();
     }
 
     #[test]

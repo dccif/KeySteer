@@ -262,32 +262,37 @@ impl SpatialIndex {
             i64::from(range.2 - range.0 + 1).saturating_mul(i64::from(range.3 - range.1 + 1));
         let oversize = cell_count > 32;
         self.next_query_generation();
-        let mut candidates = SmallVec::<[usize; 64]>::new();
-        candidates.extend(self.oversize.iter().copied());
-        if oversize {
-            candidates.extend(0..self.rects.len());
-        } else {
-            for y in range.1..=range.3 {
-                for x in range.0..=range.2 {
-                    if let Some(entries) = self.cells.get(&(x, y)) {
-                        candidates.extend(entries.iter().copied());
-                    }
+        let duplicate = {
+            let generation = self.query_generation;
+            let rects = &self.rects;
+            let marks = &mut self.marks;
+            let mut inspect = |candidate: usize| {
+                if marks[candidate] == generation {
+                    return false;
                 }
+                marks[candidate] = generation;
+                rectangles_match(
+                    rects[candidate],
+                    rect,
+                    self.iou_threshold,
+                    self.minimum_spacing,
+                )
+            };
+            if oversize {
+                (0..rects.len()).any(&mut inspect)
+            } else {
+                self.oversize.iter().copied().any(&mut inspect)
+                    || (range.1..=range.3).any(|y| {
+                        (range.0..=range.2).any(|x| {
+                            self.cells
+                                .get(&(x, y))
+                                .is_some_and(|entries| entries.iter().copied().any(&mut inspect))
+                        })
+                    })
             }
-        }
-        for candidate in candidates {
-            if self.marks[candidate] == self.query_generation {
-                continue;
-            }
-            self.marks[candidate] = self.query_generation;
-            if rectangles_match(
-                self.rects[candidate],
-                rect,
-                self.iou_threshold,
-                self.minimum_spacing,
-            ) {
-                return false;
-            }
+        };
+        if duplicate {
+            return false;
         }
         let index = self.rects.len();
         self.rects.push(rect);

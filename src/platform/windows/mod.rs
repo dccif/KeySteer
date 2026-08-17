@@ -130,6 +130,7 @@ pub struct WindowsBackend {
     update_worker: Option<crate::app::update::UpdateWorker>,
     held_buttons: Cell<u8>,
     shutdown_complete: bool,
+    shutdown_attempted: bool,
 }
 
 impl WindowsBackend {
@@ -209,6 +210,7 @@ impl WindowsBackend {
             update_worker: None,
             held_buttons: Cell::new(0),
             shutdown_complete: false,
+            shutdown_attempted: false,
         })
     }
 
@@ -454,6 +456,9 @@ impl WindowsBackend {
 
 impl Drop for WindowsBackend {
     fn drop(&mut self) {
+        if self.shutdown_attempted {
+            return;
+        }
         if let Err(error) = self.shutdown_resources() {
             crate::app::logging::report_error(
                 "windows-backend",
@@ -751,6 +756,7 @@ impl Backend for WindowsBackend {
     }
 
     fn shutdown(&mut self) -> Result<(), String> {
+        self.shutdown_attempted = true;
         self.shutdown_resources()
     }
 }

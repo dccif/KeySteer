@@ -17,10 +17,8 @@ use windows::Win32::Graphics::Gdi::{
     OUT_DEFAULT_PRECIS, SetBkMode, SetTextColor, TRANSPARENT, UpdateWindow, ValidateRect,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, HCURSOR, HICON, HWND_TOPMOST, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, SetWindowPos, ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WM_DESTROY, WM_PAINT,
-    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    CS_HREDRAW, CS_VREDRAW, HCURSOR, HICON, ULW_ALPHA, UpdateLayeredWindow, WM_DESTROY, WM_PAINT,
+    WNDCLASSEXW,
 };
 use windows::core::{PCWSTR, w};
 
@@ -29,7 +27,10 @@ use crate::api::overlay::{
     Color, LabelStyle, LabelTextAnalysis, OverlayItems, OverlayLabel, OverlayScene, OverlayShape,
 };
 
-use super::native::{GdiDibSurface, NativeDimensions, OwnedWindow};
+use super::native::{
+    GdiDibSurface, NativeDimensions, OwnedWindow, OwnedWindowSpec, create_owned_window,
+    reposition_owned_window,
+};
 
 /// Renders scenes into layered click-through windows, one per monitor.
 pub struct Overlay {
@@ -102,19 +103,7 @@ impl Overlay {
 
         if let Some(window) = self.windows.get(&key) {
             let hwnd = window.raw();
-            // SAFETY: `hwnd` is a window we created and have not destroyed.
-            unsafe {
-                SetWindowPos(
-                    hwnd,
-                    Some(HWND_TOPMOST),
-                    key.0,
-                    key.1,
-                    area.width.round() as i32,
-                    area.height.round() as i32,
-                    SWP_NOACTIVATE,
-                )
-            }
-            .map_err(|error| format!("SetWindowPos failed: {error}"))?;
+            reposition_owned_window(window, area)?;
             return Ok(hwnd);
         }
 
@@ -127,52 +116,14 @@ impl Overlay {
                 .remove(&old_key)
                 .ok_or("overlay window disappeared while repositioning")?;
             let hwnd = window.raw();
-            // SAFETY: `hwnd` remains owned by `window` for the synchronous
-            // move and the validated area converts to Win32 coordinates.
-            unsafe {
-                SetWindowPos(
-                    hwnd,
-                    Some(HWND_TOPMOST),
-                    key.0,
-                    key.1,
-                    area.width.round() as i32,
-                    area.height.round() as i32,
-                    SWP_NOACTIVATE,
-                )
-                .map_err(|error| format!("SetWindowPos failed: {error}"))?;
-            }
+            reposition_owned_window(&window, area)?;
             self.windows.insert(key, window);
             return Ok(hwnd);
         }
 
-        // SAFETY: the class is registered and all arguments are valid.
-        let hwnd = unsafe {
-            CreateWindowExW(
-                WS_EX_LAYERED
-                    | WS_EX_TRANSPARENT
-                    | WS_EX_NOACTIVATE
-                    | WS_EX_TOOLWINDOW
-                    | WS_EX_TOPMOST,
-                Self::CLASS_NAME,
-                w!("KeySteer"),
-                WS_POPUP,
-                key.0,
-                key.1,
-                area.width.round() as i32,
-                area.height.round() as i32,
-                None,
-                None,
-                None,
-                None,
-            )
-        }
-        .map_err(|e| format!("CreateWindowExW failed: {e}"))?;
-
-        // SAFETY: `hwnd` was just created successfully.
-        unsafe {
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        }
-        self.windows.insert(key, OwnedWindow::new(hwnd));
+        let window = create_owned_window(OwnedWindowSpec::CpuOverlay(area))?;
+        let hwnd = window.raw();
+        self.windows.insert(key, window);
         Ok(hwnd)
     }
 

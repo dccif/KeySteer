@@ -117,6 +117,7 @@ pub struct MacOsBackend {
     warned_about_permissions: bool,
     keyboard: input::KeyboardInjector,
     shutdown_complete: bool,
+    shutdown_attempted: bool,
 }
 
 impl MacOsBackend {
@@ -186,6 +187,7 @@ impl MacOsBackend {
             warned_about_permissions: false,
             keyboard,
             shutdown_complete: false,
+            shutdown_attempted: false,
         })
     }
 
@@ -227,7 +229,7 @@ impl MacOsBackend {
     }
 
     fn release_held_buttons(&self) -> Result<(), String> {
-        let mut first_error = None;
+        let mut errors = crate::app::errors::ErrorBundle::default();
         for button in [
             MouseButton::Left,
             MouseButton::Right,
@@ -241,11 +243,10 @@ impl MacOsBackend {
             }
             match input::mouse_button(&self.click_tracker, button, ButtonAction::Release) {
                 Ok(()) => self.held_buttons.set(self.held_buttons.get() & !bit),
-                Err(error) if first_error.is_none() => first_error = Some(error),
-                Err(_) => {}
+                Err(error) => errors.push(format!("release {button:?}"), error),
             }
         }
-        first_error.map_or(Ok(()), Err)
+        errors.into_result()
     }
 
     fn reap_update_worker(&mut self) {
@@ -269,48 +270,39 @@ impl MacOsBackend {
         self.status_item.take();
         self.display_watcher.take();
         self.frame_clock.stop();
-        let mut first_error = self.scan_worker.shutdown().err();
+        let mut errors = crate::app::errors::ErrorBundle::default();
+        errors.record("UI scan worker", self.scan_worker.shutdown());
         if let Some(worker) = self.update_worker.as_mut() {
             match worker.cancel_and_wait() {
                 Ok(()) => {
                     self.update_worker.take();
                 }
-                Err(error) if first_error.is_none() => first_error = Some(error),
-                Err(_) => {}
+                Err(error) => errors.push("update worker", error),
             }
         }
 
-        if let Err(error) = self.release_held_buttons()
-            && first_error.is_none()
-        {
-            first_error = Some(error);
-        }
+        errors.record("held mouse buttons", self.release_held_buttons());
         if let Some(hook) = self.hook.as_mut() {
             match hook.stop() {
                 Ok(()) => {
                     self.hook.take();
                 }
-                Err(error) if first_error.is_none() => first_error = Some(error),
-                Err(_) => {}
+                Err(error) => errors.push("input hook", error),
             }
         }
-        if let Err(error) = self.overlay.dismiss()
-            && first_error.is_none()
-        {
-            first_error = Some(error);
+        errors.record("overlay dismiss", self.overlay.dismiss());
+        if errors.is_empty() {
+            self.shutdown_complete = true;
         }
-        match first_error {
-            Some(error) => Err(error),
-            None => {
-                self.shutdown_complete = true;
-                Ok(())
-            }
-        }
+        errors.into_result()
     }
 }
 
 impl Drop for MacOsBackend {
     fn drop(&mut self) {
+        if self.shutdown_attempted {
+            return;
+        }
         if let Err(error) = self.shutdown_resources() {
             crate::app::logging::report_error(
                 "macos-shutdown",
@@ -552,6 +544,7 @@ impl Backend for MacOsBackend {
     }
 
     fn shutdown(&mut self) -> Result<(), String> {
+        self.shutdown_attempted = true;
         self.shutdown_resources()
     }
 }

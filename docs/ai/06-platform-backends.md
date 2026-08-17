@@ -7,7 +7,7 @@
 - Vision result 由 Rust RAII owner 释放，读取 slice 前验证 count<=2000 和非空指针。
 - COM apartment 显式 `!Send/!Sync`，确保 `CoUninitialize` 回到初始化线程。
 - 两个平台入口不放行 undocumented unsafe；每个最小块记录 `SAFETY` 契约。机械门禁当前为
-  不高于 230 个 unsafe expression/18 个文件，并同时禁止 `transmute`/`transmute_copy`；`domain` 与其余 portable 层使用编译期
+  不高于 225 个 unsafe expression/18 个文件，并同时禁止 `transmute`/`transmute_copy`；`domain` 与其余 portable 层使用编译期
   `forbid(unsafe_code)`/测试门禁保持零 unsafe。
 
 ## 共同契约

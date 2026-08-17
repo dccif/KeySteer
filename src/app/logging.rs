@@ -100,7 +100,7 @@ impl Logger {
             Some(file) => {
                 let result = writeln!(file, "{line}");
                 if result.is_ok()
-                    && level >= Level::Warning
+                    && level == Level::Error
                     && let Err(error) = file.flush()
                 {
                     write_emergency_stderr(format_args!(

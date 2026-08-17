@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use windows::Win32::Foundation::{COLORREF, HMODULE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
@@ -36,10 +36,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Graphics::Dxgi::{IDXGIDevice, IDXGISurface};
 use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DestroyWindow, HCURSOR, HICON, HWND_TOPMOST,
-    LWA_ALPHA, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SetLayeredWindowAttributes, SetWindowPos,
-    ShowWindow, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    CS_HREDRAW, CS_VREDRAW, HCURSOR, HICON, SW_SHOWNOACTIVATE, ShowWindow, WNDCLASSEXW,
 };
 use windows::core::{Interface, PCWSTR, w};
 use windows_numerics::Vector2;
@@ -50,7 +47,9 @@ use crate::api::overlay::{
     OverlayShape,
 };
 
-use super::native::{NativeDimensions, OwnedWindow};
+use super::native::{
+    NativeDimensions, OwnedWindow, OwnedWindowSpec, create_owned_window, reposition_owned_window,
+};
 
 const MAX_BRUSHES: usize = 64;
 const MAX_TEXT_FORMATS: usize = 32;
@@ -390,14 +389,14 @@ impl GpuOverlay {
         {
             let area_changed = content.area != area;
             if area_changed {
-                reposition(content.window.raw(), area)?;
+                reposition_owned_window(&content.window, area)?;
                 content.area = area;
             }
             return Ok(area_changed);
         }
 
         self.ensure_class()?;
-        let window = OwnedWindow::new(create_window(area)?);
+        let window = create_window(area)?;
         // SAFETY: the HWND and DirectComposition device are both live and
         // owned by this render thread.
         let target = unsafe { self.dcomp.CreateTargetForHwnd(window.raw(), true) }
@@ -1040,61 +1039,8 @@ fn scene_has_static_content(scene: &OverlayScene) -> bool {
     scene.backdrop.is_some() || !scene.shapes.is_empty() || !scene.labels.is_empty()
 }
 
-fn create_window(area: Rect) -> Result<HWND, String> {
-    let x = area.x.round() as i32;
-    let y = area.y.round() as i32;
-    let dimensions = NativeDimensions::from_f64(area.width, area.height)?;
-    // SAFETY: the class is registered before this function is called. A
-    // successfully created HWND belongs to this thread; initialization either
-    // completes or destroys it before returning the error.
-    let hwnd = unsafe {
-        let hwnd = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
-            GpuOverlay::CLASS_NAME,
-            w!("KeySteer"),
-            WS_POPUP,
-            x,
-            y,
-            dimensions.width_i32(),
-            dimensions.height_i32(),
-            None,
-            None,
-            None,
-            None,
-        )
-        .map_err(|error| format!("CreateWindowExW failed: {error}"))?;
-        // A fully opaque global alpha enables the layered HWND while
-        // DirectComposition supplies per-pixel alpha. WS_EX_TRANSPARENT then
-        // routes mouse input to windows underneath.
-        if let Err(error) = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA) {
-            if let Err(cleanup) = DestroyWindow(hwnd) {
-                crate::report_error!(
-                    "windows-overlay",
-                    "cannot destroy failed GPU overlay window: {cleanup}"
-                );
-            }
-            return Err(format!("SetLayeredWindowAttributes failed: {error}"));
-        }
-        hwnd
-    };
-    Ok(hwnd)
-}
-
-fn reposition(hwnd: HWND, area: Rect) -> Result<(), String> {
-    let dimensions = NativeDimensions::from_f64(area.width, area.height)?;
-    // SAFETY: `hwnd` is owned by the current render thread.
-    unsafe {
-        SetWindowPos(
-            hwnd,
-            Some(HWND_TOPMOST),
-            area.x.round() as i32,
-            area.y.round() as i32,
-            dimensions.width_i32(),
-            dimensions.height_i32(),
-            SWP_NOACTIVATE,
-        )
-    }
-    .map_err(|error| format!("SetWindowPos failed: {error}"))
+fn create_window(area: Rect) -> Result<OwnedWindow, String> {
+    create_owned_window(OwnedWindowSpec::GpuOverlay(area))
 }
 
 fn dimension(value: f64) -> Result<u32, String> {

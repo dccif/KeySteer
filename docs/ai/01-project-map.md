@@ -25,7 +25,7 @@ keysteer/
 | `src/api/` | 跨平台公共协议：按键、动作、命令、事件、几何、场景、插件、后端 trait | `api/mod.rs`, `command.rs`, `backend.rs` |
 | `src/app/` | 程序启动、CLI、日志、路径、网页配置交接、worker join 和运行时编排 | `bootstrap.rs`, `config_simulator.rs`, `worker.rs`, `runtime/mod.rs` |
 | `src/config/` | TOML 模型、校验、主题解析、原子写入 | `mod.rs`, `store.rs`, `style.rs` |
-| `src/domain/hints/` | 与平台无关的 UI Hint 标签分配、匹配和空间算法 | `labels.rs`, `matcher.rs`, `grid.rs` |
+| `src/domain/hints/` | 与平台无关的 UI Hint 标签分配、匹配和视觉分层算法 | `labels.rs`, `matcher.rs`, `grid.rs`, `visual_layers.rs` |
 | `src/modes/` | 五个内置 Mode 状态机 | `normal.rs`, `grid.rs`, `recursive_grid.rs`, `hint.rs` |
 | `src/plugins/` | 使用公共 API 实现的内置插件示例 | `builtin/screen_selector.rs` |
 | `src/update.rs` | 用户主动触发的 GitHub Release 查询和 SemVer 比较 | `check_async` |

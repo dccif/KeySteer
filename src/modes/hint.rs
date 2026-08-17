@@ -22,7 +22,7 @@ use crate::api::input::{Key, KeyChord, KeyState, ModeId};
 use crate::api::overlay::{Color, LabelStyle, OverlayLabel, OverlayScene, OverlayShape};
 use crate::config::style::AUTO;
 use crate::config::{Config, Palette, UiHint as HintsConfig};
-use crate::hints::{self, CompactHint, Match};
+use crate::hints::{self, CompactHint, Match, VisualLayerPlan, build_visual_layer_plan};
 
 const SCAN_RETRY_TIMER_ID: &str = "ui_hint.scan_retry";
 /// Reuse the small container backing needed by the common UIHint session.
@@ -34,21 +34,6 @@ const MIN_VISUAL_STACK_AREA_RATIO: f64 = 0.20;
 const MAX_SCAN_TIMEOUT_MS: u64 = 30_000;
 const AUTO_HINT_PADDING_X_RATIO: f64 = 2.0 / 17.0;
 const AUTO_HINT_PADDING_Y_RATIO: f64 = 0.06;
-#[derive(Debug, Default)]
-struct OverlapPlan {
-    layers: SmallVec<[u8; 128]>,
-    layer_count: u8,
-    ready: bool,
-}
-
-impl OverlapPlan {
-    fn clear(&mut self) {
-        self.layers.clear();
-        self.layer_count = 0;
-        self.ready = false;
-    }
-}
-
 /// What the keyboard is currently doing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Input {
@@ -97,7 +82,10 @@ pub struct HintMode {
     overlap_cycle: usize,
     /// Source-agnostic visual layers, built once at scan terminal so the first
     /// post-scan overlap-cycle input only reads compact cached layer numbers.
-    overlap_plan: OverlapPlan,
+    overlap_plan: VisualLayerPlan,
+    /// Targets that arrived after a label prefix was typed. Reassigning those
+    /// labels immediately would invalidate keys already visible to the user.
+    pending_relabel: bool,
     selected: Option<usize>,
     finished: bool,
 }
@@ -123,7 +111,8 @@ impl HintMode {
             scan_bounds: None,
             held_overlap_keys: SmallVec::new(),
             overlap_cycle: 0,
-            overlap_plan: OverlapPlan::default(),
+            overlap_plan: VisualLayerPlan::default(),
+            pending_relabel: false,
             selected: None,
             finished: false,
         }
@@ -136,6 +125,7 @@ impl HintMode {
         self.seen_targets.clear();
         self.hints.clear();
         self.overlap_plan.clear();
+        self.pending_relabel = false;
         if release_large_buffers {
             if self.scanned.capacity() > MAX_IDLE_RETAINED_TARGETS {
                 self.scanned = Vec::new();
@@ -146,8 +136,8 @@ impl HintMode {
             if self.hints.capacity() > MAX_IDLE_RETAINED_TARGETS {
                 self.hints = Vec::new();
             }
-            if self.overlap_plan.layers.capacity() > MAX_IDLE_RETAINED_TARGETS {
-                self.overlap_plan = OverlapPlan::default();
+            if self.overlap_plan.retained_capacity() > MAX_IDLE_RETAINED_TARGETS {
+                self.overlap_plan = VisualLayerPlan::default();
             }
             if self.seen_targets.capacity() > MAX_IDLE_RETAINED_TARGETS {
                 self.seen_targets = HashMap::new();
@@ -331,12 +321,16 @@ impl HintMode {
         // see and select. With no input, every partial remains visible even
         // while the overlap modifier is held. Layer planning waits for the
         // terminal batch because the scan is normally faster than interaction.
-        let labels_changed = if added && self.input.text().is_empty() {
-            self.relabel(ctx);
-            true
-        } else {
-            false
-        };
+        let labels_changed =
+            if added && (self.input.text().is_empty() || matches!(self.input, Input::Search(_))) {
+                self.relabel(ctx);
+                true
+            } else {
+                if added {
+                    self.pending_relabel = true;
+                }
+                false
+            };
 
         if status == UiScanStatus::Partial {
             self.status = None;
@@ -373,14 +367,20 @@ impl HintMode {
             && self.status.is_none()
         {
             self.scanning = false;
-            if !self.overlap_plan.ready {
-                self.rebuild_overlap_plan(ctx);
-            }
-            return CommandBatch::new();
+            let needs_redraw = if !self.overlap_plan.is_ready() {
+                self.rebuild_overlap_plan(ctx)
+            } else {
+                false
+            };
+            return if needs_redraw {
+                self.redraw(ctx)
+            } else {
+                CommandBatch::new()
+            };
         }
 
         self.scanning = false;
-        if !self.hints.is_empty() && !self.overlap_plan.ready {
+        if !self.hints.is_empty() && !self.overlap_plan.is_ready() {
             self.rebuild_overlap_plan(ctx);
         }
         self.status = match &status {
@@ -435,18 +435,31 @@ impl HintMode {
         {
             self.hints.clear();
         }
+        self.pending_relabel = false;
         self.refresh_overlap_plan(ctx);
     }
 
-    fn rebuild_overlap_plan(&mut self, ctx: &HostContext<'_>) {
+    fn rebuild_overlap_plan(&mut self, ctx: &HostContext<'_>) -> bool {
         let style = self.resolved_hint_label_style(ctx.palette);
-        let rects: SmallVec<[Rect; 128]> = self
+        let placements: SmallVec<[(usize, Rect); 128]> = self
             .hints
             .iter()
-            .filter(|hint| self.hint_is_visible(hint))
-            .map(|hint| placed_hint_rect(&self.config, hint, &style))
+            .enumerate()
+            .filter(|(_, hint)| self.hint_is_visible(hint))
+            .map(|(index, hint)| (index, placed_hint_rect(&self.config, hint, &style)))
             .collect();
-        build_overlap_plan(&rects, &mut self.overlap_plan);
+        build_visual_layer_plan(
+            &placements,
+            self.hints.len(),
+            visually_stacked,
+            &mut self.overlap_plan,
+        );
+        if self.held_overlap_keys.is_empty() {
+            self.overlap_cycle = 0;
+        } else if self.overlap_plan.layer_count() != 0 {
+            self.overlap_cycle %= self.overlap_plan.layer_count();
+        }
+        self.overlap_plan.layer_count() != 0
     }
 
     fn refresh_overlap_plan(&mut self, ctx: &HostContext<'_>) {
@@ -473,7 +486,10 @@ impl HintMode {
         if self.scanning {
             return CommandBatch::new();
         }
-        let changed = match state {
+        if state == KeyState::Down && !self.overlap_plan.is_ready() {
+            self.rebuild_overlap_plan(ctx);
+        }
+        let active_layer_changed = match state {
             KeyState::Down => {
                 let was_released = self.held_overlap_keys.is_empty();
                 let inserted = if self.held_overlap_keys.contains(key) {
@@ -483,25 +499,43 @@ impl HintMode {
                     true
                 };
                 if inserted && was_released {
-                    self.overlap_cycle = self.overlap_cycle.wrapping_add(1);
+                    let layer_count = self.overlap_plan.layer_count();
+                    if layer_count > 1 {
+                        self.overlap_cycle = (self.overlap_cycle + 1) % layer_count;
+                    } else {
+                        self.overlap_cycle = 0;
+                    }
                 }
-                inserted
+                inserted && was_released && self.overlap_plan.layer_count() > 1
             }
-            KeyState::Up => self
-                .held_overlap_keys
-                .iter()
-                .position(|candidate| candidate == key)
-                .map(|index| self.held_overlap_keys.swap_remove(index))
-                .is_some(),
+            KeyState::Up => {
+                let was_last = self.held_overlap_keys.len() == 1;
+                let removed = self
+                    .held_overlap_keys
+                    .iter()
+                    .position(|candidate| candidate == key)
+                    .map(|index| self.held_overlap_keys.swap_remove(index))
+                    .is_some();
+                removed && was_last && self.overlap_plan.layer_count() > 1
+            }
         };
-        if changed && state == KeyState::Down && !self.scanning && !self.overlap_plan.ready {
-            self.rebuild_overlap_plan(ctx);
-        }
-        if changed && !self.hints.is_empty() && !self.scanning {
+        if active_layer_changed && !self.hints.is_empty() {
             self.redraw(ctx)
         } else {
             CommandBatch::new()
         }
+    }
+
+    fn active_overlap_layer(&self) -> Option<usize> {
+        let layer_count = self.overlap_plan.layer_count();
+        if !self.overlap_plan.is_ready() || layer_count == 0 {
+            return None;
+        }
+        Some(if self.held_overlap_keys.is_empty() {
+            0
+        } else {
+            self.overlap_cycle % layer_count
+        })
     }
 
     fn scene(&self, ctx: &HostContext<'_>) -> OverlayScene {
@@ -549,16 +583,26 @@ impl HintMode {
             Input::Search(_) => "",
         };
         let matched_prefix_len = typed.chars().count();
-        for hint in self.hints.iter().filter(|hint| self.hint_is_visible(hint)) {
+        let active_overlap_layer = self.active_overlap_layer();
+        for (hint_index, hint) in self
+            .hints
+            .iter()
+            .enumerate()
+            .filter(|(_, hint)| self.hint_is_visible(hint))
+        {
             let rect = placed_hint_rect(&self.config, hint, &label_style);
+            let z_index = if active_overlap_layer.is_some()
+                && self.overlap_plan.layer(hint_index) == active_overlap_layer
+            {
+                3
+            } else {
+                2
+            };
             scene.push_label(
                 OverlayLabel::new(hint.label.as_str(), rect, label_style.clone())
                     .with_matched_prefix(matched_prefix_len)
-                    .with_z_index(2),
+                    .with_z_index(z_index),
             );
-        }
-        if !self.held_overlap_keys.is_empty() && self.overlap_plan.ready {
-            apply_overlap_layer(&mut scene.labels, &self.overlap_plan, self.overlap_cycle);
         }
 
         // Search box, shown only while searching.
@@ -718,7 +762,9 @@ impl HintMode {
                         s.pop();
                     }
                 }
-                if matches!(self.input, Input::Search(_)) {
+                if matches!(self.input, Input::Search(_))
+                    || (self.input.text().is_empty() && self.pending_relabel)
+                {
                     self.relabel(ctx);
                 } else {
                     self.refresh_overlap_plan(ctx);
@@ -765,7 +811,12 @@ impl HintMode {
                         if let Input::Labels(typed) = &mut self.input {
                             typed.pop();
                         }
-                        CommandBatch::new()
+                        if self.input.text().is_empty() && self.pending_relabel {
+                            self.relabel(ctx);
+                            self.redraw(ctx)
+                        } else {
+                            CommandBatch::new()
+                        }
                     }
                 }
             }
@@ -818,83 +869,24 @@ fn visually_stacked(left: Rect, right: Rect) -> bool {
     smaller_area > 0.0 && intersection_area >= smaller_area * MIN_VISUAL_STACK_AREA_RATIO
 }
 
-/// Build visual depth from the final draw order. Labels are emitted bottom to
-/// top, so greedily assigning each label against all earlier intersections
-/// makes layer zero the obscured bottom layer and preserves what users see.
-fn build_overlap_plan(rects: &[Rect], plan: &mut OverlapPlan) {
-    plan.clear();
-    let count = rects.len();
-    plan.layers.resize(count, 0);
-    let mut overlaps: SmallVec<[bool; 128]> = std::iter::repeat_n(false, count).collect();
-    let mut layer_count = 0usize;
-
-    // Four words cover every representable retained layer while keeping the
-    // per-label scratch state in 32 stack bytes. Final UI Hint scenes normally
-    // contain at most 128 labels, making the direct draw-order scan both small
-    // and deterministic without a second spatial ordering.
-    for index in 0..count {
-        let mut occupied_layers = [0u64; 4];
-        for other in 0..index {
-            if !visually_stacked(rects[index], rects[other]) {
-                continue;
-            }
-            overlaps[index] = true;
-            overlaps[other] = true;
-            let occupied = usize::from(plan.layers[other]);
-            occupied_layers[occupied / 64] |= 1u64 << (occupied % 64);
-        }
-        let layer = occupied_layers
-            .iter()
-            .enumerate()
-            .find_map(|(word_index, occupied)| {
-                (*occupied != u64::MAX)
-                    .then(|| word_index * 64 + (!occupied).trailing_zeros() as usize)
-            })
-            .unwrap_or(usize::from(u8::MAX) + 1);
-        let Ok(compact_layer) = u8::try_from(layer) else {
-            plan.clear();
-            return;
-        };
-        plan.layers[index] = compact_layer;
-        layer_count = layer_count.max(layer + 1);
-    }
-
-    if !overlaps.iter().any(|overlap| *overlap) {
-        plan.layers.clear();
-        plan.ready = true;
+#[cfg(test)]
+fn rotate_overlapping_labels(labels: &mut [OverlayLabel], cycle: usize) {
+    let placements: SmallVec<[(usize, Rect); 128]> = labels
+        .iter()
+        .enumerate()
+        .map(|(index, label)| (index, label.rect))
+        .collect();
+    let mut plan = VisualLayerPlan::default();
+    build_visual_layer_plan(&placements, labels.len(), visually_stacked, &mut plan);
+    if plan.layer_count() == 0 {
         return;
     }
-    let Ok(compact_count) = u8::try_from(layer_count) else {
-        plan.clear();
-        return;
-    };
-    plan.layer_count = compact_count;
-    plan.ready = true;
-    for (layer, overlaps) in plan.layers.iter_mut().zip(overlaps) {
-        if !overlaps {
-            *layer = u8::MAX;
-        }
-    }
-}
-
-fn apply_overlap_layer(labels: &mut [OverlayLabel], plan: &OverlapPlan, cycle: usize) {
-    if plan.layer_count == 0 || plan.layers.len() != labels.len() {
-        return;
-    }
-    let selected_layer = cycle.wrapping_sub(1) % usize::from(plan.layer_count);
+    let selected_layer = cycle.wrapping_sub(1) % plan.layer_count();
     for (index, label) in labels.iter_mut().enumerate() {
-        if usize::from(plan.layers[index]) == selected_layer {
+        if plan.layer(index) == Some(selected_layer) {
             label.z_index = 3;
         }
     }
-}
-
-#[cfg(test)]
-fn rotate_overlapping_labels(labels: &mut [OverlayLabel], cycle: usize) {
-    let rects: SmallVec<[Rect; 128]> = labels.iter().map(|label| label.rect).collect();
-    let mut plan = OverlapPlan::default();
-    build_overlap_plan(&rects, &mut plan);
-    apply_overlap_layer(labels, &plan, cycle);
 }
 
 impl Mode for HintMode {
@@ -1166,12 +1158,12 @@ mod tests {
         mode.scanned_names_lower.reserve(1_024);
         mode.seen_targets.reserve(1_024);
         mode.hints.reserve(1_024);
-        mode.overlap_plan.layers.reserve(1_024);
+        mode.overlap_plan.reserve_for_test(1_024);
         assert!(mode.scanned.capacity() >= 1_024);
         assert!(mode.scanned_names_lower.capacity() >= 1_024);
         assert!(mode.seen_targets.capacity() >= 1_024);
         assert!(mode.hints.capacity() >= 1_024);
-        assert!(mode.overlap_plan.layers.capacity() >= 1_024);
+        assert!(mode.overlap_plan.retained_capacity() >= 1_024);
 
         mode.handle(&ModeEvent::Deactivated, &env.ctx());
 
@@ -1179,7 +1171,7 @@ mod tests {
         assert_eq!(mode.scanned_names_lower.capacity(), 0);
         assert_eq!(mode.seen_targets.capacity(), 0);
         assert_eq!(mode.hints.capacity(), 0);
-        assert_eq!(mode.overlap_plan.layers.capacity(), 128);
+        assert_eq!(mode.overlap_plan.retained_capacity(), 128);
     }
 
     #[test]
@@ -1205,7 +1197,7 @@ mod tests {
         assert!(mode.seen_targets.capacity() >= 100);
         assert!(mode.hints.is_empty());
         assert!(mode.hints.capacity() >= 100);
-        assert!(mode.overlap_plan.layers.capacity() <= 128);
+        assert!(mode.overlap_plan.retained_capacity() <= 128);
     }
 
     #[test]
@@ -1304,18 +1296,23 @@ mod tests {
             &env.ctx(),
         );
         assert_eq!(scene_of(&second).labels.len(), 2);
-        assert!(mode.overlap_plan.layers.is_empty());
+        assert_eq!(mode.overlap_plan.len(), 0);
 
         let completed = deliver(&mut mode, &env, Vec::new());
         assert!(!mode.scanning);
-        assert!(
-            completed.is_empty(),
-            "an unchanged terminal must not redraw"
+        assert_eq!(
+            scene_of(&completed)
+                .labels
+                .iter()
+                .filter(|label| label.z_index == 3)
+                .count(),
+            1,
+            "terminal applies the final default visual layer"
         );
         assert_eq!(mode.hints.len(), 2);
-        assert!(mode.overlap_plan.ready);
-        assert_eq!(mode.overlap_plan.layers.len(), 2);
-        assert_eq!(mode.overlap_plan.layer_count, 2);
+        assert!(mode.overlap_plan.is_ready());
+        assert_eq!(mode.overlap_plan.len(), 2);
+        assert_eq!(mode.overlap_plan.layer_count(), 2);
 
         let cycled = press(&mut mode, &env, "left_shift");
         assert_eq!(
@@ -1501,9 +1498,9 @@ mod tests {
         let filtered = press(&mut mode, &env, &prefix.to_string());
         let visible = scene_of(&filtered).labels.len();
         assert!(visible > 1 && visible < total);
-        assert!(mode.overlap_plan.ready);
-        assert_eq!(mode.overlap_plan.layers.len(), visible);
-        assert_eq!(usize::from(mode.overlap_plan.layer_count), visible);
+        assert!(mode.overlap_plan.is_ready());
+        assert_eq!(mode.overlap_plan.len(), mode.hints.len());
+        assert_eq!(mode.overlap_plan.layer_count(), visible);
 
         let cycled = press(&mut mode, &env, "left_shift");
         assert_eq!(scene_of(&cycled).labels.len(), visible);
@@ -1519,7 +1516,7 @@ mod tests {
 
         let restored = press(&mut mode, &env, "backspace");
         assert_eq!(scene_of(&restored).labels.len(), total);
-        assert_eq!(mode.overlap_plan.layers.len(), total);
+        assert_eq!(mode.overlap_plan.len(), mode.hints.len());
     }
 
     #[test]
@@ -1560,12 +1557,12 @@ mod tests {
                 target("Three", 100.0),
             ],
         );
-        assert!(
-            scene_of(&initial)
-                .labels
-                .iter()
-                .all(|label| label.z_index == 2)
-        );
+        let initial_top = scene_of(&initial)
+            .labels
+            .iter()
+            .find(|label| label.z_index == 3)
+            .map(|label| label.text.clone())
+            .expect("the default front layer should be raised");
 
         let first = press(&mut mode, &env, "left_shift");
         let first_top = scene_of(&first)
@@ -1576,11 +1573,13 @@ mod tests {
             .expect("one overlapping label should be raised");
 
         let restored = release(&mut mode, &env, "left_shift");
-        assert!(
+        assert_eq!(
             scene_of(&restored)
                 .labels
                 .iter()
-                .all(|label| label.z_index == 2)
+                .find(|label| label.z_index == 3)
+                .map(|label| label.text.clone()),
+            Some(initial_top.clone())
         );
 
         let second = press(&mut mode, &env, "right_shift");
@@ -1602,6 +1601,76 @@ mod tests {
             .expect("one overlapping label should be raised");
         assert_ne!(first_top, third_top);
         assert_ne!(second_top, third_top);
+        assert_eq!(third_top, initial_top, "three layers must wrap 0→1→2→0");
+    }
+
+    #[test]
+    fn shift_cycles_every_computed_layer_instead_of_stopping_at_three() {
+        let env = Env::new();
+        let mut mode = HintMode::new(&env.config);
+        activate(&mut mode, &env);
+        let initial = deliver(
+            &mut mode,
+            &env,
+            (0..5)
+                .map(|index| target(&format!("Layer {index}"), 100.0))
+                .collect(),
+        );
+        let top_text = |output: &_| {
+            scene_of(output)
+                .labels
+                .iter()
+                .find(|label| label.z_index == 3)
+                .map(|label| label.text.clone())
+                .expect("one visual layer should be raised")
+        };
+        let mut observed = vec![top_text(&initial)];
+        for index in 0_usize..5 {
+            let shift = if index.is_multiple_of(2) {
+                "left_shift"
+            } else {
+                "right_shift"
+            };
+            observed.push(top_text(&press(&mut mode, &env, shift)));
+            release(&mut mode, &env, shift);
+        }
+
+        assert_eq!(observed.len(), 6);
+        assert_eq!(observed[0], observed[5], "five layers must wrap to zero");
+        observed.pop();
+        observed.sort_unstable();
+        observed.dedup();
+        assert_eq!(observed.len(), 5, "every computed layer must be reachable");
+    }
+
+    #[test]
+    fn layer_switch_changes_only_z_order() {
+        let env = Env::new();
+        let mut mode = HintMode::new(&env.config);
+        activate(&mut mode, &env);
+        let initial = deliver(
+            &mut mode,
+            &env,
+            vec![
+                target("One", 100.0),
+                target("Two", 100.0),
+                target("Three", 100.0),
+            ],
+        );
+        let shifted = press(&mut mode, &env, "left_shift");
+        let normalize = |output: &_| {
+            scene_of(output)
+                .labels
+                .iter()
+                .cloned()
+                .map(|mut label| {
+                    label.z_index = 2;
+                    label
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(normalize(&initial), normalize(&shifted));
     }
 
     #[test]
@@ -1624,7 +1693,7 @@ mod tests {
                 .filter(|label| label.z_index == 3)
                 .map(|label| label.text.as_str())
                 .collect::<Vec<_>>(),
-            ["a", "c"]
+            ["b", "d"]
         );
 
         let mut second = labels;
@@ -1635,7 +1704,7 @@ mod tests {
                 .filter(|label| label.z_index == 3)
                 .map(|label| label.text.as_str())
                 .collect::<Vec<_>>(),
-            ["b", "d"]
+            ["a", "c"]
         );
     }
 
@@ -1662,7 +1731,7 @@ mod tests {
                 .filter(|label| label.z_index == 3)
                 .map(|label| label.text.as_str())
                 .collect::<Vec<_>>(),
-            ["left-0", "right-0"]
+            ["left-1", "right-1"]
         );
 
         let mut second = labels;
@@ -1673,8 +1742,19 @@ mod tests {
                 .filter(|label| label.z_index == 3)
                 .map(|label| label.text.as_str())
                 .collect::<Vec<_>>(),
-            ["left-1", "right-1"]
+            ["left-0", "right-0"]
         );
+    }
+
+    #[test]
+    fn visual_stack_threshold_and_center_occlusion_are_stable() {
+        let base = Rect::new(0.0, 0.0, 20.0, 20.0);
+        assert!(visually_stacked(base, Rect::new(16.0, 0.0, 20.0, 20.0)));
+        assert!(!visually_stacked(base, Rect::new(16.01, 0.0, 20.0, 20.0)));
+        assert!(visually_stacked(
+            Rect::new(0.0, 0.0, 100.0, 100.0),
+            Rect::new(49.5, -450.0, 1.0, 1_000.0)
+        ));
     }
 
     #[test]
@@ -1733,7 +1813,7 @@ mod tests {
                 .filter(|label| label.z_index == 3)
                 .map(|label| label.text.as_str())
                 .collect::<Vec<_>>(),
-            ["bottom"]
+            ["top-left", "top-right"]
         );
 
         let mut second = labels;
@@ -1744,7 +1824,7 @@ mod tests {
                 .filter(|label| label.z_index == 3)
                 .map(|label| label.text.as_str())
                 .collect::<Vec<_>>(),
-            ["top-left", "top-right"]
+            ["bottom"]
         );
     }
 
@@ -1771,8 +1851,8 @@ mod tests {
         assert_eq!(mode.scanned.len(), 128);
         assert_eq!(mode.hints.len(), 128);
         assert_eq!(completed_labels.len(), 128);
-        assert_eq!(mode.overlap_plan.layers.len(), 128);
-        assert_eq!(mode.overlap_plan.layer_count, 128);
+        assert_eq!(mode.overlap_plan.len(), 128);
+        assert_eq!(mode.overlap_plan.layer_count(), 128);
 
         let shifted = press(&mut mode, &env, "left_shift");
         let shifted_scene = scene_of(&shifted);
@@ -1827,7 +1907,7 @@ mod tests {
                 .filter(|label| label.z_index == 3)
                 .map(|label| label.text.as_str())
                 .collect::<Vec<_>>(),
-            ["three-2"]
+            ["three-0"]
         );
     }
 
@@ -1849,7 +1929,7 @@ mod tests {
         assert!(held.is_empty(), "scanning Shift does not add a redraw");
         assert!(mode.held_overlap_keys.is_empty());
         assert_eq!(mode.overlap_cycle, 0);
-        assert!(!mode.overlap_plan.ready);
+        assert!(!mode.overlap_plan.is_ready());
 
         let streamed = mode.handle(
             &ModeEvent::UiScanned(crate::api::UiScanResult {
@@ -1862,7 +1942,7 @@ mod tests {
         let streamed_scene = scene_of(&streamed);
         assert_eq!(streamed_scene.labels.len(), 4);
         assert_eq!(mode.hints.len(), 4, "new partial labels remain visible");
-        assert!(!mode.overlap_plan.ready);
+        assert!(!mode.overlap_plan.is_ready());
         assert_eq!(
             streamed_scene
                 .labels
@@ -1874,11 +1954,18 @@ mod tests {
         );
 
         let completed = deliver(&mut mode, &env, Vec::new());
-        assert!(completed.is_empty());
+        assert_eq!(
+            scene_of(&completed)
+                .labels
+                .iter()
+                .filter(|label| label.z_index == 3)
+                .count(),
+            1
+        );
         assert!(!mode.scanning);
-        assert!(mode.overlap_plan.ready);
-        assert_eq!(mode.overlap_plan.layers.len(), 4);
-        assert_eq!(mode.overlap_plan.layer_count, 4);
+        assert!(mode.overlap_plan.is_ready());
+        assert_eq!(mode.overlap_plan.len(), 4);
+        assert_eq!(mode.overlap_plan.layer_count(), 4);
 
         let released = release(&mut mode, &env, "left_shift");
         assert!(released.is_empty(), "the ignored key has no held state");
@@ -1901,6 +1988,64 @@ mod tests {
             4,
             "every stacked label must be reachable"
         );
+    }
+
+    #[test]
+    fn partials_after_a_typed_prefix_merge_when_the_prefix_is_cleared() {
+        let env = Env::new();
+        let mut mode = HintMode::new(&env.config);
+        activate(&mut mode, &env);
+        mode.handle(
+            &ModeEvent::UiScanned(UiScanResult {
+                id: mode.scan_id,
+                targets: (0..30)
+                    .map(|index| target(&format!("Initial {index}"), index as f64 * 24.0))
+                    .collect(),
+                status: UiScanStatus::Partial,
+            }),
+            &env.ctx(),
+        );
+        let original_hint_count = mode.hints.len();
+        let prefix = mode
+            .alphabet
+            .iter()
+            .copied()
+            .find(|prefix| {
+                let prefix = prefix.to_string();
+                mode.hints
+                    .iter()
+                    .filter(|hint| hint.label.starts_with(&prefix))
+                    .count()
+                    > 1
+                    && mode.hints.iter().all(|hint| hint.label != prefix)
+            })
+            .expect("test data should provide a partial label prefix");
+        press(&mut mode, &env, &prefix.to_string());
+
+        let late = mode.handle(
+            &ModeEvent::UiScanned(UiScanResult {
+                id: mode.scan_id,
+                targets: (0..5)
+                    .map(|index| target(&format!("Late {index}"), 720.0 + index as f64 * 24.0))
+                    .collect(),
+                status: UiScanStatus::Partial,
+            }),
+            &env.ctx(),
+        );
+        assert!(late.is_empty(), "typed label codes must remain stable");
+        assert_eq!(mode.hints.len(), original_hint_count);
+        assert_eq!(mode.scanned.len(), original_hint_count + 5);
+        assert!(mode.pending_relabel);
+
+        deliver(&mut mode, &env, Vec::new());
+        assert_eq!(mode.hints.len(), original_hint_count);
+        assert!(mode.pending_relabel);
+
+        let merged = press(&mut mode, &env, "backspace");
+        assert_eq!(scene_of(&merged).labels.len(), mode.scanned.len());
+        assert_eq!(mode.hints.len(), mode.scanned.len());
+        assert!(!mode.pending_relabel);
+        assert!(mode.overlap_plan.is_ready());
     }
 
     #[test]
@@ -1969,11 +2114,13 @@ mod tests {
             1
         );
         let restored = release(&mut mode, &env, "right_alt");
-        assert!(
+        assert_eq!(
             scene_of(&restored)
                 .labels
                 .iter()
-                .all(|label| label.z_index == 2)
+                .filter(|label| label.z_index == 3)
+                .count(),
+            1
         );
     }
 
@@ -2240,7 +2387,7 @@ mod tests {
         press(&mut mode, &env, "/");
         let filtered = press(&mut mode, &env, "a");
         assert_eq!(mode.hints.len(), 2);
-        assert_eq!(mode.overlap_plan.layers.len(), 2);
+        assert_eq!(mode.overlap_plan.len(), 2);
         // Two hint labels plus the search input label.
         assert_eq!(scene_of(&filtered).labels.len(), 3);
 

@@ -20,8 +20,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MF_STRING, MSG, MessageBoxW, PostMessageW, RegisterWindowMessageW, SW_SHOWNORMAL,
     SetForegroundWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
     TrackPopupMenu, TranslateMessage, WM_APP, WM_CANCELMODE, WM_DISPLAYCHANGE, WM_LBUTTONUP,
-    WM_NULL, WM_QUIT, WM_RBUTTONUP, WM_SETTINGCHANGE, WNDCLASSEXW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_POPUP,
+    WM_NULL, WM_QUIT, WM_RBUTTONUP, WM_SETTINGCHANGE, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -202,13 +201,14 @@ impl Drop for StatusItem {
 }
 
 fn tray_thread(ready: std::sync::mpsc::SyncSender<Result<(u32, isize), String>>) {
-    let hwnd = match create_window() {
-        Ok(hwnd) => hwnd,
+    let window = match create_window() {
+        Ok(window) => window,
         Err(error) => {
             let _ = ready.send(Err(error));
             return;
         }
     };
+    let hwnd = window.raw();
     if !add_icon(hwnd) {
         crate::report_warning!(
             "windows-tray",
@@ -217,7 +217,7 @@ fn tray_thread(ready: std::sync::mpsc::SyncSender<Result<(u32, isize), String>>)
     }
     let thread_id = super::native::current_thread_id();
     if ready.send(Ok((thread_id, hwnd.0 as isize))).is_err() {
-        destroy_window(hwnd);
+        destroy_window(window);
         return;
     }
 
@@ -244,10 +244,10 @@ fn tray_thread(ready: std::sync::mpsc::SyncSender<Result<(u32, isize), String>>)
             DispatchMessageW(&message);
         }
     }
-    destroy_window(hwnd);
+    destroy_window(window);
 }
 
-fn create_window() -> Result<HWND, String> {
+fn create_window() -> Result<super::native::OwnedWindow, String> {
     // SAFETY: the static message name is NUL-terminated and lives forever.
     let taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
     if taskbar_created == 0 {
@@ -267,34 +267,17 @@ fn create_window() -> Result<HWND, String> {
         ..Default::default()
     };
     super::native::register_window_class(&class)?;
-    // SAFETY: the class was registered above, all strings are static, and the
-    // returned HWND is owned by this tray thread until `destroy_window`.
-    unsafe {
-        CreateWindowExW(
-            WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
-            w!("KeySteerStatusWindow"),
-            w!("KeySteer"),
-            WS_POPUP,
-            0,
-            0,
-            0,
-            0,
-            None,
-            None,
-            Some(instance.into()),
-            None,
-        )
-    }
-    .map_err(|error| format!("CreateWindowExW(status) failed: {error}"))
+    super::native::create_owned_window(super::native::OwnedWindowSpec::Status)
 }
 
-fn destroy_window(hwnd: HWND) {
+fn destroy_window(window: super::native::OwnedWindow) {
+    let hwnd = window.raw();
     // SAFETY: `hwnd` owns the icon identified by `icon_data`; NIM_DELETE does
     // not retain the stack structure.
     unsafe {
         let _ = Shell_NotifyIconW(NIM_DELETE, &icon_data(hwnd));
     }
-    if let Err(error) = super::native::OwnedWindow::new(hwnd).destroy() {
+    if let Err(error) = window.destroy() {
         crate::report_error!("windows-tray", "cannot destroy tray event window: {error}");
     }
 }
