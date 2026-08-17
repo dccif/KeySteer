@@ -456,8 +456,10 @@ impl HintMode {
         );
         if self.held_overlap_keys.is_empty() {
             self.overlap_cycle = 0;
-        } else if self.overlap_plan.layer_count() != 0 {
-            self.overlap_cycle %= self.overlap_plan.layer_count();
+        } else if self.overlap_plan.layer_count() > 1 {
+            self.overlap_cycle = self
+                .overlap_cycle
+                .clamp(1, self.overlap_plan.layer_count() - 1);
         }
         self.overlap_plan.layer_count() != 0
     }
@@ -501,7 +503,10 @@ impl HintMode {
                 if inserted && was_released {
                     let layer_count = self.overlap_plan.layer_count();
                     if layer_count > 1 {
-                        self.overlap_cycle = (self.overlap_cycle + 1) % layer_count;
+                        // Releasing the modifier already restores layer zero.
+                        // Cycle only the non-default layers so every press has
+                        // an observable effect, especially in a two-layer stack.
+                        self.overlap_cycle = self.overlap_cycle % (layer_count - 1) + 1;
                     } else {
                         self.overlap_cycle = 0;
                     }
@@ -531,10 +536,10 @@ impl HintMode {
         if !self.overlap_plan.is_ready() || layer_count == 0 {
             return None;
         }
-        Some(if self.held_overlap_keys.is_empty() {
+        Some(if self.held_overlap_keys.is_empty() || layer_count == 1 {
             0
         } else {
-            self.overlap_cycle % layer_count
+            self.overlap_cycle.clamp(1, layer_count - 1)
         })
     }
 
@@ -1599,9 +1604,9 @@ mod tests {
             .find(|label| label.z_index == 3)
             .map(|label| label.text.clone())
             .expect("one overlapping label should be raised");
-        assert_ne!(first_top, third_top);
         assert_ne!(second_top, third_top);
-        assert_eq!(third_top, initial_top, "three layers must wrap 0→1→2→0");
+        assert_ne!(third_top, initial_top);
+        assert_eq!(third_top, first_top, "presses must cycle 1→2→1");
     }
 
     #[test]
@@ -1636,11 +1641,41 @@ mod tests {
         }
 
         assert_eq!(observed.len(), 6);
-        assert_eq!(observed[0], observed[5], "five layers must wrap to zero");
-        observed.pop();
+        assert_ne!(observed[0], observed[5]);
+        assert_eq!(observed[1], observed[5], "non-default layers must wrap");
+        observed.truncate(5);
         observed.sort_unstable();
         observed.dedup();
         assert_eq!(observed.len(), 5, "every computed layer must be reachable");
+    }
+
+    #[test]
+    fn two_layers_show_the_other_layer_on_every_shift_press() {
+        let env = Env::new();
+        let mut mode = HintMode::new(&env.config);
+        activate(&mut mode, &env);
+        let initial = deliver(
+            &mut mode,
+            &env,
+            vec![target("One", 100.0), target("Two", 100.0)],
+        );
+        let top_text = |output: &_| {
+            scene_of(output)
+                .labels
+                .iter()
+                .find(|label| label.z_index == 3)
+                .map(|label| label.text.clone())
+                .expect("one visual layer should be raised")
+        };
+        let initial_top = top_text(&initial);
+        let first_top = top_text(&press(&mut mode, &env, "left_shift"));
+        assert_ne!(first_top, initial_top);
+        assert_eq!(
+            top_text(&release(&mut mode, &env, "left_shift")),
+            initial_top
+        );
+        let second_top = top_text(&press(&mut mode, &env, "right_shift"));
+        assert_eq!(second_top, first_top);
     }
 
     #[test]
@@ -1970,7 +2005,12 @@ mod tests {
         let released = release(&mut mode, &env, "left_shift");
         assert!(released.is_empty(), "the ignored key has no held state");
 
-        let mut raised_labels = HashSet::new();
+        let mut raised_labels = HashSet::from([scene_of(&completed)
+            .labels
+            .iter()
+            .find(|label| label.z_index == 3)
+            .map(|label| label.text.clone())
+            .expect("the default layer should be raised")]);
         for key in ["left_shift", "right_shift", "left_shift", "right_shift"] {
             let cycled = press(&mut mode, &env, key);
             raised_labels.insert(

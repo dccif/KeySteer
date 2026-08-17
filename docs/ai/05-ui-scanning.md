@@ -59,7 +59,8 @@ UIA 重叠也不会误跑纯像素检测。系统 OCR 使用 WinRT completion ha
 5. 完整标签选中后保存 target、warp pointer、建立 finished 状态。
 6. 只有没有出现标签时才按 `scan_retry_count`/delay 重试；每次预算递增，单次最多 30s。
 7. Partial 保持立即显示；只在 terminal 和筛选集合变化后重建视觉层。扫描期间忽略 Shift；
-   扫描结束后每次新按下置顶下一个全局层，松开恢复第 0 层。已有 Hint 前缀时，晚到 Partial
+   扫描结束后每次新按下置顶下一个非默认全局层，松开恢复第 0 层；第 0 层不再占用一次按下。
+   已有 Hint 前缀时，晚到 Partial
    不改变已有键码，前缀清空后再合入全部待处理目标并重建层级。
 
 因此“流式”是端到端语义，不只是 worker 分批：Mode 会在扫描尚未结束时展示和接受已有
