@@ -29,13 +29,11 @@ const SCAN_RETRY_TIMER_ID: &str = "ui_hint.scan_retry";
 /// Elements and their strings are still dropped on exit; only empty capacity
 /// is retained, and larger scans cannot become an Idle high-water mark.
 const MAX_IDLE_RETAINED_TARGETS: usize = 128;
+/// Ignore border contact that remains readable; center occlusion always counts.
+const MIN_VISUAL_STACK_AREA_RATIO: f64 = 0.20;
 const MAX_SCAN_TIMEOUT_MS: u64 = 30_000;
 const AUTO_HINT_PADDING_X_RATIO: f64 = 2.0 / 17.0;
 const AUTO_HINT_PADDING_Y_RATIO: f64 = 0.06;
-/// Edge contact and tiny corner intersections are still readable and should
-/// not create an extra user-visible stack layer.
-const MIN_VISUAL_STACK_AREA_RATIO: f64 = 0.20;
-
 #[derive(Debug, Default)]
 struct OverlapPlan {
     layers: SmallVec<[u8; 128]>,
@@ -809,41 +807,23 @@ fn visually_stacked(left: Rect, right: Rect) -> bool {
     smaller_area > 0.0 && intersection_area >= smaller_area * MIN_VISUAL_STACK_AREA_RATIO
 }
 
-/// Build a source-agnostic visual plan from the final placed label rectangles.
-/// Tiny edge intersections remain readable and do not consume another Shift
-/// layer. The cached u8 layer number is the only per-label retained state.
+/// Build visual depth from the final draw order. Labels are emitted bottom to
+/// top, so greedily assigning each label against all earlier intersections
+/// makes layer zero the obscured bottom layer and preserves what users see.
 fn build_overlap_plan(rects: &[Rect], plan: &mut OverlapPlan) {
     plan.clear();
     let count = rects.len();
-    if u16::try_from(count).is_err() {
-        return;
-    }
     plan.layers.resize(count, 0);
-    let mut order: SmallVec<[u16; 128]> = (0..count).map(|index| index as u16).collect();
-    order.sort_unstable_by(|left, right| {
-        let left = usize::from(*left);
-        let right = usize::from(*right);
-        rects[left]
-            .left()
-            .total_cmp(&rects[right].left())
-            .then_with(|| rects[left].top().total_cmp(&rects[right].top()))
-            .then_with(|| left.cmp(&right))
-    });
-
     let mut overlaps: SmallVec<[bool; 128]> = std::iter::repeat_n(false, count).collect();
-    let mut active: SmallVec<[u16; 128]> = SmallVec::new();
     let mut layer_count = 0usize;
 
-    // Sweep from left to right. Active rectangles are the only possible
-    // conflicts. Four words cover every representable retained layer while
-    // keeping the per-label scratch state in 32 stack bytes.
-    for compact_index in order {
-        let index = usize::from(compact_index);
-        let left = rects[index].left();
-        active.retain(|other| rects[usize::from(*other)].right() >= left);
+    // Four words cover every representable retained layer while keeping the
+    // per-label scratch state in 32 stack bytes. Final UI Hint scenes normally
+    // contain at most 128 labels, making the direct draw-order scan both small
+    // and deterministic without a second spatial ordering.
+    for index in 0..count {
         let mut occupied_layers = [0u64; 4];
-        for &compact_other in &active {
-            let other = usize::from(compact_other);
+        for other in 0..index {
             if !visually_stacked(rects[index], rects[other]) {
                 continue;
             }
@@ -866,7 +846,6 @@ fn build_overlap_plan(rects: &[Rect], plan: &mut OverlapPlan) {
         };
         plan.layers[index] = compact_layer;
         layer_count = layer_count.max(layer + 1);
-        active.push(compact_index);
     }
 
     if !overlaps.iter().any(|overlap| *overlap) {
@@ -1604,8 +1583,7 @@ mod tests {
                 .with_z_index(2)
         };
         // Each pair is a real two-label stack. The pairs only touch across a
-        // 2px strip, which remains readable and must not turn this into four
-        // Shift layers.
+        // 2px strip, which remains readable and must not create four layers.
         let labels = vec![
             label("left-0", 0.0),
             label("left-1", 0.0),
@@ -1667,6 +1645,101 @@ mod tests {
                 .map(|label| label.text.as_str())
                 .collect::<Vec<_>>(),
             ["left", "right"]
+        );
+    }
+
+    #[test]
+    fn visual_layers_follow_draw_order_instead_of_spatial_order() {
+        let label = |text: &str, x: f64| {
+            OverlayLabel::new(text, Rect::new(x, 0.0, 10.0, 10.0), LabelStyle::default())
+                .with_z_index(2)
+        };
+        // `bottom` is emitted first and is obscured by both later labels. A
+        // spatial left-to-right coloring reverses this visual relationship.
+        let labels = vec![
+            label("bottom", 8.0),
+            label("top-left", 0.0),
+            label("top-right", 16.0),
+        ];
+
+        let mut first = labels.clone();
+        rotate_overlapping_labels(&mut first, 1);
+        assert_eq!(
+            first
+                .iter()
+                .filter(|label| label.z_index == 3)
+                .map(|label| label.text.as_str())
+                .collect::<Vec<_>>(),
+            ["bottom"]
+        );
+
+        let mut second = labels;
+        rotate_overlapping_labels(&mut second, 2);
+        assert_eq!(
+            second
+                .iter()
+                .filter(|label| label.z_index == 3)
+                .map(|label| label.text.as_str())
+                .collect::<Vec<_>>(),
+            ["top-left", "top-right"]
+        );
+    }
+
+    #[test]
+    fn final_layer_plan_never_removes_or_reorders_scan_labels() {
+        let env = Env::new();
+        let mut mode = HintMode::new(&env.config);
+        activate(&mut mode, &env);
+        let targets = (0..128)
+            .map(|index| target(&format!("Target {index}"), 100.0))
+            .collect();
+
+        let completed = deliver(&mut mode, &env, targets);
+        let completed_labels: Vec<_> = scene_of(&completed)
+            .labels
+            .iter()
+            .map(|label| label.text.clone())
+            .collect();
+        let completed_rects: Vec<_> = scene_of(&completed)
+            .labels
+            .iter()
+            .map(|label| label.rect)
+            .collect();
+        assert_eq!(mode.scanned.len(), 128);
+        assert_eq!(mode.hints.len(), 128);
+        assert_eq!(completed_labels.len(), 128);
+        assert_eq!(mode.overlap_plan.layers.len(), 128);
+        assert_eq!(mode.overlap_plan.layer_count, 128);
+
+        let shifted = press(&mut mode, &env, "left_shift");
+        let shifted_scene = scene_of(&shifted);
+        assert_eq!(shifted_scene.labels.len(), 128);
+        assert_eq!(
+            shifted_scene
+                .labels
+                .iter()
+                .map(|label| label.text.as_str())
+                .collect::<Vec<_>>(),
+            completed_labels
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            shifted_scene
+                .labels
+                .iter()
+                .map(|label| label.rect)
+                .collect::<Vec<_>>(),
+            completed_rects
+        );
+        assert_eq!(
+            shifted_scene
+                .labels
+                .iter()
+                .filter(|label| label.z_index == 3)
+                .count(),
+            1
         );
     }
 

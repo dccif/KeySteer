@@ -2,9 +2,9 @@
 
 ## 0.9.4
 
-跨平台 UI Hint 统一使用零分配文字分析和精确前缀高亮。
+跨平台 UI Hint 统一使用零分配文字分析和精确前缀高亮，并修正最终视觉层切换。
 
-Cross-platform UI Hint now shares allocation-free text analysis, exact prefix highlighting.
+Cross-platform UI Hint now shares allocation-free text analysis and exact prefix highlighting, with corrected final visual-layer cycling.
 
 ## 0.9.3
 

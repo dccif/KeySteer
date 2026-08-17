@@ -127,14 +127,14 @@ UI Hint 按需为目标名缓存一次 lowercase 结果；退出后立即 drop �
 不保留旧坐标或扫描结果。为避免常见不足 100 项的重入重新增长容器，最多保留 128 项的
 空 `scanned`/`hints`/dedup backing；超过上限的 request-scoped backing 立即释放，因此大型
 扫描不会成为 Idle 常驻内存。搜索重标记不得逐目标重新分配小写字符串。目标去重使用矩形
-到 canonical index 的小碰撞表。重叠轮换在 UIA/视觉结果已经到达的批次合并、Hint 分配和
-位置计算之后，以按左边界排序的扫描线建立视觉层计划；矩形中心遮挡或交叠面积达到较小标签
-20% 才算肉眼堆叠，轻微边缘接触不增加 Shift 次数。中间 Partial 始终流式显示且不计算计划；
+到 canonical index 的小碰撞表。重叠轮换在 UIA/视觉结果全部合并、Hint 分配和最终位置计算
+之后，严格按最终 scene 的底到顶绘制顺序建立视觉层计划；矩形中心被遮挡或交叠面积达到较小
+标签20%才算肉眼堆叠，轻微边缘接触不增加Shift次数。中间Partial始终流式显示且不计算计划；
 扫描期间的 Shift 完全忽略，terminal 从最终标签建立一次计划，使第一次 Shift 也不承担排序
 开销。计划每标签只保留一个 `u8` 层号，128 项占 128 B；重复 Shift 只线性更新 z-index，不重新排序
-或分组。order/active/overlap 工作表使用 inline 128 的 `SmallVec`，层占用使用 4 个 `u64` 的
-固定 bitset；常见场景不产生临时堆分配，超出 128 项仍安全 spill；退出 UI Hint 后清空请求级
-计划。
+或分组。overlap 工作表使用 inline 128 的 `SmallVec`，层占用使用 4 个 `u64` 的固定 bitset；
+常见场景不产生临时堆分配，超出 128 项仍安全 spill；退出 UI Hint 后清空请求级计划。Shift
+前后只允许 z-index 改变。
 
 ## 帧时钟
 
