@@ -33,6 +33,7 @@ const NO_WINDOW_UNDER_POINTER: &str =
 const MAX_IDLE_RETAINED_TARGETS: usize = 128;
 /// Ignore border contact that remains readable; center occlusion always counts.
 const MIN_VISUAL_STACK_AREA_RATIO: f64 = 0.20;
+const MIN_TEXT_OCCLUSION_EXTENT: f64 = 0.5;
 const MAX_SCAN_TIMEOUT_MS: u64 = 30_000;
 const AUTO_HINT_PADDING_X_RATIO: f64 = 2.0 / 17.0;
 const AUTO_HINT_PADDING_Y_RATIO: f64 = 0.06;
@@ -459,7 +460,7 @@ impl HintMode {
         build_visual_layer_plan(
             &placements,
             self.hints.len(),
-            visually_stacked,
+            |left, right| visually_stacked(left, right, style.padding_x, style.padding_y),
             &mut self.overlap_plan,
         );
         if self.held_overlap_keys.is_empty() {
@@ -863,7 +864,12 @@ fn placed_hint_rect(config: &HintsConfig, hint: &CompactHint<usize>, style: &Lab
     )
 }
 
-fn visually_stacked(left: Rect, right: Rect) -> bool {
+fn visually_stacked(
+    left: Rect,
+    right: Rect,
+    horizontal_padding: f64,
+    vertical_padding: f64,
+) -> bool {
     let Some(intersection) = left.intersect(&right) else {
         return false;
     };
@@ -872,7 +878,29 @@ fn visually_stacked(left: Rect, right: Rect) -> bool {
     }
     let intersection_area = intersection.width * intersection.height;
     let smaller_area = (left.width * left.height).min(right.width * right.height);
-    smaller_area > 0.0 && intersection_area >= smaller_area * MIN_VISUAL_STACK_AREA_RATIO
+    (smaller_area > 0.0 && intersection_area >= smaller_area * MIN_VISUAL_STACK_AREA_RATIO)
+        || obscures_label_text(left, right, horizontal_padding, vertical_padding)
+        || obscures_label_text(right, left, horizontal_padding, vertical_padding)
+}
+
+fn obscures_label_text(
+    cover: Rect,
+    target: Rect,
+    horizontal_padding: f64,
+    vertical_padding: f64,
+) -> bool {
+    let inset_x = horizontal_padding.clamp(0.0, target.width / 2.0);
+    let inset_y = vertical_padding.clamp(0.0, target.height / 2.0);
+    let content = Rect::new(
+        target.x + inset_x,
+        target.y + inset_y,
+        target.width - inset_x * 2.0,
+        target.height - inset_y * 2.0,
+    );
+    cover.intersect(&content).is_some_and(|intersection| {
+        intersection.width > MIN_TEXT_OCCLUSION_EXTENT
+            && intersection.height > MIN_TEXT_OCCLUSION_EXTENT
+    })
 }
 
 #[cfg(test)]
@@ -883,7 +911,13 @@ fn rotate_overlapping_labels(labels: &mut [OverlayLabel], cycle: usize) {
         .map(|(index, label)| (index, label.rect))
         .collect();
     let mut plan = VisualLayerPlan::default();
-    build_visual_layer_plan(&placements, labels.len(), visually_stacked, &mut plan);
+    let style = LabelStyle::default();
+    build_visual_layer_plan(
+        &placements,
+        labels.len(),
+        |left, right| visually_stacked(left, right, style.padding_x, style.padding_y),
+        &mut plan,
+    );
     if plan.layer_count() == 0 {
         return;
     }
@@ -1587,6 +1621,15 @@ mod tests {
         assert_eq!(mode.overlap_plan.len(), mode.hints.len());
         assert_eq!(mode.overlap_plan.layer_count(), visible);
 
+        let raised_label = |output: &Vec<Command>| {
+            scene_of(output)
+                .labels
+                .iter()
+                .find(|label| label.z_index == 3)
+                .map(|label| label.text.clone())
+                .expect("one filtered visual layer should be raised")
+        };
+        let mut raised = HashSet::from([raised_label(&filtered)]);
         let cycled = press(&mut mode, &env, "left_shift");
         assert_eq!(scene_of(&cycled).labels.len(), visible);
         assert_eq!(
@@ -1597,7 +1640,18 @@ mod tests {
                 .count(),
             1
         );
+        raised.insert(raised_label(&cycled));
         release(&mut mode, &env, "left_shift");
+        for _ in 2..visible {
+            let cycled = press(&mut mode, &env, "left_shift");
+            raised.insert(raised_label(&cycled));
+            release(&mut mode, &env, "left_shift");
+        }
+        assert_eq!(
+            raised.len(),
+            visible,
+            "every layer must remain reachable after a Hint prefix"
+        );
 
         let restored = press(&mut mode, &env, "backspace");
         assert_eq!(scene_of(&restored).labels.len(), total);
@@ -1864,11 +1918,31 @@ mod tests {
     #[test]
     fn visual_stack_threshold_and_center_occlusion_are_stable() {
         let base = Rect::new(0.0, 0.0, 20.0, 20.0);
-        assert!(visually_stacked(base, Rect::new(16.0, 0.0, 20.0, 20.0)));
-        assert!(!visually_stacked(base, Rect::new(16.01, 0.0, 20.0, 20.0)));
+        assert!(visually_stacked(
+            base,
+            Rect::new(16.0, 0.0, 20.0, 20.0),
+            4.0,
+            2.0
+        ));
+        assert!(!visually_stacked(
+            base,
+            Rect::new(16.01, 0.0, 20.0, 20.0),
+            4.0,
+            2.0
+        ));
+        assert!(
+            visually_stacked(base, Rect::new(17.0, 0.0, 20.0, 20.0), 2.0, 2.0),
+            "sub-20% overlap that reaches text content must be switchable"
+        );
+        assert!(
+            !visually_stacked(base, Rect::new(17.0, 0.0, 20.0, 20.0), 4.0, 2.0),
+            "padding-only overlap must not create another layer"
+        );
         assert!(visually_stacked(
             Rect::new(0.0, 0.0, 100.0, 100.0),
-            Rect::new(49.5, -450.0, 1.0, 1_000.0)
+            Rect::new(49.5, -450.0, 1.0, 1_000.0),
+            4.0,
+            2.0
         ));
     }
 
