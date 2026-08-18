@@ -1,5 +1,5 @@
 import { defineComponent, onBeforeUnmount, onMounted, ref } from 'vue'
-import { withBase } from 'vitepress'
+import { useData, withBase } from 'vitepress'
 import { RELEASE_TAG, RELEASE_URL, RELEASES_URL, releaseAssetUrl } from '../generated/release'
 
 interface DownloadAsset {
@@ -7,7 +7,7 @@ interface DownloadAsset {
   platform: 'windows' | 'macos'
   platformLabel: string
   label: string
-  description: string
+  description: { zh: string; en: string }
   target: string
 }
 
@@ -17,7 +17,7 @@ const ASSETS: DownloadAsset[] = [
     platform: 'windows',
     platformLabel: 'Windows',
     label: 'x86_x64',
-    description: '绝大多数电脑',
+    description: { zh: '绝大多数电脑', en: 'Most PCs' },
     target: 'x86_64-pc-windows-msvc',
   },
   {
@@ -25,7 +25,7 @@ const ASSETS: DownloadAsset[] = [
     platform: 'windows',
     platformLabel: 'Windows',
     label: 'ARM64',
-    description: 'Windows on ARM',
+    description: { zh: 'Windows on ARM', en: 'Windows on ARM' },
     target: 'aarch64-pc-windows-msvc',
   },
   {
@@ -33,7 +33,7 @@ const ASSETS: DownloadAsset[] = [
     platform: 'macos',
     platformLabel: 'macOS',
     label: 'Apple Silicon',
-    description: 'M 系列芯片',
+    description: { zh: 'M 系列芯片', en: 'M-series chips' },
     target: 'aarch64-apple-darwin',
   },
   {
@@ -41,7 +41,7 @@ const ASSETS: DownloadAsset[] = [
     platform: 'macos',
     platformLabel: 'macOS',
     label: 'Intel',
-    description: 'Intel 芯片',
+    description: { zh: 'Intel 芯片', en: 'Intel chips' },
     target: 'x86_64-apple-darwin',
   },
 ]
@@ -92,8 +92,12 @@ function assetUrl(asset: DownloadAsset) {
 export default defineComponent({
   name: 'DownloadButton',
   setup() {
+    const { lang } = useData()
     const detected = ref<DownloadAsset>(detectAsset())
     const menuOpen = ref(false)
+    const isEnglish = () => lang.value === 'en-US'
+    const text = (zh: string, en: string) => isEnglish() ? en : zh
+    const localPath = (path: string) => withBase(`${isEnglish() ? '/en' : ''}${path}`)
 
     const closeMenu = () => {
       menuOpen.value = false
@@ -114,15 +118,15 @@ export default defineComponent({
           <a
             class="hero-download-main"
             href={assetUrl(detected.value)}
-            title={`下载 KeySteer ${detected.value.platformLabel} ${detected.value.label}`}
+            title={text(`下载 KeySteer ${detected.value.platformLabel} ${detected.value.label}`, `Download KeySteer for ${detected.value.platformLabel} ${detected.value.label}`)}
           >
             <span class="hero-download-emoji" aria-hidden="true">💾</span>
-            <strong>立即下载</strong>
+            <strong>{text('立即下载', 'Download now')}</strong>
           </a>
           <button
             class="hero-download-toggle"
             type="button"
-            aria-label="选择下载平台和架构"
+            aria-label={text('选择下载平台和架构', 'Choose download platform and architecture')}
             aria-expanded={menuOpen.value}
             onClick={() => { menuOpen.value = !menuOpen.value }}
           >
@@ -152,9 +156,9 @@ export default defineComponent({
                     <span class="hero-download-option-emoji" aria-hidden="true">📦</span>
                     <span class="hero-download-option-copy">
                       <strong>{asset.label}</strong>
-                      <small>{asset.description}</small>
+                      <small>{asset.description[isEnglish() ? 'en' : 'zh']}</small>
                     </span>
-                    {asset.key === detected.value.key && <span class="hero-download-option-status">当前设备</span>}
+                    {asset.key === detected.value.key && <span class="hero-download-option-status">{text('当前设备', 'This device')}</span>}
                   </a>
                 ))}
               </div>
@@ -171,20 +175,22 @@ export default defineComponent({
                     <span class="hero-download-option-emoji" aria-hidden="true">📦</span>
                     <span class="hero-download-option-copy">
                       <strong>{asset.label}</strong>
-                      <small>{asset.description}</small>
+                      <small>{asset.description[isEnglish() ? 'en' : 'zh']}</small>
                     </span>
-                    {asset.key === detected.value.key && <span class="hero-download-option-status">当前设备</span>}
+                    {asset.key === detected.value.key && <span class="hero-download-option-status">{text('当前设备', 'This device')}</span>}
                   </a>
                 ))}
               </div>
               <a class="hero-download-all" href={RELEASES_URL} target="_blank" rel="noopener" onClick={closeMenu}>
-                查看全部 Release →
+                {text('查看全部 Release →', 'View all releases →')}
               </a>
             </div>
           )}
         </div>
-        <a class="hero-action-link" href={withBase('/guide/getting-started')}>快速开始</a>
-        <a class="hero-action-link" href={withBase('/development/architecture')}>一起开发</a>
+        <a class="hero-action-link" href={localPath('/guide/getting-started')}>{text('快速开始', 'Get started')}</a>
+        <a class="hero-action-link" href={localPath(isEnglish() ? '/editor/' : '/development/architecture')}>
+          {text('一起开发', 'Configuration & simulator')}
+        </a>
       </div>
     )
   },

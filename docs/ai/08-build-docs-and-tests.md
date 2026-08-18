@@ -119,7 +119,9 @@ GitHub Pages。需要更新线上文档时，在 Actions 页面运行 `Deploy do
 `docs/en/`，不要把 `docs/ai/` 的维护者资料复制到任一面向用户的侧栏。`docs/.vitepress/config.mts`
 在 `locales` 与 `themeConfig.locales` 中维护两种语言的导航、侧栏、搜索、页内目录和上下页文案；
 两套导航各有一个语言菜单。新增或移动用户页面时，必须同时新增/移动其 `docs/en/` 对应页面并更新两套链接，
-避免语言切换后落到不存在的地址。
+避免语言切换后落到不存在的地址。内联脚本还会将语言选择记录在浏览器本地存储，并把 VitePress 内置语言菜单的
+跳转改写为当前页面的另一语言路径；新增加英文用户页面时，也要把其无 `/en/` 前缀路径加入
+`config.mts` 的 `englishPages`，否则不会自动恢复英文偏好。
 
 工具链：VitePress 1.6、Vue 3 TSX、`smol-toml`、pnpm。主要脚本：
 

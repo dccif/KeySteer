@@ -2,13 +2,53 @@ import vueJsx from '@vitejs/plugin-vue-jsx'
 import { withMermaid } from 'vitepress-plugin-mermaid'
 
 const base = process.env.KEYSTEER_DOCS_BASE || '/'
+const languageStateScript = `(() => {
+  const base = ${JSON.stringify(base)}
+  const key = 'keysteer-docs-language'
+  const englishPages = new Set([
+    '', 'guide/getting-started', 'guide/macos', 'modes/', 'modes/grid',
+    'modes/normal', 'modes/recursive-grid', 'modes/ui-hint', 'reference/configuration',
+    'reference/modes-and-actions', 'editor/', 'simulator', 'releases/',
+  ])
+  const relativePath = () => decodeURIComponent(location.pathname.startsWith(base)
+    ? location.pathname.slice(base.length) : location.pathname.slice(1))
+  const normalise = (path) => path.replace(/^\\/+/, '').replace(/index\\.html$/, '')
+  const switchPath = (english) => {
+    const current = normalise(relativePath())
+    const withoutLanguage = current.startsWith('en/') ? current.slice(3) : current
+    if (english && !englishPages.has(withoutLanguage)) return null
+    return base + (english ? 'en/' : '') + withoutLanguage
+  }
+  const currentIsEnglish = () => normalise(relativePath()).startsWith('en/')
+  const stored = localStorage.getItem(key)
+  if (stored === 'en' && !currentIsEnglish()) {
+    const destination = switchPath(true)
+    if (destination && destination !== location.pathname) location.replace(destination)
+  }
+  document.addEventListener('click', (event) => {
+    const target = event.target instanceof Element
+      ? event.target.closest('.VPNavBarTranslations a') : null
+    if (!target) return
+    const english = target.getAttribute('href')?.includes('/en/') ?? false
+    const destination = switchPath(english)
+    localStorage.setItem(key, english ? 'en' : 'zh')
+    if (!destination) return
+    event.preventDefault()
+    location.assign(destination)
+  }, true)
+})()`
 
 export default withMermaid({
   base,
   lang: 'zh-CN',
   locales: {
     root: { label: '简体中文', lang: 'zh-CN' },
-    en: { label: 'English', lang: 'en-US' },
+    en: {
+      label: 'English',
+      lang: 'en-US',
+      title: 'KeySteer',
+      description: 'A fast, lightweight, native keyboard mouse-control tool.',
+    },
   },
   title: 'KeySteer',
   description: '用键盘操控鼠标的原生小工具：快、轻量、可定制。',
@@ -17,6 +57,7 @@ export default withMermaid({
   head: [
     ['link', { rel: 'icon', type: 'image/png', href: `${base}generated/keysteer-icon.png` }],
     ['meta', { name: 'theme-color', content: '#6578d4' }],
+    ['script', {}, languageStateScript],
   ],
   vite: {
     plugins: [vueJsx()],
@@ -77,6 +118,31 @@ export default withMermaid({
     search: {
       provider: 'local',
       options: {
+        locales: {
+          en: {
+            translations: {
+              button: {
+                buttonText: 'Search',
+                buttonAriaLabel: 'Search documentation',
+              },
+              modal: {
+                displayDetails: 'Display detailed list',
+                resetButtonTitle: 'Reset search',
+                backButtonTitle: 'Close search',
+                noResultsText: 'No results for',
+                footer: {
+                  selectText: 'Select',
+                  selectKeyAriaLabel: 'Enter',
+                  navigateText: 'Navigate',
+                  navigateUpKeyAriaLabel: 'Arrow up',
+                  navigateDownKeyAriaLabel: 'Arrow down',
+                  closeText: 'Close',
+                  closeKeyAriaLabel: 'Esc',
+                },
+              },
+            },
+          },
+        },
         translations: {
           button: {
             buttonText: '搜索',

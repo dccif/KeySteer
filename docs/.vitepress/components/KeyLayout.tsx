@@ -1,4 +1,5 @@
 import { computed, defineComponent } from 'vue'
+import { useData } from 'vitepress'
 
 const tones = [
   ['move', '移动'],
@@ -29,6 +30,14 @@ export default defineComponent({
     target: { type: String, default: '' },
   },
   setup(props) {
+    const { lang } = useData()
+    const toneLabel = (tone: Tone, chineseLabel: string) => {
+      if (lang.value !== 'en-US') return chineseLabel
+      return {
+        move: 'Move', click: 'Click', speed: 'Speed', scroll: 'Scroll',
+        state: 'Hold / drag', navigation: 'Application navigation', mode: 'Mode switch', target: 'Target keys',
+      }[tone]
+    }
     const rows = computed(() => props.layout
       .split(/[\/\n]/)
       .map((row) => row.trim())
@@ -61,8 +70,8 @@ export default defineComponent({
           ))}
         </div>
         {activeTones.value.length > 0 && (
-          <ul class="key-layout-legend" aria-label="键位颜色图例">
-            {activeTones.value.map(([tone, label]) => <li class={`tone-${tone}`}><i />{label}</li>)}
+          <ul class="key-layout-legend" aria-label={lang.value === 'en-US' ? 'Key colour legend' : '键位颜色图例'}>
+            {activeTones.value.map(([tone, label]) => <li class={`tone-${tone}`}><i />{toneLabel(tone, label)}</li>)}
           </ul>
         )}
       </figure>

@@ -1,5 +1,5 @@
 import { defineComponent } from 'vue'
-import { withBase } from 'vitepress'
+import { useData, withBase } from 'vitepress'
 
 export default defineComponent({
   name: 'ModeVideo',
@@ -9,6 +9,7 @@ export default defineComponent({
     description: { type: String, required: true },
   },
   setup(props) {
+    const { lang } = useData()
     return () => {
       const source = withBase(`/video/${props.file}`)
       return (
@@ -21,7 +22,8 @@ export default defineComponent({
             aria-label={props.title}
           >
             <source src={source} type="video/mp4" />
-            当前浏览器无法播放 MP4。<a href={source}>直接打开视频</a>
+            {lang.value === 'en-US' ? 'Your browser cannot play this MP4. ' : '当前浏览器无法播放 MP4。'}
+            <a href={source}>{lang.value === 'en-US' ? 'Open the video directly' : '直接打开视频'}</a>
           </video>
           <figcaption>
             <strong>{props.title}</strong>
