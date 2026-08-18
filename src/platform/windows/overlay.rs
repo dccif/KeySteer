@@ -25,6 +25,7 @@ use windows::core::{PCWSTR, w};
 use crate::api::geometry::{Point, Rect};
 use crate::api::overlay::{
     Color, LabelStyle, LabelTextAnalysis, OverlayItems, OverlayLabel, OverlayScene, OverlayShape,
+    normalized_label_scale, scaled_label_geometry,
 };
 
 use super::native::{
@@ -292,7 +293,7 @@ impl DpiSceneCache {
         scene: &'a OverlayScene,
         scale: f64,
     ) -> Cow<'a, OverlayScene> {
-        let scale = normalized_scale(scale);
+        let scale = normalized_label_scale(scale);
         if (scale - 1.0).abs() < f64::EPSILON {
             self.clear();
             return Cow::Borrowed(scene);
@@ -336,35 +337,10 @@ fn scene_for_dpi(scene: &OverlayScene, scale: f64) -> Cow<'_, OverlayScene> {
     DpiSceneCache::default().scene_for_dpi(scene, scale)
 }
 
-fn normalized_scale(scale: f64) -> f64 {
-    if scale.is_finite() {
-        scale.max(1.0)
-    } else {
-        1.0
-    }
-}
-
 fn scale_labels(labels: &mut OverlayItems<OverlayLabel>, scale: f64) {
     for label in labels {
-        let chars = label.text.chars().count().max(1) as f64;
-        let expected_width = label.style.font_size * 0.75 * chars + label.style.padding_x * 2.0;
-        let expected_height = label.style.font_size * 1.4 + label.style.padding_y * 2.0;
-        let compact = label.rect.width <= expected_width * 1.75
-            && label.rect.height <= expected_height * 1.75;
-        let effective = if compact {
-            let center = label.rect.center();
-            label.rect.width = (label.rect.width * scale).round().max(1.0);
-            label.rect.height = (label.rect.height * scale).round().max(1.0);
-            label.rect.x = (center.x - label.rect.width / 2.0).round();
-            label.rect.y = (center.y - label.rect.height / 2.0).round();
-            scale
-        } else {
-            scale.min(
-                (label.rect.width * 0.8 / expected_width.max(1.0))
-                    .min(label.rect.height * 0.8 / expected_height.max(1.0))
-                    .max(1.0),
-            )
-        };
+        let (rect, effective) = scaled_label_geometry(&label.text, label.rect, &label.style, scale);
+        label.rect = rect;
         scale_style(&mut label.style, effective);
     }
 }

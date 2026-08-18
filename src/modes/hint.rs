@@ -452,17 +452,28 @@ impl HintMode {
 
     fn rebuild_overlap_plan(&mut self, ctx: &HostContext<'_>) -> bool {
         let style = self.resolved_hint_label_style(ctx.palette);
+        let visual_scale = visual_layer_scale(ctx, self.scan_bounds);
+        let visual_padding_x = (style.padding_x * visual_scale).round();
+        let visual_padding_y = (style.padding_y * visual_scale).round();
         let placements: SmallVec<[(usize, Rect); 128]> = self
             .hints
             .iter()
             .enumerate()
             .filter(|(_, hint)| self.hint_is_visible(hint))
-            .map(|(index, hint)| (index, placed_hint_rect(&self.config, hint, &style)))
+            .map(|(index, hint)| {
+                let rect = placed_hint_rect(&self.config, hint, &style);
+                let rect = if visual_scale > 1.0 {
+                    crate::api::overlay::scaled_compact_label_rect(rect, visual_scale)
+                } else {
+                    rect
+                };
+                (index, rect)
+            })
             .collect();
         build_visual_layer_plan(
             &placements,
             self.hints.len(),
-            |left, right| visually_stacked(left, right, style.padding_x, style.padding_y),
+            |left, right| visually_stacked(left, right, visual_padding_x, visual_padding_y),
             &mut self.overlap_plan,
         );
         if self.held_overlap_keys.is_empty() {
@@ -869,6 +880,19 @@ fn placed_hint_rect(config: &HintsConfig, hint: &CompactHint<usize>, style: &Lab
         placed.width,
         placed.height,
     )
+}
+
+fn visual_layer_scale(ctx: &HostContext<'_>, scan_bounds: Option<Rect>) -> f64 {
+    if !cfg!(target_os = "windows") {
+        return 1.0;
+    }
+    let center = scan_bounds.unwrap_or_else(|| ctx.active_bounds()).center();
+    let scale = ctx
+        .screens
+        .iter()
+        .find(|screen| screen.bounds.contains(&center))
+        .map_or(1.0, |screen| screen.scale);
+    crate::api::overlay::normalized_label_scale(scale)
 }
 
 fn visually_stacked(
@@ -1668,9 +1692,11 @@ mod tests {
         assert_eq!(mode.overlap_plan.len(), mode.hints.len());
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
-    fn filtered_ajh_is_ranked_above_the_ajj_that_previously_covered_it() {
-        let env = Env::new();
+    fn high_dpi_ajh_and_ajj_switch_before_and_after_prefix_filtering() {
+        let mut env = Env::new();
+        env.screens[0].scale = 1.5;
         let mut mode = HintMode::new(&env.config);
         activate(&mut mode, &env);
         deliver(
@@ -1682,12 +1708,7 @@ mod tests {
         );
 
         for (index, hint) in mode.hints.iter_mut().enumerate() {
-            hint.bounds = Rect::new(
-                50.0 + (index % 10) as f64 * 90.0,
-                80.0 + (index / 10) as f64 * 65.0,
-                20.0,
-                20.0,
-            );
+            hint.bounds = Rect::new(1_000.0 + index as f64 * 100.0, 300.0, 20.0, 20.0);
         }
         let ajh = mode
             .hints
@@ -1699,8 +1720,52 @@ mod tests {
             .iter()
             .position(|hint| hint.label.as_str() == "ajj")
             .expect("100 labels should include ajj");
-        mode.hints[ajh].bounds = Rect::new(100.0, 100.0, 20.0, 20.0);
-        mode.hints[ajj].bounds = Rect::new(125.0, 100.0, 20.0, 20.0);
+        let style = mode.resolved_hint_label_style(&env.palette);
+        mode.hints[ajh].bounds = Rect::new(50.0, 100.0, 20.0, 20.0);
+        let logical_ajh = placed_hint_rect(&mode.config, &mode.hints[ajh], &style);
+        mode.hints[ajj].bounds = Rect::new(50.0 + logical_ajh.width * 1.10, 100.0, 20.0, 20.0);
+        let logical_ajj = placed_hint_rect(&mode.config, &mode.hints[ajj], &style);
+        assert!(
+            logical_ajh.intersect(&logical_ajj).is_none(),
+            "the old 96-DPI planner must miss this real-world overlap"
+        );
+        let rendered_ajh = crate::api::overlay::scaled_label_geometry(
+            "ajh",
+            logical_ajh,
+            &style,
+            env.screens[0].scale,
+        )
+        .0;
+        let rendered_ajj = crate::api::overlay::scaled_label_geometry(
+            "ajj",
+            logical_ajj,
+            &style,
+            env.screens[0].scale,
+        )
+        .0;
+        assert!(visually_stacked(
+            rendered_ajh,
+            rendered_ajj,
+            (style.padding_x * env.screens[0].scale).round(),
+            (style.padding_y * env.screens[0].scale).round(),
+        ));
+
+        mode.refresh_overlap_plan(&env.ctx());
+        assert_eq!(mode.overlap_plan.component_layer_count(ajh), Some(2));
+        assert_eq!(mode.overlap_plan.component_layer_count(ajj), Some(2));
+        let default_scene = mode.scene(&env.ctx()).sorted();
+        let z = |scene: &OverlayScene, text: &str| {
+            scene
+                .labels
+                .iter()
+                .find(|label| label.text == text)
+                .map(|label| label.z_index)
+                .expect("the pair must remain visible")
+        };
+        assert!(z(&default_scene, "ajj") > z(&default_scene, "ajh"));
+        let shifted = press(&mut mode, &env, "left_shift");
+        assert!(z(scene_of(&shifted), "ajh") > z(scene_of(&shifted), "ajj"));
+        release(&mut mode, &env, "left_shift");
 
         press(&mut mode, &env, "a");
         assert_eq!(mode.overlap_plan.component_layer_count(ajh), Some(2));

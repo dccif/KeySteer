@@ -286,6 +286,55 @@ impl OverlayLabel {
     }
 }
 
+/// Resolve the geometry Windows uses when rasterising a label at monitor DPI.
+///
+/// Kept in the platform-neutral render contract so producers that reason about
+/// final visual overlap can use exactly the same allocation-free calculation
+/// as the native renderer. Calling it does not imply that a backend must scale
+/// its logical geometry.
+pub(crate) fn scaled_label_geometry(
+    text: &str,
+    mut rect: Rect,
+    style: &LabelStyle,
+    scale: f64,
+) -> (Rect, f64) {
+    let scale = normalized_label_scale(scale);
+    let characters = text.chars().count().max(1) as f64;
+    let expected_width = style.font_size * 0.75 * characters + style.padding_x * 2.0;
+    let expected_height = style.font_size * 1.4 + style.padding_y * 2.0;
+    let compact = rect.width <= expected_width * 1.75 && rect.height <= expected_height * 1.75;
+    let effective = if compact {
+        rect = scaled_compact_label_rect(rect, scale);
+        scale
+    } else {
+        scale.min(
+            (rect.width * 0.8 / expected_width.max(1.0))
+                .min(rect.height * 0.8 / expected_height.max(1.0))
+                .max(1.0),
+        )
+    };
+    (rect, effective)
+}
+
+/// Scale a known compact label around its centre using renderer rounding.
+pub(crate) fn scaled_compact_label_rect(mut rect: Rect, scale: f64) -> Rect {
+    let scale = normalized_label_scale(scale);
+    let center = rect.center();
+    rect.width = (rect.width * scale).round().max(1.0);
+    rect.height = (rect.height * scale).round().max(1.0);
+    rect.x = (center.x - rect.width / 2.0).round();
+    rect.y = (center.y - rect.height / 2.0).round();
+    rect
+}
+
+pub(crate) fn normalized_label_scale(scale: f64) -> f64 {
+    if scale.is_finite() {
+        scale.max(1.0)
+    } else {
+        1.0
+    }
+}
+
 /// A non-text primitive: grid lines, cell fills, element outlines.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum OverlayShape {
@@ -607,6 +656,24 @@ mod tests {
         assert!(fitted.font_size < style.font_size);
         assert!(width <= rect.width * 0.8 + f64::EPSILON);
         assert!(height <= rect.height * 0.8 + f64::EPSILON);
+    }
+
+    #[test]
+    fn compact_label_geometry_uses_monitor_scale_without_allocating_text() {
+        let style = LabelStyle {
+            font_size: 17.0,
+            padding_x: 2.0,
+            padding_y: 1.0,
+            ..Default::default()
+        };
+        let rect = Rect::new(40.0, 80.0, 42.25, 25.8);
+        let (scaled, effective) = scaled_label_geometry("ajh", rect, &style, 1.5);
+
+        assert_eq!(effective, 1.5);
+        assert_eq!(scaled.width, 63.0);
+        assert_eq!(scaled.height, 39.0);
+        assert!((scaled.center().x - rect.center().x).abs() <= 0.5);
+        assert!((scaled.center().y - rect.center().y).abs() <= 0.5);
     }
 
     #[test]

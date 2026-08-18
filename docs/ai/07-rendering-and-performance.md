@@ -144,7 +144,9 @@ bitset 和必要的宽层号。计划按完整 Hint 索引保存，筛选压缩�
 映射到互不相同的稳定 z-index，并把当前 Shift 层映射到统一最高值。Mode 单次线性生成标签，
 Engine 随后执行已有的一次稳定 z 排序，保证 CPU/GPU 都不会重新遮住提升层；
 不移动、裁剪或重新分配标签。Hint 前缀、Backspace 或名称查询改变可见集合时重建
-计划；已有前缀时晚到 Partial 等前缀清空后才合入并重建。退出 UI Hint 后清空请求级计划。
+计划；Windows 分层与 `DpiSceneCache` 共享同一个零分配 compact-label 几何 helper，按 scene clip
+中心的显示器 scale 使用最终放大、取整后的矩形和 padding，macOS 则保持 1x 点坐标。已有前缀时
+晚到 Partial 等前缀清空后才合入并重建。退出 UI Hint 后清空请求级计划。
 
 ## 帧时钟
 
