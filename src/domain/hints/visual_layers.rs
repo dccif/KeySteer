@@ -5,14 +5,17 @@ use smallvec::SmallVec;
 use crate::api::geometry::Rect;
 
 const INLINE_LABELS: usize = 128;
-const COMPACT_UNSTACKED: u8 = u8::MAX;
-const WIDE_UNSTACKED: u16 = u16::MAX;
+const COMPACT_UNSTACKED: u16 = u16::MAX;
+const WIDE_UNSTACKED: u32 = u32::MAX;
 const UNCOLORED: u16 = u16::MAX;
 
 #[derive(Debug)]
+// Keeping the common <=128-Hint plan inline avoids a heap allocation on every
+// rebuild; boxing the rare wide variant would only add another allocation.
+#[allow(clippy::large_enum_variant)]
 enum LayerStorage {
-    Compact(SmallVec<[u8; INLINE_LABELS]>),
-    Wide(Vec<u16>),
+    Compact(SmallVec<[u16; INLINE_LABELS]>),
+    Wide(Vec<u32>),
 }
 
 impl Default for LayerStorage {
@@ -23,9 +26,9 @@ impl Default for LayerStorage {
 
 /// A full-Hint-indexed visual layer plan.
 ///
-/// Isolated and currently filtered labels have no layer. Common scenes retain
-/// one byte per Hint; only a scene that genuinely needs 255 or more layers
-/// switches to the wide representation.
+/// Isolated and currently filtered labels have no layer. Each entry packs the
+/// component-local layer and component depth together, so cycling can wrap a
+/// shallow overlap group independently without another allocation.
 #[derive(Debug, Default)]
 pub(crate) struct VisualLayerPlan {
     layers: LayerStorage,
@@ -82,38 +85,76 @@ impl VisualLayerPlan {
             LayerStorage::Compact(layers) => layers
                 .get(hint_index)
                 .copied()
-                .filter(|layer| *layer != COMPACT_UNSTACKED)
-                .map(usize::from),
+                .filter(|packed| *packed != COMPACT_UNSTACKED)
+                .map(|packed| usize::from(packed & u16::from(u8::MAX))),
             LayerStorage::Wide(layers) => layers
                 .get(hint_index)
                 .copied()
-                .filter(|layer| *layer != WIDE_UNSTACKED)
-                .map(usize::from),
+                .filter(|packed| *packed != WIDE_UNSTACKED)
+                .map(|packed| (packed & u32::from(u16::MAX)) as usize),
         }
+    }
+
+    pub(crate) fn component_layer_count(&self, hint_index: usize) -> Option<usize> {
+        if !self.ready {
+            return None;
+        }
+        match &self.layers {
+            LayerStorage::Compact(layers) => layers
+                .get(hint_index)
+                .copied()
+                .filter(|packed| *packed != COMPACT_UNSTACKED)
+                .map(|packed| usize::from(packed >> u8::BITS)),
+            LayerStorage::Wide(layers) => layers
+                .get(hint_index)
+                .copied()
+                .filter(|packed| *packed != WIDE_UNSTACKED)
+                .map(|packed| (packed >> u16::BITS) as usize),
+        }
+    }
+
+    /// Whether this Hint should be raised for a global selection.
+    ///
+    /// Layer zero is the normal draw order. Non-default selections wrap over
+    /// each connected component's own non-default layers, so a two-label
+    /// component never disappears merely because another component is deeper.
+    pub(crate) fn is_selected(&self, hint_index: usize, selected_layer: usize) -> bool {
+        let (Some(layer), Some(component_layer_count)) = (
+            self.layer(hint_index),
+            self.component_layer_count(hint_index),
+        ) else {
+            return false;
+        };
+        if selected_layer == 0 || component_layer_count <= 1 {
+            return layer == 0;
+        }
+        layer == (selected_layer - 1) % (component_layer_count - 1) + 1
     }
 
     fn finish(
         &mut self,
         placements: &[(usize, Rect)],
         hint_count: usize,
-        colors: &[u16],
+        packed_component_layers: &[u32],
         layer_count: usize,
     ) {
         self.layer_count = layer_count;
         self.ready = true;
-        if layer_count < usize::from(COMPACT_UNSTACKED) {
+        if layer_count < usize::from(u8::MAX) {
             let mut layers = SmallVec::from_elem(COMPACT_UNSTACKED, hint_count);
-            for ((hint_index, _), color) in placements.iter().zip(colors) {
-                if *color != UNCOLORED {
-                    layers[*hint_index] = *color as u8;
+            for ((hint_index, _), packed) in placements.iter().zip(packed_component_layers) {
+                if *packed != WIDE_UNSTACKED {
+                    let layer = (*packed & u32::from(u16::MAX)) as u16;
+                    let component_layer_count = (*packed >> u16::BITS) as u16;
+                    layers[*hint_index] = (component_layer_count << u8::BITS) | layer;
                 }
             }
             self.layers = LayerStorage::Compact(layers);
         } else {
             let mut layers = vec![WIDE_UNSTACKED; hint_count];
-            for ((hint_index, _), color) in placements.iter().zip(colors) {
-                if *color != UNCOLORED {
-                    layers[*hint_index] = *color;
+            for ((hint_index, _), packed) in placements.iter().zip(packed_component_layers) {
+                if *packed != WIDE_UNSTACKED {
+                    layers[*hint_index] = *packed;
                 }
             }
             self.layers = LayerStorage::Wide(layers);
@@ -222,9 +263,9 @@ pub(crate) fn build_visual_layer_plan(
 ) {
     plan.clear();
     if placements.len() < 2 {
-        let colors: SmallVec<[u16; INLINE_LABELS]> =
-            SmallVec::from_elem(UNCOLORED, placements.len());
-        plan.finish(placements, hint_count, &colors, 0);
+        let packed_component_layers: SmallVec<[u32; INLINE_LABELS]> =
+            SmallVec::from_elem(WIDE_UNSTACKED, placements.len());
+        plan.finish(placements, hint_count, &packed_component_layers, 0);
         return;
     }
 
@@ -238,8 +279,8 @@ pub(crate) fn build_visual_layer_plan(
     }
 
     let mut visited: SmallVec<[bool; INLINE_LABELS]> = SmallVec::from_elem(false, graph.len());
-    let mut final_colors: SmallVec<[u16; INLINE_LABELS]> =
-        SmallVec::from_elem(UNCOLORED, graph.len());
+    let mut packed_component_layers: SmallVec<[u32; INLINE_LABELS]> =
+        SmallVec::from_elem(WIDE_UNSTACKED, graph.len());
     let mut global_layer_count = 0usize;
 
     for root in 0..graph.len() {
@@ -265,11 +306,17 @@ pub(crate) fn build_visual_layer_plan(
         let (colors, layer_count) = color_component(&graph, placements, &component);
         global_layer_count = global_layer_count.max(layer_count);
         for &vertex in &component {
-            final_colors[vertex] = colors[vertex];
+            packed_component_layers[vertex] =
+                ((layer_count as u32) << u16::BITS) | u32::from(colors[vertex]);
         }
     }
 
-    plan.finish(placements, hint_count, &final_colors, global_layer_count);
+    plan.finish(
+        placements,
+        hint_count,
+        &packed_component_layers,
+        global_layer_count,
+    );
 }
 
 fn color_component(
@@ -522,6 +569,40 @@ mod tests {
         assert_eq!(plan.layer(2), None);
         assert!(plan.layer(1).is_some());
         assert!(plan.layer(3).is_some());
+        assert_eq!(plan.component_layer_count(1), Some(2));
+        assert_eq!(plan.component_layer_count(3), Some(2));
+        assert_eq!(plan.component_layer_count(4), None);
+    }
+
+    #[test]
+    fn global_selection_wraps_each_components_non_default_layers() {
+        let placements = [
+            (0, Rect::new(0.0, 0.0, 20.0, 20.0)),
+            (1, Rect::new(0.0, 0.0, 20.0, 20.0)),
+            (2, Rect::new(100.0, 0.0, 20.0, 20.0)),
+            (3, Rect::new(100.0, 0.0, 20.0, 20.0)),
+            (4, Rect::new(100.0, 0.0, 20.0, 20.0)),
+        ];
+        let mut plan = VisualLayerPlan::default();
+        build_visual_layer_plan(&placements, placements.len(), overlap, &mut plan);
+
+        assert_eq!(plan.layer_count(), 3);
+        for selected_layer in 1..=4 {
+            assert_eq!(
+                (0..2)
+                    .filter(|index| plan.is_selected(*index, selected_layer))
+                    .count(),
+                1,
+                "the shallow component must be switchable at global selection {selected_layer}"
+            );
+            assert_eq!(
+                (2..5)
+                    .filter(|index| plan.is_selected(*index, selected_layer))
+                    .count(),
+                1,
+                "the deep component must select one local layer at {selected_layer}"
+            );
+        }
     }
 
     #[test]

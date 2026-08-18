@@ -598,8 +598,8 @@ impl HintMode {
             .filter(|(_, hint)| self.hint_is_visible(hint))
         {
             let rect = placed_hint_rect(&self.config, hint, &label_style);
-            let z_index = if active_overlap_layer.is_some()
-                && self.overlap_plan.layer(hint_index) == active_overlap_layer
+            let z_index = if active_overlap_layer
+                .is_some_and(|layer| self.overlap_plan.is_selected(hint_index, layer))
             {
                 3
             } else {
@@ -923,7 +923,7 @@ fn rotate_overlapping_labels(labels: &mut [OverlayLabel], cycle: usize) {
     }
     let selected_layer = cycle.wrapping_sub(1) % plan.layer_count();
     for (index, label) in labels.iter_mut().enumerate() {
-        if plan.layer(index) == Some(selected_layer) {
+        if plan.is_selected(index, selected_layer) {
             label.z_index = 3;
         }
     }
@@ -2076,7 +2076,7 @@ mod tests {
     }
 
     #[test]
-    fn shallow_groups_do_not_wrap_into_a_deeper_global_layer() {
+    fn shallow_groups_wrap_their_non_default_layers_during_a_deeper_global_cycle() {
         let label = |text: &str, x: f64| {
             OverlayLabel::new(text, Rect::new(x, 0.0, 20.0, 20.0), LabelStyle::default())
                 .with_z_index(2)
@@ -2096,7 +2096,7 @@ mod tests {
                 .filter(|label| label.z_index == 3)
                 .map(|label| label.text.as_str())
                 .collect::<Vec<_>>(),
-            ["three-0"]
+            ["two-0", "three-0"]
         );
     }
 
