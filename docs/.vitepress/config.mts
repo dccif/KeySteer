@@ -2,6 +2,42 @@ import vueJsx from '@vitejs/plugin-vue-jsx'
 import { withMermaid } from 'vitepress-plugin-mermaid'
 
 const base = process.env.KEYSTEER_DOCS_BASE || '/'
+const englishTheme = {
+  nav: [
+    { text: 'Get started', link: '/en/guide/getting-started' },
+    { text: 'Modes', link: '/en/modes/' },
+    { text: 'Configuration', link: '/en/reference/configuration' },
+    { text: 'Configuration & simulator', link: '/en/editor/' },
+  ],
+  sidebar: [
+    { text: 'Get started', items: [{ text: 'Getting started', link: '/en/guide/getting-started' }, { text: 'macOS', link: '/en/guide/macos' }] },
+    { text: 'Modes', items: [
+      { text: 'Overview', link: '/en/modes/' }, { text: 'Normal', link: '/en/modes/normal' },
+      { text: 'Grid', link: '/en/modes/grid' }, { text: 'Recursive Grid', link: '/en/modes/recursive-grid' },
+      { text: 'UI Hint', link: '/en/modes/ui-hint' },
+    ] },
+    { text: 'Reference', items: [
+      { text: 'Configuration', link: '/en/reference/configuration' },
+      { text: 'Modes and actions', link: '/en/reference/modes-and-actions' }, { text: 'Release notes', link: '/en/releases/' },
+    ] },
+    { text: 'Tools', items: [{ text: 'Configuration & simulator', link: '/en/editor/' }] },
+  ],
+  search: {
+    provider: 'local',
+    options: {
+      translations: {
+        button: { buttonText: 'Search', buttonAriaLabel: 'Search documentation' },
+        modal: {
+          displayDetails: 'Display detailed list', resetButtonTitle: 'Reset search', backButtonTitle: 'Close search', noResultsText: 'No results for',
+          footer: { selectText: 'Select', selectKeyAriaLabel: 'Enter', navigateText: 'Navigate', navigateUpKeyAriaLabel: 'Arrow up', navigateDownKeyAriaLabel: 'Arrow down', closeText: 'Close', closeKeyAriaLabel: 'Esc' },
+        },
+      },
+    },
+  },
+  outline: { label: 'On this page' },
+  docFooter: { prev: 'Previous page', next: 'Next page' },
+  lastUpdated: { text: 'Last updated' },
+}
 const languageStateScript = `(() => {
   const base = ${JSON.stringify(base)}
   const key = 'keysteer-docs-language'
@@ -48,6 +84,7 @@ export default withMermaid({
       lang: 'en-US',
       title: 'KeySteer',
       description: 'A fast, lightweight, native keyboard mouse-control tool.',
+      themeConfig: englishTheme,
     },
   },
   title: 'KeySteer',
