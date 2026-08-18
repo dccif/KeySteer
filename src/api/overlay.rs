@@ -292,6 +292,7 @@ impl OverlayLabel {
 /// final visual overlap can use exactly the same allocation-free calculation
 /// as the native renderer. Calling it does not imply that a backend must scale
 /// its logical geometry.
+#[cfg(any(target_os = "windows", test))]
 pub(crate) fn scaled_label_geometry(
     text: &str,
     mut rect: Rect,
@@ -317,6 +318,7 @@ pub(crate) fn scaled_label_geometry(
 }
 
 /// Scale a known compact label around its centre using renderer rounding.
+#[cfg(any(target_os = "windows", test))]
 pub(crate) fn scaled_compact_label_rect(mut rect: Rect, scale: f64) -> Rect {
     let scale = normalized_label_scale(scale);
     let center = rect.center();
@@ -327,6 +329,7 @@ pub(crate) fn scaled_compact_label_rect(mut rect: Rect, scale: f64) -> Rect {
     rect
 }
 
+#[cfg(any(target_os = "windows", test))]
 pub(crate) fn normalized_label_scale(scale: f64) -> f64 {
     if scale.is_finite() {
         scale.max(1.0)

@@ -462,12 +462,7 @@ impl HintMode {
             .filter(|(_, hint)| self.hint_is_visible(hint))
             .map(|(index, hint)| {
                 let rect = placed_hint_rect(&self.config, hint, &style);
-                let rect = if visual_scale > 1.0 {
-                    crate::api::overlay::scaled_compact_label_rect(rect, visual_scale)
-                } else {
-                    rect
-                };
-                (index, rect)
+                (index, visual_layer_rect(rect, visual_scale))
             })
             .collect();
         build_visual_layer_plan(
@@ -882,10 +877,8 @@ fn placed_hint_rect(config: &HintsConfig, hint: &CompactHint<usize>, style: &Lab
     )
 }
 
+#[cfg(target_os = "windows")]
 fn visual_layer_scale(ctx: &HostContext<'_>, scan_bounds: Option<Rect>) -> f64 {
-    if !cfg!(target_os = "windows") {
-        return 1.0;
-    }
     let center = scan_bounds.unwrap_or_else(|| ctx.active_bounds()).center();
     let scale = ctx
         .screens
@@ -893,6 +886,25 @@ fn visual_layer_scale(ctx: &HostContext<'_>, scan_bounds: Option<Rect>) -> f64 {
         .find(|screen| screen.bounds.contains(&center))
         .map_or(1.0, |screen| screen.scale);
     crate::api::overlay::normalized_label_scale(scale)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn visual_layer_scale(_ctx: &HostContext<'_>, _scan_bounds: Option<Rect>) -> f64 {
+    1.0
+}
+
+#[cfg(target_os = "windows")]
+fn visual_layer_rect(rect: Rect, scale: f64) -> Rect {
+    if scale > 1.0 {
+        crate::api::overlay::scaled_compact_label_rect(rect, scale)
+    } else {
+        rect
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn visual_layer_rect(rect: Rect, _scale: f64) -> Rect {
+    rect
 }
 
 fn visually_stacked(
