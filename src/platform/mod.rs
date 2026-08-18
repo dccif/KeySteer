@@ -34,7 +34,7 @@ pub mod windows;
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub mod unsupported;
 
-use crate::api::Backend;
+use crate::api::{Backend, UiScanStrategy};
 
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
 pub(crate) const fn redundant_button_action(
@@ -79,16 +79,32 @@ pub(crate) fn atomic_replace(
 
 /// Create the backend for the target this binary was built for.
 pub fn backend() -> Result<Box<dyn Backend>, String> {
+    backend_with_ui_scan_strategy(None)
+}
+
+/// Create the application backend and prewarm providers required by the
+/// configured UI scan strategy.
+pub fn backend_for_ui_scan(strategy: UiScanStrategy) -> Result<Box<dyn Backend>, String> {
+    backend_with_ui_scan_strategy(Some(strategy))
+}
+
+fn backend_with_ui_scan_strategy(
+    strategy: Option<UiScanStrategy>,
+) -> Result<Box<dyn Backend>, String> {
     #[cfg(target_os = "macos")]
     {
+        let _ = strategy;
         Ok(Box::new(macos::MacOsBackend::new()?))
     }
     #[cfg(target_os = "windows")]
     {
-        Ok(Box::new(windows::WindowsBackend::new()?))
+        Ok(Box::new(
+            windows::WindowsBackend::new_with_ui_scan_strategy(strategy)?,
+        ))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
+        let _ = strategy;
         Ok(Box::new(unsupported::UnsupportedBackend::new()?))
     }
 }

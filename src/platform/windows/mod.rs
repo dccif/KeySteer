@@ -135,8 +135,21 @@ pub struct WindowsBackend {
     shutdown_attempted: bool,
 }
 
+const fn strategy_prewarms_uia(strategy: Option<crate::api::UiScanStrategy>) -> bool {
+    matches!(
+        strategy,
+        Some(crate::api::UiScanStrategy::AxTree | crate::api::UiScanStrategy::Hybrid)
+    )
+}
+
 impl WindowsBackend {
     pub fn new() -> Result<Self, String> {
+        Self::new_with_ui_scan_strategy(None)
+    }
+
+    pub(super) fn new_with_ui_scan_strategy(
+        strategy: Option<crate::api::UiScanStrategy>,
+    ) -> Result<Self, String> {
         // Must happen before any window exists, or coordinates will be wrong
         // on scaled displays.
         screens::enable_dpi_awareness();
@@ -161,6 +174,24 @@ impl WindowsBackend {
         // builds the D3D/D2D/DComp device tree concurrently with the remaining
         // native startup work.
         let overlay = OverlayWorker::start(event_tx.clone())?;
+        // UIA is useful only for axtree/hybrid. Start its MTA alongside GPU
+        // prewarming so COM, IUIAutomation2, CacheRequest, and conditions are
+        // ready before the first Hint request. The worker does not inspect a
+        // HWND until a scan is submitted, and vision-only startup owns no UIA
+        // thread or COM resources.
+        let ui_automation = if strategy_prewarms_uia(strategy) {
+            match accessibility::UiAutomationWorker::start() {
+                Ok(worker) => Some(worker),
+                Err(error) => {
+                    pending.push_back(BackendEvent::Warning(format!(
+                        "Windows UI Automation prewarm failed; the first accessibility scan will retry: {error}"
+                    )));
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let status_item = match status_item::StatusItem::new(event_tx.clone()) {
             Ok(item) => Some(item),
             Err(error) => {
@@ -207,7 +238,7 @@ impl WindowsBackend {
             foreground_watcher,
             status_item,
             console_control,
-            ui_automation: None,
+            ui_automation,
             vision,
             update_worker: None,
             held_buttons: Cell::new(0),
@@ -813,6 +844,20 @@ fn system_appearance() -> Appearance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_accessibility_strategies_prewarm_uia() {
+        assert!(strategy_prewarms_uia(Some(
+            crate::api::UiScanStrategy::AxTree
+        )));
+        assert!(strategy_prewarms_uia(Some(
+            crate::api::UiScanStrategy::Hybrid
+        )));
+        assert!(!strategy_prewarms_uia(Some(
+            crate::api::UiScanStrategy::Vision
+        )));
+        assert!(!strategy_prewarms_uia(None));
+    }
 
     #[test]
     fn executable_name_resolves_the_current_process() {

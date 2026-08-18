@@ -110,7 +110,7 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
         None
     };
 
-    let mut backend = platform::backend()?;
+    let mut backend = platform::backend_for_ui_scan(config.ui_hint.strategy)?;
     crate::app::perf_probe::mark("backend_created");
     let mut engine = Engine::new(config, backend.appearance());
     if let Some(store) = store {

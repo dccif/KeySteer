@@ -72,6 +72,8 @@ fn request_call_cancellation(thread_id: u32) {
 }
 
 fn cancellation_context_is_gone(code: windows::core::HRESULT) -> bool {
+    // These are expected races when cancellation arrives just before a
+    // provider call begins or just after it returns.
     code == RPC_E_NO_CONTEXT || code == RPC_E_CALL_COMPLETE
 }
 
@@ -370,6 +372,7 @@ fn worker_main(shared: Arc<SharedQueue>, thread_id: Arc<AtomicU32>) {
             return;
         }
     };
+    crate::app::perf_probe::mark("uia_prewarm_ready");
 
     let mut configured_timeout = None;
     while let Some(job) = next_job(&shared) {

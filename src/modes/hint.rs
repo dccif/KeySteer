@@ -82,8 +82,8 @@ pub struct HintMode {
     scan_bounds: Option<Rect>,
     held_overlap_keys: SmallVec<[Key; 2]>,
     overlap_cycle: usize,
-    /// Source-agnostic visual layers, built once at scan terminal so the first
-    /// post-scan overlap-cycle input only reads compact cached layer numbers.
+    /// Source-agnostic visual layers over the merged UIA/Vision Hint list.
+    /// Rebuilt at each exponentially batched Partial so overlap input stays hot.
     overlap_plan: VisualLayerPlan,
     /// Targets that arrived after a label prefix was typed. Reassigning those
     /// labels immediately would invalidate keys already visible to the user.
@@ -323,9 +323,9 @@ impl HintMode {
 
         let added = self.append_targets_owned(targets);
         // Once the user starts typing, preserve the labels they can already
-        // see and select. With no input, every partial remains visible even
-        // while the overlap modifier is held. Layer planning waits for the
-        // terminal batch because the scan is normally faster than interaction.
+        // see and select. With no input, every partial remains visible. A
+        // source-agnostic plan is rebuilt from the merged UIA/Vision labels at
+        // each published batch, so overlap input never pays graph-build latency.
         let labels_changed =
             if added && (self.input.text().is_empty() || matches!(self.input, Input::Search(_))) {
                 self.relabel(ctx);
@@ -473,11 +473,7 @@ impl HintMode {
     }
 
     fn refresh_overlap_plan(&mut self, ctx: &HostContext<'_>) {
-        if self.scanning {
-            self.overlap_plan.clear();
-        } else {
-            self.rebuild_overlap_plan(ctx);
-        }
+        self.rebuild_overlap_plan(ctx);
     }
 
     fn hint_is_visible(&self, hint: &CompactHint<usize>) -> bool {
@@ -493,9 +489,6 @@ impl HintMode {
         state: KeyState,
         ctx: &HostContext<'_>,
     ) -> CommandBatch {
-        if self.scanning {
-            return CommandBatch::new();
-        }
         if state == KeyState::Down && !self.overlap_plan.is_ready() {
             self.rebuild_overlap_plan(ctx);
         }
@@ -1351,19 +1344,22 @@ mod tests {
             &env.ctx(),
         );
         assert_eq!(scene_of(&second).labels.len(), 2);
-        assert_eq!(mode.overlap_plan.len(), 0);
-
-        let completed = deliver(&mut mode, &env, Vec::new());
-        assert!(!mode.scanning);
+        assert!(mode.overlap_plan.is_ready());
+        assert_eq!(mode.overlap_plan.len(), 2);
+        assert_eq!(mode.overlap_plan.layer_count(), 2);
         assert_eq!(
-            scene_of(&completed)
+            scene_of(&second)
                 .labels
                 .iter()
                 .filter(|label| label.z_index == 3)
                 .count(),
             1,
-            "terminal applies the final default visual layer"
+            "each merged Partial prepares the default visual layer"
         );
+
+        let completed = deliver(&mut mode, &env, Vec::new());
+        assert!(!mode.scanning);
+        assert!(completed.is_empty(), "terminal reuses the prepared plan");
         assert_eq!(mode.hints.len(), 2);
         assert!(mode.overlap_plan.is_ready());
         assert_eq!(mode.overlap_plan.len(), 2);
@@ -1379,6 +1375,40 @@ mod tests {
             1
         );
         release(&mut mode, &env, "left_shift");
+    }
+
+    #[test]
+    fn later_partial_rebuilds_the_merged_plan_instead_of_appending_layers() {
+        let env = Env::new();
+        let mut mode = HintMode::new(&env.config);
+        activate(&mut mode, &env);
+
+        mode.handle(
+            &ModeEvent::UiScanned(UiScanResult {
+                id: mode.scan_id,
+                targets: vec![target("Vision one", 100.0), target("Vision two", 100.0)],
+                status: UiScanStatus::Partial,
+            }),
+            &env.ctx(),
+        );
+        assert_eq!(mode.overlap_plan.layer_count(), 2);
+
+        mode.handle(
+            &ModeEvent::UiScanned(UiScanResult {
+                id: mode.scan_id,
+                targets: vec![target("UIA one", 400.0), target("UIA two", 400.0)],
+                status: UiScanStatus::Partial,
+            }),
+            &env.ctx(),
+        );
+
+        assert_eq!(mode.hints.len(), 4);
+        assert_eq!(mode.overlap_plan.len(), 4);
+        assert_eq!(
+            mode.overlap_plan.layer_count(),
+            2,
+            "disconnected UIA/Vision stacks must reuse global layers"
+        );
     }
 
     #[test]
@@ -1997,7 +2027,7 @@ mod tests {
     }
 
     #[test]
-    fn overlap_key_during_scan_is_ignored_without_blocking_stream() {
+    fn overlap_key_during_scan_uses_all_merged_partial_labels() {
         let env = Env::new();
         let mut mode = HintMode::new(&env.config);
         activate(&mut mode, &env);
@@ -2011,10 +2041,11 @@ mod tests {
         );
 
         let held = press(&mut mode, &env, "left_shift");
-        assert!(held.is_empty(), "scanning Shift does not add a redraw");
-        assert!(mode.held_overlap_keys.is_empty());
-        assert_eq!(mode.overlap_cycle, 0);
-        assert!(!mode.overlap_plan.is_ready());
+        assert_eq!(scene_of(&held).labels.len(), 2);
+        assert_eq!(mode.held_overlap_keys.len(), 1);
+        assert!(mode.overlap_plan.is_ready());
+        assert_eq!(mode.overlap_plan.len(), 2);
+        assert_eq!(mode.overlap_plan.layer_count(), 2);
 
         let streamed = mode.handle(
             &ModeEvent::UiScanned(crate::api::UiScanResult {
@@ -2027,35 +2058,37 @@ mod tests {
         let streamed_scene = scene_of(&streamed);
         assert_eq!(streamed_scene.labels.len(), 4);
         assert_eq!(mode.hints.len(), 4, "new partial labels remain visible");
-        assert!(!mode.overlap_plan.is_ready());
+        assert!(mode.overlap_plan.is_ready());
+        assert_eq!(mode.overlap_plan.len(), 4);
+        assert_eq!(mode.overlap_plan.layer_count(), 4);
         assert_eq!(
             streamed_scene
                 .labels
                 .iter()
                 .filter(|label| label.z_index == 3)
                 .count(),
-            0,
-            "partial batches do not spend time applying a provisional layer"
+            1,
+            "UIA and Vision partials share one visual layer plan"
         );
 
         let completed = deliver(&mut mode, &env, Vec::new());
-        assert_eq!(
-            scene_of(&completed)
-                .labels
-                .iter()
-                .filter(|label| label.z_index == 3)
-                .count(),
-            1
-        );
+        assert!(completed.is_empty(), "terminal reuses the merged plan");
         assert!(!mode.scanning);
         assert!(mode.overlap_plan.is_ready());
         assert_eq!(mode.overlap_plan.len(), 4);
         assert_eq!(mode.overlap_plan.layer_count(), 4);
 
         let released = release(&mut mode, &env, "left_shift");
-        assert!(released.is_empty(), "the ignored key has no held state");
+        assert_eq!(
+            scene_of(&released)
+                .labels
+                .iter()
+                .filter(|label| label.z_index == 3)
+                .count(),
+            1
+        );
 
-        let mut raised_labels = HashSet::from([scene_of(&completed)
+        let mut raised_labels = HashSet::from([scene_of(&released)
             .labels
             .iter()
             .find(|label| label.z_index == 3)

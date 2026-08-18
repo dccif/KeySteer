@@ -61,8 +61,11 @@ UIA 重叠也不会误跑纯像素检测。系统 OCR 使用 WinRT completion ha
 4. 搜索模式只过滤已扫描目标，不重新遍历平台树。
 5. 完整标签选中后保存 target、warp pointer、建立 finished 状态。
 6. 只有 `Success`/`TimedOut` 且没有出现标签时才按 `scan_retry_count`/delay 重试；每次预算递增，单次最多 30s。`ContextChanged`、焦点变化和显示器变化清空旧 Hint 并立即创建新 generation，不消耗失败重试次数。
-7. Partial 保持立即显示；只在 terminal 和筛选集合变化后重建视觉层。扫描期间忽略 Shift；
-   扫描结束后每次新按下置顶下一个非默认全局层，松开恢复第 0 层；第 0 层不再占用一次按下。
+7. Partial 保持立即显示。UIA/Vision 来源先合并、去重并分配 Hint，视觉层只接受这份统一标签
+   集合，不保留 provider 身份。层计划按 24/48/96…累计 Partial 批次同步更新，而不是逐扫描节点
+   更新；因此 Shift 热路径只读取紧凑层号，扫描尚未 terminal 时也能切换全部已显示标签。晚到
+   Partial 会用新的完整合并集合更新计划。扫描结束后每次新按下置顶下一个非默认全局层，松开
+   恢复第 0 层；第 0 层不再占用一次按下。
    已有 Hint 前缀时，晚到 Partial
    不改变已有键码，前缀清空后再合入全部待处理目标并重建层级。
 
@@ -73,10 +76,15 @@ UIA 重叠也不会误跑纯像素检测。系统 OCR 使用 WinRT completion ha
 
 实现：`src/platform/windows/accessibility.rs`。
 
-- 一个 backend-owned MTA worker 长期持有 COM/UIA；新任务替换 pending 旧任务。
+- 启动配置的 `strategy` 为 `hybrid` 或 `axtree` 时，Backend 在 GPU 预热同期异步启动
+  backend-owned MTA worker，并预先创建 COM/UIA、可选 `IUIAutomation2`、`CacheRequest` 和
+  conditions；`vision` 启动不创建 UIA 线程或 COM 资源。预热不读取 HWND、不枚举窗口，首次
+  请求若早于 ready 只进入 latest-only pending slot。运行期策略覆盖需要 UIA 而 worker 尚未
+  创建时仍按需启动；新任务替换 pending 旧任务。
 - 退出 owner 时使 generation 失效、清 pending，并仅在 active job 存在时以
   `CoCancelCall(thread, 0)` 非阻塞请求取消 provider call；取消请求与 active generation
-  受同一队列锁保护，`RPC_E_NO_CONTEXT`/call-complete 表示调用已自然结束，按控制流处理。
+  受同一队列锁保护，`RPC_E_NO_CONTEXT`（`0x8001011E`）/call-complete 表示调用尚未建立上下文
+  或已经自然结束，按正常取消控制流静默处理。
   COM apartment 与 Automation 对象继续保持温热。
 - `IUIAutomation2` 可用时设置 connection/transaction timeout；不可用时退回基础 UIA。
 - worker 初始化时构建一次并复用 `CacheRequest`、true condition 和 clickable condition；每轮
