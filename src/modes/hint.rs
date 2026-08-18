@@ -34,6 +34,8 @@ const MAX_IDLE_RETAINED_TARGETS: usize = 128;
 /// Ignore border contact that remains readable; center occlusion always counts.
 const MIN_VISUAL_STACK_AREA_RATIO: f64 = 0.20;
 const MIN_TEXT_OCCLUSION_EXTENT: f64 = 0.5;
+const HINT_LAYER_Z_BASE: i32 = 1;
+const SEARCH_INPUT_Z_INDEX: i32 = 10_000;
 const MAX_SCAN_TIMEOUT_MS: u64 = 30_000;
 const AUTO_HINT_PADDING_X_RATIO: f64 = 2.0 / 17.0;
 const AUTO_HINT_PADDING_Y_RATIO: f64 = 0.06;
@@ -591,6 +593,9 @@ impl HintMode {
         };
         let matched_prefix_len = typed.chars().count();
         let active_overlap_layer = self.active_overlap_layer();
+        // Every visual layer has a distinct z-index. The Engine performs one
+        // stable z sort before sharing the scene with either native backend,
+        // so Mode construction needs only this single traversal.
         for (hint_index, hint) in self
             .hints
             .iter()
@@ -598,13 +603,12 @@ impl HintMode {
             .filter(|(_, hint)| self.hint_is_visible(hint))
         {
             let rect = placed_hint_rect(&self.config, hint, &label_style);
-            let z_index = if active_overlap_layer
-                .is_some_and(|layer| self.overlap_plan.is_selected(hint_index, layer))
-            {
-                3
-            } else {
-                2
-            };
+            let z_index = active_overlap_layer
+                .and_then(|layer| self.overlap_plan.draw_rank(hint_index, layer))
+                .and_then(|rank| i32::try_from(rank).ok())
+                .map_or(HINT_LAYER_Z_BASE + 1, |rank| {
+                    HINT_LAYER_Z_BASE.saturating_add(rank)
+                });
             scene.push_label(
                 OverlayLabel::new(hint.label.as_str(), rect, label_style.clone())
                     .with_matched_prefix(matched_prefix_len)
@@ -629,7 +633,10 @@ impl HintMode {
                 cfg.x_offset as f64,
                 cfg.y_offset as f64,
             );
-            scene.push_label(OverlayLabel::new(format!("/{query}"), rect, style).with_z_index(10));
+            scene.push_label(
+                OverlayLabel::new(format!("/{query}"), rect, style)
+                    .with_z_index(SEARCH_INPUT_Z_INDEX),
+            );
         }
 
         scene
@@ -1181,6 +1188,23 @@ mod tests {
             .expect("expected an overlay")
     }
 
+    fn top_label(scene: &OverlayScene) -> &OverlayLabel {
+        scene
+            .labels
+            .iter()
+            .max_by_key(|label| label.z_index)
+            .expect("expected at least one label")
+    }
+
+    fn top_layer_count(scene: &OverlayScene) -> usize {
+        let top = top_label(scene).z_index;
+        scene
+            .labels
+            .iter()
+            .filter(|label| label.z_index == top)
+            .count()
+    }
+
     #[test]
     fn default_auto_padding_resolves_to_compact_hint_spacing() {
         let env = Env::new();
@@ -1621,25 +1645,11 @@ mod tests {
         assert_eq!(mode.overlap_plan.len(), mode.hints.len());
         assert_eq!(mode.overlap_plan.layer_count(), visible);
 
-        let raised_label = |output: &Vec<Command>| {
-            scene_of(output)
-                .labels
-                .iter()
-                .find(|label| label.z_index == 3)
-                .map(|label| label.text.clone())
-                .expect("one filtered visual layer should be raised")
-        };
+        let raised_label = |output: &Vec<Command>| top_label(scene_of(output)).text.clone();
         let mut raised = HashSet::from([raised_label(&filtered)]);
         let cycled = press(&mut mode, &env, "left_shift");
         assert_eq!(scene_of(&cycled).labels.len(), visible);
-        assert_eq!(
-            scene_of(&cycled)
-                .labels
-                .iter()
-                .filter(|label| label.z_index == 3)
-                .count(),
-            1
-        );
+        assert_eq!(top_layer_count(scene_of(&cycled)), 1);
         raised.insert(raised_label(&cycled));
         release(&mut mode, &env, "left_shift");
         for _ in 2..visible {
@@ -1656,6 +1666,62 @@ mod tests {
         let restored = press(&mut mode, &env, "backspace");
         assert_eq!(scene_of(&restored).labels.len(), total);
         assert_eq!(mode.overlap_plan.len(), mode.hints.len());
+    }
+
+    #[test]
+    fn filtered_ajh_is_ranked_above_the_ajj_that_previously_covered_it() {
+        let env = Env::new();
+        let mut mode = HintMode::new(&env.config);
+        activate(&mut mode, &env);
+        deliver(
+            &mut mode,
+            &env,
+            (0..100)
+                .map(|index| target(&format!("Target {index}"), 100.0))
+                .collect(),
+        );
+
+        for (index, hint) in mode.hints.iter_mut().enumerate() {
+            hint.bounds = Rect::new(
+                50.0 + (index % 10) as f64 * 90.0,
+                80.0 + (index / 10) as f64 * 65.0,
+                20.0,
+                20.0,
+            );
+        }
+        let ajh = mode
+            .hints
+            .iter()
+            .position(|hint| hint.label.as_str() == "ajh")
+            .expect("100 labels should include ajh");
+        let ajj = mode
+            .hints
+            .iter()
+            .position(|hint| hint.label.as_str() == "ajj")
+            .expect("100 labels should include ajj");
+        mode.hints[ajh].bounds = Rect::new(100.0, 100.0, 20.0, 20.0);
+        mode.hints[ajj].bounds = Rect::new(125.0, 100.0, 20.0, 20.0);
+
+        press(&mut mode, &env, "a");
+        assert_eq!(mode.overlap_plan.component_layer_count(ajh), Some(2));
+        assert_eq!(mode.overlap_plan.component_layer_count(ajj), Some(2));
+
+        let shifted = press(&mut mode, &env, "left_shift");
+        let sorted = scene_of(&shifted).clone().sorted();
+        let labels = &sorted.labels;
+        let ajh_position = labels
+            .iter()
+            .position(|label| label.text == "ajh")
+            .expect("ajh should remain visible");
+        let ajj_position = labels
+            .iter()
+            .position(|label| label.text == "ajj")
+            .expect("ajj should remain visible");
+        assert!(labels[ajh_position].z_index > labels[ajj_position].z_index);
+        assert!(
+            ajh_position > ajj_position,
+            "the Engine's stable z sort must draw the raised ajh after ajj"
+        );
     }
 
     #[test]
@@ -1696,48 +1762,24 @@ mod tests {
                 target("Three", 100.0),
             ],
         );
-        let initial_top = scene_of(&initial)
-            .labels
-            .iter()
-            .find(|label| label.z_index == 3)
-            .map(|label| label.text.clone())
-            .expect("the default front layer should be raised");
+        let initial_top = top_label(scene_of(&initial)).text.clone();
 
         let first = press(&mut mode, &env, "left_shift");
-        let first_top = scene_of(&first)
-            .labels
-            .iter()
-            .find(|label| label.z_index == 3)
-            .map(|label| label.text.clone())
-            .expect("one overlapping label should be raised");
+        let first_top = top_label(scene_of(&first)).text.clone();
 
         let restored = release(&mut mode, &env, "left_shift");
         assert_eq!(
-            scene_of(&restored)
-                .labels
-                .iter()
-                .find(|label| label.z_index == 3)
-                .map(|label| label.text.clone()),
+            Some(top_label(scene_of(&restored)).text.clone()),
             Some(initial_top.clone())
         );
 
         let second = press(&mut mode, &env, "right_shift");
-        let second_top = scene_of(&second)
-            .labels
-            .iter()
-            .find(|label| label.z_index == 3)
-            .map(|label| label.text.clone())
-            .expect("one overlapping label should be raised");
+        let second_top = top_label(scene_of(&second)).text.clone();
         assert_ne!(first_top, second_top);
 
         release(&mut mode, &env, "right_shift");
         let third = press(&mut mode, &env, "left_shift");
-        let third_top = scene_of(&third)
-            .labels
-            .iter()
-            .find(|label| label.z_index == 3)
-            .map(|label| label.text.clone())
-            .expect("one overlapping label should be raised");
+        let third_top = top_label(scene_of(&third)).text.clone();
         assert_ne!(second_top, third_top);
         assert_ne!(third_top, initial_top);
         assert_eq!(third_top, first_top, "presses must cycle 1→2→1");
@@ -1755,14 +1797,7 @@ mod tests {
                 .map(|index| target(&format!("Layer {index}"), 100.0))
                 .collect(),
         );
-        let top_text = |output: &_| {
-            scene_of(output)
-                .labels
-                .iter()
-                .find(|label| label.z_index == 3)
-                .map(|label| label.text.clone())
-                .expect("one visual layer should be raised")
-        };
+        let top_text = |output: &_| top_label(scene_of(output)).text.clone();
         let mut observed = vec![top_text(&initial)];
         for index in 0_usize..5 {
             let shift = if index.is_multiple_of(2) {
@@ -1793,14 +1828,7 @@ mod tests {
             &env,
             vec![target("One", 100.0), target("Two", 100.0)],
         );
-        let top_text = |output: &_| {
-            scene_of(output)
-                .labels
-                .iter()
-                .find(|label| label.z_index == 3)
-                .map(|label| label.text.clone())
-                .expect("one visual layer should be raised")
-        };
+        let top_text = |output: &_| top_label(scene_of(output)).text.clone();
         let initial_top = top_text(&initial);
         let first_top = top_text(&press(&mut mode, &env, "left_shift"));
         assert_ne!(first_top, initial_top);
@@ -1813,7 +1841,7 @@ mod tests {
     }
 
     #[test]
-    fn layer_switch_changes_only_z_order() {
+    fn layer_switch_changes_only_draw_order_and_z_index() {
         let env = Env::new();
         let mut mode = HintMode::new(&env.config);
         activate(&mut mode, &env);
@@ -1828,7 +1856,7 @@ mod tests {
         );
         let shifted = press(&mut mode, &env, "left_shift");
         let normalize = |output: &_| {
-            scene_of(output)
+            let mut labels = scene_of(output)
                 .labels
                 .iter()
                 .cloned()
@@ -1836,10 +1864,17 @@ mod tests {
                     label.z_index = 2;
                     label
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            labels.sort_by(|left, right| left.text.cmp(&right.text));
+            labels
         };
 
         assert_eq!(normalize(&initial), normalize(&shifted));
+        let sorted = scene_of(&shifted).clone().sorted();
+        assert_eq!(
+            sorted.labels.last().unwrap().z_index,
+            top_label(&sorted).z_index
+        );
     }
 
     #[test]
@@ -2018,7 +2053,7 @@ mod tests {
     }
 
     #[test]
-    fn final_layer_plan_never_removes_or_reorders_scan_labels() {
+    fn final_layer_plan_never_removes_or_moves_scan_labels() {
         let env = Env::new();
         let mut mode = HintMode::new(&env.config);
         activate(&mut mode, &env);
@@ -2046,32 +2081,30 @@ mod tests {
         let shifted = press(&mut mode, &env, "left_shift");
         let shifted_scene = scene_of(&shifted);
         assert_eq!(shifted_scene.labels.len(), 128);
+        let mut shifted_labels = shifted_scene
+            .labels
+            .iter()
+            .map(|label| label.text.as_str())
+            .collect::<Vec<_>>();
+        let mut expected_labels = completed_labels
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        shifted_labels.sort_unstable();
+        expected_labels.sort_unstable();
+        assert_eq!(shifted_labels, expected_labels);
+        for label in &shifted_scene.labels {
+            let original_index = completed_labels
+                .iter()
+                .position(|text| text == &label.text)
+                .expect("every shifted label came from the completed scene");
+            assert_eq!(label.rect, completed_rects[original_index]);
+        }
+        assert_eq!(top_layer_count(shifted_scene), 1);
+        let sorted = shifted_scene.clone().sorted();
         assert_eq!(
-            shifted_scene
-                .labels
-                .iter()
-                .map(|label| label.text.as_str())
-                .collect::<Vec<_>>(),
-            completed_labels
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(
-            shifted_scene
-                .labels
-                .iter()
-                .map(|label| label.rect)
-                .collect::<Vec<_>>(),
-            completed_rects
-        );
-        assert_eq!(
-            shifted_scene
-                .labels
-                .iter()
-                .filter(|label| label.z_index == 3)
-                .count(),
-            1
+            sorted.labels.last().unwrap().z_index,
+            top_label(&sorted).z_index
         );
     }
 
@@ -2136,11 +2169,7 @@ mod tests {
         assert_eq!(mode.overlap_plan.len(), 4);
         assert_eq!(mode.overlap_plan.layer_count(), 4);
         assert_eq!(
-            streamed_scene
-                .labels
-                .iter()
-                .filter(|label| label.z_index == 3)
-                .count(),
+            top_layer_count(streamed_scene),
             1,
             "UIA and Vision partials share one visual layer plan"
         );
@@ -2153,31 +2182,12 @@ mod tests {
         assert_eq!(mode.overlap_plan.layer_count(), 4);
 
         let released = release(&mut mode, &env, "left_shift");
-        assert_eq!(
-            scene_of(&released)
-                .labels
-                .iter()
-                .filter(|label| label.z_index == 3)
-                .count(),
-            1
-        );
+        assert_eq!(top_layer_count(scene_of(&released)), 1);
 
-        let mut raised_labels = HashSet::from([scene_of(&released)
-            .labels
-            .iter()
-            .find(|label| label.z_index == 3)
-            .map(|label| label.text.clone())
-            .expect("the default layer should be raised")]);
+        let mut raised_labels = HashSet::from([top_label(scene_of(&released)).text.clone()]);
         for key in ["left_shift", "right_shift", "left_shift", "right_shift"] {
             let cycled = press(&mut mode, &env, key);
-            raised_labels.insert(
-                scene_of(&cycled)
-                    .labels
-                    .iter()
-                    .find(|label| label.z_index == 3)
-                    .map(|label| label.text.clone())
-                    .expect("one label should be raised"),
-            );
+            raised_labels.insert(top_label(scene_of(&cycled)).text.clone());
             release(&mut mode, &env, key);
         }
         assert_eq!(

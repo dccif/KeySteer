@@ -77,25 +77,18 @@ impl VisualLayerPlan {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn layer(&self, hint_index: usize) -> Option<usize> {
-        if !self.ready {
-            return None;
-        }
-        match &self.layers {
-            LayerStorage::Compact(layers) => layers
-                .get(hint_index)
-                .copied()
-                .filter(|packed| *packed != COMPACT_UNSTACKED)
-                .map(|packed| usize::from(packed & u16::from(u8::MAX))),
-            LayerStorage::Wide(layers) => layers
-                .get(hint_index)
-                .copied()
-                .filter(|packed| *packed != WIDE_UNSTACKED)
-                .map(|packed| (packed & u32::from(u16::MAX)) as usize),
-        }
+        self.layer_info(hint_index).map(|(layer, _)| layer)
     }
 
+    #[cfg(test)]
     pub(crate) fn component_layer_count(&self, hint_index: usize) -> Option<usize> {
+        self.layer_info(hint_index)
+            .map(|(_, component_layer_count)| component_layer_count)
+    }
+
+    fn layer_info(&self, hint_index: usize) -> Option<(usize, usize)> {
         if !self.ready {
             return None;
         }
@@ -104,12 +97,22 @@ impl VisualLayerPlan {
                 .get(hint_index)
                 .copied()
                 .filter(|packed| *packed != COMPACT_UNSTACKED)
-                .map(|packed| usize::from(packed >> u8::BITS)),
+                .map(|packed| {
+                    (
+                        usize::from(packed & u16::from(u8::MAX)),
+                        usize::from(packed >> u8::BITS),
+                    )
+                }),
             LayerStorage::Wide(layers) => layers
                 .get(hint_index)
                 .copied()
                 .filter(|packed| *packed != WIDE_UNSTACKED)
-                .map(|packed| (packed >> u16::BITS) as usize),
+                .map(|packed| {
+                    (
+                        (packed & u32::from(u16::MAX)) as usize,
+                        (packed >> u16::BITS) as usize,
+                    )
+                }),
         }
     }
 
@@ -118,17 +121,38 @@ impl VisualLayerPlan {
     /// Layer zero is the normal draw order. Non-default selections wrap over
     /// each connected component's own non-default layers, so a two-label
     /// component never disappears merely because another component is deeper.
+    #[cfg(test)]
     pub(crate) fn is_selected(&self, hint_index: usize, selected_layer: usize) -> bool {
-        let (Some(layer), Some(component_layer_count)) = (
-            self.layer(hint_index),
-            self.component_layer_count(hint_index),
-        ) else {
-            return false;
+        self.presentation(hint_index, selected_layer)
+            .is_some_and(|(selected, _)| selected)
+    }
+
+    /// Component-local draw rank for the current global Shift selection.
+    ///
+    /// The selected layer is always highest. Every other layer keeps a
+    /// distinct rank in its normal front-to-back order, so a component with
+    /// three or more layers cannot collapse back into one native z value.
+    pub(crate) fn draw_rank(&self, hint_index: usize, selected_layer: usize) -> Option<usize> {
+        self.presentation(hint_index, selected_layer)
+            .map(|(_, draw_rank)| draw_rank)
+    }
+
+    fn presentation(&self, hint_index: usize, selected_layer: usize) -> Option<(bool, usize)> {
+        let (layer, component_layer_count) = self.layer_info(hint_index)?;
+        let selected = selected_component_layer(component_layer_count, selected_layer);
+        let local_rank = if layer == selected {
+            component_layer_count
+        } else {
+            let remaining_index = if layer < selected { layer } else { layer - 1 };
+            component_layer_count - 1 - remaining_index
         };
-        if selected_layer == 0 || component_layer_count <= 1 {
-            return layer == 0;
-        }
-        layer == (selected_layer - 1) % (component_layer_count - 1) + 1
+        // Align the selected rank across disconnected components. A shallow
+        // two-layer group and a deeper group therefore reach the same top z,
+        // while every component still retains its own compact ordering.
+        Some((
+            layer == selected,
+            self.layer_count - component_layer_count + local_rank,
+        ))
     }
 
     fn finish(
@@ -159,6 +183,14 @@ impl VisualLayerPlan {
             }
             self.layers = LayerStorage::Wide(layers);
         }
+    }
+}
+
+fn selected_component_layer(component_layer_count: usize, selected_layer: usize) -> usize {
+    if selected_layer == 0 || component_layer_count <= 1 {
+        0
+    } else {
+        (selected_layer - 1) % (component_layer_count - 1) + 1
     }
 }
 
@@ -602,6 +634,33 @@ mod tests {
                 1,
                 "the deep component must select one local layer at {selected_layer}"
             );
+        }
+    }
+
+    #[test]
+    fn every_component_layer_has_a_distinct_rank_and_selection_is_topmost() {
+        let placements = [
+            (0, Rect::new(0.0, 0.0, 20.0, 20.0)),
+            (1, Rect::new(0.0, 0.0, 20.0, 20.0)),
+            (2, Rect::new(100.0, 0.0, 20.0, 20.0)),
+            (3, Rect::new(100.0, 0.0, 20.0, 20.0)),
+            (4, Rect::new(100.0, 0.0, 20.0, 20.0)),
+        ];
+        let mut plan = VisualLayerPlan::default();
+        build_visual_layer_plan(&placements, placements.len(), overlap, &mut plan);
+
+        for selected in 0..plan.layer_count() {
+            let global_top = plan.layer_count();
+            for component in [&[0, 1][..], &[2, 3, 4][..]] {
+                let mut ranks = component
+                    .iter()
+                    .map(|index| plan.draw_rank(*index, selected).unwrap())
+                    .collect::<Vec<_>>();
+                assert!(ranks.contains(&global_top));
+                ranks.sort_unstable();
+                ranks.dedup();
+                assert_eq!(ranks.len(), component.len());
+            }
         }
     }
 
