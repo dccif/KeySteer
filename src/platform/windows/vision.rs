@@ -9,14 +9,13 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use windows::Media::Ocr::{OcrEngine, OcrResult};
-use windows::Win32::Foundation::HWND;
 use windows_future::{AsyncOperationCompletedHandler, AsyncStatus, IAsyncOperation};
 
-use crate::api::command::{UiScanRequest, UiScanStatus};
+use crate::api::command::UiScanStatus;
 use crate::api::geometry::{Rect, UiTarget};
 use crate::app::worker::WorkerJoin;
 
-use super::accessibility::{foreground_context, window_bounds};
+use super::accessibility::WindowsScanPlan;
 use super::overlay_worker::CaptureLease;
 use super::ui_scan::ScanSource;
 use super::wechat_ocr::{WechatDescriptor, WechatOcr};
@@ -62,7 +61,7 @@ impl std::fmt::Display for VisionError {
 }
 
 struct ScanJob {
-    request: UiScanRequest,
+    request: Arc<WindowsScanPlan>,
     generation: u64,
     source: ScanSource,
     capture: Option<CaptureLease>,
@@ -413,7 +412,7 @@ impl VisionWorker {
 
     pub(super) fn submit(
         &mut self,
-        request: UiScanRequest,
+        request: Arc<WindowsScanPlan>,
         generation: u64,
         source: ScanSource,
         capture: CaptureLease,
@@ -632,10 +631,13 @@ fn worker_main(shared: Arc<SharedQueue>, discovery: DiscoveryHandle) {
     }
 }
 
-fn current(shared: &SharedQueue, generation: u64, context: Option<(HWND, u32)>) -> bool {
+fn generation_is_current(shared: &SharedQueue, generation: u64) -> bool {
     !shared.stopping.load(Ordering::Acquire)
         && shared.latest_generation.load(Ordering::Acquire) == generation
-        && foreground_context() == context
+}
+
+fn context_is_current(shared: &SharedQueue, generation: u64, plan: &WindowsScanPlan) -> bool {
+    generation_is_current(shared, generation) && plan.target_is_current()
 }
 
 fn finish_cancelled_job(job: ScanJob) {
@@ -753,28 +755,7 @@ fn run_scan_inner(
                 .min(job.request.timeout_ms.max(250))
                 .clamp(250, 30_000),
         );
-    let original = foreground_context();
-    if job
-        .request
-        .app
-        .as_ref()
-        .is_some_and(|app| original.is_none_or(|(_, pid)| app.process_id != pid))
-    {
-        return UiScanStatus::ContextChanged;
-    }
-    let Some((hwnd, _)) = original else {
-        return UiScanStatus::Failed(
-            "No foreground window is available for visual scanning".into(),
-        );
-    };
-    let Some(window) = window_bounds(hwnd) else {
-        return UiScanStatus::Failed("Cannot read foreground window bounds".into());
-    };
-    let bounds = job
-        .request
-        .bounds
-        .and_then(|requested| requested.intersect(&window))
-        .unwrap_or(window);
+    let bounds = job.request.scan_bounds();
     let geometry = match capture_geometry(bounds) {
         Ok(geometry) => geometry,
         Err(error) => {
@@ -925,9 +906,9 @@ fn run_scan_inner(
         }
     });
     if let Err(error) =
-        capture_lease.wait_hidden(deadline, || !current(shared, job.generation, original))
+        capture_lease.wait_hidden(deadline, || !generation_is_current(shared, job.generation))
     {
-        let current = current(shared, job.generation, original);
+        let current = context_is_current(shared, job.generation, &job.request);
         if let Err(release_error) = capture_lease.release() {
             crate::app::logging::report_error("windows-overlay", release_error);
         }
@@ -939,7 +920,7 @@ fn run_scan_inner(
         }
         return UiScanStatus::Failed(error);
     }
-    if !current(shared, job.generation, original) {
+    if !context_is_current(shared, job.generation, &job.request) {
         if let Err(error) = capture_lease.release() {
             crate::app::logging::report_error("windows-overlay", error);
         }
@@ -958,7 +939,7 @@ fn run_scan_inner(
             if width != geometry.width || height != geometry.height {
                 return Err("native capture dimensions changed unexpectedly".into());
             }
-            if !current(shared, job.generation, original) {
+            if !context_is_current(shared, job.generation, &job.request) {
                 context_changed_during_capture = true;
                 return Err("visual capture context changed".into());
             }
@@ -981,13 +962,17 @@ fn run_scan_inner(
                                     bitmap_factory_error.as_deref(),
                                 );
                             }
-                            drain_early_ocr_events(
+                            if !drain_early_ocr_events(
                                 &rx,
                                 &job.source,
                                 &fallback_cancelled,
                                 &mut ocr_had_valid_targets,
                                 &mut early_events,
-                            );
+                                || context_is_current(shared, job.generation, &job.request),
+                            ) {
+                                context_changed_during_capture = true;
+                                return Err("visual capture context changed".into());
+                            }
                             Ok(())
                         })
                     {
@@ -1012,13 +997,17 @@ fn run_scan_inner(
                     bitmap_factory_error.as_deref(),
                 );
             }
-            drain_early_ocr_events(
+            if !drain_early_ocr_events(
                 &rx,
                 &job.source,
                 &fallback_cancelled,
                 &mut ocr_had_valid_targets,
                 &mut early_events,
-            );
+                || context_is_current(shared, job.generation, &job.request),
+            ) {
+                context_changed_during_capture = true;
+                return Err("visual capture context changed".into());
+            }
             let fallback = (job.request.vision.detect_rectangles && !ocr_had_valid_targets)
                 .then(|| fallback_input_from_bgra(pixels, geometry))
                 .transpose()?;
@@ -1037,7 +1026,7 @@ fn run_scan_inner(
         Err(_) if context_changed_during_capture => return UiScanStatus::ContextChanged,
         Err(error) => return UiScanStatus::Failed(error),
     };
-    if !current(shared, job.generation, original) {
+    if !context_is_current(shared, job.generation, &job.request) {
         return UiScanStatus::ContextChanged;
     }
 
@@ -1071,7 +1060,7 @@ fn run_scan_inner(
     let mut context_changed = false;
     let mut cleanup_errors = crate::app::errors::ErrorBundle::default();
     while pending_ocr != 0 || (fallback_pending && fallback.is_none()) {
-        if !current(shared, job.generation, original) {
+        if !generation_is_current(shared, job.generation) {
             cancellation.cancel();
             context_changed = true;
             break;
@@ -1113,6 +1102,11 @@ fn run_scan_inner(
         }
         ocr_ready.sort_by(|a, b| compare_ready(a.2.len(), a.1, b.2.len(), b.1));
         for (provider, _elapsed, targets) in ocr_ready {
+            if !context_is_current(shared, job.generation, &job.request) {
+                cancellation.cancel();
+                context_changed = true;
+                break;
+            }
             let count = targets.len();
             if count != 0 {
                 ocr_had_valid_targets = true;
@@ -1161,10 +1155,15 @@ fn run_scan_inner(
         }
     }
 
-    if should_publish_fallback(ocr_had_valid_targets, job.request.vision.detect_rectangles)
+    if !context_changed
+        && should_publish_fallback(ocr_had_valid_targets, job.request.vision.detect_rectangles)
         && let Some(targets) = fallback
     {
-        job.source.push(targets);
+        if context_is_current(shared, job.generation, &job.request) {
+            job.source.push(targets);
+        } else {
+            context_changed = true;
+        }
     }
     cleanup_errors.record(
         "provider join",
@@ -1172,7 +1171,7 @@ fn run_scan_inner(
     );
     drop(bitmap_apartment);
     let cleanup_result = cleanup_errors.into_result();
-    if context_changed || !current(shared, job.generation, original) {
+    if context_changed || !context_is_current(shared, job.generation, &job.request) {
         if let Err(error) = cleanup_result {
             crate::app::logging::report_error("windows-vision", error);
         }
@@ -1643,7 +1642,8 @@ fn drain_early_ocr_events(
     fallback_cancelled: &AtomicBool,
     ocr_had_valid_targets: &mut bool,
     deferred: &mut VecDeque<ProviderEvent>,
-) {
+    mut context_is_current: impl FnMut() -> bool,
+) -> bool {
     let mut ready = Vec::new();
     for event in receiver.try_iter() {
         match event {
@@ -1657,6 +1657,9 @@ fn drain_early_ocr_events(
     }
     ready.sort_by(|a, b| compare_ready(a.2.len(), a.1, b.2.len(), b.1));
     for (provider, _elapsed, targets) in ready {
+        if !context_is_current() {
+            return false;
+        }
         let count = targets.len();
         if count != 0 {
             *ocr_had_valid_targets = true;
@@ -1671,6 +1674,7 @@ fn drain_early_ocr_events(
             "{provider} OCR streamed {count} valid targets ({accepted} new)"
         );
     }
+    true
 }
 
 fn send_ocr_batches(

@@ -23,9 +23,11 @@ Enter from Normal with `Primary+F`. By default it only moves the pointer: after 
 ## Scanning strategies
 
 - Windows uses `hybrid` by default: UI Automation and the full visual pipeline scan in parallel and merge results. UIA fills in native window buttons such as minimise, maximise, and close while OCR and built-in pixel-region fallback cover custom interfaces. Use `axtree` or `vision` to enable one pipeline only.
+- On Windows, each scan targets the window under the pointer when native submission actually begins, together with its menus, popups, and dialogs. The window does not have to be foreground first. Ordinary pointer movement does not poll or continuously rescan; a target, focus, or display change clears stale hints and immediately retargets from the latest pointer position.
+- If the pointer is over the desktop, taskbar, or KeySteer overlay with no application window below it, KeySteer shows `No window under the pointer — move the pointer over a window`. It starts no OCR or screenshot work and does not advertise a fixed rescan shortcut that the user may have changed.
 - macOS supports `axtree`, `vision`, and `hybrid`.
 
-Vision needs macOS Screen Recording permission; keyboard capture still needs Accessibility permission. On startup, Windows asynchronously detects system OCR and locally installed WeChat OCR components without configuration. OCR engines and the WeChat helper are created only during scanning and released before it finishes. When neither OCR engine returns usable results, KeySteer uses built-in region recognition that does not depend on OpenCV.
+Vision needs macOS Screen Recording permission; keyboard capture still needs Accessibility permission. On startup, Windows asynchronously detects system OCR and locally installed WeChat OCR components without configuration. OCR engines and the WeChat helper are created only during scanning and released before it finishes. Leaving UI Hint for Normal or Idle cancels the UIA, OCR, and capture generation and releases its image, bitmap, targets, and oversized buffers. When neither OCR engine returns usable results, KeySteer uses built-in region recognition that does not depend on OpenCV.
 
 ## Common configuration
 
@@ -47,7 +49,7 @@ after_finish = "normal"
 after_click = "normal"
 ```
 
-`scan_timeout_ms` controls how long a scan may run. A page that produces no elements is retried `scan_retry_count` times; increase the timeout and retry count for large or complex pages.
+`scan_timeout_ms` controls how long a scan may run. Automatic retry applies only after `Success` or `TimedOut` produces no hints; a window/context change retargets immediately without consuming the retry count. Increase the timeout and retry count for large or complex pages.
 
 ## Visual style
 

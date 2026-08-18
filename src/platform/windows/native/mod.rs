@@ -1568,6 +1568,58 @@ pub(crate) fn is_window_iconic(hwnd: HWND) -> bool {
     unsafe { IsIconic(hwnd) }.as_bool()
 }
 
+#[inline(always)]
+pub(crate) fn is_window(hwnd: HWND) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+
+    // SAFETY: the borrowed HWND is used only for this synchronous query.
+    unsafe { IsWindow(Some(hwnd)) }.as_bool()
+}
+
+#[inline(always)]
+pub(crate) fn root_owner(hwnd: HWND) -> HWND {
+    use windows::Win32::UI::WindowsAndMessaging::{GA_ROOTOWNER, GetAncestor};
+
+    // SAFETY: the borrowed HWND is queried synchronously; the result is also
+    // a borrowed handle and retains no Rust data.
+    unsafe { GetAncestor(hwnd, GA_ROOTOWNER) }
+}
+
+#[inline(always)]
+pub(crate) fn desktop_window() -> HWND {
+    use windows::Win32::UI::WindowsAndMessaging::GetDesktopWindow;
+
+    // SAFETY: this returns a borrowed process-global desktop handle.
+    unsafe { GetDesktopWindow() }
+}
+
+#[inline(always)]
+pub(crate) fn window_from_point(point: windows::Win32::Foundation::POINT) -> HWND {
+    use windows::Win32::UI::WindowsAndMessaging::WindowFromPoint;
+
+    // SAFETY: the point is a plain value and the result is a borrowed HWND.
+    unsafe { WindowFromPoint(point) }
+}
+
+pub(crate) fn window_class_name(hwnd: HWND, buffer: &mut [u16]) -> usize {
+    use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+
+    // SAFETY: `buffer` is writable for its full length and `hwnd` is borrowed
+    // for this synchronous query.
+    unsafe { GetClassNameW(hwnd, buffer) }.max(0) as usize
+}
+
+pub(crate) fn enum_windows(
+    callback: windows::Win32::UI::WindowsAndMessaging::WNDENUMPROC,
+    data: windows::Win32::Foundation::LPARAM,
+) -> windows::core::Result<()> {
+    use windows::Win32::UI::WindowsAndMessaging::EnumWindows;
+
+    // SAFETY: callers keep callback state alive for the complete synchronous
+    // enumeration and provide a callback with the documented ABI.
+    unsafe { EnumWindows(callback, data) }
+}
+
 /// Return a window's creating thread and optionally its owning process.
 #[inline(always)]
 pub(crate) fn window_thread_process_id(hwnd: HWND, process_id: Option<&mut u32>) -> u32 {

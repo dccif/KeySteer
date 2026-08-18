@@ -25,6 +25,8 @@ use crate::config::{Config, Palette, UiHint as HintsConfig};
 use crate::hints::{self, CompactHint, Match, VisualLayerPlan, build_visual_layer_plan};
 
 const SCAN_RETRY_TIMER_ID: &str = "ui_hint.scan_retry";
+const NO_WINDOW_UNDER_POINTER: &str =
+    "No window under the pointer — move the pointer over a window";
 /// Reuse the small container backing needed by the common UIHint session.
 /// Elements and their strings are still dropped on exit; only empty capacity
 /// is retained, and larger scans cannot become an Idle high-water mark.
@@ -88,6 +90,8 @@ pub struct HintMode {
     pending_relabel: bool,
     selected: Option<usize>,
     finished: bool,
+    /// Prevent late asynchronous scan results from reviving an inactive mode.
+    active: bool,
 }
 
 impl HintMode {
@@ -115,6 +119,7 @@ impl HintMode {
             pending_relabel: false,
             selected: None,
             finished: false,
+            active: false,
         }
     }
 
@@ -303,17 +308,17 @@ impl HintMode {
     }
 
     fn handle_scan_result(&mut self, result: UiScanResult, ctx: &HostContext<'_>) -> CommandBatch {
-        if self.finished || result.id != self.scan_id {
+        if !self.active || self.finished || result.id != self.scan_id {
             return CommandBatch::new();
         }
         let UiScanResult {
             targets, status, ..
         } = result;
         if status == UiScanStatus::ContextChanged {
-            self.scanning = false;
-            self.clear_scan_results(false);
-            self.status = Some("Focused window changed — Esc to exit".into());
-            return self.status_scene(ctx);
+            // Context replacement is a normal retarget, not a failed scan.
+            // Start a fresh generation immediately without consuming the
+            // timeout/empty-result retry budget.
+            return self.request_scan(ctx);
         }
 
         let added = self.append_targets_owned(targets);
@@ -388,12 +393,15 @@ impl HintMode {
                 Some("No accessible targets — Esc to exit".into())
             }
             UiScanStatus::Success => None,
+            UiScanStatus::Failed(message) if message == NO_WINDOW_UNDER_POINTER => {
+                Some(message.clone())
+            }
             UiScanStatus::PermissionDenied(message)
             | UiScanStatus::Unsupported(message)
             | UiScanStatus::Failed(message) => Some(format!("{message} — Esc to exit")),
             UiScanStatus::TimedOut => Some("UI scan timed out — Esc to exit".into()),
             UiScanStatus::Partial => self.status.clone(),
-            UiScanStatus::ContextChanged => Some("Focused window changed - Esc to exit".into()),
+            UiScanStatus::ContextChanged => None,
         };
         if self.hints.is_empty() {
             return self.status_scene(ctx);
@@ -910,10 +918,14 @@ impl Mode for HintMode {
     fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
         match event {
             ModeEvent::Activated { previous } => {
+                self.active = true;
                 self.return_mode = previous.clone().unwrap_or_else(ModeId::idle);
                 self.request_scan(ctx)
             }
-            ModeEvent::Restarted => self.request_scan(ctx),
+            ModeEvent::Restarted => {
+                self.active = true;
+                self.request_scan(ctx)
+            }
             ModeEvent::FinishRequested { .. } if self.finished => CommandBatch::new(),
             ModeEvent::FinishRequested { .. } => {
                 self.finished = true;
@@ -928,6 +940,7 @@ impl Mode for HintMode {
                 super::lifecycle_commands(&self.config.lifecycle.after_click, &self.return_mode)
             }
             ModeEvent::Deactivated => {
+                self.active = false;
                 self.clear_scan_results(true);
                 self.scanning = false;
                 self.scan_bounds = None;
@@ -947,6 +960,7 @@ impl Mode for HintMode {
             ModeEvent::UiScanned(result) => self.handle_scan_result(result.clone(), ctx),
             ModeEvent::Timer { id, .. }
                 if id == SCAN_RETRY_TIMER_ID
+                    && self.active
                     && self.retry_pending
                     && self.scanning
                     && self.hints.is_empty() =>
@@ -957,13 +971,18 @@ impl Mode for HintMode {
                 binding,
                 state: KeyState::Down,
                 ..
-            } if matches!(binding.as_ref(), Binding::RescanUi) => self.request_scan(ctx),
+            } if self.active && matches!(binding.as_ref(), Binding::RescanUi) => {
+                self.request_scan(ctx)
+            }
             // The tree we labelled belongs to the old window/geometry.
-            ModeEvent::FocusChanged(_) | ModeEvent::ScreensChanged(_) if !self.finished => {
+            ModeEvent::FocusChanged(_) | ModeEvent::ScreensChanged(_)
+                if self.active && !self.finished =>
+            {
                 self.request_scan(ctx)
             }
             ModeEvent::PointerMoved(_)
-                if !self.finished
+                if self.active
+                    && !self.finished
                     && self
                         .scan_bounds
                         .is_some_and(|bounds| bounds != ctx.active_bounds()) =>
@@ -983,6 +1002,7 @@ impl Mode for HintMode {
                 let return_mode = self.return_mode.clone();
                 let scan_id = self.scan_id;
                 let scan_bounds = self.scan_bounds;
+                let active = self.active;
                 let Some(config) = ctx.config.downcast_ref::<Config>() else {
                     return CommandBatch::new();
                 };
@@ -990,7 +1010,12 @@ impl Mode for HintMode {
                 self.return_mode = return_mode;
                 self.scan_id = scan_id;
                 self.scan_bounds = scan_bounds;
-                self.request_scan(ctx)
+                self.active = active;
+                if active {
+                    self.request_scan(ctx)
+                } else {
+                    CommandBatch::new()
+                }
             }
             ModeEvent::Key {
                 key,
@@ -1203,6 +1228,31 @@ mod tests {
         assert!(mode.hints.is_empty());
         assert!(mode.hints.capacity() >= 100);
         assert!(mode.overlap_plan.retained_capacity() <= 128);
+    }
+
+    #[test]
+    fn late_context_change_cannot_restart_a_deactivated_hint_mode() {
+        let env = Env::new();
+        let mut mode = HintMode::new(&env.config);
+        activate(&mut mode, &env);
+        let retired_scan_id = mode.scan_id;
+
+        mode.handle(&ModeEvent::Deactivated, &env.ctx());
+        let out = mode.handle_owned(
+            ModeEvent::UiScanned(crate::api::UiScanResult {
+                id: retired_scan_id,
+                targets: Vec::new(),
+                status: UiScanStatus::ContextChanged,
+            }),
+            &env.ctx(),
+        );
+
+        assert!(out.is_empty());
+        assert!(!mode.active);
+        assert!(!mode.scanning);
+        assert_eq!(mode.scan_id, retired_scan_id);
+        assert!(mode.scanned.is_empty());
+        assert!(mode.hints.is_empty());
     }
 
     #[test]
@@ -2299,6 +2349,66 @@ mod tests {
             .expect("retry should submit another scan");
         assert!(request.id > first_id);
         assert_eq!(request.timeout_ms, 2_000);
+    }
+
+    #[test]
+    fn context_change_retargets_immediately_without_consuming_retry_budget() {
+        let env = Env::new();
+        let mut mode = HintMode::new(&env.config);
+        activate(&mut mode, &env);
+        deliver(&mut mode, &env, vec![target("Old", 20.0)]);
+        let retired_scan_id = mode.scan_id;
+        mode.retry_attempt = 2;
+
+        let out = mode.handle_owned(
+            ModeEvent::UiScanned(crate::api::UiScanResult {
+                id: retired_scan_id,
+                targets: Vec::new(),
+                status: UiScanStatus::ContextChanged,
+            }),
+            &env.ctx(),
+        );
+
+        assert!(mode.scan_id > retired_scan_id);
+        assert_eq!(mode.retry_attempt, 0);
+        assert!(mode.scanning);
+        assert!(mode.scanned.is_empty());
+        assert!(mode.hints.is_empty());
+        assert!(
+            out.iter()
+                .any(|command| matches!(command, Command::ScanUi(_)))
+        );
+        assert!(
+            out.iter()
+                .all(|command| !matches!(command, Command::SetTimer { .. }))
+        );
+    }
+
+    #[test]
+    fn no_window_prompt_does_not_retry_or_advertise_a_fixed_shortcut() {
+        let env = Env::new();
+        let mut mode = HintMode::new(&env.config);
+        activate(&mut mode, &env);
+
+        let out = mode.handle_owned(
+            ModeEvent::UiScanned(crate::api::UiScanResult {
+                id: mode.scan_id,
+                targets: Vec::new(),
+                status: UiScanStatus::Failed(NO_WINDOW_UNDER_POINTER.into()),
+            }),
+            &env.ctx(),
+        );
+
+        assert!(!mode.scanning);
+        assert_eq!(mode.status.as_deref(), Some(NO_WINDOW_UNDER_POINTER));
+        assert!(
+            out.iter()
+                .all(|command| !matches!(command, Command::SetTimer { .. }))
+        );
+        let scene = scene_of(&out);
+        assert_eq!(scene.labels.len(), 1);
+        assert_eq!(scene.labels[0].text, NO_WINDOW_UNDER_POINTER);
+        assert!(!scene.labels[0].text.contains("Primary"));
     }
 
     #[test]

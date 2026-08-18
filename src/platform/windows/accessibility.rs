@@ -7,13 +7,14 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use smallvec::SmallVec;
 use windows::Win32::Foundation::{
-    HWND, LPARAM, RECT, RPC_E_CALL_COMPLETE, RPC_E_NO_CONTEXT, VARIANT_FALSE, VARIANT_TRUE,
+    HWND, LPARAM, POINT, RECT, RPC_E_CALL_COMPLETE, RPC_E_NO_CONTEXT, VARIANT_FALSE, VARIANT_TRUE,
 };
 use windows::Win32::Graphics::Dwm::{
     DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
@@ -36,8 +37,7 @@ use windows::Win32::UI::Accessibility::{
     UIA_NamePropertyId, UIA_PROPERTY_ID,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumThreadWindows, EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetWindow, GetWindowRect,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    EnumThreadWindows, GWL_EXSTYLE, GWL_STYLE, GetWindowRect, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{BOOL, Interface};
 
@@ -51,6 +51,8 @@ const PARTIAL_BATCH_SIZE: usize = 24;
 const MAX_TARGETS: usize = 2_000;
 const MAX_VISITED_ELEMENTS: usize = 20_000;
 const MAX_SCAN_WINDOWS: usize = 16;
+type InlineScanWindows = SmallVec<[ScanWindow; MAX_SCAN_WINDOWS]>;
+type InlineOccluders = SmallVec<[Rect; MAX_SCAN_WINDOWS]>;
 const MINIMUM_SPACING: f64 = 8.0;
 const MIN_SCAN_TIMEOUT_MS: u64 = 250;
 const MAX_SCAN_TIMEOUT_MS: u64 = 30_000;
@@ -74,7 +76,7 @@ fn cancellation_context_is_gone(code: windows::core::HRESULT) -> bool {
 }
 
 struct ScanJob {
-    request: UiScanRequest,
+    request: Arc<WindowsScanPlan>,
     generation: u64,
     source: ScanSource,
 }
@@ -143,7 +145,7 @@ impl UiAutomationWorker {
 
     pub fn submit(
         &self,
-        request: UiScanRequest,
+        request: Arc<WindowsScanPlan>,
         generation: u64,
         source: ScanSource,
     ) -> Result<(), String> {
@@ -433,12 +435,8 @@ fn is_current(shared: &SharedQueue, generation: u64) -> bool {
 }
 
 #[inline]
-fn context_is_current(
-    shared: &SharedQueue,
-    generation: u64,
-    original: Option<(HWND, u32)>,
-) -> bool {
-    is_current(shared, generation) && original == foreground_context()
+fn context_is_current(shared: &SharedQueue, generation: u64, plan: &WindowsScanPlan) -> bool {
+    is_current(shared, generation) && plan.target_is_current()
 }
 
 fn run_scan(
@@ -476,24 +474,7 @@ fn run_scan(
         }
     }
 
-    let original = foreground_context();
-    let request_context_changed = job
-        .request
-        .app
-        .as_ref()
-        .is_some_and(|app| original.is_none_or(|(_, pid)| pid != app.process_id));
-    if request_context_changed {
-        job.finish(UiScanStatus::ContextChanged);
-        return;
-    }
-    let Some((hwnd, _)) = original else {
-        job.finish(UiScanStatus::Failed(
-            "No foreground window is available".into(),
-        ));
-        return;
-    };
-
-    let status = match stream_scan(automation, query_plan, hwnd, &job, shared, original) {
+    let status = match stream_scan(automation, query_plan, &job, shared) {
         Ok(status) => status,
         Err(error) => UiScanStatus::Failed(format!("UI Automation scan failed: {error}")),
     };
@@ -517,12 +498,108 @@ fn is_timeout_error(error: &windows::core::Error) -> bool {
     is_timeout_hresult(error.code().0)
 }
 
-#[derive(Clone)]
-struct ScanWindow {
-    hwnd: HWND,
-    bounds: Rect,
-    /// Visible, click-receiving top-level windows above this HWND in Z-order.
-    occluders: Vec<Rect>,
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ScanWindow {
+    hwnd: isize,
+    pub(super) bounds: Rect,
+    /// Prefix length in the plan's shared front-to-back occluder array.
+    occluder_end: u8,
+}
+
+/// Immutable, generation-scoped Windows scan input shared by UIA and Vision.
+///
+/// The request, native target identity and visibility snapshot live in one
+/// allocation. Provider jobs only clone the `Arc`, so Hybrid does not clone
+/// role/config vectors or a per-window occluder list.
+pub(super) struct WindowsScanPlan {
+    request: UiScanRequest,
+    target_hwnd: isize,
+    target_process_id: u32,
+    target_bounds: Rect,
+    scan_bounds: Rect,
+    windows: InlineScanWindows,
+    occluders: InlineOccluders,
+}
+
+impl Deref for WindowsScanPlan {
+    type Target = UiScanRequest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
+}
+
+impl WindowsScanPlan {
+    pub(super) fn target_hwnd(&self) -> HWND {
+        HWND(self.target_hwnd as *mut core::ffi::c_void)
+    }
+
+    pub(super) fn scan_bounds(&self) -> Rect {
+        self.scan_bounds
+    }
+
+    fn windows(&self) -> &[ScanWindow] {
+        &self.windows
+    }
+
+    fn window_occluders(&self, window: &ScanWindow) -> &[Rect] {
+        &self.occluders[..usize::from(window.occluder_end)]
+    }
+
+    pub(super) fn target_is_current(&self) -> bool {
+        let target_hwnd = self.target_hwnd();
+        if target_hwnd.is_invalid() || !super::native::is_window(target_hwnd) {
+            return false;
+        }
+        let mut process_id = 0;
+        super::native::window_thread_process_id(target_hwnd, Some(&mut process_id));
+        process_id == self.target_process_id
+            && window_bounds(target_hwnd) == Some(self.target_bounds)
+            && self.windows.iter().all(|window| {
+                let hwnd = window.hwnd();
+                !hwnd.is_invalid()
+                    && super::native::is_window(hwnd)
+                    && window_bounds(hwnd).and_then(|bounds| bounds.intersect(&self.scan_bounds))
+                        == Some(window.bounds)
+            })
+    }
+
+    pub(super) fn target_center_is_visible(&self, target: &UiTarget) -> bool {
+        let center = target.rect.center();
+        self.windows.iter().any(|window| {
+            window.bounds.contains(&center)
+                && !self
+                    .window_occluders(window)
+                    .iter()
+                    .any(|rect| rect.contains(&center))
+        })
+    }
+}
+
+#[cfg(test)]
+pub(super) fn test_scan_plan(request: UiScanRequest) -> Arc<WindowsScanPlan> {
+    let bounds = request
+        .bounds
+        .unwrap_or_else(|| Rect::new(0.0, 0.0, 1_920.0, 1_080.0));
+    Arc::new(WindowsScanPlan {
+        request,
+        target_hwnd: 0,
+        target_process_id: 0,
+        target_bounds: bounds,
+        scan_bounds: bounds,
+        windows: SmallVec::from_slice(&[ScanWindow {
+            hwnd: 0,
+            bounds,
+            occluder_end: 0,
+        }]),
+        occluders: SmallVec::new(),
+    })
+}
+
+impl ScanWindow {
+    fn hwnd(&self) -> HWND {
+        HWND(self.hwnd as *mut core::ffi::c_void)
+    }
 }
 
 fn rect_from_native(rect: RECT) -> Option<Rect> {
@@ -586,10 +663,122 @@ fn is_cloaked(hwnd: HWND) -> bool {
     .is_ok_and(|_| cloaked != 0)
 }
 
+fn class_name_is_shell_surface(hwnd: HWND) -> bool {
+    fn ascii_lower(unit: u16) -> u16 {
+        if unit >= u16::from(b'A') && unit <= u16::from(b'Z') {
+            unit + u16::from(b'a' - b'A')
+        } else {
+            unit
+        }
+    }
+
+    let mut class_name = [0u16; 64];
+    let length = super::native::window_class_name(hwnd, &mut class_name);
+    let class_name = &class_name[..length.min(class_name.len())];
+    [
+        "Progman",
+        "WorkerW",
+        "Shell_TrayWnd",
+        "Shell_SecondaryTrayWnd",
+    ]
+    .iter()
+    .any(|expected| {
+        class_name
+            .iter()
+            .copied()
+            .map(ascii_lower)
+            .eq(expected.encode_utf16().map(ascii_lower))
+    })
+}
+
+fn normalize_root_owner(hwnd: HWND) -> HWND {
+    if hwnd.is_invalid() {
+        return hwnd;
+    }
+    let root = super::native::root_owner(hwnd);
+    if root.is_invalid() { hwnd } else { root }
+}
+
+fn scannable_target(hwnd: HWND) -> Option<(HWND, u32, Rect)> {
+    let hwnd = normalize_root_owner(hwnd);
+    let desktop = super::native::desktop_window();
+    let valid = super::native::is_window(hwnd);
+    if hwnd.is_invalid()
+        || hwnd == desktop
+        || !valid
+        || !super::native::is_window_visible(hwnd)
+        || super::native::is_window_iconic(hwnd)
+        || is_cloaked(hwnd)
+        || super::native::window_long(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TRANSPARENT.0 != 0
+        || class_name_is_shell_surface(hwnd)
+    {
+        return None;
+    }
+    let mut process_id = 0;
+    super::native::window_thread_process_id(hwnd, Some(&mut process_id));
+    if process_id == 0 || process_id == super::native::current_process_id() {
+        return None;
+    }
+    window_bounds(hwnd).map(|bounds| (hwnd, process_id, bounds))
+}
+
+fn native_point_in_rect(point: POINT, rect: Rect) -> bool {
+    let x = f64::from(point.x);
+    let y = f64::from(point.y);
+    x >= rect.left() && x < rect.right() && y >= rect.top() && y < rect.bottom()
+}
+
+struct PointWindowCollector {
+    point: POINT,
+    target: Option<(HWND, u32, Rect)>,
+}
+
+extern "system" fn collect_window_at_point(hwnd: HWND, _data: LPARAM) -> BOOL {
+    POINT_WINDOW_COLLECTOR.with_borrow_mut(|slot| {
+        let Some(collector) = slot.as_mut() else {
+            return BOOL(0);
+        };
+        if collector.target.is_none()
+            && window_bounds(hwnd)
+                .is_some_and(|bounds| native_point_in_rect(collector.point, bounds))
+            && let Some(target) = scannable_target(hwnd)
+        {
+            collector.target = Some(target);
+        }
+        BOOL(1)
+    })
+}
+
+fn window_under_pointer() -> Result<Option<(HWND, u32, Rect)>, String> {
+    let cursor = super::input::cursor_position()?;
+    let point = POINT {
+        x: cursor.x.round() as i32,
+        y: cursor.y.round() as i32,
+    };
+    if let Some(target) = scannable_target(super::native::window_from_point(point)) {
+        return Ok(Some(target));
+    }
+
+    POINT_WINDOW_COLLECTOR.with_borrow_mut(|slot| {
+        *slot = Some(PointWindowCollector {
+            point,
+            target: None,
+        })
+    });
+    let enumeration = super::native::enum_windows(Some(collect_window_at_point), LPARAM(0))
+        .map_err(|error| format!("cannot resolve the window under the pointer: {error}"));
+    let target = POINT_WINDOW_COLLECTOR
+        .with_borrow_mut(Option::take)
+        .and_then(|collector| collector.target);
+    enumeration?;
+    Ok(target)
+}
+
 thread_local! {
-    static MONITOR_COLLECTOR: RefCell<Vec<HMONITOR>> = const { RefCell::new(Vec::new()) };
+    static MONITOR_COLLECTOR: RefCell<SmallVec<[HMONITOR; 4]>> = RefCell::new(SmallVec::new());
     static THREAD_WINDOW_COLLECTOR: RefCell<Option<ThreadWindowCollector>> = const { RefCell::new(None) };
     static Z_ORDER_COLLECTOR: RefCell<Option<ZOrderCollector>> = const { RefCell::new(None) };
+    static POINT_WINDOW_COLLECTOR: RefCell<Option<PointWindowCollector>> = const { RefCell::new(None) };
 }
 
 extern "system" fn collect_monitor(
@@ -602,12 +791,12 @@ extern "system" fn collect_monitor(
     BOOL(1)
 }
 
-fn monitors_intersecting(hwnd: HWND) -> Vec<HMONITOR> {
+fn monitors_intersecting(hwnd: HWND) -> SmallVec<[HMONITOR; 4]> {
     let Some(bounds) = window_bounds(hwnd) else {
-        return Vec::new();
+        return SmallVec::new();
     };
     let clip = native_rect(bounds);
-    MONITOR_COLLECTOR.with_borrow_mut(Vec::clear);
+    MONITOR_COLLECTOR.with_borrow_mut(|monitors| monitors.clear());
     // SAFETY: the callback ABI matches and the collector pointer remains valid
     // for the complete synchronous enumeration.
     unsafe {
@@ -616,23 +805,8 @@ fn monitors_intersecting(hwnd: HWND) -> Vec<HMONITOR> {
     MONITOR_COLLECTOR.with_borrow_mut(std::mem::take)
 }
 
-fn is_owned_by(mut hwnd: HWND, foreground: HWND) -> bool {
-    // Owner chains are normally one link, but nested modal dialogs exist.
-    for _ in 0..16 {
-        // SAFETY: `hwnd` is a borrowed top-level window handle and GW_OWNER
-        // returns another borrowed handle without retaining Rust data.
-        let Ok(owner) = (unsafe { GetWindow(hwnd, GW_OWNER) }) else {
-            return false;
-        };
-        if owner == foreground {
-            return true;
-        }
-        if owner.is_invalid() || owner == hwnd {
-            return false;
-        }
-        hwnd = owner;
-    }
-    false
+fn is_owned_by(hwnd: HWND, foreground: HWND) -> bool {
+    hwnd != foreground && normalize_root_owner(hwnd) == foreground
 }
 
 fn popup_relationship_is_scannable(
@@ -645,8 +819,8 @@ fn popup_relationship_is_scannable(
 
 struct ThreadWindowCollector {
     foreground: HWND,
-    foreground_monitors: Vec<HMONITOR>,
-    windows: Vec<HWND>,
+    foreground_monitors: SmallVec<[HMONITOR; 4]>,
+    windows: SmallVec<[HWND; MAX_SCAN_WINDOWS]>,
 }
 
 extern "system" fn collect_thread_window(hwnd: HWND, _data: LPARAM) -> BOOL {
@@ -680,11 +854,13 @@ extern "system" fn collect_thread_window(hwnd: HWND, _data: LPARAM) -> BOOL {
     })
 }
 
-fn foreground_and_popup_windows(foreground: HWND) -> Vec<HWND> {
+fn foreground_and_popup_windows(foreground: HWND) -> SmallVec<[HWND; MAX_SCAN_WINDOWS]> {
+    let mut windows = SmallVec::new();
+    windows.push(foreground);
     let collector = ThreadWindowCollector {
         foreground,
         foreground_monitors: monitors_intersecting(foreground),
-        windows: vec![foreground],
+        windows,
     };
     THREAD_WINDOW_COLLECTOR.with_borrow_mut(|slot| *slot = Some(collector));
     let thread_id = super::native::window_thread_process_id(foreground, None);
@@ -697,15 +873,15 @@ fn foreground_and_popup_windows(foreground: HWND) -> Vec<HWND> {
     }
     THREAD_WINDOW_COLLECTOR
         .with_borrow_mut(Option::take)
-        .map_or_else(Vec::new, |collector| collector.windows)
+        .map_or_else(SmallVec::new, |collector| collector.windows)
 }
 
 struct ZOrderCollector {
-    candidates: Vec<HWND>,
+    candidates: SmallVec<[HWND; MAX_SCAN_WINDOWS]>,
     scan_bounds: Rect,
     own_process_id: u32,
-    scan_windows: Vec<ScanWindow>,
-    occluders: Vec<Rect>,
+    scan_windows: InlineScanWindows,
+    occluders: InlineOccluders,
 }
 
 extern "system" fn collect_z_order_window(hwnd: HWND, _data: LPARAM) -> BOOL {
@@ -734,9 +910,9 @@ extern "system" fn collect_z_order_window(hwnd: HWND, _data: LPARAM) -> BOOL {
         let candidate = collector.candidates.contains(&hwnd);
         if candidate {
             collector.scan_windows.push(ScanWindow {
-                hwnd,
+                hwnd: hwnd.0 as isize,
                 bounds: bounds_in_scan,
-                occluders: collector.occluders.clone(),
+                occluder_end: collector.occluders.len().min(u8::MAX as usize) as u8,
             });
         }
 
@@ -744,47 +920,86 @@ extern "system" fn collect_z_order_window(hwnd: HWND, _data: LPARAM) -> BOOL {
         super::native::window_thread_process_id(hwnd, Some(&mut process_id));
         // Our click-through overlay was already skipped above. Ignore any other
         // helper/tray HWND owned by this process so it cannot hide application UI.
-        if candidate || process_id != collector.own_process_id {
+        if (candidate || process_id != collector.own_process_id)
+            && collector.occluders.len() < MAX_SCAN_WINDOWS
+        {
             collector.occluders.push(bounds_in_scan);
         }
         BOOL(1)
     })
 }
 
-fn scan_windows_in_z_order(foreground: HWND, scan_bounds: Rect) -> Result<Vec<ScanWindow>, String> {
+fn scan_windows_in_z_order(
+    foreground: HWND,
+    scan_bounds: Rect,
+) -> Result<(InlineScanWindows, InlineOccluders), String> {
     let candidates = foreground_and_popup_windows(foreground);
     let collector = ZOrderCollector {
         candidates,
         scan_bounds,
         own_process_id: super::native::current_process_id(),
-        scan_windows: Vec::new(),
-        occluders: Vec::new(),
+        scan_windows: SmallVec::new(),
+        occluders: SmallVec::new(),
     };
     Z_ORDER_COLLECTOR.with_borrow_mut(|slot| *slot = Some(collector));
-    // SAFETY: callback ABI and collector pointer are valid for the complete
-    // synchronous top-level enumeration.
-    let enumeration = unsafe { EnumWindows(Some(collect_z_order_window), LPARAM(0)) }
+    let enumeration = super::native::enum_windows(Some(collect_z_order_window), LPARAM(0))
         .map_err(|error| format!("cannot enumerate top-level windows: {error}"));
     let collector = Z_ORDER_COLLECTOR
         .with_borrow_mut(Option::take)
         .ok_or_else(|| "top-level window collector disappeared".to_string())?;
     enumeration?;
-    Ok(collector.scan_windows)
+    Ok((collector.scan_windows, collector.occluders))
 }
 
-fn target_center_is_visible(target: &UiTarget, bounds: Rect, occluders: &[Rect]) -> bool {
-    let center = target.rect.center();
-    bounds.contains(&center) && !occluders.iter().any(|rect| rect.contains(&center))
+pub(super) fn build_scan_plan(
+    request: UiScanRequest,
+) -> Result<Option<Arc<WindowsScanPlan>>, String> {
+    let Some((target_hwnd, target_process_id, target_bounds)) = window_under_pointer()? else {
+        return Ok(None);
+    };
+    // The mode bounds identify the pointer's display. Use them to discover
+    // owned popups which can extend beyond the root-owner rectangle, but ignore
+    // stale bounds after a cross-display pointer move between mode dispatch and
+    // native submission.
+    let enumeration_bounds = request
+        .bounds
+        .filter(|requested| requested.intersect(&target_bounds).is_some())
+        .unwrap_or(target_bounds);
+    let (mut windows, occluders) = scan_windows_in_z_order(target_hwnd, enumeration_bounds)?;
+    // A live target can be omitted transiently while its z-order changes. The
+    // resolved root remains a safe single-window fallback for this generation.
+    if windows.is_empty()
+        && let Some(bounds) = target_bounds.intersect(&enumeration_bounds)
+    {
+        windows.push(ScanWindow {
+            hwnd: target_hwnd.0 as isize,
+            bounds,
+            occluder_end: 0,
+        });
+    }
+    let scan_bounds = windows
+        .iter()
+        .map(|window| window.bounds)
+        .reduce(|left, right| left.union(&right))
+        .unwrap_or(target_bounds);
+    Ok(Some(Arc::new(WindowsScanPlan {
+        request,
+        target_hwnd: target_hwnd.0 as isize,
+        target_process_id,
+        target_bounds,
+        scan_bounds,
+        windows,
+        occluders,
+    })))
 }
 
 fn stream_scan(
     automation: &IUIAutomation,
     query_plan: &UiaQueryPlan,
-    hwnd: HWND,
     job: &ScanJob,
     shared: &SharedQueue,
-    original: Option<(HWND, u32)>,
 ) -> Result<UiScanStatus, String> {
+    let hwnd = job.request.target_hwnd();
     if hwnd.is_invalid() {
         return Ok(UiScanStatus::Success);
     }
@@ -795,23 +1010,7 @@ fn stream_scan(
     if allowed.is_empty() {
         allowed.extend(DEFAULT_CONTROL_TYPES);
     }
-    let scan_bounds = job
-        .request
-        .bounds
-        .or_else(|| window_bounds(hwnd))
-        .unwrap_or_default();
-    let mut windows = scan_windows_in_z_order(hwnd, scan_bounds)?;
-    // EnumWindows can transiently omit a window that is being activated. Keep
-    // the foreground UIA root as a safe fallback instead of returning no hints.
-    if windows.is_empty()
-        && let Some(bounds) = window_bounds(hwnd).and_then(|rect| rect.intersect(&scan_bounds))
-    {
-        windows.push(ScanWindow {
-            hwnd,
-            bounds,
-            occluders: Vec::new(),
-        });
-    }
+    let scan_bounds = job.request.scan_bounds();
     let deadline =
         Instant::now() + Duration::from_millis(u64::from(scan_timeout_ms(job.request.timeout_ms)));
     let mut deduper = SpatialDeduper::new(MINIMUM_SPACING);
@@ -825,8 +1024,8 @@ fn stream_scan(
     // Windows are ordered front-to-back. Popup/menu targets are therefore
     // published before their owner, and every lower window carries the bounds
     // of higher click-receiving windows as occluders.
-    for window in windows {
-        if !context_is_current(shared, job.generation, original) {
+    for window in job.request.windows() {
+        if !context_is_current(shared, job.generation, &job.request) {
             return Ok(UiScanStatus::ContextChanged);
         }
         if Instant::now() >= deadline {
@@ -843,14 +1042,14 @@ fn stream_scan(
 
         // SAFETY: the HWND is live for this iteration and `cache` belongs to
         // the same automation instance and MTA thread.
-        let root = match unsafe { automation.ElementFromHandleBuildCache(window.hwnd, cache) } {
+        let root = match unsafe { automation.ElementFromHandleBuildCache(window.hwnd(), cache) } {
             Ok(root) => root,
             Err(error) => {
                 provider_timed_out |= is_timeout_error(&error);
                 crate::report_warning!(
                     "windows-uia",
                     "cannot inspect popup/top-level window {:?}; continuing: {error}",
-                    window.hwnd
+                    window.hwnd()
                 );
                 continue;
             }
@@ -867,7 +1066,7 @@ fn stream_scan(
                     crate::report_warning!(
                         "windows-uia",
                         "cannot query UIA descendants for {:?}; continuing: {error}",
-                        window.hwnd
+                        window.hwnd()
                     );
                     continue;
                 }
@@ -886,10 +1085,10 @@ fn stream_scan(
                 .map_err(|error| format!("cannot read UIA descendant {index}: {error}"))?;
             visited_count += 1;
             // The atomic generation is cheap enough for every node. Querying
-            // foreground HWND/PID crosses into user32, so sample it every 32
+            // target HWND/PID/bounds cross into user32/DWM, so sample them every 32
             // nodes and always immediately before publishing a partial batch.
             if !is_current(shared, job.generation)
-                || visited_count.is_multiple_of(32) && original != foreground_context()
+                || visited_count.is_multiple_of(32) && !job.request.target_is_current()
             {
                 return Ok(UiScanStatus::ContextChanged);
             }
@@ -907,12 +1106,12 @@ fn stream_scan(
                 &allowed,
                 scan_bounds,
                 provider_filters_interactive,
-            ) && target_center_is_visible(&target, window.bounds, &window.occluders)
+            ) && job.request.target_center_is_visible(&target)
                 && deduper.insert(&target)
             {
                 target_count += 1;
                 if let Some(batch) = batches.push_one(target) {
-                    if !context_is_current(shared, job.generation, original) {
+                    if !context_is_current(shared, job.generation, &job.request) {
                         return Ok(UiScanStatus::ContextChanged);
                     }
                     send_partial(job, batch);
@@ -930,14 +1129,15 @@ fn stream_scan(
         if provider_timed_out {
             return Ok(UiScanStatus::TimedOut);
         }
-        return Err("cannot inspect any foreground or popup UIA window".into());
+        return Err("cannot inspect any target or popup UIA window".into());
     }
     if provider_timed_out && terminal_status == UiScanStatus::Success {
         terminal_status = UiScanStatus::TimedOut;
     }
-    if context_is_current(shared, job.generation, original)
-        && let Some(batch) = batches.finish()
-    {
+    if !context_is_current(shared, job.generation, &job.request) {
+        return Ok(UiScanStatus::ContextChanged);
+    }
+    if let Some(batch) = batches.finish() {
         send_partial(job, batch);
     }
     Ok(terminal_status)
@@ -1330,19 +1530,10 @@ impl SpatialDeduper {
     }
 }
 
-pub(super) fn foreground_context() -> Option<(HWND, u32)> {
-    let hwnd = super::native::foreground_window();
-    if hwnd.is_invalid() {
-        return None;
-    }
-    let mut process_id = 0;
-    super::native::window_thread_process_id(hwnd, Some(&mut process_id));
-    Some((hwnd, process_id))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::command::{UiScanStrategy, VisionOptions};
     use stats_alloc::{INSTRUMENTED_SYSTEM, Region};
 
     #[test]
@@ -1579,6 +1770,47 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual native pointer-target benchmark; run release with --test-threads=1"]
+    fn pointer_target_resolution_performance_probe() {
+        const WARMUP: usize = 2_000;
+        const SAMPLES: usize = 20_000;
+
+        fn percentiles(samples: &mut [u128]) -> (u128, u128, u128) {
+            samples.sort_unstable();
+            let last = samples.len() - 1;
+            (
+                samples[last * 50 / 100],
+                samples[last * 95 / 100],
+                samples[last * 99 / 100],
+            )
+        }
+
+        for _ in 0..WARMUP {
+            std::hint::black_box(window_under_pointer()).expect("native target resolution");
+        }
+        let mut samples = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let started = Instant::now();
+            std::hint::black_box(window_under_pointer()).expect("native target resolution");
+            samples.push(started.elapsed().as_nanos());
+        }
+
+        let allocation_region = Region::new(&INSTRUMENTED_SYSTEM);
+        for _ in 0..SAMPLES {
+            std::hint::black_box(window_under_pointer()).expect("native target resolution");
+        }
+        let allocations = allocation_region.change().allocations;
+        println!(
+            "windows_pointer_target_probe samples={SAMPLES} p50_p95_p99_ns={:?} allocations={allocations}",
+            percentiles(&mut samples),
+        );
+        assert_eq!(
+            allocations, 0,
+            "the normal WindowFromPoint path must not allocate"
+        );
+    }
+
+    #[test]
     fn native_provider_timeout_codes_are_retryable() {
         assert!(is_timeout_hresult(0x8013_1505_u32 as i32));
         assert!(is_timeout_hresult(0x8007_05B4_u32 as i32));
@@ -1590,17 +1822,63 @@ mod tests {
     fn higher_z_order_windows_hide_only_covered_target_centres() {
         let bounds = Rect::new(0.0, 0.0, 200.0, 100.0);
         let item = target(20.0, 20.0, "Save", "button");
-        assert!(target_center_is_visible(&item, bounds, &[]));
-        assert!(!target_center_is_visible(
-            &item,
-            bounds,
-            &[Rect::new(30.0, 25.0, 20.0, 20.0)]
-        ));
-        assert!(target_center_is_visible(
-            &item,
-            bounds,
-            &[Rect::new(0.0, 0.0, 20.0, 20.0)]
-        ));
+        let mut plan = test_scan_plan(UiScanRequest {
+            id: 1,
+            timeout_ms: 1_000,
+            bounds: Some(bounds),
+            roles: Vec::new(),
+            max_depth: 8,
+            visible_only: true,
+            clickable_only: true,
+            strategy: UiScanStrategy::AxTree,
+            vision: VisionOptions::default(),
+            app: None,
+        });
+        assert!(plan.target_center_is_visible(&item));
+        let plan = Arc::get_mut(&mut plan).expect("test owns the only plan reference");
+        plan.occluders = SmallVec::from_slice(&[Rect::new(30.0, 25.0, 20.0, 20.0)]);
+        plan.windows[0].occluder_end = 1;
+        assert!(!plan.target_center_is_visible(&item));
+        plan.occluders = SmallVec::from_slice(&[Rect::new(0.0, 0.0, 20.0, 20.0)]);
+        assert!(plan.target_center_is_visible(&item));
+    }
+
+    #[test]
+    fn common_window_and_occluder_snapshot_stays_inline() {
+        let mut windows = SmallVec::<[ScanWindow; MAX_SCAN_WINDOWS]>::new();
+        let mut occluders = SmallVec::<[Rect; MAX_SCAN_WINDOWS]>::new();
+        for index in 0..MAX_SCAN_WINDOWS {
+            let bounds = Rect::new(index as f64, 0.0, 100.0, 100.0);
+            windows.push(ScanWindow {
+                hwnd: index as isize,
+                bounds,
+                occluder_end: index as u8,
+            });
+            occluders.push(bounds);
+        }
+        assert!(!windows.spilled());
+        assert!(!occluders.spilled());
+    }
+
+    #[test]
+    fn shared_scan_plan_has_one_generation_allocation() {
+        let request = UiScanRequest {
+            id: 2,
+            timeout_ms: 1_000,
+            bounds: Some(Rect::new(0.0, 0.0, 1_920.0, 1_080.0)),
+            roles: Vec::new(),
+            max_depth: 8,
+            visible_only: true,
+            clickable_only: true,
+            strategy: UiScanStrategy::Hybrid,
+            vision: VisionOptions::default(),
+            app: None,
+        };
+        let allocation_region = Region::new(&INSTRUMENTED_SYSTEM);
+        let plan = test_scan_plan(request);
+        let allocations = allocation_region.change().allocations;
+        std::hint::black_box(&plan);
+        assert_eq!(allocations, 1, "only Arc<WindowsScanPlan> should allocate");
     }
 
     #[test]

@@ -45,6 +45,8 @@ use crate::platform::scan_mailbox::ScanMailbox;
 use self::overlay_worker::OverlayWorker;
 
 const WAKE_MESSAGE: u32 = WM_APP + 0x4C;
+const NO_WINDOW_UNDER_POINTER: &str =
+    "No window under the pointer — move the pointer over a window";
 
 #[inline]
 fn label_text_offset_y(style: &LabelStyle, analysis: LabelTextAnalysis) -> f64 {
@@ -629,19 +631,31 @@ impl Backend for WindowsBackend {
     fn request_ui_scan(&mut self, request: crate::api::UiScanRequest) -> Result<(), String> {
         use crate::api::UiScanStrategy;
 
+        let request_id = request.id;
+        let Some(plan) = accessibility::build_scan_plan(request)? else {
+            let generation = self.scan_mailbox.begin(request_id);
+            if self.scan_mailbox.publish(
+                generation,
+                request_id,
+                Vec::new(),
+                crate::api::UiScanStatus::Failed(NO_WINDOW_UNDER_POINTER.into()),
+            ) {
+                self.event_tx.wake();
+            }
+            return Ok(());
+        };
         let wants_uia = matches!(
-            request.strategy,
+            plan.strategy,
             UiScanStrategy::AxTree | UiScanStrategy::Hybrid
         );
         let wants_vision = matches!(
-            request.strategy,
+            plan.strategy,
             UiScanStrategy::Vision | UiScanStrategy::Hybrid
         );
         if wants_uia && self.ui_automation.is_none() {
             self.ui_automation = Some(accessibility::UiAutomationWorker::start()?);
         }
-        let request_id = request.id;
-        let generation = self.scan_mailbox.begin(request.id);
+        let generation = self.scan_mailbox.begin(request_id);
         let capture = if wants_vision {
             match self.overlay.begin_capture(generation) {
                 Ok(capture) => Some(capture),
@@ -655,10 +669,9 @@ impl Backend for WindowsBackend {
         };
         let sources = usize::from(wants_uia) + usize::from(wants_vision);
         let session = ui_scan::ScanSession::new(
-            request.id,
+            Arc::clone(&plan),
             generation,
             sources,
-            &request.vision,
             Arc::clone(&self.scan_mailbox),
             self.event_tx.clone(),
         );
@@ -667,11 +680,15 @@ impl Backend for WindowsBackend {
                 let worker = self.ui_automation.as_ref().ok_or_else(|| {
                     "UI Automation worker was not retained after startup".to_string()
                 })?;
-                worker.submit(request.clone(), generation, session.source("UI Automation"))?;
+                worker.submit(
+                    Arc::clone(&plan),
+                    generation,
+                    session.source("UI Automation"),
+                )?;
             }
             if wants_vision {
                 self.vision.submit(
-                    request,
+                    plan,
                     generation,
                     session.source("visual scan"),
                     capture.ok_or_else(|| "visual capture lease was not created".to_string())?,

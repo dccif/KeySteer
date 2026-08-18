@@ -1,5 +1,11 @@
 # 更新日志 / Release Notes
 
+## 0.9.5
+
+Windows UI Hint 现在扫描每轮提交时鼠标下的窗口组，窗口上下文变化会立即清除旧标签并重新定位，不占用失败重试次数；Hybrid 同时共享单份扫描计划，并在返回 Normal 或 Idle 时完整取消识别与释放本轮资源。
+
+Windows UI Hint now scans the window group under the pointer at submission time. Window-context changes immediately clear stale hints and retarget without consuming retries, while Hybrid shares one scan plan and fully cancels recognition and releases generation resources when returning to Normal or Idle.
+
 ## 0.9.4
 
 跨平台 UI Hint 统一使用零分配文字分析和精确前缀高亮，并修正最终视觉层切换。
