@@ -1,12 +1,14 @@
 # KeySteer
 
-[简体中文](README.md) | **English**
-
 <p align="center">
   <img src="assets/brand/keysteer-wordmark.webp" alt="KeySteer" width="760">
 </p>
 
 <p align="center"><strong>Put your mouse in the hands of your keyboard: lightweight, native, and configurable.</strong></p>
+
+<p align="center">
+  <sub>Language / 语言 · <a href="README.md">简体中文</a> · <strong>English</strong></sub>
+</p>
 
 KeySteer is a keyboard-driven mouse-control tool for Windows and macOS.
 
