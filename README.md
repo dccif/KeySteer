@@ -1,5 +1,7 @@
 # KeySteer
 
+**简体中文** | [English](README.en.md)
+
 <p align="center">
   <a href="https://github.com/dccif/KeySteer/actions/workflows/pages.yml"><img alt="Page status" src="https://img.shields.io/github/actions/workflow/status/dccif/KeySteer/pages.yml?branch=main&amp;label=Page&amp;style=flat&amp;logo=github&amp;logoColor=white"></a>
   <a href="https://github.com/dccif/KeySteer/actions/workflows/build.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/dccif/KeySteer/build.yml?branch=main&amp;label=Build&amp;style=flat&amp;logo=github&amp;logoColor=white"></a>

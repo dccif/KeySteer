@@ -6,6 +6,10 @@ const base = process.env.KEYSTEER_DOCS_BASE || '/'
 export default withMermaid({
   base,
   lang: 'zh-CN',
+  locales: {
+    root: { label: '简体中文', lang: 'zh-CN' },
+    en: { label: 'English', lang: 'en-US' },
+  },
   title: 'KeySteer',
   description: '用键盘操控鼠标的原生小工具：快、轻量、可定制。',
   cleanUrls: true,
@@ -99,5 +103,79 @@ export default withMermaid({
     outline: { label: '本页内容' },
     docFooter: { prev: '上一页', next: '下一页' },
     lastUpdated: { text: '最近更新' },
+    locales: {
+      root: {
+        label: '简体中文',
+      },
+      en: {
+        label: 'English',
+        nav: [
+          { text: 'Get started', link: '/en/guide/getting-started' },
+          { text: 'Modes', link: '/en/modes/' },
+          { text: 'Configuration', link: '/en/reference/configuration' },
+          { text: 'Configuration & simulator', link: '/en/editor/' },
+        ],
+        sidebar: [
+          {
+            text: 'Get started',
+            items: [
+              { text: 'Getting started', link: '/en/guide/getting-started' },
+              { text: 'macOS', link: '/en/guide/macos' },
+            ],
+          },
+          {
+            text: 'Modes',
+            items: [
+              { text: 'Overview', link: '/en/modes/' },
+              { text: 'Normal', link: '/en/modes/normal' },
+              { text: 'Grid', link: '/en/modes/grid' },
+              { text: 'Recursive Grid', link: '/en/modes/recursive-grid' },
+              { text: 'UI Hint', link: '/en/modes/ui-hint' },
+            ],
+          },
+          {
+            text: 'Reference',
+            items: [
+              { text: 'Configuration', link: '/en/reference/configuration' },
+              { text: 'Modes and actions', link: '/en/reference/modes-and-actions' },
+              { text: 'Release notes', link: '/en/releases/' },
+            ],
+          },
+          {
+            text: 'Tools',
+            items: [{ text: 'Configuration & simulator', link: '/en/editor/' }],
+          },
+        ],
+        search: {
+          provider: 'local',
+          options: {
+            translations: {
+              button: {
+                buttonText: 'Search',
+                buttonAriaLabel: 'Search documentation',
+              },
+              modal: {
+                displayDetails: 'Display detailed list',
+                resetButtonTitle: 'Reset search',
+                backButtonTitle: 'Close search',
+                noResultsText: 'No results for',
+                footer: {
+                  selectText: 'Select',
+                  selectKeyAriaLabel: 'Enter',
+                  navigateText: 'Navigate',
+                  navigateUpKeyAriaLabel: 'Arrow up',
+                  navigateDownKeyAriaLabel: 'Arrow down',
+                  closeText: 'Close',
+                  closeKeyAriaLabel: 'Esc',
+                },
+              },
+            },
+          },
+        },
+        outline: { label: 'On this page' },
+        docFooter: { prev: 'Previous page', next: 'Next page' },
+        lastUpdated: { text: 'Last updated' },
+      },
+    },
   },
 })

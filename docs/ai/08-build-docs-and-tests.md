@@ -115,6 +115,12 @@ GitHub Pages。需要更新线上文档时，在 Actions 页面运行 `Deploy do
 
 ## VitePress 文档与模拟器
 
+用户文档以中文根路径和英文 `/en/` 路径并行发布：中文源文件保留在 `docs/`，英文源文件在
+`docs/en/`，不要把 `docs/ai/` 的维护者资料复制到任一面向用户的侧栏。`docs/.vitepress/config.mts`
+在 `locales` 与 `themeConfig.locales` 中维护两种语言的导航、侧栏、搜索、页内目录和上下页文案；
+两套导航各有一个语言菜单。新增或移动用户页面时，必须同时新增/移动其 `docs/en/` 对应页面并更新两套链接，
+避免语言切换后落到不存在的地址。
+
 工具链：VitePress 1.6、Vue 3 TSX、`smol-toml`、pnpm。主要脚本：
 
 - `pnpm docs:dev`：同步 default TOML/icon 和 Release 元数据后启动开发服务器。
