@@ -36,7 +36,8 @@ pub use geometry::{Point, Rect, Screen, UiTarget};
 pub use hint::LabelDirection;
 pub use input::{InputEvent, Key, KeyChord, KeyState, ModeId};
 pub use overlay::{
-    Color, Indicator, LabelStyle, OverlayLabel, OverlayScene, OverlayShape, Placement,
+    Color, Indicator, LabelStyle, OverlayLabel, OverlayScene, OverlayShape, OverlayText, Placement,
+    SharedLabelStyle,
 };
 pub use plugin::{API_VERSION, Manifest, Plugin};
 pub use theme::Palette;

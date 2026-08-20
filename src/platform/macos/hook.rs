@@ -442,6 +442,7 @@ fn event_tap_thread(handshake: HookHandshake, context: HookThreadContext) {
         active.store(false, Ordering::Release);
         return;
     }
+    crate::app::perf_probe::mark("hook_ready");
 
     let mut timeout_retried = false;
     while !stop.load(Ordering::Acquire) {
@@ -698,6 +699,8 @@ fn disposition_for(
     mailbox: &crate::platform::disposition_mailbox::DispositionMailbox,
     event: BackendEvent,
 ) -> CallbackResult {
+    let correlation_id = crate::app::perf_probe::next_correlation_id();
+    crate::app::perf_probe::mark_correlated("hook_received", correlation_id);
     let generation = mailbox.begin();
     if sender
         .try_send(Envelope {
@@ -706,11 +709,12 @@ fn disposition_for(
         })
         .is_err()
     {
+        crate::app::perf_probe::mark_correlated("disposition_returned", correlation_id);
         return CallbackResult::Keep;
     }
     super::workspace::wake_main_run_loop();
 
-    match mailbox.wait(generation, DISPOSITION_TIMEOUT) {
+    let result = match mailbox.wait(generation, DISPOSITION_TIMEOUT) {
         Some(KeyDisposition::Consume) => CallbackResult::Drop,
         Some(KeyDisposition::Defer | KeyDisposition::Forward) => CallbackResult::Keep,
         None => {
@@ -720,7 +724,9 @@ fn disposition_for(
             });
             CallbackResult::Keep
         }
-    }
+    };
+    crate::app::perf_probe::mark_correlated("disposition_returned", correlation_id);
+    result
 }
 
 #[cfg(test)]

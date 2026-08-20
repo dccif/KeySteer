@@ -13,7 +13,7 @@ use objc2::rc::{Allocated, Retained, autoreleasepool};
 use objc2::runtime::NSObject;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::NSView;
-use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSRunLoop, NSRunLoopCommonModes};
+use objc2_foundation::{NSDate, NSRunLoop, NSRunLoopCommonModes};
 use objc2_quartz_core::CADisplayLink;
 
 struct FrameTargetIvars {
@@ -134,20 +134,11 @@ impl DisplayFrameClock {
 
         let deadline = NSDate::dateWithTimeIntervalSinceNow(timeout.as_secs_f64());
         let run_loop = NSRunLoop::mainRunLoop();
-        loop {
-            if deadline.timeIntervalSinceNow() <= 0.0 {
-                return self.target.take_elapsed();
-            }
-            // SAFETY: NSDefaultRunLoopMode is a process-lifetime Foundation
-            // constant used only for this synchronous main-thread call.
-            let handled = run_loop.runMode_beforeDate(unsafe { NSDefaultRunLoopMode }, &deadline);
-            if let Some(elapsed) = self.target.take_elapsed() {
-                return Some(elapsed);
-            }
-            if !handled {
-                return None;
-            }
-        }
+        let mode = super::native::default_run_loop_modes().foundation;
+        let _handled = run_loop.runMode_beforeDate(mode, &deadline);
+        // Any non-frame AppKit wake returns control to Backend::poll so a
+        // synchronously waiting hook is checked before another VBlank wait.
+        self.target.take_elapsed()
     }
 }
 

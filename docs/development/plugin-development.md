@@ -29,7 +29,7 @@ pub struct Manifest {
     pub id: String,            // reverse-DNS 风格唯一 id，如 "com.example.zoom"
     pub name: String,          // 人类可读名称
     pub description: String,   // 一句话说明
-    pub api_version: u32,      // 必须等于 API_VERSION（当前 7）
+    pub api_version: u32,      // 必须等于 API_VERSION（当前 8）
     pub default_chords: Vec<KeyChord>,     // 直接激活插件模式的遗留组合键
     pub verbs: Vec<String>,                // 插件导出的带参动词
     pub default_bindings: Vec<(KeyChord, Binding)>, // 建议绑定（见下）
@@ -40,7 +40,16 @@ Manifest 提供链式构造方法：`Manifest::new(id, name).with_description(..
 
 **校验规则**（`Manifest::validate`，注册时宿主会校验）：
 
-- `api_version` 必须等于 `API_VERSION`（当前 `7`），否则整个插件被拒绝
+- `api_version` 必须等于 `API_VERSION`（当前 `8`），否则整个插件被拒绝
+
+### API v8 overlay migration
+
+`OverlayLabel.text` is now `OverlayText` and `style` is `SharedLabelStyle`.
+Their serialized shapes remain a TOML/JSON string and a style object. Existing
+`OverlayLabel::new(text, rect, LabelStyle)` calls still compile; struct literals
+must use `.into()`, and direct style mutation becomes
+`label.style_mut().font_size = ...`. Short text stays inline and cloned labels
+share style through copy-on-write semantics.
 - `id` 只能包含 ASCII 字母、数字以及 `.`、`_`、`-`，不能为空
 - `verbs` 只能包含小写 ASCII 字母、数字和 `_`，不能为空
 

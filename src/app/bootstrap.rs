@@ -30,7 +30,7 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
             )
         }
         None => match Config::discover() {
-            Some(path) => match Config::load_with_source(&path) {
+            Ok(Some(path)) => match Config::load_with_source(&path) {
                 Ok(loaded) => (
                     loaded.config,
                     Some(loaded.path),
@@ -48,10 +48,18 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
                     (Config::default(), Config::default_write_path(), false, None)
                 }
             },
-            None => (Config::default(), Config::default_write_path(), false, None),
+            Ok(None) => (Config::default(), Config::default_write_path(), false, None),
+            Err(error) => {
+                crate::app::logging::report_error(
+                    "config",
+                    format!("could not discover configuration; using built-in defaults: {error}"),
+                );
+                (Config::default(), Config::default_write_path(), false, None)
+            }
         },
     };
     crate::app::logging::set_non_error_enabled(config.debug.enabled);
+    crate::app::logging::start_session();
     if loaded_from_file {
         let path = config_path.as_deref().ok_or_else(|| {
             "configuration loader reported a file without retaining its path".to_string()
@@ -73,7 +81,7 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
     log_debug_configuration(&config, config_path.as_deref());
 
     if args.dump_config {
-        print!("{}", config.to_toml());
+        print!("{}", config.to_toml().map_err(|error| error.to_string())?);
         return Ok(());
     }
 

@@ -1470,11 +1470,14 @@ impl Engine {
                 self.refresh_overlay(backend)?;
             }
             BackendEvent::UiScanned(result) => {
-                crate::app::perf_probe::mark(if result.status == UiScanStatus::Partial {
-                    "ui_scan_partial"
-                } else {
-                    "ui_scan_terminal"
-                });
+                crate::app::perf_probe::mark_value(
+                    if result.status == UiScanStatus::Partial {
+                        "ui_scan_partial"
+                    } else {
+                        "ui_scan_terminal"
+                    },
+                    isize::try_from(result.id).unwrap_or(isize::MAX),
+                );
                 match &result.status {
                     UiScanStatus::Failed(error) => crate::app::logging::report_error(
                         "ui-scan",
@@ -1516,10 +1519,10 @@ impl Engine {
                 }) {
                     return Ok(());
                 }
-                let source = self
-                    .config_store
-                    .as_ref()
-                    .map_or_else(|| self.config.to_toml(), ConfigStore::source_text);
+                let source = match self.config_store.as_ref() {
+                    Some(store) => store.source_text(),
+                    None => self.config.to_toml().map_err(|error| error.to_string())?,
+                };
                 let url = crate::app::config_simulator::url_for_config(&source);
                 if let Err(error) = backend.open_url(&url) {
                     crate::app::logging::report_error("config-simulator", error);
@@ -1574,7 +1577,7 @@ impl Engine {
     fn reload_config(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
         let discovered_path = if let Some(directory) = self.config_discovery_directory.clone() {
             let (config, store, path) = match Config::discover_in(&directory) {
-                Some(path) => {
+                Ok(Some(path)) => {
                     let loaded = Config::load_with_source(&path).map_err(|error| {
                         format!(
                             "configuration reload rejected; keeping the last valid configuration: {error}"
@@ -1584,11 +1587,19 @@ impl Engine {
                         ConfigStore::from_validated_text(loaded.path.clone(), loaded.raw_text);
                     (loaded.config, store, Some(loaded.path))
                 }
-                None => {
+                Ok(None) => {
                     let config = Config::default();
                     let path = directory.join("keysteer.user.toml");
-                    let store = ConfigStore::from_validated_text(path, config.to_toml());
+                    let store = ConfigStore::from_validated_text(
+                        path,
+                        config.to_toml().map_err(|error| error.to_string())?,
+                    );
                     (config, store, None)
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "configuration reload rejected; discovery failed: {error}"
+                    ));
                 }
             };
             self.apply_config(config)?;
@@ -3272,7 +3283,7 @@ mod tests {
     #[test]
     fn simulator_menu_serializes_config_without_a_store() {
         let config = Config::default();
-        let expected = crate::app::config_simulator::url_for_config(&config.to_toml());
+        let expected = crate::app::config_simulator::url_for_config(&config.to_toml().unwrap());
         let mut engine = Engine::new(config, Appearance::Dark);
         let (mut backend, log) = FakeBackend::new(vec![BackendEvent::OpenConfigSimulator]);
 

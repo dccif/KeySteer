@@ -9,11 +9,14 @@
 //! exactly the fidelity of the built-in modes — it has the same primitives.
 
 use std::{
+    borrow::Borrow,
+    fmt,
     ops::{Deref, DerefMut},
     sync::Arc,
 };
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use smallvec::SmallVec;
 
 use super::geometry::{Point, Rect};
 
@@ -186,6 +189,164 @@ impl LabelStyle {
     }
 }
 
+/// UTF-8 overlay text stored inline for common short labels.
+#[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OverlayText(SmallVec<[u8; 16]>);
+
+impl OverlayText {
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.0).unwrap_or_default()
+    }
+    pub fn push(&mut self, character: char) {
+        let mut encoded = [0; 4];
+        self.0
+            .extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+    }
+    pub fn push_str(&mut self, text: &str) {
+        self.0.extend_from_slice(text.as_bytes());
+    }
+    pub fn pop(&mut self) -> Option<char> {
+        let character = self.as_str().chars().next_back()?;
+        self.0.truncate(self.0.len() - character.len_utf8());
+        Some(character)
+    }
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    #[cfg(test)]
+    fn is_inline(&self) -> bool {
+        !self.0.spilled()
+    }
+}
+
+impl From<&str> for OverlayText {
+    fn from(value: &str) -> Self {
+        Self(SmallVec::from_slice(value.as_bytes()))
+    }
+}
+impl From<String> for OverlayText {
+    fn from(value: String) -> Self {
+        Self(SmallVec::from_vec(value.into_bytes()))
+    }
+}
+impl From<char> for OverlayText {
+    fn from(value: char) -> Self {
+        let mut text = Self::default();
+        text.push(value);
+        text
+    }
+}
+impl Deref for OverlayText {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+impl AsRef<str> for OverlayText {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+impl Borrow<str> for OverlayText {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+impl fmt::Debug for OverlayText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.as_str().fmt(f)
+    }
+}
+impl fmt::Display for OverlayText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+impl PartialEq<str> for OverlayText {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+impl PartialEq<&str> for OverlayText {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+impl Serialize for OverlayText {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+impl<'de> Deserialize<'de> for OverlayText {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Self::from)
+    }
+}
+
+/// Cheap COW value semantics for label styles shared across a scene.
+#[derive(Clone)]
+pub struct SharedLabelStyle(Arc<LabelStyle>);
+impl SharedLabelStyle {
+    pub fn make_mut(&mut self) -> &mut LabelStyle {
+        Arc::make_mut(&mut self.0)
+    }
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+    pub(crate) fn identity(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+}
+impl Default for SharedLabelStyle {
+    fn default() -> Self {
+        Self::from(LabelStyle::default())
+    }
+}
+impl Deref for SharedLabelStyle {
+    type Target = LabelStyle;
+    fn deref(&self) -> &LabelStyle {
+        &self.0
+    }
+}
+impl AsRef<LabelStyle> for SharedLabelStyle {
+    fn as_ref(&self) -> &LabelStyle {
+        &self.0
+    }
+}
+impl From<LabelStyle> for SharedLabelStyle {
+    fn from(value: LabelStyle) -> Self {
+        Self(Arc::new(value))
+    }
+}
+impl From<Arc<LabelStyle>> for SharedLabelStyle {
+    fn from(value: Arc<LabelStyle>) -> Self {
+        Self(value)
+    }
+}
+impl PartialEq for SharedLabelStyle {
+    fn eq(&self, other: &Self) -> bool {
+        self.ptr_eq(other) || self.0 == other.0
+    }
+}
+impl fmt::Debug for SharedLabelStyle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl Serialize for SharedLabelStyle {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for SharedLabelStyle {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        LabelStyle::deserialize(deserializer).map(Self::from)
+    }
+}
+
 /// Allocation-free text facts shared by native overlay renderers.
 ///
 /// The public prefix length is measured in Unicode scalar values, while both
@@ -240,10 +401,10 @@ impl LabelTextAnalysis {
 /// A text label to draw — a hint code, a grid cell key, a status badge.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OverlayLabel {
-    pub text: String,
+    pub text: OverlayText,
     /// Where to draw. Use [`Placement::place`] to derive it from an element.
     pub rect: Rect,
-    pub style: LabelStyle,
+    pub style: SharedLabelStyle,
     /// Length of the leading substring of `text` already typed by the user;
     /// the backend paints it with `style.matched_text_color`.
     pub matched_prefix_len: usize,
@@ -254,15 +415,23 @@ pub struct OverlayLabel {
 }
 
 impl OverlayLabel {
-    pub fn new(text: impl Into<String>, rect: Rect, style: LabelStyle) -> Self {
+    pub fn new(
+        text: impl Into<OverlayText>,
+        rect: Rect,
+        style: impl Into<SharedLabelStyle>,
+    ) -> Self {
         Self {
             text: text.into(),
             rect,
-            style,
+            style: style.into(),
             matched_prefix_len: 0,
             z_index: 0,
             fit_to_text: false,
         }
+    }
+
+    pub fn style_mut(&mut self) -> &mut LabelStyle {
+        self.style.make_mut()
     }
 
     pub fn with_matched_prefix(mut self, len: usize) -> Self {
@@ -600,8 +769,20 @@ impl OverlayScene {
     }
 
     pub(crate) fn sort_in_place(&mut self) {
-        self.shapes.sort_by_key(OverlayShape::z_index);
-        self.labels.sort_by_key(|l| l.z_index);
+        if !self
+            .shapes
+            .windows(2)
+            .all(|pair| pair[0].z_index() <= pair[1].z_index())
+        {
+            self.shapes.sort_by_key(OverlayShape::z_index);
+        }
+        if !self
+            .labels
+            .windows(2)
+            .all(|pair| pair[0].z_index <= pair[1].z_index)
+        {
+            self.labels.sort_by_key(|label| label.z_index);
+        }
     }
 }
 
@@ -619,6 +800,44 @@ mod tests {
         );
         assert_eq!(Color::rgba(255, 0, 0, 0x80).to_hex(), "#FF000080");
         assert!(Color::parse("a€aaaa").is_none());
+    }
+
+    #[test]
+    fn short_overlay_text_is_inline_and_unicode_edits_remain_valid() {
+        let mut text = OverlayText::from("1234567890123456");
+        assert!(text.is_inline());
+        text.push('界');
+        assert!(!text.is_inline());
+        assert_eq!(text.pop(), Some('界'));
+        assert_eq!(text.as_str(), "1234567890123456");
+    }
+
+    #[test]
+    fn overlay_label_keeps_the_existing_json_shape_and_cow_style() {
+        let label = OverlayLabel::new("abc", Rect::new(1.0, 2.0, 3.0, 4.0), LabelStyle::default());
+        let value = serde_json::to_value(&label).unwrap();
+        assert_eq!(value["text"], "abc");
+        assert!(value["style"].is_object());
+        let decoded: OverlayLabel = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), value);
+        let mut clone = label.clone();
+        assert!(label.style.ptr_eq(&clone.style));
+        clone.style_mut().bold = false;
+        assert!(!label.style.ptr_eq(&clone.style));
+        assert!(label.style.bold);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn compact_overlay_layout_stays_within_budget() {
+        assert_eq!(std::mem::size_of::<OverlayText>(), 24);
+        assert_eq!(std::mem::size_of::<SharedLabelStyle>(), 8);
+        assert!(std::mem::size_of::<OverlayLabel>() <= 80);
+        println!(
+            "overlay_label_size_candidate={} label_style_size_candidate={}",
+            std::mem::size_of::<OverlayLabel>(),
+            std::mem::size_of::<LabelStyle>(),
+        );
     }
 
     #[test]

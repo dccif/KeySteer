@@ -167,3 +167,16 @@ pnpm docs:build
 ```
 
 只改文档 Markdown 时不必运行所有原生 target，但应检查链接/路径和 `git diff --check`。
+# Latency benchmark gates
+
+Build with `--features perf-probe` and use
+`tools/benchmark-windows-hint-cold-start.ps1` for startup offsets
+`0/10/50/100/500 ms`. The offsets and input scheduling live only in the
+external harness; production startup remains event-driven parallel prewarming.
+Samples with `probe_dropped > 0` are invalid. The primary metric is the causal
+physical `hook_received` marker through the first subsequent
+`native_presented`, not `backend_started`.
+
+Global `stats_alloc` regions are process-wide. Allocation assertions that need
+exact counts are ignored in ordinary parallel CI and must run alone with
+`--test-threads=1`; ordinary CI checks deterministic Arc/SmallVec invariants.

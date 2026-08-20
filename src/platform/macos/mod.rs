@@ -22,7 +22,7 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use objc2::MainThreadMarker;
@@ -56,37 +56,21 @@ fn app_bundle_for_executable(executable: &Path) -> Option<PathBuf> {
     (bundle.extension()? == "app").then(|| bundle.to_path_buf())
 }
 
-/// Routes worker and menu events into the hook queue when available. This
-/// gives asynchronous work a real wake-up path instead of polling for it.
+/// Independent asynchronous event lane. Synchronous CGEventTap input owns the
+/// bounded hook queue exclusively so menu/update bursts cannot delay or drop
+/// a physical key waiting for disposition.
 #[derive(Clone)]
 struct EventSender {
-    hook: Arc<OnceLock<hook::EventSender>>,
-    fallback: Sender<BackendEvent>,
+    sender: Sender<BackendEvent>,
 }
 
 impl EventSender {
-    fn new(fallback: Sender<BackendEvent>) -> Self {
-        Self {
-            hook: Arc::new(OnceLock::new()),
-            fallback,
-        }
-    }
-
-    fn promote(&self, sender: hook::EventSender) {
-        let _ = self.hook.set(sender);
+    fn new(sender: Sender<BackendEvent>) -> Self {
+        Self { sender }
     }
 
     fn send(&self, event: BackendEvent) -> Result<(), ()> {
-        let result = match self.hook.get() {
-            Some(sender) => match sender.try_send(event) {
-                Ok(()) => Ok(()),
-                // Status/update workers must never block behind the bounded
-                // keyboard queue. Preserve the event through the unbounded
-                // fallback and wake the main run loop explicitly.
-                Err(event) => self.fallback.send(event).map_err(|_| ()),
-            },
-            None => self.fallback.send(event).map_err(|_| ()),
-        };
+        let result = self.sender.send(event).map_err(|_| ());
         if result.is_ok() {
             self.wake();
         }
@@ -151,16 +135,13 @@ impl MacOsBackend {
             );
             Vec::new()
         });
-        let display_watcher = screens::DisplayWatcher::new();
+        let display_watcher = screens::DisplayWatcher::new()?;
         let workspace = workspace::Workspace::new();
         let keyboard = input::KeyboardInjector::new();
         let hook = match hook_start.and_then(|startup| {
             startup.finish(hook_deadline.saturating_duration_since(Instant::now()))
         }) {
-            Ok(hook) => {
-                event_tx.promote(hook.event_sender());
-                Some(hook)
-            }
+            Ok(hook) => Some(hook),
             Err(error) => {
                 if trusted {
                     crate::app::logging::report_error("macos-hook", error);
@@ -221,9 +202,10 @@ impl MacOsBackend {
             .as_mut()
             .and_then(HookThread::try_next_event)
             .or_else(|| {
-                self.pending
-                    .pop_front()
-                    .or_else(|| self.scan_mailbox.take().map(BackendEvent::UiScanned))
+                self.scan_mailbox
+                    .take()
+                    .map(BackendEvent::UiScanned)
+                    .or_else(|| self.pending.pop_front())
                     .or_else(|| self.async_rx.try_recv().ok())
             })
     }
@@ -267,10 +249,12 @@ impl MacOsBackend {
         // Stop every producer before tearing down the AppKit objects they may
         // wake or update. All operations are idempotent so Drop can safely use
         // the same path after an earlier error.
-        self.status_item.take();
-        self.display_watcher.take();
-        self.frame_clock.stop();
         let mut errors = crate::app::errors::ErrorBundle::default();
+        self.status_item.take();
+        if let Some(mut watcher) = self.display_watcher.take() {
+            errors.record("display watcher", watcher.stop());
+        }
+        self.frame_clock.stop();
         errors.record("UI scan worker", self.scan_worker.shutdown());
         if let Some(worker) = self.update_worker.as_mut() {
             match worker.cancel_and_wait() {
@@ -317,6 +301,9 @@ impl Backend for MacOsBackend {
         self.reap_update_worker();
         let deadline = Instant::now() + timeout;
         loop {
+            if let Some(event) = self.try_event() {
+                return Ok(Some(event));
+            }
             self.refresh_native_events();
             if let Some(event) = self.try_event() {
                 return Ok(Some(event));

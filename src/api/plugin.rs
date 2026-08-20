@@ -15,7 +15,7 @@ use super::command::Mode;
 use super::input::KeyChord;
 
 /// Version of the mode/command vocabulary. Bumped on breaking changes.
-pub const API_VERSION: u32 = 7;
+pub const API_VERSION: u32 = 8;
 
 /// Metadata describing a plugin to the host.
 #[derive(Debug, Clone, PartialEq, Eq)]

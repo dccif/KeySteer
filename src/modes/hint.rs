@@ -19,7 +19,9 @@ use crate::api::command::{
 };
 use crate::api::geometry::{Rect, UiTarget};
 use crate::api::input::{Key, KeyChord, KeyState, ModeId};
-use crate::api::overlay::{Color, LabelStyle, OverlayLabel, OverlayScene, OverlayShape};
+use crate::api::overlay::{
+    Color, LabelStyle, OverlayLabel, OverlayScene, OverlayShape, OverlayText, SharedLabelStyle,
+};
 use crate::config::style::AUTO;
 use crate::config::{Config, Palette, UiHint as HintsConfig};
 use crate::hints::{self, CompactHint, Match, VisualLayerPlan, build_visual_layer_plan};
@@ -43,7 +45,7 @@ const AUTO_HINT_PADDING_Y_RATIO: f64 = 0.06;
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Input {
     /// Typing hint labels.
-    Labels(String),
+    Labels(OverlayText),
     /// Typing a search query that filters by element name.
     Search(String),
 }
@@ -52,7 +54,8 @@ impl Input {
     /// Text typed so far, whether that is a label prefix or a search query.
     fn text(&self) -> &str {
         match self {
-            Input::Labels(s) | Input::Search(s) => s,
+            Input::Labels(text) => text.as_str(),
+            Input::Search(text) => text.as_str(),
         }
     }
 }
@@ -88,6 +91,7 @@ pub struct HintMode {
     /// Source-agnostic visual layers over the merged UIA/Vision Hint list.
     /// Rebuilt at each exponentially batched Partial so overlap input stays hot.
     overlap_plan: VisualLayerPlan,
+    wide_placements: Option<Vec<(usize, Rect)>>,
     /// Targets that arrived after a label prefix was typed. Reassigning those
     /// labels immediately would invalidate keys already visible to the user.
     pending_relabel: bool,
@@ -101,14 +105,19 @@ impl HintMode {
     pub fn new(config: &Config) -> Self {
         Self {
             config: config.ui_hint.clone(),
-            alphabet: config.ui_hint.hint_characters.chars().collect(),
+            alphabet: config
+                .ui_hint
+                .hint_characters
+                .chars()
+                .filter_map(|character| Key::new(character.to_string()).ok()?.as_char())
+                .collect(),
             overlap_cycle_chord: KeyChord::parse(&config.ui_hint.overlap_cycle_key).ok(),
             scanned: Vec::new(),
             scanned_names_lower: Vec::new(),
             search_names_initialized: false,
             seen_targets: HashMap::new(),
             hints: Vec::new(),
-            input: Input::Labels(String::new()),
+            input: Input::Labels(OverlayText::default()),
             scanning: false,
             status: None,
             return_mode: ModeId::idle(),
@@ -119,6 +128,7 @@ impl HintMode {
             held_overlap_keys: SmallVec::new(),
             overlap_cycle: 0,
             overlap_plan: VisualLayerPlan::default(),
+            wide_placements: None,
             pending_relabel: false,
             selected: None,
             finished: false,
@@ -135,6 +145,8 @@ impl HintMode {
         self.overlap_plan.clear();
         self.pending_relabel = false;
         if release_large_buffers {
+            self.overlap_plan.release_retained();
+            self.wide_placements = None;
             if self.scanned.capacity() > MAX_IDLE_RETAINED_TARGETS {
                 self.scanned = Vec::new();
             }
@@ -143,9 +155,6 @@ impl HintMode {
             }
             if self.hints.capacity() > MAX_IDLE_RETAINED_TARGETS {
                 self.hints = Vec::new();
-            }
-            if self.overlap_plan.retained_capacity() > MAX_IDLE_RETAINED_TARGETS {
-                self.overlap_plan = VisualLayerPlan::default();
             }
             if self.seen_targets.capacity() > MAX_IDLE_RETAINED_TARGETS {
                 self.seen_targets = HashMap::new();
@@ -176,7 +185,7 @@ impl HintMode {
         self.scanning = true;
         self.status = None;
         self.clear_scan_results(false);
-        self.input = Input::Labels(String::new());
+        self.input = Input::Labels(OverlayText::default());
         self.selected = None;
         self.finished = false;
         self.retry_attempt = 0;
@@ -436,15 +445,18 @@ impl HintMode {
             })
             .map(|(index, target)| (target.rect, index));
 
-        if hints::assign_compact_into(
+        if let Err(error) = hints::assign_compact_into(
             &mut self.hints,
             candidates,
             &self.alphabet,
             self.config.label_direction,
-        )
-        .is_err()
-        {
+        ) {
             self.hints.clear();
+            self.status = Some("Cannot assign Hint labels — check hint_characters".into());
+            crate::app::logging::report_error(
+                "ui-hint",
+                format!("cannot assign labels for scan {}: {error}", self.scan_id),
+            );
         }
         self.pending_relabel = false;
         self.refresh_overlap_plan(ctx);
@@ -455,22 +467,51 @@ impl HintMode {
         let visual_scale = visual_layer_scale(ctx, self.scan_bounds);
         let visual_padding_x = (style.padding_x * visual_scale).round();
         let visual_padding_y = (style.padding_y * visual_scale).round();
-        let placements: SmallVec<[(usize, Rect); 128]> = self
+        let visible = self
             .hints
             .iter()
-            .enumerate()
-            .filter(|(_, hint)| self.hint_is_visible(hint))
-            .map(|(index, hint)| {
-                let rect = placed_hint_rect(&self.config, hint, &style);
-                (index, visual_layer_rect(rect, visual_scale))
-            })
-            .collect();
-        build_visual_layer_plan(
-            &placements,
-            self.hints.len(),
-            |left, right| visually_stacked(left, right, visual_padding_x, visual_padding_y),
-            &mut self.overlap_plan,
-        );
+            .filter(|hint| self.hint_is_visible(hint))
+            .count();
+        let stacked =
+            |left, right| visually_stacked(left, right, visual_padding_x, visual_padding_y);
+        if visible > 128 {
+            let mut placements = self.wide_placements.take().unwrap_or_default();
+            placements.clear();
+            placements.extend(
+                self.hints
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, hint)| self.hint_is_visible(hint))
+                    .map(|(index, hint)| {
+                        let rect = placed_hint_rect(&self.config, hint, &style);
+                        (index, visual_layer_rect(rect, visual_scale))
+                    }),
+            );
+            build_visual_layer_plan(
+                &placements,
+                self.hints.len(),
+                stacked,
+                &mut self.overlap_plan,
+            );
+            self.wide_placements = Some(placements);
+        } else {
+            let placements: SmallVec<[(usize, Rect); 128]> = self
+                .hints
+                .iter()
+                .enumerate()
+                .filter(|(_, hint)| self.hint_is_visible(hint))
+                .map(|(index, hint)| {
+                    let rect = placed_hint_rect(&self.config, hint, &style);
+                    (index, visual_layer_rect(rect, visual_scale))
+                })
+                .collect();
+            build_visual_layer_plan(
+                &placements,
+                self.hints.len(),
+                stacked,
+                &mut self.overlap_plan,
+            );
+        }
         if self.held_overlap_keys.is_empty() {
             self.overlap_cycle = 0;
         } else if self.overlap_plan.layer_count() > 1 {
@@ -487,7 +528,9 @@ impl HintMode {
 
     fn hint_is_visible(&self, hint: &CompactHint<usize>) -> bool {
         match &self.input {
-            Input::Labels(typed) => typed.is_empty() || hint.label.as_str().starts_with(typed),
+            Input::Labels(typed) => {
+                typed.is_empty() || hint.label.as_str().starts_with(typed.as_str())
+            }
             Input::Search(_) => true,
         }
     }
@@ -575,6 +618,7 @@ impl HintMode {
         if self.config.ui.matched_text_color.is_none() {
             label_style.matched_text_color = Color::rgb(0xE4, 0xB4, 0x00);
         }
+        let label_style = SharedLabelStyle::from(label_style);
 
         // Optional outlines behind only the currently visible candidates.
         if self.config.boundary_highlight.enabled {
@@ -599,27 +643,37 @@ impl HintMode {
         };
         let matched_prefix_len = typed.chars().count();
         let active_overlap_layer = self.active_overlap_layer();
-        // Every visual layer has a distinct z-index. The Engine performs one
-        // stable z sort before sharing the scene with either native backend,
-        // so Mode construction needs only this single traversal.
-        for (hint_index, hint) in self
-            .hints
-            .iter()
-            .enumerate()
-            .filter(|(_, hint)| self.hint_is_visible(hint))
-        {
-            let rect = placed_hint_rect(&self.config, hint, &label_style);
-            let z_index = active_overlap_layer
+        let z_for = |hint_index| {
+            active_overlap_layer
                 .and_then(|layer| self.overlap_plan.draw_rank(hint_index, layer))
                 .and_then(|rank| i32::try_from(rank).ok())
                 .map_or(HINT_LAYER_Z_BASE + 1, |rank| {
                     HINT_LAYER_Z_BASE.saturating_add(rank)
-                });
-            scene.push_label(
-                OverlayLabel::new(hint.label.as_str(), rect, label_style.clone())
-                    .with_matched_prefix(matched_prefix_len)
-                    .with_z_index(z_index),
-            );
+                })
+        };
+        // Emit final stable z order directly. Typical components are only
+        // 2..=5 layers, so a few allocation-free linear passes are cheaper
+        // than sorting and preserve equal-z source order exactly.
+        let final_z = HINT_LAYER_Z_BASE.saturating_add(
+            i32::try_from(self.overlap_plan.layer_count().max(1)).unwrap_or(i32::MAX),
+        );
+        for z_index in HINT_LAYER_Z_BASE..=final_z {
+            for (hint_index, hint) in self
+                .hints
+                .iter()
+                .enumerate()
+                .filter(|(_, hint)| self.hint_is_visible(hint))
+            {
+                if z_for(hint_index) != z_index {
+                    continue;
+                }
+                let rect = placed_hint_rect(&self.config, hint, &label_style);
+                scene.push_label(
+                    OverlayLabel::new(hint.label.as_str(), rect, label_style.clone())
+                        .with_matched_prefix(matched_prefix_len)
+                        .with_z_index(z_index),
+                );
+            }
         }
 
         // Search box, shown only while searching.
@@ -752,7 +806,7 @@ impl HintMode {
                 // Escape leaves search first, then the mode.
                 return match &self.input {
                     Input::Search(_) => {
-                        self.input = Input::Labels(String::new());
+                        self.input = Input::Labels(OverlayText::default());
                         self.relabel(ctx);
                         self.redraw(ctx)
                     }
@@ -770,7 +824,7 @@ impl HintMode {
                     // Nothing left to undo: leave search, or leave the mode.
                     return match &self.input {
                         Input::Search(_) => {
-                            self.input = Input::Labels(String::new());
+                            self.input = Input::Labels(OverlayText::default());
                             self.relabel(ctx);
                             self.redraw(ctx)
                         }
@@ -778,8 +832,11 @@ impl HintMode {
                     };
                 }
                 match &mut self.input {
-                    Input::Labels(s) | Input::Search(s) => {
-                        s.pop();
+                    Input::Labels(text) => {
+                        text.pop();
+                    }
+                    Input::Search(text) => {
+                        text.pop();
                     }
                 }
                 if matches!(self.input, Input::Search(_))
@@ -850,13 +907,14 @@ fn match_compact_input(hints: &[CompactHint<usize>], input: &str) -> Match<usize
             remaining: hints.len(),
         };
     }
-    if let Some(hit) = hints.iter().find(|hint| hint.label.as_str() == input) {
-        return Match::Complete(hit.value);
+    let mut remaining = 0usize;
+    for hint in hints {
+        let label = hint.label.as_str();
+        if label == input {
+            return Match::Complete(hint.value);
+        }
+        remaining += usize::from(label.starts_with(input));
     }
-    let remaining = hints
-        .iter()
-        .filter(|hint| hint.label.as_str().starts_with(input))
-        .count();
     if remaining == 0 {
         Match::None
     } else {
@@ -1014,7 +1072,7 @@ impl Mode for HintMode {
                 self.clear_scan_results(true);
                 self.scanning = false;
                 self.scan_bounds = None;
-                self.input = Input::Labels(String::new());
+                self.input = Input::Labels(OverlayText::default());
                 self.held_overlap_keys.clear();
                 self.overlap_cycle = 0;
                 self.retry_pending = false;
@@ -2165,7 +2223,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut expected_labels = completed_labels
             .iter()
-            .map(String::as_str)
+            .map(crate::api::overlay::OverlayText::as_str)
             .collect::<Vec<_>>();
         shifted_labels.sort_unstable();
         expected_labels.sort_unstable();

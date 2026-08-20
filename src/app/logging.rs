@@ -7,6 +7,8 @@
 use std::backtrace::Backtrace;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
+#[cfg(target_os = "macos")]
+use std::io::IsTerminal;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +22,7 @@ const RETAINED_LOGS: usize = 3;
 static LOGGER: OnceLock<Logger> = OnceLock::new();
 static PANIC_HOOK: Once = Once::new();
 static NON_ERROR_ENABLED: AtomicBool = AtomicBool::new(false);
+static SESSION_STARTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
@@ -193,28 +196,6 @@ pub fn init() -> Result<&'static Path, String> {
                             ),
                         );
                     }
-                    if level_enabled(Level::Info) {
-                        info(
-                            "session",
-                            format!(
-                                "session started version={} pid={} os={} arch={} profile={} backend={} executable={} log={}",
-                                env!("CARGO_PKG_VERSION"),
-                                std::process::id(),
-                                std::env::consts::OS,
-                                std::env::consts::ARCH,
-                                if cfg!(debug_assertions) {
-                                    "debug"
-                                } else {
-                                    "release"
-                                },
-                                crate::platform::backend_name(),
-                                std::env::current_exe()
-                                    .map(|value| value.display().to_string())
-                                    .unwrap_or_else(|error| format!("<unavailable: {error}>")),
-                                path.display()
-                            ),
-                        );
-                    }
                     return Ok(path);
                 }
                 return LOGGER
@@ -241,6 +222,45 @@ pub fn path() -> Option<&'static Path> {
 /// the value controls observability only and does not publish program state.
 pub fn set_non_error_enabled(enabled: bool) {
     NON_ERROR_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Start a diagnostic session after configuration has enabled non-error logs.
+pub(crate) fn start_session() {
+    if !level_enabled(Level::Info)
+        || LOGGER.get().is_none()
+        || SESSION_STARTED.swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+    let log_path = path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<unavailable>".into());
+    info(
+        "session",
+        format!(
+            "session started version={} pid={} os={} arch={} profile={} backend={} executable={} log={}",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id(),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+            crate::platform::backend_name(),
+            std::env::current_exe()
+                .map(|value| value.display().to_string())
+                .unwrap_or_else(|error| format!("<unavailable: {error}>")),
+            log_path,
+        ),
+    );
+}
+
+pub(crate) fn end_session() {
+    if SESSION_STARTED.swap(false, Ordering::AcqRel) {
+        info("session", "session ended normally");
+    }
 }
 
 /// Lazy variant used by callers that would otherwise build a formatted
@@ -284,6 +304,11 @@ pub(crate) fn report_error_args(target: &str, message: fmt::Arguments<'_>) {
 /// write stderr directly.
 pub(crate) fn emergency_console(message: impl fmt::Display) {
     write_emergency_stderr(format_args!("{message}"));
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn emergency_stderr_is_terminal() -> bool {
+    io::stderr().is_terminal()
 }
 
 /// Best-effort emergency output must never panic while reporting another

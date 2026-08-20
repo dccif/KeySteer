@@ -171,3 +171,16 @@ Retina 下快速重绘时文字基线出现单帧纵向抖动。
 新增 `src/platform/<os>/` 和 `platform/mod.rs` 的一个 cfg arm，实现 Backend。不要修改
 Mode 以适配平台。配置中的 platform-specific 字段仍应在所有目标可反序列化，这样同一
 TOML 可跨平台复用，但只有对应 Backend 消费它。
+# Input and readiness latency invariants
+
+- macOS synchronous CGEventTap input has a dedicated bounded lane. Menu,
+  update, and status events use an independent unbounded lane; poll priority is
+  hook, scan/pending, then async. AppKit pumping checks the hook on both sides,
+  and a non-frame run-loop wake returns to backend polling immediately.
+- macOS display reconfiguration callbacks use no userdata. Registration and
+  explicit removal return errors, eliminating ownership ambiguity and the old
+  callback-userdata lifetime risk.
+- Windows foreground/window callbacks set atomic failure flags. Logging occurs
+  later at the engine or renderer boundary, never inside the OS callback.
+- Readiness markers distinguish `hook_ready`, `uia_ready`, `ocr_ready`, and
+  `renderer_ready`; `backend_started` is not interactive readiness.

@@ -1,5 +1,11 @@
 # 更新日志 / Release Notes
 
+## 0.9.6
+
+UI Hint 针对常见的 129–256 个标签新增会话级复用工作区、精确的 X 轴扫描和二元重叠组快速路径，
+
+UI Hint now uses a reusable session workspace, an exact X-axis sweep, and a fast path for two-label overlap groups in the common 129–256-label range while preserving the inline path through 128 labels. 
+
 ## 0.9.5
 
 Windows UI Hint 现在扫描每轮提交时鼠标下的窗口组，窗口上下文变化会立即清除旧标签并重新定位，不占用失败重试次数；Hybrid 同时共享单份扫描计划，并在返回 Normal 或 Idle 时完整取消识别与释放本轮资源。

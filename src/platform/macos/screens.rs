@@ -1,7 +1,7 @@
 //! Display snapshots and event-driven reconfiguration notices.
 
 use std::ffi::c_void;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use core_graphics::base::kCGErrorSuccess;
 use core_graphics::display::{
@@ -14,46 +14,51 @@ use objc2_app_kit::NSScreen;
 use crate::api::geometry::{Rect, Screen};
 
 pub struct DisplayWatcher {
-    receiver: Receiver<()>,
-    sender: Box<Sender<()>>,
     registered: bool,
 }
 
+static DISPLAY_CHANGED: AtomicBool = AtomicBool::new(false);
+
 impl DisplayWatcher {
-    pub fn new() -> Self {
-        let (sender, receiver) = mpsc::channel();
-        let sender = Box::new(sender);
-        let user_info = (&*sender as *const Sender<()>).cast::<c_void>();
-        // SAFETY: the callback ABI matches and the boxed sender stays at a
-        // stable address until it is unregistered during Drop.
-        let registered = unsafe {
-            CGDisplayRegisterReconfigurationCallback(display_changed, user_info) == kCGErrorSuccess
-        };
-        Self {
-            receiver,
-            sender,
-            registered,
+    pub fn new() -> Result<Self, String> {
+        // SAFETY: the callback ABI matches CoreGraphics. It uses no userdata
+        // and only touches a process-lifetime atomic plus the main run loop.
+        let result =
+            unsafe { CGDisplayRegisterReconfigurationCallback(display_changed, std::ptr::null()) };
+        if result != kCGErrorSuccess {
+            return Err(format!(
+                "cannot register display reconfiguration callback: {result:?}"
+            ));
         }
+        Ok(Self { registered: true })
     }
 
     pub fn take_changed(&self) -> bool {
-        let mut changed = false;
-        while self.receiver.try_recv().is_ok() {
-            changed = true;
+        DISPLAY_CHANGED.swap(false, Ordering::AcqRel)
+    }
+
+    pub fn stop(&mut self) -> Result<(), String> {
+        if !self.registered {
+            return Ok(());
         }
-        changed
+        // SAFETY: this is the exact callback/null-userdata pair registered by
+        // `new`; the callback owns no dynamically freed state.
+        let result =
+            unsafe { CGDisplayRemoveReconfigurationCallback(display_changed, std::ptr::null()) };
+        if result != kCGErrorSuccess {
+            return Err(format!(
+                "cannot remove display reconfiguration callback: {result:?}"
+            ));
+        }
+        self.registered = false;
+        Ok(())
     }
 }
 
 impl Drop for DisplayWatcher {
     fn drop(&mut self) {
         if self.registered {
-            let user_info = (&*self.sender as *const Sender<()>).cast::<c_void>();
-            // SAFETY: this unregisters the exact callback/pointer pair while
-            // the boxed sender is still alive and stable.
-            unsafe {
-                CGDisplayRemoveReconfigurationCallback(display_changed, user_info);
-            }
+            let _ = self.stop();
         }
     }
 }
@@ -63,14 +68,9 @@ unsafe extern "C" fn display_changed(
     _flags: u32,
     user_info: *const c_void,
 ) {
-    if !user_info.is_null() {
-        // SAFETY: DisplayWatcher owns the boxed sender until after unregistering
-        // this callback during Drop.
-        let sender = unsafe { &*user_info.cast::<Sender<()>>() };
-        if sender.send(()).is_ok() {
-            super::workspace::wake_main_run_loop();
-        }
-    }
+    let _ = user_info;
+    DISPLAY_CHANGED.store(true, Ordering::Release);
+    super::workspace::wake_main_run_loop();
 }
 
 pub fn list_screens() -> Result<Vec<Screen>, String> {

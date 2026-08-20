@@ -8,7 +8,9 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use smallvec::SmallVec;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BLENDFUNCTION, CLIP_DEFAULT_PRECIS,
@@ -25,13 +27,19 @@ use windows::core::{PCWSTR, w};
 use crate::api::geometry::{Point, Rect};
 use crate::api::overlay::{
     Color, LabelStyle, LabelTextAnalysis, OverlayItems, OverlayLabel, OverlayScene, OverlayShape,
-    normalized_label_scale, scaled_label_geometry,
+    SharedLabelStyle, normalized_label_scale, scaled_label_geometry,
 };
 
 use super::native::{
     GdiDibSurface, NativeDimensions, OwnedWindow, OwnedWindowSpec, create_owned_window,
     reposition_owned_window,
 };
+
+static WINDOW_CALLBACK_FAILED: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn take_deferred_callback_error() -> bool {
+    WINDOW_CALLBACK_FAILED.swap(false, Ordering::AcqRel)
+}
 
 /// Renders scenes into layered click-through windows, one per monitor.
 pub struct Overlay {
@@ -338,10 +346,22 @@ fn scene_for_dpi(scene: &OverlayScene, scale: f64) -> Cow<'_, OverlayScene> {
 }
 
 fn scale_labels(labels: &mut OverlayItems<OverlayLabel>, scale: f64) {
+    let mut styles: SmallVec<[(usize, u64, SharedLabelStyle); 8]> = SmallVec::new();
     for label in labels {
         let (rect, effective) = scaled_label_geometry(&label.text, label.rect, &label.style, scale);
         label.rect = rect;
-        scale_style(&mut label.style, effective);
+        let key = (label.style.identity(), effective.to_bits());
+        if let Some((_, _, style)) = styles
+            .iter()
+            .find(|(identity, bits, _)| *identity == key.0 && *bits == key.1)
+        {
+            label.style = style.clone();
+        } else {
+            let mut style = label.style.clone();
+            scale_style(style.make_mut(), effective);
+            styles.push((key.0, key.1, style.clone()));
+            label.style = style;
+        }
     }
 }
 
@@ -1176,10 +1196,7 @@ extern "system" fn window_proc(
             // SAFETY: `hwnd` and the paint region were supplied by Windows for
             // this callback; no Rust pointer is retained.
             if !unsafe { ValidateRect(Some(hwnd), None) }.as_bool() {
-                crate::app::logging::report_error(
-                    "windows-overlay",
-                    "ValidateRect failed for overlay window",
-                );
+                WINDOW_CALLBACK_FAILED.store(true, Ordering::Release);
             }
             LRESULT(0)
         }

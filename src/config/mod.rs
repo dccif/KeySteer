@@ -372,9 +372,21 @@ fn default_idle_bindings() -> Bindings {
         // Idle remains silent until this single portable launcher is pressed.
         ("primary+e", "normal"),
     ];
+    builtin_bindings(entries)
+}
+
+fn builtin_bindings(entries: &[(&str, &str)]) -> Bindings {
     entries
         .iter()
-        .filter_map(|(chord, binding)| Some((chord.to_string(), Binding::parse(binding).ok()?)))
+        .map(|&(chord, binding)| {
+            let parsed = match Binding::parse(binding) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    panic!("invalid built-in binding `{binding}` for chord `{chord}`: {error}")
+                }
+            };
+            (chord.to_owned(), parsed)
+        })
         .collect()
 }
 
@@ -691,10 +703,7 @@ fn default_normal_bindings() -> Bindings {
         ("q", "idle"),
         ("esc", "idle"),
     ];
-    entries
-        .iter()
-        .filter_map(|(chord, binding)| Some((chord.to_string(), Binding::parse(binding).ok()?)))
-        .collect()
+    builtin_bindings(entries)
 }
 
 // ---------------------------------------------------------------------------
@@ -1201,6 +1210,7 @@ pub enum ConfigError {
     Io(String),
     Parse(String),
     Invalid(String),
+    Serialize(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -1209,6 +1219,7 @@ impl std::fmt::Display for ConfigError {
             ConfigError::Io(s) => write!(f, "{s}"),
             ConfigError::Parse(s) => write!(f, "invalid TOML: {s}"),
             ConfigError::Invalid(s) => write!(f, "invalid configuration: {s}"),
+            ConfigError::Serialize(s) => write!(f, "cannot serialize configuration: {s}"),
         }
     }
 }
@@ -1387,24 +1398,39 @@ impl Config {
     /// Portable configs are named `keysteer.<name>.toml`. User profiles sort
     /// by name; the annotated `keysteer.default.toml` example is considered
     /// only when no user profile exists.
-    pub fn discover() -> Option<PathBuf> {
-        let directory = crate::app::paths::data_dir()?;
+    pub fn discover() -> Result<Option<PathBuf>, ConfigError> {
+        let Some(directory) = crate::app::paths::data_dir() else {
+            return Ok(None);
+        };
         Self::discover_in(&directory)
     }
 
-    pub(crate) fn discover_in(directory: &Path) -> Option<PathBuf> {
-        let mut matches = std::fs::read_dir(directory)
-            .ok()?
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                if !entry.file_type().ok()?.is_file()
-                    || !Self::is_portable_config_name(&entry.file_name())
-                {
-                    return None;
-                }
-                Some(entry.path())
-            })
-            .collect::<Vec<_>>();
+    pub(crate) fn discover_in(directory: &Path) -> Result<Option<PathBuf>, ConfigError> {
+        let entries = match std::fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(ConfigError::Io(format!(
+                    "cannot enumerate {}: {error}",
+                    directory.display()
+                )));
+            }
+        };
+        let mut matches = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                ConfigError::Io(format!("cannot enumerate {}: {error}", directory.display()))
+            })?;
+            let file_type = entry.file_type().map_err(|error| {
+                ConfigError::Io(format!(
+                    "cannot inspect {}: {error}",
+                    entry.path().display()
+                ))
+            })?;
+            if file_type.is_file() && Self::is_portable_config_name(&entry.file_name()) {
+                matches.push(entry.path());
+            }
+        }
         matches.sort_by(|left, right| {
             let left_name = left
                 .file_name()
@@ -1423,7 +1449,7 @@ impl Config {
                 .then_with(|| left_name.cmp(&right_name))
                 .then_with(|| left.cmp(right))
         });
-        matches.into_iter().next()
+        Ok(matches.into_iter().next())
     }
 
     pub(crate) fn is_portable_config_name(name: &std::ffi::OsStr) -> bool {
@@ -1543,7 +1569,7 @@ impl Config {
         &self.resolved_key_aliases
     }
 
-    pub fn to_toml(&self) -> String {
+    pub fn to_toml(&self) -> Result<String, ConfigError> {
         // Export only the new platform hierarchy. A legacy value is projected
         // into it so dumping and reloading a migrated configuration preserves
         // behavior without perpetuating the deprecated field.
@@ -1564,7 +1590,7 @@ impl Config {
         }
         exported.platform.macos.scroll.invert = None;
         exported.scroll.invert_scroll = None;
-        toml::to_string_pretty(&exported).unwrap_or_else(|e| format!("# serialization failed: {e}"))
+        toml::to_string_pretty(&exported).map_err(|error| ConfigError::Serialize(error.to_string()))
     }
 
     /// Effective macOS values, with explicit per-axis settings taking priority.
@@ -1793,10 +1819,30 @@ impl Config {
             }
         }
 
-        if self.ui_hint.enabled && self.ui_hint.hint_characters.chars().count() < 2 {
-            return Err(bad(
-                "ui_hint.hint_characters needs at least 2 characters".into()
-            ));
+        if self.ui_hint.enabled {
+            if self.ui_hint.hint_characters.chars().count() < 2 {
+                return Err(bad(
+                    "ui_hint.hint_characters needs at least 2 characters".into()
+                ));
+            }
+            let mut canonical = BTreeSet::new();
+            for character in self.ui_hint.hint_characters.chars() {
+                let key = Key::new(character.to_string()).map_err(|error| {
+                    bad(format!(
+                        "ui_hint.hint_characters contains an invalid key: {error}"
+                    ))
+                })?;
+                let Some(character) = key.as_char() else {
+                    return Err(bad(format!(
+                        "ui_hint.hint_characters contains non-character key `{character}`"
+                    )));
+                };
+                if !canonical.insert(character) {
+                    return Err(bad(format!(
+                        "ui_hint.hint_characters contains duplicate canonical key `{character}`"
+                    )));
+                }
+            }
         }
         if !(250..=30_000).contains(&self.ui_hint.scan_timeout_ms) {
             return Err(bad("ui_hint.scan_timeout_ms must be 250..=30000".into()));
@@ -2224,14 +2270,14 @@ mod tests {
         }
 
         assert_eq!(
-            Config::discover_in(&directory),
+            Config::discover_in(&directory).unwrap(),
             Some(directory.join("keysteer.Alpha.toml"))
         );
 
         std::fs::remove_file(directory.join("keysteer.Alpha.toml")).unwrap();
         std::fs::remove_file(directory.join("keysteer.zebra.toml")).unwrap();
         assert_eq!(
-            Config::discover_in(&directory),
+            Config::discover_in(&directory).unwrap(),
             Some(directory.join("KEYSTEER.DEFAULT.TOML")),
             "the annotated default should remain a fallback when no user profile exists"
         );
@@ -2330,7 +2376,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let reparsed = Config::parse(&config.to_toml()).unwrap();
+        let reparsed = Config::parse(&config.to_toml().unwrap()).unwrap();
 
         assert_eq!(reparsed.key_aliases, config.key_aliases);
         assert_eq!(
@@ -2402,7 +2448,12 @@ mod tests {
 
         let config = Config::parse("[pointer]\nsmooth_acceleration = false").unwrap();
         assert!(!config.pointer.smooth_acceleration);
-        assert!(config.to_toml().contains("smooth_acceleration = false"));
+        assert!(
+            config
+                .to_toml()
+                .unwrap()
+                .contains("smooth_acceleration = false")
+        );
     }
 
     #[test]
@@ -2491,7 +2542,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let exported = config.to_toml();
+        let exported = config.to_toml().unwrap();
         assert!(!exported.contains("invert ="), "{exported}");
         let reparsed = Config::parse(&exported).unwrap();
         assert_eq!(reparsed.platform.macos.scroll.invert_horizontal, Some(true));
@@ -3252,7 +3303,7 @@ mod tests {
     #[test]
     fn round_trips_through_toml() {
         let config = Config::default();
-        let reparsed = Config::parse(&config.to_toml()).unwrap();
+        let reparsed = Config::parse(&config.to_toml().unwrap()).unwrap();
         assert_eq!(config, reparsed);
     }
 

@@ -168,6 +168,7 @@ impl Engine {
                             error,
                         ));
                     }
+                    crate::app::perf_probe::mark("injection_executed");
                     self.recoverable_input_succeeded();
                     if matches!(action, ButtonAction::Click | ButtonAction::DoubleClick) {
                         self.dispatch(ModeEvent::Clicked { button, action }, backend)?;
@@ -210,6 +211,7 @@ impl Engine {
                     if let Err(error) = backend.send_key(&key, state) {
                         return Err(self.recoverable_input_error("keyboard input", error));
                     }
+                    crate::app::perf_probe::mark("injection_executed");
                     self.recoverable_input_succeeded();
                 }
                 Command::SendChord { keys } => {
@@ -217,6 +219,7 @@ impl Engine {
                         self.latched.extend(keys.into_iter().map(InputTarget::Key));
                         return Err(self.recoverable_input_error("keyboard chord", error));
                     }
+                    crate::app::perf_probe::mark("injection_executed");
                     self.recoverable_input_succeeded();
                 }
 
@@ -236,6 +239,10 @@ impl Engine {
                         ..request
                     };
                     let request_id = request.id;
+                    crate::app::perf_probe::mark_value(
+                        "scan_requested",
+                        isize::try_from(request_id).unwrap_or(isize::MAX),
+                    );
                     // A mode can only consume its latest scan generation.
                     // Cancel the superseded native job before publishing the
                     // new owner so providers cannot retain stale work.

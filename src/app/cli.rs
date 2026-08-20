@@ -39,7 +39,7 @@ pub fn run_cli() -> ExitCode {
     super::logging::install_panic_hook();
     match parse_args().and_then(|args| args.map_or(Ok(()), super::bootstrap::run)) {
         Ok(()) => {
-            crate::log_info!("session", "session ended normally");
+            super::logging::end_session();
             super::logging::flush();
             ExitCode::SUCCESS
         }

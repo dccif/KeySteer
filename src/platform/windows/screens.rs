@@ -1,6 +1,7 @@
 //! Display enumeration via `EnumDisplayMonitors`, DPI-aware.
 
 use std::cell::RefCell;
+use std::sync::OnceLock;
 
 use windows::Win32::Foundation::{LPARAM, RECT, TRUE};
 use windows::Win32::Graphics::Gdi::{
@@ -20,12 +21,16 @@ use crate::api::geometry::{Rect, Screen};
 ///
 /// Without this, Windows lies about coordinates on scaled displays and every
 /// overlay lands in the wrong place. Must run before any window is created.
-pub fn enable_dpi_awareness() {
-    // SAFETY: no arguments to validate; failure only means the process was
-    // already marked aware, which is fine.
-    unsafe {
-        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    }
+pub fn enable_dpi_awareness() -> Result<(), String> {
+    static RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+    RESULT.get_or_init(enable_dpi_awareness_once).clone()
+}
+
+fn enable_dpi_awareness_once() -> Result<(), String> {
+    // SAFETY: the process context constant is valid and this is called before
+    // KeySteer creates native windows.
+    unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
+        .map_err(|error| format!("SetProcessDpiAwarenessContext failed: {error}"))
 }
 
 fn rect_to_api(r: RECT) -> Rect {

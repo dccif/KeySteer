@@ -152,7 +152,7 @@ impl WindowsBackend {
     ) -> Result<Self, String> {
         // Must happen before any window exists, or coordinates will be wrong
         // on scaled displays.
-        screens::enable_dpi_awareness();
+        screens::enable_dpi_awareness()?;
         // Must precede creation of the DXGI overlay and the first VBlank wait.
         // On Windows 11 this exposes real dynamic-refresh cadence; older
         // systems keep DXGI's compatible virtualized cadence.
@@ -457,6 +457,16 @@ impl WindowsBackend {
     }
 
     fn take_native_change(&mut self) -> Option<BackendEvent> {
+        if self
+            .foreground_watcher
+            .as_ref()
+            .is_some_and(system_events::ForegroundWatcher::take_wake_failure)
+        {
+            crate::app::logging::report_error(
+                "windows-events",
+                "cannot wake engine for a foreground change",
+            );
+        }
         let focus_changed = self
             .foreground_watcher
             .as_ref()

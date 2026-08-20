@@ -437,12 +437,19 @@ fn render_loop(shared: &Shared, events: &EventSender, ready: SyncSender<u32>) {
         return;
     }
     let (mut renderer, startup_notice) = AdaptiveRenderer::new();
+    crate::app::perf_probe::mark("renderer_ready");
     let mut dpi_cache = overlay::DpiSceneCache::default();
     if let Some(notice) = startup_notice {
         warn(events, notice);
     }
     let mut scale = 1.0;
     loop {
+        if overlay::take_deferred_callback_error() {
+            crate::app::logging::report_error(
+                "windows-overlay",
+                "ValidateRect failed for an overlay window",
+            );
+        }
         let (control, frame, positions) = {
             let mut state = shared
                 .state

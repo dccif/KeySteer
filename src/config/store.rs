@@ -34,7 +34,7 @@ impl ConfigStore {
             std::fs::read_to_string(&path)
                 .map_err(|e| ConfigError::Io(format!("cannot read {}: {e}", path.display())))?
         } else {
-            fallback.to_toml()
+            fallback.to_toml()?
         };
         Config::parse(&text)?;
         Ok(Self::from_validated_text(path, text))
@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn document_ast_is_lazy_and_reload_returns_to_raw_source() {
         let path = std::env::temp_dir().join(test_file_name("keysteer-lazy-store"));
-        std::fs::write(&path, Config::default().to_toml()).unwrap();
+        std::fs::write(&path, Config::default().to_toml().unwrap()).unwrap();
         let mut store = ConfigStore::open(&path, &Config::default()).unwrap();
         assert!(matches!(store.source, StoreSource::Raw(_)));
         store.set("pointer.initial_speed", "11").unwrap();

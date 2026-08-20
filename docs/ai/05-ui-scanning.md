@@ -164,3 +164,14 @@ Vision：`src/platform/macos/vision.rs` + `vision_bridge.m`。
 - retry 只属于 HintMode 生命周期，Backend 不应自行无限重试。
 - Windows 鼠标目标、焦点或显示器变化必须使旧结果失效并立即重定向；无目标时不得启动 provider、隐藏 overlay 或截图。
 - 过滤应尽可能下推 provider，但必须保留失败后的安全 fallback。
+# Performance invariants added for 256-target Hint/OCR workloads
+
+- `128` remains the zero-allocation inline Hint layer boundary. Active sessions
+  lazily retain a reusable dynamic workspace for `129..=256`; deactivation
+  releases it, and larger scans retain a safe dynamic fallback.
+- Wide conflict construction uses an exact X sweep and the original overlap
+  predicate; invalid/non-finite rectangles use the quadratic reference path.
+- Windows system OCR constructs a tile only after acquiring a credit. The
+  default is `min(tile_count, available_parallelism, 8)`; completion closes the
+  bitmap before returning the credit. WinRT callbacks publish atomic terminal
+  state and use a coalesced non-blocking wake.

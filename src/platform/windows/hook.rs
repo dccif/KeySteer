@@ -540,6 +540,7 @@ fn hook_thread(
         HOOK_THREAD.store(0, Ordering::Release);
         return;
     }
+    crate::app::perf_probe::mark("hook_ready");
 
     let mut message = MSG::default();
     loop {
@@ -793,6 +794,12 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         injected: false,
         timestamp_millis: info.time as u64,
     });
+    let correlation_id = crate::app::perf_probe::next_correlation_id();
+    crate::app::perf_probe::mark_correlated_value(
+        "hook_received",
+        correlation_id,
+        info.vkCode as isize,
+    );
     let disposition = if let Some((mailbox, generation)) = begin_disposition(event) {
         match mailbox.wait(generation, Duration::from_millis(100)) {
             Some(disposition) => disposition,
@@ -804,6 +811,7 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     } else {
         KeyDisposition::Forward
     };
+    crate::app::perf_probe::mark_correlated("disposition_returned", correlation_id);
     let virtual_key = info.vkCode as u16;
     let mask_menu = FORWARDED_ALT.with(|alt| {
         let mut alt_state = alt.get();

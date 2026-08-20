@@ -4,7 +4,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -32,6 +32,7 @@ const PROVIDER_BATCH_SIZE: usize = 24;
 const MAX_OCR_TARGETS: usize = 2_000;
 const MIN_SYSTEM_OCR_TILE_SIDE: u32 = 64;
 const SYSTEM_OCR_TILE_OVERLAP: u32 = 64;
+const MAX_SYSTEM_OCR_IN_FLIGHT: usize = 8;
 
 #[derive(Debug)]
 enum VisionError {
@@ -698,9 +699,40 @@ struct SystemOcrTile {
 enum SystemOcrInput {
     Begin { tile_count: usize },
     Tile(SystemOcrTile),
-    Completed { index: usize, status: AsyncStatus },
+    CompletionWake,
     Failed(String),
     Done,
+}
+
+struct SystemOcrSubmission {
+    sender: mpsc::SyncSender<SystemOcrInput>,
+    credits: mpsc::Receiver<()>,
+    max_in_flight: usize,
+}
+
+struct SystemOcrCompletion(AtomicU8);
+
+impl SystemOcrCompletion {
+    fn pending() -> Self {
+        Self(AtomicU8::new(0))
+    }
+    fn publish(&self, status: AsyncStatus) {
+        let value = match status {
+            AsyncStatus::Completed => 1,
+            AsyncStatus::Canceled => 2,
+            AsyncStatus::Error => 3,
+            _ => 4,
+        };
+        self.0.store(value, Ordering::Release);
+    }
+    fn take(&self) -> Option<AsyncStatus> {
+        match self.0.swap(0, Ordering::AcqRel) {
+            0 => None,
+            1 => Some(AsyncStatus::Completed),
+            2 => Some(AsyncStatus::Canceled),
+            _ => Some(AsyncStatus::Error),
+        }
+    }
 }
 
 struct SharedSoftwareBitmap {
@@ -793,9 +825,10 @@ fn run_scan_inner(
     let mut pending_ocr = 0usize;
     if let Some(descriptor) = system_descriptor {
         let tile_count = system_ocr_tile_count(geometry);
-        let (image_tx, image_rx) =
-            mpsc::sync_channel(tile_count.saturating_mul(2).saturating_add(2));
+        let max_in_flight = system_ocr_concurrency(tile_count);
+        let (image_tx, image_rx) = mpsc::sync_channel(max_in_flight.saturating_add(2));
         let completion_tx = image_tx.clone();
+        let (credit_tx, credit_rx) = mpsc::channel();
         let result_tx = tx.clone();
         let provider_cancellation = cancellation.clone();
         if providers.spawn("keysteer-system-ocr", move || {
@@ -808,6 +841,7 @@ fn run_scan_inner(
                 descriptor,
                 image_rx,
                 completion_tx,
+                credit_tx,
                 deadline,
                 &provider_cancellation,
                 &result_tx,
@@ -820,7 +854,11 @@ fn run_scan_inner(
             });
             crate::app::perf_probe::mark("system_ocr_finished");
         }) {
-            system_input = Some(image_tx);
+            system_input = Some(SystemOcrSubmission {
+                sender: image_tx,
+                credits: credit_rx,
+                max_in_flight,
+            });
             pending_ocr += 1;
         }
     }
@@ -953,7 +991,7 @@ fn run_scan_inner(
                 if let Some(factory) = bitmap_factory.as_ref() {
                     if let Err(error) =
                         stream_system_ocr_tiles(pixels, geometry, factory, &input, |index| {
-                            if index == 0 && wechat_input.is_some() {
+                            if index == Some(0) && wechat_input.is_some() {
                                 submit_wechat_full_frame(
                                     &mut wechat_input,
                                     pixels,
@@ -976,16 +1014,16 @@ fn run_scan_inner(
                             Ok(())
                         })
                     {
-                        let _ = input.send(SystemOcrInput::Failed(error));
-                        let _ = input.send(SystemOcrInput::Done);
+                        let _ = input.sender.send(SystemOcrInput::Failed(error));
+                        let _ = input.sender.send(SystemOcrInput::Done);
                     }
                 } else {
-                    let _ = input.send(SystemOcrInput::Failed(
+                    let _ = input.sender.send(SystemOcrInput::Failed(
                         bitmap_factory_error.clone().unwrap_or_else(|| {
                             "cannot create the COM apartment for system OCR tiles".into()
                         }),
                     ));
-                    let _ = input.send(SystemOcrInput::Done);
+                    let _ = input.sender.send(SystemOcrInput::Done);
                 }
             }
             if wechat_input.is_some() {
@@ -1216,10 +1254,12 @@ fn wait_provider_image(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn recognize_system_provider(
     descriptor: SystemOcrDescriptor,
     receiver: mpsc::Receiver<SystemOcrInput>,
     completion_sender: mpsc::SyncSender<SystemOcrInput>,
+    credit_sender: mpsc::Sender<()>,
     deadline: Instant,
     cancellation: &ScanCancellation,
     result_tx: &mpsc::SyncSender<ProviderEvent>,
@@ -1284,6 +1324,7 @@ fn recognize_system_provider(
                     if let Err(error) = tile.bitmap.close() {
                         cleanup_failures.push(error);
                     }
+                    let _ = credit_sender.send(());
                     continue;
                 }
                 let index = active.len();
@@ -1292,6 +1333,7 @@ fn recognize_system_provider(
                         cleanup_failures.push(error);
                     }
                     active.push(None);
+                    let _ = credit_sender.send(());
                     continue;
                 }
                 if tile.geometry.width > descriptor.maximum_dimension
@@ -1305,6 +1347,7 @@ fn recognize_system_provider(
                         cleanup_failures.push(error);
                     }
                     active.push(None);
+                    let _ = credit_sender.send(());
                     continue;
                 }
                 let engine = match first_engine
@@ -1318,10 +1361,11 @@ fn recognize_system_provider(
                             cleanup_failures.push(error);
                         }
                         active.push(None);
+                        let _ = credit_sender.send(());
                         continue;
                     }
                 };
-                let operation = match tile.bitmap.bitmap().and_then(|bitmap| {
+                let (operation, completion) = match tile.bitmap.bitmap().and_then(|bitmap| {
                     OcrOperationGuard::start_notified(
                         &engine,
                         bitmap,
@@ -1337,43 +1381,32 @@ fn recognize_system_provider(
                             cleanup_failures.push(error);
                         }
                         active.push(None);
+                        let _ = credit_sender.send(());
                         continue;
                     }
                 };
                 active.push(Some(ActiveSystemOcrTile {
                     _engine: engine,
                     operation,
+                    completion,
                     tile,
                 }));
                 pending += 1;
             }
-            SystemOcrInput::Completed { index, status } => {
-                if let Err(error) = complete_system_tile(
-                    (index, status),
-                    &mut active,
-                    &mut pending,
-                    &mut accepted,
-                    result_tx,
-                    started,
-                    &mut operational_failures,
-                    &mut cleanup_failures,
-                ) {
-                    cancel_active_system_tiles(
-                        &mut active,
-                        &receiver,
-                        deadline,
-                        &mut cleanup_failures,
-                    );
-                    return if cleanup_failures.is_empty() {
-                        Err(error)
-                    } else {
-                        Err(VisionError::Cleanup(cleanup_failures.join("; ")))
-                    };
-                }
-            }
+            SystemOcrInput::CompletionWake => {}
             SystemOcrInput::Failed(error) => operational_failures.push(error),
             SystemOcrInput::Done => break,
         }
+        drain_completed_system_tiles(
+            &mut active,
+            &mut pending,
+            &mut accepted,
+            result_tx,
+            started,
+            &credit_sender,
+            &mut operational_failures,
+            &mut cleanup_failures,
+        )?;
     }
     drop(first_engine);
     if let Some(expected) = expected_tiles
@@ -1386,20 +1419,31 @@ fn recognize_system_provider(
     }
 
     while pending != 0 && accepted < MAX_OCR_TARGETS {
+        drain_completed_system_tiles(
+            &mut active,
+            &mut pending,
+            &mut accepted,
+            result_tx,
+            started,
+            &credit_sender,
+            &mut operational_failures,
+            &mut cleanup_failures,
+        )?;
+        if pending == 0 || accepted >= MAX_OCR_TARGETS {
+            break;
+        }
         if cancellation.is_cancelled() || Instant::now() >= deadline {
             break;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         let completion = receiver.recv_timeout(remaining);
-        let (index, status) = match completion {
-            Ok(SystemOcrInput::Completed { index, status }) => (index, status),
+        match completion {
+            Ok(SystemOcrInput::CompletionWake) => {}
             Ok(SystemOcrInput::Failed(error)) => {
                 operational_failures.push(error);
-                continue;
             }
             Ok(SystemOcrInput::Begin { .. } | SystemOcrInput::Tile(_) | SystemOcrInput::Done) => {
                 operational_failures.push("system OCR received input after tile stream end".into());
-                continue;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => break,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1407,23 +1451,6 @@ fn recognize_system_provider(
                 break;
             }
         };
-        if let Err(error) = complete_system_tile(
-            (index, status),
-            &mut active,
-            &mut pending,
-            &mut accepted,
-            result_tx,
-            started,
-            &mut operational_failures,
-            &mut cleanup_failures,
-        ) {
-            cancel_active_system_tiles(&mut active, &receiver, deadline, &mut cleanup_failures);
-            return if cleanup_failures.is_empty() {
-                Err(error)
-            } else {
-                Err(VisionError::Cleanup(cleanup_failures.join("; ")))
-            };
-        }
     }
     cancel_active_system_tiles(&mut active, &receiver, deadline, &mut cleanup_failures);
     if !cleanup_failures.is_empty() {
@@ -1442,7 +1469,41 @@ fn recognize_system_provider(
 struct ActiveSystemOcrTile {
     _engine: OcrEngine,
     operation: OcrOperationGuard,
+    completion: Arc<SystemOcrCompletion>,
     tile: SystemOcrTile,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_completed_system_tiles(
+    active: &mut [Option<ActiveSystemOcrTile>],
+    pending: &mut usize,
+    accepted: &mut usize,
+    result_tx: &mpsc::SyncSender<ProviderEvent>,
+    started: Instant,
+    credit_sender: &mpsc::Sender<()>,
+    operational_failures: &mut Vec<String>,
+    cleanup_failures: &mut Vec<String>,
+) -> Result<(), VisionError> {
+    for index in 0..active.len() {
+        let Some(status) = active[index]
+            .as_ref()
+            .and_then(|tile| tile.completion.take())
+        else {
+            continue;
+        };
+        complete_system_tile(
+            (index, status),
+            active,
+            pending,
+            accepted,
+            result_tx,
+            started,
+            credit_sender,
+            operational_failures,
+            cleanup_failures,
+        )?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1453,6 +1514,7 @@ fn complete_system_tile(
     accepted: &mut usize,
     result_tx: &mpsc::SyncSender<ProviderEvent>,
     started: Instant,
+    credit_sender: &mpsc::Sender<()>,
     operational_failures: &mut Vec<String>,
     cleanup_failures: &mut Vec<String>,
 ) -> Result<(), VisionError> {
@@ -1469,6 +1531,7 @@ fn complete_system_tile(
         return Ok(());
     };
     *pending = pending.saturating_sub(1);
+    let mut fatal = None;
     match completed.operation.complete(status) {
         Ok(result) => match stream_system_targets_from_result(
             &result,
@@ -1480,14 +1543,15 @@ fn complete_system_tile(
         ) {
             Ok(count) => *accepted += count,
             Err(VisionError::Operational(error)) => operational_failures.push(error),
-            Err(error) => return Err(error),
+            Err(error) => fatal = Some(error),
         },
         Err(error) => operational_failures.push(format!("system OCR tile {index}: {error}")),
     }
     if let Err(error) = completed.tile.bitmap.close() {
         cleanup_failures.push(error);
     }
-    Ok(())
+    let _ = credit_sender.send(());
+    fatal.map_or(Ok(()), Err)
 }
 
 fn cancel_active_system_tiles(
@@ -1504,6 +1568,29 @@ fn cancel_active_system_tiles(
         }
     }
     while remaining != 0 {
+        for slot in active.iter_mut() {
+            let Some(status) = slot.as_ref().and_then(|tile| tile.completion.take()) else {
+                continue;
+            };
+            let Some(mut tile) = slot.take() else {
+                continue;
+            };
+            remaining = remaining.saturating_sub(1);
+            let close = if status == AsyncStatus::Completed {
+                tile.operation.complete(status).map(drop)
+            } else {
+                tile.operation.close_terminal()
+            };
+            if let Err(error) = close {
+                cleanup_failures.push(error);
+            }
+            if let Err(error) = tile.tile.bitmap.close() {
+                cleanup_failures.push(error);
+            }
+        }
+        if remaining == 0 {
+            break;
+        }
         let remaining_time = deadline.saturating_duration_since(Instant::now());
         if remaining_time.is_zero() {
             cleanup_failures.push(format!(
@@ -1511,11 +1598,8 @@ fn cancel_active_system_tiles(
             ));
             break;
         }
-        let completion = completions
-            .recv_timeout(remaining_time)
-            .map_err(|error| error.to_string());
-        let (index, status) = match completion {
-            Ok(SystemOcrInput::Completed { index, status }) => (index, status),
+        match completions.recv_timeout(remaining_time) {
+            Ok(SystemOcrInput::CompletionWake) => {}
             Ok(_) => continue,
             Err(error) => {
                 cleanup_failures.push(format!(
@@ -1523,28 +1607,6 @@ fn cancel_active_system_tiles(
                 ));
                 break;
             }
-        };
-        if status == AsyncStatus::Started {
-            cleanup_failures.push(format!(
-                "system OCR cancellation callback {index} reported Started"
-            ));
-            continue;
-        }
-        let Some(slot) = active.get_mut(index) else {
-            cleanup_failures.push(format!(
-                "system OCR cancellation returned invalid tile index {index}"
-            ));
-            continue;
-        };
-        let Some(mut tile) = slot.take() else {
-            continue;
-        };
-        remaining = remaining.saturating_sub(1);
-        if let Err(error) = tile.operation.close_terminal() {
-            cleanup_failures.push(error);
-        }
-        if let Err(error) = tile.tile.bitmap.close() {
-            cleanup_failures.push(error);
         }
     }
 }
@@ -1773,6 +1835,29 @@ fn system_ocr_tile_count(geometry: CaptureGeometry) -> usize {
     grid.saturating_mul(grid)
 }
 
+fn system_ocr_concurrency(tile_count: usize) -> usize {
+    let parallelism = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(MAX_SYSTEM_OCR_IN_FLIGHT);
+    #[cfg(feature = "perf-probe")]
+    if let Some(value) = std::env::var_os("KEYSTEER_OCR_IN_FLIGHT") {
+        let value = value.to_string_lossy();
+        if value.eq_ignore_ascii_case("unbounded") {
+            return tile_count.max(1);
+        }
+        if let Ok(limit) = value.parse::<usize>() {
+            return tile_count.min(limit.max(1)).max(1);
+        }
+    }
+    system_ocr_concurrency_for(tile_count, parallelism)
+}
+
+fn system_ocr_concurrency_for(tile_count: usize, parallelism: usize) -> usize {
+    tile_count
+        .min(parallelism.max(1))
+        .clamp(1, MAX_SYSTEM_OCR_IN_FLIGHT)
+}
+
 fn scaled_partition(value: u32, index: u32, divisions: u32) -> u32 {
     ((u64::from(value) * u64::from(index)) / u64::from(divisions)) as u32
 }
@@ -1889,8 +1974,8 @@ fn stream_system_ocr_tiles(
     pixels: &[u8],
     geometry: CaptureGeometry,
     factory: &super::native::SoftwareBitmapFactory,
-    sender: &mpsc::SyncSender<SystemOcrInput>,
-    mut after_tile: impl FnMut(usize) -> Result<(), String>,
+    submission: &SystemOcrSubmission,
+    mut progress: impl FnMut(Option<usize>) -> Result<(), String>,
 ) -> Result<(), String> {
     let expected = geometry.width as usize * geometry.height as usize * 4;
     if pixels.len() != expected {
@@ -1900,12 +1985,25 @@ fn stream_system_ocr_tiles(
     let tile_count = (grid as usize)
         .checked_mul(grid as usize)
         .ok_or_else(|| "system OCR tile count overflowed".to_string())?;
-    if sender.send(SystemOcrInput::Begin { tile_count }).is_err() {
+    if submission
+        .sender
+        .send(SystemOcrInput::Begin { tile_count })
+        .is_err()
+    {
         return Ok(());
     }
     let mut index = 0usize;
+    let mut in_flight = 0usize;
     for row in 0..grid {
         for column in 0..grid {
+            while in_flight == submission.max_in_flight {
+                progress(None)?;
+                match submission.credits.recv_timeout(Duration::from_millis(2)) {
+                    Ok(()) => in_flight = in_flight.saturating_sub(1),
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                }
+            }
             let core_x = scaled_partition(geometry.width, column, grid);
             let core_right = scaled_partition(geometry.width, column + 1, grid);
             let core_y = scaled_partition(geometry.height, row, grid);
@@ -1919,14 +2017,15 @@ fn stream_system_ocr_tiles(
                 core_right,
                 core_bottom,
             )?;
-            if sender.send(SystemOcrInput::Tile(tile)).is_err() {
+            if submission.sender.send(SystemOcrInput::Tile(tile)).is_err() {
                 return Ok(());
             }
-            after_tile(index)?;
+            in_flight += 1;
+            progress(Some(index))?;
             index += 1;
         }
     }
-    let _ = sender.send(SystemOcrInput::Done);
+    let _ = submission.sender.send(SystemOcrInput::Done);
     Ok(())
 }
 
@@ -2021,6 +2120,7 @@ fn discover_ocr(shared: Arc<DiscoveryShared>) {
     };
     shared.completed.store(true, Ordering::Release);
     shared.ready.notify_all();
+    crate::app::perf_probe::mark("ocr_ready");
 }
 
 fn probe_ocr(cancelled: impl Fn() -> bool + Copy) -> Option<OcrDiscoverySnapshot> {
@@ -2194,9 +2294,9 @@ impl OcrOperationGuard {
     fn start_notified(
         engine: &OcrEngine,
         bitmap: &windows::Graphics::Imaging::SoftwareBitmap,
-        index: usize,
+        _index: usize,
         notifier: mpsc::SyncSender<SystemOcrInput>,
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, Arc<SystemOcrCompletion>), String> {
         let operation = engine
             .RecognizeAsync(bitmap)
             .map_err(|error| format!("OcrEngine::RecognizeAsync failed: {error}"))?;
@@ -2204,10 +2304,13 @@ impl OcrOperationGuard {
             operation,
             closed: false,
         };
+        let completion = Arc::new(SystemOcrCompletion::pending());
+        let callback_completion = Arc::clone(&completion);
         if let Err(error) = guard
             .operation
             .SetCompleted(&AsyncOperationCompletedHandler::new(move |_, status| {
-                let _ = notifier.try_send(SystemOcrInput::Completed { index, status });
+                callback_completion.publish(status);
+                let _ = notifier.try_send(SystemOcrInput::CompletionWake);
                 Ok(())
             }))
         {
@@ -2215,7 +2318,7 @@ impl OcrOperationGuard {
                 "cannot register tiled system OCR completion: {error}"
             )));
         }
-        Ok(guard)
+        Ok((guard, completion))
     }
 
     fn complete(mut self, status: AsyncStatus) -> Result<OcrResult, String> {
@@ -2807,6 +2910,29 @@ mod tests {
         assert_eq!(system_ocr_grid_for_parallelism(7_680, 4_320, 64), 9);
         assert_eq!(system_ocr_grid_for_parallelism(320, 200, 16), 3);
         assert_eq!(system_ocr_grid_for_parallelism(200, 100, 16), 1);
+    }
+
+    #[test]
+    fn system_ocr_credit_limit_covers_production_tile_counts() {
+        for count in [1, 2, 4, 9, 25, 81] {
+            let limit = system_ocr_concurrency_for(count, 64);
+            assert_eq!(limit, count.min(MAX_SYSTEM_OCR_IN_FLIGHT));
+        }
+        assert_eq!(system_ocr_concurrency_for(25, 2), 2);
+        assert_eq!(system_ocr_concurrency_for(25, 4), 4);
+    }
+
+    #[test]
+    fn completion_state_survives_a_full_coalesced_wake_lane() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        sender
+            .send(SystemOcrInput::Begin { tile_count: 1 })
+            .unwrap();
+        let completion = SystemOcrCompletion::pending();
+        completion.publish(AsyncStatus::Completed);
+        assert!(sender.try_send(SystemOcrInput::CompletionWake).is_err());
+        assert_eq!(completion.take(), Some(AsyncStatus::Completed));
+        assert_eq!(completion.take(), None);
     }
 
     #[test]

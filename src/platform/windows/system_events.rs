@@ -8,6 +8,7 @@ use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use super::WAKE_MESSAGE;
 
 static FOCUS_CHANGED: AtomicBool = AtomicBool::new(false);
+static WAKE_FAILED: AtomicBool = AtomicBool::new(false);
 static OWNER_THREAD: AtomicU32 = AtomicU32::new(0);
 
 pub struct ForegroundWatcher(HWINEVENTHOOK);
@@ -26,6 +27,10 @@ impl ForegroundWatcher {
 
     pub fn take_changed(&self) -> bool {
         FOCUS_CHANGED.swap(false, Ordering::AcqRel)
+    }
+
+    pub fn take_wake_failure(&self) -> bool {
+        WAKE_FAILED.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -55,9 +60,7 @@ extern "system" fn win_event(
     if owner != 0
         && let Err(error) = super::native::post_thread_message(owner, WAKE_MESSAGE, 0)
     {
-        crate::report_error!(
-            "windows-events",
-            "cannot wake engine for foreground change: {error}"
-        );
+        let _ = error;
+        WAKE_FAILED.store(true, Ordering::Release);
     }
 }

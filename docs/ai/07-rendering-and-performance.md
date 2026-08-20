@@ -199,3 +199,12 @@ macOS 原生探针使用固定 AppKit fixture 子进程，运行：
 交替执行基线和当前分支，原始日志与中位数汇总写入 `target/macos-native-bench/`；正式数据
 必须在已授予 Accessibility 与 Screen Recording 的 Apple Silicon 实机采集。汇总阶段也会
 验证 24 个 fixture 控件：AX 身份与矩形完全一致，Vision/Hybrid 的逻辑坐标误差不超过 1 px。
+# Overlay allocation rules
+
+- API v8 uses inline UTF-8 `OverlayText` and COW `SharedLabelStyle` for labels.
+  The wire format remains unchanged. On supported 64-bit targets their layout
+  gates are 24 bytes, 8 bytes, and at most 80 bytes for `OverlayLabel`.
+- Hint resolves one shared label style per scene. Windows DPI scaling interns
+  scaled styles by source identity and scale instead of detaching every label.
+- Scene sorting first performs an O(n) ordered check and only runs the stable
+  sort when required; equal-z source order remains stable.

@@ -373,6 +373,7 @@ fn worker_main(shared: Arc<SharedQueue>, thread_id: Arc<AtomicU32>) {
         }
     };
     crate::app::perf_probe::mark("uia_prewarm_ready");
+    crate::app::perf_probe::mark("uia_ready");
 
     let mut configured_timeout = None;
     while let Some(job) = next_job(&shared) {
@@ -1864,6 +1865,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "global allocation counter requires --test-threads=1; ordinary CI checks structural invariants"]
     fn shared_scan_plan_has_one_generation_allocation() {
         let request = UiScanRequest {
             id: 2,
@@ -1882,6 +1884,30 @@ mod tests {
         let allocations = allocation_region.change().allocations;
         std::hint::black_box(&plan);
         assert_eq!(allocations, 1, "only Arc<WindowsScanPlan> should allocate");
+    }
+
+    #[test]
+    fn shared_scan_plan_uses_one_arc_and_inline_common_snapshots() {
+        let request = UiScanRequest {
+            id: 2,
+            timeout_ms: 1_000,
+            bounds: Some(Rect::new(0.0, 0.0, 1_920.0, 1_080.0)),
+            roles: Vec::new(),
+            max_depth: 8,
+            visible_only: true,
+            clickable_only: true,
+            strategy: UiScanStrategy::Hybrid,
+            vision: VisionOptions::default(),
+            app: None,
+        };
+        let plan = test_scan_plan(request);
+        assert_eq!(Arc::strong_count(&plan), 1);
+        assert!(!plan.windows.spilled());
+        assert!(!plan.occluders.spilled());
+        let shared = Arc::clone(&plan);
+        assert_eq!(Arc::strong_count(&plan), 2);
+        drop(shared);
+        assert_eq!(Arc::strong_count(&plan), 1);
     }
 
     #[test]
