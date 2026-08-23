@@ -1699,6 +1699,18 @@ impl Engine {
         };
         let click_indicator_released =
             input.state == KeyState::Up && self.active_click_indicators.release(&input.key);
+        // A physical Down may have reached the foreground application before a
+        // later `press`/`toggle` action took ownership of that same key. Its
+        // matching physical Up will clear the application's synthetic state as
+        // well, so remember that exact case before disposition bookkeeping
+        // removes the Down decision. Consumed keys already keep the synthetic
+        // Down alive and must not receive a redundant edge.
+        let released_forwarded_key = input.state == KeyState::Up
+            && !self.latched.is_empty()
+            && matches!(
+                self.key_dispositions.get(&input.key),
+                Some(KeyDisposition::Defer | KeyDisposition::Forward)
+            );
         let completed_long_press = (input.state == KeyState::Up)
             .then(|| self.take_pending_long_press_toggle(&input.key))
             .flatten();
@@ -1718,7 +1730,13 @@ impl Engine {
                 self.report_action_error(error, backend);
             }
             let outcome = self.complete_key_disposition(&input, KeyOutcome::Forwarded);
-            return self.dispose_input(&input, outcome, trace_key, backend);
+            self.dispose_input(&input, outcome, trace_key, backend)?;
+            self.reassert_latched_key_after_forwarded_release(
+                &input,
+                released_forwarded_key,
+                backend,
+            )?;
+            return Ok(());
         }
 
         if let Some(pending) = completed_long_press {
@@ -1731,6 +1749,11 @@ impl Engine {
             if let Err(error) = self.complete_pending_mouse_click(pending, backend) {
                 self.report_action_error(error, backend);
             }
+            self.reassert_latched_key_after_forwarded_release(
+                &input,
+                released_forwarded_key,
+                backend,
+            )?;
             if display_changed || click_indicator_released {
                 self.refresh_overlay(backend)?;
             }
@@ -1852,6 +1875,11 @@ impl Engine {
                     self.report_action_error(error, backend);
                 }
             }
+            self.reassert_latched_key_after_forwarded_release(
+                &input,
+                released_forwarded_key,
+                backend,
+            )?;
             if display_changed || click_indicator_released {
                 self.refresh_overlay(backend)?;
             }
@@ -1892,6 +1920,7 @@ impl Engine {
             },
             backend,
         )?;
+        self.reassert_latched_key_after_forwarded_release(&input, released_forwarded_key, backend)?;
         if display_changed || click_indicator_released {
             self.refresh_overlay(backend)?;
         }
@@ -2198,19 +2227,21 @@ impl Engine {
         }
     }
 
+    fn keys_match(left: &Key, right: &Key) -> bool {
+        if left == right {
+            return true;
+        }
+        let left_generic = matches!(left.as_str(), "shift" | "ctrl" | "alt" | "win");
+        let right_generic = matches!(right.as_str(), "shift" | "ctrl" | "alt" | "win");
+        (left_generic || right_generic)
+            && Self::modifier_family(left)
+                .zip(Self::modifier_family(right))
+                .is_some_and(|(left, right)| left == right)
+    }
+
     fn targets_match(left: &InputTarget, right: &InputTarget) -> bool {
         match (left, right) {
-            (InputTarget::Key(left), InputTarget::Key(right)) => {
-                if left == right {
-                    return true;
-                }
-                let left_generic = matches!(left.as_str(), "shift" | "ctrl" | "alt" | "win");
-                let right_generic = matches!(right.as_str(), "shift" | "ctrl" | "alt" | "win");
-                (left_generic || right_generic)
-                    && Self::modifier_family(left)
-                        .zip(Self::modifier_family(right))
-                        .is_some_and(|(left, right)| left == right)
-            }
+            (InputTarget::Key(left), InputTarget::Key(right)) => Self::keys_match(left, right),
             (InputTarget::Mouse(left), InputTarget::Mouse(right)) => left == right,
             _ => false,
         }
@@ -2224,8 +2255,36 @@ impl Engine {
     }
 
     fn latched_key_matches(&self, key: &Key) -> bool {
-        self.matching_latched_target(&InputTarget::Key(key.clone()))
-            .is_some()
+        self.latched.iter().any(
+            |target| matches!(target, InputTarget::Key(latched) if Self::keys_match(latched, key)),
+        )
+    }
+
+    #[inline]
+    fn reassert_latched_key_after_forwarded_release(
+        &mut self,
+        input: &crate::api::input::InputEvent,
+        released_forwarded_key: bool,
+        backend: &mut dyn Backend,
+    ) -> Result<(), String> {
+        if !released_forwarded_key {
+            return Ok(());
+        }
+        let Some(target) = self
+            .latched
+            .iter()
+            .find(|target| {
+                matches!(target, InputTarget::Key(latched) if Self::keys_match(latched, &input.key))
+            })
+            .cloned()
+        else {
+            return Ok(());
+        };
+        Self::inject_target(&target, KeyState::Down, backend).map_err(|error| {
+            self.recoverable_input_error("reassert latched key after physical release", error)
+        })?;
+        self.recoverable_input_succeeded();
+        Ok(())
     }
 
     fn pending_long_press_toggle(
@@ -6367,6 +6426,227 @@ mod tests {
                 .as_ref()
                 .is_some_and(|indicator| indicator.held_text.as_deref() == Some("● LEFT SHIFT"))
         }));
+    }
+
+    #[test]
+    fn every_toggle_target_survives_its_forwarded_physical_key_release() {
+        for (target, chord, binding, injected) in [
+            ("left_ctrl", "ctrl+n", "toggle ctrl", "left_ctrl"),
+            (
+                "right_shift",
+                "right_shift+n",
+                "toggle right_shift",
+                "right_shift",
+            ),
+            ("left_alt", "alt+n", "toggle alt", "left_alt"),
+            ("left_win", "left_win+n", "toggle left_win", "left_win"),
+            ("e", "e+n", "toggle e", "e"),
+        ] {
+            let mut config = Config::default();
+            config.normal.bindings.clear();
+            config
+                .normal
+                .bindings
+                .insert(chord.into(), Binding::parse(binding).unwrap());
+            let mut engine = Engine::new(config.clone(), Appearance::Dark);
+            for mode in crate::modes::built_in(&config) {
+                engine.register(mode);
+            }
+            engine.active = ModeId::normal();
+            let (mut backend, log) = FakeBackend::new(Vec::new());
+
+            for event in [key_down(target), key_down("n"), key_up("n")] {
+                engine.handle_backend_event(event, &mut backend).unwrap();
+            }
+            assert!(
+                engine
+                    .matching_latched_target(&InputTarget::Key(Key::new(target).unwrap()))
+                    .is_some(),
+                "target={target}"
+            );
+            assert_eq!(
+                log.lock().unwrap().sent,
+                vec![(injected.into(), KeyState::Down)],
+                "target={target}"
+            );
+
+            engine
+                .handle_backend_event(key_up(target), &mut backend)
+                .unwrap();
+            assert!(
+                engine
+                    .matching_latched_target(&InputTarget::Key(Key::new(target).unwrap()))
+                    .is_some(),
+                "target={target}"
+            );
+            assert_eq!(
+                log.lock().unwrap().sent,
+                vec![
+                    (injected.into(), KeyState::Down),
+                    (injected.into(), KeyState::Down),
+                ],
+                "the forwarded physical Up must be followed by one synthetic Down; target={target}"
+            );
+
+            for event in [key_down(target), key_down("n"), key_up("n"), key_up(target)] {
+                engine.handle_backend_event(event, &mut backend).unwrap();
+            }
+            assert!(engine.latched.is_empty(), "target={target}");
+            assert_eq!(
+                log.lock().unwrap().sent.last(),
+                Some(&(injected.into(), KeyState::Up)),
+                "an explicit toggle-off must not be reasserted; target={target}"
+            );
+        }
+    }
+
+    #[test]
+    fn parameterless_toggle_uses_the_same_forwarded_release_reassertion() {
+        for activation in ["n", "t", "f8"] {
+            let mut config = Config::default();
+            config.normal.bindings.clear();
+            config
+                .normal
+                .bindings
+                .insert(activation.into(), Binding::Toggle(Vec::new()));
+            let mut engine = Engine::new(config.clone(), Appearance::Dark);
+            for mode in crate::modes::built_in(&config) {
+                engine.register(mode);
+            }
+            engine.active = ModeId::normal();
+            let (mut backend, log) = FakeBackend::new(Vec::new());
+
+            engine
+                .handle_backend_event(key_down("left_ctrl"), &mut backend)
+                .unwrap();
+            assert!(log.lock().unwrap().sent.is_empty());
+
+            engine
+                .handle_backend_event(key_down(activation), &mut backend)
+                .unwrap();
+            assert!(engine.pending_long_press_toggles.is_empty());
+            assert!(
+                engine
+                    .latched
+                    .contains(&InputTarget::Key(Key::new("left_ctrl").unwrap()))
+            );
+            assert_eq!(
+                log.lock().unwrap().sent,
+                vec![("left_ctrl".into(), KeyState::Down)],
+                "the already-held companion must latch on the configurable toggle KeyDown; activation={activation}"
+            );
+
+            engine
+                .handle_backend_event(key_up(activation), &mut backend)
+                .unwrap();
+            engine
+                .handle_backend_event(key_up("left_ctrl"), &mut backend)
+                .unwrap();
+
+            assert!(
+                engine
+                    .latched
+                    .contains(&InputTarget::Key(Key::new("left_ctrl").unwrap()))
+            );
+            assert_eq!(
+                log.lock().unwrap().sent,
+                vec![
+                    ("left_ctrl".into(), KeyState::Down),
+                    ("left_ctrl".into(), KeyState::Down),
+                ],
+                "activation={activation}"
+            );
+        }
+    }
+
+    #[test]
+    fn parameterless_toggle_latches_every_companion_in_both_orders() {
+        const ACTIVATION: &str = "t";
+        const PARTNERS: [&str; 4] = ["left_ctrl", "left_shift", "left_alt", "s"];
+
+        for partners_first in [true, false] {
+            let mut config = Config::default();
+            config.normal.bindings.clear();
+            config
+                .normal
+                .bindings
+                .insert(ACTIVATION.into(), Binding::Toggle(Vec::new()));
+            let mut engine = Engine::new(config.clone(), Appearance::Dark);
+            for mode in crate::modes::built_in(&config) {
+                engine.register(mode);
+            }
+            engine.active = ModeId::normal();
+            let (mut backend, log) = FakeBackend::new(Vec::new());
+
+            if partners_first {
+                for partner in PARTNERS {
+                    engine
+                        .handle_backend_event(key_down(partner), &mut backend)
+                        .unwrap();
+                }
+                engine
+                    .handle_backend_event(key_down(ACTIVATION), &mut backend)
+                    .unwrap();
+            } else {
+                engine
+                    .handle_backend_event(key_down(ACTIVATION), &mut backend)
+                    .unwrap();
+                for partner in PARTNERS {
+                    engine
+                        .handle_backend_event(key_down(partner), &mut backend)
+                        .unwrap();
+                }
+            }
+
+            assert!(engine.pending_long_press_toggles.is_empty());
+            for partner in PARTNERS {
+                assert!(
+                    engine
+                        .latched
+                        .contains(&InputTarget::Key(Key::new(partner).unwrap())),
+                    "partner={partner} partners_first={partners_first}"
+                );
+                assert_eq!(
+                    log.lock()
+                        .unwrap()
+                        .sent
+                        .iter()
+                        .filter(|(key, state)| key == partner && *state == KeyState::Down)
+                        .count(),
+                    1,
+                    "partner={partner} partners_first={partners_first}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn configurable_parameterless_toggle_self_latches_only_after_the_threshold() {
+        for activation in ["t", "f8", "caps_lock"] {
+            let mut engine = engine_with_normal_binding(activation, "toggle");
+            engine.active = ModeId::normal();
+            let (mut backend, log) = FakeBackend::new(Vec::new());
+
+            engine
+                .handle_backend_event(key_down(activation), &mut backend)
+                .unwrap();
+            assert_eq!(engine.pending_long_press_toggles.len(), 1);
+            assert!(log.lock().unwrap().sent.is_empty());
+
+            engine.pending_long_press_toggles[0].fires_at = Instant::now();
+            engine.fire_due_long_press_toggles(&mut backend).unwrap();
+            assert!(
+                engine
+                    .latched
+                    .contains(&InputTarget::Key(Key::new(activation).unwrap())),
+                "activation={activation}"
+            );
+            assert_eq!(
+                log.lock().unwrap().sent,
+                vec![(activation.into(), KeyState::Down)],
+                "activation={activation}"
+            );
+        }
     }
 
     #[test]

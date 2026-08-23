@@ -162,9 +162,11 @@ passthrough_unbound_keys = true
 # A click key immediately presses its mouse button; releasing before this
 # threshold immediately releases it to complete the click. Reaching the
 # threshold keeps that existing press latched without injecting a click.
-# Holding a parameterless toggle key by itself latches that key. Releasing the
-# physical key does not undo either latch. Set to 0 to use an atomic key-down
-# click and disable both long-press behaviours.
+# A parameterless toggle captures any number of companions immediately in
+# either order; its binding key is user-configurable. Holding that key by
+# itself latches the key after this threshold. Releasing a captured physical
+# key does not undo either latch. Set to 0 to use an atomic key-down click and
+# disable both long-press behaviours.
 long_press_toggle_ms = 500
 
 # ---------------------------------------------------------------------------

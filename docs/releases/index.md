@@ -1,5 +1,11 @@
 # 更新日志 / Release Notes
 
+## 0.9.8
+
+修复与此前鼠标长按同类的键盘 `toggle` 状态问题：多个修饰键现在可在激活键前后立即锁定，松开物理键后仍保持按下，且不会把 `toggle` 激活键组合透传给当前窗口。
+
+Fixed the keyboard `toggle` state issue caused by the same kind of input transition as the earlier mouse long-press bug: multiple modifiers can now latch immediately in either order, remain held after their physical keys are released, and no longer pass the toggle activation chord to the focused window.
+
 ## 0.9.7
 
 修复 [Issue #1](https://github.com/dccif/KeySteer/issues/1)：鼠标按键进入按下状态前可能意外触发一次点击；同时将 Rust 工具链升级至 1.98。

@@ -148,7 +148,7 @@ f = "recursive_grid"
 
 `passthrough_unbound_keys = true` is the default: Normal consumes only input matching a complete KeySteer binding. Unbound keys and unconfigured modifier chords preserve their original down/up lifecycle. With `false`, Normal returns to keyboard exclusivity and its old permissive chord matching. Grid, Recursive Grid, and UI Hint are always exclusive; Idle always passes through unmatched input and also uses complete chord matching.
 
-`long_press_toggle_ms` applies to bindings for mouse buttons and to a standalone parameterless `toggle` key. At the threshold, a mouse button remains down; a standalone `toggle` holds its activating key down even after the physical key is released. A short standalone `toggle` releases all latches. Set `0` to disable this behaviour; the allowed range is `0..=60000` milliseconds.
+`long_press_toggle_ms` applies to bindings for mouse buttons and to a standalone parameterless `toggle` key. At the threshold, a mouse button remains down; a standalone `toggle` holds its activating key down even after the physical key is released. A parameterless `toggle` may use any activation key and latch any number of companions at once; companions and the activation key work in either order without waiting for the threshold. A short standalone `toggle` releases all latches. Set `0` to disable this behaviour; the allowed range is `0..=60000` milliseconds.
 
 ### Grid
 

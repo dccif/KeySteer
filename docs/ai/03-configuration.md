@@ -87,8 +87,9 @@ TOML 右值可以是字符串，也可以是字符串数组；数组解析为有
 canonical 输出必须能重新 parse。`press/release/toggle` 是合成输入状态管理；
 `precision/slow/fast` 才是移动速度修饰符。
 
-无参数 `toggle` 对所有键使用相同规则。伙伴键在激活键之前或之后按下都可被锁定；伙伴
-绑定为 click/double-click 时锁定其鼠标按钮，否则锁定解析出的键盘目标。单独短按激活键
+无参数 `toggle` 对所有键使用相同规则。它是严格修饰键匹配的唯一例外，因此伙伴键在激活键
+之前或之后按下都可立即被锁定；已透传的伙伴 KeyUp 后，Engine 重新注入一次 Down 保持 OS
+可见的锁定状态。伙伴绑定为 click/double-click 时锁定其鼠标按钮，否则锁定解析出的键盘目标。单独短按激活键
 释放全部现有 latch，单独长按达到 `long_press_toggle_ms` 才锁定激活键自身。Windows 与
 macOS 原生后端把重复的同按钮 `Press` 视为幂等操作，不得注入第二个 mouse-down。
 

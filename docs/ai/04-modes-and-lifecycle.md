@@ -40,6 +40,8 @@ settings；不能注入输入、创建窗口或直接扫描 UI。
   deadline；直接 click/double-click 在 KeyDown 立即 MouseDown，未到期的 KeyUp 立即 MouseUp，
   到期后只把现有按压转交给 latched Toggle，不等待 deadline 才响应，也不先注入完整点击。
   物理键释放不释放已经 Toggle 的鼠标按钮或激活键自身；组合伙伴出现时会取消激活键的自锁 deadline。
+  无参数 toggle 的伙伴允许先于激活键按下并立即命中；若伙伴的 Down 已经透传，处理其 Up 后会
+  立即重新注入 Down。该补偿只检查现有 disposition，不增加 timer、线程或普通按键等待。
 
 ### Grid (`src/modes/grid.rs`)
 

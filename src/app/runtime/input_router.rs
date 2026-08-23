@@ -68,6 +68,10 @@ impl CompiledKeymap {
     /// to be owned by KeySteer already. This prevents a bare `h` binding from
     /// stealing an external `Alt+H` shortcut, while a consumed `left_shift`
     /// speed binding can still modify `h`.
+    ///
+    /// A bare parameterless `toggle` is deliberately the sole exception: its
+    /// purpose is to capture whichever companion input is already held, so
+    /// `Ctrl` then `n = "toggle"` must resolve just like `n` then `Ctrl`.
     pub fn lookup_with_specificity_strict(
         &self,
         key: &Key,
@@ -83,6 +87,8 @@ impl CompiledKeymap {
                         configured.is_modifier() && modifier_matches(configured, pressed_modifier)
                     }) || modifier_is_owned(pressed_modifier)
                 })
+                || (entry.chord.keys().len() == 1
+                    && matches!(entry.binding.as_ref(), Binding::Toggle(targets) if targets.is_empty()))
         })
     }
 
@@ -196,6 +202,21 @@ mod tests {
         assert_eq!(
             map.lookup_with_specificity_strict(&h, &shift_h, |key| key == &shift),
             Some((Arc::new(mode("normal")), 1))
+        );
+    }
+
+    #[test]
+    fn strict_lookup_allows_a_bare_parameterless_toggle_to_capture_a_modifier() {
+        let map = CompiledKeymap::compile(
+            vec![("n".into(), Binding::Toggle(Vec::new()))],
+            &BTreeMap::new(),
+        );
+        let n = Key::new("n").unwrap();
+        let ctrl = Key::new("left_ctrl").unwrap();
+
+        assert_eq!(
+            map.lookup_with_specificity_strict(&n, &[ctrl, n.clone()], |_| false),
+            Some((Arc::new(Binding::Toggle(Vec::new())), 1))
         );
     }
 
