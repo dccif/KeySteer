@@ -45,10 +45,10 @@ Engine 的稳定 `ModeSlot` 缓存活动模式、pointer interest 和已编译�
 活动的 `(Key, MouseButton)` 指示器条目，而不是 Hint 标签字符数；常见 0–1 项不分配，第三个
 同时活动的点击状态才安全 spill。
 
-cursor marker 由 Engine 在 mode scene 之上装饰；合成鼠标按钮进入 latched 状态，或普通
-click 的物理触发键仍按住时，仅替换 marker 的填充/轮廓颜色并刷新动态 overlay，不改变
-mode scene，也不重建静态 Grid/Hint 内容。latched 的真实按钮状态优先；普通 click 使用
-最近仍按住的触发键，并由该键的释放事件清除。颜色提示本身不使用 timer 或 polling；
+cursor marker 由 Engine 在 mode scene 之上装饰；合成鼠标按钮进入 latched 状态，或等待
+短按/长按判定的 click 物理触发键仍按住时，仅替换 marker 的填充/轮廓颜色并刷新动态
+overlay，不改变 mode scene，也不重建静态 Grid/Hint 内容。latched 的真实按钮状态优先；
+待定 click 使用最近仍按住的触发键，并由该键的释放事件清除。颜色提示本身不使用 timer 或 polling；
 可配置的长按 Toggle 复用 Engine 的下一 deadline 超时，不创建周期轮询或额外线程。
 长按和延迟 sequence 使用 deadline 倒序 `Vec`，等待轮询只查看尾项，到期从尾部弹出；常见
 不超过 8 项的 Toggle 目标、回滚快照和按压事务使用栈内 `SmallVec`，超长组合才分配。

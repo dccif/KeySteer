@@ -1,9 +1,9 @@
 [package]
 name = "keysteer"
-version = "0.9.6"
+version = "0.9.7"
 authors = ["dccif"]
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.98"
 license = "GPL-3.0-or-later"
 description = "Keyboard-driven mouse control with grid, recursive-grid and accessibility hint modes"
 repository = "https://github.com/dccif/KeySteer"

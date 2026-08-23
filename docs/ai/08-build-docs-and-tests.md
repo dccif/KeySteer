@@ -28,7 +28,7 @@ release profile：`opt-level=3`、fat LTO、`codegen-units=1`、abort panic、st
 关闭 incremental/debug/overflow checks，目标是发布体积和运行性能。
 
 `Cargo.toml` 的 `rust-version` 是最低 Rust 版本；`rust-toolchain.toml` 固定同一
-`1.97` toolchain。发布工作流在每个原生 job 显式安装它，不能依赖 GitHub runner 预装
+`1.98` toolchain。发布工作流在每个原生 job 显式安装它，不能依赖 GitHub runner 预装
 的 `stable` 版本。
 
 ## build.rs

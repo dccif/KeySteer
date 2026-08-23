@@ -22,13 +22,14 @@
 加速。两种模式都按真实时间积分并在松开最后一个方向键时立即停止。
 
 `normal.long_press_toggle_ms` 默认 500；0 禁用。它为直接绑定的 click/double-click 和
-单独按住的无参数 `toggle` 激活键建立 deadline。前者达到阈值后把对应鼠标按钮交给现有
-latched Toggle 状态机；后者把激活键自身锁定为 `Down`。普通点击仍在按下沿立即完成，
-配置允许范围为 `0..=60000`。
+单独按住的无参数 `toggle` 激活键建立 deadline。前者在 KeyDown 立即注入 MouseDown，阈值前
+KeyUp 立即注入 MouseUp 完成点击；达到阈值后只把已经按下的按钮交给 latched Toggle，不等待
+500ms 也不先注入完整点击。后者把激活键自身锁定为 `Down`。设为 0 时直接鼠标绑定恢复按下沿立即点击，配置允许范围为
+`0..=60000`。
 
 `mode_indicator.cursor.{left,middle,right}_pressed_color` 控制合成鼠标按钮被 `press` 或
-`toggle` 锁定时，以及普通 click 的物理触发键仍按住时的光标圆形颜色；每个 Mode 的
-cursor override 可单独覆盖这些值。普通 click 的提示由按键释放事件清除，不计时。
+`toggle` 锁定时，以及等待短按/长按判定的 click 物理触发键仍按住时的光标圆形颜色；每个
+Mode 的 cursor override 可单独覆盖这些值。提示由按键释放事件清除，不计时。
 
 ## 加载与发现
 

@@ -159,10 +159,12 @@ inherits = ["hotkeys"]
 # Alt is itself held by a KeySteer action. Set false for keyboard-exclusive
 # Normal behaviour.
 passthrough_unbound_keys = true
-# A click key still clicks immediately. Holding it this long then toggles the
-# same mouse button. Holding a parameterless toggle key by itself latches that
-# key. Releasing the physical key does not undo either latch. Set to 0 to
-# disable both long-press behaviours.
+# A click key immediately presses its mouse button; releasing before this
+# threshold immediately releases it to complete the click. Reaching the
+# threshold keeps that existing press latched without injecting a click.
+# Holding a parameterless toggle key by itself latches that key. Releasing the
+# physical key does not undo either latch. Set to 0 to use an atomic key-down
+# click and disable both long-press behaviours.
 long_press_toggle_ms = 500
 
 # ---------------------------------------------------------------------------

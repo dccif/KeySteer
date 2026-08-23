@@ -64,8 +64,8 @@ h = "move_left"
 
 | Action | Description |
 | --- | --- |
-| `left_click`, `right_click`, `middle_click` | Inject one complete click immediately on the physical key-down edge. |
-| `double_click` | Double-click the left button. |
+| `left_click`, `right_click`, `middle_click` | With long-press detection enabled, send MouseDown immediately and MouseUp on a short release; at the threshold, only latch the existing press. With it disabled, inject an atomic click on key-down. |
+| `double_click` | Immediately starts the first left-button press, completes the double-click on a short release, or latches the left button on a long press. |
 | `left_press`, `right_press` | Hold a pointer button. |
 | `left_release`, `right_release` | Release a held pointer button. |
 | `toggle_left`, `toggle_right` | Toggle the held state of that pointer button. |

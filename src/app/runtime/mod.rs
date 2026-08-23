@@ -86,6 +86,7 @@ struct PendingLongPressToggle {
     fires_at: Instant,
     key: Key,
     target: InputTarget,
+    short_action: Option<ButtonAction>,
 }
 
 type TargetBuffer = SmallVec<[InputTarget; 8]>;
@@ -331,9 +332,9 @@ struct ActiveGesture {
     owner: ModeId,
 }
 
-/// Ordinary clicks remain atomic on key-down, but their cursor decoration
-/// follows the physical activation key until it is released. This is visual
-/// state only: unlike `latched`, it never owns a synthetic mouse button.
+/// Click feedback follows the physical activation key until it is released.
+/// This is visual state only; pending and latched mouse-button ownership stays
+/// in the Engine input state rather than in the decoration.
 #[derive(Debug, Default)]
 struct ActiveClickIndicators(SmallVec<[(Key, Button); 2]>);
 
@@ -564,8 +565,9 @@ pub struct Engine {
     /// Remembering the binding is what guarantees every press is followed by
     /// its release, rather than movement sticking on forever.
     active_gestures: KeyMap<ActiveGesture>,
-    /// Successful atomic clicks whose physical activation keys remain down.
-    /// This drives cursor color only and does not represent mouse-button state.
+    /// Direct clicks awaiting short/long-press resolution, or completed atomic
+    /// clicks whose physical activation keys remain down. This drives cursor
+    /// color only and does not represent mouse-button state.
     active_click_indicators: ActiveClickIndicators,
     /// Synthetic keyboard keys and mouse buttons held by `press` or `toggle`.
     /// Keeping one shared set makes these actions idempotent and lets the UI
@@ -577,8 +579,8 @@ pub struct Engine {
     active_default_toggles: DefaultToggleKeys,
     pending_sequences: Vec<PendingSequence>,
     /// Click keys and parameterless toggle activations waiting to cross the
-    /// configured hold threshold. Firing delegates to the same latched-input
-    /// state machine as explicit toggle.
+    /// configured hold threshold. A short click completes on key-up; firing
+    /// delegates only the held target to the latched-input toggle state machine.
     pending_long_press_toggles: SmallVec<[PendingLongPressToggle; 4]>,
     timers: HashMap<String, Timer>,
     scan_owners: HashMap<u64, ModeId>,
@@ -851,7 +853,12 @@ impl Engine {
 
         let previous = self.active.clone();
         self.pending_sequences.clear();
-        self.pending_long_press_toggles.clear();
+        if let Err(cancel_error) = self.cancel_all_pending_long_presses(backend) {
+            crate::app::logging::report_error(
+                "input",
+                format!("cannot cancel pending mouse presses during recovery: {cancel_error}"),
+            );
+        }
         self.active_default_toggles.clear();
         self.active_gestures.clear();
         self.active_click_indicators.clear();
@@ -1247,7 +1254,10 @@ impl Engine {
         let mut errors = crate::app::errors::ErrorBundle::default();
         errors.record("runtime", result);
         self.pending_sequences.clear();
-        self.pending_long_press_toggles.clear();
+        errors.record(
+            "cancel pending mouse presses",
+            self.cancel_all_pending_long_presses(backend),
+        );
         self.active_click_indicators.clear();
         errors.record("cancel scans", self.cancel_all_scans(backend));
         errors.record("release held inputs", self.release_latched(backend));
@@ -1299,8 +1309,7 @@ impl Engine {
             return Ok(());
         }
         if self.should_quit || !self.enabled || self.is_excluded_app() {
-            self.pending_long_press_toggles.clear();
-            return Ok(());
+            return self.cancel_all_pending_long_presses(backend);
         }
         let now = Instant::now();
         while self
@@ -1314,7 +1323,17 @@ impl Engine {
             if !self.pressed.contains(&toggle.key) {
                 continue;
             }
-            self.toggle_targets(std::slice::from_ref(&toggle.target), backend)?;
+            // A direct mouse click is primed with MouseDown on the physical
+            // key edge. Reaching the deadline only transfers ownership of that
+            // already-held button to the latch; it must not inject a second
+            // press. An already-latched button has no short action, so its long
+            // press still toggles the latch off here.
+            if toggle.short_action.is_some() {
+                self.latched.insert(toggle.target.clone());
+            } else {
+                self.toggle_targets(std::slice::from_ref(&toggle.target), backend)?;
+            }
+            self.cancel_pending_long_press_targets(std::slice::from_ref(&toggle.target));
             if matches!(&toggle.target, InputTarget::Key(key) if key == &toggle.key)
                 && let Some(used) = self.active_default_toggles.get_mut(&toggle.key)
             {
@@ -1536,7 +1555,7 @@ impl Engine {
                 if !self.enabled {
                     self.cancel_all_scans(backend)?;
                     self.pending_sequences.clear();
-                    self.pending_long_press_toggles.clear();
+                    self.cancel_all_pending_long_presses(backend)?;
                     self.active_click_indicators.clear();
                     self.release_latched(backend)?;
                     self.activate(ModeId::idle(), None, backend)?;
@@ -1646,7 +1665,6 @@ impl Engine {
         self.focused_app_excluded =
             Self::excluded_app_matches(&self.config, self.focused_app.as_ref());
         self.palette = self.config.palette(self.appearance);
-        self.pending_long_press_toggles.clear();
         self.rebuild_tables();
         self.trace_binding_tables();
         Ok(())
@@ -1681,10 +1699,9 @@ impl Engine {
         };
         let click_indicator_released =
             input.state == KeyState::Up && self.active_click_indicators.release(&input.key);
-        if input.state == KeyState::Up {
-            self.pending_long_press_toggles
-                .retain(|pending| pending.key != input.key);
-        }
+        let completed_long_press = (input.state == KeyState::Up)
+            .then(|| self.take_pending_long_press_toggle(&input.key))
+            .flatten();
         let captures_default_toggle_partner = input.state == KeyState::Down
             && !input.repeat
             && self
@@ -1695,8 +1712,29 @@ impl Engine {
             && display_before.is_some_and(|display_before| display_before != self.display_mode());
 
         if !self.enabled || self.is_excluded_app() {
+            if let Some(pending) = completed_long_press
+                && let Err(error) = self.cancel_pending_long_press(pending, backend)
+            {
+                self.report_action_error(error, backend);
+            }
             let outcome = self.complete_key_disposition(&input, KeyOutcome::Forwarded);
             return self.dispose_input(&input, outcome, trace_key, backend);
+        }
+
+        if let Some(pending) = completed_long_press {
+            let outcome = self.complete_key_disposition(&input, KeyOutcome::Consumed);
+            self.dispose_input(&input, outcome, trace_key, backend)?;
+            self.trace_key_resolution(&input, None, trace_key);
+            if let Err(error) = self.finish_default_toggle(completed_default_toggle, backend) {
+                self.report_action_error(error, backend);
+            }
+            if let Err(error) = self.complete_pending_mouse_click(pending, backend) {
+                self.report_action_error(error, backend);
+            }
+            if display_changed || click_indicator_released {
+                self.refresh_overlay(backend)?;
+            }
+            return Ok(());
         }
 
         // Resolve the key. On press we consult the active mode's table; on
@@ -1762,12 +1800,33 @@ impl Engine {
                 self.report_action_error(error, backend);
             }
             let pending_long_press = self.pending_long_press_toggle(&resolved, &input);
-            let suppress_click = pending_long_press.as_ref().is_some_and(|pending| {
-                matches!(&pending.target, InputTarget::Mouse(_))
-                    && self.matching_latched_target(&pending.target).is_some()
+            let deferred_button = pending_long_press.as_ref().and_then(|pending| {
+                let InputTarget::Mouse(button) = &pending.target else {
+                    return None;
+                };
+                Some(*button)
             });
-            let applied = if suppress_click {
-                true
+            let duplicate_pending = deferred_button.is_some()
+                && pending_long_press.as_ref().is_some_and(|pending| {
+                    self.pending_long_press_toggles
+                        .iter()
+                        .any(|current| Self::targets_match(&current.target, &pending.target))
+                });
+            let applied = if let (Some(pending), Some(button)) =
+                (pending_long_press.as_ref(), deferred_button)
+            {
+                if duplicate_pending || pending.short_action.is_none() {
+                    true
+                } else {
+                    match self.inject_mouse_button(map_button(button), ButtonAction::Press, backend)
+                    {
+                        Ok(()) => true,
+                        Err(error) => {
+                            self.report_action_error(error, backend);
+                            false
+                        }
+                    }
+                }
             } else {
                 match self.apply_binding(resolved, &input, backend) {
                     Ok(_) => true,
@@ -1777,13 +1836,21 @@ impl Engine {
                     }
                 }
             };
-            if applied && let Some(pending) = pending_long_press {
+            if applied
+                && !duplicate_pending
+                && let Some(pending) = pending_long_press
+            {
                 self.pending_long_press_toggles
                     .retain(|current| current.key != pending.key);
                 let index = self
                     .pending_long_press_toggles
                     .partition_point(|current| current.fires_at > pending.fires_at);
                 self.pending_long_press_toggles.insert(index, pending);
+                if let Some(button) = deferred_button
+                    && let Err(error) = self.activate_click_indicator(&input, button, backend)
+                {
+                    self.report_action_error(error, backend);
+                }
             }
             if display_changed || click_indicator_released {
                 self.refresh_overlay(backend)?;
@@ -2174,21 +2241,79 @@ impl Engine {
         {
             return None;
         }
-        let target = match resolved.binding.as_ref() {
-            Binding::Click(button) | Binding::DoubleClick(button) => InputTarget::Mouse(*button),
+        let (target, short_action) = match resolved.binding.as_ref() {
+            Binding::Click(button) => (InputTarget::Mouse(*button), Some(ButtonAction::Click)),
+            Binding::DoubleClick(button) => {
+                (InputTarget::Mouse(*button), Some(ButtonAction::DoubleClick))
+            }
             Binding::Toggle(targets)
                 if targets.is_empty() && !self.has_pressed_toggle_partner(&input.key) =>
             {
-                InputTarget::Key(input.key.clone())
+                (InputTarget::Key(input.key.clone()), None)
             }
             _ => return None,
         };
+        let short_action = short_action.filter(|_| self.matching_latched_target(&target).is_none());
         Some(PendingLongPressToggle {
             fires_at: Instant::now()
                 + Duration::from_millis(self.config.normal.long_press_toggle_ms),
             key: input.key.clone(),
             target,
+            short_action,
         })
+    }
+
+    fn take_pending_long_press_toggle(&mut self, key: &Key) -> Option<PendingLongPressToggle> {
+        let index = self
+            .pending_long_press_toggles
+            .iter()
+            .position(|pending| &pending.key == key)?;
+        Some(self.pending_long_press_toggles.remove(index))
+    }
+
+    fn complete_pending_mouse_click(
+        &mut self,
+        pending: PendingLongPressToggle,
+        backend: &mut dyn Backend,
+    ) -> Result<(), String> {
+        let (InputTarget::Mouse(button), Some(action)) = (pending.target, pending.short_action)
+        else {
+            return Ok(());
+        };
+        let button = map_button(button);
+        self.inject_mouse_button(button, ButtonAction::Release, backend)?;
+        if action == ButtonAction::DoubleClick {
+            // MouseDown was sent on the activation edge and MouseUp above
+            // completed the first click. One complete click now produces the
+            // second click without adding a third semantic Clicked event.
+            self.inject_mouse_button(button, ButtonAction::Click, backend)?;
+        }
+        self.dispatch(ModeEvent::Clicked { button, action }, backend)
+    }
+
+    fn cancel_pending_long_press(
+        &mut self,
+        pending: PendingLongPressToggle,
+        backend: &mut dyn Backend,
+    ) -> Result<(), String> {
+        if pending.short_action.is_some()
+            && let InputTarget::Mouse(button) = pending.target
+        {
+            self.inject_mouse_button(map_button(button), ButtonAction::Release, backend)?;
+        }
+        Ok(())
+    }
+
+    fn cancel_all_pending_long_presses(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
+        let pending = std::mem::take(&mut self.pending_long_press_toggles);
+        let mut errors = crate::app::errors::ErrorBundle::default();
+        for pending in pending {
+            errors.record(
+                "release pending mouse press",
+                self.cancel_pending_long_press(pending, backend),
+            );
+        }
+        errors.into_result()
     }
 
     fn cancel_pending_long_press_targets(&mut self, targets: &[InputTarget]) {
@@ -2197,6 +2322,29 @@ impl Engine {
                 .iter()
                 .any(|target| Self::targets_match(target, &pending.target))
         });
+    }
+
+    fn unprimed_toggle_targets(&mut self, targets: &[InputTarget]) -> TargetBuffer {
+        let mut primed = TargetBuffer::new();
+        self.pending_long_press_toggles.retain(|pending| {
+            let matched = targets
+                .iter()
+                .any(|target| Self::targets_match(target, &pending.target));
+            if matched && pending.short_action.is_some() {
+                primed.push(pending.target.clone());
+            }
+            !matched
+        });
+        self.latched.extend(primed.iter().cloned());
+        targets
+            .iter()
+            .filter(|target| {
+                !primed
+                    .iter()
+                    .any(|pressed| Self::targets_match(pressed, target))
+            })
+            .cloned()
+            .collect()
     }
 
     fn has_pressed_toggle_partner(&self, activation: &Key) -> bool {
@@ -2274,8 +2422,8 @@ impl Engine {
         self.pending_long_press_toggles.retain(
             |pending| !matches!(&pending.target, InputTarget::Key(key) if key == &pending.key),
         );
-        self.cancel_pending_long_press_targets(&targets);
-        self.toggle_targets(&targets, backend)?;
+        let toggle = self.unprimed_toggle_targets(&targets);
+        self.toggle_targets(&toggle, backend)?;
         self.refresh_overlay(backend)
     }
 
@@ -2630,16 +2778,16 @@ impl Engine {
                     let inferred = self.pressed_toggle_targets(&input.key);
                     let used = !inferred.is_empty();
                     if used {
-                        self.cancel_pending_long_press_targets(&inferred);
-                        self.toggle_targets(&inferred, backend)?;
+                        let toggle = self.unprimed_toggle_targets(&inferred);
+                        self.toggle_targets(&toggle, backend)?;
                         self.refresh_overlay(backend)?;
                     }
                     if self.pressed.contains(&input.key) {
                         self.active_default_toggles.insert(input.key.clone(), used);
                     }
                 } else {
-                    self.cancel_pending_long_press_targets(targets);
-                    self.toggle_targets(targets, backend)?;
+                    let toggle = self.unprimed_toggle_targets(targets);
+                    self.toggle_targets(&toggle, backend)?;
                     self.refresh_overlay(backend)?;
                 }
                 Ok(true)
@@ -4788,7 +4936,13 @@ mod tests {
                     *dy > 0.0
                 }
         }));
-        assert_eq!(log.clicks, 1);
+        assert!(log.buttons.windows(2).any(|actions| {
+            actions
+                == [
+                    (MouseButton::Left, ButtonAction::Press),
+                    (MouseButton::Left, ButtonAction::Release),
+                ]
+        }));
         assert!(log.sent.contains(&("page_down".into(), KeyState::Down)));
         assert!(log.sent.contains(&("page_down".into(), KeyState::Up)));
         let first_move = log
@@ -4938,11 +5092,17 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let mut engine = engine_with_probes(&seen, &["grid"]);
         let mut script = enter_normal();
-        script.extend([key_down("g"), key_down(";")]);
+        script.extend([key_down("g"), key_down(";"), key_up(";")]);
         let (mut backend, log) = FakeBackend::new(script);
         engine.run(&mut backend).unwrap();
 
-        assert_eq!(log.lock().unwrap().clicks, 1);
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Left, ButtonAction::Release),
+            ]
+        );
         assert_eq!(engine.active_mode().as_str(), "grid");
         assert!(
             seen.lock()
@@ -5042,17 +5202,17 @@ mod tests {
         let log = run_in_normal(&mut engine, vec![key_down("x"), repeat, key_up("x")]);
         let log = log.lock().unwrap();
         assert_eq!(
-            log.buttons
-                .iter()
-                .filter(|(_, action)| *action == ButtonAction::Click)
-                .count(),
-            1
+            log.buttons,
+            [
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Left, ButtonAction::Release),
+            ]
         );
     }
 
     #[test]
-    fn every_mouse_click_binding_long_press_toggles_its_button() {
-        for (binding, button, initial_action) in [
+    fn every_mouse_click_binding_short_press_runs_on_key_up() {
+        for (binding, button, action) in [
             ("left_click", Button::Left, ButtonAction::Click),
             ("middle_click", Button::Middle, ButtonAction::Click),
             ("right_click", Button::Right, ButtonAction::Click),
@@ -5066,8 +5226,104 @@ mod tests {
                 .handle_backend_event(key_down("x"), &mut backend)
                 .unwrap();
             assert_eq!(engine.pending_long_press_toggles.len(), 1);
+            assert_eq!(
+                log.lock().unwrap().buttons,
+                [(map_button(button), ButtonAction::Press)],
+                "binding={binding}"
+            );
+
+            engine
+                .handle_backend_event(key_up("x"), &mut backend)
+                .unwrap();
+            assert!(engine.pending_long_press_toggles.is_empty());
+            let expected = if action == ButtonAction::DoubleClick {
+                vec![
+                    (map_button(button), ButtonAction::Press),
+                    (map_button(button), ButtonAction::Release),
+                    (map_button(button), ButtonAction::Click),
+                ]
+            } else {
+                vec![
+                    (map_button(button), ButtonAction::Press),
+                    (map_button(button), ButtonAction::Release),
+                ]
+            };
+            assert_eq!(log.lock().unwrap().buttons, expected, "binding={binding}");
+        }
+    }
+
+    #[test]
+    fn disabling_long_press_keeps_every_mouse_click_on_key_down() {
+        for (binding, button, action) in [
+            ("left_click", Button::Left, ButtonAction::Click),
+            ("middle_click", Button::Middle, ButtonAction::Click),
+            ("right_click", Button::Right, ButtonAction::Click),
+            ("double_click", Button::Left, ButtonAction::DoubleClick),
+        ] {
+            let mut engine = engine_with_normal_binding("x", binding);
+            engine.config.normal.long_press_toggle_ms = 0;
+            engine.active = ModeId::normal();
+            let (mut backend, log) = FakeBackend::new(Vec::new());
+
+            engine
+                .handle_backend_event(key_down("x"), &mut backend)
+                .unwrap();
+            assert!(engine.pending_long_press_toggles.is_empty());
+            assert_eq!(
+                log.lock().unwrap().buttons,
+                vec![(map_button(button), action)],
+                "binding={binding}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_chord_click_uses_the_same_short_press_state_machine() {
+        let mut engine = engine_with_normal_binding("ctrl+x", "right_click");
+        engine.active = ModeId::normal();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+
+        for event in [
+            key_down("left_ctrl"),
+            key_down("x"),
+            key_up("x"),
+            key_up("left_ctrl"),
+        ] {
+            engine.handle_backend_event(event, &mut backend).unwrap();
+        }
+
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [
+                (MouseButton::Right, ButtonAction::Press),
+                (MouseButton::Right, ButtonAction::Release),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_mouse_click_binding_long_press_only_toggles_its_button() {
+        for (binding, button) in [
+            ("left_click", Button::Left),
+            ("middle_click", Button::Middle),
+            ("right_click", Button::Right),
+            ("double_click", Button::Left),
+        ] {
+            let mut engine = engine_with_normal_binding("x", binding);
+            engine.active = ModeId::normal();
+            let (mut backend, log) = FakeBackend::new(Vec::new());
+
+            engine
+                .handle_backend_event(key_down("x"), &mut backend)
+                .unwrap();
+            assert_eq!(engine.pending_long_press_toggles.len(), 1);
             assert!(
                 !engine.latched.contains(&InputTarget::Mouse(button)),
+                "binding={binding}"
+            );
+            assert_eq!(
+                log.lock().unwrap().buttons,
+                [(map_button(button), ButtonAction::Press)],
                 "binding={binding}"
             );
             engine.pending_long_press_toggles[0].fires_at = Instant::now();
@@ -5086,10 +5342,7 @@ mod tests {
             );
             assert_eq!(
                 log.lock().unwrap().buttons,
-                vec![
-                    (map_button(button), initial_action),
-                    (map_button(button), ButtonAction::Press),
-                ],
+                vec![(map_button(button), ButtonAction::Press)],
                 "binding={binding}"
             );
         }
@@ -5104,6 +5357,10 @@ mod tests {
         engine
             .handle_backend_event(key_down("x"), &mut backend)
             .unwrap();
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [(MouseButton::Left, ButtonAction::Press)]
+        );
         engine.pending_long_press_toggles[0].fires_at = Instant::now();
         engine.fire_due_long_press_toggles(&mut backend).unwrap();
         engine
@@ -5115,11 +5372,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             log.lock().unwrap().buttons,
-            vec![
-                (MouseButton::Left, ButtonAction::Click),
-                (MouseButton::Left, ButtonAction::Press),
-            ],
-            "a latched button must not receive another atomic click"
+            vec![(MouseButton::Left, ButtonAction::Press)],
+            "a latched button must not receive an atomic click"
         );
         engine.pending_long_press_toggles[0].fires_at = Instant::now();
         engine.fire_due_long_press_toggles(&mut backend).unwrap();
@@ -5131,11 +5385,57 @@ mod tests {
         assert_eq!(
             log.lock().unwrap().buttons,
             vec![
-                (MouseButton::Left, ButtonAction::Click),
                 (MouseButton::Left, ButtonAction::Press),
                 (MouseButton::Left, ButtonAction::Release),
             ]
         );
+    }
+
+    #[test]
+    fn one_long_press_cancels_other_pending_keys_for_the_same_button() {
+        let mut config = Config::default();
+        config.normal.bindings.clear();
+        config
+            .normal
+            .bindings
+            .insert("x".into(), Binding::Click(Button::Left));
+        config
+            .normal
+            .bindings
+            .insert("y".into(), Binding::Click(Button::Left));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = Engine::new(config, Appearance::Dark);
+        let mut idle = ProbeMode::new("idle", seen.clone());
+        idle.captures = false;
+        engine.register(Box::new(idle));
+        engine.register(Box::new(ProbeMode::new("normal", seen)));
+        engine.active = ModeId::normal();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+
+        engine
+            .handle_backend_event(key_down("x"), &mut backend)
+            .unwrap();
+        engine
+            .handle_backend_event(key_down("y"), &mut backend)
+            .unwrap();
+        assert_eq!(engine.pending_long_press_toggles.len(), 1);
+        for pending in &mut engine.pending_long_press_toggles {
+            pending.fires_at = Instant::now();
+        }
+        engine.fire_due_long_press_toggles(&mut backend).unwrap();
+
+        assert!(engine.pending_long_press_toggles.is_empty());
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [(MouseButton::Left, ButtonAction::Press)]
+        );
+        engine
+            .handle_backend_event(key_up("x"), &mut backend)
+            .unwrap();
+        engine
+            .handle_backend_event(key_up("y"), &mut backend)
+            .unwrap();
+        assert_eq!(log.lock().unwrap().buttons.len(), 1);
     }
 
     #[test]
@@ -5146,22 +5446,40 @@ mod tests {
         engine
             .handle_backend_event(key_down("x"), &mut backend)
             .unwrap();
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [(MouseButton::Left, ButtonAction::Press)]
+        );
         engine
             .handle_backend_event(key_up("x"), &mut backend)
             .unwrap();
         assert!(engine.pending_long_press_toggles.is_empty());
         assert!(engine.latched.is_empty());
-        assert_eq!(log.lock().unwrap().clicks, 1);
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Left, ButtonAction::Release),
+            ]
+        );
 
         engine.config.normal.long_press_toggle_ms = 0;
         engine
             .handle_backend_event(key_down("x"), &mut backend)
             .unwrap();
         assert!(engine.pending_long_press_toggles.is_empty());
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Left, ButtonAction::Release),
+                (MouseButton::Left, ButtonAction::Click),
+            ]
+        );
         engine
             .handle_backend_event(key_up("x"), &mut backend)
             .unwrap();
-        assert_eq!(log.lock().unwrap().clicks, 2);
+        assert_eq!(log.lock().unwrap().clicks, 1);
     }
 
     #[test]
@@ -5198,7 +5516,7 @@ mod tests {
             engine.fire_due_long_press_toggles(&mut backend).unwrap();
             assert_eq!(
                 log.lock().unwrap().buttons,
-                vec![(button, ButtonAction::Click), (button, ButtonAction::Press)],
+                vec![(button, ButtonAction::Press)],
                 "key={key}"
             );
         }
@@ -5287,7 +5605,7 @@ mod tests {
         let mut engine = engine_with_normal_binding("x", "left_click");
         engine.register(Box::new(ProbeMode::new("grid", seen)));
         engine.active = ModeId::normal();
-        let (mut backend, _) = FakeBackend::new(Vec::new());
+        let (mut backend, log) = FakeBackend::new(Vec::new());
 
         engine
             .handle_backend_event(key_down("x"), &mut backend)
@@ -5304,6 +5622,13 @@ mod tests {
             .unwrap();
         assert!(engine.active_click_indicators.is_empty());
         assert!(engine.pending_long_press_toggles.is_empty());
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Left, ButtonAction::Release),
+            ]
+        );
     }
 
     #[test]
@@ -5314,6 +5639,10 @@ mod tests {
         backend.fail_mouse = true;
         engine
             .handle_backend_event(key_down("x"), &mut backend)
+            .unwrap();
+        assert!(engine.active_click_indicators.is_empty());
+        engine
+            .handle_backend_event(key_up("x"), &mut backend)
             .unwrap();
         assert!(engine.active_click_indicators.is_empty());
 
@@ -5352,7 +5681,7 @@ mod tests {
     fn disabling_clears_click_indicators() {
         let mut engine = engine_with_normal_binding("x", "left_click");
         engine.active = ModeId::normal();
-        let (mut backend, _) = FakeBackend::new(Vec::new());
+        let (mut backend, log) = FakeBackend::new(Vec::new());
         engine
             .handle_backend_event(key_down("x"), &mut backend)
             .unwrap();
@@ -5363,16 +5692,66 @@ mod tests {
             .unwrap();
         assert!(engine.active_click_indicators.is_empty());
         assert!(engine.pending_long_press_toggles.is_empty());
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Left, ButtonAction::Release),
+            ]
+        );
     }
 
     #[test]
-    fn shutdown_clears_click_indicators_without_delaying_the_click() {
+    fn reload_completes_and_capture_loss_cancels_pending_mouse_presses() {
+        let mut engine = engine_with_normal_binding("x", "left_click");
+        engine.active = ModeId::normal();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+        engine
+            .handle_backend_event(key_down("x"), &mut backend)
+            .unwrap();
+        engine.apply_config(engine.config.clone()).unwrap();
+        engine
+            .handle_backend_event(key_up("x"), &mut backend)
+            .unwrap();
+        assert!(engine.pending_long_press_toggles.is_empty());
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Left, ButtonAction::Release),
+            ]
+        );
+
+        let mut engine = engine_with_normal_binding("x", "right_click");
+        engine.active = ModeId::normal();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+        engine
+            .handle_backend_event(key_down("x"), &mut backend)
+            .unwrap();
+        engine
+            .handle_backend_event(
+                BackendEvent::InputCaptureLost("injected capture loss".into()),
+                &mut backend,
+            )
+            .unwrap();
+        assert!(engine.pending_long_press_toggles.is_empty());
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [
+                (MouseButton::Right, ButtonAction::Press),
+                (MouseButton::Right, ButtonAction::Release),
+            ]
+        );
+    }
+
+    #[test]
+    fn shutdown_cancels_a_pending_click_and_clears_its_indicator() {
         let mut engine = engine_with_normal_binding("x", "left_click");
         let log = run_in_normal(&mut engine, vec![key_down("x")]);
         assert!(engine.active_click_indicators.is_empty());
         assert!(engine.pending_long_press_toggles.is_empty());
         let log = log.lock().unwrap();
-        assert_eq!(log.clicks, 1);
+        assert_eq!(log.clicks, 0);
         assert!(log.scenes.iter().any(|scene| {
             scene
                 .cursor_marker
@@ -5455,7 +5834,10 @@ mod tests {
         let (mut backend, log) = FakeBackend::new(script);
         engine.run(&mut backend).unwrap();
 
-        assert_eq!(log.lock().unwrap().clicks, 1);
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [(MouseButton::Left, ButtonAction::Click)]
+        );
         assert_eq!(engine.active_mode(), &ModeId::grid());
     }
 
@@ -5471,7 +5853,13 @@ mod tests {
         let (mut backend, log) = FakeBackend::new(script);
         engine.run(&mut backend).unwrap();
 
-        assert_eq!(log.lock().unwrap().clicks, 1);
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Left, ButtonAction::Release),
+            ]
+        );
         assert_eq!(engine.active_mode(), &ModeId::normal());
         assert!(log.lock().unwrap().dismissals > 0);
     }
@@ -5731,8 +6119,14 @@ mod tests {
     #[test]
     fn a_click_binding_is_executed_by_the_engine_not_the_mode() {
         let mut engine = engine_with_normal_binding("f", "left_click");
-        let log = run_in_normal(&mut engine, vec![key_down("f")]);
-        assert_eq!(log.lock().unwrap().clicks, 1);
+        let log = run_in_normal(&mut engine, vec![key_down("f"), key_up("f")]);
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Left, ButtonAction::Release),
+            ]
+        );
     }
 
     #[test]
@@ -5745,8 +6139,10 @@ mod tests {
         assert_eq!(
             log.lock().unwrap().buttons,
             [
-                (MouseButton::Left, ButtonAction::Click),
-                (MouseButton::Left, ButtonAction::Click),
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Left, ButtonAction::Release),
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Left, ButtonAction::Release),
             ]
         );
     }
@@ -5773,10 +6169,14 @@ mod tests {
     #[test]
     fn a_double_click_reaches_the_backend_as_one_native_action() {
         let mut engine = engine_with_normal_binding("f", "double_click");
-        let log = run_in_normal(&mut engine, vec![key_down("f")]);
+        let log = run_in_normal(&mut engine, vec![key_down("f"), key_up("f")]);
         assert_eq!(
             log.lock().unwrap().buttons,
-            [(MouseButton::Left, ButtonAction::DoubleClick)]
+            [
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Left, ButtonAction::Release),
+                (MouseButton::Left, ButtonAction::Click),
+            ]
         );
     }
 
@@ -5822,9 +6222,17 @@ mod tests {
                     injected: false,
                     timestamp_millis: 0,
                 }),
+                key_up("f"),
             ],
         );
-        assert_eq!(log.lock().unwrap().clicks, 1, "repeat must not re-click");
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Left, ButtonAction::Release),
+            ],
+            "repeat must not re-click"
+        );
     }
 
     #[test]
@@ -6806,6 +7214,7 @@ mod tests {
                 fires_at: Instant::now() + Duration::from_secs(60),
                 key: Key::new("n").unwrap(),
                 target: InputTarget::Key(Key::new("n").unwrap()),
+                short_action: None,
             });
         let (mut backend, _) = FakeBackend::new(Vec::new());
 
@@ -6817,6 +7226,28 @@ mod tests {
         assert_eq!(change.allocations, 0, "waiting allocated: {change:?}");
         assert_eq!(change.deallocations, 0, "waiting freed: {change:?}");
         assert_eq!(change.bytes_allocated, 0, "waiting allocated: {change:?}");
+    }
+
+    #[test]
+    #[ignore = "allocation probe; run alone with --test-threads=1"]
+    fn pending_short_press_queue_is_allocation_free() {
+        let mut engine = engine_with_normal_binding("x", "left_click");
+        let pending = PendingLongPressToggle {
+            fires_at: Instant::now() + Duration::from_secs(60),
+            key: Key::new("x").unwrap(),
+            target: InputTarget::Mouse(Button::Left),
+            short_action: Some(ButtonAction::Click),
+        };
+
+        let region = Region::new(TEST_ALLOCATOR);
+        for _ in 0..10_000 {
+            engine.pending_long_press_toggles.push(pending.clone());
+            std::hint::black_box(engine.take_pending_long_press_toggle(&pending.key));
+        }
+        let change = region.change();
+        assert_eq!(change.allocations, 0, "queue allocated: {change:?}");
+        assert_eq!(change.deallocations, 0, "queue freed: {change:?}");
+        assert_eq!(change.bytes_allocated, 0, "queue allocated: {change:?}");
     }
 
     #[test]

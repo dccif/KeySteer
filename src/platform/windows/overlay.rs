@@ -580,7 +580,7 @@ impl<'a> Surface<'a> {
 
     #[inline]
     fn blend_solid_span(pixels: &mut [u8], tables: &[[u8; 256]; 4]) {
-        for pixel in pixels.chunks_exact_mut(4) {
+        for pixel in pixels.as_chunks_mut::<4>().0 {
             for channel in 0..3 {
                 pixel[channel] = tables[channel][pixel[channel] as usize];
             }
@@ -635,7 +635,7 @@ impl<'a> Surface<'a> {
                 for y in clipped_top as usize..clipped_bottom as usize {
                     let start = (y * self.width + left) * 4;
                     let end = (y * self.width + right) * 4;
-                    for target in self.pixels[start..end].chunks_exact_mut(4) {
+                    for target in self.pixels[start..end].as_chunks_mut::<4>().0 {
                         target.copy_from_slice(&pixel);
                     }
                 }
@@ -1072,7 +1072,7 @@ impl TextRasterizer {
         for y in 0..height {
             let source = &pixels[y * stride * 4..(y * stride + width) * 4];
             let target = &mut self.mask[y * width..(y + 1) * width];
-            for (coverage, pixel) in target.iter_mut().zip(source.chunks_exact(4)) {
+            for (coverage, pixel) in target.iter_mut().zip(source.as_chunks::<4>().0) {
                 *coverage = pixel[0].max(pixel[1]).max(pixel[2]);
             }
         }
@@ -1114,7 +1114,7 @@ impl DibSurfaceExt for GdiDibSurface {
         }
         let [red, green, blue, alpha] = color.premultiplied();
         let pixel = [blue, green, red, alpha];
-        for target in self.pixels_mut().chunks_exact_mut(4) {
+        for target in self.pixels_mut().as_chunks_mut::<4>().0 {
             target.copy_from_slice(&pixel);
         }
     }

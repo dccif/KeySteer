@@ -162,14 +162,7 @@ impl Engine {
                     self.refresh_overlay_positions(backend)?;
                 }
                 Command::MouseButton { button, action } => {
-                    if let Err(error) = backend.mouse_button(button, action) {
-                        return Err(self.recoverable_input_error(
-                            &format!("mouse button {button:?} {action:?}"),
-                            error,
-                        ));
-                    }
-                    crate::app::perf_probe::mark("injection_executed");
-                    self.recoverable_input_succeeded();
+                    self.inject_mouse_button(button, action, backend)?;
                     if matches!(action, ButtonAction::Click | ButtonAction::DoubleClick) {
                         self.dispatch(ModeEvent::Clicked { button, action }, backend)?;
                     }
@@ -330,6 +323,22 @@ impl Engine {
                 Command::Quit => self.should_quit = true,
             }
         }
+        Ok(())
+    }
+
+    pub(super) fn inject_mouse_button(
+        &mut self,
+        button: MouseButton,
+        action: ButtonAction,
+        backend: &mut dyn Backend,
+    ) -> Result<(), String> {
+        if let Err(error) = backend.mouse_button(button, action) {
+            return Err(
+                self.recoverable_input_error(&format!("mouse button {button:?} {action:?}"), error)
+            );
+        }
+        crate::app::perf_probe::mark("injection_executed");
+        self.recoverable_input_succeeded();
         Ok(())
     }
 }

@@ -1,5 +1,11 @@
 # 更新日志 / Release Notes
 
+## 0.9.7
+
+修复 [Issue #1](https://github.com/dccif/KeySteer/issues/1)：鼠标按键进入按下状态前可能意外触发一次点击；同时将 Rust 工具链升级至 1.98。
+
+Fixed [Issue #1](https://github.com/dccif/KeySteer/issues/1), where a click could be triggered accidentally before a mouse button entered its held state, and upgraded the Rust toolchain to 1.98.
+
 ## 0.9.6
 
 UI Hint 针对常见的 129–256 个标签新增会话级复用工作区、精确的 X 轴扫描和二元重叠组快速路径，
