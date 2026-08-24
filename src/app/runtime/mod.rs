@@ -1321,6 +1321,7 @@ impl Engine {
                 break;
             };
             if !self.pressed.contains(&toggle.key) {
+                self.cancel_pending_long_press(toggle, backend)?;
                 continue;
             }
             // A direct mouse click is primed with MouseDown on the physical
@@ -1333,7 +1334,7 @@ impl Engine {
             } else {
                 self.toggle_targets(std::slice::from_ref(&toggle.target), backend)?;
             }
-            self.cancel_pending_long_press_targets(std::slice::from_ref(&toggle.target));
+            self.transfer_pending_long_press_targets(std::slice::from_ref(&toggle.target));
             if matches!(&toggle.target, InputTarget::Key(key) if key == &toggle.key)
                 && let Some(used) = self.active_default_toggles.get_mut(&toggle.key)
             {
@@ -1621,22 +1622,32 @@ impl Engine {
                     ));
                 }
             };
+            if let Err(error) = self.cancel_all_pending_long_presses(backend) {
+                self.report_action_error(error, backend);
+            }
             self.apply_config(config)?;
             self.config_store = Some(store);
             path
-        } else if let Some(store) = self.config_store.as_mut() {
-            match store.reload() {
-                Ok(config) => self.apply_config(config)?,
-                Err(error) => {
-                    return Err(format!(
-                        "configuration reload rejected; keeping the last valid configuration: {error}"
-                    ));
-                }
+        } else if let Some(current) = self.config_store.as_ref() {
+            // Reload into a detached candidate. A malformed file must not
+            // replace the active source or cancel an in-flight short click.
+            let mut candidate = current.clone();
+            let config = candidate.reload().map_err(|error| {
+                format!(
+                    "configuration reload rejected; keeping the last valid configuration: {error}"
+                )
+            })?;
+            let path = candidate.path().to_path_buf();
+            if let Err(error) = self.cancel_all_pending_long_presses(backend) {
+                self.report_action_error(error, backend);
             }
-            self.config_store
-                .as_ref()
-                .map(|store| store.path().to_path_buf())
+            self.apply_config(config)?;
+            self.config_store = Some(candidate);
+            Some(path)
         } else {
+            if let Err(error) = self.cancel_all_pending_long_presses(backend) {
+                self.report_action_error(error, backend);
+            }
             self.palette = self.config.palette(self.appearance);
             self.rebuild_tables();
             None
@@ -1784,24 +1795,26 @@ impl Engine {
             }
         };
 
-        if let Some(resolved) = bound {
-            // A key pressed while a parameterless toggle activation key is held
-            // becomes that toggle's target. Suppress its ordinary click/send/
-            // movement action so the combination has exactly one effect.
-            if captures_default_toggle_partner {
-                let outcome = self.complete_key_disposition(&input, KeyOutcome::Consumed);
-                self.dispose_input(&input, outcome, trace_key, backend)?;
-                self.trace_key_resolution(&input, Some(&resolved), trace_key);
-                if let Err(error) = self.capture_default_toggle_partner(
-                    &input.key,
-                    Some(&resolved.binding),
-                    backend,
-                ) {
-                    self.report_action_error(error, backend);
-                }
-                return Ok(());
+        // A key pressed after a parameterless toggle activation becomes that
+        // toggle's target whether or not it has its own binding. Decide and
+        // publish the consumed disposition before any target injection or
+        // overlay work, so an unbound partner cannot leak through Normal's
+        // passthrough path first.
+        if captures_default_toggle_partner {
+            let outcome = self.complete_key_disposition(&input, KeyOutcome::Consumed);
+            self.dispose_input(&input, outcome, trace_key, backend)?;
+            self.trace_key_resolution(&input, bound.as_ref(), trace_key);
+            if let Err(error) = self.capture_default_toggle_partner(
+                &input.key,
+                bound.as_ref().map(|resolved| resolved.binding.as_ref()),
+                backend,
+            ) {
+                self.report_action_error(error, backend);
             }
+            return Ok(());
+        }
 
+        if let Some(resolved) = bound {
             // Remember both the binding and its recipient so a release stops a
             // normal gesture even while grid, recursive_grid or ui_hint remains
             // the active mode.
@@ -1902,12 +1915,6 @@ impl Engine {
         self.trace_key_resolution(&input, None, trace_key);
         if let Err(error) = self.finish_default_toggle(completed_default_toggle, backend) {
             self.report_action_error(error, backend);
-        }
-        if captures_default_toggle_partner {
-            if let Err(error) = self.capture_default_toggle_partner(&input.key, None, backend) {
-                self.report_action_error(error, backend);
-            }
-            return Ok(());
         }
 
         // Raw-mode handling may redraw a large target scene, so it must also
@@ -2270,17 +2277,19 @@ impl Engine {
         if !released_forwarded_key {
             return Ok(());
         }
-        let Some(target) = self
-            .latched
-            .iter()
-            .find(|target| {
-                matches!(target, InputTarget::Key(latched) if Self::keys_match(latched, &input.key))
-            })
-            .cloned()
-        else {
-            return Ok(());
+        let result = {
+            let Some(key) = self.latched.iter().find_map(|target| match target {
+                InputTarget::Key(latched) if Self::keys_match(latched, &input.key) => Some(latched),
+                _ => None,
+            }) else {
+                return Ok(());
+            };
+            // Latched keyboard targets are made concrete by `press_targets`
+            // before insertion, so reassertion can borrow the stored key
+            // directly instead of cloning its Arc-backed name.
+            backend.send_key(key, KeyState::Down)
         };
-        Self::inject_target(&target, KeyState::Down, backend).map_err(|error| {
+        result.map_err(|error| {
             self.recoverable_input_error("reassert latched key after physical release", error)
         })?;
         self.recoverable_input_succeeded();
@@ -2339,8 +2348,12 @@ impl Engine {
         else {
             return Ok(());
         };
+        let target = InputTarget::Mouse(button);
+        // MouseDown already succeeded on the physical activation edge. Move
+        // that native ownership into `latched` before releasing it, so a
+        // failed MouseUp remains visible to the common recovery/shutdown path.
         let button = map_button(button);
-        self.inject_mouse_button(button, ButtonAction::Release, backend)?;
+        self.release_primed_mouse_button(target, button, backend)?;
         if action == ButtonAction::DoubleClick {
             // MouseDown was sent on the activation edge and MouseUp above
             // completed the first click. One complete click now produces the
@@ -2358,8 +2371,21 @@ impl Engine {
         if pending.short_action.is_some()
             && let InputTarget::Mouse(button) = pending.target
         {
-            self.inject_mouse_button(map_button(button), ButtonAction::Release, backend)?;
+            let target = InputTarget::Mouse(button);
+            self.release_primed_mouse_button(target, map_button(button), backend)?;
         }
+        Ok(())
+    }
+
+    fn release_primed_mouse_button(
+        &mut self,
+        target: InputTarget,
+        button: MouseButton,
+        backend: &mut dyn Backend,
+    ) -> Result<(), String> {
+        self.latched.insert(target.clone());
+        self.inject_mouse_button(button, ButtonAction::Release, backend)?;
+        self.latched.remove(&target);
         Ok(())
     }
 
@@ -2375,15 +2401,7 @@ impl Engine {
         errors.into_result()
     }
 
-    fn cancel_pending_long_press_targets(&mut self, targets: &[InputTarget]) {
-        self.pending_long_press_toggles.retain(|pending| {
-            !targets
-                .iter()
-                .any(|target| Self::targets_match(target, &pending.target))
-        });
-    }
-
-    fn unprimed_toggle_targets(&mut self, targets: &[InputTarget]) -> TargetBuffer {
+    fn transfer_pending_long_press_targets(&mut self, targets: &[InputTarget]) -> TargetBuffer {
         let mut primed = TargetBuffer::new();
         self.pending_long_press_toggles.retain(|pending| {
             let matched = targets
@@ -2395,6 +2413,11 @@ impl Engine {
             !matched
         });
         self.latched.extend(primed.iter().cloned());
+        primed
+    }
+
+    fn unprimed_toggle_targets(&mut self, targets: &[InputTarget]) -> TargetBuffer {
+        let primed = self.transfer_pending_long_press_targets(targets);
         targets
             .iter()
             .filter(|target| {
@@ -2821,13 +2844,13 @@ impl Engine {
                 Ok(true)
             }
             Binding::Press(targets) => {
-                self.cancel_pending_long_press_targets(targets);
+                self.transfer_pending_long_press_targets(targets);
                 self.press_targets(targets, backend)?;
                 self.refresh_overlay(backend)?;
                 Ok(true)
             }
             Binding::Release(targets) => {
-                self.cancel_pending_long_press_targets(targets);
+                self.transfer_pending_long_press_targets(targets);
                 self.release_targets(targets, true, backend)?;
                 self.refresh_overlay(backend)?;
                 Ok(true)
@@ -3317,6 +3340,7 @@ mod tests {
         /// Synthetic keystrokes, in order.
         sent: Vec<(String, KeyState)>,
         fail_next_key_up: bool,
+        fail_next_mouse_release: bool,
     }
 
     struct FakeBackend {
@@ -3403,6 +3427,10 @@ mod tests {
                 return Err("SendInput blocked by UIPI".into());
             }
             let mut log = self.log.lock().unwrap();
+            if a == ButtonAction::Release && log.fail_next_mouse_release {
+                log.fail_next_mouse_release = false;
+                return Err("injected mouse release failure".into());
+            }
             log.buttons.push((b, a));
             log.timeline.push("mouse");
             if a == ButtonAction::Click {
@@ -5451,6 +5479,30 @@ mod tests {
     }
 
     #[test]
+    fn due_pending_mouse_press_releases_when_its_physical_key_disappeared() {
+        let mut engine = engine_with_normal_binding("x", "left_click");
+        engine.active = ModeId::normal();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+
+        engine
+            .handle_backend_event(key_down("x"), &mut backend)
+            .unwrap();
+        engine.pressed.remove(&Key::new("x").unwrap());
+        engine.pending_long_press_toggles[0].fires_at = Instant::now();
+        engine.fire_due_long_press_toggles(&mut backend).unwrap();
+
+        assert!(engine.pending_long_press_toggles.is_empty());
+        assert!(engine.latched.is_empty());
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Left, ButtonAction::Release),
+            ]
+        );
+    }
+
+    #[test]
     fn one_long_press_cancels_other_pending_keys_for_the_same_button() {
         let mut config = Config::default();
         config.normal.bindings.clear();
@@ -5761,7 +5813,7 @@ mod tests {
     }
 
     #[test]
-    fn reload_completes_and_capture_loss_cancels_pending_mouse_presses() {
+    fn apply_config_completes_and_capture_loss_cancels_pending_mouse_presses() {
         let mut engine = engine_with_normal_binding("x", "left_click");
         engine.active = ModeId::normal();
         let (mut backend, log) = FakeBackend::new(Vec::new());
@@ -5800,6 +5852,32 @@ mod tests {
                 (MouseButton::Right, ButtonAction::Press),
                 (MouseButton::Right, ButtonAction::Release),
             ]
+        );
+    }
+
+    #[test]
+    fn failed_pending_mouse_release_remains_owned_until_recovery_retries_it() {
+        let mut engine = engine_with_normal_binding("x", "left_click");
+        engine.active = ModeId::normal();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+
+        engine
+            .handle_backend_event(key_down("x"), &mut backend)
+            .unwrap();
+        log.lock().unwrap().fail_next_mouse_release = true;
+        engine
+            .handle_backend_event(key_up("x"), &mut backend)
+            .unwrap();
+
+        assert!(engine.pending_long_press_toggles.is_empty());
+        assert!(engine.latched.is_empty());
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Left, ButtonAction::Release),
+            ],
+            "the failed first MouseUp must be retried by input recovery"
         );
     }
 
@@ -6618,6 +6696,75 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn parameterless_toggle_consumes_every_unbound_partner_edge() {
+        let mut engine = engine_with_normal_binding("t", "toggle");
+        engine.active = ModeId::normal();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+
+        for event in [
+            key_down("t"),
+            key_down("e"),
+            key_up("e"),
+            key_up("t"),
+            key_down("t"),
+            key_up("t"),
+        ] {
+            engine.handle_backend_event(event, &mut backend).unwrap();
+        }
+
+        let log = log.lock().unwrap();
+        assert_eq!(log.dispositions, [KeyDisposition::Consume; 6]);
+        assert_eq!(
+            log.sent,
+            [("e".into(), KeyState::Down), ("e".into(), KeyState::Up)]
+        );
+        assert!(engine.latched.is_empty());
+    }
+
+    #[test]
+    fn parameterless_toggle_consumes_a_bound_partner_without_running_its_action() {
+        let mut config = Config::default();
+        config.normal.bindings.clear();
+        config
+            .normal
+            .bindings
+            .insert("t".into(), Binding::Toggle(Vec::new()));
+        config.normal.bindings.insert(
+            "x".into(),
+            Binding::Click(crate::api::binding::Button::Left),
+        );
+        let mut engine = Engine::new(config.clone(), Appearance::Dark);
+        for mode in crate::modes::built_in(&config) {
+            engine.register(mode);
+        }
+        engine.active = ModeId::normal();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+
+        for event in [
+            key_down("t"),
+            key_down("x"),
+            key_up("x"),
+            key_up("t"),
+            key_down("t"),
+            key_up("t"),
+        ] {
+            engine.handle_backend_event(event, &mut backend).unwrap();
+        }
+
+        let log = log.lock().unwrap();
+        assert_eq!(log.dispositions, [KeyDisposition::Consume; 6]);
+        assert_eq!(
+            log.buttons,
+            [
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Left, ButtonAction::Release),
+            ]
+        );
+        assert_eq!(log.clicks, 0, "the partner's click action must not run");
+        assert!(engine.latched.is_empty());
     }
 
     #[test]
@@ -8320,6 +8467,59 @@ mod tests {
         assert_eq!(engine.config.pointer.initial_speed, 456.0);
         assert_eq!(engine.config_store.as_ref().unwrap().path(), explicit_path);
 
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn runtime_reload_cancels_pending_mouse_only_after_candidate_validation() {
+        let directory = std::env::temp_dir().join(format!(
+            "keysteer-runtime-pending-reload-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        let path = directory.join("keysteer.user.toml");
+        let mut engine = engine_with_normal_action("x", Binding::Click(Button::Left));
+        let mut config = engine.config.clone();
+        std::fs::write(&path, config.to_toml().unwrap()).unwrap();
+        let store = ConfigStore::open(&path, &config).unwrap();
+        engine.attach_config_store(store);
+        engine.active = ModeId::normal();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+
+        engine
+            .handle_backend_event(key_down("x"), &mut backend)
+            .unwrap();
+        std::fs::write(&path, "not valid toml = [").unwrap();
+        assert!(engine.reload_config(&mut backend).is_err());
+        assert_eq!(engine.pending_long_press_toggles.len(), 1);
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [(MouseButton::Left, ButtonAction::Press)]
+        );
+
+        config.pointer.initial_speed = 456.0;
+        std::fs::write(&path, config.to_toml().unwrap()).unwrap();
+        engine.reload_config(&mut backend).unwrap();
+        assert!(engine.pending_long_press_toggles.is_empty());
+        assert!(engine.latched.is_empty());
+        assert_eq!(engine.config.pointer.initial_speed, 456.0);
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Left, ButtonAction::Release),
+            ]
+        );
+
+        engine
+            .handle_backend_event(key_up("x"), &mut backend)
+            .unwrap();
+        assert_eq!(log.lock().unwrap().buttons.len(), 2);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

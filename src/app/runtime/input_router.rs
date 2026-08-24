@@ -221,6 +221,24 @@ mod tests {
     }
 
     #[test]
+    fn strict_lookup_prefers_a_specific_chord_over_a_bare_toggle() {
+        let map = CompiledKeymap::compile(
+            vec![
+                ("n".into(), Binding::Toggle(Vec::new())),
+                ("ctrl+n".into(), mode("grid")),
+            ],
+            &BTreeMap::new(),
+        );
+        let n = Key::new("n").unwrap();
+        let ctrl = Key::new("left_ctrl").unwrap();
+
+        assert_eq!(
+            map.lookup_with_specificity_strict(&n, &[ctrl, n.clone()], |_| false),
+            Some((Arc::new(mode("grid")), 2))
+        );
+    }
+
+    #[test]
     fn disabled_binding_is_compiled_so_it_can_block_inheritance() {
         let map = CompiledKeymap::compile(vec![("h".into(), Binding::Disabled)], &BTreeMap::new());
         let h = Key::new("h").unwrap();

@@ -92,6 +92,9 @@ canonical 输出必须能重新 parse。`press/release/toggle` 是合成输入�
 可见的锁定状态。伙伴绑定为 click/double-click 时锁定其鼠标按钮，否则锁定解析出的键盘目标。单独短按激活键
 释放全部现有 latch，单独长按达到 `long_press_toggle_ms` 才锁定激活键自身。Windows 与
 macOS 原生后端把重复的同按钮 `Press` 视为幂等操作，不得注入第二个 mouse-down。
+激活键已经按下时，后到伙伴的 Down/Up 必须在查找和执行伙伴自身 binding 之前被消费；更具体的
+完整 chord 仍优先于裸 `toggle`。运行时 Reload 只在新配置完成解析和验证后取消旧配置的 pending
+长按；无效配置必须保留现有输入状态。
 
 ## 继承和优先级
 
