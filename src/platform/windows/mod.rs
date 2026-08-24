@@ -412,6 +412,10 @@ impl WindowsBackend {
         if let Err(error) = self.release_held_buttons() {
             errors.push("held mouse buttons", error);
         }
+        // Pointer wake follows the overlay session, not the display clock.
+        // Clear it before stopping the hook so a partially failed shutdown
+        // cannot leave process-global tracking enabled for a later backend.
+        hook::set_pointer_wake_enabled(false);
         errors.record("frame clock", self.frame_clock.stop());
         if let Some(hook) = self.hook.as_mut() {
             match hook.stop() {
@@ -631,7 +635,6 @@ impl Backend for WindowsBackend {
     }
 
     fn set_frame_clock(&mut self, active: bool) -> Result<(), String> {
-        hook::set_pointer_wake_enabled(active);
         if active {
             if let Ok(pointer) = input::cursor_position() {
                 self.frame_clock.retarget(pointer.x, pointer.y);
@@ -902,7 +905,25 @@ mod tests {
     #[ignore = "requires an interactive Windows desktop"]
     fn backend_shutdown_stops_vision_and_is_idempotent() -> Result<(), String> {
         let mut backend = WindowsBackend::new()?;
+        hook::set_pointer_wake_enabled(true);
         backend.shutdown_resources()?;
+        assert!(!hook::pointer_wake_enabled());
         backend.shutdown_resources()
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop"]
+    fn stopping_frame_clock_keeps_pointer_wake_enabled_until_dismiss() -> Result<(), String> {
+        let mut backend = WindowsBackend::new()?;
+        backend.start()?;
+        backend.present(Arc::new(OverlayScene::new()))?;
+        assert!(hook::pointer_wake_enabled());
+
+        backend.set_frame_clock(false)?;
+        assert!(hook::pointer_wake_enabled());
+
+        backend.dismiss()?;
+        assert!(!hook::pointer_wake_enabled());
+        backend.shutdown()
     }
 }

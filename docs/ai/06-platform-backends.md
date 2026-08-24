@@ -49,7 +49,9 @@ may open File Explorer instead of preserving the complete URL for the default br
 - `accessibility.rs` 是持久 COM MTA UIA worker，并在 MTA 内复用只读 query plan。
 - `vision.rs` 在 backend ready 后的首次事件轮询派发一次低优先级 OCR discovery，缓存系统语言/尺寸与微信绝对路径/文件标识，探测线程结束前不保留引擎或 helper。每次扫描从快照生成 `None`/`SystemOnly`/`WechatOnly`/`Dual` 内部计划；系统单路不会构造任何微信 bitmap、WIC、PNG、helper、job、pipe 或 reader。WinRT OCR/WIC 使用 generation-owned activation factory，不能依赖跨临时 COM apartment 的投影静态缓存。视觉 coordinator 按请求懒启动；每次扫描只拥有计划需要且可取消、可 join 的 provider，当前与 latest pending generation 完成后 coordinator 退出。`ui_scan.rs` 统一流式发布和空间去重；`wechat_ocr.rs` 只在 generation-scoped 隐藏 helper 中加载可选桥接 DLL。
 - capture 使用 generation 栈上的 `PreparedCapture`，CPU overlay 使用线程绑定 `GdiDibSurface`；两者共用带长度验证的 DIB/DC owner，selected-object guard 通过 Rust 生命周期绑定所属 surface。微信 helper 创建后立即加入 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` job；取消、超时或上下文变化跳过 graceful 等待并终止子进程，reader/pipe/PNG 都在 terminal 前回收。PNG 只写入带独占 owner lock 的进程私有临时目录，启动下一次编码时只清扫确认没有活跃 owner 的同名目录。
-- `frame_clock.rs` 有 DWM 等待 worker，one-slot channel 合并多余帧。
+- `frame_clock.rs` 有 DWM 等待 worker，one-slot channel 合并多余帧。帧时钟只负责移动动画；
+  物理指针 wake 独立跟随 overlay 生命周期，由 `present` 开启、`dismiss` 关闭。停止 H/J/K/L
+  的帧时钟不得关闭仍可见模式的指针跟踪。
 - worker 和 tray 通过 `EventSender` 发 channel，并用自定义 `WM_APP` 唤醒 engine thread。
 - Windows Hook、overlay renderer 和 tray 的 readiness 由 `WorkerJoin` 设置 deadline；平台初始化
   失败必须返回错误，不能在 `recv()` 上无限等待。

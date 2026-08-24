@@ -28,8 +28,9 @@ Engine 另外缓存自己生成的 cursor/indicator 几何。普通指针移动�
 
 Windows 低级鼠标 Hook 是 pointer seqlock 的唯一写者，因此写侧使用 odd/payload/even 的普通
 原子 store 与 Release fence，不再为每个移动执行两次 locked RMW。release 交错微测中每批
-8,000 次写入的 p99 从约 63.1µs 降到 11.1µs；pointer wake 关闭时仍只更新 packed 坐标，
-模式切换继续通过 `Backend::pointer()` 获取权威位置。
+8,000 次写入的 p99 从约 63.1µs 降到 11.1µs；pointer wake 只由 overlay `present/dismiss`
+切换，停止移动帧时钟不会覆盖它。Idle 关闭 wake 后仍只更新 packed 坐标，进入非 Idle 模式
+继续通过 `Backend::pointer()` 获取权威位置。
 
 Normal 的活动方向使用四位 mask，而不是每个显示帧收集一个 `BTreeSet`。移动距离仍由
 真实 elapsed 的解析积分决定；这个优化只消除逐帧堆分配，不改变对向抵消、对角线归一化

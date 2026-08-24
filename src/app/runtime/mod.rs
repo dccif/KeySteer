@@ -3327,6 +3327,7 @@ mod tests {
         scrolls: Vec<(f64, f64)>,
         scenes: Vec<OverlayScene>,
         positions: Vec<(Option<Point>, Option<Point>)>,
+        frame_clock_states: Vec<bool>,
         timeline: Vec<&'static str>,
         dispositions: Vec<KeyDisposition>,
         scans: usize,
@@ -3451,7 +3452,8 @@ mod tests {
             log.sent.push((k.as_str().to_string(), s));
             Ok(())
         }
-        fn set_frame_clock(&mut self, _active: bool) -> Result<(), String> {
+        fn set_frame_clock(&mut self, active: bool) -> Result<(), String> {
+            self.log.lock().unwrap().frame_clock_states.push(active);
             Ok(())
         }
         fn present(&mut self, scene: Arc<OverlayScene>) -> Result<(), String> {
@@ -5066,6 +5068,38 @@ mod tests {
             engine.active_gestures.is_empty(),
             "every tapped held action must receive its release"
         );
+    }
+
+    #[test]
+    fn physical_pointer_after_normal_movement_reanchors_the_next_keyboard_move() {
+        let config = Config::default();
+        let mut engine = Engine::new(config.clone(), Appearance::Dark);
+        for mode in crate::modes::built_in(&config) {
+            engine.register(mode);
+        }
+        let physical = Point::new(200.0, 300.0);
+        let mut script = enter_normal();
+        script.extend([
+            key_down("l"),
+            key_up("l"),
+            BackendEvent::PointerMoved(physical),
+            key_down("h"),
+            key_up("h"),
+        ]);
+        let (mut backend, log) = FakeBackend::new(script);
+
+        engine.run(&mut backend).unwrap();
+
+        let log = log.lock().unwrap();
+        assert_eq!(log.frame_clock_states, [true, false, true, false]);
+        assert!(
+            log.positions
+                .iter()
+                .any(|(cursor, _)| *cursor == Some(physical)),
+            "the dynamic overlay must visit the physical pointer position"
+        );
+        let &(dx, dy) = log.moves.last().expect("second keyboard movement");
+        assert_eq!(engine.cursor, Point::new(physical.x + dx, physical.y + dy));
     }
 
     #[test]

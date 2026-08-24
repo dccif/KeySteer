@@ -342,6 +342,9 @@ impl HookThread {
         // Build canonical shared Key values before the first physical key edge
         // reaches the latency-sensitive hook callback.
         input::prewarm_key_map();
+        // A backend can be recreated in the same process by tests or recovery.
+        // Physical pointer movement stays silent until an overlay is presented.
+        set_pointer_wake_enabled(false);
         // Ensure the engine thread has a message queue before hook callbacks
         // try to wake it with PostThreadMessageW.
         let owner_thread = super::native::prepare_thread_message_queue();
@@ -608,7 +611,7 @@ fn hook_thread(
     EVENT_SINK.with(|current| current.borrow_mut().take());
     WAKE_THREAD.store(0, Ordering::Release);
     HOOK_THREAD.store(0, Ordering::Release);
-    POINTER_PENDING.store(0, Ordering::Release);
+    set_pointer_wake_enabled(false);
 }
 
 fn send_envelope(envelope: Envelope) -> bool {
@@ -699,6 +702,11 @@ pub(super) fn set_pointer_wake_enabled(enabled: bool) {
     if !enabled {
         POINTER_PENDING.store(0, Ordering::Release);
     }
+}
+
+#[cfg(test)]
+pub(super) fn pointer_wake_enabled() -> bool {
+    POINTER_WAKE_ENABLED.load(Ordering::Acquire)
 }
 
 fn mark_pointer_pending() -> bool {
