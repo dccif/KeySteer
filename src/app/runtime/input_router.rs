@@ -64,6 +64,38 @@ impl CompiledKeymap {
         self.lookup_with_modifier_filter(key, pressed, |_| true)
     }
 
+    /// Resolve a binding against an effective held-input set without treating
+    /// unrelated modifiers as a reason to reject a shorter chord.
+    ///
+    /// Parameterless `toggle` uses this after it has taken ownership of its
+    /// companions. The effective set can therefore include synthetic, latched
+    /// keys that are no longer physically held. Returning a borrowed binding
+    /// keeps that tiny path free of `Arc` reference-count traffic.
+    pub fn lookup_ref_with_pressed(
+        &self,
+        key: &Key,
+        mut is_pressed: impl FnMut(&Key) -> bool,
+    ) -> Option<&Binding> {
+        self.find_entry(key, |entry| entry.chord.keys().iter().all(&mut is_pressed))
+            .map(|entry| entry.binding.as_ref())
+    }
+
+    /// Resolve only a pointer-movement binding against a caller-provided
+    /// effective held set. Drag assist uses this to ignore the physical
+    /// modifiers it deliberately forwarded without making click, send or mode
+    /// bindings eligible for the same fallback.
+    pub fn lookup_move_with_pressed(
+        &self,
+        key: &Key,
+        mut is_pressed: impl FnMut(&Key) -> bool,
+    ) -> Option<Arc<Binding>> {
+        self.find_entry(key, |entry| {
+            matches!(entry.binding.as_ref(), Binding::Move(_))
+                && entry.chord.keys().iter().all(&mut is_pressed)
+        })
+        .map(|entry| Arc::clone(&entry.binding))
+    }
+
     /// Match a chord while requiring every held modifier outside that chord
     /// to be owned by KeySteer already. This prevents a bare `h` binding from
     /// stealing an external `Alt+H` shortcut, while a consumed `left_shift`
@@ -98,6 +130,17 @@ impl CompiledKeymap {
         pressed: &[Key],
         modifier_filter: impl Fn(&CompiledBinding) -> bool,
     ) -> Option<(Arc<Binding>, usize)> {
+        self.find_entry(key, |entry| {
+            entry.chord.matches_pressed(pressed) && modifier_filter(entry)
+        })
+        .map(|entry| (Arc::clone(&entry.binding), entry.chord.keys().len()))
+    }
+
+    fn find_entry(
+        &self,
+        key: &Key,
+        mut matches: impl FnMut(&CompiledBinding) -> bool,
+    ) -> Option<&CompiledBinding> {
         let generic = match key.as_str() {
             "left_alt" | "right_alt" => Some("alt"),
             "left_ctrl" | "right_ctrl" => Some("ctrl"),
@@ -110,12 +153,7 @@ impl CompiledKeymap {
             .into_iter()
             .chain(generic.and_then(|name| self.by_activation.get(name)))
             .flatten()
-            .find(|entry| {
-                entry.chord.activation_matches(key)
-                    && entry.chord.matches_pressed(pressed)
-                    && modifier_filter(entry)
-            })
-            .map(|entry| (Arc::clone(&entry.binding), entry.chord.keys().len()))
+            .find(|entry| entry.chord.activation_matches(key) && matches(entry))
     }
 
     pub fn entries(&self) -> Vec<(String, Binding)> {

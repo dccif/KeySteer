@@ -137,9 +137,10 @@ pub enum Binding {
     Press(Vec<InputTarget>),
     /// Release one or more inputs previously held by [`Binding::Press`] or [`Binding::Toggle`].
     Release(Vec<InputTarget>),
-    /// Press unlatched inputs and release latched inputs. An empty list turns
-    /// the activation key into a toggle modifier: companion actions select
-    /// their targets, while a bare activation releases all latched inputs.
+    /// With explicit targets, press unlatched inputs and release latched ones.
+    /// An empty list turns the activation key into a toggle modifier: Normal
+    /// companion actions accumulate their effective targets in the pressed
+    /// state, while a bare activation releases all latched inputs.
     Toggle(Vec<InputTarget>),
     /// Pause an action sequence without blocking the input event loop.
     Wait { min_ms: u64, max_ms: u64 },

@@ -10,9 +10,9 @@ use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use objc2_core_foundation::{CFRetained, CGPoint};
 use objc2_core_graphics::{
     CGAssociateMouseAndMouseCursorPosition, CGError, CGEvent as NativeEvent,
-    CGEventField as NativeEventField, CGEventTapLocation as NativeEventTapLocation,
-    CGEventType as NativeEventType, CGMouseButton as NativeMouseButton, CGScrollEventUnit,
-    CGWarpMouseCursorPosition,
+    CGEventField as NativeEventField, CGEventFlags as NativeEventFlags,
+    CGEventTapLocation as NativeEventTapLocation, CGEventType as NativeEventType,
+    CGMouseButton as NativeMouseButton, CGScrollEventUnit, CGWarpMouseCursorPosition,
 };
 
 use crate::api::command::{ButtonAction, MouseButton};
@@ -23,6 +23,76 @@ use crate::platform::multi_click::ClickTracker;
 /// Tags our synthetic events so the tap can ignore them. Any value works as
 /// long as it is unlikely to collide with another tool's.
 pub const INJECTED_TAG: i64 = 0x4E4D_4B31;
+
+const LEFT_CTRL_DEVICE_FLAG: u64 = 0x0000_0001;
+const LEFT_SHIFT_DEVICE_FLAG: u64 = 0x0000_0002;
+const RIGHT_SHIFT_DEVICE_FLAG: u64 = 0x0000_0004;
+const LEFT_COMMAND_DEVICE_FLAG: u64 = 0x0000_0008;
+const RIGHT_COMMAND_DEVICE_FLAG: u64 = 0x0000_0010;
+const LEFT_OPTION_DEVICE_FLAG: u64 = 0x0000_0020;
+const RIGHT_OPTION_DEVICE_FLAG: u64 = 0x0000_0040;
+const RIGHT_CTRL_DEVICE_FLAG: u64 = 0x0000_2000;
+
+pub(super) const DRAG_MODIFIER_SHIFT: u8 = 1 << 0;
+pub(super) const DRAG_MODIFIER_CONTROL: u8 = 1 << 1;
+pub(super) const DRAG_MODIFIER_OPTION: u8 = 1 << 2;
+pub(super) const DRAG_MODIFIER_COMMAND: u8 = 1 << 3;
+const DRAG_MODIFIER_ALL: u8 =
+    DRAG_MODIFIER_SHIFT | DRAG_MODIFIER_CONTROL | DRAG_MODIFIER_OPTION | DRAG_MODIFIER_COMMAND;
+
+/// Compress the physical left/right modifier state reported by a FlagsChanged
+/// event into the four semantic flags a synthetic mouse-drag event needs.
+/// The hook is the sole writer, so this representation fits in one atomic byte.
+pub(super) fn compact_drag_modifier_flags(flags: u64) -> u8 {
+    let mut compact = 0;
+    if flags
+        & (LEFT_SHIFT_DEVICE_FLAG | RIGHT_SHIFT_DEVICE_FLAG | NativeEventFlags::MaskShift.bits())
+        != 0
+    {
+        compact |= DRAG_MODIFIER_SHIFT;
+    }
+    if flags
+        & (LEFT_CTRL_DEVICE_FLAG | RIGHT_CTRL_DEVICE_FLAG | NativeEventFlags::MaskControl.bits())
+        != 0
+    {
+        compact |= DRAG_MODIFIER_CONTROL;
+    }
+    if flags
+        & (LEFT_OPTION_DEVICE_FLAG
+            | RIGHT_OPTION_DEVICE_FLAG
+            | NativeEventFlags::MaskAlternate.bits())
+        != 0
+    {
+        compact |= DRAG_MODIFIER_OPTION;
+    }
+    if flags
+        & (LEFT_COMMAND_DEVICE_FLAG
+            | RIGHT_COMMAND_DEVICE_FLAG
+            | NativeEventFlags::MaskCommand.bits())
+        != 0
+    {
+        compact |= DRAG_MODIFIER_COMMAND;
+    }
+    compact
+}
+
+fn native_drag_modifier_flags(compact: u8) -> NativeEventFlags {
+    debug_assert_eq!(compact & !DRAG_MODIFIER_ALL, 0);
+    let mut flags = NativeEventFlags::empty();
+    if compact & DRAG_MODIFIER_SHIFT != 0 {
+        flags.insert(NativeEventFlags::MaskShift);
+    }
+    if compact & DRAG_MODIFIER_CONTROL != 0 {
+        flags.insert(NativeEventFlags::MaskControl);
+    }
+    if compact & DRAG_MODIFIER_OPTION != 0 {
+        flags.insert(NativeEventFlags::MaskAlternate);
+    }
+    if compact & DRAG_MODIFIER_COMMAND != 0 {
+        flags.insert(NativeEventFlags::MaskCommand);
+    }
+    flags
+}
 
 pub(super) struct KeyboardInjector {
     source: Result<CGEventSource, String>,
@@ -224,14 +294,31 @@ fn post_mouse_event(spec: MouseEventSpec, at: Point) -> Result<(), String> {
     Ok(())
 }
 
+fn post_drag_event(spec: MouseEventSpec, at: Point, modifier_flags: u8) -> Result<(), String> {
+    let Some(event) = create_mouse_event(spec, at, 0) else {
+        return Err("cannot create a macOS mouse drag event".into());
+    };
+    NativeEvent::set_flags(Some(&event), native_drag_modifier_flags(modifier_flags));
+    NativeEvent::post(NativeEventTapLocation::SessionEventTap, Some(&event));
+    Ok(())
+}
+
 pub fn move_cursor_relative(
     from: Point,
     dx: f64,
     dy: f64,
     held_buttons: u8,
+    drag_modifier_flags: u8,
 ) -> Result<Point, String> {
     let to = Point::new(from.x + dx, from.y + dy);
-    post_mouse_event(movement_event(held_buttons), to)?;
+    let event = movement_event(held_buttons);
+    if held_buttons == 0 {
+        // Ordinary pointer movement keeps its existing path: it neither reads
+        // nor attaches the hook's modifier snapshot.
+        post_mouse_event(event, to)?;
+    } else {
+        post_drag_event(event, to, drag_modifier_flags)?;
+    }
     Ok(to)
 }
 
@@ -465,28 +552,19 @@ pub(super) fn prewarm_key_map() {
 /// Modifier state extracted from a `FlagsChanged` event, since macOS reports
 /// modifiers as a bitmask rather than as key up/down.
 pub fn modifier_is_down(flags: u64, key: &Key) -> bool {
-    // Device-dependent bits distinguish left from right.
-    const LSHIFT: u64 = 0x0000_0002;
-    const RSHIFT: u64 = 0x0000_0004;
-    const LCTRL: u64 = 0x0000_0001;
-    const RCTRL: u64 = 0x0000_2000;
-    const LALT: u64 = 0x0000_0020;
-    const RALT: u64 = 0x0000_0040;
-    const LCMD: u64 = 0x0000_0008;
-    const RCMD: u64 = 0x0000_0010;
     // Device-independent CGEventFlagMask values.
     const CAPS_LOCK: u64 = 0x0001_0000;
     const FN: u64 = 0x0080_0000;
 
     let mask = match key.as_str() {
-        "left_shift" => LSHIFT,
-        "right_shift" => RSHIFT,
-        "left_ctrl" => LCTRL,
-        "right_ctrl" => RCTRL,
-        "left_alt" => LALT,
-        "right_alt" => RALT,
-        "left_win" => LCMD,
-        "right_win" => RCMD,
+        "left_shift" => LEFT_SHIFT_DEVICE_FLAG,
+        "right_shift" => RIGHT_SHIFT_DEVICE_FLAG,
+        "left_ctrl" => LEFT_CTRL_DEVICE_FLAG,
+        "right_ctrl" => RIGHT_CTRL_DEVICE_FLAG,
+        "left_alt" => LEFT_OPTION_DEVICE_FLAG,
+        "right_alt" => RIGHT_OPTION_DEVICE_FLAG,
+        "left_win" => LEFT_COMMAND_DEVICE_FLAG,
+        "right_win" => RIGHT_COMMAND_DEVICE_FLAG,
         "caps_lock" => CAPS_LOCK,
         "fn" => FN,
         _ => return false,
@@ -596,5 +674,52 @@ mod tests {
             &Key::new("caps_lock").unwrap()
         ));
         assert!(modifier_is_down(0x0080_0000, &Key::new("fn").unwrap()));
+    }
+
+    #[test]
+    fn drag_modifiers_compress_both_sides_and_combinations() {
+        for (physical, expected) in [
+            (LEFT_SHIFT_DEVICE_FLAG, DRAG_MODIFIER_SHIFT),
+            (RIGHT_SHIFT_DEVICE_FLAG, DRAG_MODIFIER_SHIFT),
+            (LEFT_CTRL_DEVICE_FLAG, DRAG_MODIFIER_CONTROL),
+            (RIGHT_CTRL_DEVICE_FLAG, DRAG_MODIFIER_CONTROL),
+            (LEFT_OPTION_DEVICE_FLAG, DRAG_MODIFIER_OPTION),
+            (RIGHT_OPTION_DEVICE_FLAG, DRAG_MODIFIER_OPTION),
+            (LEFT_COMMAND_DEVICE_FLAG, DRAG_MODIFIER_COMMAND),
+            (RIGHT_COMMAND_DEVICE_FLAG, DRAG_MODIFIER_COMMAND),
+        ] {
+            assert_eq!(compact_drag_modifier_flags(physical), expected);
+        }
+
+        let physical_combination = LEFT_SHIFT_DEVICE_FLAG
+            | RIGHT_CTRL_DEVICE_FLAG
+            | LEFT_OPTION_DEVICE_FLAG
+            | RIGHT_COMMAND_DEVICE_FLAG;
+        assert_eq!(
+            compact_drag_modifier_flags(physical_combination),
+            DRAG_MODIFIER_ALL
+        );
+        assert_eq!(
+            compact_drag_modifier_flags(
+                NativeEventFlags::MaskShift.bits()
+                    | NativeEventFlags::MaskControl.bits()
+                    | NativeEventFlags::MaskAlternate.bits()
+                    | NativeEventFlags::MaskCommand.bits()
+            ),
+            DRAG_MODIFIER_ALL,
+            "device-independent flags are retained when side bits are unavailable"
+        );
+    }
+
+    #[test]
+    fn compact_drag_modifiers_expand_to_mouse_event_flags() {
+        assert_eq!(
+            native_drag_modifier_flags(DRAG_MODIFIER_ALL),
+            NativeEventFlags::MaskShift
+                | NativeEventFlags::MaskControl
+                | NativeEventFlags::MaskAlternate
+                | NativeEventFlags::MaskCommand
+        );
+        assert!(native_drag_modifier_flags(0).is_empty());
     }
 }

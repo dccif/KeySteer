@@ -118,6 +118,9 @@ item、window 和 display link 都有线程亲和性。
 - frame clock 绑定 overlay cursor view，跨屏后 AppKit 自动跟踪目标显示器 cadence。
 - 高频 Pointer 位置使用原子 seqlock latest-point mailbox；队列忙时只覆盖旧位置，按键和
   capture-loss 仍走各自可靠路径，因此 EventTap callback 不再竞争 `Mutex<Point>`。
+- EventTap 还把当前物理 Shift/Ctrl/Option/Command 压缩为一个 `AtomicU8`；只有 Backend 已持有
+  鼠标按钮并合成 `mouseDragged` 时才读取它并设置 CoreGraphics flags。普通 MouseMoved、点击和
+  双击不读取该状态；capture loss、Hook 停止及 shutdown 都会清零，避免旧修饰键泄漏到后续拖动。
 - cursor/indicator 位置更新直接在禁用隐式动画的事务中修改已有 CALayer frame，不构造
   `NSString`、颜色、路径或完整 scene；隐藏或首帧未完成时由 Engine 回退完整提交。
 - Backend 缓存一个轻量 `CGEventSource`；单键与拥有所有权的组合键批次复用它，批次先验证
@@ -167,6 +170,12 @@ Retina 下快速重绘时文字基线出现单帧纵向抖动。
 - 权限绑定应用 bundle identity；正式用户必须运行打包的 `KeySteer.app`，不能让 Terminal
   代替应用申请权限。
 - `SMAppService` 需要 bundle 上下文，裸二进制不等同正式 `.app` 登录项。
+- macOS 状态项使用固定方形图标槽。登录项可能早于菜单栏 scene 完全就绪，因此在十秒
+  启动稳定窗口内验证 status item 的 button 已挂到原生 window；未挂接时复用 Backend
+  现有 poll 最多重建三次，不增加线程或系统 timer。状态项使用稳定的 autosave identity，
+  并区分用户隐藏和挂接失败；用户隐藏不触发自愈。稳定窗口结束后停止所有检查；恢复期
+  内仍允许显示却始终无法挂接时切换为 Dock 图标，避免进程无入口常驻。shutdown 仍只
+  移除当前唯一 status item。
 
 ## 新增平台的最小边界
 

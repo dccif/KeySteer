@@ -55,3 +55,7 @@ invert_vertical = true
 4. 仍有问题时查看数据目录中的 `keysteer.log`。
 
 因为没开发者签名，未来的升级可能都需要 **重新授权**。
+
+## 菜单栏图标
+
+开机启动时，在系统允许显示的前提下，KeySteer 会在 macOS 菜单栏准备完成后自动确认并恢复未挂接的图标。如果“活动监视器”里能看到 KeySteer，但菜单栏仍没有图标，请在 macOS 26 及以上检查[“系统设置 → 菜单栏”](https://support.apple.com/guide/mac-help/mchlad96d366/mac)中是否允许 KeySteer 显示；系统也可能在菜单栏空间不足时隐藏部分图标。

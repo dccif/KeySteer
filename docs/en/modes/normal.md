@@ -62,14 +62,17 @@ fast_multiplier = 2.0
 
 ## Dragging and holding
 
-`n = "toggle"` controls whether paired input stays pressed. It works with any key or modifier, including `Shift`, `alt`, and `ctrl`.
+`n = "toggle"` can keep any number of companions pressed in either order. Each companion follows its Normal binding: the default `;`, `'`, and `right_shift` bindings hold the left, right, and middle mouse buttons rather than the physical keys. A standalone tap, returning to Normal, or entering Idle releases every held target.
 
 Hold a key bound to a mouse button for `long_press_toggle_ms` to latch that mouse button down; tap `n = "toggle"` to release it.
+
+Set `auto_release_ms` to a non-zero value to finish a modifier-assisted drag without another release key. It applies only to a direct click/double-click binding latched by long press. Once one or more physical Shift/Ctrl/Alt/Win or Command keys are held and passed through, the first real pointer movement starts the delay and every later movement restarts it. When the pointer remains still for that long, KeySteer releases that mouse button without affecting the physically held modifiers. Latches created by explicit `press` or `toggle` actions do not participate.
 
 ```toml
 [normal]
 passthrough_unbound_keys = true
 long_press_toggle_ms = 500 # Set 0 to disable.
+auto_release_ms = 0        # Set 0 to keep manual release.
 ```
 
 ## Custom shortcuts

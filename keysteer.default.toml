@@ -163,11 +163,19 @@ passthrough_unbound_keys = true
 # threshold immediately releases it to complete the click. Reaching the
 # threshold keeps that existing press latched without injecting a click.
 # A parameterless toggle captures any number of companions immediately in
-# either order; its binding key is user-configurable. Holding that key by
-# itself latches the key after this threshold. Releasing a captured physical
-# key does not undo either latch. Set to 0 to use an atomic key-down click and
-# disable both long-press behaviours.
+# either order; each companion follows its Normal binding, so `;`, `'`, and
+# `right_shift` hold the mapped mouse button instead of the physical key.
+# Holding the toggle key by itself latches that key after this threshold.
+# A standalone tap, returning to Normal, or entering Idle releases all held
+# targets. Set to 0 to use an atomic key-down click and disable both long-press
+# behaviours.
 long_press_toggle_ms = 500
+# Optional modifier-drag convenience. This applies only to a direct
+# click/double-click binding latched by long press. While one or more physical
+# Shift/Ctrl/Alt/Win or Command key is held and passed through, the first pointer
+# movement arms the delay and later movement restarts it. Explicit press/toggle
+# latches are unaffected. Set to 0 to keep manual release.
+auto_release_ms = 0
 
 # ---------------------------------------------------------------------------
 # normal — the working mode

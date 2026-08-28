@@ -22,7 +22,7 @@
 | 修改 TOML、按键、继承或持久化 | [配置、按键和持久化](03-configuration.md) |
 | 修改 Mode、插件或 Finish | [内置模式、插件与 Finish](04-modes-and-lifecycle.md) |
 | 修改 UIA、AX、OCR、Vision 或扫描超时 | [UI Hint 扫描链路](05-ui-scanning.md) |
-| 修改原生平台能力 | [Windows 与 macOS 后端](06-platform-backends.md) |
+| 修改原生平台能力、登录项或状态栏生命周期 | [Windows 与 macOS 后端](06-platform-backends.md) |
 | 修改覆盖层、帧时钟或性能 | [覆盖层、帧同步与性能](07-rendering-and-performance.md) |
 | 修改构建、打包、文档或测试 | [构建、打包、文档站与测试](08-build-docs-and-tests.md) |
 | 准备实施跨层改动 | [改动导航与不变量](09-change-guide.md) |

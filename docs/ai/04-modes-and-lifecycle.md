@@ -41,9 +41,19 @@ settings；不能注入输入、创建窗口或直接扫描 UI。
   到期后只把现有按压转交给 latched Toggle，不等待 deadline 才响应，也不先注入完整点击。
   物理键释放不释放已经 Toggle 的鼠标按钮或激活键自身；组合伙伴出现时会取消激活键的自锁 deadline。
   无参数 toggle 的伙伴允许先于激活键按下并立即命中；若伙伴的 Down 已经透传，处理其 Up 后会
-  立即重新注入 Down。激活后的伙伴边沿在执行其自身 binding 前消费；pending MouseDown 的所有权在
+  立即重新注入 Down。伙伴按 Normal 最终语义映射为键盘或鼠标目标，并以幂等 Press 累积；已经
+  latch 的修饰键参与后续完整 chord 查找。激活后的伙伴边沿在执行其自身 binding 前消费；pending MouseDown 的所有权在
   Release、取消和 Reload 清理前先转交给 latched recovery，失败后仍可由恢复或 shutdown 重试。
-  这些路径只使用现有 deadline 和 disposition，不增加 timer、线程或普通按键等待。
+  toggle session 可跨 Grid/UI Hint 等临时定位模式保留；返回 Normal、进入 Idle 或 shutdown 时，
+  pending MouseDown 与全部 latch 走同一反序释放路径。这些路径只使用现有 deadline 和 disposition，
+  不增加 timer、线程或普通按键等待。
+- `normal.auto_release_ms` 只给上述直接 click/double-click 长按产生的鼠标 latch 增加一个可选 owner。
+  候选出现后，Engine 以一个 `u8` 跟踪后续透传的左右 Shift/Ctrl/Alt/Win(Command)；存在至少一个
+  透传修饰键时，首次真实位移建立 deadline，后续物理移动、MovePointer 或 WarpPointer 的有效位移
+  只重置同一 deadline。完整显式 chord 始终优先；没有完整匹配时才忽略本次透传修饰键并借用
+  Normal 的 `Move`，`none` 与其他动作不会被回退绕过。默认 0 路径不读取时钟，也不增加系统 timer、
+  worker、锁或堆分配。Reload 只取消自动 owner，保留已经存在的手动 latch；离开 Normal、capture loss、
+  Disable 和 shutdown 则走可恢复的 MouseUp 清理。
 
 ### Grid (`src/modes/grid.rs`)
 

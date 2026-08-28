@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use objc2::rc::{Allocated, Retained, autoreleasepool};
 use objc2::runtime::{AnyObject, NSObject};
@@ -12,10 +13,10 @@ use objc2::{
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton,
     NSControlStateValueOff, NSControlStateValueOn, NSFont, NSImage, NSImageView, NSMenu,
-    NSMenuItem, NSPanel, NSStatusBar, NSStatusItem, NSTextField, NSVariableStatusItemLength,
-    NSView, NSWindowStyleMask, NSWorkspace,
+    NSMenuItem, NSPanel, NSSquareStatusItemLength, NSStatusBar, NSStatusItem, NSTextField, NSView,
+    NSWindowStyleMask, NSWorkspace,
 };
-use objc2_foundation::{NSData, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSData, NSPoint, NSRect, NSSize, NSString, ns_string};
 
 use crate::api::Autostart;
 use crate::api::backend::{BackendEvent, UpdateCheckResult, UpdateProgress};
@@ -23,6 +24,12 @@ use crate::api::backend::{BackendEvent, UpdateCheckResult, UpdateProgress};
 use super::EventSender;
 
 static SENDER: OnceLock<Mutex<Option<EventSender>>> = OnceLock::new();
+
+const STATUS_ITEM_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+const STATUS_ITEM_REBUILD_INTERVAL: Duration = Duration::from_secs(3);
+const STATUS_ITEM_RECOVERY_WINDOW: Duration = Duration::from_secs(10);
+const STATUS_ITEM_REBUILDS: u8 = 3;
+const STATUS_ITEM_HIDDEN_CONFIRMATIONS: u8 = 2;
 const STATUS_ICON_PNG: &[u8] = include_bytes!("../../../assets/icons/keysteer-icon.png");
 const STATUS_ICON_SIZE: f64 = 18.0;
 
@@ -145,11 +152,86 @@ impl StatusTarget {
 
 pub struct StatusItem {
     item: Retained<NSStatusItem>,
+    menu: Retained<NSMenu>,
+    icon: Option<Retained<NSImage>>,
     _target: Retained<StatusTarget>,
     toggle_item: Retained<NSMenuItem>,
     autostart_item: Retained<NSMenuItem>,
     update_item: Retained<NSMenuItem>,
     enabled: bool,
+    startup_repair: Option<StartupRepair>,
+    button_configured: bool,
+}
+
+#[derive(Clone, Copy)]
+struct StartupRepair {
+    next_check: Instant,
+    next_rebuild: Instant,
+    deadline: Instant,
+    rebuilds_remaining: u8,
+    hidden_confirmations: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeItemState {
+    Attached,
+    Detached { visible: bool },
+    Hidden,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RepairAction {
+    Wait,
+    Complete,
+    Rebuild,
+    FallBack,
+}
+
+impl StartupRepair {
+    fn observe(&mut self, now: Instant, state: NativeItemState) -> RepairAction {
+        match state {
+            NativeItemState::Hidden => {
+                self.hidden_confirmations = self.hidden_confirmations.saturating_add(1);
+                if self.hidden_confirmations >= STATUS_ITEM_HIDDEN_CONFIRMATIONS {
+                    RepairAction::Complete
+                } else {
+                    self.next_check = now + STATUS_ITEM_CHECK_INTERVAL;
+                    RepairAction::Wait
+                }
+            }
+            NativeItemState::Attached if now >= self.deadline => RepairAction::Complete,
+            NativeItemState::Attached => {
+                self.hidden_confirmations = 0;
+                self.next_check = now + STATUS_ITEM_CHECK_INTERVAL;
+                RepairAction::Wait
+            }
+            NativeItemState::Detached { visible: false } if now >= self.deadline => {
+                RepairAction::Complete
+            }
+            NativeItemState::Detached { visible: false } => {
+                self.hidden_confirmations = 0;
+                self.next_check = now + STATUS_ITEM_CHECK_INTERVAL;
+                RepairAction::Wait
+            }
+            NativeItemState::Detached { visible: true } if now >= self.deadline => {
+                RepairAction::FallBack
+            }
+            NativeItemState::Detached { visible: true }
+                if self.rebuilds_remaining > 0 && now >= self.next_rebuild =>
+            {
+                self.hidden_confirmations = 0;
+                self.rebuilds_remaining -= 1;
+                self.next_rebuild = now + STATUS_ITEM_REBUILD_INTERVAL;
+                self.next_check = now + STATUS_ITEM_CHECK_INTERVAL;
+                RepairAction::Rebuild
+            }
+            NativeItemState::Detached { visible: true } => {
+                self.hidden_confirmations = 0;
+                self.next_check = now + STATUS_ITEM_CHECK_INTERVAL;
+                RepairAction::Wait
+            }
+        }
+    }
 }
 
 impl StatusItem {
@@ -160,7 +242,14 @@ impl StatusItem {
             .unwrap_or_else(|error| error.into_inner()) = Some(sender);
 
         let application = NSApplication::sharedApplication(mtm);
-        application.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+        if !application.setActivationPolicy(NSApplicationActivationPolicy::Accessory)
+            && application.activationPolicy() != NSApplicationActivationPolicy::Accessory
+        {
+            crate::app::logging::report_error(
+                "macos-status-item",
+                "AppKit rejected the accessory activation policy; the menu-bar item may be unavailable",
+            );
+        }
         application.finishLaunching();
 
         let target = StatusTarget::new(mtm);
@@ -196,36 +285,109 @@ impl StatusItem {
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         menu.addItem(&quit_item);
 
-        let status_bar = NSStatusBar::systemStatusBar();
-        let item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
-        if let Some(button) = item.button(mtm) {
-            if let Some(image) = status_icon(STATUS_ICON_SIZE) {
-                button.setImage(Some(&image));
-                button.setTitle(&NSString::from_str(""));
-            } else {
-                let symbol = NSString::from_str("cursorarrow.motionlines");
-                let description = NSString::from_str("KeySteer");
-                if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-                    &symbol,
-                    Some(&description),
-                ) {
-                    button.setImage(Some(&image));
-                    button.setTitle(&NSString::from_str(""));
-                } else {
-                    button.setTitle(&NSString::from_str("KeySteer"));
-                }
-            }
-        }
-        item.setMenu(Some(&menu));
+        let icon = status_icon(STATUS_ICON_SIZE);
+        let (item, button_configured) = create_native_item(mtm, &menu, icon.as_deref());
+        let startup_now = Instant::now();
+        let startup_repair = Some(StartupRepair {
+            next_check: startup_now,
+            next_rebuild: startup_now + Duration::from_secs(1),
+            deadline: startup_now + STATUS_ITEM_RECOVERY_WINDOW,
+            rebuilds_remaining: STATUS_ITEM_REBUILDS,
+            hidden_confirmations: 0,
+        });
 
         Self {
             item,
+            menu,
+            icon,
             _target: target,
             toggle_item,
             autostart_item,
             update_item,
             enabled: true,
+            startup_repair,
+            button_configured,
         }
+    }
+
+    /// Verify the status item after AppKit has completed at least one run-loop
+    /// turn. Login items can start while the menu-bar scene is still attaching;
+    /// a detached item must not be accepted as permanently ready.
+    pub(super) fn maintain_startup(&mut self) {
+        let Some(repair) = self.startup_repair.as_ref() else {
+            return;
+        };
+        let now = Instant::now();
+        if now < repair.next_check {
+            return;
+        }
+        let Some(mut repair) = self.startup_repair.take() else {
+            return;
+        };
+
+        let mtm = self._target.mtm();
+        let mut state = self.native_item_state(mtm);
+        if matches!(state, NativeItemState::Detached { .. }) {
+            NSApplication::sharedApplication(mtm).updateWindows();
+            state = self.native_item_state(mtm);
+        }
+        match repair.observe(now, state) {
+            RepairAction::Wait => self.startup_repair = Some(repair),
+            RepairAction::Complete => {}
+            RepairAction::Rebuild => {
+                self.rebuild_native_item(mtm);
+                self.startup_repair = Some(repair);
+            }
+            RepairAction::FallBack => self.fall_back_to_dock(mtm),
+        }
+    }
+
+    fn fall_back_to_dock(&mut self, mtm: MainThreadMarker) {
+        if let Some(status_bar) = self.item.statusBar() {
+            status_bar.removeStatusItem(&self.item);
+        }
+        let application = NSApplication::sharedApplication(mtm);
+        let dock_available = application
+            .setActivationPolicy(NSApplicationActivationPolicy::Regular)
+            || application.activationPolicy() == NSApplicationActivationPolicy::Regular;
+        crate::app::logging::report_error(
+            "macos-status-item",
+            if dock_available {
+                "the menu-bar item did not attach after startup recovery; showing KeySteer in the Dock instead"
+            } else {
+                "the menu-bar item did not attach after startup recovery, and AppKit rejected the Dock fallback"
+            },
+        );
+    }
+
+    fn native_item_state(&mut self, mtm: MainThreadMarker) -> NativeItemState {
+        let visible = self.item.isVisible();
+        if self.item.statusBar().is_none() {
+            return NativeItemState::Detached { visible };
+        }
+        let Some(button) = self.item.button(mtm) else {
+            return NativeItemState::Detached { visible };
+        };
+        if !self.button_configured {
+            configure_status_button(&button, self.icon.as_deref());
+            self.button_configured = true;
+        }
+        if !visible {
+            NativeItemState::Hidden
+        } else if button.window().is_none() {
+            NativeItemState::Detached { visible }
+        } else {
+            NativeItemState::Attached
+        }
+    }
+
+    fn rebuild_native_item(&mut self, mtm: MainThreadMarker) {
+        if let Some(status_bar) = self.item.statusBar() {
+            status_bar.removeStatusItem(&self.item);
+        }
+        let (item, button_configured) = create_native_item(mtm, &self.menu, self.icon.as_deref());
+        self.item = item;
+        self.button_configured = button_configured;
     }
 
     pub fn set_enabled(&mut self, enabled: bool) {
@@ -402,6 +564,39 @@ fn show_panel(
     })
 }
 
+fn create_native_item(
+    mtm: MainThreadMarker,
+    menu: &NSMenu,
+    icon: Option<&NSImage>,
+) -> (Retained<NSStatusItem>, bool) {
+    let status_bar = NSStatusBar::systemStatusBar();
+    let item = status_bar.statusItemWithLength(NSSquareStatusItemLength);
+    let button_configured = item.button(mtm).is_some_and(|button| {
+        configure_status_button(&button, icon);
+        true
+    });
+    item.setMenu(Some(menu));
+    // Apply persisted visibility only after configuring the default-visible
+    // button, so a later System Settings unhide cannot reveal a blank item.
+    item.setAutosaveName(Some(ns_string!("com.keysteer.app.status-item")));
+    (item, button_configured)
+}
+
+fn configure_status_button(button: &objc2_app_kit::NSStatusBarButton, icon: Option<&NSImage>) {
+    if let Some(image) = icon {
+        button.setImage(Some(image));
+        button.setTitle(&NSString::from_str(""));
+    } else if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+        &NSString::from_str("cursorarrow.motionlines"),
+        Some(&NSString::from_str("KeySteer")),
+    ) {
+        button.setImage(Some(&image));
+        button.setTitle(&NSString::from_str(""));
+    } else {
+        button.setTitle(&NSString::from_str("KeySteer"));
+    }
+}
+
 fn status_icon(size: f64) -> Option<Retained<NSImage>> {
     // SAFETY: the static PNG byte slice is live for the complete call and
     // NSData copies/retains the supplied bytes according to this initializer.
@@ -467,6 +662,152 @@ fn emit(event: BackendEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn startup_repair(start: Instant) -> StartupRepair {
+        StartupRepair {
+            next_check: start,
+            next_rebuild: start + Duration::from_secs(1),
+            deadline: start + STATUS_ITEM_RECOVERY_WINDOW,
+            rebuilds_remaining: STATUS_ITEM_REBUILDS,
+            hidden_confirmations: 0,
+        }
+    }
+
+    #[test]
+    fn startup_repair_watches_the_complete_horizon_for_scene_replacement() {
+        let start = Instant::now();
+        let mut repair = startup_repair(start);
+        assert_eq!(
+            repair.observe(start, NativeItemState::Attached),
+            RepairAction::Wait
+        );
+        assert_eq!(
+            repair.observe(start + Duration::from_secs(2), NativeItemState::Attached),
+            RepairAction::Wait
+        );
+        assert_eq!(
+            repair.observe(
+                start + Duration::from_secs(3),
+                NativeItemState::Detached { visible: true }
+            ),
+            RepairAction::Rebuild
+        );
+        assert_eq!(
+            repair.observe(
+                start + Duration::from_millis(9_900),
+                NativeItemState::Attached
+            ),
+            RepairAction::Wait
+        );
+        assert_eq!(
+            repair.observe(
+                start + STATUS_ITEM_RECOVERY_WINDOW,
+                NativeItemState::Attached
+            ),
+            RepairAction::Complete
+        );
+    }
+
+    #[test]
+    fn startup_repair_recovers_a_cold_login_and_resets_transient_hidden_state() {
+        let start = Instant::now();
+        let mut repair = startup_repair(start);
+        assert_eq!(
+            repair.observe(
+                start + Duration::from_secs(1),
+                NativeItemState::Detached { visible: true }
+            ),
+            RepairAction::Rebuild
+        );
+        assert_eq!(
+            repair.observe(start + Duration::from_secs(2), NativeItemState::Attached),
+            RepairAction::Wait
+        );
+        assert_eq!(
+            repair.observe(start + Duration::from_secs(3), NativeItemState::Hidden),
+            RepairAction::Wait
+        );
+        assert_eq!(repair.hidden_confirmations, 1);
+        assert_eq!(
+            repair.observe(start + Duration::from_secs(4), NativeItemState::Attached),
+            RepairAction::Wait
+        );
+        assert_eq!(repair.hidden_confirmations, 0);
+        assert_eq!(
+            repair.observe(
+                start + STATUS_ITEM_RECOVERY_WINDOW,
+                NativeItemState::Attached
+            ),
+            RepairAction::Complete
+        );
+    }
+
+    #[test]
+    fn startup_repair_respects_hidden_items_and_bounds_native_rebuilds() {
+        let start = Instant::now();
+        let mut hidden = startup_repair(start);
+        assert_eq!(
+            hidden.observe(start, NativeItemState::Hidden),
+            RepairAction::Wait
+        );
+        assert_eq!(
+            hidden.observe(start + STATUS_ITEM_CHECK_INTERVAL, NativeItemState::Hidden),
+            RepairAction::Complete
+        );
+        assert_eq!(hidden.rebuilds_remaining, STATUS_ITEM_REBUILDS);
+
+        let mut detached = startup_repair(start);
+        for seconds in [1, 4, 7] {
+            assert_eq!(
+                detached.observe(
+                    start + Duration::from_secs(seconds),
+                    NativeItemState::Detached { visible: true }
+                ),
+                RepairAction::Rebuild
+            );
+        }
+        assert_eq!(detached.rebuilds_remaining, 0);
+        assert_eq!(
+            detached.observe(
+                start + Duration::from_secs(9),
+                NativeItemState::Detached { visible: true }
+            ),
+            RepairAction::Wait
+        );
+        assert_eq!(
+            detached.observe(
+                start + STATUS_ITEM_RECOVERY_WINDOW,
+                NativeItemState::Detached { visible: true }
+            ),
+            RepairAction::FallBack
+        );
+
+        let mut detached_hidden = startup_repair(start);
+        assert_eq!(
+            detached_hidden.observe(
+                start + Duration::from_secs(1),
+                NativeItemState::Detached { visible: false }
+            ),
+            RepairAction::Wait
+        );
+        assert_eq!(detached_hidden.rebuilds_remaining, STATUS_ITEM_REBUILDS);
+        assert_eq!(
+            detached_hidden.observe(
+                start + Duration::from_secs(2),
+                NativeItemState::Detached { visible: true }
+            ),
+            RepairAction::Rebuild
+        );
+
+        let mut detached_hidden = startup_repair(start);
+        assert_eq!(
+            detached_hidden.observe(
+                start + STATUS_ITEM_RECOVERY_WINDOW,
+                NativeItemState::Detached { visible: false }
+            ),
+            RepairAction::Complete
+        );
+    }
 
     #[test]
     fn menu_actions_use_the_backend_event_channel() {

@@ -64,6 +64,7 @@ jobs:
           test -n "$version"
           cargo update --package keysteer --precise "$version"
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-features startup_repair
       - run: cargo clippy --locked --target x86_64-apple-darwin --all-targets --all-features -- -D warnings
 
   windows:

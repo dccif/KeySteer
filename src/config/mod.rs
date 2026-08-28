@@ -648,6 +648,9 @@ pub struct Normal {
     /// milliseconds to toggle that mouse button. The same threshold lets a
     /// parameterless toggle activation key latch itself. Zero disables both.
     pub long_press_toggle_ms: u64,
+    /// Release a direct click/double-click button latched by long press after
+    /// a physical-modifier drag has remained still. Zero disables it.
+    pub auto_release_ms: u64,
     pub bindings: Bindings,
     pub app_configs: Vec<AppOverride>,
 }
@@ -658,6 +661,7 @@ impl Default for Normal {
             inherits: vec!["hotkeys".into()],
             passthrough_unbound_keys: true,
             long_press_toggle_ms: 500,
+            auto_release_ms: 0,
             bindings: default_normal_bindings(),
             app_configs: Vec::new(),
         }
@@ -1680,6 +1684,9 @@ impl Config {
         if self.normal.long_press_toggle_ms > 60_000 {
             return Err(bad("normal.long_press_toggle_ms must be 0..=60000".into()));
         }
+        if self.normal.auto_release_ms > 60_000 {
+            return Err(bad("normal.auto_release_ms must be 0..=60000".into()));
+        }
 
         for (appearance, colors) in [("light", &self.theme.light), ("dark", &self.theme.dark)] {
             for (name, value) in [
@@ -2659,6 +2666,25 @@ mod tests {
         let invalid = Config::parse("[normal]\nlong_press_toggle_ms = 60001").unwrap();
         let error = invalid.validate().unwrap_err();
         assert!(error.to_string().contains("normal.long_press_toggle_ms"));
+    }
+
+    #[test]
+    fn normal_auto_release_threshold_is_configurable() {
+        assert_eq!(Config::default().normal.auto_release_ms, 0);
+
+        let legacy = Config::parse("[normal]\nlong_press_toggle_ms = 750").unwrap();
+        assert_eq!(legacy.normal.auto_release_ms, 0);
+
+        let configured = Config::parse("[normal]\nauto_release_ms = 750").unwrap();
+        configured.validate().unwrap();
+        assert_eq!(configured.normal.auto_release_ms, 750);
+
+        let dumped = toml::to_string(&Config::default()).unwrap();
+        assert!(dumped.contains("auto_release_ms = 0"));
+
+        let invalid = Config::parse("[normal]\nauto_release_ms = 60001").unwrap();
+        let error = invalid.validate().unwrap_err();
+        assert!(error.to_string().contains("normal.auto_release_ms"));
     }
 
     #[test]

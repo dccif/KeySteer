@@ -98,6 +98,21 @@ fn macos_autostart_registers_the_keysteer_bundle_instead_of_open() {
 }
 
 #[test]
+fn macos_status_item_has_cold_login_recovery_primitives() {
+    let status_item = include_str!("../src/platform/macos/status_item.rs");
+    assert!(status_item.contains("NSSquareStatusItemLength"));
+    assert!(!status_item.contains("NSVariableStatusItemLength"));
+    assert!(status_item.contains("button.window().is_none()"));
+    assert!(status_item.contains("rebuild_native_item"));
+    assert!(status_item.contains("STATUS_ITEM_RECOVERY_WINDOW"));
+    assert!(status_item.contains("com.keysteer.app.status-item"));
+    assert!(status_item.contains("item.setAutosaveName"));
+    assert!(status_item.contains("item.isVisible()"));
+    assert!(!status_item.contains("item.setVisible(true)"));
+    assert!(status_item.contains("NSApplicationActivationPolicy::Regular"));
+}
+
+#[test]
 fn the_shipped_config_reaches_normal_from_idle() {
     let config = shipped();
     assert!(

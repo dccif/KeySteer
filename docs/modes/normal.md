@@ -68,13 +68,17 @@ fast_multiplier = 2.0
 
 ## 拖拽与长按
 
-`n = "toggle"` 可以控制按键的按下还是松开状态。可以和任意按键或者修饰符结合，比如 `Shift` `alt` `ctrl` 等
+`n = "toggle"` 可以让任意数量的伙伴保持按下，伙伴先按或后按都可以。伙伴会先按 Normal 绑定转换为实际目标：例如默认的 `;`、`'`、`right_shift` 会分别保持鼠标左、右、中键，而不是这些物理键。单独短按 `n`、返回 Normal 或进入 Idle 会释放全部目标。
 
 如果持续按住 `鼠标按键` 键达到 `long_press_toggle_ms`，鼠标会进入 `Toggle` 状态，也就是按下模式；点击 `n = "toggle"` 可以释放
+
+如果希望“按住修饰键拖动”结束时少按一次释放键，可将 `auto_release_ms` 设为非零值。它仅适用于直接绑定为 click/double-click 的键经长按形成的鼠标候选；一个或多个物理 Shift/Ctrl/Alt/Win 或 Command 键已按住并透传时，首次实际移动才开始计时，后续移动会重置计时。指针停止达到该时间后只释放该鼠标按钮，不影响你手动按住的修饰键；显式 `press`/`toggle` 创建的 latch 不参与。
+
 ```toml
 [normal]
 passthrough_unbound_keys = true
 long_press_toggle_ms = 500 # 设为 0 可关闭
+auto_release_ms = 0        # 设为 0 保持手动释放
 ```
 
 ## 自定义快捷键

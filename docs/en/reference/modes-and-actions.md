@@ -69,7 +69,7 @@ h = "move_left"
 | `left_press`, `right_press` | Hold a pointer button. |
 | `left_release`, `right_release` | Release a held pointer button. |
 | `toggle_left`, `toggle_right` | Toggle the held state of that pointer button. |
-| `toggle` | Without parameters, toggle a paired input latch regardless of which key was pressed first. A short standalone tap releases all latches; a long standalone hold latches its activating key. |
+| `toggle` | Without parameters, latch each companion's effective Normal keyboard or mouse target regardless of which key was pressed first. A short standalone tap, returning to Normal, or entering Idle releases all latches; a long standalone hold latches its activating key. |
 | `press <target...>` | Hold one or more keys or pointer buttons. |
 | `release <target...>` | Release targets that were previously held. |
 | `toggle <target...>` | Toggle the state of targets. |

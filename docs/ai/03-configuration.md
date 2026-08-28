@@ -27,6 +27,11 @@ KeyUp 立即注入 MouseUp 完成点击；达到阈值后只把已经按下的�
 500ms 也不先注入完整点击。后者把激活键自身锁定为 `Down`。设为 0 时直接鼠标绑定恢复按下沿立即点击，配置允许范围为
 `0..=60000`。
 
+`normal.auto_release_ms` 默认 0，即不启用。它只接受直接 click/double-click 绑定经长按形成的鼠标候选；
+一个或多个物理 Shift/Ctrl/Alt/Win 或 Command 已透传按住时，首次实际位移才建立 deadline，后续位移重置它。
+到期只释放该候选鼠标按钮，不处理物理修饰键、键盘 latch 或显式 `press`/`toggle` 的鼠标 latch。
+配置允许范围为 `0..=60000`；0 路径不应创建 timer 或增加闲置轮询。
+
 `mode_indicator.cursor.{left,middle,right}_pressed_color` 控制合成鼠标按钮被 `press` 或
 `toggle` 锁定时，以及等待短按/长按判定的 click 物理触发键仍按住时的光标圆形颜色；每个
 Mode 的 cursor override 可单独覆盖这些值。提示由按键释放事件清除，不计时。
@@ -87,11 +92,13 @@ TOML 右值可以是字符串，也可以是字符串数组；数组解析为有
 canonical 输出必须能重新 parse。`press/release/toggle` 是合成输入状态管理；
 `precision/slow/fast` 才是移动速度修饰符。
 
-无参数 `toggle` 对所有键使用相同规则。它是严格修饰键匹配的唯一例外，因此伙伴键在激活键
-之前或之后按下都可立即被锁定；已透传的伙伴 KeyUp 后，Engine 重新注入一次 Down 保持 OS
-可见的锁定状态。伙伴绑定为 click/double-click 时锁定其鼠标按钮，否则锁定解析出的键盘目标。单独短按激活键
-释放全部现有 latch，单独长按达到 `long_press_toggle_ms` 才锁定激活键自身。Windows 与
-macOS 原生后端把重复的同按钮 `Press` 视为幂等操作，不得注入第二个 mouse-down。
+无参数 `toggle` 对所有键使用相同规则。伙伴键在激活键之前或之后按下都可立即被锁定；推断伙伴
+目标时使用 Normal 的最终语义表和 `physical pressed ∪ latched keyboard targets`，但不执行伙伴
+原动作。因此 `; = "left_click"` 锁定鼠标左键，完整的 `ctrl+x` 仍优先于裸 `x`，无法解析为
+输入状态的动作才回退到物理键。伙伴只做幂等 Press/累积，同一语义目标不会被第二个伙伴反向释放。
+已透传的伙伴 KeyUp 后，Engine 重新注入一次 Down 保持 OS 可见的锁定状态。单独短按激活键释放
+全部现有 latch，单独长按达到 `long_press_toggle_ms` 才锁定激活键自身；进入 Normal 或 Idle 也会
+结束 toggle session 并释放全部目标。Windows 与 macOS 原生后端不得注入重复的 mouse-down。
 激活键已经按下时，后到伙伴的 Down/Up 必须在查找和执行伙伴自身 binding 之前被消费；更具体的
 完整 chord 仍优先于裸 `toggle`。运行时 Reload 只在新配置完成解析和验证后取消旧配置的 pending
 长按；无效配置必须保留现有输入状态。

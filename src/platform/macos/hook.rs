@@ -84,6 +84,21 @@ type SharedState = Arc<Mutex<TapState>>;
 type SharedPointer = Arc<crate::platform::latest_point_mailbox::LatestPointMailbox>;
 type SharedClickTracker = Arc<Mutex<ClickTracker>>;
 type SharedRunLoop = Arc<Mutex<Option<CFRunLoop>>>;
+type SharedHookSignals = Arc<HookSignals>;
+
+struct HookSignals {
+    capture_loss: AtomicU8,
+    drag_modifier_flags: AtomicU8,
+}
+
+impl HookSignals {
+    const fn new() -> Self {
+        Self {
+            capture_loss: AtomicU8::new(CAPTURE_LOSS_NONE),
+            drag_modifier_flags: AtomicU8::new(0),
+        }
+    }
+}
 
 struct CallbackContext {
     sender: SyncSender<Envelope>,
@@ -91,6 +106,7 @@ struct CallbackContext {
     state: SharedState,
     latest_pointer: SharedPointer,
     click_tracker: SharedClickTracker,
+    signals: SharedHookSignals,
 }
 
 pub struct HookThread {
@@ -101,7 +117,7 @@ pub struct HookThread {
     latest_pointer: SharedPointer,
     stop: Arc<AtomicBool>,
     active: Arc<AtomicBool>,
-    capture_loss: Arc<AtomicU8>,
+    signals: SharedHookSignals,
     run_loop: SharedRunLoop,
     worker: WorkerJoin,
     deferred: VecDeque<BackendEvent>,
@@ -114,7 +130,7 @@ pub struct HookStartup {
     latest_pointer: SharedPointer,
     stop: Arc<AtomicBool>,
     active: Arc<AtomicBool>,
-    capture_loss: Arc<AtomicU8>,
+    signals: SharedHookSignals,
     run_loop: SharedRunLoop,
     worker: Option<WorkerJoin>,
     ready: Receiver<Result<(), String>>,
@@ -133,7 +149,7 @@ struct HookThreadContext {
     mailbox: Arc<crate::platform::disposition_mailbox::DispositionMailbox>,
     stop: Arc<AtomicBool>,
     active: Arc<AtomicBool>,
-    capture_loss: Arc<AtomicU8>,
+    signals: SharedHookSignals,
     run_loop: SharedRunLoop,
     latest_pointer: SharedPointer,
     click_tracker: SharedClickTracker,
@@ -156,8 +172,8 @@ impl HookStartup {
         let thread_stop = Arc::clone(&stop);
         let active = Arc::new(AtomicBool::new(false));
         let thread_active = Arc::clone(&active);
-        let capture_loss = Arc::new(AtomicU8::new(CAPTURE_LOSS_NONE));
-        let thread_capture_loss = Arc::clone(&capture_loss);
+        let signals = Arc::new(HookSignals::new());
+        let thread_signals = Arc::clone(&signals);
         let run_loop = Arc::new(Mutex::new(None));
         let thread_run_loop = Arc::clone(&run_loop);
         let latest_pointer =
@@ -176,7 +192,7 @@ impl HookStartup {
                             mailbox: thread_mailbox,
                             stop: thread_stop,
                             active: thread_active,
-                            capture_loss: thread_capture_loss,
+                            signals: thread_signals,
                             run_loop: thread_run_loop,
                             latest_pointer: thread_pointer,
                             click_tracker,
@@ -193,7 +209,7 @@ impl HookStartup {
             latest_pointer,
             stop,
             active,
-            capture_loss,
+            signals,
             run_loop,
             worker: Some(worker),
             ready: ready_rx,
@@ -223,7 +239,7 @@ impl HookStartup {
                     latest_pointer: Arc::clone(&self.latest_pointer),
                     stop: Arc::clone(&self.stop),
                     active: Arc::clone(&self.active),
-                    capture_loss: Arc::clone(&self.capture_loss),
+                    signals: Arc::clone(&self.signals),
                     run_loop: Arc::clone(&self.run_loop),
                     worker: self
                         .worker
@@ -245,6 +261,7 @@ impl Drop for HookStartup {
         }
         self.stop.store(true, Ordering::Release);
         self.active.store(false, Ordering::Release);
+        self.signals.drag_modifier_flags.store(0, Ordering::Relaxed);
         self.mailbox.cancel_pending();
         let _ = self.activate.try_send(());
         stop_run_loop(&self.run_loop);
@@ -265,6 +282,13 @@ impl HookThread {
         EventSender {
             sender: self.sender.clone(),
         }
+    }
+
+    #[inline]
+    pub(super) fn drag_modifier_flags(&self) -> u8 {
+        // This is a latest-value snapshot with no ordering relationship to any
+        // other state, so Relaxed avoids adding a fence to every drag frame.
+        self.signals.drag_modifier_flags.load(Ordering::Relaxed)
     }
 
     pub fn next_event(&mut self, timeout: Duration) -> Option<BackendEvent> {
@@ -294,7 +318,10 @@ impl HookThread {
     /// queue. Permission removal can happen while that queue is full, so a
     /// normal `try_send` is not reliable enough for state recovery.
     pub fn take_capture_loss(&mut self) -> Option<BackendEvent> {
-        let reason = self.capture_loss.swap(CAPTURE_LOSS_NONE, Ordering::AcqRel);
+        let reason = self
+            .signals
+            .capture_loss
+            .swap(CAPTURE_LOSS_NONE, Ordering::AcqRel);
         if reason == CAPTURE_LOSS_NONE {
             self.reap_finished();
             return None;
@@ -302,6 +329,7 @@ impl HookThread {
 
         self.pending = None;
         self.mailbox.cancel_pending();
+        self.signals.drag_modifier_flags.store(0, Ordering::Relaxed);
         self.latest_pointer.clear();
         while let Ok(envelope) = self.receiver.try_recv() {
             if envelope.generation.is_some()
@@ -351,6 +379,7 @@ impl HookThread {
     pub fn stop(&mut self) -> Result<(), String> {
         self.stop.store(true, Ordering::Release);
         self.active.store(false, Ordering::Release);
+        self.signals.drag_modifier_flags.store(0, Ordering::Relaxed);
         self.mailbox.cancel_pending();
         stop_run_loop(&self.run_loop);
         let result = self.worker.join_timeout(STOP_TIMEOUT);
@@ -386,7 +415,7 @@ fn event_tap_thread(handshake: HookHandshake, context: HookThreadContext) {
         mailbox,
         stop,
         active,
-        capture_loss,
+        signals,
         run_loop: shared_run_loop,
         latest_pointer,
         click_tracker,
@@ -401,6 +430,7 @@ fn event_tap_thread(handshake: HookHandshake, context: HookThreadContext) {
         state: Arc::clone(&state),
         latest_pointer,
         click_tracker,
+        signals: Arc::clone(&signals),
     };
     let callback_mailbox = Arc::clone(&callback.mailbox);
     let tap = match create_tap(move |proxy, event_type, event| {
@@ -476,7 +506,7 @@ fn event_tap_thread(handshake: HookHandshake, context: HookThreadContext) {
                 } else {
                     CAPTURE_LOSS_REPEATED_TIMEOUT
                 };
-                let _ = capture_loss.compare_exchange(
+                let _ = signals.capture_loss.compare_exchange(
                     CAPTURE_LOSS_NONE,
                     reason,
                     Ordering::AcqRel,
@@ -487,6 +517,7 @@ fn event_tap_thread(handshake: HookHandshake, context: HookThreadContext) {
             None => {}
         }
     }
+    signals.drag_modifier_flags.store(0, Ordering::Relaxed);
     active.store(false, Ordering::Release);
     callback_mailbox.cancel_pending();
     run_loop.remove_source(
@@ -539,6 +570,7 @@ fn handle_event(
         state,
         latest_pointer,
         click_tracker,
+        signals,
     } = context;
     if matches!(
         event_type,
@@ -580,6 +612,12 @@ fn handle_event(
         }
         CGEventType::FlagsChanged => {
             let flags = event.get_flags().bits();
+            // The callback is the sole writer. Store only the four semantic
+            // modifier families needed by synthetic dragged events; clicks and
+            // ordinary MouseMoved events never read this atomic.
+            signals
+                .drag_modifier_flags
+                .store(input::compact_drag_modifier_flags(flags), Ordering::Relaxed);
             let code = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
             let Some((key, key_state)) = modifier_transition(state, code, flags) else {
                 return CallbackResult::Keep;
@@ -757,7 +795,7 @@ mod tests {
             ),
             stop: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicBool::new(true)),
-            capture_loss: Arc::new(AtomicU8::new(CAPTURE_LOSS_NONE)),
+            signals: Arc::new(HookSignals::new()),
             run_loop: Arc::new(Mutex::new(None)),
             worker: WorkerJoin::spawn("test hook", std::thread::Builder::new(), || {}).unwrap(),
             deferred: VecDeque::new(),
@@ -785,7 +823,7 @@ mod tests {
             ),
             stop: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicBool::new(true)),
-            capture_loss: Arc::new(AtomicU8::new(CAPTURE_LOSS_NONE)),
+            signals: Arc::new(HookSignals::new()),
             run_loop: Arc::new(Mutex::new(None)),
             worker: WorkerJoin::spawn("test hook", std::thread::Builder::new(), || {}).unwrap(),
             deferred: VecDeque::new(),
@@ -836,7 +874,12 @@ mod tests {
                 generation: Some(1),
             })
             .unwrap();
-        let capture_loss = Arc::new(AtomicU8::new(CAPTURE_LOSS_USER_INPUT));
+        let signals = Arc::new(HookSignals {
+            capture_loss: AtomicU8::new(CAPTURE_LOSS_USER_INPUT),
+            drag_modifier_flags: AtomicU8::new(
+                input::DRAG_MODIFIER_SHIFT | input::DRAG_MODIFIER_COMMAND,
+            ),
+        });
         let latest_pointer =
             Arc::new(crate::platform::latest_point_mailbox::LatestPointMailbox::default());
         latest_pointer.publish(Point::new(1.0, 2.0));
@@ -848,7 +891,7 @@ mod tests {
             latest_pointer,
             stop: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicBool::new(false)),
-            capture_loss,
+            signals: Arc::clone(&signals),
             run_loop: Arc::new(Mutex::new(None)),
             worker: WorkerJoin::spawn("test hook", std::thread::Builder::new(), || {}).unwrap(),
             deferred: VecDeque::new(),
@@ -861,6 +904,11 @@ mod tests {
         assert!(hook.try_next_event().is_none());
         assert!(hook.pending.is_none());
         assert_eq!(hook.latest_pointer.take(), None);
+        assert_eq!(
+            signals.capture_loss.load(Ordering::Acquire),
+            CAPTURE_LOSS_NONE
+        );
+        assert_eq!(signals.drag_modifier_flags.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -899,7 +947,7 @@ mod tests {
             latest_pointer: Arc::clone(&latest_pointer),
             stop: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicBool::new(true)),
-            capture_loss: Arc::new(AtomicU8::new(CAPTURE_LOSS_NONE)),
+            signals: Arc::new(HookSignals::new()),
             run_loop: Arc::new(Mutex::new(None)),
             worker: WorkerJoin::spawn("test hook", std::thread::Builder::new(), || {}).unwrap(),
             deferred: VecDeque::new(),
@@ -933,7 +981,7 @@ mod tests {
             ),
             stop: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicBool::new(true)),
-            capture_loss: Arc::new(AtomicU8::new(CAPTURE_LOSS_NONE)),
+            signals: Arc::new(HookSignals::new()),
             run_loop: Arc::new(Mutex::new(None)),
             worker: WorkerJoin::spawn("test hook", std::thread::Builder::new(), || {}).unwrap(),
             deferred: VecDeque::new(),

@@ -27,6 +27,7 @@ const frequentFields: ConfigField[] = [
   { path: 'pointer.smooth_acceleration', label: '平滑加速', description: '开启 smootherstep S 曲线；关闭为线性', kind: 'boolean' },
   { path: 'normal.passthrough_unbound_keys', label: '未绑定键透传', description: '仅接管完整命中的 KeySteer 绑定；关闭后 Normal 键盘独占', kind: 'boolean' },
   { path: 'normal.long_press_toggle_ms', label: '长按切换', description: '点击键长按多少毫秒后切换持续按下；0 为关闭', kind: 'number', min: 0, max: 5000, step: 50 },
+  { path: 'normal.auto_release_ms', label: '停止拖动后释放', description: '长按点击键并按住物理修饰键拖动；停止多少毫秒后释放；0 为关闭', kind: 'number', min: 0, max: 60000, step: 50 },
   { path: 'grid.max_depth', label: 'Grid 层数', description: '确认目标前需要输入的网格层数', kind: 'number', min: 1, max: 20, step: 1 },
   { path: 'recursive_grid.max_depth', label: '递归上限', description: 'Recursive Grid 最大递归次数', kind: 'number', min: 1, max: 20, step: 1 },
   { path: 'ui_hint.strategy', label: 'UI 扫描', description: 'macOS 可使用视觉或辅助功能树；Windows 自动回退 UIA', kind: 'select', options: [

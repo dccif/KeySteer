@@ -89,6 +89,26 @@ struct PendingLongPressToggle {
     short_action: Option<ButtonAction>,
 }
 
+/// Normal-mode drag state created only by a long-pressed click binding.
+///
+/// Buttons and the eight concrete left/right modifiers fit in two bytes. The
+/// deadline stays empty until a forwarded modifier is held and the pointer
+/// actually moves, so the disabled and awaiting paths never read the clock.
+#[derive(Debug, Default)]
+struct DragAutoRelease {
+    buttons: u8,
+    modifiers: u8,
+    fires_at: Option<Instant>,
+}
+
+impl DragAutoRelease {
+    fn clear(&mut self) {
+        self.buttons = 0;
+        self.modifiers = 0;
+        self.fires_at = None;
+    }
+}
+
 type TargetBuffer = SmallVec<[InputTarget; 8]>;
 
 /// Inputs owned by `press`/`toggle` are a tiny sorted set in practice. Keeping
@@ -582,6 +602,10 @@ pub struct Engine {
     /// configured hold threshold. A short click completes on key-up; firing
     /// delegates only the held target to the latched-input toggle state machine.
     pending_long_press_toggles: SmallVec<[PendingLongPressToggle; 4]>,
+    /// Optional modifier-assisted drag release. This is separate from
+    /// `latched` so explicit press/toggle actions keep their existing manual
+    /// lifetime.
+    drag_auto_release: DragAutoRelease,
     timers: HashMap<String, Timer>,
     scan_owners: HashMap<u64, ModeId>,
     /// Mode that owns native display frames. This can differ from `active`
@@ -643,6 +667,7 @@ impl Engine {
             active_default_toggles: DefaultToggleKeys::default(),
             pending_sequences: Vec::new(),
             pending_long_press_toggles: SmallVec::new(),
+            drag_auto_release: DragAutoRelease::default(),
             timers: HashMap::new(),
             scan_owners: HashMap::new(),
             frame_clock_owner: None,
@@ -862,6 +887,7 @@ impl Engine {
         self.active_default_toggles.clear();
         self.active_gestures.clear();
         self.active_click_indicators.clear();
+        self.drag_auto_release.clear();
         self.modal_stack.clear();
         self.timers.clear();
         if let Err(cancel_error) = self.cancel_all_scans(backend) {
@@ -1235,6 +1261,12 @@ impl Engine {
                 {
                     return Err(error);
                 }
+                let drag_release_result = self.fire_due_drag_auto_release(backend);
+                if let Err(error) = drag_release_result
+                    && !self.recover_from_input_error(&error, backend)
+                {
+                    return Err(error);
+                }
                 let timer_result = self.fire_due_timers(backend);
                 if let Err(error) = timer_result
                     && !self.recover_from_input_error(&error, backend)
@@ -1258,6 +1290,7 @@ impl Engine {
             "cancel pending mouse presses",
             self.cancel_all_pending_long_presses(backend),
         );
+        self.drag_auto_release.clear();
         self.active_click_indicators.clear();
         errors.record("cancel scans", self.cancel_all_scans(backend));
         errors.record("release held inputs", self.release_latched(backend));
@@ -1281,6 +1314,7 @@ impl Engine {
         if self.timers.is_empty()
             && self.pending_sequences.is_empty()
             && self.pending_long_press_toggles.is_empty()
+            && self.drag_auto_release.fires_at.is_none()
         {
             return MAX;
         }
@@ -1298,6 +1332,7 @@ impl Engine {
                     .last()
                     .map(|pending| pending.fires_at),
             )
+            .chain(self.drag_auto_release.fires_at)
             .map(|fires_at| fires_at.saturating_duration_since(now))
             .min()
             .unwrap_or(MAX)
@@ -1329,10 +1364,14 @@ impl Engine {
             // already-held button to the latch; it must not inject a second
             // press. An already-latched button has no short action, so its long
             // press still toggles the latch off here.
-            if toggle.short_action.is_some() {
+            let long_pressed_click = toggle.short_action.is_some();
+            if long_pressed_click {
                 self.latched.insert(toggle.target.clone());
             } else {
                 self.toggle_targets(std::slice::from_ref(&toggle.target), backend)?;
+            }
+            if long_pressed_click && let InputTarget::Mouse(button) = &toggle.target {
+                self.begin_drag_auto_release(*button);
             }
             self.transfer_pending_long_press_targets(std::slice::from_ref(&toggle.target));
             if matches!(&toggle.target, InputTarget::Key(key) if key == &toggle.key)
@@ -1343,6 +1382,86 @@ impl Engine {
             self.refresh_overlay(backend)?;
         }
         Ok(())
+    }
+
+    fn begin_drag_auto_release(&mut self, button: Button) {
+        if self.config.normal.auto_release_ms == 0 || self.active != ModeId::normal() {
+            return;
+        }
+        let button_bit = drag_button_bit(button);
+        if self.drag_auto_release.buttons == 0 {
+            self.drag_auto_release.modifiers = self.forwarded_modifier_mask();
+        }
+        // All auto-managed buttons deliberately share one deadline. A newly
+        // added button must still observe a real pointer movement of its own
+        // generation, so an older button's nearly-expired deadline cannot
+        // release it immediately.
+        if self.drag_auto_release.buttons & button_bit == 0 {
+            self.drag_auto_release.fires_at = None;
+        }
+        self.drag_auto_release.buttons |= button_bit;
+    }
+
+    fn forwarded_modifier_mask(&self) -> u8 {
+        self.pressed.iter().fold(0, |mask, key| {
+            if matches!(
+                self.key_dispositions.get(key),
+                Some(KeyDisposition::Defer | KeyDisposition::Forward)
+            ) {
+                mask | drag_modifier_bit(key).unwrap_or(0)
+            } else {
+                mask
+            }
+        })
+    }
+
+    fn note_drag_pointer_moved(&mut self) {
+        if self.drag_auto_release.buttons == 0 || self.active != ModeId::normal() {
+            return;
+        }
+        // A modifier is required only to start the automatic release. Once
+        // armed, releasing every modifier early leaves the existing deadline
+        // active and later pointer movement continues to extend it.
+        if self.drag_auto_release.fires_at.is_none() && self.drag_auto_release.modifiers == 0 {
+            return;
+        }
+        let delay_ms = self.config.normal.auto_release_ms;
+        if delay_ms == 0 {
+            return;
+        }
+        self.drag_auto_release.fires_at = Some(Instant::now() + Duration::from_millis(delay_ms));
+    }
+
+    fn take_drag_release_targets(&mut self) -> TargetBuffer {
+        let buttons = self.drag_auto_release.buttons;
+        self.drag_auto_release.clear();
+        [Button::Left, Button::Right, Button::Middle]
+            .into_iter()
+            .filter(|button| buttons & drag_button_bit(*button) != 0)
+            .map(InputTarget::Mouse)
+            .collect()
+    }
+
+    fn forget_drag_button(&mut self, button: Button) {
+        self.drag_auto_release.buttons &= !drag_button_bit(button);
+        if self.drag_auto_release.buttons == 0 {
+            self.drag_auto_release.clear();
+        }
+    }
+
+    fn release_drag_auto_release(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
+        let targets = self.take_drag_release_targets();
+        self.release_targets(&targets, false, backend)
+    }
+
+    fn fire_due_drag_auto_release(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
+        let Some(fires_at) = self.drag_auto_release.fires_at else {
+            return Ok(());
+        };
+        if fires_at > Instant::now() {
+            return Ok(());
+        }
+        self.release_drag_auto_release(backend)
     }
 
     fn fire_due_sequences(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
@@ -1436,6 +1555,7 @@ impl Engine {
                 let changed = self.cursor != p;
                 self.cursor = p;
                 if changed {
+                    self.note_drag_pointer_moved();
                     self.trace_lazy(self.config.debug.pointer, "pointer", || {
                         format!("position=({:.1},{:.1})", p.x, p.y)
                     });
@@ -1474,6 +1594,9 @@ impl Engine {
                 self.focused_app = app.clone();
                 self.focused_app_excluded =
                     Self::excluded_app_matches(&self.config, self.focused_app.as_ref());
+                if self.focused_app_excluded {
+                    self.release_drag_auto_release(backend)?;
+                }
                 if profile_changed {
                     self.rebuild_tables();
                     self.trace_binding_tables();
@@ -1558,6 +1681,7 @@ impl Engine {
                     self.pending_sequences.clear();
                     self.cancel_all_pending_long_presses(backend)?;
                     self.active_click_indicators.clear();
+                    self.drag_auto_release.clear();
                     self.release_latched(backend)?;
                     self.activate(ModeId::idle(), None, backend)?;
                     self.hide_overlay(backend)?;
@@ -1652,6 +1776,7 @@ impl Engine {
             self.rebuild_tables();
             None
         };
+        self.drag_auto_release.clear();
         self.notify_config_reloaded(backend)?;
         if let Some(path) = discovered_path {
             crate::log_info!(
@@ -1672,6 +1797,7 @@ impl Engine {
     pub fn apply_config(&mut self, config: Config) -> Result<(), String> {
         config.validate().map_err(|e| e.to_string())?;
         crate::app::logging::set_non_error_enabled(config.debug.enabled);
+        self.drag_auto_release.clear();
         self.config = config;
         self.focused_app_excluded =
             Self::excluded_app_matches(&self.config, self.focused_app.as_ref());
@@ -1774,7 +1900,7 @@ impl Engine {
         // Resolve the key. On press we consult the active mode's table; on
         // release we use the gesture that press started, because the chord no
         // longer matches once the keys are up.
-        let bound = match input.state {
+        let mut bound = match input.state {
             KeyState::Down if input.repeat => {
                 self.active_gestures
                     .get(&input.key)
@@ -1804,14 +1930,39 @@ impl Engine {
             let outcome = self.complete_key_disposition(&input, KeyOutcome::Consumed);
             self.dispose_input(&input, outcome, trace_key, backend)?;
             self.trace_key_resolution(&input, bound.as_ref(), trace_key);
-            if let Err(error) = self.capture_default_toggle_partner(
-                &input.key,
-                bound.as_ref().map(|resolved| resolved.binding.as_ref()),
-                backend,
-            ) {
+            if let Err(error) = self.capture_default_toggle_partner(&input.key, backend) {
                 self.report_action_error(error, backend);
             }
             return Ok(());
+        }
+
+        // During a long-press drag candidate, physical modifiers belong to the
+        // foreground application rather than Normal's own shift/click
+        // bindings. Disposition pairing preserves every forwarded Down/Up,
+        // including arbitrary left/right modifier combinations.
+        if self.update_drag_modifier(&input) {
+            let outcome = self.complete_key_disposition(&input, KeyOutcome::Forwarded);
+            self.dispose_input(&input, outcome, trace_key, backend)?;
+            self.trace_key_resolution(&input, None, trace_key);
+            if let Err(error) = self.finish_default_toggle(completed_default_toggle, backend) {
+                self.report_action_error(error, backend);
+            }
+            self.reassert_latched_key_after_forwarded_release(
+                &input,
+                released_forwarded_key,
+                backend,
+            )?;
+            if display_changed || click_indicator_released {
+                self.refresh_overlay(backend)?;
+            }
+            return Ok(());
+        }
+
+        // Exact configured chords were resolved above. If none matched, only
+        // borrow a bare/custom Normal movement binding while the drag's
+        // forwarded modifiers are held; no other action becomes eligible.
+        if bound.is_none() && input.state == KeyState::Down && !input.repeat {
+            bound = self.drag_move_binding(&input.key);
         }
 
         if let Some(resolved) = bound {
@@ -2208,6 +2359,95 @@ impl Engine {
         }
     }
 
+    fn update_drag_modifier(&mut self, input: &crate::api::input::InputEvent) -> bool {
+        if self.drag_auto_release.buttons == 0 || self.active != ModeId::normal() {
+            return false;
+        }
+        let Some(bit) = drag_modifier_bit(&input.key) else {
+            return false;
+        };
+        match input.state {
+            KeyState::Down => {
+                // A modifier pressed before the drag candidate may already be
+                // consumed by Normal (for example left_shift=slow). Its Down
+                // cannot be retroactively forwarded, so preserve the paired
+                // disposition until the user releases and presses it again.
+                if matches!(
+                    self.key_dispositions.get(&input.key),
+                    Some(KeyDisposition::Consume)
+                ) {
+                    return false;
+                }
+                self.drag_auto_release.modifiers |= bit;
+                true
+            }
+            KeyState::Up => {
+                if self.drag_auto_release.modifiers & bit == 0 {
+                    return false;
+                }
+                self.drag_auto_release.modifiers &= !bit;
+                true
+            }
+        }
+    }
+
+    fn drag_move_binding(&self, key: &Key) -> Option<ResolvedBinding> {
+        if self.active != ModeId::normal()
+            || self.drag_auto_release.buttons == 0
+            || self.drag_auto_release.modifiers == 0
+        {
+            return None;
+        }
+        let ignored_modifiers = self.drag_auto_release.modifiers;
+        let table = self.modes.table(&ModeId::normal())?;
+        // Preserve an explicit binding for the complete physical chord even
+        // when that binding is `none`. `lookup()` intentionally represents
+        // `none` as no action, but drag fallback must not reinterpret that as
+        // permission to run a shorter bare movement binding.
+        if self.normal_binding_chain_matches(key) {
+            return None;
+        }
+        let binding = table.lookup_move_with_pressed(key, |configured| {
+            self.pressed.iter().any(|physical| {
+                if !Self::keys_match(configured, physical) {
+                    return false;
+                }
+                drag_modifier_bit(physical).is_none_or(|bit| ignored_modifiers & bit == 0)
+            })
+        })?;
+        Some(ResolvedBinding {
+            binding,
+            owner: ModeId::normal(),
+        })
+    }
+
+    fn normal_binding_chain_matches(&self, key: &Key) -> bool {
+        self.binding_chain_matches(&ModeId::normal(), key, &mut SmallVec::new())
+    }
+
+    fn binding_chain_matches(
+        &self,
+        owner: &ModeId,
+        key: &Key,
+        visited: &mut SmallVec<[ModeId; 8]>,
+    ) -> bool {
+        if visited.contains(owner) {
+            return false;
+        }
+        visited.push(owner.clone());
+        if self.lookup_with_specificity_in(owner, key).is_some() {
+            return true;
+        }
+        let Some((sources, _, _)) = self.config.inheritance_for(owner.as_str()) else {
+            return false;
+        };
+        sources.iter().any(|source| {
+            Self::source_mode_id(source)
+                .ok()
+                .is_some_and(|source| self.binding_chain_matches(&source, key, visited))
+        })
+    }
+
     fn strict_modifier_matching_enabled(&self) -> bool {
         self.active == ModeId::idle()
             || (self.active == ModeId::normal() && self.config.normal.passthrough_unbound_keys)
@@ -2433,79 +2673,106 @@ impl Engine {
         self.pressed.iter().any(|key| key != activation)
     }
 
+    fn push_unique_toggle_target(targets: &mut TargetBuffer, target: &InputTarget) {
+        if !targets
+            .iter()
+            .any(|current| Self::targets_match(current, target))
+        {
+            targets.push(target.clone());
+        }
+    }
+
+    fn append_toggle_binding_targets(binding: &Binding, targets: &mut TargetBuffer) {
+        match binding {
+            Binding::Click(button) | Binding::DoubleClick(button) => {
+                Self::push_unique_toggle_target(targets, &InputTarget::Mouse(*button));
+            }
+            Binding::Send(chord) => {
+                for key in chord.keys() {
+                    Self::push_unique_toggle_target(targets, &InputTarget::Key(key.clone()));
+                }
+            }
+            Binding::Press(items) | Binding::Release(items) | Binding::Toggle(items)
+                if !items.is_empty() =>
+            {
+                for target in items {
+                    Self::push_unique_toggle_target(targets, target);
+                }
+            }
+            Binding::Sequence(actions) => {
+                for action in actions {
+                    Self::append_toggle_binding_targets(action, targets);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn toggle_partner_targets(key: &Key, binding: Option<&Binding>) -> TargetBuffer {
         let mut targets = TargetBuffer::new();
-        if let Some(Binding::Click(button) | Binding::DoubleClick(button)) = binding {
-            targets.push(InputTarget::Mouse(*button));
-            return targets;
-        }
-        if key.is_modifier() {
-            targets.push(InputTarget::Key(key.clone()));
-            return targets;
-        }
-
-        fn append(binding: &Binding, targets: &mut TargetBuffer) {
-            match binding {
-                Binding::Click(button) | Binding::DoubleClick(button) => {
-                    targets.push(InputTarget::Mouse(*button));
-                }
-                Binding::Send(chord) => {
-                    targets.extend(chord.keys().iter().cloned().map(InputTarget::Key));
-                }
-                Binding::Press(items) | Binding::Release(items) | Binding::Toggle(items)
-                    if !items.is_empty() =>
-                {
-                    targets.extend(items.iter().cloned());
-                }
-                Binding::Sequence(actions) => {
-                    for action in actions {
-                        append(action, targets);
-                    }
-                }
-                _ => {}
-            }
-        }
-
         if let Some(binding) = binding {
-            append(binding, &mut targets);
+            Self::append_toggle_binding_targets(binding, &mut targets);
         }
         if targets.is_empty() {
             targets.push(InputTarget::Key(key.clone()));
         }
-        targets.sort_unstable();
-        targets.dedup();
         targets
+    }
+
+    fn toggle_key_is_held(&self, configured: &Key) -> bool {
+        self.pressed
+            .iter()
+            .any(|physical| Self::keys_match(configured, physical))
+            || self.latched.iter().any(|target| {
+                matches!(target, InputTarget::Key(key) if Self::keys_match(configured, key))
+            })
+    }
+
+    fn normal_toggle_partner_targets(&self, key: &Key) -> TargetBuffer {
+        let binding = self.modes.table(&ModeId::normal()).and_then(|table| {
+            table.lookup_ref_with_pressed(key, |configured| self.toggle_key_is_held(configured))
+        });
+        Self::toggle_partner_targets(key, binding)
+    }
+
+    fn extend_unique_toggle_targets(targets: &mut TargetBuffer, incoming: TargetBuffer) {
+        for target in incoming {
+            if !targets
+                .iter()
+                .any(|current| Self::targets_match(current, &target))
+            {
+                targets.push(target);
+            }
+        }
     }
 
     fn pressed_toggle_targets(&self, activation: &Key) -> TargetBuffer {
         let mut targets = TargetBuffer::new();
         for key in self.pressed.iter().filter(|key| *key != activation) {
-            let resolved = self.lookup(key);
-            targets.extend(Self::toggle_partner_targets(
-                key,
-                resolved.as_ref().map(|item| item.binding.as_ref()),
-            ));
+            Self::extend_unique_toggle_targets(
+                &mut targets,
+                self.normal_toggle_partner_targets(key),
+            );
         }
-        targets.sort_unstable();
-        targets.dedup();
         targets
     }
 
     fn capture_default_toggle_partner(
         &mut self,
         key: &Key,
-        binding: Option<&Binding>,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
-        let targets = Self::toggle_partner_targets(key, binding);
+        let targets = self.normal_toggle_partner_targets(key);
         for used in self.active_default_toggles.values_mut() {
             *used = true;
         }
         self.pending_long_press_toggles.retain(
-            |pending| !matches!(&pending.target, InputTarget::Key(key) if key == &pending.key),
+            |pending| {
+                !matches!(&pending.target, InputTarget::Key(target) if target == &pending.key)
+            },
         );
-        let toggle = self.unprimed_toggle_targets(&targets);
-        self.toggle_targets(&toggle, backend)?;
+        self.transfer_pending_long_press_targets(&targets);
+        self.press_targets(&targets, backend)?;
         self.refresh_overlay(backend)
     }
 
@@ -2860,8 +3127,8 @@ impl Engine {
                     let inferred = self.pressed_toggle_targets(&input.key);
                     let used = !inferred.is_empty();
                     if used {
-                        let toggle = self.unprimed_toggle_targets(&inferred);
-                        self.toggle_targets(&toggle, backend)?;
+                        self.transfer_pending_long_press_targets(&inferred);
+                        self.press_targets(&inferred, backend)?;
                         self.refresh_overlay(backend)?;
                     }
                     if self.pressed.contains(&input.key) {
@@ -2935,6 +3202,13 @@ impl Engine {
         let mut pressed = TargetBuffer::new();
         for target in targets {
             if self.matching_latched_target(target).is_some() {
+                // An explicit `press` or parameterless `toggle` takes over an
+                // already-held auto-drag button without injecting a duplicate
+                // Down. Remove only its automatic owner so the old idle
+                // deadline cannot release the explicit latch later.
+                if let InputTarget::Mouse(button) = target {
+                    self.forget_drag_button(*button);
+                }
                 continue;
             }
             let actual = match target {
@@ -2980,6 +3254,9 @@ impl Engine {
             match Self::inject_target(&actual, KeyState::Up, backend) {
                 Ok(()) => {
                     self.latched.remove(&actual);
+                    if let InputTarget::Mouse(button) = &actual {
+                        self.forget_drag_button(*button);
+                    }
                 }
                 Err(error) => errors.push(format!("release {actual:?}"), error),
             }
@@ -3037,6 +3314,29 @@ impl Engine {
     fn release_latched(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
         let held: TargetBuffer = self.latched.iter().cloned().collect();
         self.release_targets(&held, false, backend)
+    }
+
+    fn release_toggle_session_for_safe_mode(
+        &mut self,
+        backend: &mut dyn Backend,
+    ) -> Result<(), String> {
+        // A pending ordinary mouse binding already owns a native MouseDown.
+        // Transfer that ownership to the common latch set before clearing the
+        // deadline, so one reverse-order release path handles every target and
+        // retains any failed MouseUp/KeyUp for recovery or shutdown retry.
+        for pending in std::mem::take(&mut self.pending_long_press_toggles) {
+            if pending.short_action.is_some() {
+                self.latched.insert(pending.target);
+            }
+        }
+        self.active_default_toggles.clear();
+        self.active_click_indicators.clear();
+        self.drag_auto_release.clear();
+        self.release_latched(backend)
+    }
+
+    fn releases_toggle_session_on_entry(target: &ModeId) -> bool {
+        matches!(target.as_str(), "normal" | "idle")
     }
 
     fn send_chord(&mut self, chord: &KeyChord, backend: &mut dyn Backend) -> Result<(), String> {
@@ -3165,6 +3465,15 @@ impl Engine {
         if target == self.active || !self.modes.contains_key(&target) {
             return Ok(());
         }
+        if self.active == ModeId::normal()
+            && target != ModeId::normal()
+            && !Self::releases_toggle_session_on_entry(&target)
+        {
+            self.release_drag_auto_release(backend)?;
+        }
+        if Self::releases_toggle_session_on_entry(&target) {
+            self.release_toggle_session_for_safe_mode(backend)?;
+        }
         let previous = self.active.clone();
         self.dispatch(ModeEvent::Suspended, backend)?;
         self.modal_stack.push(previous.clone());
@@ -3173,9 +3482,19 @@ impl Engine {
     }
 
     fn pop_mode(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
-        let Some(previous) = self.modal_stack.pop() else {
+        let Some(previous) = self.modal_stack.last().cloned() else {
             return Ok(());
         };
+        if self.active == ModeId::normal()
+            && previous != ModeId::normal()
+            && !Self::releases_toggle_session_on_entry(&previous)
+        {
+            self.release_drag_auto_release(backend)?;
+        }
+        if Self::releases_toggle_session_on_entry(&previous) {
+            self.release_toggle_session_for_safe_mode(backend)?;
+        }
+        self.modal_stack.pop();
         let current = self.active.clone();
         self.dispatch(ModeEvent::Deactivated, backend)?;
         self.cancel_scans_for_owner(&current, backend)?;
@@ -3200,6 +3519,16 @@ impl Engine {
             return Ok(());
         }
 
+        if self.active == ModeId::normal()
+            && target != ModeId::normal()
+            && !Self::releases_toggle_session_on_entry(&target)
+        {
+            self.release_drag_auto_release(backend)?;
+        }
+        if target != self.active && Self::releases_toggle_session_on_entry(&target) {
+            self.release_toggle_session_for_safe_mode(backend)?;
+        }
+
         self.trace_lazy(self.config.debug.modes, "mode", || {
             format!("switch {} -> {target}, previous={previous:?}", self.active)
         });
@@ -3207,9 +3536,9 @@ impl Engine {
         if target != self.active {
             self.pending_sequences.clear();
             self.active_default_toggles.clear();
-            // `latched` belongs to the engine and intentionally survives mode
-            // and screen changes. Only physical held gestures are owned by the
-            // outgoing mode and need a synthetic release here.
+            // Toggle state may cross temporary targeting modes, but entry into
+            // Normal or Idle released it above. Physical held gestures remain
+            // owned by the outgoing mode and need a synthetic release here.
             // Deliver the release of anything still held, so the outgoing mode
             // can stop its timers rather than moving the pointer forever.
             let pending: Vec<(Key, ActiveGesture)> = std::mem::take(&mut self.active_gestures)
@@ -3301,6 +3630,29 @@ fn map_button(button: crate::api::binding::Button) -> MouseButton {
         crate::api::binding::Button::Right => MouseButton::Right,
         crate::api::binding::Button::Middle => MouseButton::Middle,
     }
+}
+
+const fn drag_button_bit(button: Button) -> u8 {
+    match button {
+        Button::Left => 1 << 0,
+        Button::Right => 1 << 1,
+        Button::Middle => 1 << 2,
+    }
+}
+
+fn drag_modifier_bit(key: &Key) -> Option<u8> {
+    let index = match key.as_str() {
+        "left_shift" => 0,
+        "right_shift" => 1,
+        "left_ctrl" => 2,
+        "right_ctrl" => 3,
+        "left_alt" => 4,
+        "right_alt" => 5,
+        "left_win" => 6,
+        "right_win" => 7,
+        _ => return None,
+    };
+    Some(1 << index)
 }
 
 #[cfg(test)]
@@ -5469,6 +5821,534 @@ mod tests {
         }
     }
 
+    fn drag_auto_release_engine() -> Engine {
+        let mut config = Config::default();
+        config.normal.auto_release_ms = 300;
+        let mut engine = Engine::new(config.clone(), Appearance::Dark);
+        for mode in crate::modes::built_in(&config) {
+            engine.register(mode);
+        }
+        engine.active = ModeId::normal();
+        engine.cursor = Point::new(400.0, 300.0);
+        engine.screens = vec![Screen {
+            bounds: Rect::new(0.0, 0.0, 1_000.0, 800.0),
+            work_area: Rect::new(0.0, 0.0, 1_000.0, 800.0),
+            is_primary: true,
+            scale: 1.0,
+            name: None,
+        }];
+        engine
+    }
+
+    fn latch_drag_button(engine: &mut Engine, key: &str, backend: &mut dyn Backend) {
+        engine.handle_backend_event(key_down(key), backend).unwrap();
+        engine
+            .pending_long_press_toggles
+            .last_mut()
+            .expect("pending long press")
+            .fires_at = Instant::now();
+        engine.fire_due_long_press_toggles(backend).unwrap();
+        engine.handle_backend_event(key_up(key), backend).unwrap();
+    }
+
+    #[test]
+    fn drag_auto_release_requires_a_forwarded_modifier_and_real_movement() {
+        let mut engine = drag_auto_release_engine();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+        latch_drag_button(&mut engine, ";", &mut backend);
+
+        assert_eq!(
+            engine.drag_auto_release.buttons,
+            drag_button_bit(Button::Left)
+        );
+        assert!(engine.drag_auto_release.fires_at.is_none());
+
+        engine
+            .execute([Command::MovePointer { dx: 10.0, dy: 0.0 }], &mut backend)
+            .unwrap();
+        assert!(
+            engine.drag_auto_release.fires_at.is_none(),
+            "movement without a forwarded modifier must keep manual release"
+        );
+
+        engine
+            .handle_backend_event(key_down("left_ctrl"), &mut backend)
+            .unwrap();
+        assert_ne!(engine.drag_auto_release.modifiers, 0);
+        assert!(engine.drag_auto_release.fires_at.is_none());
+
+        engine
+            .handle_backend_event(BackendEvent::PointerMoved(engine.cursor), &mut backend)
+            .unwrap();
+        engine
+            .execute(
+                [Command::WarpPointer {
+                    x: engine.cursor.x,
+                    y: engine.cursor.y,
+                }],
+                &mut backend,
+            )
+            .unwrap();
+        assert!(
+            engine.drag_auto_release.fires_at.is_none(),
+            "a coordinate report or warp without displacement must not arm release"
+        );
+
+        engine
+            .handle_backend_event(
+                BackendEvent::PointerMoved(Point::new(450.0, 300.0)),
+                &mut backend,
+            )
+            .unwrap();
+        assert!(engine.drag_auto_release.fires_at.is_some());
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [(MouseButton::Left, ButtonAction::Press)]
+        );
+    }
+
+    #[test]
+    fn drag_auto_release_forwards_multiple_modifiers_and_moves_with_a_bare_binding() {
+        let mut engine = drag_auto_release_engine();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+        latch_drag_button(&mut engine, ";", &mut backend);
+
+        const MODIFIERS: [&str; 8] = [
+            "left_shift",
+            "right_shift",
+            "left_ctrl",
+            "right_ctrl",
+            "left_alt",
+            "right_alt",
+            "left_win",
+            "right_win",
+        ];
+        for key in MODIFIERS {
+            engine
+                .handle_backend_event(key_down(key), &mut backend)
+                .unwrap();
+        }
+        assert_eq!(engine.drag_auto_release.modifiers.count_ones(), 8);
+
+        engine
+            .handle_backend_event(key_down("h"), &mut backend)
+            .unwrap();
+        engine
+            .handle_backend_event(key_up("h"), &mut backend)
+            .unwrap();
+        assert!(
+            !log.lock().unwrap().moves.is_empty(),
+            "forwarded modifiers must not hide the effective Normal movement binding"
+        );
+        assert!(engine.drag_auto_release.fires_at.is_some());
+
+        engine
+            .handle_backend_event(key_up("left_alt"), &mut backend)
+            .unwrap();
+        assert_eq!(engine.drag_auto_release.modifiers.count_ones(), 7);
+        for key in MODIFIERS.into_iter().filter(|key| *key != "left_alt") {
+            engine
+                .handle_backend_event(key_up(key), &mut backend)
+                .unwrap();
+        }
+        assert_eq!(engine.drag_auto_release.modifiers, 0);
+        assert!(
+            engine.drag_auto_release.fires_at.is_some(),
+            "an armed deadline survives an early release of every modifier"
+        );
+
+        engine.drag_auto_release.fires_at = Some(Instant::now());
+        engine
+            .handle_backend_event(
+                BackendEvent::PointerMoved(Point::new(430.0, 300.0)),
+                &mut backend,
+            )
+            .unwrap();
+        assert!(
+            engine
+                .drag_auto_release
+                .fires_at
+                .is_some_and(|deadline| deadline > Instant::now()),
+            "movement keeps resetting an already-armed deadline after every modifier is up"
+        );
+
+        engine.drag_auto_release.fires_at = Some(Instant::now());
+        engine.fire_due_drag_auto_release(&mut backend).unwrap();
+        assert!(engine.drag_auto_release.fires_at.is_none());
+        assert!(!engine.latched.contains(&InputTarget::Mouse(Button::Left)));
+
+        let log = log.lock().unwrap();
+        assert_eq!(
+            log.buttons,
+            [
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Left, ButtonAction::Release),
+            ]
+        );
+        assert_eq!(log.clicks, 0);
+        assert_eq!(
+            log.dispositions
+                .iter()
+                .filter(|disposition| **disposition == KeyDisposition::Forward)
+                .count(),
+            16,
+            "every concrete modifier Down/Up pair must be forwarded"
+        );
+    }
+
+    #[test]
+    fn drag_auto_release_keeps_specific_modifier_chords_ahead_of_move_fallback() {
+        let mut engine = drag_auto_release_engine();
+        engine
+            .config
+            .normal
+            .bindings
+            .insert("ctrl+shift+h".into(), Binding::parse("send home").unwrap());
+        engine.rebuild_tables();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+        latch_drag_button(&mut engine, ";", &mut backend);
+
+        engine
+            .handle_backend_event(key_down("left_ctrl"), &mut backend)
+            .unwrap();
+        engine
+            .handle_backend_event(key_down("left_shift"), &mut backend)
+            .unwrap();
+        engine
+            .handle_backend_event(key_down("h"), &mut backend)
+            .unwrap();
+        engine
+            .handle_backend_event(key_up("h"), &mut backend)
+            .unwrap();
+
+        let log = log.lock().unwrap();
+        assert!(log.moves.is_empty());
+        assert!(log.sent.contains(&("home".into(), KeyState::Down)));
+        assert!(log.sent.contains(&("home".into(), KeyState::Up)));
+    }
+
+    #[test]
+    fn drag_auto_release_respects_an_exact_disabled_chord() {
+        let mut engine = drag_auto_release_engine();
+        engine
+            .config
+            .normal
+            .bindings
+            .insert("ctrl+h".into(), Binding::Disabled);
+        engine.rebuild_tables();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+        latch_drag_button(&mut engine, ";", &mut backend);
+
+        engine
+            .handle_backend_event(key_down("left_ctrl"), &mut backend)
+            .unwrap();
+        engine
+            .handle_backend_event(key_down("h"), &mut backend)
+            .unwrap();
+        engine
+            .handle_backend_event(key_up("h"), &mut backend)
+            .unwrap();
+
+        assert!(
+            log.lock().unwrap().moves.is_empty(),
+            "an explicit `none` chord must not fall back to the bare movement binding"
+        );
+    }
+
+    #[test]
+    fn drag_auto_release_respects_a_disabled_chord_from_normal_inheritance() {
+        let mut engine = drag_auto_release_engine();
+        engine
+            .config
+            .hotkeys
+            .insert("ctrl+h".into(), Binding::Disabled);
+        engine.rebuild_tables();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+        latch_drag_button(&mut engine, ";", &mut backend);
+
+        engine
+            .handle_backend_event(key_down("left_ctrl"), &mut backend)
+            .unwrap();
+        engine
+            .handle_backend_event(key_down("h"), &mut backend)
+            .unwrap();
+        engine
+            .handle_backend_event(key_up("h"), &mut backend)
+            .unwrap();
+
+        assert!(
+            log.lock().unwrap().moves.is_empty(),
+            "an inherited `none` chord must also block bare movement fallback"
+        );
+    }
+
+    #[test]
+    fn drag_auto_release_releases_every_long_pressed_click_candidate() {
+        let mut engine = drag_auto_release_engine();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+        latch_drag_button(&mut engine, ";", &mut backend);
+        latch_drag_button(&mut engine, "'", &mut backend);
+        assert_eq!(engine.drag_auto_release.buttons.count_ones(), 2);
+
+        engine
+            .handle_backend_event(key_down("left_ctrl"), &mut backend)
+            .unwrap();
+        engine
+            .handle_backend_event(
+                BackendEvent::PointerMoved(Point::new(420.0, 300.0)),
+                &mut backend,
+            )
+            .unwrap();
+        engine.drag_auto_release.fires_at = Some(Instant::now());
+        engine.fire_due_drag_auto_release(&mut backend).unwrap();
+
+        assert!(engine.latched.is_empty());
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Right, ButtonAction::Press),
+                (MouseButton::Right, ButtonAction::Release),
+                (MouseButton::Left, ButtonAction::Release),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_new_drag_button_waits_for_movement_instead_of_reusing_an_old_deadline() {
+        let mut engine = drag_auto_release_engine();
+        let (mut backend, _) = FakeBackend::new(Vec::new());
+        latch_drag_button(&mut engine, ";", &mut backend);
+        engine
+            .handle_backend_event(key_down("left_ctrl"), &mut backend)
+            .unwrap();
+        engine
+            .handle_backend_event(
+                BackendEvent::PointerMoved(Point::new(420.0, 300.0)),
+                &mut backend,
+            )
+            .unwrap();
+        engine.drag_auto_release.fires_at = Some(Instant::now());
+        engine
+            .handle_backend_event(key_up("left_ctrl"), &mut backend)
+            .unwrap();
+
+        latch_drag_button(&mut engine, "'", &mut backend);
+
+        assert_eq!(engine.drag_auto_release.buttons.count_ones(), 2);
+        assert!(
+            engine.drag_auto_release.fires_at.is_none(),
+            "a newly owned button must not inherit a nearly-expired deadline"
+        );
+        engine.fire_due_drag_auto_release(&mut backend).unwrap();
+        assert!(engine.latched.contains(&InputTarget::Mouse(Button::Left)));
+        assert!(engine.latched.contains(&InputTarget::Mouse(Button::Right)));
+
+        engine
+            .handle_backend_event(key_down("left_ctrl"), &mut backend)
+            .unwrap();
+        engine
+            .handle_backend_event(
+                BackendEvent::PointerMoved(Point::new(440.0, 300.0)),
+                &mut backend,
+            )
+            .unwrap();
+        assert!(engine.drag_auto_release.fires_at.is_some());
+        engine.drag_auto_release.fires_at = Some(Instant::now());
+        engine.fire_due_drag_auto_release(&mut backend).unwrap();
+        assert!(!engine.latched.contains(&InputTarget::Mouse(Button::Left)));
+        assert!(!engine.latched.contains(&InputTarget::Mouse(Button::Right)));
+    }
+
+    #[test]
+    fn explicit_press_takes_over_an_existing_auto_drag_button() {
+        let mut engine = drag_auto_release_engine();
+        engine
+            .config
+            .normal
+            .bindings
+            .insert("ctrl+x".into(), Binding::parse("press mouse_left").unwrap());
+        engine.rebuild_tables();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+        latch_drag_button(&mut engine, ";", &mut backend);
+        latch_drag_button(&mut engine, "'", &mut backend);
+        engine
+            .handle_backend_event(key_down("left_ctrl"), &mut backend)
+            .unwrap();
+        engine
+            .handle_backend_event(
+                BackendEvent::PointerMoved(Point::new(420.0, 300.0)),
+                &mut backend,
+            )
+            .unwrap();
+        assert!(engine.drag_auto_release.fires_at.is_some());
+
+        engine
+            .handle_backend_event(key_down("x"), &mut backend)
+            .unwrap();
+
+        assert_eq!(
+            engine.drag_auto_release.buttons,
+            drag_button_bit(Button::Right),
+            "explicit ownership removes only the matching auto button"
+        );
+        assert!(engine.latched.contains(&InputTarget::Mouse(Button::Left)));
+        assert!(engine.latched.contains(&InputTarget::Mouse(Button::Right)));
+        engine.drag_auto_release.fires_at = Some(Instant::now());
+        engine.fire_due_drag_auto_release(&mut backend).unwrap();
+        assert!(engine.latched.contains(&InputTarget::Mouse(Button::Left)));
+        assert!(!engine.latched.contains(&InputTarget::Mouse(Button::Right)));
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Right, ButtonAction::Press),
+                (MouseButton::Right, ButtonAction::Release),
+            ],
+            "the old deadline may release only the button it still owns"
+        );
+    }
+
+    #[test]
+    fn parameterless_toggle_partner_takes_over_an_existing_auto_drag_button() {
+        let mut engine = drag_auto_release_engine();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+        latch_drag_button(&mut engine, ";", &mut backend);
+        engine
+            .handle_backend_event(key_down("left_ctrl"), &mut backend)
+            .unwrap();
+        engine
+            .handle_backend_event(
+                BackendEvent::PointerMoved(Point::new(420.0, 300.0)),
+                &mut backend,
+            )
+            .unwrap();
+
+        engine
+            .handle_backend_event(key_down("n"), &mut backend)
+            .unwrap();
+        engine
+            .handle_backend_event(key_down(";"), &mut backend)
+            .unwrap();
+
+        assert_eq!(engine.drag_auto_release.buttons, 0);
+        assert!(engine.latched.contains(&InputTarget::Mouse(Button::Left)));
+        engine.fire_due_drag_auto_release(&mut backend).unwrap();
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [(MouseButton::Left, ButtonAction::Press)]
+        );
+    }
+
+    #[test]
+    fn config_reload_forgets_auto_release_without_releasing_the_existing_latch() {
+        let mut engine = drag_auto_release_engine();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+        latch_drag_button(&mut engine, ";", &mut backend);
+        engine
+            .handle_backend_event(key_down("left_ctrl"), &mut backend)
+            .unwrap();
+        assert_ne!(engine.drag_auto_release.buttons, 0);
+
+        let mut replacement = engine.config.clone();
+        replacement.normal.auto_release_ms = 50;
+        engine.apply_config(replacement).unwrap();
+
+        assert_eq!(engine.drag_auto_release.buttons, 0);
+        assert!(engine.latched.contains(&InputTarget::Mouse(Button::Left)));
+        engine
+            .handle_backend_event(key_up("left_ctrl"), &mut backend)
+            .unwrap();
+        engine
+            .release_targets(&[InputTarget::Mouse(Button::Left)], false, &mut backend)
+            .unwrap();
+        assert!(!engine.latched.contains(&InputTarget::Mouse(Button::Left)));
+        let log = log.lock().unwrap();
+        assert_eq!(
+            log.buttons,
+            [
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Left, ButtonAction::Release),
+            ],
+            "reload must leave an existing native latch under manual ownership until explicit release"
+        );
+        assert_eq!(
+            log.dispositions
+                .iter()
+                .filter(|disposition| **disposition == KeyDisposition::Forward)
+                .count(),
+            2,
+            "reload must preserve the forwarded modifier Down/Up disposition pair"
+        );
+    }
+
+    #[test]
+    fn leaving_normal_releases_only_the_auto_managed_drag_candidate() {
+        let mut engine = drag_auto_release_engine();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+        engine
+            .press_targets(
+                &[InputTarget::Key(Key::new("left_ctrl").unwrap())],
+                &mut backend,
+            )
+            .unwrap();
+        latch_drag_button(&mut engine, ";", &mut backend);
+
+        engine
+            .activate(ModeId::grid(), Some(ModeId::normal()), &mut backend)
+            .unwrap();
+
+        assert_eq!(engine.drag_auto_release.buttons, 0);
+        assert!(!engine.latched.contains(&InputTarget::Mouse(Button::Left)));
+        assert!(
+            engine
+                .latched
+                .contains(&InputTarget::Key(Key::new("left_ctrl").unwrap())),
+            "an unrelated explicit latch keeps its existing targeting lifetime"
+        );
+        assert!(
+            log.lock()
+                .unwrap()
+                .buttons
+                .contains(&(MouseButton::Left, ButtonAction::Release))
+        );
+    }
+
+    #[test]
+    fn explicit_mouse_toggle_never_becomes_an_auto_release_candidate() {
+        let mut config = Config::default();
+        config.normal.auto_release_ms = 1;
+        config
+            .normal
+            .bindings
+            .insert("x".into(), Binding::parse("toggle mouse_left").unwrap());
+        let mut engine = Engine::new(config.clone(), Appearance::Dark);
+        for mode in crate::modes::built_in(&config) {
+            engine.register(mode);
+        }
+        engine.active = ModeId::normal();
+        let (mut backend, _) = FakeBackend::new(Vec::new());
+
+        for event in [key_down("x"), key_up("x"), key_down("left_ctrl")] {
+            engine.handle_backend_event(event, &mut backend).unwrap();
+        }
+
+        assert!(engine.latched.contains(&InputTarget::Mouse(Button::Left)));
+        assert_eq!(engine.drag_auto_release.buttons, 0);
+        assert!(engine.drag_auto_release.fires_at.is_none());
+    }
+
+    #[test]
+    #[ignore = "allocation probe; run alone with --test-threads=1"]
+    fn disabled_drag_auto_release_pointer_check_allocates_nothing() {
+        let mut engine = Engine::new(Config::default(), Appearance::Dark);
+        let region = Region::new(TEST_ALLOCATOR);
+        for _ in 0..1_000 {
+            engine.note_drag_pointer_moved();
+        }
+        assert_eq!(region.change().allocations, 0);
+    }
+
     #[test]
     fn second_long_press_releases_latched_button_without_an_extra_click() {
         let mut engine = engine_with_normal_binding("x", "left_click");
@@ -6674,7 +7554,7 @@ mod tests {
     #[test]
     fn parameterless_toggle_latches_every_companion_in_both_orders() {
         const ACTIVATION: &str = "t";
-        const PARTNERS: [&str; 4] = ["left_ctrl", "left_shift", "left_alt", "s"];
+        const PARTNERS: [&str; 5] = ["left_ctrl", "left_shift", "left_alt", "s", "d"];
 
         for partners_first in [true, false] {
             let mut config = Config::default();
@@ -6730,6 +7610,215 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn parameterless_toggle_maps_normal_click_bindings_in_both_orders() {
+        use crate::api::binding::Button;
+
+        for (partner, button, mouse, companions) in [
+            (
+                ";",
+                Button::Left,
+                MouseButton::Left,
+                &["left_shift", "left_ctrl"][..],
+            ),
+            (
+                "'",
+                Button::Right,
+                MouseButton::Right,
+                &["left_shift", "left_ctrl"][..],
+            ),
+            (
+                "right_shift",
+                Button::Middle,
+                MouseButton::Middle,
+                &["left_ctrl"][..],
+            ),
+        ] {
+            for partners_first in [true, false] {
+                let mut config = Config::default();
+                config.normal.bindings.clear();
+                config
+                    .normal
+                    .bindings
+                    .insert("n".into(), Binding::Toggle(Vec::new()));
+                config
+                    .normal
+                    .bindings
+                    .insert(partner.into(), Binding::Click(button));
+                let mut engine = Engine::new(config.clone(), Appearance::Dark);
+                for mode in crate::modes::built_in(&config) {
+                    engine.register(mode);
+                }
+                engine.active = ModeId::normal();
+                let (mut backend, log) = FakeBackend::new(Vec::new());
+
+                if !partners_first {
+                    engine
+                        .handle_backend_event(key_down("n"), &mut backend)
+                        .unwrap();
+                }
+                for companion in companions {
+                    engine
+                        .handle_backend_event(key_down(companion), &mut backend)
+                        .unwrap();
+                }
+                engine
+                    .handle_backend_event(key_down(partner), &mut backend)
+                    .unwrap();
+                if partners_first {
+                    engine
+                        .handle_backend_event(key_down("n"), &mut backend)
+                        .unwrap();
+                }
+
+                assert!(engine.latched.contains(&InputTarget::Mouse(button)));
+                assert!(
+                    engine
+                        .matching_latched_target(&InputTarget::Key(Key::new(partner).unwrap()))
+                        .is_none(),
+                    "the Normal binding must replace the physical partner; partner={partner} partners_first={partners_first}"
+                );
+                for companion in companions {
+                    assert!(
+                        engine
+                            .matching_latched_target(&InputTarget::Key(
+                                Key::new(*companion).unwrap()
+                            ))
+                            .is_some(),
+                        "companion={companion} partner={partner} partners_first={partners_first}"
+                    );
+                }
+                assert_eq!(
+                    log.lock().unwrap().buttons,
+                    [(mouse, ButtonAction::Press)],
+                    "partner={partner} partners_first={partners_first}"
+                );
+
+                engine
+                    .handle_backend_event(key_up(partner), &mut backend)
+                    .unwrap();
+                for companion in companions.iter().rev() {
+                    engine
+                        .handle_backend_event(key_up(companion), &mut backend)
+                        .unwrap();
+                }
+                engine
+                    .handle_backend_event(key_up("n"), &mut backend)
+                    .unwrap();
+                for event in [key_down("n"), key_up("n")] {
+                    engine.handle_backend_event(event, &mut backend).unwrap();
+                }
+
+                assert!(engine.latched.is_empty());
+                assert_eq!(
+                    log.lock().unwrap().buttons,
+                    [(mouse, ButtonAction::Press), (mouse, ButtonAction::Release),],
+                    "partner={partner} partners_first={partners_first}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parameterless_toggle_uses_latched_modifiers_for_later_normal_chords() {
+        use crate::api::binding::Button;
+
+        let mut config = Config::default();
+        config.normal.bindings.clear();
+        config
+            .normal
+            .bindings
+            .insert("n".into(), Binding::Toggle(Vec::new()));
+        config
+            .normal
+            .bindings
+            .insert("x".into(), Binding::Click(Button::Left));
+        config
+            .normal
+            .bindings
+            .insert("ctrl+x".into(), Binding::Click(Button::Right));
+        let mut engine = Engine::new(config.clone(), Appearance::Dark);
+        for mode in crate::modes::built_in(&config) {
+            engine.register(mode);
+        }
+        engine.active = ModeId::normal();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+
+        for event in [
+            key_down("n"),
+            key_down("left_ctrl"),
+            key_up("left_ctrl"),
+            key_down("x"),
+            key_up("x"),
+            key_up("n"),
+        ] {
+            engine.handle_backend_event(event, &mut backend).unwrap();
+        }
+
+        assert!(
+            engine
+                .matching_latched_target(&InputTarget::Key(Key::new("left_ctrl").unwrap()))
+                .is_some()
+        );
+        assert!(engine.latched.contains(&InputTarget::Mouse(Button::Right)));
+        assert!(!engine.latched.contains(&InputTarget::Mouse(Button::Left)));
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [(MouseButton::Right, ButtonAction::Press)]
+        );
+    }
+
+    #[test]
+    fn parameterless_toggle_accumulates_duplicate_semantic_targets_once() {
+        use crate::api::binding::Button;
+
+        let mut config = Config::default();
+        config.normal.bindings.clear();
+        config
+            .normal
+            .bindings
+            .insert("n".into(), Binding::Toggle(Vec::new()));
+        for key in ["x", "y"] {
+            config
+                .normal
+                .bindings
+                .insert(key.into(), Binding::Click(Button::Left));
+        }
+        let mut engine = Engine::new(config.clone(), Appearance::Dark);
+        for mode in crate::modes::built_in(&config) {
+            engine.register(mode);
+        }
+        engine.active = ModeId::normal();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+
+        for event in [
+            key_down("n"),
+            key_down("x"),
+            key_up("x"),
+            key_down("y"),
+            key_up("y"),
+            key_up("n"),
+        ] {
+            engine.handle_backend_event(event, &mut backend).unwrap();
+        }
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [(MouseButton::Left, ButtonAction::Press)]
+        );
+
+        for event in [key_down("n"), key_up("n")] {
+            engine.handle_backend_event(event, &mut backend).unwrap();
+        }
+        assert!(engine.latched.is_empty());
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Left, ButtonAction::Release),
+            ]
+        );
     }
 
     #[test]
@@ -7390,7 +8479,7 @@ mod tests {
     }
 
     #[test]
-    fn toggled_inputs_survive_mode_and_screen_changes_until_explicitly_released() {
+    fn toggled_inputs_survive_targeting_but_release_on_normal_or_idle_entry() {
         let mut engine = engine_with_normal_binding("n", "toggle left_shift mouse_left");
         engine.register(Box::new(ProbeMode::new(
             "grid",
@@ -7415,30 +8504,20 @@ mod tests {
         engine
             .handle_backend_event(BackendEvent::ScreensChanged(screens), &mut backend)
             .unwrap();
-        engine
-            .activate(ModeId::idle(), Some(grid), &mut backend)
-            .unwrap();
 
         assert_eq!(
             log.lock().unwrap().sent,
             [("left_shift".into(), KeyState::Down)],
-            "mode and screen changes must not synthesize a key-up"
+            "targeting modes and screen changes must preserve the toggle session"
         );
         assert_eq!(
             log.lock().unwrap().buttons,
-            [(MouseButton::Left, ButtonAction::Press)],
-            "mode and screen changes must not release a toggled mouse button"
+            [(MouseButton::Left, ButtonAction::Press)]
         );
         assert_eq!(engine.latched.len(), 2);
 
         engine
-            .toggle_targets(
-                &[
-                    InputTarget::Key(Key::new("left_shift").unwrap()),
-                    InputTarget::Mouse(crate::api::binding::Button::Left),
-                ],
-                &mut backend,
-            )
+            .activate(ModeId::normal(), Some(grid.clone()), &mut backend)
             .unwrap();
         assert!(engine.latched.is_empty());
         assert_eq!(
@@ -7450,6 +8529,109 @@ mod tests {
         );
         assert_eq!(
             log.lock().unwrap().buttons,
+            [
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Left, ButtonAction::Release),
+            ]
+        );
+
+        for event in [key_down("n"), key_up("n")] {
+            engine.handle_backend_event(event, &mut backend).unwrap();
+        }
+        engine
+            .activate(grid.clone(), Some(ModeId::normal()), &mut backend)
+            .unwrap();
+        engine
+            .activate(ModeId::idle(), Some(grid), &mut backend)
+            .unwrap();
+
+        assert!(engine.latched.is_empty());
+        assert_eq!(
+            log.lock().unwrap().sent,
+            [
+                ("left_shift".into(), KeyState::Down),
+                ("left_shift".into(), KeyState::Up),
+                ("left_shift".into(), KeyState::Down),
+                ("left_shift".into(), KeyState::Up),
+            ]
+        );
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Left, ButtonAction::Release),
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Left, ButtonAction::Release),
+            ]
+        );
+    }
+
+    #[test]
+    fn popping_a_targeting_mode_to_normal_releases_the_toggle_session() {
+        let mut engine = engine_with_normal_binding("n", "toggle left_ctrl mouse_left");
+        engine.register(Box::new(ProbeMode::new(
+            "grid",
+            Arc::new(Mutex::new(Vec::new())),
+        )));
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+        engine
+            .activate(ModeId::normal(), Some(ModeId::idle()), &mut backend)
+            .unwrap();
+
+        for event in [key_down("n"), key_up("n")] {
+            engine.handle_backend_event(event, &mut backend).unwrap();
+        }
+        engine
+            .push_mode(ModeId::new("grid").unwrap(), &mut backend)
+            .unwrap();
+        assert_eq!(engine.latched.len(), 2);
+        engine.pop_mode(&mut backend).unwrap();
+
+        assert!(engine.latched.is_empty());
+        assert_eq!(
+            log.lock().unwrap().sent,
+            [
+                ("left_ctrl".into(), KeyState::Down),
+                ("left_ctrl".into(), KeyState::Up),
+            ]
+        );
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Left, ButtonAction::Release),
+            ]
+        );
+    }
+
+    #[test]
+    fn entering_idle_releases_a_pending_immediate_mouse_down_without_clicking() {
+        let mut engine = engine_with_normal_binding(";", "left_click");
+        engine.active = ModeId::normal();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+
+        engine
+            .handle_backend_event(key_down(";"), &mut backend)
+            .unwrap();
+        assert_eq!(engine.pending_long_press_toggles.len(), 1);
+        assert_eq!(
+            log.lock().unwrap().buttons,
+            [(MouseButton::Left, ButtonAction::Press)]
+        );
+
+        engine
+            .activate(ModeId::idle(), Some(ModeId::normal()), &mut backend)
+            .unwrap();
+        engine
+            .handle_backend_event(key_up(";"), &mut backend)
+            .unwrap();
+
+        assert!(engine.pending_long_press_toggles.is_empty());
+        assert!(engine.latched.is_empty());
+        let log = log.lock().unwrap();
+        assert_eq!(log.clicks, 0);
+        assert_eq!(
+            log.buttons,
             [
                 (MouseButton::Left, ButtonAction::Press),
                 (MouseButton::Left, ButtonAction::Release),

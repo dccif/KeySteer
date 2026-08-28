@@ -65,6 +65,7 @@ The left side of a binding accepts a single key, a chord, or multiple independen
 ```toml
 [normal]
 long_press_toggle_ms = 500
+auto_release_ms = 0
 
 [normal.bindings]
 h = "move_left"
@@ -133,6 +134,7 @@ q = "none" # Disable q inherited from Normal.
 ```toml
 [normal]
 long_press_toggle_ms = 500
+auto_release_ms = 0
 
 [normal.bindings]
 h = "move_left"
@@ -148,7 +150,9 @@ f = "recursive_grid"
 
 `passthrough_unbound_keys = true` is the default: Normal consumes only input matching a complete KeySteer binding. Unbound keys and unconfigured modifier chords preserve their original down/up lifecycle. With `false`, Normal returns to keyboard exclusivity and its old permissive chord matching. Grid, Recursive Grid, and UI Hint are always exclusive; Idle always passes through unmatched input and also uses complete chord matching.
 
-`long_press_toggle_ms` applies to bindings for mouse buttons and to a standalone parameterless `toggle` key. At the threshold, a mouse button remains down; a standalone `toggle` holds its activating key down even after the physical key is released. A parameterless `toggle` may use any activation key and latch any number of companions at once; companions and the activation key work in either order without waiting for the threshold. A short standalone `toggle` releases all latches. Set `0` to disable this behaviour; the allowed range is `0..=60000` milliseconds.
+`long_press_toggle_ms` applies to bindings for mouse buttons and to a standalone parameterless `toggle` key. At the threshold, a mouse button remains down; a standalone `toggle` holds its activating key down even after the physical key is released. A parameterless `toggle` may use any activation key and latch any number of companions at once; companions and the activation key work in either order without waiting for the threshold. Each companion follows its Normal binding, so the default `;`, `'`, and `right_shift` bindings hold the left, right, and middle mouse buttons rather than those physical keys. A short standalone `toggle`, returning to Normal, or entering Idle releases all latches. Set `0` to disable this behaviour; the allowed range is `0..=60000` milliseconds.
+
+`auto_release_ms` defaults to `0`, which keeps manual release. It applies only to a direct click/double-click binding latched by long press. Once one or more physical Shift/Ctrl/Alt/Win or Command keys are held and passed through, the first real pointer movement starts the delay and every later movement restarts it. When the pointer remains still for that long, KeySteer releases that mouse button without affecting the physical modifiers. Latches created by explicit `press` or `toggle` actions do not participate. The allowed range is `0..=60000` milliseconds.
 
 ### Grid
 

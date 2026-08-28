@@ -52,3 +52,7 @@ If the menu-bar icon appears but keys do nothing:
 4. If it persists, inspect `keysteer.log` in the data directory.
 
 Because future builds may not have a stable Developer ID signature, upgrades can require you to grant permission again.
+
+## Menu-bar icon
+
+When launched at login, KeySteer verifies and restores a detached icon after the macOS menu bar is ready, provided system visibility is enabled. If KeySteer appears in Activity Monitor but no icon is visible, on macOS 26 or later check that KeySteer is allowed under [**System Settings → Menu Bar**](https://support.apple.com/guide/mac-help/mchlad96d366/mac). macOS can also hide items when menu-bar space is limited.

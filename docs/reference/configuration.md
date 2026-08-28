@@ -69,6 +69,7 @@ space = "idle"
 ```toml
 [normal]
 long_press_toggle_ms = 500
+auto_release_ms = 0
 
 [normal.bindings]
 h = "move_left"
@@ -150,6 +151,7 @@ x = ["press shift", "left_click", "release shift"]
 ```toml
 [normal]
 long_press_toggle_ms = 500
+auto_release_ms = 0
 
 [normal.bindings]
 h = "move_left"
@@ -173,7 +175,9 @@ f = "recursive_grid"
 
 设为 `false` 时，Normal 恢复键盘独占，并保留旧的宽松组合匹配；`Grid`、`Recursive Grid` 和 `UI Hint` 始终保持独占。`Idle` 始终透传未命中的输入，并同样采用完整修饰组合匹配。
 
-`long_press_toggle_ms` 作用于绑定为 `鼠标键` 的键和单独按住的无参数 `toggle` 激活键。鼠标键达到阈值后保持对应按钮按下；无参数 `toggle` 达到阈值后保持激活键自身按下，松开物理键不会撤销 latch。无参数 `toggle` 可绑定到任意激活键，并一次锁定任意数量的伙伴；伙伴与激活键无论谁先按下都会立即锁定，不等待长按阈值。单独短按无参数 `toggle` 可释放全部 latch。设为 `0` 禁用这两种长按行为，允许范围为 `0..=60000` 毫秒。
+`long_press_toggle_ms` 作用于绑定为 `鼠标键` 的键和单独按住的无参数 `toggle` 激活键。鼠标键达到阈值后保持对应按钮按下；无参数 `toggle` 达到阈值后保持激活键自身按下，松开物理键不会撤销 latch。无参数 `toggle` 可绑定到任意激活键，并一次锁定任意数量的伙伴；伙伴与激活键无论谁先按下都会立即锁定，不等待长按阈值。伙伴按 Normal 绑定转换为实际目标，例如默认的 `;`、`'`、`right_shift` 分别保持鼠标左、右、中键，而不是保持这些物理键。单独短按无参数 `toggle`、返回 Normal 或进入 Idle 都会释放全部 latch。设为 `0` 禁用这两种长按行为，允许范围为 `0..=60000` 毫秒。
+
+`auto_release_ms` 默认为 `0`，即保持上述手动释放行为。它仅适用于直接 click/double-click 绑定经长按形成的鼠标候选；一个或多个物理 Shift/Ctrl/Alt/Win 或 Command 键已按住并透传时，首次实际移动指针才开始计时，后续移动会重置计时。指针保持静止达到该时间后仅释放该鼠标按钮，不影响物理按住的修饰键；显式 `press`/`toggle` 的 latch 不参与。允许范围为 `0..=60000` 毫秒。
 
 ### Grid
 

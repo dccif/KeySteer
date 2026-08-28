@@ -126,7 +126,13 @@ impl MacOsBackend {
         let hook_start = HookStartup::spawn(Arc::clone(&click_tracker));
         let mtm = MainThreadMarker::new()
             .ok_or_else(|| "macOS backend must be created on the main thread".to_string())?;
-        let status_item = Some(status_item::StatusItem::new(mtm, event_tx.clone()));
+        let mut status_item = status_item::StatusItem::new(mtm, event_tx.clone());
+        // `finishLaunching` posts AppKit work. Process that first turn before
+        // the hook startup may wait, then keep a bounded repair active for the
+        // slower login-item path where the menu-bar scene is not ready yet.
+        workspace::pump_app_events();
+        status_item.maintain_startup();
+        let status_item = Some(status_item);
         let frame_clock = display_link::DisplayFrameClock::new(mtm);
         let initial_screens = screens::list_screens().unwrap_or_else(|error| {
             crate::app::logging::report_error(
@@ -178,6 +184,9 @@ impl MacOsBackend {
 
     fn refresh_native_events(&mut self) {
         self.pending.extend(self.workspace.refresh());
+        if let Some(item) = self.status_item.as_mut() {
+            item.maintain_startup();
+        }
         if self
             .display_watcher
             .as_ref()
@@ -358,7 +367,15 @@ impl Backend for MacOsBackend {
     }
 
     fn move_pointer(&self, from: Point, dx: f64, dy: f64) -> Result<(), String> {
-        input::move_cursor_relative(from, dx, dy, self.held_buttons.get()).map(|_| ())
+        let held_buttons = self.held_buttons.get();
+        let drag_modifier_flags = if held_buttons == 0 {
+            0
+        } else {
+            self.hook
+                .as_ref()
+                .map_or(0, HookThread::drag_modifier_flags)
+        };
+        input::move_cursor_relative(from, dx, dy, held_buttons, drag_modifier_flags).map(|_| ())
     }
 
     fn mouse_button(&self, button: MouseButton, action: ButtonAction) -> Result<(), String> {

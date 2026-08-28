@@ -1,5 +1,11 @@
 # 更新日志 / Release Notes
 
+## 0.9.9
+
+新增可选的修饰键拖拽自动释放：长按鼠标键后可透传任意组合的修饰键，并在指针停止移动后自动松开鼠标键；默认关闭。
+
+Added optional automatic release for modifier-assisted dragging: after holding a mouse button, any modifier combination can pass through and the button is released when pointer movement stops; disabled by default.
+
 ## 0.9.8
 
 修复与此前鼠标长按同类的键盘 `toggle` 状态问题：多个修饰键现在可在激活键前后立即锁定，松开物理键后仍保持按下，且不会把 `toggle` 激活键组合透传给当前窗口。

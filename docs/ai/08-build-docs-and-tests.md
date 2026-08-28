@@ -7,7 +7,7 @@
 - `perf-probe` 是 opt-in feature；正式通用发布默认不启用。启用时热路径只向固定有界队列
   非阻塞写入，文件 I/O 由测试线程执行。mimalloc 在 Windows x64 A/B 中未通过启动 p99
   门禁，未保留依赖或 feature。
-- `.github/workflows/build.yml` 统一承载 CI 与发布且仅手动触发：可选择 Windows/macOS 打包发布或仅运行检查；Miri 也是手动选项。
+- `.github/workflows/build.yml` 统一承载 CI 与发布且仅手动触发：可选择 Windows/macOS 打包发布或仅运行检查。
 - PGO 不在缺少代表性整进程训练语料时启用；必须先由对应架构原生 runner 产出稳定训练集，并通过同一 p99/内存门禁。
 
 性能变更使用独立 target/worktree A/B：关键 p99 回退不得超过 2%；目标延迟改善至少 3%或内存下降至少 5%才保留。`tools/benchmark-windows-dist.ps1` 记录启动与 working set/private bytes/handles/threads；真实 ready 延迟要求被测二进制启用 `perf-probe`，并通过 `KEYSTEER_PERF_PROBE` 输出生命周期 JSONL marker。普通发行包的 `--check` 结果只标记为 config-check，不冒充 ready 延迟。
