@@ -209,3 +209,11 @@ macOS 原生探针使用固定 AppKit fixture 子进程，运行：
   scaled styles by source identity and scale instead of detaching every label.
 - Scene sorting first performs an O(n) ordered check and only runs the stable
   sort when required; equal-z source order remains stable.
+- Common mode-indicator refreshes resolve configured text lazily and assemble
+  held-input text directly into one exact-capacity `String`; do not reintroduce
+  per-target canonical/replace/uppercase strings or an intermediate `Vec`.
+- Cursor-indicator mode overrides resolve through a borrowed internal view;
+  full refreshes must not clone the configured themed-color strings.
+- A rejected position-only backend update disables that fast path until the
+  overlay is dismissed. Operational failures are reported once through the
+  unified logger instead of being swallowed or retried on every pointer event.

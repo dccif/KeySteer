@@ -72,7 +72,7 @@ fast_multiplier = 2.0
 
 如果持续按住 `鼠标按键` 键达到 `long_press_toggle_ms`，鼠标会进入 `Toggle` 状态，也就是按下模式；点击 `n = "toggle"` 可以释放
 
-如果希望“按住修饰键拖动”结束时少按一次释放键，可将 `auto_release_ms` 设为非零值。它仅适用于直接绑定为 click/double-click 的键经长按形成的鼠标候选；一个或多个物理 Shift/Ctrl/Alt/Win 或 Command 键已按住并透传时，首次实际移动才开始计时，后续移动会重置计时。指针停止达到该时间后只释放该鼠标按钮，不影响你手动按住的修饰键；显式 `press`/`toggle` 创建的 latch 不参与。
+如果希望“按住修饰键拖动”结束时少按一次释放键，可将 `auto_release_ms` 设为非零值。它仅适用于直接绑定为 click/double-click 的键经长按形成的鼠标候选；一个或多个物理 Shift/Ctrl/Alt/Win 或 Command 键已按住并透传时，首次实际移动才开始计时，后续移动会重置计时。指针停止达到该时间后只释放该鼠标按钮并立即清除按下提示，不影响你手动按住的修饰键；显式 `press`/`toggle` 创建的 latch 不参与。
 
 ```toml
 [normal]

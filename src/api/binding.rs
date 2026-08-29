@@ -94,13 +94,17 @@ impl InputTarget {
         Key::new(value).map(Self::Key)
     }
 
-    pub fn canonical(&self) -> String {
+    pub(crate) fn canonical_str(&self) -> &str {
         match self {
-            Self::Key(key) => key.as_str().to_string(),
-            Self::Mouse(Button::Left) => "mouse_left".into(),
-            Self::Mouse(Button::Right) => "mouse_right".into(),
-            Self::Mouse(Button::Middle) => "mouse_middle".into(),
+            Self::Key(key) => key.as_str(),
+            Self::Mouse(Button::Left) => "mouse_left",
+            Self::Mouse(Button::Right) => "mouse_right",
+            Self::Mouse(Button::Middle) => "mouse_middle",
         }
+    }
+
+    pub fn canonical(&self) -> String {
+        self.canonical_str().to_owned()
     }
 }
 

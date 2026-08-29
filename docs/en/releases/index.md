@@ -1,5 +1,9 @@
 # Release notes
 
+## 0.9.10
+
+Fixed held-mouse text and pressed colors sometimes remaining after automatic drag release, while reducing temporary allocations and duplicate work in shared indicator and input-state handling.
+
 ## 0.9.9
 
 Added optional automatic release for modifier-assisted dragging: after holding a mouse button, any modifier combination can pass through and the button is released when pointer movement stops; disabled by default.

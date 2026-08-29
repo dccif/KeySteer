@@ -66,7 +66,7 @@ fast_multiplier = 2.0
 
 Hold a key bound to a mouse button for `long_press_toggle_ms` to latch that mouse button down; tap `n = "toggle"` to release it.
 
-Set `auto_release_ms` to a non-zero value to finish a modifier-assisted drag without another release key. It applies only to a direct click/double-click binding latched by long press. Once one or more physical Shift/Ctrl/Alt/Win or Command keys are held and passed through, the first real pointer movement starts the delay and every later movement restarts it. When the pointer remains still for that long, KeySteer releases that mouse button without affecting the physically held modifiers. Latches created by explicit `press` or `toggle` actions do not participate.
+Set `auto_release_ms` to a non-zero value to finish a modifier-assisted drag without another release key. It applies only to a direct click/double-click binding latched by long press. Once one or more physical Shift/Ctrl/Alt/Win or Command keys are held and passed through, the first real pointer movement starts the delay and every later movement restarts it. When the pointer remains still for that long, KeySteer releases that mouse button and immediately clears its held indicator without affecting the physically held modifiers. Latches created by explicit `press` or `toggle` actions do not participate.
 
 ```toml
 [normal]

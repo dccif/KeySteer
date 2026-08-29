@@ -30,11 +30,11 @@ KeyUp 立即注入 MouseUp 完成点击；达到阈值后只把已经按下的�
 `normal.auto_release_ms` 默认 0，即不启用。它只接受直接 click/double-click 绑定经长按形成的鼠标候选；
 一个或多个物理 Shift/Ctrl/Alt/Win 或 Command 已透传按住时，首次实际位移才建立 deadline，后续位移重置它。
 到期只释放该候选鼠标按钮，不处理物理修饰键、键盘 latch 或显式 `press`/`toggle` 的鼠标 latch。
-配置允许范围为 `0..=60000`；0 路径不应创建 timer 或增加闲置轮询。
+释放成功后必须立即重建动态装饰，清除对应 held badge 和按下色；配置允许范围为 `0..=60000`，0 路径不应创建 timer 或增加闲置轮询。
 
 `mode_indicator.cursor.{left,middle,right}_pressed_color` 控制合成鼠标按钮被 `press` 或
 `toggle` 锁定时，以及等待短按/长按判定的 click 物理触发键仍按住时的光标圆形颜色；每个
-Mode 的 cursor override 可单独覆盖这些值。提示由按键释放事件清除，不计时。
+Mode 的 cursor override 可单独覆盖这些值。普通反馈由物理按键释放清除；长按转交给 latch 后由 latch 生命周期负责，并在自动释放成功时同步清除。
 
 ## 加载与发现
 

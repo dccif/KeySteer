@@ -374,12 +374,19 @@ impl ActiveClickIndicators {
         true
     }
 
+    fn release_buttons(&mut self, buttons: u8) {
+        self.0
+            .retain(|(_, button)| buttons & drag_button_bit(*button) == 0);
+    }
+
     fn latest_button(&self) -> Option<Button> {
         self.0.last().map(|(_, button)| *button)
     }
 
-    fn clear(&mut self) {
+    fn clear(&mut self) -> bool {
+        let changed = !self.0.is_empty();
         self.0.clear();
+        changed
     }
 
     #[cfg(test)]
@@ -462,6 +469,10 @@ impl<T> KeyMap<T> {
             .iter()
             .find(|(candidate, _)| candidate == key)
             .map(|(_, value)| value)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&Key, &T)> {
+        self.0.iter().map(|(key, value)| (key, value))
     }
 
     fn remove(&mut self, key: &Key) -> Option<T> {
@@ -619,6 +630,9 @@ pub struct Engine {
     overlay_visible: bool,
     overlay_dynamic: DynamicOverlayState,
     overlay_positions: Option<OverlayPositions>,
+    /// Avoid retrying a rejected native position-only update on every pointer
+    /// event. A fresh visible overlay session gets one new attempt.
+    overlay_position_fast_path_disabled: bool,
     command_batch_depth: usize,
     pending_overlay: Option<PendingOverlay>,
 
@@ -676,6 +690,7 @@ impl Engine {
             overlay_visible: false,
             overlay_dynamic: DynamicOverlayState::default(),
             overlay_positions: None,
+            overlay_position_fast_path_disabled: false,
             command_batch_depth: 0,
             pending_overlay: None,
             enabled: true,
@@ -878,7 +893,7 @@ impl Engine {
 
         let previous = self.active.clone();
         self.pending_sequences.clear();
-        if let Err(cancel_error) = self.cancel_all_pending_long_presses(backend) {
+        if let Err(cancel_error) = self.cancel_transient_clicks(backend) {
             crate::app::logging::report_error(
                 "input",
                 format!("cannot cancel pending mouse presses during recovery: {cancel_error}"),
@@ -886,7 +901,6 @@ impl Engine {
         }
         self.active_default_toggles.clear();
         self.active_gestures.clear();
-        self.active_click_indicators.clear();
         self.drag_auto_release.clear();
         self.modal_stack.clear();
         self.timers.clear();
@@ -1288,10 +1302,9 @@ impl Engine {
         self.pending_sequences.clear();
         errors.record(
             "cancel pending mouse presses",
-            self.cancel_all_pending_long_presses(backend),
+            self.cancel_transient_clicks(backend).map(|_| ()),
         );
         self.drag_auto_release.clear();
-        self.active_click_indicators.clear();
         errors.record("cancel scans", self.cancel_all_scans(backend));
         errors.record("release held inputs", self.release_latched(backend));
         errors.record("dismiss overlay", backend.dismiss());
@@ -1344,7 +1357,7 @@ impl Engine {
             return Ok(());
         }
         if self.should_quit || !self.enabled || self.is_excluded_app() {
-            return self.cancel_all_pending_long_presses(backend);
+            return self.cancel_transient_clicks(backend).map(|_| ());
         }
         let now = Instant::now();
         while self
@@ -1370,8 +1383,15 @@ impl Engine {
             } else {
                 self.toggle_targets(std::slice::from_ref(&toggle.target), backend)?;
             }
-            if long_pressed_click && let InputTarget::Mouse(button) = &toggle.target {
-                self.begin_drag_auto_release(*button);
+            // The physical activation key no longer owns ordinary click
+            // feedback once its pending press has become a latch. The latch
+            // keeps the same pressed decoration until it is released, without
+            // letting a still-held activation key resurrect stale feedback.
+            if let InputTarget::Mouse(button) = &toggle.target {
+                self.active_click_indicators.release(&toggle.key);
+                if long_pressed_click {
+                    self.begin_drag_auto_release(*button);
+                }
             }
             self.transfer_pending_long_press_targets(std::slice::from_ref(&toggle.target));
             if matches!(&toggle.target, InputTarget::Key(key) if key == &toggle.key)
@@ -1403,16 +1423,15 @@ impl Engine {
     }
 
     fn forwarded_modifier_mask(&self) -> u8 {
-        self.pressed.iter().fold(0, |mask, key| {
-            if matches!(
-                self.key_dispositions.get(key),
-                Some(KeyDisposition::Defer | KeyDisposition::Forward)
-            ) {
-                mask | drag_modifier_bit(key).unwrap_or(0)
-            } else {
-                mask
-            }
-        })
+        self.key_dispositions
+            .iter()
+            .fold(0, |mask, (key, disposition)| {
+                if matches!(disposition, KeyDisposition::Defer | KeyDisposition::Forward) {
+                    mask | drag_modifier_bit(key).unwrap_or(0)
+                } else {
+                    mask
+                }
+            })
     }
 
     fn note_drag_pointer_moved(&mut self) {
@@ -1449,9 +1468,26 @@ impl Engine {
         }
     }
 
-    fn release_drag_auto_release(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
+    fn release_drag_auto_release(&mut self, backend: &mut dyn Backend) -> Result<bool, String> {
+        let buttons = self.drag_auto_release.buttons;
+        if buttons == 0 {
+            return Ok(false);
+        }
         let targets = self.take_drag_release_targets();
-        self.release_targets(&targets, false, backend)
+        self.release_targets(&targets, false, backend)?;
+
+        // Automatic release wins over an overlapping second long-press for
+        // the same button. Otherwise that late deadline could immediately
+        // latch the button again after the idle release. A primed short click
+        // still owns a native MouseDown and must keep its later MouseUp path.
+        self.pending_long_press_toggles.retain(|pending| {
+            let InputTarget::Mouse(button) = &pending.target else {
+                return true;
+            };
+            buttons & drag_button_bit(*button) == 0 || pending.short_action.is_some()
+        });
+        self.active_click_indicators.release_buttons(buttons);
+        Ok(true)
     }
 
     fn fire_due_drag_auto_release(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
@@ -1461,7 +1497,13 @@ impl Engine {
         if fires_at > Instant::now() {
             return Ok(());
         }
-        self.release_drag_auto_release(backend)
+        if self.release_drag_auto_release(backend)? {
+            // Position-only overlay updates intentionally reuse the previous
+            // scene. Rebuild once here so held text and pressed colors
+            // disappear instead of following the pointer as stale content.
+            self.refresh_overlay(backend)?;
+        }
+        Ok(())
     }
 
     fn fire_due_sequences(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
@@ -1595,7 +1637,11 @@ impl Engine {
                 self.focused_app_excluded =
                     Self::excluded_app_matches(&self.config, self.focused_app.as_ref());
                 if self.focused_app_excluded {
-                    self.release_drag_auto_release(backend)?;
+                    let click_feedback_changed = self.cancel_transient_clicks(backend)?;
+                    let released_drag = self.release_drag_auto_release(backend)?;
+                    if click_feedback_changed || released_drag {
+                        self.refresh_overlay(backend)?;
+                    }
                 }
                 if profile_changed {
                     self.rebuild_tables();
@@ -1679,8 +1725,7 @@ impl Engine {
                 if !self.enabled {
                     self.cancel_all_scans(backend)?;
                     self.pending_sequences.clear();
-                    self.cancel_all_pending_long_presses(backend)?;
-                    self.active_click_indicators.clear();
+                    let _ = self.cancel_transient_clicks(backend)?;
                     self.drag_auto_release.clear();
                     self.release_latched(backend)?;
                     self.activate(ModeId::idle(), None, backend)?;
@@ -1746,7 +1791,7 @@ impl Engine {
                     ));
                 }
             };
-            if let Err(error) = self.cancel_all_pending_long_presses(backend) {
+            if let Err(error) = self.cancel_transient_clicks(backend) {
                 self.report_action_error(error, backend);
             }
             self.apply_config(config)?;
@@ -1762,14 +1807,14 @@ impl Engine {
                 )
             })?;
             let path = candidate.path().to_path_buf();
-            if let Err(error) = self.cancel_all_pending_long_presses(backend) {
+            if let Err(error) = self.cancel_transient_clicks(backend) {
                 self.report_action_error(error, backend);
             }
             self.apply_config(config)?;
             self.config_store = Some(candidate);
             Some(path)
         } else {
-            if let Err(error) = self.cancel_all_pending_long_presses(backend) {
+            if let Err(error) = self.cancel_transient_clicks(backend) {
                 self.report_action_error(error, backend);
             }
             self.palette = self.config.palette(self.appearance);
@@ -2607,14 +2652,20 @@ impl Engine {
         &mut self,
         pending: PendingLongPressToggle,
         backend: &mut dyn Backend,
-    ) -> Result<(), String> {
-        if pending.short_action.is_some()
-            && let InputTarget::Mouse(button) = pending.target
+    ) -> Result<bool, String> {
+        let PendingLongPressToggle {
+            key,
+            target,
+            short_action,
+            ..
+        } = pending;
+        if short_action.is_some()
+            && let InputTarget::Mouse(button) = target
         {
             let target = InputTarget::Mouse(button);
             self.release_primed_mouse_button(target, map_button(button), backend)?;
         }
-        Ok(())
+        Ok(self.active_click_indicators.release(&key))
     }
 
     fn release_primed_mouse_button(
@@ -2629,16 +2680,20 @@ impl Engine {
         Ok(())
     }
 
-    fn cancel_all_pending_long_presses(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
+    /// Cancel native pending clicks and clear every activation-key decoration.
+    /// The caller can use the returned dirty bit to rebuild the overlay once.
+    fn cancel_transient_clicks(&mut self, backend: &mut dyn Backend) -> Result<bool, String> {
         let pending = std::mem::take(&mut self.pending_long_press_toggles);
         let mut errors = crate::app::errors::ErrorBundle::default();
+        let mut feedback_changed = false;
         for pending in pending {
-            errors.record(
-                "release pending mouse press",
-                self.cancel_pending_long_press(pending, backend),
-            );
+            match self.cancel_pending_long_press(pending, backend) {
+                Ok(changed) => feedback_changed |= changed,
+                Err(error) => errors.push("release pending mouse press", error),
+            }
         }
-        errors.into_result()
+        feedback_changed |= self.active_click_indicators.clear();
+        errors.into_result().map(|()| feedback_changed)
     }
 
     fn transfer_pending_long_press_targets(&mut self, targets: &[InputTarget]) -> TargetBuffer {
@@ -3469,7 +3524,7 @@ impl Engine {
             && target != ModeId::normal()
             && !Self::releases_toggle_session_on_entry(&target)
         {
-            self.release_drag_auto_release(backend)?;
+            let _ = self.release_drag_auto_release(backend)?;
         }
         if Self::releases_toggle_session_on_entry(&target) {
             self.release_toggle_session_for_safe_mode(backend)?;
@@ -3489,7 +3544,7 @@ impl Engine {
             && previous != ModeId::normal()
             && !Self::releases_toggle_session_on_entry(&previous)
         {
-            self.release_drag_auto_release(backend)?;
+            let _ = self.release_drag_auto_release(backend)?;
         }
         if Self::releases_toggle_session_on_entry(&previous) {
             self.release_toggle_session_for_safe_mode(backend)?;
@@ -3523,7 +3578,7 @@ impl Engine {
             && target != ModeId::normal()
             && !Self::releases_toggle_session_on_entry(&target)
         {
-            self.release_drag_auto_release(backend)?;
+            let _ = self.release_drag_auto_release(backend)?;
         }
         if target != self.active && Self::releases_toggle_session_on_entry(&target) {
             self.release_toggle_session_for_safe_mode(backend)?;
@@ -3694,6 +3749,7 @@ mod tests {
         sent: Vec<(String, KeyState)>,
         fail_next_key_up: bool,
         fail_next_mouse_release: bool,
+        position_update_attempts: usize,
     }
 
     struct FakeBackend {
@@ -3820,6 +3876,7 @@ mod tests {
             cursor: Option<Point>,
             indicator: Option<Point>,
         ) -> Result<bool, String> {
+            self.log.lock().unwrap().position_update_attempts += 1;
             if self.fail_position_updates {
                 return Err("injected position update failure".into());
             }
@@ -5439,6 +5496,7 @@ mod tests {
             key_up("h"),
         ]);
         let (mut backend, log) = FakeBackend::new(script);
+        backend.accept_position_updates = true;
 
         engine.run(&mut backend).unwrap();
 
@@ -5997,6 +6055,313 @@ mod tests {
     }
 
     #[test]
+    fn drag_auto_release_refreshes_held_text_and_pressed_color() {
+        let mut engine = drag_auto_release_engine();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+        latch_drag_button(&mut engine, ";", &mut backend);
+
+        let pressed = crate::api::overlay::Color::rgb(0, 255, 0);
+        {
+            let log = log.lock().unwrap();
+            let scene = log.scenes.last().expect("latched drag scene");
+            assert_eq!(
+                scene
+                    .indicator
+                    .as_ref()
+                    .and_then(|indicator| indicator.held_text.as_deref()),
+                Some("● MOUSE LEFT")
+            );
+            assert_eq!(
+                scene
+                    .cursor_marker
+                    .as_ref()
+                    .expect("latched cursor marker")
+                    .stroke,
+                pressed
+            );
+        }
+
+        engine
+            .handle_backend_event(key_down("left_ctrl"), &mut backend)
+            .unwrap();
+        engine
+            .handle_backend_event(
+                BackendEvent::PointerMoved(Point::new(420.0, 300.0)),
+                &mut backend,
+            )
+            .unwrap();
+        engine.drag_auto_release.fires_at = Some(Instant::now());
+        let scenes_before_release = log.lock().unwrap().scenes.len();
+        engine.fire_due_drag_auto_release(&mut backend).unwrap();
+
+        assert!(engine.latched.is_empty());
+        let log = log.lock().unwrap();
+        assert_eq!(log.scenes.len(), scenes_before_release + 1);
+        let scene = log.scenes.last().expect("auto-released drag scene");
+        assert_eq!(
+            scene
+                .indicator
+                .as_ref()
+                .and_then(|indicator| indicator.held_text.as_deref()),
+            None
+        );
+        assert_ne!(
+            scene
+                .cursor_marker
+                .as_ref()
+                .expect("released cursor marker")
+                .stroke,
+            pressed
+        );
+        assert_eq!(log.clicks, 0);
+    }
+
+    #[test]
+    fn auto_release_clears_feedback_while_activation_key_is_still_down() {
+        let mut engine = drag_auto_release_engine();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+
+        engine
+            .handle_backend_event(key_down(";"), &mut backend)
+            .unwrap();
+        engine.pending_long_press_toggles[0].fires_at = Instant::now();
+        engine.fire_due_long_press_toggles(&mut backend).unwrap();
+        assert!(engine.active_click_indicators.is_empty());
+        assert!(engine.latched.contains(&InputTarget::Mouse(Button::Left)));
+
+        engine
+            .handle_backend_event(key_down("left_ctrl"), &mut backend)
+            .unwrap();
+        engine
+            .handle_backend_event(
+                BackendEvent::PointerMoved(Point::new(420.0, 300.0)),
+                &mut backend,
+            )
+            .unwrap();
+        engine.drag_auto_release.fires_at = Some(Instant::now());
+        engine.fire_due_drag_auto_release(&mut backend).unwrap();
+
+        assert!(engine.active_click_indicators.is_empty());
+        assert!(engine.latched.is_empty());
+        let pressed = crate::api::overlay::Color::rgb(0, 255, 0);
+        assert_ne!(
+            log.lock()
+                .unwrap()
+                .scenes
+                .last()
+                .and_then(|scene| scene.cursor_marker.as_ref())
+                .expect("released cursor marker")
+                .stroke,
+            pressed
+        );
+
+        engine
+            .handle_backend_event(key_up(";"), &mut backend)
+            .unwrap();
+        let log = log.lock().unwrap();
+        assert_eq!(
+            log.buttons,
+            [
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Left, ButtonAction::Release),
+            ]
+        );
+        assert_eq!(log.clicks, 0);
+    }
+
+    #[test]
+    fn auto_release_cancels_an_overlapping_late_toggle_for_the_same_button() {
+        let mut engine = drag_auto_release_engine();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+        latch_drag_button(&mut engine, ";", &mut backend);
+        engine
+            .handle_backend_event(key_down("left_ctrl"), &mut backend)
+            .unwrap();
+        engine
+            .handle_backend_event(
+                BackendEvent::PointerMoved(Point::new(420.0, 300.0)),
+                &mut backend,
+            )
+            .unwrap();
+        engine
+            .handle_backend_event(key_up("left_ctrl"), &mut backend)
+            .unwrap();
+
+        engine
+            .handle_backend_event(key_down(";"), &mut backend)
+            .unwrap();
+        assert_eq!(engine.pending_long_press_toggles.len(), 1);
+        assert!(engine.pending_long_press_toggles[0].short_action.is_none());
+        engine.drag_auto_release.fires_at = Some(Instant::now());
+        engine.fire_due_drag_auto_release(&mut backend).unwrap();
+
+        assert!(engine.pending_long_press_toggles.is_empty());
+        assert!(engine.active_click_indicators.is_empty());
+        engine
+            .handle_backend_event(key_up(";"), &mut backend)
+            .unwrap();
+        assert!(engine.latched.is_empty());
+        let log = log.lock().unwrap();
+        assert_eq!(
+            log.buttons,
+            [
+                (MouseButton::Left, ButtonAction::Press),
+                (MouseButton::Left, ButtonAction::Release),
+            ]
+        );
+        assert_eq!(log.clicks, 0);
+    }
+
+    #[test]
+    fn empty_drag_auto_release_does_not_redraw() {
+        let mut engine = drag_auto_release_engine();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+        let scenes_before = log.lock().unwrap().scenes.len();
+
+        engine.fire_due_drag_auto_release(&mut backend).unwrap();
+
+        assert_eq!(log.lock().unwrap().scenes.len(), scenes_before);
+    }
+
+    #[test]
+    fn excluded_focus_clears_pending_and_latched_click_feedback() {
+        for long_pressed in [false, true] {
+            let mut engine = drag_auto_release_engine();
+            engine.config.general.excluded_apps = vec!["com.example.excluded".into()];
+            let (mut backend, log) = FakeBackend::new(Vec::new());
+            if long_pressed {
+                latch_drag_button(&mut engine, ";", &mut backend);
+            } else {
+                engine
+                    .handle_backend_event(key_down(";"), &mut backend)
+                    .unwrap();
+            }
+
+            engine
+                .handle_backend_event(
+                    BackendEvent::FocusChanged(Some(FocusedApp {
+                        bundle_id: "com.example.excluded".into(),
+                        window_title: String::new(),
+                        process_id: 1,
+                    })),
+                    &mut backend,
+                )
+                .unwrap();
+
+            assert!(engine.pending_long_press_toggles.is_empty());
+            assert!(engine.active_click_indicators.is_empty());
+            assert!(engine.latched.is_empty());
+            let log = log.lock().unwrap();
+            let scene = log.scenes.last().expect("released excluded-app scene");
+            assert_eq!(
+                scene
+                    .indicator
+                    .as_ref()
+                    .and_then(|indicator| indicator.held_text.as_deref()),
+                None,
+                "long_pressed={long_pressed}"
+            );
+            assert_ne!(
+                scene
+                    .cursor_marker
+                    .as_ref()
+                    .expect("released cursor marker")
+                    .stroke,
+                crate::api::overlay::Color::rgb(0, 255, 0),
+                "long_pressed={long_pressed}"
+            );
+            assert_eq!(
+                log.buttons,
+                [
+                    (MouseButton::Left, ButtonAction::Press),
+                    (MouseButton::Left, ButtonAction::Release),
+                ],
+                "long_pressed={long_pressed}"
+            );
+        }
+    }
+
+    #[test]
+    fn excluded_focus_clears_immediate_click_feedback_without_a_pending_toggle() {
+        let mut engine = drag_auto_release_engine();
+        engine.config.normal.long_press_toggle_ms = 0;
+        engine.config.general.excluded_apps = vec!["com.example.excluded".into()];
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+
+        engine
+            .handle_backend_event(key_down(";"), &mut backend)
+            .unwrap();
+        assert!(engine.pending_long_press_toggles.is_empty());
+        assert!(!engine.active_click_indicators.is_empty());
+        let scenes_before_focus = log.lock().unwrap().scenes.len();
+
+        engine
+            .handle_backend_event(
+                BackendEvent::FocusChanged(Some(FocusedApp {
+                    bundle_id: "com.example.excluded".into(),
+                    window_title: String::new(),
+                    process_id: 1,
+                })),
+                &mut backend,
+            )
+            .unwrap();
+
+        assert!(engine.active_click_indicators.is_empty());
+        let log = log.lock().unwrap();
+        assert_eq!(log.scenes.len(), scenes_before_focus + 1);
+        assert_ne!(
+            log.scenes
+                .last()
+                .and_then(|scene| scene.cursor_marker.as_ref())
+                .expect("released cursor marker")
+                .stroke,
+            crate::api::overlay::Color::rgb(0, 255, 0)
+        );
+        assert_eq!(log.clicks, 1);
+    }
+
+    #[test]
+    fn drag_auto_release_preserves_keyboard_latch_feedback() {
+        let mut engine = drag_auto_release_engine();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+        engine
+            .press_targets(
+                &[InputTarget::Key(Key::new("left_ctrl").unwrap())],
+                &mut backend,
+            )
+            .unwrap();
+        latch_drag_button(&mut engine, ";", &mut backend);
+        engine
+            .handle_backend_event(key_down("left_shift"), &mut backend)
+            .unwrap();
+        engine
+            .handle_backend_event(
+                BackendEvent::PointerMoved(Point::new(420.0, 300.0)),
+                &mut backend,
+            )
+            .unwrap();
+        engine.drag_auto_release.fires_at = Some(Instant::now());
+
+        engine.fire_due_drag_auto_release(&mut backend).unwrap();
+
+        assert!(
+            engine
+                .latched
+                .contains(&InputTarget::Key(Key::new("left_ctrl").unwrap()))
+        );
+        assert!(!engine.latched.contains(&InputTarget::Mouse(Button::Left)));
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .scenes
+                .last()
+                .and_then(|scene| scene.indicator.as_ref())
+                .and_then(|indicator| indicator.held_text.as_deref()),
+            Some("● LEFT CTRL")
+        );
+    }
+
+    #[test]
     fn drag_auto_release_keeps_specific_modifier_chords_ahead_of_move_fallback() {
         let mut engine = drag_auto_release_engine();
         engine
@@ -6198,6 +6563,16 @@ mod tests {
         engine.fire_due_drag_auto_release(&mut backend).unwrap();
         assert!(engine.latched.contains(&InputTarget::Mouse(Button::Left)));
         assert!(!engine.latched.contains(&InputTarget::Mouse(Button::Right)));
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .scenes
+                .last()
+                .and_then(|scene| scene.indicator.as_ref())
+                .and_then(|indicator| indicator.held_text.as_deref()),
+            Some("● MOUSE LEFT"),
+            "automatic release must keep feedback for an explicitly owned button"
+        );
         assert_eq!(
             log.lock().unwrap().buttons,
             [
@@ -9171,13 +9546,19 @@ mod tests {
             engine.cursor = Point::new(200.0, 300.0);
 
             engine.refresh_overlay_positions(&mut backend).unwrap();
+            engine.cursor = Point::new(300.0, 300.0);
+            engine.refresh_overlay_positions(&mut backend).unwrap();
 
             let log = log.lock().unwrap();
-            assert_eq!(log.presents, 2, "fail={fail}: no complete fallback");
+            assert_eq!(log.presents, 3, "fail={fail}: no complete fallback");
+            assert_eq!(
+                log.position_update_attempts, 1,
+                "fail={fail}: rejected fast path was retried"
+            );
             let scene = log.scenes.last().unwrap();
             assert_eq!(
                 scene.cursor_marker.as_ref().map(|marker| marker.center),
-                Some(Point::new(200.0, 300.0))
+                Some(Point::new(300.0, 300.0))
             );
         }
     }

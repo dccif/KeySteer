@@ -1,5 +1,11 @@
 # 更新日志 / Release Notes
 
+## 0.9.10
+
+修复拖拽自动释放后鼠标按住提示和按下颜色可能残留的问题，并减少模式指示器刷新时的临时分配与重复处理，让输入状态清理和指针提示更稳定、轻快。
+
+Fixed held-mouse text and pressed colors sometimes remaining after automatic drag release, while reducing temporary allocations and duplicate work in shared indicator and input-state handling.
+
 ## 0.9.9
 
 新增可选的修饰键拖拽自动释放：长按鼠标键后可透传任意组合的修饰键，并在指针停止移动后自动松开鼠标键；默认关闭。

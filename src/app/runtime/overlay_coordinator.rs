@@ -2,6 +2,55 @@
 
 use super::*;
 
+struct HeldTargetsText {
+    value: String,
+    character_count: usize,
+}
+
+fn held_targets_text(targets: &LatchedTargets) -> Option<HeldTargetsText> {
+    if targets.is_empty() {
+        return None;
+    }
+
+    const PREFIX: &str = "● ";
+    const SEPARATOR: &str = " · ";
+    let (names_len, names_characters) = targets
+        .iter()
+        .map(|target| {
+            let name = target.canonical_str();
+            (name.len(), name.chars().count())
+        })
+        .fold(
+            (0, 0),
+            |(bytes, characters), (name_bytes, name_characters)| {
+                (bytes + name_bytes, characters + name_characters)
+            },
+        );
+    let target_count = targets.iter().len();
+    let mut text = String::with_capacity(
+        PREFIX.len() + names_len + SEPARATOR.len() * target_count.saturating_sub(1),
+    );
+    text.push_str(PREFIX);
+    for (index, target) in targets.iter().enumerate() {
+        if index != 0 {
+            text.push_str(SEPARATOR);
+        }
+        for character in target.canonical_str().chars() {
+            text.push(if character == '_' {
+                ' '
+            } else {
+                character.to_ascii_uppercase()
+            });
+        }
+    }
+    Some(HeldTargetsText {
+        value: text,
+        character_count: PREFIX.chars().count()
+            + names_characters
+            + SEPARATOR.chars().count() * target_count.saturating_sub(1),
+    })
+}
+
 impl Engine {
     pub(super) fn show_overlay(
         &mut self,
@@ -33,6 +82,7 @@ impl Engine {
         mut scene: OverlayScene,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
+        let starts_visible_session = !self.overlay_visible;
         let cursor_only = scene.clip.is_none()
             && scene.backdrop.is_none()
             && scene.labels.is_empty()
@@ -51,7 +101,7 @@ impl Engine {
         if let Some(cursor) = self
             .config
             .mode_indicator
-            .cursor_for_mode(display_mode.as_str())
+            .cursor_for_mode_ref(display_mode.as_str())
         {
             dynamic.cursor = true;
             let pressed_button = [
@@ -63,16 +113,16 @@ impl Engine {
             .find(|button| self.latched.contains(&InputTarget::Mouse(*button)))
             .or_else(|| self.active_click_indicators.latest_button());
             let pressed_color = match pressed_button {
-                Some(crate::api::binding::Button::Left) => cursor.left_pressed_color.as_ref(),
-                Some(crate::api::binding::Button::Middle) => cursor.middle_pressed_color.as_ref(),
-                Some(crate::api::binding::Button::Right) => cursor.right_pressed_color.as_ref(),
+                Some(crate::api::binding::Button::Left) => cursor.left_pressed_color,
+                Some(crate::api::binding::Button::Middle) => cursor.middle_pressed_color,
+                Some(crate::api::binding::Button::Right) => cursor.right_pressed_color,
                 None => None,
             }
             .and_then(|color| color.resolve(self.palette.appearance));
             let fill = pressed_color.map_or_else(
                 || {
                     crate::config::style::resolve(
-                        cursor.fill_color.as_ref(),
+                        cursor.fill_color,
                         self.palette.appearance,
                         self.palette.accent.with_alpha(34),
                     )
@@ -81,7 +131,7 @@ impl Engine {
             );
             let stroke = pressed_color.unwrap_or_else(|| {
                 crate::config::style::resolve(
-                    cursor.stroke_color.as_ref(),
+                    cursor.stroke_color,
                     self.palette.appearance,
                     self.palette.accent_alt.with_alpha(210),
                 )
@@ -160,6 +210,9 @@ impl Engine {
         self.overlay_visible = true;
         self.overlay_dynamic = dynamic;
         self.overlay_positions = Some(positions);
+        if starts_visible_session {
+            self.overlay_position_fast_path_disabled = false;
+        }
         Ok(())
     }
 
@@ -183,6 +236,7 @@ impl Engine {
         self.overlay_visible = false;
         self.overlay_dynamic = DynamicOverlayState::default();
         self.overlay_positions = None;
+        self.overlay_position_fast_path_disabled = false;
         crate::app::perf_probe::mark("overlay_hidden");
         Ok(())
     }
@@ -235,6 +289,9 @@ impl Engine {
         if self.overlay_positions == Some(positions) {
             return Ok(());
         }
+        if self.overlay_position_fast_path_disabled {
+            return self.refresh_overlay(backend);
+        }
         if self.command_batch_depth > 0 {
             if self.pending_overlay.is_none() {
                 self.pending_overlay = Some(PendingOverlay::Positions);
@@ -248,7 +305,20 @@ impl Engine {
                 self.overlay_positions = Some(positions);
                 Ok(())
             }
-            Ok(false) | Err(_) => self.refresh_overlay_now(backend),
+            Ok(false) => {
+                self.overlay_position_fast_path_disabled = true;
+                self.refresh_overlay_now(backend)
+            }
+            Err(error) => {
+                self.overlay_position_fast_path_disabled = true;
+                crate::app::logging::report_error(
+                    "overlay",
+                    format!(
+                        "position-only overlay update failed; using complete frames until the overlay is dismissed: {error}"
+                    ),
+                );
+                self.refresh_overlay_now(backend)
+            }
         }
     }
 
@@ -270,11 +340,10 @@ impl Engine {
 
     fn build_indicator(&self, display_mode: &ModeId) -> Option<(Indicator, IndicatorGeometry)> {
         let mode = self.modes.get(display_mode)?;
-        let display = mode.display_name();
         let (text, ui) = self
             .config
             .mode_indicator
-            .for_mode(display_mode.as_str(), &display)?;
+            .for_mode_with(display_mode.as_str(), || mode.display_name())?;
 
         let background = mode
             .indicator_color(&self.palette)
@@ -285,25 +354,17 @@ impl Engine {
             self.palette.readable_on(background),
             self.palette.accent,
         );
-        let held_text = (!self.latched.is_empty()).then(|| {
-            let targets = self
-                .latched
-                .iter()
-                .map(|target| target.canonical().replace('_', " ").to_ascii_uppercase())
-                .collect::<Vec<_>>()
-                .join(" · ");
-            format!("● {targets}")
-        });
-        let text_width = |value: &str| {
-            (value.chars().count() as f64 * style.font_size * 0.75 + style.padding_x * 2.0)
+        let held_text = held_targets_text(&self.latched);
+        let text_width = |character_count: usize| {
+            (character_count as f64 * style.font_size * 0.75 + style.padding_x * 2.0)
                 .max(style.font_size * 2.0)
                 .ceil()
         };
         let width = held_text
-            .as_deref()
-            .map(text_width)
+            .as_ref()
+            .map(|held| text_width(held.character_count))
             .unwrap_or_default()
-            .max(text_width(&text));
+            .max(text_width(text.chars().count()));
         let line_height = (style.font_size * 1.4 + style.padding_y * 2.0).ceil();
         let height = line_height + held_text.as_ref().map_or(0.0, |_| line_height + 4.0);
         // `position.x` is the shared right edge of both badges. Keeping the
@@ -318,11 +379,42 @@ impl Engine {
         Some((
             Indicator {
                 text,
-                held_text,
+                held_text: held_text.map(|held| held.value),
                 position: geometry.position(self.cursor, &self.screens),
                 style,
             },
             geometry,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn held_target_text_uses_stable_order_and_exact_character_count() {
+        let mut targets = LatchedTargets::default();
+        targets.insert(InputTarget::Mouse(Button::Middle));
+        targets.insert(InputTarget::Key(Key::new("left_shift").unwrap()));
+        targets.insert(InputTarget::Mouse(Button::Right));
+        targets.insert(InputTarget::Mouse(Button::Left));
+
+        let held = held_targets_text(&targets).expect("held targets");
+        assert_eq!(
+            held.value,
+            "● LEFT SHIFT · MOUSE LEFT · MOUSE RIGHT · MOUSE MIDDLE"
+        );
+        assert_eq!(held.character_count, held.value.chars().count());
+    }
+
+    #[test]
+    fn held_target_text_preserves_non_ascii_key_names() {
+        let mut targets = LatchedTargets::default();
+        targets.insert(InputTarget::Key(Key::new("é").unwrap()));
+
+        let held = held_targets_text(&targets).expect("held target");
+        assert_eq!(held.value, "● é");
+        assert_eq!(held.character_count, 3);
     }
 }

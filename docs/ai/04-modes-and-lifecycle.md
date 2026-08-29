@@ -52,7 +52,8 @@ settings；不能注入输入、创建窗口或直接扫描 UI。
   透传修饰键时，首次真实位移建立 deadline，后续物理移动、MovePointer 或 WarpPointer 的有效位移
   只重置同一 deadline。完整显式 chord 始终优先；没有完整匹配时才忽略本次透传修饰键并借用
   Normal 的 `Move`，`none` 与其他动作不会被回退绕过。默认 0 路径不读取时钟，也不增加系统 timer、
-  worker、锁或堆分配。Reload 只取消自动 owner，保留已经存在的手动 latch；离开 Normal、capture loss、
+  worker、锁或堆分配。自动释放成功后完整刷新一次动态装饰，且长按决议时普通 click feedback 的所有权
+  转交给 latch，避免位置快路继续搬运旧的 held badge 或按下色。Reload 只取消自动 owner，保留已经存在的手动 latch；离开 Normal、capture loss、
   Disable 和 shutdown 则走可恢复的 MouseUp 清理。
 
 ### Grid (`src/modes/grid.rs`)

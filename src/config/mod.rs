@@ -1169,6 +1169,14 @@ impl Default for ModeIndicator {
 impl ModeIndicator {
     /// Whether to show a badge for `mode_id`, and its merged visual style.
     pub fn for_mode(&self, mode_id: &str, display_name: &str) -> Option<(String, IndicatorUi)> {
+        self.for_mode_with(mode_id, || display_name.to_owned())
+    }
+
+    pub(crate) fn for_mode_with(
+        &self,
+        mode_id: &str,
+        display_name: impl FnOnce() -> String,
+    ) -> Option<(String, IndicatorUi)> {
         let entry = self.modes.get(mode_id);
         let enabled = entry.and_then(|e| e.enabled).unwrap_or(mode_id != "idle");
         if !enabled {
@@ -1176,7 +1184,7 @@ impl ModeIndicator {
         }
         let text = entry
             .and_then(|e| e.text.clone())
-            .unwrap_or_else(|| display_name.to_string());
+            .unwrap_or_else(display_name);
         let ui = entry
             .map(|entry| entry.ui.apply(&self.ui))
             .unwrap_or_else(|| self.ui.clone());
@@ -1184,15 +1192,72 @@ impl ModeIndicator {
     }
 
     pub fn cursor_for_mode(&self, mode_id: &str) -> Option<CursorIndicatorUi> {
+        self.cursor_for_mode_ref(mode_id)
+            .map(ResolvedCursorIndicatorUi::into_owned)
+    }
+
+    pub(crate) fn cursor_for_mode_ref(
+        &self,
+        mode_id: &str,
+    ) -> Option<ResolvedCursorIndicatorUi<'_>> {
         if mode_id == "idle" {
             return None;
         }
-        let cursor = self
-            .modes
-            .get(mode_id)
-            .map(|entry| entry.cursor.apply(&self.cursor))
-            .unwrap_or_else(|| self.cursor.clone());
+        let override_cursor = self.modes.get(mode_id).map(|entry| &entry.cursor);
+        let cursor = ResolvedCursorIndicatorUi {
+            enabled: override_cursor
+                .and_then(|cursor| cursor.enabled)
+                .unwrap_or(self.cursor.enabled),
+            radius: override_cursor
+                .and_then(|cursor| cursor.radius)
+                .unwrap_or(self.cursor.radius),
+            fill_color: override_cursor
+                .and_then(|cursor| cursor.fill_color.as_ref())
+                .or(self.cursor.fill_color.as_ref()),
+            stroke_color: override_cursor
+                .and_then(|cursor| cursor.stroke_color.as_ref())
+                .or(self.cursor.stroke_color.as_ref()),
+            left_pressed_color: override_cursor
+                .and_then(|cursor| cursor.left_pressed_color.as_ref())
+                .or(self.cursor.left_pressed_color.as_ref()),
+            middle_pressed_color: override_cursor
+                .and_then(|cursor| cursor.middle_pressed_color.as_ref())
+                .or(self.cursor.middle_pressed_color.as_ref()),
+            right_pressed_color: override_cursor
+                .and_then(|cursor| cursor.right_pressed_color.as_ref())
+                .or(self.cursor.right_pressed_color.as_ref()),
+            stroke_width: override_cursor
+                .and_then(|cursor| cursor.stroke_width)
+                .unwrap_or(self.cursor.stroke_width),
+        };
         cursor.enabled.then_some(cursor)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ResolvedCursorIndicatorUi<'a> {
+    pub enabled: bool,
+    pub radius: i32,
+    pub fill_color: Option<&'a ThemedColor>,
+    pub stroke_color: Option<&'a ThemedColor>,
+    pub left_pressed_color: Option<&'a ThemedColor>,
+    pub middle_pressed_color: Option<&'a ThemedColor>,
+    pub right_pressed_color: Option<&'a ThemedColor>,
+    pub stroke_width: i32,
+}
+
+impl ResolvedCursorIndicatorUi<'_> {
+    fn into_owned(self) -> CursorIndicatorUi {
+        CursorIndicatorUi {
+            enabled: self.enabled,
+            radius: self.radius,
+            fill_color: self.fill_color.cloned(),
+            stroke_color: self.stroke_color.cloned(),
+            left_pressed_color: self.left_pressed_color.cloned(),
+            middle_pressed_color: self.middle_pressed_color.cloned(),
+            right_pressed_color: self.right_pressed_color.cloned(),
+            stroke_width: self.stroke_width,
+        }
     }
 }
 
@@ -3209,6 +3274,39 @@ mod tests {
         // Unlisted active modes stay visible, while idle remains silent.
         assert!(config.mode_indicator.for_mode("grid", "Grid").is_some());
         assert!(config.mode_indicator.for_mode("idle", "Idle").is_none());
+    }
+
+    #[test]
+    fn mode_indicator_only_builds_a_display_name_when_needed() {
+        let indicator = ModeIndicator::default();
+        let calls = std::cell::Cell::new(0);
+        let (normal, _) = indicator
+            .for_mode_with("normal", || {
+                calls.set(calls.get() + 1);
+                "unused".into()
+            })
+            .expect("normal indicator");
+        assert_eq!(normal, "Normal");
+        assert_eq!(calls.get(), 0);
+
+        let (grid, _) = indicator
+            .for_mode_with("grid", || {
+                calls.set(calls.get() + 1);
+                "Grid".into()
+            })
+            .expect("grid indicator");
+        assert_eq!(grid, "Grid");
+        assert_eq!(calls.get(), 1);
+
+        assert!(
+            indicator
+                .for_mode_with("idle", || {
+                    calls.set(calls.get() + 1);
+                    "Idle".into()
+                })
+                .is_none()
+        );
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]
