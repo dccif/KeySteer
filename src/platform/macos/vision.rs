@@ -3,6 +3,7 @@ use std::ptr::NonNull;
 
 use crate::api::command::{UiScanStatus, VisionOptions};
 use crate::api::geometry::{Rect, UiTarget};
+use crate::platform::spatial_index::SpatialIndex;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -35,6 +36,8 @@ struct NativeConfig {
     rectangle_min_size: f64,
     rectangle_min_aspect: f64,
     rectangle_max_aspect: f64,
+    maximum_capture_pixels: u64,
+    maximum_capture_dimension: u64,
 }
 
 #[repr(C)]
@@ -65,6 +68,8 @@ struct NativeResult {
 const MAX_VISION_REGIONS: usize = 2_000;
 const MAX_VISION_LABEL_BYTES: usize = 64 * 1024;
 const MAX_VISION_MESSAGE_BYTES: usize = 4 * 1024;
+const MAX_CAPTURE_PIXELS: u64 = 8_388_608;
+const MAX_CAPTURE_DIMENSION: u64 = 4_096;
 const VISION_ABI_VERSION: u32 = 2;
 
 struct OwnedVisionResult(NonNull<NativeResult>);
@@ -176,6 +181,8 @@ pub fn detect(
         rectangle_min_size: options.rectangle_min_size,
         rectangle_min_aspect: options.rectangle_min_aspect,
         rectangle_max_aspect: options.rectangle_max_aspect,
+        maximum_capture_pixels: MAX_CAPTURE_PIXELS,
+        maximum_capture_dimension: MAX_CAPTURE_DIMENSION,
     };
     let result =
         match OwnedVisionResult::new(NmkDetectVisionElements(native_bounds, config, scan_id)) {
@@ -359,9 +366,10 @@ fn merge_candidates(mut candidates: Vec<Candidate>, threshold: f64) -> Vec<UiTar
             .then_with(|| b.confidence.total_cmp(&a.confidence))
     });
     let mut targets: Vec<UiTarget> = Vec::new();
+    let mut index = SpatialIndex::new(64.0, 0.0, f64::EPSILON);
     for candidate in candidates {
-        if targets.iter().all(|existing| {
-            intersection_over_union(existing.rect, candidate.target.rect) < threshold
+        if index.insert_if_unique(candidate.target.rect, |existing, candidate| {
+            intersection_over_union(existing, candidate) >= threshold
         }) {
             targets.push(candidate.target);
         }

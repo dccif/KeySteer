@@ -192,13 +192,19 @@ impl SurfaceDrawGuard {
                 .map_err(|error| format!("DirectComposition EndDraw failed: {error}"));
             (d2d_result, surface_result)
         };
-        d2d_result.and(surface_result)
+        match (d2d_result, surface_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(d2d), Err(surface)) => Err(format!("{d2d}; {surface}")),
+        }
     }
 }
 
 impl Drop for SurfaceDrawGuard {
     fn drop(&mut self) {
-        let _ = self.finish_inner();
+        if let Err(error) = self.finish_inner() {
+            crate::report_error!("windows-overlay", "{error}");
+        }
     }
 }
 
@@ -1130,7 +1136,7 @@ fn indicator_rect(text: &str, position: Point, style: &LabelStyle) -> Rect {
     Rect::new(position.x - width, position.y, width, height)
 }
 
-unsafe extern "system" fn window_proc(
+extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,

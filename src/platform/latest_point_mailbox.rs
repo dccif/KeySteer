@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::sync::atomic::{AtomicU64, Ordering, fence};
 
 use crate::api::geometry::Point;
@@ -20,13 +22,16 @@ impl LatestPointMailbox {
     /// a wake marker.
     pub(crate) fn publish(&self, point: Point) -> bool {
         // The macOS event tap is the sole producer. Release fences keep both
-        // coordinate stores inside the odd sequence interval.
-        self.sequence.fetch_add(1, Ordering::Relaxed);
+        // coordinate stores inside the odd sequence interval. With one writer,
+        // ordinary stores preserve the seqlock protocol without two locked
+        // read-modify-write instructions on every physical mouse edge.
+        let odd = self.sequence.load(Ordering::Relaxed).wrapping_add(1) | 1;
+        self.sequence.store(odd, Ordering::Relaxed);
         fence(Ordering::Release);
         self.x.store(point.x.to_bits(), Ordering::Relaxed);
         self.y.store(point.y.to_bits(), Ordering::Relaxed);
         fence(Ordering::Release);
-        self.sequence.fetch_add(1, Ordering::Relaxed);
+        self.sequence.store(odd.wrapping_add(1), Ordering::Relaxed);
         self.pending.fetch_add(1, Ordering::Release) == 0
     }
 
@@ -197,12 +202,13 @@ mod tests {
             }
 
             fn publish(&self, value: u64) {
-                self.sequence.fetch_add(1, Ordering::Relaxed);
+                let odd = self.sequence.load(Ordering::Relaxed).wrapping_add(1) | 1;
+                self.sequence.store(odd, Ordering::Relaxed);
                 fence(Ordering::Release);
                 self.x.store(value, Ordering::Relaxed);
                 self.y.store(!value, Ordering::Relaxed);
                 fence(Ordering::Release);
-                self.sequence.fetch_add(1, Ordering::Relaxed);
+                self.sequence.store(odd.wrapping_add(1), Ordering::Relaxed);
                 self.pending.fetch_add(1, Ordering::Release);
             }
 

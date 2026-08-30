@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <string.h>
+#include <math.h>
 #include <unistd.h>
 
 typedef struct {
@@ -17,6 +18,8 @@ typedef struct {
     double rectangle_min_size;
     double rectangle_min_aspect;
     double rectangle_max_aspect;
+    uint64_t maximum_capture_pixels;
+    uint64_t maximum_capture_dimension;
 } NmkVisionConfig;
 
 typedef struct {
@@ -104,6 +107,8 @@ static SCDisplay *displayForID(CGDirectDisplayID displayID, SCShareableContent *
 static CGImageRef captureRegion(
     CGRect region,
     uint64_t timeoutMS,
+    uint64_t maximumPixels,
+    uint64_t maximumDimension,
     int32_t *status,
     NSString **message,
     CGRect *capturedBounds) {
@@ -167,8 +172,19 @@ static CGImageRef captureRegion(
             clipped.origin.y - displayBounds.origin.y,
             clipped.size.width,
             clipped.size.height);
-        configuration.width = MAX(1, (size_t)llround(clipped.size.width * scaleX));
-        configuration.height = MAX(1, (size_t)llround(clipped.size.height * scaleY));
+        double captureWidth = MAX(1.0, clipped.size.width * scaleX);
+        double captureHeight = MAX(1.0, clipped.size.height * scaleY);
+        double scale = 1.0;
+        if (maximumDimension > 0) {
+            scale = MIN(scale, (double)maximumDimension / captureWidth);
+            scale = MIN(scale, (double)maximumDimension / captureHeight);
+        }
+        if (maximumPixels > 0 && captureWidth * captureHeight > (double)maximumPixels) {
+            scale = MIN(scale, sqrt((double)maximumPixels / (captureWidth * captureHeight)));
+        }
+        scale = MIN(1.0, scale);
+        configuration.width = MAX(1, (size_t)llround(captureWidth * scale));
+        configuration.height = MAX(1, (size_t)llround(captureHeight * scale));
         configuration.showsCursor = NO;
         [SCScreenshotManager captureImageWithFilter:filter configuration:configuration completionHandler:^(CGImageRef image, NSError *error) {
             captureError = error;
@@ -228,6 +244,8 @@ NmkVisionResult *NmkDetectVisionElements(
         CGImageRef image = captureRegion(
             windowBounds,
             config.timeout_ms,
+            config.maximum_capture_pixels,
+            config.maximum_capture_dimension,
             &captureStatus,
             &captureMessage,
             &capturedBounds);

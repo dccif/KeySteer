@@ -5,7 +5,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use semver::Version;
 use serde::Deserialize;
@@ -31,6 +31,7 @@ static CHECK_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 pub(crate) struct UpdateWorker {
     cancel: Arc<AtomicBool>,
     worker: WorkerJoin,
+    shutdown_failure_returned: bool,
 }
 
 impl UpdateWorker {
@@ -50,13 +51,29 @@ impl UpdateWorker {
     /// native network calls retain their own hard timeout, so shutdown never
     /// waits indefinitely.
     pub(crate) fn cancel_and_wait(&mut self) -> Result<(), String> {
+        let now = Instant::now();
+        let deadline = now.checked_add(UPDATE_STOP_WAIT).unwrap_or(now);
+        self.cancel_and_wait_until(deadline)
+    }
+
+    /// Request cancellation without extending a caller-owned shutdown
+    /// deadline. The update worker keeps its shorter 250 ms local cap so a
+    /// blocking network operation cannot consume the rest of backend cleanup.
+    pub(crate) fn cancel_and_wait_until(&mut self, deadline: Instant) -> Result<(), String> {
         self.cancel.store(true, Ordering::Release);
-        self.worker.join_timeout(UPDATE_STOP_WAIT)
+        let now = Instant::now();
+        let local_deadline = deadline.min(now.checked_add(UPDATE_STOP_WAIT).unwrap_or(deadline));
+        let result = self.worker.join_until(local_deadline);
+        self.shutdown_failure_returned = result.is_err();
+        result
     }
 }
 
 impl Drop for UpdateWorker {
     fn drop(&mut self) {
+        if self.shutdown_failure_returned || self.worker.shutdown_failure_was_returned() {
+            return;
+        }
         if let Err(error) = self.cancel_and_wait() {
             crate::app::logging::report_error("update-check", &error);
         }
@@ -176,7 +193,11 @@ pub(crate) fn check_async(
             });
         },
     )?;
-    Ok(Some(UpdateWorker { cancel, worker }))
+    Ok(Some(UpdateWorker {
+        cancel,
+        worker,
+        shutdown_failure_returned: false,
+    }))
 }
 
 #[cfg(target_os = "macos")]
@@ -612,7 +633,15 @@ impl PartialDownload {
 
 impl Drop for PartialDownload {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if let Err(error) = fs::remove_file(&self.path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            crate::report_error!(
+                "update-check",
+                "cannot remove partial download {}: {error}",
+                self.path.display()
+            );
+        }
     }
 }
 
@@ -747,7 +776,11 @@ mod tests {
             }
         })
         .unwrap();
-        let mut worker = UpdateWorker { cancel, worker };
+        let mut worker = UpdateWorker {
+            cancel,
+            worker,
+            shutdown_failure_returned: false,
+        };
 
         worker.cancel_and_wait().unwrap();
 

@@ -4,10 +4,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use core_graphics::base::kCGErrorSuccess;
-use core_graphics::display::{
-    CGDirectDisplayID, CGDisplay, CGDisplayRegisterReconfigurationCallback,
-    CGDisplayRemoveReconfigurationCallback,
-};
+use core_graphics::display::{CGDirectDisplayID, CGDisplay};
 use objc2::MainThreadMarker;
 use objc2_app_kit::NSScreen;
 
@@ -15,22 +12,23 @@ use crate::api::geometry::{Rect, Screen};
 
 pub struct DisplayWatcher {
     registered: bool,
+    stop_failure_returned: bool,
 }
 
 static DISPLAY_CHANGED: AtomicBool = AtomicBool::new(false);
 
 impl DisplayWatcher {
     pub fn new() -> Result<Self, String> {
-        // SAFETY: the callback ABI matches CoreGraphics. It uses no userdata
-        // and only touches a process-lifetime atomic plus the main run loop.
-        let result =
-            unsafe { CGDisplayRegisterReconfigurationCallback(display_changed, std::ptr::null()) };
+        let result = super::native::register_display_reconfiguration_callback();
         if result != kCGErrorSuccess {
             return Err(format!(
                 "cannot register display reconfiguration callback: {result:?}"
             ));
         }
-        Ok(Self { registered: true })
+        Ok(Self {
+            registered: true,
+            stop_failure_returned: false,
+        })
     }
 
     pub fn take_changed(&self) -> bool {
@@ -41,29 +39,32 @@ impl DisplayWatcher {
         if !self.registered {
             return Ok(());
         }
-        // SAFETY: this is the exact callback/null-userdata pair registered by
-        // `new`; the callback owns no dynamically freed state.
-        let result =
-            unsafe { CGDisplayRemoveReconfigurationCallback(display_changed, std::ptr::null()) };
+        let result = super::native::remove_display_reconfiguration_callback();
         if result != kCGErrorSuccess {
+            self.stop_failure_returned = true;
             return Err(format!(
                 "cannot remove display reconfiguration callback: {result:?}"
             ));
         }
         self.registered = false;
+        self.stop_failure_returned = false;
         Ok(())
     }
 }
 
 impl Drop for DisplayWatcher {
     fn drop(&mut self) {
-        if self.registered {
-            let _ = self.stop();
+        let failure_was_returned = self.stop_failure_returned;
+        if self.registered
+            && let Err(error) = self.stop()
+            && !failure_was_returned
+        {
+            crate::report_error!("macos-screen", "{error}");
         }
     }
 }
 
-unsafe extern "C" fn display_changed(
+pub(super) extern "C" fn display_changed(
     _display: CGDirectDisplayID,
     _flags: u32,
     user_info: *const c_void,

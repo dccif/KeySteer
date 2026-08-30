@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Shell::{
@@ -46,6 +46,7 @@ static ENABLED: AtomicBool = AtomicBool::new(true);
 static DISPLAY_CHANGED: AtomicBool = AtomicBool::new(false);
 static APPEARANCE_CHANGED: AtomicBool = AtomicBool::new(false);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+static ICON_INSTALLED: AtomicBool = AtomicBool::new(false);
 static NATIVE_DIALOG_VISIBLE: AtomicBool = AtomicBool::new(false);
 static UPDATE_MENU_STATE: OnceLock<Mutex<UpdateMenuState>> = OnceLock::new();
 const NATIVE_DIALOG_THREAD_STACK_BYTES: usize = 256 * 1024;
@@ -145,6 +146,12 @@ impl StatusItem {
     }
 
     pub fn stop(&mut self) -> Result<(), String> {
+        let now = Instant::now();
+        let deadline = now.checked_add(TRAY_STOP_TIMEOUT).unwrap_or(now);
+        self.stop_until(deadline)
+    }
+
+    pub fn stop_until(&mut self, deadline: Instant) -> Result<(), String> {
         if self.worker.is_none() {
             clear_sender();
             return Ok(());
@@ -163,15 +170,15 @@ impl StatusItem {
                     crate::report_error!("windows-tray", "cannot request tray shutdown: {error}")
                 }
             }
-            self.thread_id = 0;
-            self.hwnd = HWND::default();
         }
         let result = self
             .worker
             .as_mut()
-            .map_or(Ok(()), |worker| worker.join_timeout(TRAY_STOP_TIMEOUT));
+            .map_or(Ok(()), |worker| worker.join_until(deadline));
         if result.is_ok() {
             self.worker.take();
+            self.thread_id = 0;
+            self.hwnd = HWND::default();
         }
         clear_sender();
         if !posted && result.is_ok() {
@@ -194,6 +201,14 @@ pub(super) fn set_update_progress(progress: &UpdateProgress) {
 
 impl Drop for StatusItem {
     fn drop(&mut self) {
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(WorkerJoin::shutdown_failure_was_returned)
+        {
+            clear_sender();
+            return;
+        }
         if let Err(error) = self.stop() {
             crate::app::logging::report_error("windows-tray", &error);
         }
@@ -272,10 +287,15 @@ fn create_window() -> Result<super::native::OwnedWindow, String> {
 
 fn destroy_window(window: super::native::OwnedWindow) {
     let hwnd = window.raw();
-    // SAFETY: `hwnd` owns the icon identified by `icon_data`; NIM_DELETE does
-    // not retain the stack structure.
-    unsafe {
-        let _ = Shell_NotifyIconW(NIM_DELETE, &icon_data(hwnd));
+    if ICON_INSTALLED.swap(false, Ordering::AcqRel) {
+        // SAFETY: `hwnd` owns the icon identified by `icon_data`; NIM_DELETE
+        // does not retain the stack structure.
+        if !unsafe { Shell_NotifyIconW(NIM_DELETE, &icon_data(hwnd)) }.as_bool() {
+            crate::report_error!(
+                "windows-tray",
+                "cannot remove the notification-area icon during shutdown"
+            );
+        }
     }
     if let Err(error) = window.destroy() {
         crate::report_error!("windows-tray", "cannot destroy tray event window: {error}");
@@ -328,7 +348,14 @@ fn load_app_icon() -> HICON {
 fn add_icon(hwnd: HWND) -> bool {
     // SAFETY: icon_data is fully initialized and remains live for the
     // synchronous Shell_NotifyIconW copy.
-    unsafe { Shell_NotifyIconW(NIM_ADD, &icon_data(hwnd)) }.as_bool()
+    let installed = unsafe { Shell_NotifyIconW(NIM_ADD, &icon_data(hwnd)) }.as_bool();
+    // A failed recovery NIM_ADD does not prove that the previous icon vanished.
+    // Preserve ownership until an explicit delete consumes it; successful adds
+    // establish ownership for a newly created/taskbar-recreated icon.
+    if installed {
+        ICON_INSTALLED.store(true, Ordering::Release);
+    }
+    installed
 }
 
 pub(super) fn open_https_url(url: &str) -> Result<(), String> {
@@ -691,7 +718,7 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-unsafe extern "system" fn window_proc(
+extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,

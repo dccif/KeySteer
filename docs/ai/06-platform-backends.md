@@ -7,7 +7,7 @@
 - Vision result 由 Rust RAII owner 释放，读取 slice 前验证 count<=2000 和非空指针。
 - COM apartment 显式 `!Send/!Sync`，确保 `CoUninitialize` 回到初始化线程。
 - 两个平台入口不放行 undocumented unsafe；每个最小块记录 `SAFETY` 契约。机械门禁当前为
-  不高于 225 个 unsafe expression/18 个文件，并同时禁止 `transmute`/`transmute_copy`；`domain` 与其余 portable 层使用编译期
+  不高于 220 个 unsafe expression/17 个文件，并同时禁止 `transmute`/`transmute_copy`；`domain` 与其余 portable 层使用编译期
   `forbid(unsafe_code)`/测试门禁保持零 unsafe。
 
 ## 共同契约
@@ -18,6 +18,12 @@ frame clock、overlay、UI scan、appearance、系统浏览器、状态栏开关
 的同一按钮再次请求 `Press` 必须幂等返回，不得向系统追加第二个 mouse-down。
 两端还实现动态 overlay 位置快路径；`None` 表示该层保持原位，跨屏、缩放或任何内容变化
 仍由完整 `present` 同步状态。
+
+可失败的后台 owner 必须在显式 stop/join 成功后才从 Backend 中移除。`WorkerJoin` 超时会
+保留 handle 并转交显式 quarantine；backend poll 先检查非空原子标志，只有确有待回收线程
+才进入 quarantine 锁。显式 shutdown 已返回的失败只由最终处理边界记录一次；Backend/owner
+Drop 仍重试未完成阶段，但不得重复上报同一错误。所有阶段用 `ErrorBundle` 聚合，前一项失败
+不能跳过后续输入、扫描、系统回调或原生窗口的释放。
 
 ## Windows
 
@@ -110,6 +116,10 @@ item、window 和 display link 都有线程亲和性。
 - `hook.rs` 在专用 CFRunLoop thread 安装 CGEventTap，并做 disposition handshake。tap 的创建与
   status item、frame clock、屏幕和 workspace 初始化并行，Backend 完成前才启用，启动期间
   的异步事件先进入 fallback channel，成功后通过共享 `OnceLock` 路由到有界 Hook 队列。
+- EventTap 的修饰键和 tap-disabled 状态使用单写者原子字段，不在同步 callback 中锁
+  `Mutex<TapState>`。CFRunLoop 只因真实 event source 或显式 `CFRunLoopStop` 返回；长有限等待
+  只是异常兜底，空闲时不再每 20ms 醒来，也不增加 timer、sleep 或辅助线程。若 active run loop
+  意外返回 `Finished`/`Stopped`，立即按输入捕获丢失终止并由统一 logger 记录，不能原地空转。
 - AppKit main run loop 负责窗口、菜单栏和 workspace 事件；wake 使用 typed
   `objc2-core-foundation` 接口。workspace 先比较 PID，只有前台进程变化时才分配 bundle ID，
   appearance 与静态 `NSString` 直接比较。

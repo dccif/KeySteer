@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Normal mode: the working state.
 //!
 //! Normal is where the user actually drives the pointer: vim-style movement,
@@ -122,6 +124,7 @@ impl FromIterator<Direction> for DirectionMask {
 #[derive(Debug, Clone, Default)]
 struct Motion {
     elapsed_seconds: f64,
+    travelled_distance: f64,
     remainder_x: f64,
     remainder_y: f64,
 }
@@ -151,11 +154,12 @@ impl Motion {
         if seconds <= 0.0 {
             return (0.0, 0.0);
         }
-        let start = self.elapsed_seconds;
         self.elapsed_seconds += seconds;
         // The multiplier scales velocity and acceleration equally, so the
         // ramp duration stays stable when a speed modifier is pressed.
-        let distance = Self::distance(profile, start, self.elapsed_seconds) * multiplier;
+        let travelled_distance = Self::travel_at(profile, self.elapsed_seconds);
+        let distance = (travelled_distance - self.travelled_distance) * multiplier;
+        self.travelled_distance = travelled_distance;
         self.advance(directions, distance)
     }
 
@@ -164,6 +168,7 @@ impl Motion {
     /// Integrating the velocity curve rather than sampling it once per frame
     /// keeps total travel independent of display cadence, including a frame
     /// that crosses from acceleration into cruising speed.
+    #[cfg(test)]
     fn distance(profile: &Pointer, start: f64, end: f64) -> f64 {
         Self::travel_at(profile, end) - Self::travel_at(profile, start)
     }
@@ -209,10 +214,15 @@ impl Motion {
         if dx == 0.0 && dy == 0.0 || distance <= 0.0 {
             return (0.0, 0.0);
         }
-        // Normalise so diagonal travel matches axis-aligned travel.
-        let length = (dx * dx + dy * dy).sqrt();
-        self.remainder_x += dx / length * distance;
-        self.remainder_y += dy / length * distance;
+        // Direction components are always -1, 0, or 1. Avoid recomputing a
+        // square root and two divisions on every display frame.
+        let scale = if dx != 0.0 && dy != 0.0 {
+            std::f64::consts::FRAC_1_SQRT_2
+        } else {
+            1.0
+        };
+        self.remainder_x += dx * scale * distance;
+        self.remainder_y += dy * scale * distance;
 
         let out_x = self.remainder_x.trunc();
         let out_y = self.remainder_y.trunc();
@@ -235,6 +245,11 @@ pub struct NormalMode {
     /// Speed modifiers currently held.
     speeds: SmallKeyMap<Speed>,
 
+    /// Derived held-input state. It changes only on physical key edges, so
+    /// display frames need neither scan the small maps nor resolve precedence.
+    directions: DirectionMask,
+    speed_multiplier: f64,
+
     motion: Motion,
     /// Once the first native display update arrives, OS key repeats are
     /// ignored. Before that they remain a fallback without a display link.
@@ -252,15 +267,21 @@ impl NormalMode {
             moving: SmallKeyMap::default(),
             scrolling: SmallKeyMap::default(),
             speeds: SmallKeyMap::default(),
+            directions: DirectionMask::default(),
+            speed_multiplier: 1.0,
             motion: Motion::default(),
             frame_driven: false,
             fallback_tick: None,
         }
     }
 
-    /// Current speed multiplier. Fast wins if both are held.
+    /// Current speed multiplier. Precision, fast, then slow win ties.
     fn multiplier(&self) -> f64 {
-        if self.speeds.values().any(|s| *s == Speed::Precision) {
+        self.speed_multiplier
+    }
+
+    fn refresh_multiplier(&mut self) {
+        self.speed_multiplier = if self.speeds.values().any(|s| *s == Speed::Precision) {
             self.profile.precision_multiplier
         } else if self.speeds.values().any(|s| *s == Speed::Fast) {
             self.profile.fast_multiplier
@@ -268,11 +289,11 @@ impl NormalMode {
             self.profile.slow_multiplier
         } else {
             1.0
-        }
+        };
     }
 
-    fn directions(&self) -> DirectionMask {
-        self.moving.values().copied().collect()
+    fn refresh_directions(&mut self) {
+        self.directions = self.moving.values().copied().collect();
     }
 
     fn binding(&mut self, binding: &Binding, state: KeyState, key: &Key) -> CommandBatch {
@@ -284,6 +305,7 @@ impl NormalMode {
                 if pressed {
                     let was_still = self.moving.is_empty();
                     let is_first_press = self.moving.insert(key.clone(), *direction).is_none();
+                    self.refresh_directions();
                     if !is_first_press && self.frame_driven {
                         // Native display updates own held movement. Keyboard
                         // autorepeat is only a fallback when no update arrives.
@@ -291,18 +313,17 @@ impl NormalMode {
                     }
 
                     let now = Instant::now();
-                    let directions = self.directions();
                     let (dx, dy) = if is_first_press {
                         self.motion.reset();
                         self.fallback_tick = Some(now);
                         self.motion
-                            .tap(directions, &self.profile, self.multiplier())
+                            .tap(self.directions, &self.profile, self.multiplier())
                     } else {
                         let elapsed = now.saturating_duration_since(
                             self.fallback_tick.replace(now).unwrap_or(now),
                         );
                         self.motion
-                            .step(directions, &self.profile, self.multiplier(), elapsed)
+                            .step(self.directions, &self.profile, self.multiplier(), elapsed)
                     };
                     if dx != 0.0 || dy != 0.0 {
                         out.push(Command::MovePointer { dx, dy });
@@ -311,11 +332,14 @@ impl NormalMode {
                         self.frame_driven = false;
                         out.push(Command::SetFrameClock(true));
                     }
-                } else if self.moving.remove(key).is_some() && self.moving.is_empty() {
-                    self.motion.reset();
-                    self.frame_driven = false;
-                    self.fallback_tick = None;
-                    out.push(Command::SetFrameClock(false));
+                } else if self.moving.remove(key).is_some() {
+                    self.refresh_directions();
+                    if self.moving.is_empty() {
+                        self.motion.reset();
+                        self.frame_driven = false;
+                        self.fallback_tick = None;
+                        out.push(Command::SetFrameClock(false));
+                    }
                 }
             }
 
@@ -336,6 +360,7 @@ impl NormalMode {
                 } else {
                     self.speeds.remove(key);
                 }
+                self.refresh_multiplier();
             }
 
             // The engine handles every other verb before it reaches a mode.
@@ -358,6 +383,8 @@ impl NormalMode {
         self.moving.clear();
         self.scrolling.clear();
         self.speeds.clear();
+        self.directions = DirectionMask::default();
+        self.speed_multiplier = 1.0;
         self.motion.reset();
         self.frame_driven = false;
         self.fallback_tick = None;
@@ -370,10 +397,9 @@ impl NormalMode {
         if self.moving.is_empty() {
             return Command::SetFrameClock(false).into();
         }
-        let directions = self.directions();
         let (dx, dy) = self
             .motion
-            .step(directions, &self.profile, self.multiplier(), elapsed);
+            .step(self.directions, &self.profile, self.multiplier(), elapsed);
         if dx == 0.0 && dy == 0.0 {
             CommandBatch::new()
         } else {

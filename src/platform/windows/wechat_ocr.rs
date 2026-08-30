@@ -578,7 +578,6 @@ impl TemporaryPng {
         deadline: Instant,
         cancelled: &impl Fn() -> bool,
     ) -> Result<Self, String> {
-        STALE_TEMP_CLEANUP.get_or_init(cleanup_stale_temporary_directories);
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let directory =
             std::env::temp_dir().join(format!("keysteer-ocr-{}-{sequence}", std::process::id()));
@@ -1218,6 +1217,10 @@ fn discover() -> Result<Option<HelperPaths>, String> {
 }
 
 pub(super) fn discover_descriptor() -> Result<Option<WechatDescriptor>, String> {
+    // Discovery already runs once on the low-priority startup worker. Keeping
+    // stale-directory I/O here removes it from the first UI Hint scan without
+    // adding another thread or changing the cached discovery semantics.
+    STALE_TEMP_CLEANUP.get_or_init(cleanup_stale_temporary_directories);
     discover()?.map(WechatDescriptor::from_paths).transpose()
 }
 

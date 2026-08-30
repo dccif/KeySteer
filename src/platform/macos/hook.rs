@@ -1,12 +1,12 @@
 //! Dedicated CGEventTap thread with per-event disposition handshakes.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use core_foundation::runloop::CFRunLoop;
+use core_foundation::runloop::{CFRunLoop, CFRunLoopRunResult};
 use core_graphics::event::{
     CGEvent, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
     CGEventTapProxy, CGEventType, CallbackResult, EventField,
@@ -22,13 +22,17 @@ use crate::platform::multi_click::ClickTracker;
 use super::input;
 
 const DISPOSITION_TIMEOUT: Duration = Duration::from_millis(100);
-const RUN_LOOP_SLICE: Duration = Duration::from_millis(20);
+// `return_after_source_handled` below wakes this worker for real event-tap
+// traffic, while `CFRunLoopStop` wakes shutdown. A long finite bound avoids an
+// otherwise permanent 20 ms idle poll without adding a timer or helper thread.
+const RUN_LOOP_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
 const STOP_TIMEOUT: Duration = Duration::from_millis(250);
 pub const TIMEOUT_WARNING: &str =
     "keyboard disposition timed out; the key was forwarded and the event tap remained active";
 const CAPTURE_LOSS_NONE: u8 = 0;
 const CAPTURE_LOSS_USER_INPUT: u8 = 1;
 const CAPTURE_LOSS_REPEATED_TIMEOUT: u8 = 2;
+const CAPTURE_LOSS_RUN_LOOP: u8 = 3;
 
 struct Envelope {
     event: BackendEvent,
@@ -73,14 +77,51 @@ enum TapDisabled {
     UserInput,
 }
 
-#[derive(Default)]
 struct TapState {
-    last_flags: u64,
-    caps_lock_down: bool,
-    disabled: Option<TapDisabled>,
+    // The event-tap callback is the sole writer for modifier state. Atomics
+    // avoid taking a mutex inside the synchronous system callback; only the
+    // disabled signal crosses from the callback to the surrounding run loop.
+    last_flags: AtomicU64,
+    caps_lock_down: AtomicBool,
+    disabled: AtomicU8,
 }
 
-type SharedState = Arc<Mutex<TapState>>;
+impl Default for TapState {
+    fn default() -> Self {
+        Self {
+            last_flags: AtomicU64::new(0),
+            caps_lock_down: AtomicBool::new(false),
+            disabled: AtomicU8::new(0),
+        }
+    }
+}
+
+impl TapDisabled {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Timeout => 1,
+            Self::UserInput => 2,
+        }
+    }
+
+    const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Timeout),
+            2 => Some(Self::UserInput),
+            _ => None,
+        }
+    }
+}
+
+fn run_loop_stopped_unexpectedly(result: CFRunLoopRunResult, stopping: bool) -> bool {
+    !stopping
+        && matches!(
+            result,
+            CFRunLoopRunResult::Finished | CFRunLoopRunResult::Stopped
+        )
+}
+
+type SharedState = Arc<TapState>;
 type SharedPointer = Arc<crate::platform::latest_point_mailbox::LatestPointMailbox>;
 type SharedClickTracker = Arc<Mutex<ClickTracker>>;
 type SharedRunLoop = Arc<Mutex<Option<CFRunLoop>>>;
@@ -120,6 +161,7 @@ pub struct HookThread {
     signals: SharedHookSignals,
     run_loop: SharedRunLoop,
     worker: WorkerJoin,
+    stop_failure_returned: bool,
     deferred: VecDeque<BackendEvent>,
 }
 
@@ -245,6 +287,7 @@ impl HookStartup {
                         .worker
                         .take()
                         .ok_or_else(|| "macOS event tap worker is unavailable".to_string())?,
+                    stop_failure_returned: false,
                     deferred: VecDeque::new(),
                 })
             }
@@ -318,6 +361,10 @@ impl HookThread {
     /// queue. Permission removal can happen while that queue is full, so a
     /// normal `try_send` is not reliable enough for state recovery.
     pub fn take_capture_loss(&mut self) -> Option<BackendEvent> {
+        if self.signals.capture_loss.load(Ordering::Acquire) == CAPTURE_LOSS_NONE {
+            self.reap_finished();
+            return None;
+        }
         let reason = self
             .signals
             .capture_loss
@@ -354,6 +401,9 @@ impl HookThread {
             CAPTURE_LOSS_REPEATED_TIMEOUT => {
                 "the macOS event tap timed out again after its single recovery attempt; KeySteer stopped capturing input and must be restarted"
             }
+            CAPTURE_LOSS_RUN_LOOP => {
+                "the macOS event-tap run loop stopped unexpectedly; KeySteer stopped capturing input and must be restarted"
+            }
             _ => "macOS physical input capture stopped; KeySteer must be restarted",
         };
         Some(BackendEvent::InputCaptureLost(message.into()))
@@ -377,12 +427,21 @@ impl HookThread {
     }
 
     pub fn stop(&mut self) -> Result<(), String> {
+        let now = Instant::now();
+        let deadline = now.checked_add(STOP_TIMEOUT).unwrap_or(now);
+        self.stop_until(deadline)
+    }
+
+    pub fn stop_until(&mut self, deadline: Instant) -> Result<(), String> {
         self.stop.store(true, Ordering::Release);
         self.active.store(false, Ordering::Release);
         self.signals.drag_modifier_flags.store(0, Ordering::Relaxed);
         self.mailbox.cancel_pending();
         stop_run_loop(&self.run_loop);
-        let result = self.worker.join_timeout(STOP_TIMEOUT);
+        let now = Instant::now();
+        let local_deadline = deadline.min(now.checked_add(STOP_TIMEOUT).unwrap_or(deadline));
+        let result = self.worker.join_until(local_deadline);
+        self.stop_failure_returned = result.is_err();
         self.pending = None;
         result
     }
@@ -398,6 +457,9 @@ fn stop_run_loop(run_loop: &SharedRunLoop) {
 
 impl Drop for HookThread {
     fn drop(&mut self) {
+        if self.stop_failure_returned || self.worker.shutdown_failure_was_returned() {
+            return;
+        }
         if let Err(error) = self.stop() {
             crate::app::logging::report_error("macos-hook", &error);
         }
@@ -423,7 +485,7 @@ fn event_tap_thread(handshake: HookHandshake, context: HookThreadContext) {
     // Build the reverse key table on this worker while AppKit initializes on
     // the main thread. No physical event is captured until activation below.
     input::prewarm_key_map();
-    let state = Arc::new(Mutex::new(TapState::default()));
+    let state = Arc::new(TapState::default());
     let callback = CallbackContext {
         sender: sender.clone(),
         mailbox,
@@ -476,15 +538,29 @@ fn event_tap_thread(handshake: HookHandshake, context: HookThreadContext) {
 
     let mut timeout_retried = false;
     while !stop.load(Ordering::Acquire) {
-        CFRunLoop::run_in_mode(
+        let run_result = CFRunLoop::run_in_mode(
             super::native::default_run_loop_modes().core_foundation,
-            RUN_LOOP_SLICE,
+            RUN_LOOP_WAIT,
             true,
         );
-        let disabled = state
-            .lock()
-            .map(|mut state| state.disabled.take())
-            .unwrap_or(None);
+        if run_loop_stopped_unexpectedly(run_result, stop.load(Ordering::Acquire)) {
+            crate::app::logging::report_error(
+                "macos-hook",
+                "macOS event-tap run loop stopped while physical input capture was active",
+            );
+            active.store(false, Ordering::Release);
+            stop.store(true, Ordering::Release);
+            callback_mailbox.cancel_pending();
+            let _ = signals.capture_loss.compare_exchange(
+                CAPTURE_LOSS_NONE,
+                CAPTURE_LOSS_RUN_LOOP,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            super::workspace::wake_main_run_loop();
+            break;
+        }
+        let disabled = TapDisabled::from_code(state.disabled.swap(0, Ordering::AcqRel));
         match disabled {
             Some(TapDisabled::Timeout) if !timeout_retried => {
                 timeout_retried = true;
@@ -576,13 +652,12 @@ fn handle_event(
         event_type,
         CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
     ) {
-        if let Ok(mut state) = state.lock() {
-            state.disabled = Some(if matches!(event_type, CGEventType::TapDisabledByTimeout) {
-                TapDisabled::Timeout
-            } else {
-                TapDisabled::UserInput
-            });
-        }
+        let disabled = if matches!(event_type, CGEventType::TapDisabledByTimeout) {
+            TapDisabled::Timeout
+        } else {
+            TapDisabled::UserInput
+        };
+        state.disabled.store(disabled.code(), Ordering::Release);
         return CallbackResult::Keep;
     }
 
@@ -707,18 +782,17 @@ fn modifier_transition(state: &SharedState, code: i64, flags: u64) -> Option<(Ke
         return None;
     }
     let key = input::key_for_keycode(code)?;
-    let mut state = state.lock().ok()?;
+    let previous_flags = state.last_flags.swap(flags, Ordering::Relaxed);
     let key_state = if code == 57 {
-        state.caps_lock_down = !state.caps_lock_down;
-        if state.caps_lock_down {
+        let was_down = state.caps_lock_down.fetch_xor(true, Ordering::Relaxed);
+        if !was_down {
             KeyState::Down
         } else {
             KeyState::Up
         }
     } else {
-        let was_down = input::modifier_is_down(state.last_flags, &key);
+        let was_down = input::modifier_is_down(previous_flags, &key);
         let is_down = input::modifier_is_down(flags, &key);
-        state.last_flags = flags;
         if was_down == is_down {
             return None;
         }
@@ -728,7 +802,6 @@ fn modifier_transition(state: &SharedState, code: i64, flags: u64) -> Option<(Ke
             KeyState::Up
         }
     };
-    state.last_flags = flags;
     Some((key, key_state))
 }
 
@@ -778,6 +851,35 @@ mod tests {
         retried = true;
         assert!(!(matches!(TapDisabled::Timeout, TapDisabled::Timeout) && !retried));
         assert!(!matches!(TapDisabled::UserInput, TapDisabled::Timeout));
+        assert_eq!(
+            TapDisabled::from_code(TapDisabled::Timeout.code()),
+            Some(TapDisabled::Timeout)
+        );
+        assert_eq!(
+            TapDisabled::from_code(TapDisabled::UserInput.code()),
+            Some(TapDisabled::UserInput)
+        );
+        assert_eq!(TapDisabled::from_code(0), None);
+    }
+
+    #[test]
+    fn a_finished_or_stopped_active_run_loop_is_terminal_capture_loss() {
+        assert!(run_loop_stopped_unexpectedly(
+            CFRunLoopRunResult::Finished,
+            false
+        ));
+        assert!(run_loop_stopped_unexpectedly(
+            CFRunLoopRunResult::Stopped,
+            false
+        ));
+        assert!(!run_loop_stopped_unexpectedly(
+            CFRunLoopRunResult::HandledSource,
+            false
+        ));
+        assert!(!run_loop_stopped_unexpectedly(
+            CFRunLoopRunResult::Stopped,
+            true
+        ));
     }
 
     #[test]
@@ -798,6 +900,7 @@ mod tests {
             signals: Arc::new(HookSignals::new()),
             run_loop: Arc::new(Mutex::new(None)),
             worker: WorkerJoin::spawn("test hook", std::thread::Builder::new(), || {}).unwrap(),
+            stop_failure_returned: false,
             deferred: VecDeque::new(),
         };
         hook.set_disposition(KeyDisposition::Consume).unwrap();
@@ -826,6 +929,7 @@ mod tests {
             signals: Arc::new(HookSignals::new()),
             run_loop: Arc::new(Mutex::new(None)),
             worker: WorkerJoin::spawn("test hook", std::thread::Builder::new(), || {}).unwrap(),
+            stop_failure_returned: false,
             deferred: VecDeque::new(),
         };
         hook.set_disposition(KeyDisposition::Forward).unwrap();
@@ -894,6 +998,7 @@ mod tests {
             signals: Arc::clone(&signals),
             run_loop: Arc::new(Mutex::new(None)),
             worker: WorkerJoin::spawn("test hook", std::thread::Builder::new(), || {}).unwrap(),
+            stop_failure_returned: false,
             deferred: VecDeque::new(),
         };
 
@@ -950,6 +1055,7 @@ mod tests {
             signals: Arc::new(HookSignals::new()),
             run_loop: Arc::new(Mutex::new(None)),
             worker: WorkerJoin::spawn("test hook", std::thread::Builder::new(), || {}).unwrap(),
+            stop_failure_returned: false,
             deferred: VecDeque::new(),
         };
         let edge = Point::new(999.0, 400.0);
@@ -984,6 +1090,7 @@ mod tests {
             signals: Arc::new(HookSignals::new()),
             run_loop: Arc::new(Mutex::new(None)),
             worker: WorkerJoin::spawn("test hook", std::thread::Builder::new(), || {}).unwrap(),
+            stop_failure_returned: false,
             deferred: VecDeque::new(),
         };
         hook.event_sender()
@@ -1014,7 +1121,7 @@ mod tests {
 
     #[test]
     fn caps_lock_reports_a_physical_press_and_release() {
-        let state = Arc::new(Mutex::new(TapState::default()));
+        let state = Arc::new(TapState::default());
         let (key, down) = modifier_transition(&state, 57, 0x0001_0000).unwrap();
         assert_eq!(key.as_str(), "caps_lock");
         assert_eq!(down, KeyState::Down);
@@ -1024,7 +1131,7 @@ mod tests {
 
     #[test]
     fn left_and_right_modifiers_are_distinct() {
-        let state = Arc::new(Mutex::new(TapState::default()));
+        let state = Arc::new(TapState::default());
         let (left, state_value) = modifier_transition(&state, 56, 0x0000_0002).unwrap();
         assert_eq!(left.as_str(), "left_shift");
         assert_eq!(state_value, KeyState::Down);

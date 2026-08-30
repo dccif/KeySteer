@@ -28,6 +28,32 @@ const NODE_TIMEOUT_SECONDS: c_double = 0.05;
 type AXUIElementRef = *const c_void;
 type AXValueRef = *const c_void;
 
+struct AxApplication(OwnedCf);
+
+impl AxApplication {
+    fn new(pid: libc::pid_t) -> Result<Self, String> {
+        // SAFETY: AX returns a +1 application object for the pid; the owned
+        // wrapper takes that create-rule reference exactly once. The timeout
+        // is finite and is installed before any synchronous attribute query.
+        let application =
+            unsafe { OwnedCf::from_create_rule(AXUIElementCreateApplication(pid).cast()) }
+                .ok_or_else(|| "cannot create AX application element".to_string())?;
+        // SAFETY: `application` is a live AXUIElement and the timeout is finite.
+        let error =
+            unsafe { AXUIElementSetMessagingTimeout(application.as_ptr(), NODE_TIMEOUT_SECONDS) };
+        if error != AX_OK {
+            return Err(format!(
+                "cannot set the AX messaging timeout for pid {pid}: AXError {error}"
+            ));
+        }
+        Ok(Self(application))
+    }
+
+    fn as_ptr(&self) -> *const c_void {
+        self.0.as_ptr()
+    }
+}
+
 struct AxAttributes {
     role: CFString,
     enabled: CFString,
@@ -124,16 +150,7 @@ pub(crate) fn frontmost_pid() -> Option<libc::pid_t> {
 }
 
 pub(crate) fn focused_window_bounds(pid: libc::pid_t) -> Result<Rect, String> {
-    // SAFETY: AX returns a +1 application object for the pid; the owned wrapper
-    // takes that create-rule reference exactly once.
-    let Some(application) =
-        (unsafe { OwnedCf::from_create_rule(AXUIElementCreateApplication(pid).cast()) })
-    else {
-        return Err("cannot create AX application element".into());
-    };
-    // SAFETY: `application` is a live AXUIElement and the finite timeout value
-    // is accepted by the synchronous AX API.
-    unsafe { AXUIElementSetMessagingTimeout(application.as_ptr(), NODE_TIMEOUT_SECONDS) };
+    let application = AxApplication::new(pid)?;
     let attributes = AxAttributes::new();
     let window = match copy_attribute(application.as_ptr(), &attributes.focused_window) {
         Some(window) if is_ax_element(window.as_ptr()) => window,
@@ -150,18 +167,7 @@ pub(crate) fn scan_process_stream(
     is_current: impl Fn() -> bool,
     mut on_batch: impl FnMut(Vec<UiTarget>),
 ) -> Result<(), String> {
-    // SAFETY: AX returns a +1 application object for the pid; the owned wrapper
-    // takes that create-rule reference exactly once.
-    let Some(application) =
-        (unsafe { OwnedCf::from_create_rule(AXUIElementCreateApplication(pid).cast()) })
-    else {
-        return Err("cannot create AX application element".into());
-    };
-    // SAFETY: `application` is a live AXUIElement and the finite timeout value
-    // is accepted by the synchronous AX API.
-    unsafe {
-        AXUIElementSetMessagingTimeout(application.as_ptr(), NODE_TIMEOUT_SECONDS);
-    }
+    let application = AxApplication::new(pid)?;
 
     let attributes = AxAttributes::new();
     let focused_window = copy_attribute(application.as_ptr(), &attributes.focused_window);

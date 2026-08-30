@@ -29,7 +29,7 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::WM_APP;
@@ -45,6 +45,7 @@ use crate::platform::scan_mailbox::ScanMailbox;
 use self::overlay_worker::OverlayWorker;
 
 const WAKE_MESSAGE: u32 = WM_APP + 0x4C;
+const BACKEND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const NO_WINDOW_UNDER_POINTER: &str =
     "No window under the pointer — move the pointer over a window";
 
@@ -386,9 +387,11 @@ impl WindowsBackend {
         if self.shutdown_complete {
             return Ok(());
         }
+        let now = Instant::now();
+        let deadline = now.checked_add(BACKEND_SHUTDOWN_TIMEOUT).unwrap_or(now);
         let mut errors = crate::app::errors::ErrorBundle::default();
         if let Some(worker) = self.update_worker.as_mut() {
-            match worker.cancel_and_wait() {
+            match worker.cancel_and_wait_until(deadline) {
                 Ok(()) => {
                     self.update_worker.take();
                 }
@@ -398,11 +401,11 @@ impl WindowsBackend {
         // Stop visual providers before tearing down the hook and overlay. The
         // vision worker cancels WinRT OCR, terminates the optional WeChat
         // helper, and joins pure-Rust fallback work before returning.
-        if let Err(error) = self.vision.stop() {
+        if let Err(error) = self.vision.stop_until(deadline) {
             errors.push("vision worker", error);
         }
         if let Some(worker) = self.ui_automation.as_mut() {
-            match worker.stop() {
+            match worker.stop_until(deadline) {
                 Ok(()) => {
                     self.ui_automation.take();
                 }
@@ -416,9 +419,9 @@ impl WindowsBackend {
         // Clear it before stopping the hook so a partially failed shutdown
         // cannot leave process-global tracking enabled for a later backend.
         hook::set_pointer_wake_enabled(false);
-        errors.record("frame clock", self.frame_clock.stop());
+        errors.record("frame clock", self.frame_clock.stop_until(deadline));
         if let Some(hook) = self.hook.as_mut() {
-            match hook.stop() {
+            match hook.stop_until(deadline) {
                 Ok(()) => {
                     self.hook.take();
                 }
@@ -426,7 +429,7 @@ impl WindowsBackend {
             }
         }
         if let Some(status_item) = self.status_item.as_mut() {
-            match status_item.stop() {
+            match status_item.stop_until(deadline) {
                 Ok(()) => {
                     self.status_item.take();
                 }
@@ -437,7 +440,7 @@ impl WindowsBackend {
         if let Err(error) = self.overlay.dismiss() {
             errors.push("overlay dismiss", error);
         }
-        if let Err(error) = self.overlay.shutdown() {
+        if let Err(error) = self.overlay.shutdown_until(deadline) {
             errors.push("overlay shutdown", error);
         }
         if errors.is_empty() {
@@ -503,14 +506,19 @@ impl WindowsBackend {
 
 impl Drop for WindowsBackend {
     fn drop(&mut self) {
-        if self.shutdown_attempted {
+        if self.shutdown_complete {
             return;
         }
         if let Err(error) = self.shutdown_resources() {
-            crate::app::logging::report_error(
-                "windows-backend",
-                format!("cannot clean up native resources during drop: {error}"),
-            );
+            // An explicit shutdown already returned its complete ErrorBundle
+            // to the runtime boundary. Retry unfinished stages here, but do
+            // not record the same failures a second time.
+            if !self.shutdown_attempted {
+                crate::app::logging::report_error(
+                    "windows-backend",
+                    format!("cannot clean up native resources during drop: {error}"),
+                );
+            }
         }
     }
 }
@@ -526,6 +534,7 @@ impl Backend for WindowsBackend {
         if let Some(event) = self.try_event()? {
             return Ok(Some(event));
         }
+        crate::app::worker::reap_quarantined();
 
         if !self.pump_messages() {
             return Ok(Some(BackendEvent::Quit));
@@ -663,8 +672,7 @@ impl Backend for WindowsBackend {
         cursor: Option<Point>,
         indicator: Option<Point>,
     ) -> Result<bool, String> {
-        self.overlay.update_positions(cursor, indicator)?;
-        Ok(true)
+        self.overlay.update_positions(cursor, indicator)
     }
 
     fn dismiss(&mut self) -> Result<(), String> {

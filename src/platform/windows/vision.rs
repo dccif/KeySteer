@@ -3,13 +3,15 @@
 //! Native Windows visual UI-hint scanning without OpenCV.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, Weak, mpsc};
 use std::time::{Duration, Instant};
 
 use windows::Media::Ocr::{OcrEngine, OcrResult};
 use windows_future::{AsyncOperationCompletedHandler, AsyncStatus, IAsyncOperation};
+
+use smallvec::SmallVec;
 
 use crate::api::command::UiScanStatus;
 use crate::api::geometry::{Rect, UiTarget};
@@ -32,7 +34,7 @@ const PROVIDER_BATCH_SIZE: usize = 24;
 const MAX_OCR_TARGETS: usize = 2_000;
 const MIN_SYSTEM_OCR_TILE_SIDE: u32 = 64;
 const SYSTEM_OCR_TILE_OVERLAP: u32 = 64;
-const MAX_SYSTEM_OCR_IN_FLIGHT: usize = 8;
+const MAX_SYSTEM_OCR_IN_FLIGHT: usize = 16;
 
 #[derive(Debug)]
 enum VisionError {
@@ -72,6 +74,7 @@ struct ScanJob {
 struct QueueState {
     pending: Option<ScanJob>,
     active_request_id: Option<u64>,
+    active_cancellation: Option<Weak<ScanSignal>>,
     running: bool,
     stopping: bool,
 }
@@ -82,6 +85,7 @@ struct SharedQueue {
     latest_generation: AtomicU64,
     stopping: AtomicBool,
     vision_disabled: AtomicBool,
+    provider_quarantine_nonempty: AtomicBool,
     provider_quarantine: Mutex<Vec<WorkerJoin>>,
 }
 
@@ -91,20 +95,20 @@ struct SystemOcrDescriptor {
     maximum_dimension: u32,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 struct OcrDiscoverySnapshot {
-    system: Option<SystemOcrDescriptor>,
-    wechat: Option<WechatDescriptor>,
+    system: Option<Arc<SystemOcrDescriptor>>,
+    wechat: Option<Arc<WechatDescriptor>>,
 }
 
 #[derive(Debug)]
 enum OcrExecutionPlan {
     None,
-    SystemOnly(SystemOcrDescriptor),
-    WechatOnly(WechatDescriptor),
+    SystemOnly(Arc<SystemOcrDescriptor>),
+    WechatOnly(Arc<WechatDescriptor>),
     Dual {
-        system: SystemOcrDescriptor,
-        wechat: WechatDescriptor,
+        system: Arc<SystemOcrDescriptor>,
+        wechat: Arc<WechatDescriptor>,
     },
 }
 
@@ -135,19 +139,27 @@ fn ocr_execution_kind(
 }
 
 impl OcrExecutionPlan {
-    fn from_snapshot(snapshot: OcrDiscoverySnapshot, detect_text: bool) -> Self {
+    fn from_snapshot(snapshot: &OcrDiscoverySnapshot, detect_text: bool) -> Self {
         if !detect_text {
             return Self::None;
         }
-        match (snapshot.system, snapshot.wechat) {
-            (Some(system), Some(wechat)) => Self::Dual { system, wechat },
-            (Some(system), None) => Self::SystemOnly(system),
-            (None, Some(wechat)) => Self::WechatOnly(wechat),
+        match (&snapshot.system, &snapshot.wechat) {
+            (Some(system), Some(wechat)) => Self::Dual {
+                system: Arc::clone(system),
+                wechat: Arc::clone(wechat),
+            },
+            (Some(system), None) => Self::SystemOnly(Arc::clone(system)),
+            (None, Some(wechat)) => Self::WechatOnly(Arc::clone(wechat)),
             (None, None) => Self::None,
         }
     }
 
-    fn into_descriptors(self) -> (Option<SystemOcrDescriptor>, Option<WechatDescriptor>) {
+    fn into_descriptors(
+        self,
+    ) -> (
+        Option<Arc<SystemOcrDescriptor>>,
+        Option<Arc<WechatDescriptor>>,
+    ) {
         match self {
             Self::None => (None, None),
             Self::SystemOnly(system) => (Some(system), None),
@@ -160,7 +172,7 @@ impl OcrExecutionPlan {
 #[derive(Clone, Debug)]
 enum DiscoveryState {
     Pending,
-    Ready(OcrDiscoverySnapshot),
+    Ready(Arc<OcrDiscoverySnapshot>),
     Unavailable,
 }
 
@@ -192,7 +204,7 @@ impl DiscoveryHandle {
         &self,
         deadline: Instant,
         cancelled: impl Fn() -> bool,
-    ) -> Option<OcrDiscoverySnapshot> {
+    ) -> Option<Arc<OcrDiscoverySnapshot>> {
         let mut state = self
             .0
             .state
@@ -200,8 +212,10 @@ impl DiscoveryHandle {
             .unwrap_or_else(|error| error.into_inner());
         loop {
             match &*state {
-                DiscoveryState::Ready(snapshot) => return Some(snapshot.clone()),
-                DiscoveryState::Unavailable => return Some(OcrDiscoverySnapshot::default()),
+                DiscoveryState::Ready(snapshot) => return Some(Arc::clone(snapshot)),
+                DiscoveryState::Unavailable => {
+                    return Some(Arc::new(OcrDiscoverySnapshot::default()));
+                }
                 DiscoveryState::Pending => {}
             }
             if cancelled() || Instant::now() >= deadline {
@@ -211,7 +225,7 @@ impl DiscoveryHandle {
             state = self
                 .0
                 .ready
-                .wait_timeout(state, remaining.min(Duration::from_millis(10)))
+                .wait_timeout(state, remaining)
                 .unwrap_or_else(|error| error.into_inner())
                 .0;
         }
@@ -277,11 +291,11 @@ impl OcrDiscovery {
         Ok(())
     }
 
-    fn stop(&mut self) -> Result<(), String> {
+    fn stop_until(&mut self, deadline: Instant) -> Result<(), String> {
         self.shared.stopping.store(true, Ordering::Release);
         self.shared.ready.notify_all();
         if let Some(worker) = self.worker.as_mut() {
-            worker.join_timeout(STOP_TIMEOUT)?;
+            worker.join_until(deadline)?;
         }
         self.worker.take();
         Ok(())
@@ -292,26 +306,131 @@ impl OcrDiscovery {
 struct ScanCancellation {
     shared: Arc<SharedQueue>,
     generation: u64,
-    local: Arc<AtomicBool>,
+    signal: Arc<ScanSignal>,
+}
+
+struct ScanSignal {
+    local: AtomicBool,
+    mailbox: Arc<ProviderMailbox>,
+    system_wake: Mutex<Option<mpsc::SyncSender<SystemOcrInput>>>,
+    system_credit_wake: Mutex<Option<mpsc::Sender<()>>>,
+    wechat_wake: Mutex<Option<mpsc::SyncSender<WechatInput>>>,
+    discovery: Weak<DiscoveryShared>,
 }
 
 impl ScanCancellation {
-    fn new(shared: &Arc<SharedQueue>, generation: u64) -> Self {
+    fn new(
+        shared: &Arc<SharedQueue>,
+        generation: u64,
+        mailbox: &Arc<ProviderMailbox>,
+        discovery: Weak<DiscoveryShared>,
+    ) -> Self {
         Self {
             shared: Arc::clone(shared),
             generation,
-            local: Arc::new(AtomicBool::new(false)),
+            signal: Arc::new(ScanSignal {
+                local: AtomicBool::new(false),
+                mailbox: Arc::clone(mailbox),
+                system_wake: Mutex::new(None),
+                system_credit_wake: Mutex::new(None),
+                wechat_wake: Mutex::new(None),
+                discovery,
+            }),
         }
     }
 
     fn is_cancelled(&self) -> bool {
-        self.local.load(Ordering::Acquire)
+        self.signal.local.load(Ordering::Acquire)
             || self.shared.stopping.load(Ordering::Acquire)
             || self.shared.latest_generation.load(Ordering::Acquire) != self.generation
     }
 
     fn cancel(&self) {
-        self.local.store(true, Ordering::Release);
+        self.signal.cancel();
+    }
+
+    fn signal(&self) -> Weak<ScanSignal> {
+        Arc::downgrade(&self.signal)
+    }
+
+    fn register_system_wake(&self, sender: mpsc::SyncSender<SystemOcrInput>) {
+        self.signal.register_system_wake(sender);
+    }
+
+    fn register_wechat_wake(&self, sender: mpsc::SyncSender<WechatInput>) {
+        self.signal.register_wechat_wake(sender);
+    }
+
+    fn register_system_credit_wake(&self, sender: mpsc::Sender<()>) {
+        self.signal.register_system_credit_wake(sender);
+    }
+}
+
+impl ScanSignal {
+    fn cancel(&self) {
+        if self.local.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.mailbox.close();
+        let wake = self
+            .system_wake
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(sender) = wake.as_ref() {
+            let _ = sender.try_send(SystemOcrInput::CancelWake);
+        }
+        drop(wake);
+        let credit_wake = self
+            .system_credit_wake
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(sender) = credit_wake.as_ref() {
+            let _ = sender.send(());
+        }
+        drop(credit_wake);
+        let wake = self
+            .wechat_wake
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(sender) = wake.as_ref() {
+            let _ = sender.try_send(WechatInput::CancelWake);
+        }
+        if let Some(discovery) = self.discovery.upgrade() {
+            discovery.ready.notify_all();
+        }
+    }
+
+    fn register_system_wake(&self, sender: mpsc::SyncSender<SystemOcrInput>) {
+        let mut wake = self
+            .system_wake
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.local.load(Ordering::Acquire) {
+            let _ = sender.try_send(SystemOcrInput::CancelWake);
+        }
+        *wake = Some(sender);
+    }
+
+    fn register_wechat_wake(&self, sender: mpsc::SyncSender<WechatInput>) {
+        let mut wake = self
+            .wechat_wake
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.local.load(Ordering::Acquire) {
+            let _ = sender.try_send(WechatInput::CancelWake);
+        }
+        *wake = Some(sender);
+    }
+
+    fn register_system_credit_wake(&self, sender: mpsc::Sender<()>) {
+        let mut wake = self
+            .system_credit_wake
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.local.load(Ordering::Acquire) {
+            let _ = sender.send(());
+        }
+        *wake = Some(sender);
     }
 }
 
@@ -370,12 +489,20 @@ impl ProviderThreads {
             }
         }
         if !quarantine.is_empty() {
+            // A quarantined provider retains its closure stack, including the
+            // mailbox Arc. Drop already-published target strings here so the
+            // native owner does not also pin unrelated UI results.
+            self.cancellation.signal.mailbox.discard();
             self.shared.vision_disabled.store(true, Ordering::Release);
-            self.shared
+            let mut retained = self
+                .shared
                 .provider_quarantine
                 .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .extend(quarantine);
+                .unwrap_or_else(|error| error.into_inner());
+            retained.extend(quarantine);
+            self.shared
+                .provider_quarantine_nonempty
+                .store(true, Ordering::Release);
         }
         failures
             .is_empty()
@@ -396,6 +523,7 @@ pub(super) struct VisionWorker {
     shared: Arc<SharedQueue>,
     discovery: OcrDiscovery,
     workers: Vec<WorkerJoin>,
+    shutdown_failure_returned: bool,
 }
 
 impl VisionWorker {
@@ -404,6 +532,7 @@ impl VisionWorker {
             shared: Arc::new(SharedQueue::default()),
             discovery: OcrDiscovery::new(),
             workers: Vec::with_capacity(2),
+            shutdown_failure_returned: false,
         }
     }
 
@@ -434,6 +563,7 @@ impl VisionWorker {
         self.shared
             .latest_generation
             .store(generation, Ordering::Release);
+        let active_cancellation = state.active_cancellation.as_ref().and_then(Weak::upgrade);
         let superseded = state.pending.replace(ScanJob {
             request,
             generation,
@@ -477,6 +607,9 @@ impl VisionWorker {
         if let Some(job) = superseded {
             finish_cancelled_job(job);
         }
+        if let Some(cancellation) = active_cancellation {
+            cancellation.cancel();
+        }
         Ok(())
     }
 
@@ -494,7 +627,13 @@ impl VisionWorker {
         if clear_generation {
             self.shared.latest_generation.store(0, Ordering::Release);
         }
+        let active_cancellation = clear_generation
+            .then(|| state.active_cancellation.as_ref().and_then(Weak::upgrade))
+            .flatten();
         drop(state);
+        if let Some(cancellation) = active_cancellation {
+            cancellation.cancel();
+        }
         if let Some(job) = pending {
             finish_cancelled_job(job);
         }
@@ -518,28 +657,45 @@ impl VisionWorker {
                 }
             }
         }
-        let mut quarantine = self
+        if self
             .shared
-            .provider_quarantine
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let mut index = 0;
-        while index < quarantine.len() {
-            match quarantine[index].reap_finished() {
-                Ok(true) => {
-                    drop(quarantine.swap_remove(index));
+            .provider_quarantine_nonempty
+            .load(Ordering::Acquire)
+        {
+            let mut quarantine = self
+                .shared
+                .provider_quarantine
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let mut index = 0;
+            while index < quarantine.len() {
+                match quarantine[index].reap_finished() {
+                    Ok(true) => {
+                        drop(quarantine.swap_remove(index));
+                    }
+                    Ok(false) => index += 1,
+                    Err(error) => {
+                        crate::app::logging::report_error("windows-vision", error);
+                        drop(quarantine.swap_remove(index));
+                    }
                 }
-                Ok(false) => index += 1,
-                Err(error) => {
-                    crate::app::logging::report_error("windows-vision", error);
-                    drop(quarantine.swap_remove(index));
-                }
+            }
+            if quarantine.is_empty() {
+                self.shared
+                    .provider_quarantine_nonempty
+                    .store(false, Ordering::Release);
             }
         }
     }
 
     pub(super) fn stop(&mut self) -> Result<(), String> {
-        let pending = {
+        let now = Instant::now();
+        let deadline = now.checked_add(STOP_TIMEOUT).unwrap_or(now);
+        self.stop_until(deadline)
+    }
+
+    pub(super) fn stop_until(&mut self, deadline: Instant) -> Result<(), String> {
+        let (pending, active_cancellation) = {
             let mut state = self
                 .shared
                 .state
@@ -547,18 +703,25 @@ impl VisionWorker {
                 .unwrap_or_else(|error| error.into_inner());
             state.stopping = true;
             let pending = state.pending.take();
+            let active_cancellation = state.active_cancellation.as_ref().and_then(Weak::upgrade);
             self.shared.stopping.store(true, Ordering::Release);
-            pending
+            (pending, active_cancellation)
         };
         self.shared.latest_generation.store(0, Ordering::Release);
+        if let Some(cancellation) = active_cancellation {
+            cancellation.cancel();
+        }
         if let Some(job) = pending {
             finish_cancelled_job(job);
         }
         let mut errors = crate::app::errors::ErrorBundle::default();
-        errors.record("OCR discovery shutdown", self.discovery.stop());
+        errors.record(
+            "OCR discovery shutdown",
+            self.discovery.stop_until(deadline),
+        );
         let mut index = 0;
         while index < self.workers.len() {
-            match self.workers[index].join_timeout(STOP_TIMEOUT) {
+            match self.workers[index].join_until(deadline) {
                 Ok(()) => {
                     drop(self.workers.swap_remove(index));
                 }
@@ -568,30 +731,45 @@ impl VisionWorker {
                 }
             }
         }
-        let deadline = Instant::now() + STOP_TIMEOUT;
-        let mut quarantine = self
+        if self
             .shared
-            .provider_quarantine
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let mut index = 0;
-        while index < quarantine.len() {
-            match quarantine[index].join_until(deadline) {
-                Ok(()) => {
-                    drop(quarantine.swap_remove(index));
-                }
-                Err(error) => {
-                    errors.push("quarantined provider shutdown", error);
-                    index += 1;
+            .provider_quarantine_nonempty
+            .load(Ordering::Acquire)
+        {
+            let mut quarantine = self
+                .shared
+                .provider_quarantine
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let mut index = 0;
+            while index < quarantine.len() {
+                match quarantine[index].join_until(deadline) {
+                    Ok(()) => {
+                        drop(quarantine.swap_remove(index));
+                    }
+                    Err(error) => {
+                        errors.push("quarantined provider shutdown", error);
+                        index += 1;
+                    }
                 }
             }
+            if quarantine.is_empty() {
+                self.shared
+                    .provider_quarantine_nonempty
+                    .store(false, Ordering::Release);
+            }
         }
-        errors.into_result()
+        let result = errors.into_result();
+        self.shutdown_failure_returned = result.is_err();
+        result
     }
 }
 
 impl Drop for VisionWorker {
     fn drop(&mut self) {
+        if self.shutdown_failure_returned {
+            return;
+        }
         if let Err(error) = self.stop() {
             crate::app::logging::report_error("windows-vision", error);
         }
@@ -628,6 +806,7 @@ fn worker_main(shared: Arc<SharedQueue>, discovery: DiscoveryHandle) {
             .unwrap_or_else(|error| error.into_inner());
         if state.active_request_id == Some(request_id) {
             state.active_request_id = None;
+            state.active_cancellation = None;
         }
     }
 }
@@ -666,6 +845,7 @@ struct WechatFullFrame {
 
 enum WechatInput {
     Frame(WechatFullFrame),
+    CancelWake,
     Failed(String),
 }
 
@@ -700,6 +880,7 @@ enum SystemOcrInput {
     Begin { tile_count: usize },
     Tile(SystemOcrTile),
     CompletionWake,
+    CancelWake,
     Failed(String),
     Done,
 }
@@ -707,10 +888,19 @@ enum SystemOcrInput {
 struct SystemOcrSubmission {
     sender: mpsc::SyncSender<SystemOcrInput>,
     credits: mpsc::Receiver<()>,
-    max_in_flight: usize,
+    layout: SystemOcrLayout,
+    deadline: Instant,
 }
 
 struct SystemOcrCompletion(AtomicU8);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SystemOcrCompletionStatus {
+    Completed,
+    Canceled,
+    Error,
+    NonTerminal,
+}
 
 impl SystemOcrCompletion {
     fn pending() -> Self {
@@ -725,12 +915,21 @@ impl SystemOcrCompletion {
         };
         self.0.store(value, Ordering::Release);
     }
-    fn take(&self) -> Option<AsyncStatus> {
-        match self.0.swap(0, Ordering::AcqRel) {
+    fn take(&self) -> Option<SystemOcrCompletionStatus> {
+        // The provider is the only consumer and each operation completes once.
+        // Load first so scanning pending tiles does not issue a locked RMW for
+        // the overwhelmingly common not-ready state.
+        let value = self.0.load(Ordering::Acquire);
+        if value == 0 {
+            return None;
+        }
+        self.0.store(0, Ordering::Relaxed);
+        match value {
             0 => None,
-            1 => Some(AsyncStatus::Completed),
-            2 => Some(AsyncStatus::Canceled),
-            _ => Some(AsyncStatus::Error),
+            1 => Some(SystemOcrCompletionStatus::Completed),
+            2 => Some(SystemOcrCompletionStatus::Canceled),
+            3 => Some(SystemOcrCompletionStatus::Error),
+            _ => Some(SystemOcrCompletionStatus::NonTerminal),
         }
     }
 }
@@ -804,7 +1003,26 @@ fn run_scan_inner(
             );
         }
     };
-    let cancellation = ScanCancellation::new(shared, job.generation);
+    let provider_mailbox = Arc::new(ProviderMailbox::new());
+    let cancellation = ScanCancellation::new(
+        shared,
+        job.generation,
+        &provider_mailbox,
+        Arc::downgrade(&discovery.0),
+    );
+    {
+        let mut state = shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.active_request_id == Some(job.request.id) {
+            state.active_cancellation = Some(cancellation.signal());
+        }
+    }
+    if !generation_is_current(shared, job.generation) {
+        cancellation.cancel();
+        return UiScanStatus::ContextChanged;
+    }
     let discovery_snapshot = if job.request.vision.detect_text {
         match discovery.wait(deadline, || cancellation.is_cancelled()) {
             Some(snapshot) => snapshot,
@@ -812,24 +1030,24 @@ fn run_scan_inner(
             None => return UiScanStatus::TimedOut,
         }
     } else {
-        OcrDiscoverySnapshot::default()
+        Arc::new(OcrDiscoverySnapshot::default())
     };
 
     let (system_descriptor, wechat_descriptor) =
-        OcrExecutionPlan::from_snapshot(discovery_snapshot, job.request.vision.detect_text)
+        OcrExecutionPlan::from_snapshot(&discovery_snapshot, job.request.vision.detect_text)
             .into_descriptors();
-    let (tx, rx) = mpsc::sync_channel(3);
     let mut providers = ProviderThreads::new(cancellation.clone(), shared);
     let mut system_input = None;
     let mut wechat_input = None;
     let mut pending_ocr = 0usize;
     if let Some(descriptor) = system_descriptor {
-        let tile_count = system_ocr_tile_count(geometry);
-        let max_in_flight = system_ocr_concurrency(tile_count);
-        let (image_tx, image_rx) = mpsc::sync_channel(max_in_flight.saturating_add(2));
+        let layout = SystemOcrLayout::new(geometry);
+        let (image_tx, image_rx) = mpsc::sync_channel(layout.max_in_flight.saturating_add(2));
         let completion_tx = image_tx.clone();
+        cancellation.register_system_wake(image_tx.clone());
         let (credit_tx, credit_rx) = mpsc::channel();
-        let result_tx = tx.clone();
+        cancellation.register_system_credit_wake(credit_tx.clone());
+        let result_mailbox = Arc::clone(&provider_mailbox);
         let provider_cancellation = cancellation.clone();
         if providers.spawn("keysteer-system-ocr", move || {
             let _provider_ledger = crate::app::perf_probe::ResourceGuard::new(
@@ -844,10 +1062,10 @@ fn run_scan_inner(
                 credit_tx,
                 deadline,
                 &provider_cancellation,
-                &result_tx,
+                &result_mailbox,
                 started,
             );
-            let _ = result_tx.send(ProviderEvent::OcrDone {
+            let _ = result_mailbox.publish(ProviderEvent::OcrDone {
                 provider: "system",
                 elapsed: started.elapsed(),
                 result,
@@ -857,14 +1075,16 @@ fn run_scan_inner(
             system_input = Some(SystemOcrSubmission {
                 sender: image_tx,
                 credits: credit_rx,
-                max_in_flight,
+                layout,
+                deadline,
             });
             pending_ocr += 1;
         }
     }
     if let Some(descriptor) = wechat_descriptor {
         let (image_tx, image_rx) = mpsc::sync_channel(1);
-        let result_tx = tx.clone();
+        cancellation.register_wechat_wake(image_tx.clone());
+        let result_mailbox = Arc::clone(&provider_mailbox);
         let provider_cancellation = cancellation.clone();
         let minimum_confidence = job.request.vision.minimum_confidence;
         if providers.spawn("keysteer-wechat-ocr", move || {
@@ -879,10 +1099,10 @@ fn run_scan_inner(
                 deadline,
                 minimum_confidence,
                 &provider_cancellation,
-                &result_tx,
+                &result_mailbox,
                 started,
             );
-            let _ = result_tx.send(ProviderEvent::OcrDone {
+            let _ = result_mailbox.publish(ProviderEvent::OcrDone {
                 provider: "wechat",
                 elapsed: started.elapsed(),
                 result,
@@ -895,7 +1115,7 @@ fn run_scan_inner(
     }
     let fallback_cancelled = Arc::new(AtomicBool::new(false));
     let mut ocr_had_valid_targets = false;
-    let mut early_events = VecDeque::new();
+    let mut early_events = ProviderEvents::new();
 
     let Some(mut capture_lease) = job.capture.take() else {
         return UiScanStatus::Failed("visual capture lease was not created".into());
@@ -1001,7 +1221,7 @@ fn run_scan_inner(
                                 );
                             }
                             if !drain_early_ocr_events(
-                                &rx,
+                                &provider_mailbox,
                                 &job.source,
                                 &fallback_cancelled,
                                 &mut ocr_had_valid_targets,
@@ -1036,7 +1256,7 @@ fn run_scan_inner(
                 );
             }
             if !drain_early_ocr_events(
-                &rx,
+                &provider_mailbox,
                 &job.source,
                 &fallback_cancelled,
                 &mut ocr_had_valid_targets,
@@ -1046,9 +1266,24 @@ fn run_scan_inner(
                 context_changed_during_capture = true;
                 return Err("visual capture context changed".into());
             }
-            let fallback = (job.request.vision.detect_rectangles && !ocr_had_valid_targets)
-                .then(|| fallback_input_from_bgra(pixels, geometry))
-                .transpose()?;
+            let fallback = if job.request.vision.detect_rectangles && !ocr_had_valid_targets {
+                fallback_input_from_bgra_with_progress(pixels, geometry, || {
+                    if !drain_early_ocr_events(
+                        &provider_mailbox,
+                        &job.source,
+                        &fallback_cancelled,
+                        &mut ocr_had_valid_targets,
+                        &mut early_events,
+                        || context_is_current(shared, job.generation, &job.request),
+                    ) {
+                        context_changed_during_capture = true;
+                        return Ok(true);
+                    }
+                    Ok(ocr_had_valid_targets || cancellation.is_cancelled())
+                })?
+            } else {
+                None
+            };
             Ok(fallback)
         },
     );
@@ -1072,7 +1307,7 @@ fn run_scan_inner(
     drop(wechat_input);
 
     let fallback_pending = if let Some(fallback_input) = fallback_input {
-        let result_tx = tx.clone();
+        let result_mailbox = Arc::clone(&provider_mailbox);
         let options = job.request.vision.clone();
         let provider_cancellation = cancellation.clone();
         let fallback_cancelled = Arc::clone(&fallback_cancelled);
@@ -1085,47 +1320,51 @@ fn run_scan_inner(
             let targets = detect_regions(&fallback_input, &options, &mut scratch, || {
                 provider_cancellation.is_cancelled() || fallback_cancelled.load(Ordering::Acquire)
             });
-            let _ = result_tx.send(ProviderEvent::Fallback(targets));
+            let _ = send_fallback_batches(&result_mailbox, targets);
             crate::app::perf_probe::mark("vision_fallback_finished");
         })
     } else {
         false
     };
-    drop(tx);
-
-    let mut fallback = None;
+    let mut fallback = Vec::new();
+    let mut fallback_done = !fallback_pending;
     let mut timed_out = false;
     let mut context_changed = false;
     let mut cleanup_errors = crate::app::errors::ErrorBundle::default();
-    while pending_ocr != 0 || (fallback_pending && fallback.is_none()) {
+    while pending_ocr != 0 || !fallback_done {
         if !generation_is_current(shared, job.generation) {
             cancellation.cancel();
             context_changed = true;
             break;
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        if Instant::now() >= deadline {
             timed_out = true;
             cancellation.cancel();
             break;
         }
-        let first = if let Some(event) = early_events.pop_front() {
-            event
-        } else {
-            match rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
-                Ok(event) => event,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        let mut events = std::mem::take(&mut early_events);
+        if events.is_empty() {
+            match provider_mailbox.wait_until_ready(deadline) {
+                Ok(()) => {}
+                Err(VisionError::TimedOut) => {
+                    timed_out = true;
+                    cancellation.cancel();
+                    break;
+                }
+                Err(VisionError::Cancelled) if cancellation.is_cancelled() => break,
+                Err(error) => {
+                    cleanup_errors.push("provider mailbox", error.to_string());
+                    break;
+                }
             }
-        };
-        let mut events = VecDeque::from([first]);
-        events.append(&mut early_events);
-        events.extend(rx.try_iter());
-        let mut ocr_ready = Vec::new();
-        let mut ocr_done = Vec::new();
-        while let Some(event) = events.pop_front() {
+        }
+        provider_mailbox.drain_into(&mut events);
+        let mut ocr_ready: SmallVec<[ReadyOcrBatch; 2]> = SmallVec::new();
+        let mut ocr_done: SmallVec<[CompletedOcr; 2]> = SmallVec::new();
+        for event in events {
             match event {
-                ProviderEvent::Fallback(targets) => fallback = Some(targets),
+                ProviderEvent::FallbackBatch(mut targets) => fallback.append(&mut targets),
+                ProviderEvent::FallbackDone => fallback_done = true,
                 ProviderEvent::OcrBatch {
                     provider,
                     elapsed,
@@ -1195,10 +1434,11 @@ fn run_scan_inner(
 
     if !context_changed
         && should_publish_fallback(ocr_had_valid_targets, job.request.vision.detect_rectangles)
-        && let Some(targets) = fallback
+        && fallback_done
+        && !fallback.is_empty()
     {
         if context_is_current(shared, job.generation, &job.request) {
-            job.source.push(targets);
+            job.source.push(fallback);
         } else {
             context_changed = true;
         }
@@ -1235,34 +1475,31 @@ fn wait_provider_image(
     deadline: Instant,
     cancellation: &ScanCancellation,
 ) -> Result<WechatFullFrame, VisionError> {
-    loop {
-        if cancellation.is_cancelled() {
-            return Err(VisionError::Cancelled);
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(VisionError::TimedOut);
-        }
-        match receiver.recv_timeout(remaining.min(Duration::from_millis(10))) {
-            Ok(WechatInput::Frame(image)) => return Ok(image),
-            Ok(WechatInput::Failed(error)) => return Err(VisionError::Operational(error)),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(VisionError::Cancelled);
-            }
-        }
+    if cancellation.is_cancelled() {
+        return Err(VisionError::Cancelled);
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(VisionError::TimedOut);
+    }
+    match receiver.recv_timeout(remaining) {
+        Ok(WechatInput::Frame(image)) => Ok(image),
+        Ok(WechatInput::CancelWake) => Err(VisionError::Cancelled),
+        Ok(WechatInput::Failed(error)) => Err(VisionError::Operational(error)),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(VisionError::TimedOut),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(VisionError::Cancelled),
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn recognize_system_provider(
-    descriptor: SystemOcrDescriptor,
+    descriptor: Arc<SystemOcrDescriptor>,
     receiver: mpsc::Receiver<SystemOcrInput>,
     completion_sender: mpsc::SyncSender<SystemOcrInput>,
     credit_sender: mpsc::Sender<()>,
     deadline: Instant,
     cancellation: &ScanCancellation,
-    result_tx: &mpsc::SyncSender<ProviderEvent>,
+    result_mailbox: &ProviderMailbox,
     started: Instant,
 ) -> Result<usize, VisionError> {
     let _apartment = super::native::ComApartment::initialise().map_err(VisionError::Operational)?;
@@ -1393,7 +1630,7 @@ fn recognize_system_provider(
                 }));
                 pending += 1;
             }
-            SystemOcrInput::CompletionWake => {}
+            SystemOcrInput::CompletionWake | SystemOcrInput::CancelWake => {}
             SystemOcrInput::Failed(error) => operational_failures.push(error),
             SystemOcrInput::Done => break,
         }
@@ -1401,7 +1638,7 @@ fn recognize_system_provider(
             &mut active,
             &mut pending,
             &mut accepted,
-            result_tx,
+            result_mailbox,
             started,
             &credit_sender,
             &mut operational_failures,
@@ -1423,7 +1660,7 @@ fn recognize_system_provider(
             &mut active,
             &mut pending,
             &mut accepted,
-            result_tx,
+            result_mailbox,
             started,
             &credit_sender,
             &mut operational_failures,
@@ -1438,7 +1675,7 @@ fn recognize_system_provider(
         let remaining = deadline.saturating_duration_since(Instant::now());
         let completion = receiver.recv_timeout(remaining);
         match completion {
-            Ok(SystemOcrInput::CompletionWake) => {}
+            Ok(SystemOcrInput::CompletionWake | SystemOcrInput::CancelWake) => {}
             Ok(SystemOcrInput::Failed(error)) => {
                 operational_failures.push(error);
             }
@@ -1478,7 +1715,7 @@ fn drain_completed_system_tiles(
     active: &mut [Option<ActiveSystemOcrTile>],
     pending: &mut usize,
     accepted: &mut usize,
-    result_tx: &mpsc::SyncSender<ProviderEvent>,
+    result_mailbox: &ProviderMailbox,
     started: Instant,
     credit_sender: &mpsc::Sender<()>,
     operational_failures: &mut Vec<String>,
@@ -1496,7 +1733,7 @@ fn drain_completed_system_tiles(
             active,
             pending,
             accepted,
-            result_tx,
+            result_mailbox,
             started,
             credit_sender,
             operational_failures,
@@ -1508,11 +1745,11 @@ fn drain_completed_system_tiles(
 
 #[allow(clippy::too_many_arguments)]
 fn complete_system_tile(
-    (index, status): (usize, AsyncStatus),
+    (index, status): (usize, SystemOcrCompletionStatus),
     active: &mut [Option<ActiveSystemOcrTile>],
     pending: &mut usize,
     accepted: &mut usize,
-    result_tx: &mpsc::SyncSender<ProviderEvent>,
+    result_mailbox: &ProviderMailbox,
     started: Instant,
     credit_sender: &mpsc::Sender<()>,
     operational_failures: &mut Vec<String>,
@@ -1538,7 +1775,7 @@ fn complete_system_tile(
             completed.tile.geometry,
             completed.tile.core_bounds,
             MAX_OCR_TARGETS.saturating_sub(*accepted),
-            result_tx,
+            result_mailbox,
             started,
         ) {
             Ok(count) => *accepted += count,
@@ -1576,10 +1813,14 @@ fn cancel_active_system_tiles(
                 continue;
             };
             remaining = remaining.saturating_sub(1);
-            let close = if status == AsyncStatus::Completed {
-                tile.operation.complete(status).map(drop)
-            } else {
-                tile.operation.close_terminal()
+            let close = match status {
+                SystemOcrCompletionStatus::Completed => tile.operation.complete(status).map(drop),
+                SystemOcrCompletionStatus::Canceled | SystemOcrCompletionStatus::Error => {
+                    tile.operation.close_terminal()
+                }
+                SystemOcrCompletionStatus::NonTerminal => retain_nonterminal_system_ocr_owner(
+                    "system OCR completion callback reported a non-terminal status during cancellation",
+                ),
             };
             if let Err(error) = close {
                 cleanup_failures.push(error);
@@ -1591,33 +1832,56 @@ fn cancel_active_system_tiles(
         if remaining == 0 {
             break;
         }
-        let remaining_time = deadline.saturating_duration_since(Instant::now());
-        if remaining_time.is_zero() {
-            cleanup_failures.push(format!(
-                "{remaining} system OCR operation(s) did not complete cancellation before the generation deadline"
-            ));
-            break;
-        }
-        match completions.recv_timeout(remaining_time) {
-            Ok(SystemOcrInput::CompletionWake) => {}
+        let completion = wait_system_ocr_cancellation_event(completions, deadline);
+        match completion {
+            Ok(SystemOcrInput::CompletionWake | SystemOcrInput::CancelWake) => {}
             Ok(_) => continue,
-            Err(error) => {
-                cleanup_failures.push(format!(
-                    "system OCR cancellation completion channel failed: {error}"
-                ));
-                break;
-            }
+            Err(_) => retain_nonterminal_system_ocr_owner(
+                "system OCR completion channel closed while an operation was still active",
+            ),
         }
     }
 }
 
+fn wait_system_ocr_cancellation_event(
+    completions: &mpsc::Receiver<SystemOcrInput>,
+    deadline: Instant,
+) -> Result<SystemOcrInput, mpsc::RecvError> {
+    let remaining_time = deadline.saturating_duration_since(Instant::now());
+    if remaining_time.is_zero() {
+        // Keep the complete tile owner (operation, engine, bitmap and this COM
+        // apartment) on the provider thread until WinRT reports a terminal
+        // state. The coordinator has its own bounded join; if a native
+        // operation never calls back, that WorkerJoin moves to the explicit
+        // provider quarantine instead of dropping live objects.
+        return completions.recv();
+    }
+    match completions.recv_timeout(remaining_time) {
+        Ok(input) => Ok(input),
+        Err(mpsc::RecvTimeoutError::Timeout) => completions.recv(),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(mpsc::RecvError),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn retain_nonterminal_system_ocr_owner(reason: &str) -> ! {
+    crate::app::logging::report_error(
+        "windows-vision",
+        format!("{reason}; retaining its complete provider owner in quarantine"),
+    );
+    loop {
+        std::thread::park();
+    }
+}
+
 fn recognize_wechat_provider(
-    descriptor: WechatDescriptor,
+    descriptor: Arc<WechatDescriptor>,
     receiver: mpsc::Receiver<WechatInput>,
     deadline: Instant,
     minimum_confidence: f64,
     cancellation: &ScanCancellation,
-    result_tx: &mpsc::SyncSender<ProviderEvent>,
+    result_mailbox: &ProviderMailbox,
     started: Instant,
 ) -> Result<usize, VisionError> {
     let _apartment = super::native::ComApartment::initialise().map_err(VisionError::Operational)?;
@@ -1634,7 +1898,7 @@ fn recognize_wechat_provider(
                 minimum_confidence,
                 || cancellation.is_cancelled(),
                 |targets| {
-                    send_ocr_batches(result_tx, "wechat", started, targets)
+                    send_ocr_batches(result_mailbox, "wechat", started, targets)
                         .map_err(|error| error.to_string())
                 },
             )
@@ -1695,26 +1959,334 @@ enum ProviderEvent {
         elapsed: Duration,
         result: Result<usize, VisionError>,
     },
-    Fallback(Vec<UiTarget>),
+    FallbackBatch(Vec<UiTarget>),
+    FallbackDone,
+}
+
+type ProviderEvents = SmallVec<[ProviderEvent; 6]>;
+type ReadyOcrBatch = (&'static str, Duration, Vec<UiTarget>);
+type CompletedOcr = (&'static str, Duration, Result<usize, VisionError>);
+
+const SYSTEM_READY: u8 = 1 << 0;
+const WECHAT_READY: u8 = 1 << 1;
+const FALLBACK_READY: u8 = 1 << 2;
+
+/// Generation-owned provider mailbox with one fixed slot per provider.
+///
+/// A producer replaces an empty target vector or appends to its own bounded
+/// slot. It never waits for coordinator capacity, and repeated batches merely
+/// keep the same ready bit set. The coordinator takes ownership of each slot
+/// when woken, so all valid targets are preserved without an event queue.
+struct ProviderMailbox {
+    state: Mutex<ProviderMailboxState>,
+    ready_flags: AtomicU8,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct ProviderMailboxState {
+    system: OcrProviderSlot,
+    wechat: OcrProviderSlot,
+    fallback: FallbackProviderSlot,
+    ready: u8,
+    closed: bool,
+}
+
+#[derive(Default)]
+struct OcrProviderSlot {
+    targets: Vec<UiTarget>,
+    target_elapsed: Option<Duration>,
+    terminal: Option<(Duration, Result<usize, VisionError>)>,
+    published_targets: usize,
+    terminal_published: bool,
+}
+
+#[derive(Default)]
+struct FallbackProviderSlot {
+    targets: Vec<UiTarget>,
+    published_targets: usize,
+    terminal_published: bool,
+    terminal_ready: bool,
+}
+
+impl ProviderMailbox {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ProviderMailboxState::default()),
+            ready_flags: AtomicU8::new(0),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn publish(&self, event: ProviderEvent) -> Result<(), VisionError> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.closed {
+            return Err(VisionError::Cancelled);
+        }
+        let was_empty = state.ready == 0;
+        state.publish(event)?;
+        self.ready_flags.store(state.ready, Ordering::Release);
+        drop(state);
+        if was_empty {
+            self.ready.notify_one();
+        }
+        Ok(())
+    }
+
+    fn wait_until_ready(&self, deadline: Instant) -> Result<(), VisionError> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        loop {
+            if state.ready != 0 {
+                return Ok(());
+            }
+            if state.closed {
+                return Err(VisionError::Cancelled);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(VisionError::TimedOut);
+            }
+            state = self
+                .ready
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|error| error.into_inner())
+                .0;
+        }
+    }
+
+    fn drain_into(&self, events: &mut ProviderEvents) {
+        if self.ready_flags.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.drain_into(events);
+        self.ready_flags.store(state.ready, Ordering::Release);
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.closed = true;
+        drop(state);
+        self.ready.notify_all();
+    }
+
+    fn discard(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.system = OcrProviderSlot::default();
+        state.wechat = OcrProviderSlot::default();
+        state.fallback = FallbackProviderSlot::default();
+        state.ready = 0;
+        self.ready_flags.store(0, Ordering::Release);
+    }
+}
+
+impl ProviderMailboxState {
+    fn publish(&mut self, event: ProviderEvent) -> Result<(), VisionError> {
+        match event {
+            ProviderEvent::OcrBatch {
+                provider,
+                elapsed,
+                targets,
+            } => {
+                let (slot, ready) = self.ocr_slot(provider)?;
+                slot.append(provider, elapsed, targets)?;
+                self.ready |= ready;
+            }
+            ProviderEvent::OcrDone {
+                provider,
+                elapsed,
+                result,
+            } => {
+                let (slot, ready) = self.ocr_slot(provider)?;
+                slot.finish(provider, elapsed, result)?;
+                self.ready |= ready;
+            }
+            ProviderEvent::FallbackBatch(targets) => {
+                if targets.is_empty() || targets.len() > PROVIDER_BATCH_SIZE {
+                    return Err(VisionError::Operational(format!(
+                        "fallback published an invalid batch of {} targets",
+                        targets.len()
+                    )));
+                }
+                let next = self
+                    .fallback
+                    .published_targets
+                    .checked_add(targets.len())
+                    .ok_or_else(|| {
+                        VisionError::Operational("fallback target count overflow".into())
+                    })?;
+                if next > MAX_OCR_TARGETS {
+                    return Err(VisionError::Operational(format!(
+                        "fallback exceeded the {MAX_OCR_TARGETS}-target limit"
+                    )));
+                }
+                self.fallback.published_targets = next;
+                if self.fallback.targets.is_empty() {
+                    self.fallback.targets = targets;
+                } else {
+                    self.fallback.targets.extend(targets);
+                }
+                self.ready |= FALLBACK_READY;
+            }
+            ProviderEvent::FallbackDone => {
+                if std::mem::replace(&mut self.fallback.terminal_published, true) {
+                    return Err(VisionError::Operational(
+                        "fallback published duplicate terminal results".into(),
+                    ));
+                }
+                self.fallback.terminal_ready = true;
+                self.ready |= FALLBACK_READY;
+            }
+        }
+        Ok(())
+    }
+
+    fn ocr_slot(
+        &mut self,
+        provider: &'static str,
+    ) -> Result<(&mut OcrProviderSlot, u8), VisionError> {
+        let slot = match provider {
+            "system" => (&mut self.system, SYSTEM_READY),
+            "wechat" => (&mut self.wechat, WECHAT_READY),
+            _ => {
+                return Err(VisionError::Operational(format!(
+                    "unknown OCR provider {provider}"
+                )));
+            }
+        };
+        Ok(slot)
+    }
+
+    fn drain_into(&mut self, events: &mut ProviderEvents) {
+        Self::drain_ocr_slot(
+            &mut self.system,
+            "system",
+            SYSTEM_READY,
+            &mut self.ready,
+            events,
+        );
+        Self::drain_ocr_slot(
+            &mut self.wechat,
+            "wechat",
+            WECHAT_READY,
+            &mut self.ready,
+            events,
+        );
+        if self.ready & FALLBACK_READY != 0 {
+            if !self.fallback.targets.is_empty() {
+                events.push(ProviderEvent::FallbackBatch(std::mem::take(
+                    &mut self.fallback.targets,
+                )));
+            }
+            if self.fallback.terminal_ready {
+                self.fallback.terminal_ready = false;
+                events.push(ProviderEvent::FallbackDone);
+            }
+            if self.fallback.targets.is_empty() && !self.fallback.terminal_ready {
+                self.ready &= !FALLBACK_READY;
+            }
+        }
+    }
+
+    fn drain_ocr_slot(
+        slot: &mut OcrProviderSlot,
+        provider: &'static str,
+        ready_bit: u8,
+        ready: &mut u8,
+        events: &mut ProviderEvents,
+    ) {
+        if *ready & ready_bit == 0 {
+            return;
+        }
+        if !slot.targets.is_empty() {
+            events.push(ProviderEvent::OcrBatch {
+                provider,
+                elapsed: slot.target_elapsed.take().unwrap_or_default(),
+                targets: std::mem::take(&mut slot.targets),
+            });
+        }
+        if let Some((elapsed, result)) = slot.terminal.take() {
+            events.push(ProviderEvent::OcrDone {
+                provider,
+                elapsed,
+                result,
+            });
+        }
+        if slot.targets.is_empty() && slot.terminal.is_none() {
+            *ready &= !ready_bit;
+        }
+    }
+}
+
+impl OcrProviderSlot {
+    fn append(
+        &mut self,
+        provider: &'static str,
+        elapsed: Duration,
+        targets: Vec<UiTarget>,
+    ) -> Result<(), VisionError> {
+        if targets.is_empty() || targets.len() > PROVIDER_BATCH_SIZE {
+            return Err(VisionError::Operational(format!(
+                "{provider} OCR published an invalid batch of {} targets",
+                targets.len()
+            )));
+        }
+        let next = self
+            .published_targets
+            .checked_add(targets.len())
+            .ok_or_else(|| {
+                VisionError::Operational(format!("{provider} OCR target count overflow"))
+            })?;
+        if next > MAX_OCR_TARGETS {
+            return Err(VisionError::Operational(format!(
+                "{provider} OCR exceeded the {MAX_OCR_TARGETS}-target limit"
+            )));
+        }
+        self.published_targets = next;
+        if self.targets.is_empty() {
+            self.targets = targets;
+            self.target_elapsed = Some(elapsed);
+        } else {
+            self.targets.extend(targets);
+        }
+        Ok(())
+    }
+
+    fn finish(
+        &mut self,
+        provider: &'static str,
+        elapsed: Duration,
+        result: Result<usize, VisionError>,
+    ) -> Result<(), VisionError> {
+        if std::mem::replace(&mut self.terminal_published, true) {
+            return Err(VisionError::Operational(format!(
+                "{provider} OCR published duplicate terminal results"
+            )));
+        }
+        self.terminal = Some((elapsed, result));
+        Ok(())
+    }
 }
 
 fn drain_early_ocr_events(
-    receiver: &mpsc::Receiver<ProviderEvent>,
+    mailbox: &ProviderMailbox,
     source: &ScanSource,
     fallback_cancelled: &AtomicBool,
     ocr_had_valid_targets: &mut bool,
-    deferred: &mut VecDeque<ProviderEvent>,
+    deferred: &mut ProviderEvents,
     mut context_is_current: impl FnMut() -> bool,
 ) -> bool {
-    let mut ready = Vec::new();
-    for event in receiver.try_iter() {
+    let mut ready: SmallVec<[ReadyOcrBatch; 2]> = SmallVec::new();
+    let mut events = ProviderEvents::new();
+    mailbox.drain_into(&mut events);
+    for event in events {
         match event {
             ProviderEvent::OcrBatch {
                 provider,
                 elapsed,
                 targets,
             } => ready.push((provider, elapsed, targets)),
-            event => deferred.push_back(event),
+            event => deferred.push(event),
         }
     }
     ready.sort_by(|a, b| compare_ready(a.2.len(), a.1, b.2.len(), b.1));
@@ -1740,21 +2312,24 @@ fn drain_early_ocr_events(
 }
 
 fn send_ocr_batches(
-    sender: &mpsc::SyncSender<ProviderEvent>,
+    mailbox: &ProviderMailbox,
     provider: &'static str,
     started: Instant,
     targets: Vec<UiTarget>,
 ) -> Result<usize, VisionError> {
     let count = targets.len();
+    if count > MAX_OCR_TARGETS {
+        return Err(VisionError::Operational(format!(
+            "{provider} OCR returned {count} targets; limit is {MAX_OCR_TARGETS}"
+        )));
+    }
     if count <= PROVIDER_BATCH_SIZE {
         if count != 0 {
-            sender
-                .send(ProviderEvent::OcrBatch {
-                    provider,
-                    elapsed: started.elapsed(),
-                    targets,
-                })
-                .map_err(|_| VisionError::Cancelled)?;
+            mailbox.publish(ProviderEvent::OcrBatch {
+                provider,
+                elapsed: started.elapsed(),
+                targets,
+            })?;
         }
         return Ok(count);
     }
@@ -1762,25 +2337,47 @@ fn send_ocr_batches(
     for target in targets {
         batch.push(target);
         if batch.len() == PROVIDER_BATCH_SIZE {
-            sender
-                .send(ProviderEvent::OcrBatch {
-                    provider,
-                    elapsed: started.elapsed(),
-                    targets: std::mem::replace(&mut batch, Vec::with_capacity(PROVIDER_BATCH_SIZE)),
-                })
-                .map_err(|_| VisionError::Cancelled)?;
+            mailbox.publish(ProviderEvent::OcrBatch {
+                provider,
+                elapsed: started.elapsed(),
+                targets: std::mem::replace(&mut batch, Vec::with_capacity(PROVIDER_BATCH_SIZE)),
+            })?;
         }
     }
     if !batch.is_empty() {
-        sender
-            .send(ProviderEvent::OcrBatch {
-                provider,
-                elapsed: started.elapsed(),
-                targets: batch,
-            })
-            .map_err(|_| VisionError::Cancelled)?;
+        mailbox.publish(ProviderEvent::OcrBatch {
+            provider,
+            elapsed: started.elapsed(),
+            targets: batch,
+        })?;
     }
     Ok(count)
+}
+
+fn send_fallback_batches(
+    mailbox: &ProviderMailbox,
+    targets: Vec<UiTarget>,
+) -> Result<(), VisionError> {
+    if targets.len() > MAX_OCR_TARGETS {
+        return Err(VisionError::Operational(format!(
+            "fallback returned {} targets; limit is {MAX_OCR_TARGETS}",
+            targets.len()
+        )));
+    }
+    let mut batch = Vec::with_capacity(PROVIDER_BATCH_SIZE);
+    for target in targets {
+        batch.push(target);
+        if batch.len() == PROVIDER_BATCH_SIZE {
+            mailbox.publish(ProviderEvent::FallbackBatch(std::mem::replace(
+                &mut batch,
+                Vec::with_capacity(PROVIDER_BATCH_SIZE),
+            )))?;
+        }
+    }
+    if !batch.is_empty() {
+        mailbox.publish(ProviderEvent::FallbackBatch(batch))?;
+    }
+    mailbox.publish(ProviderEvent::FallbackDone)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1823,33 +2420,46 @@ fn system_ocr_grid_for_parallelism(width: u32, height: u32, parallelism: usize) 
     cpu_grid.min(size_grid).max(1) as u32
 }
 
-fn system_ocr_grid(width: u32, height: u32) -> u32 {
-    let parallelism = std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(8);
-    system_ocr_grid_for_parallelism(width, height, parallelism)
+#[derive(Clone, Copy, Debug)]
+struct SystemOcrLayout {
+    grid: u32,
+    tile_count: usize,
+    max_in_flight: usize,
 }
 
-fn system_ocr_tile_count(geometry: CaptureGeometry) -> usize {
-    let grid = system_ocr_grid(geometry.width, geometry.height) as usize;
-    grid.saturating_mul(grid)
-}
-
-fn system_ocr_concurrency(tile_count: usize) -> usize {
-    let parallelism = std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(MAX_SYSTEM_OCR_IN_FLIGHT);
-    #[cfg(feature = "perf-probe")]
-    if let Some(value) = std::env::var_os("KEYSTEER_OCR_IN_FLIGHT") {
-        let value = value.to_string_lossy();
-        if value.eq_ignore_ascii_case("unbounded") {
-            return tile_count.max(1);
-        }
-        if let Ok(limit) = value.parse::<usize>() {
-            return tile_count.min(limit.max(1)).max(1);
+impl SystemOcrLayout {
+    fn new(geometry: CaptureGeometry) -> Self {
+        let parallelism = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(MAX_SYSTEM_OCR_IN_FLIGHT);
+        let grid = system_ocr_grid_for_parallelism(geometry.width, geometry.height, parallelism);
+        let tile_count = (grid as usize).saturating_mul(grid as usize);
+        let max_in_flight = {
+            let default = system_ocr_concurrency_for(tile_count, parallelism);
+            #[cfg(feature = "perf-probe")]
+            {
+                let mut selected = default;
+                if let Some(value) = std::env::var_os("KEYSTEER_OCR_IN_FLIGHT") {
+                    let value = value.to_string_lossy();
+                    if value.eq_ignore_ascii_case("unbounded") {
+                        selected = tile_count.max(1);
+                    } else if let Ok(limit) = value.parse::<usize>() {
+                        selected = tile_count.min(limit.max(1)).max(1);
+                    }
+                }
+                selected
+            }
+            #[cfg(not(feature = "perf-probe"))]
+            {
+                default
+            }
+        };
+        Self {
+            grid,
+            tile_count,
+            max_in_flight,
         }
     }
-    system_ocr_concurrency_for(tile_count, parallelism)
 }
 
 fn system_ocr_concurrency_for(tile_count: usize, parallelism: usize) -> usize {
@@ -1981,33 +2591,42 @@ fn stream_system_ocr_tiles(
     if pixels.len() != expected {
         return Err("captured BGRA byte length does not match system OCR geometry".into());
     }
-    let grid = system_ocr_grid(geometry.width, geometry.height);
-    let tile_count = (grid as usize)
-        .checked_mul(grid as usize)
-        .ok_or_else(|| "system OCR tile count overflowed".to_string())?;
     if submission
         .sender
-        .send(SystemOcrInput::Begin { tile_count })
+        .send(SystemOcrInput::Begin {
+            tile_count: submission.layout.tile_count,
+        })
         .is_err()
     {
         return Ok(());
     }
     let mut index = 0usize;
     let mut in_flight = 0usize;
-    for row in 0..grid {
-        for column in 0..grid {
-            while in_flight == submission.max_in_flight {
+    for row in 0..submission.layout.grid {
+        for column in 0..submission.layout.grid {
+            while in_flight == submission.layout.max_in_flight {
                 progress(None)?;
-                match submission.credits.recv_timeout(Duration::from_millis(2)) {
-                    Ok(()) => in_flight = in_flight.saturating_sub(1),
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                let remaining = submission
+                    .deadline
+                    .saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err("system OCR tile submission timed out".into());
+                }
+                match submission.credits.recv_timeout(remaining) {
+                    Ok(()) => {
+                        in_flight = in_flight.saturating_sub(1);
+                        progress(None)?;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        return Err("system OCR tile submission timed out".into());
+                    }
                     Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
                 }
             }
-            let core_x = scaled_partition(geometry.width, column, grid);
-            let core_right = scaled_partition(geometry.width, column + 1, grid);
-            let core_y = scaled_partition(geometry.height, row, grid);
-            let core_bottom = scaled_partition(geometry.height, row + 1, grid);
+            let core_x = scaled_partition(geometry.width, column, submission.layout.grid);
+            let core_right = scaled_partition(geometry.width, column + 1, submission.layout.grid);
+            let core_y = scaled_partition(geometry.height, row, submission.layout.grid);
+            let core_bottom = scaled_partition(geometry.height, row + 1, submission.layout.grid);
             let tile = system_ocr_tile_from_bgra(
                 pixels,
                 geometry,
@@ -2029,10 +2648,20 @@ fn stream_system_ocr_tiles(
     Ok(())
 }
 
+#[cfg(test)]
 fn fallback_input_from_bgra(
     pixels: &[u8],
     geometry: CaptureGeometry,
 ) -> Result<FallbackInput, String> {
+    fallback_input_from_bgra_with_progress(pixels, geometry, || Ok(false))?
+        .ok_or_else(|| "fallback grayscale conversion was cancelled".into())
+}
+
+fn fallback_input_from_bgra_with_progress(
+    pixels: &[u8],
+    geometry: CaptureGeometry,
+    mut cancelled: impl FnMut() -> Result<bool, String>,
+) -> Result<Option<FallbackInput>, String> {
     let source_width = geometry.width as usize;
     let source_height = geometry.height as usize;
     let expected = source_width
@@ -2049,24 +2678,53 @@ fn fallback_input_from_bgra(
     let analysis_scale = edge_scale.min(pixel_scale);
     let width = (source_width as f64 * analysis_scale).round().max(2.0) as usize;
     let height = (source_height as f64 * analysis_scale).round().max(2.0) as usize;
-    let source_x_offsets = nearest_offsets(source_width, width);
-    let source_y_offsets = nearest_offsets(source_height, height);
-    let mut gray = vec![0; width * height];
-    for (y, source_y) in source_y_offsets.into_iter().enumerate() {
-        for (x, source_x) in source_x_offsets.iter().copied().enumerate() {
-            let source = (source_y * source_width + source_x) * 4;
-            gray[y * width + x] = ((u16::from(pixels[source + 2]) * 77
-                + u16::from(pixels[source + 1]) * 150
-                + u16::from(pixels[source]) * 29)
-                >> 8) as u8;
+    let mut gray = Vec::with_capacity(width * height);
+    if width == source_width && height == source_height {
+        // 1080p and smaller captures need no coordinate tables or zero-fill.
+        for (y, row) in pixels.chunks_exact(source_width * 4).enumerate() {
+            if y.is_multiple_of(32) && cancelled()? {
+                return Ok(None);
+            }
+            gray.extend(row.as_chunks::<4>().0.iter().map(|pixel| bgra_luma(pixel)));
+        }
+    } else if source_width.is_multiple_of(width) && source_height.is_multiple_of(height) {
+        // Native 4K commonly becomes an exact 2:1 1080p analysis image.
+        // Stepping source rows and pixels avoids both offset allocations.
+        let x_step = source_width / width;
+        let y_step = source_height / height;
+        for (y, source_y) in (0..source_height).step_by(y_step).enumerate() {
+            if y.is_multiple_of(32) && cancelled()? {
+                return Ok(None);
+            }
+            let row = &pixels[source_y * source_width * 4..][..source_width * 4];
+            for source_x in (0..source_width).step_by(x_step) {
+                gray.push(bgra_luma(&row[source_x * 4..source_x * 4 + 4]));
+            }
+        }
+    } else {
+        let source_x_offsets = nearest_offsets(source_width, width);
+        let source_y_offsets = nearest_offsets(source_height, height);
+        for (y, source_y) in source_y_offsets.into_iter().enumerate() {
+            if y.is_multiple_of(32) && cancelled()? {
+                return Ok(None);
+            }
+            for source_x in source_x_offsets.iter().copied() {
+                let source = (source_y * source_width + source_x) * 4;
+                gray.push(bgra_luma(&pixels[source..source + 4]));
+            }
         }
     }
-    Ok(FallbackInput {
+    Ok(Some(FallbackInput {
         gray,
         width,
         height,
         desktop_bounds: geometry.desktop_bounds,
-    })
+    }))
+}
+
+#[inline]
+fn bgra_luma(pixel: &[u8]) -> u8 {
+    ((u16::from(pixel[2]) * 77 + u16::from(pixel[1]) * 150 + u16::from(pixel[0]) * 29) >> 8) as u8
 }
 
 /// Return the exact `floor(output * source / destination)` mapping without a
@@ -2114,7 +2772,7 @@ fn discover_ocr(shared: Arc<DiscoveryShared>) {
         .unwrap_or_else(|error| error.into_inner());
     *state = match snapshot {
         Some(snapshot) if snapshot.system.is_some() || snapshot.wechat.is_some() => {
-            DiscoveryState::Ready(snapshot)
+            DiscoveryState::Ready(Arc::new(snapshot))
         }
         _ => DiscoveryState::Unavailable,
     };
@@ -2135,7 +2793,7 @@ fn probe_ocr(cancelled: impl Fn() -> bool + Copy) -> Option<OcrDiscoverySnapshot
                 descriptor.languages.join(", "),
                 descriptor.maximum_dimension
             );
-            Some(descriptor)
+            Some(Arc::new(descriptor))
         }
         Err(_error) if cancelled() => return None,
         Err(error) => {
@@ -2153,7 +2811,7 @@ fn probe_ocr(cancelled: impl Fn() -> bool + Copy) -> Option<OcrDiscoverySnapshot
                 "WeChat OCR discovered ({})",
                 descriptor.description()
             );
-            Some(descriptor)
+            Some(Arc::new(descriptor))
         }
         Ok(None) => {
             crate::report_warning!(
@@ -2191,7 +2849,7 @@ fn stream_system_targets_from_result(
     geometry: CaptureGeometry,
     core_bounds: Rect,
     maximum: usize,
-    sender: &mpsc::SyncSender<ProviderEvent>,
+    mailbox: &ProviderMailbox,
     started: Instant,
 ) -> Result<usize, VisionError> {
     let lines = result
@@ -2260,26 +2918,22 @@ fn stream_system_targets_from_result(
         });
         accepted += 1;
         if batch.len() == PROVIDER_BATCH_SIZE {
-            sender
-                .send(ProviderEvent::OcrBatch {
-                    provider: "system",
-                    elapsed: started.elapsed(),
-                    targets: std::mem::replace(
-                        &mut batch,
-                        Vec::with_capacity(PROVIDER_BATCH_SIZE.min(maximum - accepted)),
-                    ),
-                })
-                .map_err(|_| VisionError::Cancelled)?;
+            mailbox.publish(ProviderEvent::OcrBatch {
+                provider: "system",
+                elapsed: started.elapsed(),
+                targets: std::mem::replace(
+                    &mut batch,
+                    Vec::with_capacity(PROVIDER_BATCH_SIZE.min(maximum - accepted)),
+                ),
+            })?;
         }
     }
     if !batch.is_empty() {
-        sender
-            .send(ProviderEvent::OcrBatch {
-                provider: "system",
-                elapsed: started.elapsed(),
-                targets: batch,
-            })
-            .map_err(|_| VisionError::Cancelled)?;
+        mailbox.publish(ProviderEvent::OcrBatch {
+            provider: "system",
+            elapsed: started.elapsed(),
+            targets: batch,
+        })?;
     }
     Ok(accepted)
 }
@@ -2321,19 +2975,20 @@ impl OcrOperationGuard {
         Ok((guard, completion))
     }
 
-    fn complete(mut self, status: AsyncStatus) -> Result<OcrResult, String> {
+    fn complete(mut self, status: SystemOcrCompletionStatus) -> Result<OcrResult, String> {
         let result = match status {
-            AsyncStatus::Completed => self
+            SystemOcrCompletionStatus::Completed => self
                 .operation
                 .GetResults()
                 .map_err(|error| format!("OcrEngine::RecognizeAsync failed: {error}")),
-            AsyncStatus::Canceled => Err("system OCR cancelled".into()),
-            AsyncStatus::Error => self.operation.ErrorCode().map_or_else(
+            SystemOcrCompletionStatus::Canceled => Err("system OCR cancelled".into()),
+            SystemOcrCompletionStatus::Error => self.operation.ErrorCode().map_or_else(
                 |error| Err(format!("cannot read system OCR error: {error}")),
                 |error| Err(format!("OcrEngine::RecognizeAsync failed: {error}")),
             ),
-            AsyncStatus::Started => Err("system OCR completed callback reported Started".into()),
-            _ => Err("system OCR returned an unknown asynchronous status".into()),
+            SystemOcrCompletionStatus::NonTerminal => retain_nonterminal_system_ocr_owner(
+                "system OCR completion callback reported a non-terminal status",
+            ),
         };
         self.finish(result)
     }
@@ -2366,17 +3021,23 @@ impl OcrOperationGuard {
                 }
                 self.closed = true;
             }
-            Ok(_) => cleanup.push(
-                "system OCR operation did not reach a terminal state after handler failure".into(),
-            ),
-            Err(status_error) => cleanup.push(format!(
-                "cannot query system OCR operation after handler failure: {status_error}"
-            )),
+            Ok(_) => {
+                cleanup.push(
+                    "system OCR operation did not reach a terminal state after handler failure"
+                        .into(),
+                );
+                let message = combine_primary_and_cleanup(error, cleanup);
+                retain_nonterminal_system_ocr_owner(&message);
+            }
+            Err(status_error) => {
+                cleanup.push(format!(
+                    "cannot query system OCR operation after handler failure: {status_error}"
+                ));
+                let message = combine_primary_and_cleanup(error, cleanup);
+                retain_nonterminal_system_ocr_owner(&message);
+            }
         }
-        match combine_result_and_cleanup::<()>(Err(error), cleanup) {
-            Ok(()) => "system OCR cleanup lost its primary error".into(),
-            Err(error) => error,
-        }
+        combine_primary_and_cleanup(error, cleanup)
     }
 }
 
@@ -2392,10 +3053,24 @@ impl Drop for OcrOperationGuard {
                     failures.push(format!("cannot close system OCR operation: {error}"));
                 }
             }
-            Ok(_) => failures.push("system OCR operation left its explicit owner".into()),
-            Err(error) => failures.push(format!(
-                "cannot query system OCR operation during drop: {error}"
-            )),
+            Ok(_) => {
+                let reason = combine_primary_and_cleanup(
+                    "system OCR operation left its explicit owner before reaching a terminal state"
+                        .into(),
+                    failures,
+                );
+                retain_nonterminal_system_ocr_owner(&reason);
+            }
+            Err(error) => {
+                failures.push(format!(
+                    "cannot query system OCR operation during drop: {error}"
+                ));
+                let reason = combine_primary_and_cleanup(
+                    "system OCR operation status is unknown during owner drop".into(),
+                    failures,
+                );
+                retain_nonterminal_system_ocr_owner(&reason);
+            }
         }
         for error in failures {
             crate::app::logging::report_error("windows-vision", error);
@@ -2410,8 +3085,15 @@ fn combine_result_and_cleanup<T>(
     match (result, cleanup.is_empty()) {
         (Ok(value), true) => Ok(value),
         (Ok(_), false) => Err(cleanup.join("; ")),
-        (Err(error), true) => Err(error),
-        (Err(error), false) => Err(format!("{error}; cleanup: {}", cleanup.join("; "))),
+        (Err(error), _) => Err(combine_primary_and_cleanup(error, cleanup)),
+    }
+}
+
+fn combine_primary_and_cleanup(error: String, cleanup: Vec<String>) -> String {
+    if cleanup.is_empty() {
+        error
+    } else {
+        format!("{error}; cleanup: {}", cleanup.join("; "))
     }
 }
 
@@ -2931,7 +3613,21 @@ mod tests {
         let completion = SystemOcrCompletion::pending();
         completion.publish(AsyncStatus::Completed);
         assert!(sender.try_send(SystemOcrInput::CompletionWake).is_err());
-        assert_eq!(completion.take(), Some(AsyncStatus::Completed));
+        assert_eq!(
+            completion.take(),
+            Some(SystemOcrCompletionStatus::Completed)
+        );
+        assert_eq!(completion.take(), None);
+    }
+
+    #[test]
+    fn completion_callback_preserves_nonterminal_status_for_quarantine() {
+        let completion = SystemOcrCompletion::pending();
+        completion.publish(AsyncStatus::Started);
+        assert_eq!(
+            completion.take(),
+            Some(SystemOcrCompletionStatus::NonTerminal)
+        );
         assert_eq!(completion.take(), None);
     }
 
@@ -3028,8 +3724,8 @@ mod tests {
     }
 
     #[test]
-    fn provider_targets_move_in_bounded_batches() {
-        let (sender, receiver) = mpsc::sync_channel(4);
+    fn provider_batches_coalesce_in_the_fixed_mailbox_slot() {
+        let mailbox = ProviderMailbox::new();
         let targets = (0..49)
             .map(|index| UiTarget {
                 rect: Rect::new(index as f64, 0.0, 4.0, 4.0),
@@ -3039,19 +3735,111 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            send_ocr_batches(&sender, "test", Instant::now(), targets)
-                .expect("test receiver is live"),
+            send_ocr_batches(&mailbox, "system", Instant::now(), targets)
+                .expect("test mailbox is live"),
             49
         );
-        drop(sender);
-        let sizes = receiver
+        let mut events = ProviderEvents::new();
+        mailbox.drain_into(&mut events);
+        let sizes = events
             .into_iter()
             .map(|event| match event {
                 ProviderEvent::OcrBatch { targets, .. } => targets.len(),
                 _ => 0,
             })
             .collect::<Vec<_>>();
-        assert_eq!(sizes, [24, 24, 1]);
+        assert_eq!(sizes, [49]);
+    }
+
+    #[test]
+    fn provider_mailbox_preserves_a_full_generation_without_blocking() {
+        let mailbox = ProviderMailbox::new();
+        let targets = |offset: usize| {
+            (0..MAX_OCR_TARGETS)
+                .map(|index| UiTarget {
+                    rect: Rect::new((offset + index) as f64, 0.0, 4.0, 4.0),
+                    name: index.to_string(),
+                    role: "static_text".into(),
+                    native_role: None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            send_ocr_batches(&mailbox, "system", Instant::now(), targets(0)).unwrap(),
+            MAX_OCR_TARGETS
+        );
+        mailbox
+            .publish(ProviderEvent::OcrDone {
+                provider: "system",
+                elapsed: Duration::ZERO,
+                result: Ok(MAX_OCR_TARGETS),
+            })
+            .unwrap();
+        assert_eq!(
+            send_ocr_batches(&mailbox, "wechat", Instant::now(), targets(MAX_OCR_TARGETS),)
+                .unwrap(),
+            MAX_OCR_TARGETS
+        );
+        mailbox
+            .publish(ProviderEvent::OcrDone {
+                provider: "wechat",
+                elapsed: Duration::ZERO,
+                result: Ok(MAX_OCR_TARGETS),
+            })
+            .unwrap();
+        send_fallback_batches(&mailbox, targets(MAX_OCR_TARGETS * 2)).unwrap();
+
+        let mut events = ProviderEvents::new();
+        mailbox.drain_into(&mut events);
+        assert_eq!(events.len(), 6);
+        let mut target_count = 0;
+        let mut terminal_count = 0;
+        for event in events {
+            match event {
+                ProviderEvent::OcrBatch { targets, .. } | ProviderEvent::FallbackBatch(targets) => {
+                    target_count += targets.len()
+                }
+                ProviderEvent::OcrDone { .. } | ProviderEvent::FallbackDone => {
+                    terminal_count += 1;
+                }
+            }
+        }
+        assert_eq!(target_count, MAX_OCR_TARGETS * 3);
+        assert_eq!(terminal_count, 3);
+    }
+
+    #[test]
+    fn provider_mailbox_close_wakes_and_rejects_late_results() {
+        let mailbox = ProviderMailbox::new();
+        mailbox.close();
+        assert!(matches!(
+            mailbox.wait_until_ready(Instant::now() + Duration::from_secs(1)),
+            Err(VisionError::Cancelled)
+        ));
+        assert!(matches!(
+            mailbox.publish(ProviderEvent::FallbackDone),
+            Err(VisionError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn quarantined_provider_mailbox_discards_published_target_owners() {
+        let mailbox = ProviderMailbox::new();
+        mailbox
+            .publish(ProviderEvent::FallbackBatch(vec![UiTarget {
+                rect: Rect::new(0.0, 0.0, 4.0, 4.0),
+                name: "discard me".into(),
+                role: "static_text".into(),
+                native_role: None,
+            }]))
+            .unwrap();
+        mailbox.close();
+        mailbox.discard();
+
+        let mut events = ProviderEvents::new();
+        mailbox.drain_into(&mut events);
+        assert!(events.is_empty());
+        assert_eq!(mailbox.ready_flags.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -3130,15 +3918,18 @@ mod tests {
     #[test]
     fn completed_discovery_snapshot_is_reused() {
         let shared = Arc::new(DiscoveryShared::default());
+        let snapshot = Arc::new(OcrDiscoverySnapshot::default());
         *shared
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner()) =
-            DiscoveryState::Ready(OcrDiscoverySnapshot::default());
+            DiscoveryState::Ready(Arc::clone(&snapshot));
         let discovery = DiscoveryHandle(shared);
         let deadline = Instant::now() + Duration::from_secs(1);
-        assert!(discovery.wait(deadline, || false).is_some());
-        assert!(discovery.wait(deadline, || false).is_some());
+        let first = discovery.wait(deadline, || false).unwrap();
+        let second = discovery.wait(deadline, || false).unwrap();
+        assert!(Arc::ptr_eq(&snapshot, &first));
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]
@@ -3153,7 +3944,8 @@ mod tests {
     fn provider_group_cancels_and_joins_every_thread() {
         let shared = Arc::new(SharedQueue::default());
         shared.latest_generation.store(23, Ordering::Release);
-        let cancellation = ScanCancellation::new(&shared, 23);
+        let mailbox = Arc::new(ProviderMailbox::new());
+        let cancellation = ScanCancellation::new(&shared, 23, &mailbox, Weak::new());
         let provider_cancellation = cancellation.clone();
         let stopped = Arc::new(AtomicBool::new(false));
         let provider_stopped = Arc::clone(&stopped);
@@ -3166,6 +3958,43 @@ mod tests {
         });
         drop(providers);
         assert!(stopped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn scan_cancellation_wakes_system_ocr_without_polling() {
+        let shared = Arc::new(SharedQueue::default());
+        shared.latest_generation.store(29, Ordering::Release);
+        let mailbox = Arc::new(ProviderMailbox::new());
+        let cancellation = ScanCancellation::new(&shared, 29, &mailbox, Weak::new());
+        let (system_sender, system_receiver) = mpsc::sync_channel(1);
+        let (credit_sender, credit_receiver) = mpsc::channel();
+        let (wechat_sender, wechat_receiver) = mpsc::sync_channel(1);
+        cancellation.register_system_wake(system_sender);
+        cancellation.register_system_credit_wake(credit_sender);
+        cancellation.register_wechat_wake(wechat_sender);
+        cancellation.cancel();
+        assert!(matches!(
+            system_receiver.try_recv(),
+            Ok(SystemOcrInput::CancelWake)
+        ));
+        assert!(matches!(
+            wechat_receiver.try_recv(),
+            Ok(WechatInput::CancelWake)
+        ));
+        assert_eq!(credit_receiver.try_recv(), Ok(()));
+        assert!(matches!(
+            mailbox.wait_until_ready(Instant::now()),
+            Err(VisionError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn expired_generation_deadline_still_retains_ocr_until_terminal_wake() {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(SystemOcrInput::CompletionWake).unwrap();
+        let event = wait_system_ocr_cancellation_event(&receiver, Instant::now())
+            .expect("the terminal wake remains authoritative after the scan deadline");
+        assert!(matches!(event, SystemOcrInput::CompletionWake));
     }
 
     #[test]

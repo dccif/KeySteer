@@ -1,5 +1,6 @@
 //! Shared ownership and bounded joining for background workers.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::thread::{Builder, JoinHandle};
@@ -10,6 +11,7 @@ pub(crate) struct WorkerJoin {
     name: &'static str,
     finished: Receiver<()>,
     join: Option<JoinHandle<()>>,
+    join_failure_returned: bool,
 }
 
 struct QuarantinedJoin {
@@ -18,6 +20,7 @@ struct QuarantinedJoin {
 }
 
 static QUARANTINED: OnceLock<Mutex<Vec<QuarantinedJoin>>> = OnceLock::new();
+static QUARANTINE_NONEMPTY: AtomicBool = AtomicBool::new(false);
 
 impl WorkerJoin {
     pub(crate) fn spawn(
@@ -37,6 +40,7 @@ impl WorkerJoin {
             name,
             finished,
             join: Some(join),
+            join_failure_returned: false,
         })
     }
 
@@ -88,6 +92,7 @@ impl WorkerJoin {
                 Err(RecvTimeoutError::Timeout)
             ) && !join.is_finished()
             {
+                self.join_failure_returned = true;
                 return Err(format!(
                     "{} did not stop before the shutdown deadline",
                     self.name
@@ -98,10 +103,24 @@ impl WorkerJoin {
         // returns, immediately before the OS thread runs TLS destructors. Do
         // not turn that signal into an unbounded join if a native TLS owner is
         // still cleaning up.
-        while !join.is_finished() && Instant::now() < deadline {
-            std::thread::yield_now();
+        let mut spins = 0u8;
+        while !join.is_finished() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            if spins < 16 {
+                std::hint::spin_loop();
+                spins += 1;
+            } else {
+                // This is a cold shutdown-only path. A short park prevents a
+                // native TLS destructor from consuming an entire CPU until the
+                // shared deadline while still reacting within one millisecond.
+                std::thread::park_timeout(remaining.min(Duration::from_millis(1)));
+            }
         }
         if !join.is_finished() {
+            self.join_failure_returned = true;
             return Err(format!(
                 "{} did not finish thread-local cleanup before the shutdown deadline",
                 self.name
@@ -117,28 +136,45 @@ impl WorkerJoin {
         join.join()
             .map_err(|_| format!("{} worker panicked", self.name))
     }
+
+    /// Whether a bounded join already returned a shutdown-deadline failure.
+    ///
+    /// Native owner `Drop` implementations use this to avoid starting a new
+    /// relative wait after their backend has already exhausted its shared
+    /// shutdown deadline. The `WorkerJoin` field is then transferred to the
+    /// process quarantine by its own `Drop` implementation.
+    pub(crate) fn shutdown_failure_was_returned(&self) -> bool {
+        self.join_failure_returned
+    }
 }
 
 impl Drop for WorkerJoin {
     fn drop(&mut self) {
         if let Some(join) = self.join.take() {
-            crate::app::logging::report_error(
-                "worker",
-                format!("{} was dropped without a completed join", self.name),
-            );
-            QUARANTINED
-                .get_or_init(|| Mutex::new(Vec::new()))
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .push(QuarantinedJoin {
-                    name: self.name,
-                    join,
-                });
+            if !self.join_failure_returned {
+                crate::app::logging::report_error(
+                    "worker",
+                    format!("{} was dropped without a completed join", self.name),
+                );
+            }
+            quarantine(self.name, join);
         }
     }
 }
 
-fn reap_quarantined() {
+fn quarantine(name: &'static str, join: JoinHandle<()>) {
+    let mut workers = QUARANTINED
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    workers.push(QuarantinedJoin { name, join });
+    QUARANTINE_NONEMPTY.store(true, Ordering::Release);
+}
+
+pub(crate) fn reap_quarantined() {
+    if !QUARANTINE_NONEMPTY.load(Ordering::Acquire) {
+        return;
+    }
     let Some(workers) = QUARANTINED.get() else {
         return;
     };
@@ -156,6 +192,9 @@ fn reap_quarantined() {
                 format!("{} quarantined worker panicked", worker.name),
             );
         }
+    }
+    if workers.is_empty() {
+        QUARANTINE_NONEMPTY.store(false, Ordering::Release);
     }
 }
 
@@ -194,6 +233,7 @@ mod tests {
         .unwrap();
         let error = worker.join_timeout(Duration::from_millis(1)).unwrap_err();
         assert!(error.contains("shutdown deadline"));
+        assert!(worker.shutdown_failure_was_returned());
         assert!(
             worker.join.is_some(),
             "a timeout must retain the join handle"
@@ -217,6 +257,7 @@ mod tests {
             name: "tls-cleanup",
             finished,
             join: Some(join),
+            join_failure_returned: false,
         };
 
         let error = worker.join_timeout(Duration::from_millis(10)).unwrap_err();

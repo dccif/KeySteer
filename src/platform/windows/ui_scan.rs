@@ -7,15 +7,17 @@
 //! immediately without allowing competing terminal results or duplicate hint
 //! positions to destabilise labels which are already visible.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use smallvec::SmallVec;
 
 use crate::api::command::UiScanStatus;
-use crate::api::geometry::{Rect, UiTarget};
+#[cfg(test)]
+use crate::api::geometry::Rect;
+use crate::api::geometry::UiTarget;
 use crate::platform::partial_batcher::PartialBatcher;
 use crate::platform::scan_mailbox::ScanMailbox;
+use crate::platform::spatial_index::{SpatialIndex, rectangles_match};
 
 use super::EventSender;
 use super::accessibility::WindowsScanPlan;
@@ -51,7 +53,6 @@ impl ScanSession {
         wake: EventSender,
     ) -> Arc<Self> {
         let id = plan.id;
-        let merge_iou_threshold = plan.vision.merge_iou_threshold.clamp(0.0, 1.0);
         Arc::new(Self {
             id,
             generation,
@@ -61,7 +62,7 @@ impl ScanSession {
             state: Mutex::new(SessionState {
                 remaining: sources,
                 batcher: PartialBatcher::new(FIRST_BATCH, MAX_TARGETS),
-                index: SpatialIndex::new(MINIMUM_SPACING, merge_iou_threshold),
+                index: SpatialIndex::new(64.0, MINIMUM_SPACING, 2.0),
                 statuses: SmallVec::new(),
                 finished: false,
                 published_any: false,
@@ -97,6 +98,7 @@ pub(super) struct ScanSource {
 impl ScanSource {
     pub(super) fn push(&self, targets: Vec<UiTarget>) -> usize {
         let mut ready = SmallVec::<[Vec<UiTarget>; 2]>::new();
+        let merge_iou_threshold = self.session.plan.vision.merge_iou_threshold.clamp(0.0, 1.0);
         let accepted = {
             let mut state = self
                 .session
@@ -112,7 +114,9 @@ impl ScanSource {
                     break;
                 }
                 if self.session.plan.target_center_is_visible(&target)
-                    && state.index.insert(&target)
+                    && state.index.insert_if_unique(target.rect, |a, b| {
+                        rectangles_match(a, b, merge_iou_threshold, MINIMUM_SPACING)
+                    })
                 {
                     accepted += 1;
                     if let Some(batch) = state.batcher.push_one(target) {
@@ -234,139 +238,6 @@ fn combined_status(statuses: &[UiScanStatus]) -> UiScanStatus {
         .unwrap_or(UiScanStatus::Success)
 }
 
-struct SpatialIndex {
-    cell_size: f64,
-    minimum_spacing: f64,
-    iou_threshold: f64,
-    cells: HashMap<(i32, i32), SmallVec<[usize; 4]>>,
-    oversize: SmallVec<[usize; 16]>,
-    rects: Vec<Rect>,
-    marks: Vec<u32>,
-    query_generation: u32,
-}
-
-impl SpatialIndex {
-    fn new(minimum_spacing: f64, iou_threshold: f64) -> Self {
-        Self {
-            cell_size: 64.0,
-            minimum_spacing: minimum_spacing.max(1.0),
-            iou_threshold,
-            cells: HashMap::new(),
-            oversize: SmallVec::new(),
-            rects: Vec::new(),
-            marks: Vec::new(),
-            query_generation: 0,
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.rects.len()
-    }
-
-    fn insert(&mut self, target: &UiTarget) -> bool {
-        let rect = target.rect;
-        if !usable_rect(rect) {
-            return false;
-        }
-        let range = self.covered_cells(rect);
-        let cell_count =
-            i64::from(range.2 - range.0 + 1).saturating_mul(i64::from(range.3 - range.1 + 1));
-        let oversize = cell_count > 32;
-        self.next_query_generation();
-        let duplicate = {
-            let generation = self.query_generation;
-            let rects = &self.rects;
-            let marks = &mut self.marks;
-            let mut inspect = |candidate: usize| {
-                if marks[candidate] == generation {
-                    return false;
-                }
-                marks[candidate] = generation;
-                rectangles_match(
-                    rects[candidate],
-                    rect,
-                    self.iou_threshold,
-                    self.minimum_spacing,
-                )
-            };
-            if oversize {
-                (0..rects.len()).any(&mut inspect)
-            } else {
-                self.oversize.iter().copied().any(&mut inspect)
-                    || (range.1..=range.3).any(|y| {
-                        (range.0..=range.2).any(|x| {
-                            self.cells
-                                .get(&(x, y))
-                                .is_some_and(|entries| entries.iter().copied().any(&mut inspect))
-                        })
-                    })
-            }
-        };
-        if duplicate {
-            return false;
-        }
-        let index = self.rects.len();
-        self.rects.push(rect);
-        self.marks.push(0);
-        if oversize {
-            self.oversize.push(index);
-        } else {
-            for y in range.1..=range.3 {
-                for x in range.0..=range.2 {
-                    self.cells.entry((x, y)).or_default().push(index);
-                }
-            }
-        }
-        true
-    }
-
-    fn covered_cells(&self, rect: Rect) -> (i32, i32, i32, i32) {
-        let spacing = self.minimum_spacing;
-        let cell = |value: f64| (value / self.cell_size).floor() as i32;
-        (
-            cell(rect.x - spacing),
-            cell(rect.y - spacing),
-            cell(rect.right() + spacing),
-            cell(rect.bottom() + spacing),
-        )
-    }
-
-    fn next_query_generation(&mut self) {
-        self.query_generation = self.query_generation.wrapping_add(1);
-        if self.query_generation == 0 {
-            self.marks.fill(0);
-            self.query_generation = 1;
-        }
-    }
-}
-
-fn usable_rect(rect: Rect) -> bool {
-    rect.x.is_finite()
-        && rect.y.is_finite()
-        && rect.width.is_finite()
-        && rect.height.is_finite()
-        && rect.width >= 2.0
-        && rect.height >= 2.0
-}
-
-fn rectangles_match(a: Rect, b: Rect, iou_threshold: f64, minimum_spacing: f64) -> bool {
-    let intersection = a.intersect(&b).map_or(0.0, |rect| rect.width * rect.height);
-    let a_area = a.width * a.height;
-    let b_area = b.width * b.height;
-    let union = a_area + b_area - intersection;
-    let iou = if union > 0.0 {
-        intersection / union
-    } else {
-        0.0
-    };
-    let containment = intersection / a_area.min(b_area).max(1.0);
-    let ac = a.center();
-    let bc = b.center();
-    let near = (ac.x - bc.x).hypot(ac.y - bc.y) < minimum_spacing
-        && (ac.y - bc.y).abs() <= (a.height.min(b.height) * 0.35).max(2.0);
-    iou >= iou_threshold || containment >= 0.8 || near
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,16 +304,13 @@ mod tests {
 
     #[test]
     fn spatial_index_finds_containment_outside_neighbouring_center_cells() {
-        let mut index = SpatialIndex::new(8.0, 0.5);
-        let target = |rect| UiTarget {
-            rect,
-            name: String::new(),
-            role: "control".into(),
-            native_role: None,
+        let mut index = SpatialIndex::new(64.0, 8.0, 2.0);
+        let unique = |index: &mut SpatialIndex, candidate| {
+            index.insert_if_unique(candidate, |a, b| rectangles_match(a, b, 0.5, 8.0))
         };
-        assert!(index.insert(&target(rect(0.0, 0.0, 200.0, 80.0))));
-        assert!(!index.insert(&target(rect(170.0, 10.0, 20.0, 20.0))));
-        assert!(index.insert(&target(rect(220.0, 10.0, 20.0, 20.0))));
+        assert!(unique(&mut index, rect(0.0, 0.0, 200.0, 80.0)));
+        assert!(!unique(&mut index, rect(170.0, 10.0, 20.0, 20.0)));
+        assert!(unique(&mut index, rect(220.0, 10.0, 20.0, 20.0)));
     }
 
     #[test]

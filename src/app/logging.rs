@@ -99,6 +99,7 @@ impl Logger {
                 self.path.display()
             ));
         }
+        let mut flush_failed = false;
         let write_result = match state.file.as_mut() {
             Some(file) => {
                 let result = writeln!(file, "{line}");
@@ -110,6 +111,7 @@ impl Logger {
                         "cannot flush diagnostic log {}: {error}",
                         self.path.display()
                     ));
+                    flush_failed = true;
                 }
                 result
             }
@@ -123,12 +125,22 @@ impl Logger {
             state.file = None;
             return;
         }
+        if flush_failed {
+            // A sink that cannot honour the synchronous Error contract is no
+            // longer usable. Reopen it on the next record instead of keeping
+            // a poisoned handle for the rest of the process.
+            state.file = None;
+            return;
+        }
         state.bytes = state.bytes.saturating_add(line.len() as u64 + 1);
     }
 
     fn rotate(&self, state: &mut LoggerState) -> io::Result<()> {
-        if let Some(file) = state.file.as_mut() {
-            file.flush()?;
+        if let Some(file) = state.file.as_mut()
+            && let Err(error) = file.flush()
+        {
+            state.file = None;
+            return Err(error);
         }
         drop(state.file.take());
         let rotation = rotate_files(&self.path);
@@ -157,13 +169,13 @@ impl Logger {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(file) = state.file.as_mut()
-            && let Err(error) = file.flush()
-        {
+        let flush_error = state.file.as_mut().and_then(|file| file.flush().err());
+        if let Some(error) = flush_error {
             write_emergency_stderr(format_args!(
                 "cannot flush diagnostic log {}: {error}",
                 self.path.display()
             ));
+            state.file = None;
         }
     }
 }
@@ -281,6 +293,8 @@ pub(crate) fn info_args(target: &str, message: fmt::Arguments<'_>) {
     }
 }
 
+#[cold]
+#[inline(never)]
 fn report(level: Level, target: &str, message: &str) {
     debug_assert!(level >= Level::Warning);
     write_emergency_stderr(format_args!("{message}"));
@@ -289,11 +303,15 @@ fn report(level: Level, target: &str, message: &str) {
     }
 }
 
+#[cold]
+#[inline(never)]
 pub fn report_error(target: &str, message: impl AsRef<str>) {
     let message = message.as_ref();
     report(Level::Error, target, message);
 }
 
+#[cold]
+#[inline(never)]
 pub(crate) fn report_error_args(target: &str, message: fmt::Arguments<'_>) {
     let message = message.to_string();
     report(Level::Error, target, &message);
@@ -302,6 +320,8 @@ pub(crate) fn report_error_args(target: &str, message: fmt::Arguments<'_>) {
 /// Central emergency console path used before the persistent logger exists or
 /// for CLI-only location hints. Platform and application modules must not
 /// write stderr directly.
+#[cold]
+#[inline(never)]
 pub(crate) fn emergency_console(message: impl fmt::Display) {
     write_emergency_stderr(format_args!("{message}"));
 }
@@ -314,6 +334,8 @@ pub(crate) fn emergency_stderr_is_terminal() -> bool {
 /// Best-effort emergency output must never panic while reporting another
 /// failure. There is deliberately no recursive fallback after stderr itself
 /// rejects a write.
+#[cold]
+#[inline(never)]
 fn write_emergency_stderr(message: fmt::Arguments<'_>) {
     let mut stderr = io::stderr().lock();
     let _ = stderr.write_all(b"KeySteer: ");
@@ -464,6 +486,8 @@ fn rotated_path(path: &Path, index: usize) -> PathBuf {
     PathBuf::from(value)
 }
 
+#[cold]
+#[inline(never)]
 fn format_line(level: Level, target: &str, message: &str) -> String {
     let thread = std::thread::current();
     let name = thread.name().unwrap_or("unnamed");
@@ -581,6 +605,27 @@ mod tests {
         logger.write(Level::Error, "test-target", "unconditional error");
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("unconditional error"), "{text}");
+        drop(logger);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_failed_file_sink_is_invalidated_and_reopened_on_the_next_error() {
+        let path = temporary_log();
+        let logger = Logger::open(path.clone()).unwrap();
+        let read_only = fs::File::open(&path).unwrap();
+        {
+            let mut state = logger.state.lock().unwrap();
+            state.file = Some(read_only);
+        }
+
+        logger.write(Level::Error, "test-target", "expected write failure");
+        assert!(logger.state.lock().unwrap().file.is_none());
+
+        logger.write(Level::Error, "test-target", "reopened sink");
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("expected write failure"), "{text}");
+        assert!(text.contains("reopened sink"), "{text}");
         drop(logger);
         fs::remove_file(path).unwrap();
     }

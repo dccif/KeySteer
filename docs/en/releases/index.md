@@ -1,5 +1,9 @@
 # Release notes
 
+## 0.9.11
+
+Improved input and UI Hint responsiveness, reduced OCR scan waits, and strengthened cancellation and resource cleanup on Windows and macOS for smoother, more reliable repeated use.
+
 ## 0.9.10
 
 Fixed held-mouse text and pressed colors sometimes remaining after automatic drag release, while reducing temporary allocations and duplicate work in shared indicator and input-state handling.

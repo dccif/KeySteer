@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -402,7 +402,7 @@ impl HookThread {
     }
 
     pub fn next_event(&mut self) -> Option<BackendEvent> {
-        if WAKE_FAILED.swap(false, Ordering::AcqRel) {
+        if take_wake_failure() {
             return Some(BackendEvent::Warning(
                 "PostThreadMessageW could not wake the engine for hooked input".into(),
             ));
@@ -469,6 +469,12 @@ impl HookThread {
     }
 
     pub fn stop(&mut self) -> Result<(), String> {
+        let now = Instant::now();
+        let deadline = now.checked_add(HOOK_STOP_TIMEOUT).unwrap_or(now);
+        self.stop_until(deadline)
+    }
+
+    pub fn stop_until(&mut self, deadline: Instant) -> Result<(), String> {
         if self.worker.is_none() {
             return Ok(());
         }
@@ -481,7 +487,7 @@ impl HookThread {
         let result = self
             .worker
             .as_mut()
-            .map_or(Ok(()), |worker| worker.join_timeout(HOOK_STOP_TIMEOUT));
+            .map_or(Ok(()), |worker| worker.join_until(deadline));
         if result.is_ok() {
             self.worker.take();
             self.thread_id = 0;
@@ -499,6 +505,13 @@ impl HookThread {
 
 impl Drop for HookThread {
     fn drop(&mut self) {
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(WorkerJoin::shutdown_failure_was_returned)
+        {
+            return;
+        }
         if let Err(error) = self.stop() {
             crate::app::logging::report_error("windows-hook", &error);
         }
@@ -704,6 +717,14 @@ pub(super) fn set_pointer_wake_enabled(enabled: bool) {
     }
 }
 
+#[inline]
+fn take_wake_failure() -> bool {
+    // The flag is false throughout normal operation. Avoid an unconditional
+    // locked exchange on every backend poll while preserving the exchange for
+    // the rare failure path.
+    WAKE_FAILED.load(Ordering::Acquire) && WAKE_FAILED.swap(false, Ordering::AcqRel)
+}
+
 #[cfg(test)]
 pub(super) fn pointer_wake_enabled() -> bool {
     POINTER_WAKE_ENABLED.load(Ordering::Acquire)
@@ -717,7 +738,12 @@ fn mark_pointer_pending() -> bool {
 }
 
 fn take_latest_pointer() -> Option<Point> {
-    if POINTER_PENDING.swap(0, Ordering::Acquire) == 0 {
+    // Empty polls dominate outside pointer bursts. A producer that races this
+    // zero load increments from zero and posts its own wake, so returning now
+    // cannot strand the new value.
+    if POINTER_PENDING.load(Ordering::Acquire) == 0
+        || POINTER_PENDING.swap(0, Ordering::Acquire) == 0
+    {
         return None;
     }
     let (sequence, packed) = loop {
@@ -733,9 +759,12 @@ fn take_latest_pointer() -> Option<Point> {
             break (after, packed);
         }
     };
-    if CONSUMED_POINTER_SEQUENCE.swap(sequence, Ordering::Relaxed) == sequence {
+    if CONSUMED_POINTER_SEQUENCE.load(Ordering::Relaxed) == sequence {
         return None;
     }
+    // `take_latest_pointer` has one engine-thread consumer, so this need not be
+    // a locked read-modify-write operation.
+    CONSUMED_POINTER_SEQUENCE.store(sequence, Ordering::Relaxed);
     Some(Point::new(
         (packed as u32 as i32) as f64,
         ((packed >> 32) as u32 as i32) as f64,
@@ -1205,7 +1234,9 @@ mod pointer_mailbox_loom_tests {
         }
 
         fn take(&self) -> Option<(u64, u64)> {
-            if self.pending.swap(0, Ordering::Acquire) == 0 {
+            if self.pending.load(Ordering::Acquire) == 0
+                || self.pending.swap(0, Ordering::Acquire) == 0
+            {
                 return None;
             }
             loop {

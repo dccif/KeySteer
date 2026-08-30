@@ -41,6 +41,8 @@ use self::hook::{HookStartup, HookThread};
 use self::overlay::Overlay;
 use crate::platform::multi_click::ClickTracker;
 
+const BACKEND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Returns the launchable application bundle when `executable` is the main
 /// binary at `Some.app/Contents/MacOS/*`.
 fn app_bundle_for_executable(executable: &Path) -> Option<PathBuf> {
@@ -254,19 +256,26 @@ impl MacOsBackend {
         if self.shutdown_complete {
             return Ok(());
         }
+        let now = Instant::now();
+        let deadline = now.checked_add(BACKEND_SHUTDOWN_TIMEOUT).unwrap_or(now);
 
         // Stop every producer before tearing down the AppKit objects they may
         // wake or update. All operations are idempotent so Drop can safely use
         // the same path after an earlier error.
         let mut errors = crate::app::errors::ErrorBundle::default();
         self.status_item.take();
-        if let Some(mut watcher) = self.display_watcher.take() {
-            errors.record("display watcher", watcher.stop());
+        if let Some(watcher) = self.display_watcher.as_mut() {
+            match watcher.stop() {
+                Ok(()) => {
+                    self.display_watcher.take();
+                }
+                Err(error) => errors.push("display watcher", error),
+            }
         }
         self.frame_clock.stop();
-        errors.record("UI scan worker", self.scan_worker.shutdown());
+        errors.record("UI scan worker", self.scan_worker.shutdown_until(deadline));
         if let Some(worker) = self.update_worker.as_mut() {
-            match worker.cancel_and_wait() {
+            match worker.cancel_and_wait_until(deadline) {
                 Ok(()) => {
                     self.update_worker.take();
                 }
@@ -276,7 +285,7 @@ impl MacOsBackend {
 
         errors.record("held mouse buttons", self.release_held_buttons());
         if let Some(hook) = self.hook.as_mut() {
-            match hook.stop() {
+            match hook.stop_until(deadline) {
                 Ok(()) => {
                     self.hook.take();
                 }
@@ -293,14 +302,18 @@ impl MacOsBackend {
 
 impl Drop for MacOsBackend {
     fn drop(&mut self) {
-        if self.shutdown_attempted {
+        if self.shutdown_complete {
             return;
         }
         if let Err(error) = self.shutdown_resources() {
-            crate::app::logging::report_error(
-                "macos-shutdown",
-                format!("cannot completely release macOS backend resources: {error}"),
-            );
+            // Explicit shutdown returns the aggregate to the runtime logger.
+            // Drop retries only unfinished owners and avoids duplicate output.
+            if !self.shutdown_attempted {
+                crate::app::logging::report_error(
+                    "macos-shutdown",
+                    format!("cannot completely release macOS backend resources: {error}"),
+                );
+            }
         }
     }
 }
@@ -313,6 +326,7 @@ impl Backend for MacOsBackend {
             if let Some(event) = self.try_event() {
                 return Ok(Some(event));
             }
+            crate::app::worker::reap_quarantined();
             self.refresh_native_events();
             if let Some(event) = self.try_event() {
                 return Ok(Some(event));

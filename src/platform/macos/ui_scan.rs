@@ -1,11 +1,14 @@
+#![forbid(unsafe_code)]
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::api::command::{UiScanRequest, UiScanStatus, UiScanStrategy};
 use crate::app::worker::WorkerJoin;
 use crate::platform::partial_batcher::PartialBatcher;
 use crate::platform::scan_mailbox::ScanMailbox;
+use crate::platform::spatial_index::{SpatialIndex, rectangles_match};
 use objc2::rc::autoreleasepool;
 
 use super::{EventSender, accessibility, vision};
@@ -13,6 +16,7 @@ use super::{EventSender, accessibility, vision};
 static LATEST_SCAN: AtomicU64 = AtomicU64::new(0);
 const FIRST_PARTIAL_TARGETS: usize = 24;
 const MAX_TARGETS: usize = 2_000;
+const MINIMUM_SPACING: f64 = 8.0;
 const STOP_TIMEOUT: Duration = Duration::from_millis(500);
 
 struct ScanJob {
@@ -50,6 +54,7 @@ struct ScanQueueState {
 pub(super) struct UiScanWorker {
     queue: Option<Arc<ScanQueue>>,
     worker: Option<WorkerJoin>,
+    shutdown_failure_returned: bool,
 }
 
 impl UiScanWorker {
@@ -57,6 +62,7 @@ impl UiScanWorker {
         Self {
             queue: None,
             worker: None,
+            shutdown_failure_returned: false,
         }
     }
 
@@ -100,17 +106,30 @@ impl UiScanWorker {
     }
 
     pub(super) fn shutdown(&mut self) -> Result<(), String> {
+        let now = Instant::now();
+        let deadline = now.checked_add(STOP_TIMEOUT).unwrap_or(now);
+        self.shutdown_until(deadline)
+    }
+
+    pub(super) fn shutdown_until(&mut self, deadline: Instant) -> Result<(), String> {
         LATEST_SCAN.store(0, Ordering::Release);
         vision::mark_latest(0);
         if let Some(queue) = self.queue.as_ref() {
             queue.stop();
         }
         let Some(worker) = self.worker.as_mut() else {
+            self.shutdown_failure_returned = false;
             return Ok(());
         };
-        worker.join_timeout(STOP_TIMEOUT)?;
+        let now = Instant::now();
+        let local_deadline = deadline.min(now.checked_add(STOP_TIMEOUT).unwrap_or(deadline));
+        if let Err(error) = worker.join_until(local_deadline) {
+            self.shutdown_failure_returned = true;
+            return Err(error);
+        }
         self.worker.take();
         self.queue.take();
+        self.shutdown_failure_returned = false;
         Ok(())
     }
 
@@ -136,6 +155,14 @@ impl UiScanWorker {
 
 impl Drop for UiScanWorker {
     fn drop(&mut self) {
+        if self.shutdown_failure_returned
+            || self
+                .worker
+                .as_ref()
+                .is_some_and(WorkerJoin::shutdown_failure_was_returned)
+        {
+            return;
+        }
         if let Err(error) = self.shutdown() {
             crate::app::logging::report_error("macos-ui-scan", &error);
         }
@@ -148,7 +175,12 @@ impl Drop for UiScanWorker {
 struct PartialPublisher<'a> {
     job: &'a ScanJob,
     pid: libc::pid_t,
-    batches: Mutex<PartialBatcher<crate::api::UiTarget>>,
+    state: Mutex<PublisherState>,
+}
+
+struct PublisherState {
+    batches: PartialBatcher<crate::api::UiTarget>,
+    index: SpatialIndex,
 }
 
 impl<'a> PartialPublisher<'a> {
@@ -156,7 +188,10 @@ impl<'a> PartialPublisher<'a> {
         Self {
             job,
             pid,
-            batches: Mutex::new(PartialBatcher::new(FIRST_PARTIAL_TARGETS, MAX_TARGETS)),
+            state: Mutex::new(PublisherState {
+                batches: PartialBatcher::new(FIRST_PARTIAL_TARGETS, MAX_TARGETS),
+                index: SpatialIndex::new(64.0, MINIMUM_SPACING, 2.0),
+            }),
         }
     }
 
@@ -173,22 +208,25 @@ impl<'a> PartialPublisher<'a> {
         // Keep publication under the same short lock as threshold assignment.
         // In Hybrid mode this prevents the 48-target batch from overtaking the
         // 24-target batch after two sources cross thresholds concurrently.
-        let mut batches = self
-            .batches
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let ready = batches.extend(targets);
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let iou_threshold = self.job.request.vision.merge_iou_threshold;
+        targets.retain(|target| {
+            state.index.len() < MAX_TARGETS
+                && state
+                    .index
+                    .insert_if_unique(target.rect, |existing, candidate| {
+                        rectangles_match(existing, candidate, iou_threshold, MINIMUM_SPACING)
+                    })
+        });
+        let ready = state.batches.extend(targets);
         for batch in ready {
             self.send(batch);
         }
     }
 
     fn finish(&self) {
-        let mut batches = self
-            .batches
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let pending = batches.finish();
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let pending = state.batches.finish();
         if let Some(batch) = pending {
             self.send(batch);
         }
@@ -332,8 +370,34 @@ fn stream_vision(
 
 fn combined_status(ax: UiScanStatus, vision: UiScanStatus) -> UiScanStatus {
     match (&ax, &vision) {
-        (UiScanStatus::Success, _) | (_, UiScanStatus::Success) => UiScanStatus::Success,
+        (UiScanStatus::Success, other) => {
+            report_masked_provider_status("Vision", other);
+            UiScanStatus::Success
+        }
+        (other, UiScanStatus::Success) => {
+            report_masked_provider_status("AX", other);
+            UiScanStatus::Success
+        }
         _ => vision,
+    }
+}
+
+fn report_masked_provider_status(provider: &str, status: &UiScanStatus) {
+    match status {
+        UiScanStatus::Failed(error) => crate::report_error!(
+            "macos-ui-scan",
+            "{provider} provider failed while the other Hybrid provider succeeded: {error}"
+        ),
+        UiScanStatus::PermissionDenied(message) | UiScanStatus::Unsupported(message) => {
+            crate::report_warning!(
+                "macos-ui-scan",
+                "{provider} provider is unavailable while the other Hybrid provider succeeded: {message}"
+            );
+        }
+        UiScanStatus::Partial
+        | UiScanStatus::Success
+        | UiScanStatus::TimedOut
+        | UiScanStatus::ContextChanged => {}
     }
 }
 
@@ -398,6 +462,18 @@ mod tests {
         assert_eq!(scan_sources(UiScanStrategy::AxTree), (true, false));
         assert_eq!(scan_sources(UiScanStrategy::Vision), (false, true));
         assert_eq!(scan_sources(UiScanStrategy::Hybrid), (true, true));
+    }
+
+    #[test]
+    fn scan_worker_shutdown_is_idempotent_without_a_started_worker() {
+        let mut worker = UiScanWorker::new();
+
+        worker.shutdown().unwrap();
+        worker.shutdown().unwrap();
+
+        assert!(!worker.shutdown_failure_returned);
+        assert!(worker.queue.is_none());
+        assert!(worker.worker.is_none());
     }
 
     #[test]

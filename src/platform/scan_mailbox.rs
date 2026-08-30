@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Latest-generation mailbox for streamed UI scan results.
 //!
 //! Native providers may publish faster than the engine can redraw. Keeping a
@@ -5,7 +7,7 @@
 //! while preserving the first available batch wake-up.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::api::command::{UiScanResult, UiScanStatus};
 use crate::api::geometry::UiTarget;
@@ -22,25 +24,20 @@ struct State {
 /// and one terminal status are retained.
 #[derive(Default)]
 pub(crate) struct ScanMailbox {
-    next_generation: AtomicU64,
+    ready: AtomicBool,
     state: Mutex<State>,
 }
 
 impl ScanMailbox {
     /// Start a new native generation and discard every unconsumed stale result.
     pub(crate) fn begin(&self, request_id: u64) -> u64 {
-        let previous = self
-            .next_generation
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                Some(current.wrapping_add(1).max(1))
-            })
-            .unwrap_or_else(|current| current);
-        let generation = previous.wrapping_add(1).max(1);
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let generation = state.generation.wrapping_add(1).max(1);
         state.generation = generation;
         state.request_id = Some(request_id);
         state.targets = Vec::new();
         state.terminal = None;
+        self.ready.store(false, Ordering::Release);
         generation
     }
 
@@ -53,6 +50,7 @@ impl ScanMailbox {
         state.request_id = None;
         state.targets = Vec::new();
         state.terminal = None;
+        self.ready.store(false, Ordering::Release);
         true
     }
 
@@ -83,14 +81,22 @@ impl ScanMailbox {
         if status != UiScanStatus::Partial {
             state.terminal = Some(status);
         }
-        !was_ready && (!state.targets.is_empty() || state.terminal.is_some())
+        let became_ready = !was_ready && (!state.targets.is_empty() || state.terminal.is_some());
+        if became_ready {
+            self.ready.store(true, Ordering::Release);
+        }
+        became_ready
     }
 
     /// Drain the accumulated partials. A terminal publication consumes the
     /// generation; a partial keeps it open for later batches.
     pub(crate) fn take(&self) -> Option<UiScanResult> {
+        if !self.ready.load(Ordering::Acquire) {
+            return None;
+        }
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if state.targets.is_empty() && state.terminal.is_none() {
+            self.ready.store(false, Ordering::Release);
             return None;
         }
         let id = state.request_id?;
@@ -99,6 +105,10 @@ impl ScanMailbox {
         if status != UiScanStatus::Partial {
             state.request_id = None;
         }
+        // Clear while holding the same lock used by publishers. A publisher
+        // that arrives after unlock will set the flag again, so no wake can be
+        // lost between draining the slot and exposing the empty fast path.
+        self.ready.store(false, Ordering::Release);
         Some(UiScanResult {
             id,
             targets,

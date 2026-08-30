@@ -210,6 +210,12 @@ impl UiAutomationWorker {
     }
 
     pub fn stop(&mut self) -> Result<(), String> {
+        let now = Instant::now();
+        let deadline = now.checked_add(UIA_SHUTDOWN_WAIT).unwrap_or(now);
+        self.stop_until(deadline)
+    }
+
+    pub fn stop_until(&mut self, deadline: Instant) -> Result<(), String> {
         if self.worker.is_none() {
             return Ok(());
         }
@@ -234,7 +240,7 @@ impl UiAutomationWorker {
         let Some(worker) = self.worker.as_mut() else {
             return Ok(());
         };
-        worker.join_timeout(UIA_SHUTDOWN_WAIT)?;
+        worker.join_until(deadline)?;
         self.worker.take();
         Ok(())
     }
@@ -242,6 +248,13 @@ impl UiAutomationWorker {
 
 impl Drop for UiAutomationWorker {
     fn drop(&mut self) {
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(WorkerJoin::shutdown_failure_was_returned)
+        {
+            return;
+        }
         if let Err(error) = self.stop() {
             crate::app::logging::report_error("windows-uia", &error);
         }
@@ -795,18 +808,21 @@ extern "system" fn collect_monitor(
     BOOL(1)
 }
 
-fn monitors_intersecting(hwnd: HWND) -> SmallVec<[HMONITOR; 4]> {
+fn monitors_intersecting(hwnd: HWND) -> Result<SmallVec<[HMONITOR; 4]>, String> {
     let Some(bounds) = window_bounds(hwnd) else {
-        return SmallVec::new();
+        return Ok(SmallVec::new());
     };
     let clip = native_rect(bounds);
     MONITOR_COLLECTOR.with_borrow_mut(|monitors| monitors.clear());
     // SAFETY: the callback ABI matches and the collector pointer remains valid
     // for the complete synchronous enumeration.
-    unsafe {
-        let _ = EnumDisplayMonitors(None, Some(&clip), Some(collect_monitor), LPARAM(0));
+    let completed = unsafe {
+        EnumDisplayMonitors(None, Some(&clip), Some(collect_monitor), LPARAM(0)).as_bool()
     };
-    MONITOR_COLLECTOR.with_borrow_mut(std::mem::take)
+    let monitors = MONITOR_COLLECTOR.with_borrow_mut(std::mem::take);
+    completed
+        .then_some(monitors)
+        .ok_or_else(|| "cannot enumerate monitors intersecting the scan window".to_string())
 }
 
 fn is_owned_by(hwnd: HWND, foreground: HWND) -> bool {
@@ -858,12 +874,14 @@ extern "system" fn collect_thread_window(hwnd: HWND, _data: LPARAM) -> BOOL {
     })
 }
 
-fn foreground_and_popup_windows(foreground: HWND) -> SmallVec<[HWND; MAX_SCAN_WINDOWS]> {
+fn foreground_and_popup_windows(
+    foreground: HWND,
+) -> Result<SmallVec<[HWND; MAX_SCAN_WINDOWS]>, String> {
     let mut windows = SmallVec::new();
     windows.push(foreground);
     let collector = ThreadWindowCollector {
         foreground,
-        foreground_monitors: monitors_intersecting(foreground),
+        foreground_monitors: monitors_intersecting(foreground)?,
         windows,
     };
     THREAD_WINDOW_COLLECTOR.with_borrow_mut(|slot| *slot = Some(collector));
@@ -871,13 +889,17 @@ fn foreground_and_popup_windows(foreground: HWND) -> SmallVec<[HWND; MAX_SCAN_WI
     if thread_id != 0 {
         // SAFETY: callback ABI and collector pointer are valid for the complete
         // synchronous enumeration of this live UI thread.
-        unsafe {
-            let _ = EnumThreadWindows(thread_id, Some(collect_thread_window), LPARAM(0));
+        let completed = unsafe {
+            EnumThreadWindows(thread_id, Some(collect_thread_window), LPARAM(0)).as_bool()
         };
+        if !completed {
+            THREAD_WINDOW_COLLECTOR.with_borrow_mut(|slot| *slot = None);
+            return Err("cannot enumerate popup windows for the foreground thread".into());
+        }
     }
-    THREAD_WINDOW_COLLECTOR
+    Ok(THREAD_WINDOW_COLLECTOR
         .with_borrow_mut(Option::take)
-        .map_or_else(SmallVec::new, |collector| collector.windows)
+        .map_or_else(SmallVec::new, |collector| collector.windows))
 }
 
 struct ZOrderCollector {
@@ -937,7 +959,7 @@ fn scan_windows_in_z_order(
     foreground: HWND,
     scan_bounds: Rect,
 ) -> Result<(InlineScanWindows, InlineOccluders), String> {
-    let candidates = foreground_and_popup_windows(foreground);
+    let candidates = foreground_and_popup_windows(foreground)?;
     let collector = ZOrderCollector {
         candidates,
         scan_bounds,

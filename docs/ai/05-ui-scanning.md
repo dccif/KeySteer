@@ -45,11 +45,19 @@ fallback 直接下采样灰度图。源窗口与目标 DIB 尺寸相同时使用
 像素的上限完整覆盖 3840x2160，只有 5K/8K 或更大的跨屏交集才使用
 `StretchBlt + HALFTONE`。截图始终是一张完整图片，绝不对桌面重复截图。
 
-系统 OCR、微信 OCR 都在 provider 内最多保留 2000 个有效目标。任一 provider 返回非空有效
-结果便取消并丢弃 fallback；这个判定发生在 UIA/空间索引去重之前，因此 Hybrid 中 OCR 与
-UIA 重叠也不会误跑纯像素检测。系统 OCR 使用 WinRT completion handler 唤醒，不做固定 5ms
-状态轮询。provider 取消后按绝对 deadline join；违反取消契约的线程转入有 owner 的 quarantine，
-本进程后续禁用视觉扫描，不能阻塞 Engine 或静默 detach。
+系统 OCR、微信 OCR 都在 provider 内最多保留 2000 个有效目标。三种 provider 通过本代拥有的
+`ProviderMailbox` 发布：系统 OCR、微信 OCR 和 fallback 各占一个固定槽，槽内只保留有界目标
+与 terminal；ready bit 合并 empty→ready 唤醒，producer 以所有权追加到自己的槽，不会因为
+coordinator 尚未消费第 4 个批次而阻塞。coordinator 排空时取得 Vec 所有权；关闭 mailbox
+会唤醒所有等待者并拒绝后续发布。
+
+任一 OCR provider 返回非空有效结果便取消并丢弃 fallback；这个判定发生在 UIA/空间索引
+去重之前，因此 Hybrid 中 OCR 与 UIA 重叠也不会误跑纯像素检测。系统 OCR 使用 WinRT
+completion handler 唤醒，不做固定 5ms 状态轮询。取消先关闭结果 mailbox，再通过现有系统/
+微信输入通道非阻塞发送 `CancelWake`；provider 批量 Cancel 并等待 completion，不新增 timer、
+sleep 或轮询线程。provider 取消后按 generation deadline join；违反取消契约的线程转入有
+owner 的 quarantine，本进程后续禁用视觉扫描，不能阻塞 Engine 或静默 detach。系统 OCR
+继续在当前进程的 generation-scoped provider 中运行，不保留进程外系统 OCR helper。
 
 ## HintMode 端
 
@@ -112,7 +120,11 @@ UIA 重叠也不会误跑纯像素检测。系统 OCR 使用 WinRT completion ha
 ### Windows strategy 与视觉管线
 
 - 发布默认是 `hybrid`：UIA 与完整视觉管线由独立 worker 同时调度，共用下述发布器流式去重并合并空间并集；`axtree` 或 `vision` 可分别只调度其中一条管线。
-- `src/platform/windows/ui_scan.rs` 是唯一发布点：所有来源共用 64px 覆盖网格、24/48/96…累计边界和 2000 项上限。矩形只保存一次，覆盖超过 32 格的大矩形进入有界 oversize 列表；查询直接遍历网格并用 generation mark 去重，不构造候选临时容器；先显示的目标不被后到重复项替换。
+- `src/platform/windows/ui_scan.rs` 是 Windows 唯一发布点；底层复用跨平台安全 Rust
+  `src/platform/spatial_index.rs`。Windows 与 macOS 都把矩形连续保存一次，64px 网格只保存
+  `u32` 索引；覆盖超过 32 格的大矩形进入有界 oversize 列表，查询用 generation mark
+  去重且不构造候选临时容器。IoU、包含和同行近邻使用同一个判定，先显示的目标不被后到
+  重复项替换。Windows 发布器继续统一 24/48/96…累计边界和 2000 项上限。
 - Hybrid 中任一 provider 报告 `ContextChanged` 都会立即发布本代 terminal，不等待另一 provider；HintMode 随即提交新 generation，Engine 的 owner 取消路径使另一 provider 释放 capture/OCR/plan。旧坐标不会作为 terminal tail 再发布。
 - Backend ready 后的首次事件轮询只异步执行一次 OCR discovery：系统探测在临时 MTA 中创建并立即销毁 `OcrEngine`，微信探测只缓存已验证的绝对路径与文件标识。系统 OCR/WIC 通过本代拥有的 activation factory 调用，禁止使用会跨临时 MTA 残留悬空指针的投影静态 factory cache。这样 ready 热路径不承担探测线程创建；成功和失败结果都缓存到进程退出，不保留 OCR、helper、COM 或 vision worker。首次扫描若探测尚未完成，只由视觉协调线程等待同一个 single-flight 结果。
 - `src/platform/windows/vision.rs` 在有视觉请求时懒启动 generation-scoped coordinator。每个 generation 只取得一张 GDI top-down DIB 截图；等待 OCR 时只检查原子 generation，不轮询 HWND。目标 HWND/PID/边界只在捕获、每批发布和 terminal 前复核；视觉候选使用 scan plan 的共享遮挡矩形过滤，不创建全屏 mask。当前与 latest pending 请求完成后 coordinator 自行退出。
@@ -120,7 +132,7 @@ UIA 重叠也不会误跑纯像素检测。系统 OCR 使用 WinRT completion ha
 - `detect_text=true` 时先从进程内 discovery 快照生成 `None`、`SystemOnly`、`WechatOnly` 或 `Dual` 执行计划。`SystemOnly` 只创建系统 tile，绝不进入微信专用完整位图、WIC、PNG、helper、job、pipe 或 reader 路径；只有 `WechatOnly`/`Dual` 才构造 `WechatFullFrame`。系统 OCR 按可用逻辑线程的下一个平方数选择 `N×N` 网格，并由图片尺寸限制核心块的宽、高都至少为 64px；没有固定 `7×7` 上限。各块向相邻核心区重叠 64px，bitmap 就绪后立即提交独立 `RecognizeAsync`；tile 输入与 completion 共用有界事件通道，provider 在继续接收 tile 时立即消费已完成结果。它先计算文字行的联合矩形和核心区归属，丢弃接缝副本后才取得文字并直接组成最多 24 项的批次，避免为最终丢弃的重叠行分配字符串。块内坐标映射回桌面，目标中心只归属于一个半开核心矩形，因此接缝文字不会漏掉或重复发布。`Dual` 在首个系统 tile 后才提交微信专用完整帧，随后继续排空两路结果；微信结果先发布、再清理 helper 与 PNG。terminal 严格等待全部块和 helper 清理完成，两路最终发布空间并集。
 - `detect_rectangles=true` 时并行计算灰度、局部对比/梯度、形态闭合和八邻域连通区域。分析图限制为 2,073,600 像素、最长边 2560，候选最小边为 6px；scratch 只属于本次 generation，连通区域使用逐行 run-length 和活跃组件，不保留最坏覆盖全图的像素队列。形态位图复用且候选维持有界 top-K。任一 OCR 产生有效目标就立即取消这项 CPU-heavy 工作；只有全部 OCR 没有有效目标时才发布缓存。
 - `src/platform/windows/wechat_ocr.rs` 自动查找可执行文件旁的 `wcocr.dll`，以及 `%APPDATA%\Tencent\xwechat\XPlugin\plugins\WeChatOcr\<版本>\extracted\wxocr.dll` 中版本最高的微信 4 OCR 组件；微信 4 运行目录按 `Weixin.dll`、`WeixinExt.exe` 或旧布局的 `Weixin.exe` 验证，不要求版本子目录内必须存在主程序。微信 3 继续作为后备。所有 PE 架构都会验证，并且组件只在隐藏 helper 子进程中加载。IPC 与响应有界，超时/崩溃/owner 取消会终止 helper，临时 WIC PNG 总会清理；组件不进入发行包。
-- 每次扫描只创建执行计划真正需要的 `OcrEngine`/helper；冷启动和 overlay 隐藏重叠。系统 OCR 各块拥有独立的 `SoftwareBitmap` 与 operation，同一 generation 复用 factory，DIB 区域直接逐行写入 bitmap，不经过 tile BGRA `Vec`。取消先对全部 operation 调用 `Cancel`，再复用 scan/shutdown 的绝对 deadline 和现有 completion channel 收敛终态，不创建 timer、sleep 或轮询线程；终态后立即 `Close`，违约 operation 连同 worker 进入显式 quarantine。微信 WIC PNG 使用完整 `SoftwareBitmap` 直接编码到临时文件，不生成完整内存 PNG，并在编码后立即关闭完整 bitmap。terminal 发布前必须删除 PNG、关闭 IPC、终止并等待 helper、join reader/provider、关闭所有块、释放截图与 GDI surface 并 drop 本次 COM apartment。源码禁止 `SetWindowDisplayAffinity`/`WDA_EXCLUDEFROMCAPTURE`，避免自捕获只依赖上述隐藏确认屏障。
+- 每次扫描只创建执行计划真正需要的 `OcrEngine`/helper；冷启动和 overlay 隐藏重叠。系统 OCR 各块拥有独立的 `SoftwareBitmap` 与 operation，同一 generation 复用 factory，DIB 区域直接逐行写入 bitmap，不经过 tile BGRA `Vec`。取消先对全部 operation 调用 `Cancel`，并通过现有 completion channel 收敛终态，不创建 timer、sleep 或轮询线程；generation deadline 到达也不得 drop 仍为 `Started` 的 operation，完整 tile owner（COM apartment、engine、bitmap、operation）继续留在 provider thread，由 coordinator 的有界 join 转交显式 quarantine。终态后立即 `Close`。微信 WIC PNG 使用完整 `SoftwareBitmap` 直接编码到临时文件，不生成完整内存 PNG，并在编码后立即关闭完整 bitmap。terminal 发布前必须删除 PNG、关闭 IPC、终止并等待 helper、join reader/provider、关闭所有块、释放截图与 GDI surface 并 drop 本次 COM apartment。源码禁止 `SetWindowDisplayAffinity`/`WDA_EXCLUDEFROMCAPTURE`，避免自捕获只依赖上述隐藏确认屏障。
 
 这里不增加公共 OCR provider/path 配置；运行时状态只进入日志和 `--doctor`。
 
@@ -134,9 +146,10 @@ UIA 重叠也不会误跑纯像素检测。系统 OCR 使用 WinRT completion ha
   ScreenCaptureKit capture 仍由真实 completion 恰好释放一次。
 - 每次发送前检查 `LATEST_SCAN` 和 frontmost pid；新 id 也会让正在遍历的 AX 在节点边界
   停止，并让 Vision 在 capture/识别阶段边界释放过期结果。
-- AX 和 Vision 共用纯计数的流式发布器；Hybrid 在 scoped thread 中并行 AX，同时当前 worker
-  执行 Vision。合计首批 24 项立即发布，之后在累计数量达到 48、96、192……时发布，终态
-  无条件刷新剩余项。这里不使用时间间隔，因此不依赖显示刷新率或机器速度。
+- AX 和 Vision 共用纯计数的流式发布器以及跨平台 `SpatialIndex`；Hybrid 在 scoped thread
+  中并行 AX，同时当前 worker 执行 Vision。两路先按共享矩形规则去重，合计首批 24 项立即
+  发布，之后在累计数量达到 48、96、192……时发布，终态无条件刷新剩余项。这里不使用
+  时间间隔，因此不依赖显示刷新率或机器速度。
 
 AX：`src/platform/macos/accessibility.rs`。
 
@@ -172,6 +185,6 @@ Vision：`src/platform/macos/vision.rs` + `vision_bridge.m`。
 - Wide conflict construction uses an exact X sweep and the original overlap
   predicate; invalid/non-finite rectangles use the quadratic reference path.
 - Windows system OCR constructs a tile only after acquiring a credit. The
-  default is `min(tile_count, available_parallelism, 8)`; completion closes the
+  default is `min(tile_count, available_parallelism, 16)`; completion closes the
   bitmap before returning the credit. WinRT callbacks publish atomic terminal
   state and use a coalesced non-blocking wake.

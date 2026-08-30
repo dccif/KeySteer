@@ -21,16 +21,24 @@ impl ErrorBundle {
         self.failures.is_empty()
     }
 
+    #[cold]
+    #[inline(never)]
     pub(crate) fn into_result(self) -> Result<(), String> {
         if self.failures.is_empty() {
             return Ok(());
         }
-        Err(self
-            .failures
-            .into_iter()
-            .map(|(stage, error)| format!("{stage}: {error}"))
-            .collect::<Vec<_>>()
-            .join("; "))
+        let mut failures = self.failures.into_iter();
+        let Some((stage, error)) = failures.next() else {
+            return Ok(());
+        };
+        let mut message = format!("{stage}: {error}");
+        for (stage, error) in failures {
+            message.push_str("; ");
+            message.push_str(&stage);
+            message.push_str(": ");
+            message.push_str(&error);
+        }
+        Err(message)
     }
 }
 

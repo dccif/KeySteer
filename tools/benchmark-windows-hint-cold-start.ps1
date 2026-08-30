@@ -22,11 +22,11 @@ using System.Runtime.InteropServices;
 public static class KeySteerColdStartInput {
     [DllImport("user32.dll")]
     private static extern void keybd_event(byte key, byte scan, uint flags, UIntPtr extra);
-    public static void ControlChord(byte key) {
-        keybd_event(0x11, 0, 0, UIntPtr.Zero);
+    public static void PrimaryChord(byte key) {
+        keybd_event(0x12, 0, 0, UIntPtr.Zero);
         keybd_event(key, 0, 0, UIntPtr.Zero);
         keybd_event(key, 0, 2, UIntPtr.Zero);
-        keybd_event(0x11, 0, 2, UIntPtr.Zero);
+        keybd_event(0x12, 0, 2, UIntPtr.Zero);
     }
 }
 "@
@@ -60,18 +60,22 @@ foreach ($offset in $OffsetsMs) {
             foreach ($event in @("hook_ready", "uia_ready", "ocr_ready", "renderer_ready")) {
                 $readiness[$event] = $null -ne ($before | Where-Object event -eq $event | Select-Object -First 1)
             }
-            # The shipped bindings enter normal with Primary+E and Hint with Primary+F.
-            [KeySteerColdStartInput]::ControlChord(0x45)
-            [KeySteerColdStartInput]::ControlChord(0x46)
+            # Windows ships Primary as left Alt; enter Normal with Primary+E and Hint with Primary+F.
+            [KeySteerColdStartInput]::PrimaryChord(0x45)
+            [KeySteerColdStartInput]::PrimaryChord(0x46)
             $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
             $records = @()
             $scan = $null
+            $partial = $null
             $present = $null
             while ([DateTime]::UtcNow -lt $deadline -and -not $process.HasExited) {
                 $records = Read-Records $probe
                 $scan = $records | Where-Object event -eq "scan_requested" | Select-Object -First 1
                 if ($null -ne $scan) {
-                    $present = $records | Where-Object { $_.event -eq "native_presented" -and $_.sequence -gt $scan.sequence } | Select-Object -First 1
+                    $partial = $records | Where-Object { $_.event -eq "ui_scan_partial" -and $_.sequence -gt $scan.sequence } | Select-Object -First 1
+                }
+                if ($null -ne $partial) {
+                    $present = $records | Where-Object { $_.event -eq "native_presented" -and $_.sequence -gt $partial.sequence } | Select-Object -First 1
                 }
                 if ($null -ne $present) { break }
                 Start-Sleep -Milliseconds 5
@@ -89,7 +93,7 @@ foreach ($offset in $OffsetsMs) {
                 readiness = $readiness
                 correlation_id = if ($null -eq $hook) { $null } else { $hook.correlation_id }
                 input_to_native_present_ms = if (-not $valid) { $null } else { ([double]$present.elapsed_ns - [double]$hook.elapsed_ns) / 1e6 }
-                status = if ($null -ne $dropped) { "probe_dropped" } elseif ($null -eq $scan) { "scan_timeout" } elseif ($null -eq $hook) { "missing_hook_marker" } elseif ($null -eq $present) { "present_timeout" } else { "ok" }
+                status = if ($null -ne $dropped) { "probe_dropped" } elseif ($null -eq $scan) { "scan_timeout" } elseif ($null -eq $hook) { "missing_hook_marker" } elseif ($null -eq $partial) { "partial_timeout" } elseif ($null -eq $present) { "present_timeout" } else { "ok" }
             })
         }
         finally {
@@ -100,11 +104,12 @@ foreach ($offset in $OffsetsMs) {
 }
 
 $summary = @($results | Group-Object offset_ms | ForEach-Object {
-    $values = @($_.Group | Where-Object valid | ForEach-Object input_to_native_present_ms | Sort-Object)
+    $group = $_
+    $values = @($group.Group | Where-Object valid | ForEach-Object input_to_native_present_ms | Sort-Object)
     [ordered]@{
-        offset_ms = [int]$_.Name
+        offset_ms = [int]$group.Name
         valid = $values.Count
-        invalid = $_.Count - $values.Count
+        invalid = $group.Count - $values.Count
         p50_ms = if ($values.Count) { $values[[math]::Floor(($values.Count - 1) * 0.50)] } else { $null }
         p95_ms = if ($values.Count) { $values[[math]::Floor(($values.Count - 1) * 0.95)] } else { $null }
         p99_ms = if ($values.Count) { $values[[math]::Floor(($values.Count - 1) * 0.99)] } else { $null }

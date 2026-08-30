@@ -18,7 +18,6 @@ use super::{EventSender, gpu_overlay::GpuOverlay, native, overlay};
 
 const DEVICE_FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const RENDER_WAKE_MESSAGE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x50;
-const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct Frame {
@@ -63,6 +62,11 @@ struct State {
     phase: OverlayPhase,
     alive: bool,
     wake_pending: bool,
+    /// Set after the renderer rejects a position-only update. The Engine
+    /// observes this on its next pointer edge and switches the current overlay
+    /// session to complete frames, so one native failure cannot become a
+    /// synchronous error-and-flush loop on every mouse move.
+    position_fast_path_failed: bool,
 }
 
 impl Default for State {
@@ -75,6 +79,7 @@ impl Default for State {
             phase: OverlayPhase::Normal,
             alive: true,
             wake_pending: false,
+            position_fast_path_failed: false,
         }
     }
 }
@@ -266,7 +271,7 @@ impl OverlayWorker {
         &self,
         cursor: Option<Point>,
         indicator: Option<Point>,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let should_wake = {
             let mut state = self
                 .shared
@@ -274,6 +279,9 @@ impl OverlayWorker {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             ensure_renderer_alive(&state)?;
+            if state.position_fast_path_failed {
+                return Ok(false);
+            }
             let positions = Positions { cursor, indicator };
             if let Some(gate) = state.capture.as_mut() {
                 // The next complete frame is authoritative and already uses
@@ -282,16 +290,22 @@ impl OverlayWorker {
                 if gate.deferred_frame.is_some() {
                     gate.deferred_positions = Some(positions);
                 }
-                return Ok(());
+                return Ok(true);
             }
             state.positions = Some(positions);
             mark_wake_pending(&mut state)?
         };
-        self.post_wake(should_wake)
+        self.post_wake(should_wake)?;
+        Ok(true)
     }
 
     pub(super) fn dismiss(&self) -> Result<(), String> {
         if self.worker.is_none() {
+            self.shared
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .position_fast_path_failed = false;
             return Ok(());
         }
         let should_wake = {
@@ -303,6 +317,7 @@ impl OverlayWorker {
             ensure_renderer_alive(&state)?;
             state.latest = None;
             state.positions = None;
+            state.position_fast_path_failed = false;
             cancel_capture_locked(&mut state, "overlay was dismissed");
             state.phase = OverlayPhase::Normal;
             state.control = Some(Control::Dismiss);
@@ -358,9 +373,10 @@ impl OverlayWorker {
         })
     }
 
-    fn control(
+    fn control_until(
         &self,
         make: impl FnOnce(SyncSender<Result<(), String>>) -> Control,
+        deadline: Instant,
     ) -> Result<(), String> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         let should_wake = {
@@ -384,7 +400,7 @@ impl OverlayWorker {
         };
         self.post_wake(should_wake)?;
         reply_rx
-            .recv_timeout(CONTROL_TIMEOUT)
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .map_err(|error| format!("Windows overlay renderer did not reply: {error}"))?
     }
 
@@ -401,15 +417,21 @@ impl OverlayWorker {
     }
 
     fn stop(&mut self) -> Result<(), String> {
+        let now = Instant::now();
+        let deadline = now.checked_add(STOP_TIMEOUT).unwrap_or(now);
+        self.stop_until(deadline)
+    }
+
+    fn stop_until(&mut self, deadline: Instant) -> Result<(), String> {
         let result = if self.worker.is_some() {
-            self.control(Control::Shutdown)
+            self.control_until(Control::Shutdown, deadline)
         } else {
             Ok(())
         };
         let join_result = self
             .worker
             .as_mut()
-            .map_or(Ok(()), |worker| worker.join_timeout(STOP_TIMEOUT));
+            .map_or(Ok(()), |worker| worker.join_until(deadline));
         if join_result.is_ok() {
             self.worker.take();
             self.thread_id = 0;
@@ -420,11 +442,22 @@ impl OverlayWorker {
     pub(super) fn shutdown(&mut self) -> Result<(), String> {
         self.stop()
     }
+
+    pub(super) fn shutdown_until(&mut self, deadline: Instant) -> Result<(), String> {
+        self.stop_until(deadline)
+    }
 }
 
 impl Drop for OverlayWorker {
     fn drop(&mut self) {
-        if let Err(error) = self.stop() {
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(WorkerJoin::shutdown_failure_was_returned)
+        {
+            return;
+        }
+        if let Err(error) = self.shutdown() {
             crate::app::logging::report_error("windows-overlay", error);
         }
     }
@@ -549,10 +582,24 @@ fn render_loop(shared: &Shared, events: &EventSender, ready: SyncSender<u32>) {
                     warn(events, notice);
                 }
                 Ok(None) => crate::app::perf_probe::mark("native_presented"),
-                Err(error) => crate::report_error!(
-                    "windows-overlay",
-                    "Windows overlay position update failed; the next frame will retry: {error}"
-                ),
+                Err(error) => {
+                    let first_failure = {
+                        let mut state = shared
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner());
+                        let first_failure = !state.position_fast_path_failed;
+                        state.position_fast_path_failed = true;
+                        state.positions = None;
+                        first_failure
+                    };
+                    if first_failure {
+                        crate::report_error!(
+                            "windows-overlay",
+                            "Windows overlay position update failed; complete frames will be used for this session: {error}"
+                        );
+                    }
+                }
             }
         }
         // Window messages (especially WM_NCHITTEST) must be serviced between
@@ -693,9 +740,13 @@ impl AdaptiveRenderer {
         cursor: Option<Point>,
         indicator: Option<Point>,
     ) -> Result<Option<String>, String> {
-        if let Renderer::Gpu(gpu) = &mut self.renderer
-            && gpu.update_positions(cursor, indicator).is_ok()
-        {
+        if let Renderer::Gpu(gpu) = &mut self.renderer {
+            // A failed DirectComposition offset update is operational, not an
+            // indication that the renderer should silently redraw the whole
+            // scene on every pointer event. The render loop records the first
+            // failure and exposes a sticky session flag; the Engine observes
+            // it on the next pointer edge and submits one complete frame.
+            gpu.update_positions(cursor, indicator)?;
             return Ok(None);
         }
 
@@ -1013,6 +1064,41 @@ mod tests {
         assert!(state.positions.is_none());
         assert!(!state.wake_pending);
         assert_eq!(state.phase, OverlayPhase::Normal);
+    }
+
+    #[test]
+    fn renderer_position_failure_disables_only_the_current_session_fast_path() {
+        let shared = Arc::new(Shared::default());
+        shared
+            .state
+            .lock()
+            .expect("overlay state")
+            .position_fast_path_failed = true;
+        let worker = OverlayWorker {
+            shared: Arc::clone(&shared),
+            thread_id: 0,
+            worker: None,
+        };
+
+        assert!(
+            !worker
+                .update_positions(Some(Point::new(10.0, 20.0)), None)
+                .expect("disabled position fast path")
+        );
+        {
+            let state = shared.state.lock().expect("overlay state");
+            assert!(state.positions.is_none());
+            assert!(!state.wake_pending);
+        }
+
+        worker.dismiss().expect("dismiss resets session state");
+        assert!(
+            !shared
+                .state
+                .lock()
+                .expect("overlay state")
+                .position_fast_path_failed
+        );
     }
 
     #[test]

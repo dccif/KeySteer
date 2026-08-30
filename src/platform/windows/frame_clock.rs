@@ -100,6 +100,12 @@ impl DisplayFrameClock {
     }
 
     pub fn stop(&mut self) -> Result<(), String> {
+        let now = Instant::now();
+        let deadline = now.checked_add(CLOCK_STOP_TIMEOUT).unwrap_or(now);
+        self.stop_until(deadline)
+    }
+
+    pub fn stop_until(&mut self, deadline: Instant) -> Result<(), String> {
         self.running.store(false, Ordering::Release);
         let compositor_token = self.compositor_token.load(Ordering::Acquire);
         if compositor_token != 0 && !native::interrupt_compositor_clock(compositor_token) {
@@ -109,7 +115,7 @@ impl DisplayFrameClock {
             );
         }
         if let Some(worker) = self.worker.as_mut() {
-            worker.join_timeout(CLOCK_STOP_TIMEOUT)?;
+            worker.join_until(deadline)?;
             self.worker.take();
         }
         self.compositor_token.store(0, Ordering::Release);
@@ -138,6 +144,13 @@ impl DisplayFrameClock {
 
 impl Drop for DisplayFrameClock {
     fn drop(&mut self) {
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(WorkerJoin::shutdown_failure_was_returned)
+        {
+            return;
+        }
         if let Err(error) = self.stop() {
             crate::app::logging::report_error("windows-frame-clock", &error);
         }
@@ -155,7 +168,12 @@ impl CompositorBoost {
 
     fn disable(&mut self) {
         if self.0 {
-            let _ = native::boost_compositor_clock(false);
+            if !native::boost_compositor_clock(false) {
+                crate::report_error!(
+                    "windows-frame-clock",
+                    "cannot release the compositor clock boost"
+                );
+            }
             self.0 = false;
         }
     }

@@ -3,6 +3,9 @@
 use std::ffi::c_void;
 
 use core_foundation::runloop::{CFRunLoopMode, kCFRunLoopDefaultMode};
+use core_graphics::display::{
+    CGDisplayRegisterReconfigurationCallback, CGDisplayRemoveReconfigurationCallback,
+};
 use objc2_foundation::{NSDefaultRunLoopMode, NSRunLoopMode};
 
 /// Process-lifetime run-loop modes exported by Core Foundation/Foundation.
@@ -20,6 +23,22 @@ pub(crate) fn default_run_loop_modes() -> RunLoopModes {
             core_foundation: kCFRunLoopDefaultMode,
             foundation: NSDefaultRunLoopMode,
         }
+    }
+}
+
+pub(crate) fn register_display_reconfiguration_callback() -> i32 {
+    // SAFETY: this callback has the exact CoreGraphics ABI, uses null userdata,
+    // and touches only process-lifetime atomics plus the main run loop.
+    unsafe {
+        CGDisplayRegisterReconfigurationCallback(super::screens::display_changed, std::ptr::null())
+    }
+}
+
+pub(crate) fn remove_display_reconfiguration_callback() -> i32 {
+    // SAFETY: this is the exact callback/null-userdata pair installed above;
+    // the callback owns no dynamically freed state.
+    unsafe {
+        CGDisplayRemoveReconfigurationCallback(super::screens::display_changed, std::ptr::null())
     }
 }
 

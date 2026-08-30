@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Allocation-free rendezvous for synchronous native input callbacks.
 //!
 //! Native keyboard callbacks must wait for the engine's consume/forward
@@ -5,7 +7,6 @@
 //! channel for every physical key edge and prevents a late response from a
 //! timed-out callback being observed by the next event.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
@@ -19,7 +20,6 @@ struct Slot {
 
 #[derive(Default)]
 pub(super) struct DispositionMailbox {
-    next_generation: AtomicU64,
     slot: Mutex<Slot>,
     ready: Condvar,
 }
@@ -27,14 +27,10 @@ pub(super) struct DispositionMailbox {
 impl DispositionMailbox {
     /// Reserve the reusable slot for one native callback.
     pub(super) fn begin(&self) -> u64 {
-        let generation = self
-            .next_generation
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
         let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
-        slot.generation = generation;
+        slot.generation = slot.generation.wrapping_add(1);
         slot.disposition = None;
-        generation
+        slot.generation
     }
 
     /// Complete `generation`; returns false when that callback already timed
@@ -72,12 +68,8 @@ impl DispositionMailbox {
     /// waiter stale and the notification wakes it immediately.
     #[cfg(any(target_os = "macos", test))]
     pub(super) fn cancel_pending(&self) {
-        let generation = self
-            .next_generation
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
         let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
-        slot.generation = generation;
+        slot.generation = slot.generation.wrapping_add(1);
         slot.disposition = None;
         self.ready.notify_all();
     }

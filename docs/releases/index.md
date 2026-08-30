@@ -1,5 +1,11 @@
 # 更新日志 / Release Notes
 
+## 0.9.11
+
+提升输入与 UI Hint 的响应速度，减少 OCR 扫描等待，并加强 Windows 与 macOS 的取消和资源清理，让连续使用更流畅稳定。
+
+Improved input and UI Hint responsiveness, reduced OCR scan waits, and strengthened cancellation and resource cleanup on Windows and macOS for smoother, more reliable repeated use.
+
 ## 0.9.10
 
 修复拖拽自动释放后鼠标按住提示和按下颜色可能残留的问题，并减少模式指示器刷新时的临时分配与重复处理，让输入状态清理和指针提示更稳定、轻快。
