@@ -164,10 +164,10 @@ struct StatusButtonRetry {
     attempts_remaining: u8,
 }
 
-/// Complete AppKit startup before creating the status item. Login items can be
-/// launched while the menu-bar scene is still coming online; creating the
-/// native item after one run-loop turn avoids trying to infer attachment from
-/// undocumented `NSStatusBarButton` window state later.
+/// Complete AppKit startup before creating the status item. The caller creates
+/// the native item immediately after this launch boundary and before AppKit
+/// dispatches its first event; this matches `applicationDidFinishLaunching`
+/// ordering for both direct and login-item starts.
 pub(super) fn prepare_application(mtm: MainThreadMarker) {
     let application = NSApplication::sharedApplication(mtm);
     if !application.setActivationPolicy(NSApplicationActivationPolicy::Accessory)
@@ -456,6 +456,9 @@ fn create_native_item(
         false
     };
     item.setMenu(Some(menu));
+    // KeySteer is an accessory-only app with no Dock fallback, so every start
+    // explicitly exposes its only control surface. Do not restore a stale
+    // hidden value left by an older status-item autosave identity.
     item.setVisible(true);
     (item, button_configured)
 }
@@ -476,11 +479,7 @@ fn configure_status_button(button: &objc2_app_kit::NSStatusBarButton, icon: Opti
 }
 
 fn status_icon(size: f64) -> Option<Retained<NSImage>> {
-    // SAFETY: the static PNG byte slice is live for the complete call and
-    // NSData copies/retains the supplied bytes according to this initializer.
-    let data = unsafe {
-        NSData::dataWithBytes_length(STATUS_ICON_PNG.as_ptr().cast(), STATUS_ICON_PNG.len())
-    };
+    let data = NSData::with_bytes(STATUS_ICON_PNG);
     let image = NSImage::initWithData(NSImage::alloc(), &data)?;
     image.setSize(NSSize::new(size, size));
     image.setTemplate(false);

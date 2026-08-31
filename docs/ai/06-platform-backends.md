@@ -117,9 +117,12 @@ item、window 和 display link 都有线程亲和性。
   status item、frame clock、屏幕和 workspace 初始化并行，Backend 完成前才启用，启动期间
   的异步事件先进入 fallback channel，成功后通过共享 `OnceLock` 路由到有界 Hook 队列。
 - EventTap 的修饰键和 tap-disabled 状态使用单写者原子字段，不在同步 callback 中锁
-  `Mutex<TapState>`。CFRunLoop 只因真实 event source 或显式 `CFRunLoopStop` 返回；长有限等待
-  只是异常兜底，空闲时不再每 20ms 醒来，也不增加 timer、sleep 或辅助线程。若 active run loop
-  意外返回 `Finished`/`Stopped`，立即按输入捕获丢失终止并由统一 logger 记录，不能原地空转。
+  `Mutex<TapState>`。`TapDisabledByUserInput` 在 callback 内只用原子状态、disposition cancel 和
+  run-loop wake 立即 fail-open；不做 AppKit、AX 查询或日志 I/O。CFRunLoop 使用 250ms 有界等待，
+  仅 `TimedOut` 才通过文档化的 `CFMachPortIsValid` 与 `CGEventTapIsEnabled` 检查健康，正常输入的
+  `HandledSource` 不执行原生查询；这能覆盖 TCC 直接令 tap/port 失效但没有投递 disabled 事件的
+  情况，也不增加 timer、sleep、channel 或辅助线程。若 active run loop 意外返回
+  `Finished`/`Stopped`，同样立即按输入捕获丢失终止，不能原地空转。
 - AppKit main run loop 负责窗口、菜单栏和 workspace 事件；wake 使用 typed
   `objc2-core-foundation` 接口。workspace 先比较 PID，只有前台进程变化时才分配 bundle ID，
   appearance 与静态 `NSString` 直接比较。
@@ -166,10 +169,13 @@ Retina 下快速重绘时文字基线出现单帧纵向抖动。
 - 键盘捕获需要 Accessibility；缺失时 Backend 仍能启动菜单栏，但
   `keyboard_available=false` 并给出说明。
 - 运行中撤销 Accessibility 时，`TapDisabledByUserInput` 被视为用户意图：Hook 立即
-  fail-open 并停止，不自动重新启用。capture-loss 使用独立原子单槽，不经过可能已满的
-  Hook 队列；Backend 在旧物理输入前交付它并丢弃旧 KeyDown/Pointer，Engine 随即停止帧
-  时钟、释放合成输入并回到 Idle。撤权路径不在 TCC 正在改动时调用
-  `AXIsProcessTrusted`。`TapDisabledByTimeout` 全进程只自动恢复一次，再次超时同样停止。
+  fail-open 并停止，不自动重新启用。callback 立即取消当前 disposition waiter；回到 run loop 后
+  先检查 terminal stop，再读取旧 timeout slot，因此不会重新启用已经被 TCC 关闭的 tap，并会直接
+  移除 source、释放 tap。这个顺序不要求每个正常输入读取额外终止位。capture-loss 使用独立原子
+  单槽，不经过可能已满的 Hook 队列，也不重复写 deferred disabled slot。Backend 在旧物理输入前
+  交付它并丢弃旧 KeyDown/Pointer，Engine 随后取消 scan、释放合成输入、撤下可能存在的普通指示器
+  并回到 Idle。撤权路径不在 TCC 正在改动时调用 `AXIsProcessTrusted`。`TapDisabledByTimeout` 全进程
+  只自动恢复一次，再次超时同样停止。
 - macOS Backend 的幂等 shutdown 顺序为：先移除 status item/系统回调，再停止 display
   link、失效并停止 UI scan、取消更新、释放 held input、停止 Hook、关闭 overlay。扫描和更新
   event tap、扫描和更新使用公共 `WorkerJoin`；成功 shutdown 必须完成 join，deadline 超时作为错误传播并立即退出
@@ -180,10 +186,14 @@ Retina 下快速重绘时文字基线出现单帧纵向抖动。
 - 权限绑定应用 bundle identity；正式用户必须运行打包的 `KeySteer.app`，不能让 Terminal
   代替应用申请权限。
 - `SMAppService` 需要 bundle 上下文，裸二进制不等同正式 `.app` 登录项。
-- macOS 状态项使用固定方形图标槽。登录项可能早于菜单栏 scene 完全就绪，因此先完成
-  AppKit 启动并处理一个 run-loop turn，再创建一次状态项并由 Backend 强持有到 shutdown。
-  不使用 `button.window` 等未承诺的附着状态做轮询，不设置会恢复陈旧隐藏状态的 autosave
-  identity，也不在运行中删除、重建或切换 Dock；shutdown 只移除当前唯一 status item。
+- macOS 状态项使用固定方形图标槽。直接点开与 `SMAppService` 开机自启走同一初始化路径：Backend
+  在 `finishLaunching` 后、第一项 AppKit event 之前创建一次状态项，再处理 run-loop turn，并强持有
+  item/menu/target/icon 到 shutdown；
+  这与 `applicationDidFinishLaunching` 的初始化边界一致。菜单栏继续使用 KeySteer 的程序图标；
+  KeySteer 没有 Dock 控制面，因此每次启动显式显示唯一 status item，不恢复旧版 autosave 遗留的
+  隐藏状态。不使用
+  `button.window` 等未承诺的附着状态推断健康，也不在运行中删除、重建或切换 Dock；shutdown
+  只移除当前唯一 status item。
 
 ## 新增平台的最小边界
 

@@ -107,21 +107,37 @@ fn macos_status_item_is_created_once_after_appkit_launch() {
     let prepare = backend
         .find("status_item::prepare_application(mtm);")
         .expect("AppKit startup must be prepared");
-    let pump = backend[prepare..]
-        .find("workspace::pump_app_events();")
-        .map(|offset| prepare + offset)
-        .expect("AppKit must process one run-loop turn before status creation");
-    let create = backend[pump..]
+    let create = backend[prepare..]
         .find("status_item::StatusItem::new(mtm")
-        .map(|offset| pump + offset)
-        .expect("the status item must be created after AppKit startup");
-    assert!(prepare < pump && pump < create);
+        .map(|offset| prepare + offset)
+        .expect("the status item must be created at the AppKit launch boundary");
+    let pump = backend[create..]
+        .find("workspace::pump_app_events();")
+        .map(|offset| create + offset)
+        .expect("AppKit must process one run-loop turn after status creation");
+    assert!(prepare < create && create < pump);
+    assert!(backend[create..].contains("let status_item = Some(status_item);"));
     assert!(!status_item.contains("button.window()"));
     assert!(!status_item.contains("rebuild_native_item"));
     assert!(!status_item.contains("setAutosaveName"));
     assert_eq!(status_item.matches("setVisible(true)").count(), 1);
+    assert!(status_item.contains("let icon = status_icon(STATUS_ICON_SIZE);"));
     assert!(!status_item.contains("NSApplicationActivationPolicy::Regular"));
     assert_eq!(status_item.matches("removeStatusItem").count(), 1);
+}
+
+#[test]
+fn macos_tcc_fail_open_adds_no_per_event_stop_poll() {
+    let hook = include_str!("../src/platform/macos/hook.rs");
+    let callback = hook
+        .split_once("fn handle_event(")
+        .map(|(_, tail)| tail)
+        .and_then(|tail| tail.split_once("fn store_latest_pointer"))
+        .map(|(body, _)| body)
+        .expect("the macOS event-tap callback must remain inspectable");
+    assert!(!callback.contains("stop.load"));
+    assert!(callback.contains("signal_capture_loss"));
+    assert!(hook.contains("if !tap_state_processing_allowed(stopping)"));
 }
 
 #[test]

@@ -2,6 +2,8 @@
 
 use std::ffi::c_void;
 
+use core_foundation::base::TCFType;
+use core_foundation::mach_port::CFMachPort;
 use core_foundation::runloop::{CFRunLoopMode, kCFRunLoopDefaultMode};
 use core_graphics::display::{
     CGDisplayRegisterReconfigurationCallback, CGDisplayRemoveReconfigurationCallback,
@@ -40,6 +42,22 @@ pub(crate) fn remove_display_reconfiguration_callback() -> i32 {
     unsafe {
         CGDisplayRemoveReconfigurationCallback(super::screens::display_changed, std::ptr::null())
     }
+}
+
+/// Check both layers that can disappear when macOS revokes input capture.
+///
+/// This is called only after the event-tap run loop has been idle for its
+/// bounded health interval; normal keyboard and pointer events never pay for
+/// either native query.
+pub(crate) fn event_tap_is_healthy(tap: &CFMachPort) -> bool {
+    let raw = tap.as_concrete_TypeRef();
+    // SAFETY: both crates wrap the same documented CFMachPortRef. `raw` comes
+    // from the live CGEventTap owner and the typed reference cannot outlive
+    // this synchronous function; no retain or ownership transfer occurs.
+    let Some(tap) = (unsafe { raw.cast::<objc2_core_foundation::CFMachPort>().as_ref() }) else {
+        return false;
+    };
+    tap.is_valid() && objc2_core_graphics::CGEvent::tap_is_enabled(tap)
 }
 
 /// A Core Foundation object returned at +1 by a Create/Copy function.

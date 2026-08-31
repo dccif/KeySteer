@@ -22,10 +22,12 @@ use crate::platform::multi_click::ClickTracker;
 use super::input;
 
 const DISPOSITION_TIMEOUT: Duration = Duration::from_millis(100);
-// `return_after_source_handled` below wakes this worker for real event-tap
-// traffic, while `CFRunLoopStop` wakes shutdown. A long finite bound avoids an
-// otherwise permanent 20 ms idle poll without adding a timer or helper thread.
-const RUN_LOOP_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
+// A TCC permission change can invalidate or disable an event tap without
+// reliably delivering TapDisabledByUserInput. Bound the existing run-loop wait
+// so an idle tap gets a documented health check without adding a timer, thread
+// or query to the normal input path. This is 92% fewer idle wakes than the old
+// 20 ms loop.
+const RUN_LOOP_HEALTH_INTERVAL: Duration = Duration::from_millis(250);
 const STOP_TIMEOUT: Duration = Duration::from_millis(250);
 pub const TIMEOUT_WARNING: &str =
     "keyboard disposition timed out; the key was forwarded and the event tap remained active";
@@ -33,6 +35,7 @@ const CAPTURE_LOSS_NONE: u8 = 0;
 const CAPTURE_LOSS_USER_INPUT: u8 = 1;
 const CAPTURE_LOSS_REPEATED_TIMEOUT: u8 = 2;
 const CAPTURE_LOSS_RUN_LOOP: u8 = 3;
+const CAPTURE_LOSS_TAP_UNAVAILABLE: u8 = 4;
 
 struct Envelope {
     event: BackendEvent,
@@ -74,7 +77,6 @@ impl EventSender {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TapDisabled {
     Timeout,
-    UserInput,
 }
 
 struct TapState {
@@ -100,14 +102,12 @@ impl TapDisabled {
     const fn code(self) -> u8 {
         match self {
             Self::Timeout => 1,
-            Self::UserInput => 2,
         }
     }
 
     const fn from_code(code: u8) -> Option<Self> {
         match code {
             1 => Some(Self::Timeout),
-            2 => Some(Self::UserInput),
             _ => None,
         }
     }
@@ -119,6 +119,14 @@ fn run_loop_stopped_unexpectedly(result: CFRunLoopRunResult, stopping: bool) -> 
             result,
             CFRunLoopRunResult::Finished | CFRunLoopRunResult::Stopped
         )
+}
+
+fn tap_health_check_due(result: CFRunLoopRunResult) -> bool {
+    matches!(result, CFRunLoopRunResult::TimedOut)
+}
+
+const fn tap_state_processing_allowed(stopping: bool) -> bool {
+    !stopping
 }
 
 type SharedState = Arc<TapState>;
@@ -148,6 +156,8 @@ struct CallbackContext {
     latest_pointer: SharedPointer,
     click_tracker: SharedClickTracker,
     signals: SharedHookSignals,
+    stop: Arc<AtomicBool>,
+    active: Arc<AtomicBool>,
 }
 
 pub struct HookThread {
@@ -404,6 +414,9 @@ impl HookThread {
             CAPTURE_LOSS_RUN_LOOP => {
                 "the macOS event-tap run loop stopped unexpectedly; KeySteer stopped capturing input and must be restarted"
             }
+            CAPTURE_LOSS_TAP_UNAVAILABLE => {
+                "the macOS event tap became unavailable without a disable event, usually because Accessibility permission was removed; KeySteer stopped capturing input and must be restarted after permission is restored"
+            }
             _ => "macOS physical input capture stopped; KeySteer must be restarted",
         };
         Some(BackendEvent::InputCaptureLost(message.into()))
@@ -455,6 +468,34 @@ fn stop_run_loop(run_loop: &SharedRunLoop) {
     }
 }
 
+/// Fail open without depending on the bounded event queue. This is safe to
+/// call from the synchronous event-tap callback: it only updates atomics,
+/// releases a disposition waiter and wakes the main run loop.
+fn signal_capture_loss(
+    signals: &HookSignals,
+    mailbox: &crate::platform::disposition_mailbox::DispositionMailbox,
+    stop: &AtomicBool,
+    active: &AtomicBool,
+    reason: u8,
+) {
+    active.store(false, Ordering::Release);
+    stop.store(true, Ordering::Release);
+    signals.drag_modifier_flags.store(0, Ordering::Relaxed);
+    mailbox.cancel_pending();
+    if signals
+        .capture_loss
+        .compare_exchange(
+            CAPTURE_LOSS_NONE,
+            reason,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        super::workspace::wake_main_run_loop();
+    }
+}
+
 impl Drop for HookThread {
     fn drop(&mut self) {
         if self.stop_failure_returned || self.worker.shutdown_failure_was_returned() {
@@ -493,6 +534,8 @@ fn event_tap_thread(handshake: HookHandshake, context: HookThreadContext) {
         latest_pointer,
         click_tracker,
         signals: Arc::clone(&signals),
+        stop: Arc::clone(&stop),
+        active: Arc::clone(&active),
     };
     let callback_mailbox = Arc::clone(&callback.mailbox);
     let tap = match create_tap(move |proxy, event_type, event| {
@@ -540,28 +583,28 @@ fn event_tap_thread(handshake: HookHandshake, context: HookThreadContext) {
     while !stop.load(Ordering::Acquire) {
         let run_result = CFRunLoop::run_in_mode(
             super::native::default_run_loop_modes().core_foundation,
-            RUN_LOOP_WAIT,
+            RUN_LOOP_HEALTH_INTERVAL,
             true,
         );
-        if run_loop_stopped_unexpectedly(run_result, stop.load(Ordering::Acquire)) {
-            crate::app::logging::report_error(
-                "macos-hook",
-                "macOS event-tap run loop stopped while physical input capture was active",
-            );
-            active.store(false, Ordering::Release);
-            stop.store(true, Ordering::Release);
-            callback_mailbox.cancel_pending();
-            let _ = signals.capture_loss.compare_exchange(
-                CAPTURE_LOSS_NONE,
+        let stopping = stop.load(Ordering::Acquire);
+        if run_loop_stopped_unexpectedly(run_result, stopping) {
+            signal_capture_loss(
+                &signals,
+                &callback_mailbox,
+                &stop,
+                &active,
                 CAPTURE_LOSS_RUN_LOOP,
-                Ordering::AcqRel,
-                Ordering::Acquire,
             );
-            super::workspace::wake_main_run_loop();
+            break;
+        }
+        // A terminal callback may have set `stop` while returning the source
+        // to this loop. Exit before reading an older timeout slot or attempting
+        // to re-enable a tap that TCC has just revoked.
+        if !tap_state_processing_allowed(stopping) {
             break;
         }
         let disabled = TapDisabled::from_code(state.disabled.swap(0, Ordering::AcqRel));
-        match disabled {
+        let terminal_reason = match disabled {
             Some(TapDisabled::Timeout) if !timeout_retried => {
                 timeout_retried = true;
                 tap.enable();
@@ -572,25 +615,29 @@ fn event_tap_thread(handshake: HookHandshake, context: HookThreadContext) {
                     generation: None,
                 });
                 super::workspace::wake_main_run_loop();
+                None
             }
-            Some(disabled) => {
-                active.store(false, Ordering::Release);
-                stop.store(true, Ordering::Release);
-                callback_mailbox.cancel_pending();
-                let reason = if disabled == TapDisabled::UserInput {
-                    CAPTURE_LOSS_USER_INPUT
-                } else {
-                    CAPTURE_LOSS_REPEATED_TIMEOUT
-                };
-                let _ = signals.capture_loss.compare_exchange(
-                    CAPTURE_LOSS_NONE,
-                    reason,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                );
-                super::workspace::wake_main_run_loop();
-            }
-            None => {}
+            Some(TapDisabled::Timeout) => Some(CAPTURE_LOSS_REPEATED_TIMEOUT),
+            None => None,
+        };
+        if let Some(reason) = terminal_reason {
+            signal_capture_loss(&signals, &callback_mailbox, &stop, &active, reason);
+            break;
+        }
+
+        // Normal input returns HandledSource and never performs native health
+        // queries. Only an idle timeout checks the Mach port and tap state, so
+        // a silent TCC revocation is detected within one bounded interval.
+        if tap_health_check_due(run_result) && !super::native::event_tap_is_healthy(tap.mach_port())
+        {
+            signal_capture_loss(
+                &signals,
+                &callback_mailbox,
+                &stop,
+                &active,
+                CAPTURE_LOSS_TAP_UNAVAILABLE,
+            );
+            break;
         }
     }
     signals.drag_modifier_flags.store(0, Ordering::Relaxed);
@@ -647,17 +694,29 @@ fn handle_event(
         latest_pointer,
         click_tracker,
         signals,
+        stop,
+        active,
     } = context;
+
     if matches!(
         event_type,
         CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
     ) {
-        let disabled = if matches!(event_type, CGEventType::TapDisabledByTimeout) {
-            TapDisabled::Timeout
+        if matches!(event_type, CGEventType::TapDisabledByTimeout) {
+            // A timeout is the only recoverable disable reason. Defer it to the
+            // surrounding run loop so that it can perform the one permitted
+            // re-enable attempt outside the synchronous callback.
+            state
+                .disabled
+                .store(TapDisabled::Timeout.code(), Ordering::Release);
         } else {
-            TapDisabled::UserInput
-        };
-        state.disabled.store(disabled.code(), Ordering::Release);
+            // Permission revocation is terminal. Publish capture loss directly
+            // from the callback instead of waiting for the surrounding run
+            // loop to return. Do not also write the deferred slot: the Engine
+            // may consume the out-of-band signal before this worker resumes,
+            // and a second signal would otherwise reset input twice.
+            signal_capture_loss(signals, mailbox, stop, active, CAPTURE_LOSS_USER_INPUT);
+        }
         return CallbackResult::Keep;
     }
 
@@ -850,14 +909,9 @@ mod tests {
         assert!(matches!(TapDisabled::Timeout, TapDisabled::Timeout) && !retried);
         retried = true;
         assert!(!(matches!(TapDisabled::Timeout, TapDisabled::Timeout) && !retried));
-        assert!(!matches!(TapDisabled::UserInput, TapDisabled::Timeout));
         assert_eq!(
             TapDisabled::from_code(TapDisabled::Timeout.code()),
             Some(TapDisabled::Timeout)
-        );
-        assert_eq!(
-            TapDisabled::from_code(TapDisabled::UserInput.code()),
-            Some(TapDisabled::UserInput)
         );
         assert_eq!(TapDisabled::from_code(0), None);
     }
@@ -880,6 +934,21 @@ mod tests {
             CFRunLoopRunResult::Stopped,
             true
         ));
+    }
+
+    #[test]
+    fn native_tap_health_is_checked_only_after_an_idle_timeout() {
+        assert!(tap_health_check_due(CFRunLoopRunResult::TimedOut));
+        assert!(!tap_health_check_due(CFRunLoopRunResult::HandledSource));
+        assert!(!tap_health_check_due(CFRunLoopRunResult::Stopped));
+        assert!(RUN_LOOP_HEALTH_INTERVAL >= Duration::from_millis(100));
+        assert!(RUN_LOOP_HEALTH_INTERVAL <= Duration::from_millis(500));
+    }
+
+    #[test]
+    fn a_terminal_callback_cannot_reenable_an_older_timeout() {
+        assert!(!tap_state_processing_allowed(true));
+        assert!(tap_state_processing_allowed(false));
     }
 
     #[test]
@@ -979,22 +1048,28 @@ mod tests {
             })
             .unwrap();
         let signals = Arc::new(HookSignals {
-            capture_loss: AtomicU8::new(CAPTURE_LOSS_USER_INPUT),
+            capture_loss: AtomicU8::new(CAPTURE_LOSS_NONE),
             drag_modifier_flags: AtomicU8::new(
                 input::DRAG_MODIFIER_SHIFT | input::DRAG_MODIFIER_COMMAND,
             ),
         });
+        let mailbox = Arc::new(crate::platform::disposition_mailbox::DispositionMailbox::default());
+        let generation = mailbox.begin();
+        let stop = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(AtomicBool::new(true));
+        signal_capture_loss(&signals, &mailbox, &stop, &active, CAPTURE_LOSS_USER_INPUT);
+        assert_eq!(mailbox.wait(generation, Duration::ZERO), None);
         let latest_pointer =
             Arc::new(crate::platform::latest_point_mailbox::LatestPointMailbox::default());
         latest_pointer.publish(Point::new(1.0, 2.0));
         let mut hook = HookThread {
             sender: event_tx,
             receiver: event_rx,
-            mailbox: Arc::new(crate::platform::disposition_mailbox::DispositionMailbox::default()),
-            pending: Some(1),
+            mailbox,
+            pending: Some(generation),
             latest_pointer,
-            stop: Arc::new(AtomicBool::new(false)),
-            active: Arc::new(AtomicBool::new(false)),
+            stop: Arc::clone(&stop),
+            active: Arc::clone(&active),
             signals: Arc::clone(&signals),
             run_loop: Arc::new(Mutex::new(None)),
             worker: WorkerJoin::spawn("test hook", std::thread::Builder::new(), || {}).unwrap(),
@@ -1006,6 +1081,7 @@ mod tests {
             hook.take_capture_loss(),
             Some(BackendEvent::InputCaptureLost(_))
         ));
+        assert!(hook.take_capture_loss().is_none());
         assert!(hook.try_next_event().is_none());
         assert!(hook.pending.is_none());
         assert_eq!(hook.latest_pointer.take(), None);
@@ -1014,6 +1090,8 @@ mod tests {
             CAPTURE_LOSS_NONE
         );
         assert_eq!(signals.drag_modifier_flags.load(Ordering::Relaxed), 0);
+        assert!(stop.load(Ordering::Acquire));
+        assert!(!active.load(Ordering::Acquire));
     }
 
     #[test]

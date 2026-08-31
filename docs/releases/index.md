@@ -2,9 +2,9 @@
 
 ## 0.9.12
 
-修复 macOS 上 UI Hint 视觉识别失败、状态栏图标不显示，以及滚动列表的窗口外元素仍生成标签的问题。
+修复 macOS 上 UI Hint 视觉识别失败、状态栏图标不显示、运行中撤销辅助功能权限可能造成输入卡住，以及滚动列表的窗口外元素仍生成标签的问题。
 
-Fixed UI Hint visual recognition failures, missing menu-bar icons, and hints appearing for off-screen list items on macOS.
+Fixed UI Hint visual recognition failures, missing menu-bar icons, input becoming unresponsive after Accessibility access was revoked, and hints appearing for off-screen list items on macOS.
 
 ## 0.9.11
 

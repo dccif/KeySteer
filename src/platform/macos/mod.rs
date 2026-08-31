@@ -129,14 +129,16 @@ impl MacOsBackend {
         let mtm = MainThreadMarker::new()
             .ok_or_else(|| "macOS backend must be created on the main thread".to_string())?;
         status_item::prepare_application(mtm);
-        // Login items can start before AppKit has attached its menu-bar scene.
-        // Finish launching and process that work before creating the one
-        // strongly-owned status item; AppKit will attach it when the scene is
-        // available without destructive polling or native-item replacement.
-        workspace::pump_app_events();
+        // Finder/direct launches and SMAppService login launches both execute
+        // this same path. applicationDidFinishLaunching is the initialization
+        // boundary before AppKit dispatches the first event: create and retain
+        // the one status item here, then let the first event turn attach it to
+        // the menu-bar scene. Pumping first regressed both launch paths.
         let mut status_item = status_item::StatusItem::new(mtm, event_tx.clone());
         workspace::pump_app_events();
         status_item.maintain_button_configuration();
+        // Keep the program icon and menu alive for the complete backend
+        // lifetime; shutdown is the only path that removes the status item.
         let status_item = Some(status_item);
         let frame_clock = display_link::DisplayFrameClock::new(mtm);
         let initial_screens = screens::list_screens().unwrap_or_else(|error| {
