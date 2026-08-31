@@ -1,5 +1,11 @@
 # 更新日志 / Release Notes
 
+## 0.9.12
+
+修复 macOS 上 UI Hint 视觉识别失败和状态栏图标可能始终隐藏的问题。
+
+Fixed UI Hint visual recognition failures and menu-bar icons remaining hidden on macOS.
+
 ## 0.9.11
 
 提升输入与 UI Hint 的响应速度，减少 OCR 扫描等待，并加强 Windows 与 macOS 的取消和资源清理，让连续使用更流畅稳定。

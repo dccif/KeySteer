@@ -1,7 +1,7 @@
 //! Bounded asynchronous macOS Accessibility traversal for UI hints.
 
 use std::collections::HashSet;
-use std::ffi::{c_double, c_int, c_void};
+use std::ffi::{c_float, c_int, c_void};
 use std::ptr;
 use std::time::{Duration, Instant};
 
@@ -23,7 +23,9 @@ const AX_VALUE_CGPOINT: i32 = 1;
 const AX_VALUE_CGSIZE: i32 = 2;
 const SCAN_BUDGET: Duration = Duration::from_millis(500);
 const MAX_TARGETS: usize = 2_000;
-const NODE_TIMEOUT_SECONDS: c_double = 0.05;
+// Apple declares AXUIElementSetMessagingTimeout's value as a C `float`.
+// Keeping the constant typed prevents an accidental ABI-widening to `double`.
+const NODE_TIMEOUT_SECONDS: c_float = 0.05;
 
 type AXUIElementRef = *const c_void;
 type AXValueRef = *const c_void;
@@ -93,7 +95,7 @@ unsafe extern "C" {
         value: *mut CFTypeRef,
     ) -> c_int;
     fn AXUIElementCopyActionNames(element: AXUIElementRef, names: *mut *const c_void) -> c_int;
-    fn AXUIElementSetMessagingTimeout(element: AXUIElementRef, timeout: c_double) -> c_int;
+    fn AXUIElementSetMessagingTimeout(element: AXUIElementRef, timeout: c_float) -> c_int;
     fn AXUIElementGetTypeID() -> usize;
     fn AXValueGetTypeID() -> usize;
     fn AXValueGetType(value: AXValueRef) -> c_int;

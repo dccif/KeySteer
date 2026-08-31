@@ -1,5 +1,9 @@
 # Release notes
 
+## 0.9.12
+
+Fixed UI Hint visual recognition failures and menu-bar icons remaining hidden on macOS.
+
 ## 0.9.11
 
 Improved input and UI Hint responsiveness, reduced OCR scan waits, and strengthened cancellation and resource cleanup on Windows and macOS for smoother, more reliable repeated use.

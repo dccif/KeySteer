@@ -29,7 +29,6 @@ const STATUS_ITEM_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const STATUS_ITEM_REBUILD_INTERVAL: Duration = Duration::from_secs(3);
 const STATUS_ITEM_RECOVERY_WINDOW: Duration = Duration::from_secs(10);
 const STATUS_ITEM_REBUILDS: u8 = 3;
-const STATUS_ITEM_HIDDEN_CONFIRMATIONS: u8 = 2;
 const STATUS_ICON_PNG: &[u8] = include_bytes!("../../../assets/icons/keysteer-icon.png");
 const STATUS_ICON_SIZE: f64 = 18.0;
 
@@ -169,7 +168,6 @@ struct StartupRepair {
     next_rebuild: Instant,
     deadline: Instant,
     rebuilds_remaining: u8,
-    hidden_confirmations: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -190,26 +188,25 @@ enum RepairAction {
 impl StartupRepair {
     fn observe(&mut self, now: Instant, state: NativeItemState) -> RepairAction {
         match state {
-            NativeItemState::Hidden => {
-                self.hidden_confirmations = self.hidden_confirmations.saturating_add(1);
-                if self.hidden_confirmations >= STATUS_ITEM_HIDDEN_CONFIRMATIONS {
-                    RepairAction::Complete
-                } else {
-                    self.next_check = now + STATUS_ITEM_CHECK_INTERVAL;
-                    RepairAction::Wait
-                }
+            NativeItemState::Hidden | NativeItemState::Detached { visible: false }
+                if now >= self.deadline =>
+            {
+                RepairAction::FallBack
             }
-            NativeItemState::Attached if now >= self.deadline => RepairAction::Complete,
-            NativeItemState::Attached => {
-                self.hidden_confirmations = 0;
+            NativeItemState::Hidden | NativeItemState::Detached { visible: false }
+                if self.rebuilds_remaining > 0 && now >= self.next_rebuild =>
+            {
+                self.rebuilds_remaining -= 1;
+                self.next_rebuild = now + STATUS_ITEM_REBUILD_INTERVAL;
+                self.next_check = now + STATUS_ITEM_CHECK_INTERVAL;
+                RepairAction::Rebuild
+            }
+            NativeItemState::Hidden | NativeItemState::Detached { visible: false } => {
                 self.next_check = now + STATUS_ITEM_CHECK_INTERVAL;
                 RepairAction::Wait
             }
-            NativeItemState::Detached { visible: false } if now >= self.deadline => {
-                RepairAction::Complete
-            }
-            NativeItemState::Detached { visible: false } => {
-                self.hidden_confirmations = 0;
+            NativeItemState::Attached if now >= self.deadline => RepairAction::Complete,
+            NativeItemState::Attached => {
                 self.next_check = now + STATUS_ITEM_CHECK_INTERVAL;
                 RepairAction::Wait
             }
@@ -219,14 +216,12 @@ impl StartupRepair {
             NativeItemState::Detached { visible: true }
                 if self.rebuilds_remaining > 0 && now >= self.next_rebuild =>
             {
-                self.hidden_confirmations = 0;
                 self.rebuilds_remaining -= 1;
                 self.next_rebuild = now + STATUS_ITEM_REBUILD_INTERVAL;
                 self.next_check = now + STATUS_ITEM_CHECK_INTERVAL;
                 RepairAction::Rebuild
             }
             NativeItemState::Detached { visible: true } => {
-                self.hidden_confirmations = 0;
                 self.next_check = now + STATUS_ITEM_CHECK_INTERVAL;
                 RepairAction::Wait
             }
@@ -293,7 +288,6 @@ impl StatusItem {
             next_rebuild: startup_now + Duration::from_secs(1),
             deadline: startup_now + STATUS_ITEM_RECOVERY_WINDOW,
             rebuilds_remaining: STATUS_ITEM_REBUILDS,
-            hidden_confirmations: 0,
         });
 
         Self {
@@ -361,6 +355,12 @@ impl StatusItem {
     }
 
     fn native_item_state(&mut self, mtm: MainThreadMarker) -> NativeItemState {
+        if !self.item.isVisible() {
+            // `autosaveName` restores the user's previous visibility. KeySteer
+            // has no Dock presence in accessory mode, so a stale hidden value
+            // would otherwise leave no UI for pausing or quitting the app.
+            self.item.setVisible(true);
+        }
         let visible = self.item.isVisible();
         if self.item.statusBar().is_none() {
             return NativeItemState::Detached { visible };
@@ -579,6 +579,7 @@ fn create_native_item(
     // Apply persisted visibility only after configuring the default-visible
     // button, so a later System Settings unhide cannot reveal a blank item.
     item.setAutosaveName(Some(ns_string!("com.keysteer.app.status-item")));
+    item.setVisible(true);
     (item, button_configured)
 }
 
@@ -669,7 +670,6 @@ mod tests {
             next_rebuild: start + Duration::from_secs(1),
             deadline: start + STATUS_ITEM_RECOVERY_WINDOW,
             rebuilds_remaining: STATUS_ITEM_REBUILDS,
-            hidden_confirmations: 0,
         }
     }
 
@@ -727,12 +727,10 @@ mod tests {
             repair.observe(start + Duration::from_secs(3), NativeItemState::Hidden),
             RepairAction::Wait
         );
-        assert_eq!(repair.hidden_confirmations, 1);
         assert_eq!(
             repair.observe(start + Duration::from_secs(4), NativeItemState::Attached),
             RepairAction::Wait
         );
-        assert_eq!(repair.hidden_confirmations, 0);
         assert_eq!(
             repair.observe(
                 start + STATUS_ITEM_RECOVERY_WINDOW,
@@ -743,7 +741,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_repair_respects_hidden_items_and_bounds_native_rebuilds() {
+    fn startup_repair_restores_hidden_items_and_bounds_native_rebuilds() {
         let start = Instant::now();
         let mut hidden = startup_repair(start);
         assert_eq!(
@@ -751,10 +749,14 @@ mod tests {
             RepairAction::Wait
         );
         assert_eq!(
-            hidden.observe(start + STATUS_ITEM_CHECK_INTERVAL, NativeItemState::Hidden),
-            RepairAction::Complete
+            hidden.observe(start + Duration::from_secs(1), NativeItemState::Hidden),
+            RepairAction::Rebuild
         );
-        assert_eq!(hidden.rebuilds_remaining, STATUS_ITEM_REBUILDS);
+        assert_eq!(hidden.rebuilds_remaining, STATUS_ITEM_REBUILDS - 1);
+        assert_eq!(
+            hidden.observe(start + STATUS_ITEM_RECOVERY_WINDOW, NativeItemState::Hidden),
+            RepairAction::FallBack
+        );
 
         let mut detached = startup_repair(start);
         for seconds in [1, 4, 7] {
@@ -783,29 +785,22 @@ mod tests {
         );
 
         let mut detached_hidden = startup_repair(start);
-        assert_eq!(
-            detached_hidden.observe(
-                start + Duration::from_secs(1),
-                NativeItemState::Detached { visible: false }
-            ),
-            RepairAction::Wait
-        );
-        assert_eq!(detached_hidden.rebuilds_remaining, STATUS_ITEM_REBUILDS);
-        assert_eq!(
-            detached_hidden.observe(
-                start + Duration::from_secs(2),
-                NativeItemState::Detached { visible: true }
-            ),
-            RepairAction::Rebuild
-        );
-
-        let mut detached_hidden = startup_repair(start);
+        for seconds in [1, 4, 7] {
+            assert_eq!(
+                detached_hidden.observe(
+                    start + Duration::from_secs(seconds),
+                    NativeItemState::Detached { visible: false }
+                ),
+                RepairAction::Rebuild
+            );
+        }
+        assert_eq!(detached_hidden.rebuilds_remaining, 0);
         assert_eq!(
             detached_hidden.observe(
                 start + STATUS_ITEM_RECOVERY_WINDOW,
                 NativeItemState::Detached { visible: false }
             ),
-            RepairAction::Complete
+            RepairAction::FallBack
         );
     }
 

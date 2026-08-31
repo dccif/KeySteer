@@ -108,7 +108,7 @@ fn macos_status_item_has_cold_login_recovery_primitives() {
     assert!(status_item.contains("com.keysteer.app.status-item"));
     assert!(status_item.contains("item.setAutosaveName"));
     assert!(status_item.contains("item.isVisible()"));
-    assert!(!status_item.contains("item.setVisible(true)"));
+    assert!(status_item.contains("item.setVisible(true)"));
     assert!(status_item.contains("NSApplicationActivationPolicy::Regular"));
 }
 

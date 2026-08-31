@@ -183,8 +183,8 @@ Retina 下快速重绘时文字基线出现单帧纵向抖动。
 - macOS 状态项使用固定方形图标槽。登录项可能早于菜单栏 scene 完全就绪，因此在十秒
   启动稳定窗口内验证 status item 的 button 已挂到原生 window；未挂接时复用 Backend
   现有 poll 最多重建三次，不增加线程或系统 timer。状态项使用稳定的 autosave identity，
-  并区分用户隐藏和挂接失败；用户隐藏不触发自愈。稳定窗口结束后停止所有检查；恢复期
-  内仍允许显示却始终无法挂接时切换为 Dock 图标，避免进程无入口常驻。shutdown 仍只
+  但 KeySteer 在 accessory 模式没有 Dock 入口，因此启动时必须覆盖陈旧的隐藏状态；隐藏或
+  未挂接状态持续到稳定窗口结束时切换为 Dock 图标，避免进程无入口常驻。shutdown 仍只
   移除当前唯一 status item。
 
 ## 新增平台的最小边界
