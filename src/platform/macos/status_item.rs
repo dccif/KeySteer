@@ -12,9 +12,9 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton,
-    NSControlStateValueOff, NSControlStateValueOn, NSFont, NSImage, NSImageView, NSMenu,
-    NSMenuItem, NSPanel, NSSquareStatusItemLength, NSStatusBar, NSStatusItem, NSTextField, NSView,
-    NSWindowStyleMask, NSWorkspace,
+    NSCellImagePosition, NSControlStateValueOff, NSControlStateValueOn, NSFont, NSImage,
+    NSImageView, NSMenu, NSMenuItem, NSPanel, NSSquareStatusItemLength, NSStatusBar, NSStatusItem,
+    NSTextField, NSView, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{NSData, NSPoint, NSRect, NSSize, NSString};
 
@@ -27,8 +27,75 @@ static SENDER: OnceLock<Mutex<Option<EventSender>>> = OnceLock::new();
 
 const STATUS_BUTTON_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const STATUS_BUTTON_RETRY_ATTEMPTS: u8 = 120;
+const STATUS_ITEM_AUTOSAVE_NAME: &str = "com.keysteer.app.status-item";
 const STATUS_ICON_PNG: &[u8] = include_bytes!("../../../assets/icons/keysteer-icon.png");
 const STATUS_ICON_SIZE: f64 = 18.0;
+
+// SAFETY: these no-pointer process-singleton entry points validate lifecycle
+// and main-thread state inside the ARC Objective-C bridge. The only arguments
+// are permanent Rust function addresses or finite scalar deadline values.
+unsafe extern "C" {
+    #[link_name = "KskInstallAppRuntimeDriver"]
+    safe fn install_app_runtime_driver(
+        did_finish_launching: extern "C" fn(),
+        drive: extern "C" fn(),
+    ) -> i32;
+    #[link_name = "KskRunApplication"]
+    safe fn run_application_loop();
+    #[link_name = "KskScheduleAppRuntime"]
+    safe fn schedule_app_runtime(after_seconds: f64);
+    #[link_name = "KskStopApplication"]
+    safe fn stop_application_loop();
+    #[link_name = "KskDestroyAppRuntimeDriver"]
+    safe fn destroy_app_runtime_driver();
+}
+
+/// Main-thread owner of the process-wide AppKit delegate and run-loop sources.
+///
+/// The bridge has no caller-provided pointers or borrowed context: callbacks
+/// enter Rust through main-thread TLS, while Objective-C owns all AppKit/Core
+/// Foundation lifetimes. This wrapper's marker prevents moving teardown away
+/// from the main thread that installed the driver.
+pub(super) struct AppRuntimeDriver {
+    _main_thread: MainThreadMarker,
+}
+
+impl AppRuntimeDriver {
+    pub(super) fn new(
+        mtm: MainThreadMarker,
+        did_finish_launching: extern "C" fn(),
+        drive: extern "C" fn(),
+    ) -> Result<Self, String> {
+        match install_app_runtime_driver(did_finish_launching, drive) {
+            0 => Ok(Self { _main_thread: mtm }),
+            1 => Err("the AppKit runtime driver must be installed on the main thread".into()),
+            2 => Err("the AppKit runtime driver is already installed".into()),
+            3 => Err("cannot create the AppKit engine run-loop observer".into()),
+            4 => Err("cannot create the AppKit engine deadline timer".into()),
+            code => Err(format!(
+                "cannot install the AppKit runtime driver (native status {code})"
+            )),
+        }
+    }
+
+    pub(super) fn run(&self) {
+        run_application_loop();
+    }
+
+    pub(super) fn schedule_current(timeout: Duration) {
+        schedule_app_runtime(timeout.as_secs_f64().max(f64::EPSILON));
+    }
+
+    pub(super) fn stop_current() {
+        stop_application_loop();
+    }
+}
+
+impl Drop for AppRuntimeDriver {
+    fn drop(&mut self) {
+        destroy_app_runtime_driver();
+    }
+}
 
 struct StatusTargetIvars {
     update_alert: RefCell<Option<Retained<NSPanel>>>,
@@ -164,21 +231,17 @@ struct StatusButtonRetry {
     attempts_remaining: u8,
 }
 
-/// Complete AppKit startup before creating the status item. The caller creates
-/// the native item immediately after this launch boundary and before AppKit
-/// dispatches its first event; this matches `applicationDidFinishLaunching`
-/// ordering for both direct and login-item starts.
-pub(super) fn prepare_application(mtm: MainThreadMarker) {
+/// Configure the accessory application before entering `NSApplication.run`.
+/// AppKit itself completes launch and the delegate creates the status item in
+/// `applicationDidFinishLaunching` for both direct and login-item starts.
+pub(super) fn prepare_application(mtm: MainThreadMarker) -> Result<(), String> {
     let application = NSApplication::sharedApplication(mtm);
     if !application.setActivationPolicy(NSApplicationActivationPolicy::Accessory)
         && application.activationPolicy() != NSApplicationActivationPolicy::Accessory
     {
-        crate::app::logging::report_error(
-            "macos-status-item",
-            "AppKit rejected the accessory activation policy; the menu-bar item may be unavailable",
-        );
+        return Err("AppKit rejected the accessory activation policy".into());
     }
-    application.finishLaunching();
+    Ok(())
 }
 
 impl StatusItem {
@@ -449,6 +512,8 @@ fn create_native_item(
 ) -> (Retained<NSStatusItem>, bool) {
     let status_bar = NSStatusBar::systemStatusBar();
     let item = status_bar.statusItemWithLength(NSSquareStatusItemLength);
+    let autosave_name = NSString::from_str(STATUS_ITEM_AUTOSAVE_NAME);
+    item.setAutosaveName(Some(&autosave_name));
     let button_configured = if let Some(button) = item.button(mtm) {
         configure_status_button(&button, icon);
         true
@@ -464,6 +529,7 @@ fn create_native_item(
 }
 
 fn configure_status_button(button: &objc2_app_kit::NSStatusBarButton, icon: Option<&NSImage>) {
+    button.setImagePosition(NSCellImagePosition::ImageOnly);
     if let Some(image) = icon {
         button.setImage(Some(image));
         button.setTitle(&NSString::from_str(""));

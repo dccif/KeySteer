@@ -23,9 +23,9 @@ use objc2_core_graphics::{CGColor, CGMutablePath};
 use objc2_core_text::{CTFont, CTFontSymbolicTraits, CTFontUIFontType};
 use objc2_foundation::{
     NSAttributedString, NSMutableAttributedString, NSNumber, NSPoint, NSRange, NSRect, NSSize,
-    NSString,
+    NSString, ns_string,
 };
-use objc2_quartz_core::{CALayer, CAShapeLayer, CATextLayer, CATransaction, kCAAlignmentCenter};
+use objc2_quartz_core::{CALayer, CAShapeLayer, CATextLayer, CATransaction};
 use smallvec::SmallVec;
 
 use crate::api::geometry::{Point, Rect, Screen};
@@ -862,9 +862,9 @@ impl LabelLayers {
         let base = CATextLayer::layer();
         let matched_clip = CALayer::new();
         let matched = CATextLayer::layer();
-        // SAFETY: QuartzCore exports this process-lifetime immutable
-        // alignment-mode object on every supported macOS version.
-        let center = unsafe { kCAAlignmentCenter };
+        // CAAlignmentMode is an NSString extensible enum. The static literal
+        // has the exact documented value without reading a foreign global.
+        let center = ns_string!("center");
         base.setAlignmentMode(center);
         matched.setAlignmentMode(center);
         base.setWrapped(false);

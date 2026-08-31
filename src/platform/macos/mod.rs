@@ -5,6 +5,7 @@
 //! macOS backend composed from isolated native services.
 
 mod accessibility;
+mod app_runtime;
 mod autostart;
 mod display_link;
 mod hook;
@@ -40,6 +41,8 @@ use crate::platform::scan_mailbox::ScanMailbox;
 use self::hook::{HookStartup, HookThread};
 use self::overlay::Overlay;
 use crate::platform::multi_click::ClickTracker;
+
+pub(crate) use app_runtime::run_application;
 
 const BACKEND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -128,18 +131,6 @@ impl MacOsBackend {
         let hook_start = HookStartup::spawn(Arc::clone(&click_tracker));
         let mtm = MainThreadMarker::new()
             .ok_or_else(|| "macOS backend must be created on the main thread".to_string())?;
-        status_item::prepare_application(mtm);
-        // Finder/direct launches and SMAppService login launches both execute
-        // this same path. applicationDidFinishLaunching is the initialization
-        // boundary before AppKit dispatches the first event: create and retain
-        // the one status item here, then let the first event turn attach it to
-        // the menu-bar scene. Pumping first regressed both launch paths.
-        let mut status_item = status_item::StatusItem::new(mtm, event_tx.clone());
-        workspace::pump_app_events();
-        status_item.maintain_button_configuration();
-        // Keep the program icon and menu alive for the complete backend
-        // lifetime; shutdown is the only path that removes the status item.
-        let status_item = Some(status_item);
         let frame_clock = display_link::DisplayFrameClock::new(mtm);
         let initial_screens = screens::list_screens().unwrap_or_else(|error| {
             crate::app::logging::report_error(
@@ -174,7 +165,7 @@ impl MacOsBackend {
             display_watcher: Some(display_watcher),
             frame_clock,
             workspace,
-            status_item,
+            status_item: None,
             update_worker: None,
             held_buttons: Cell::new(0),
             click_tracker,
@@ -187,6 +178,12 @@ impl MacOsBackend {
 
     fn has_hook(&self) -> bool {
         self.hook.as_ref().is_some_and(HookThread::is_active)
+    }
+
+    fn install_status_item(&mut self, mtm: MainThreadMarker) {
+        if self.status_item.is_none() {
+            self.status_item = Some(status_item::StatusItem::new(mtm, self.event_tx.clone()));
+        }
     }
 
     fn refresh_native_events(&mut self) {
@@ -335,6 +332,9 @@ impl Backend for MacOsBackend {
             self.refresh_native_events();
             if let Some(event) = self.try_event() {
                 return Ok(Some(event));
+            }
+            if let Some(elapsed) = self.frame_clock.try_next() {
+                return Ok(Some(BackendEvent::Frame(elapsed)));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {

@@ -1,5 +1,7 @@
 //! Application bootstrap and diagnostics.
 
+#[cfg(target_os = "macos")]
+use crate::api::Backend;
 use crate::api::Key;
 use crate::config::{Config, ConfigStore};
 use crate::{Engine, modes, platform, plugins};
@@ -118,6 +120,9 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
         None
     };
 
+    #[cfg(target_os = "macos")]
+    let backend = platform::macos::MacOsBackend::new()?;
+    #[cfg(not(target_os = "macos"))]
     let mut backend = platform::backend_for_ui_scan(config.ui_hint.strategy)?;
     crate::app::perf_probe::mark("backend_created");
     let mut engine = Engine::new(config, backend.appearance());
@@ -142,7 +147,14 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
         }
     }
 
-    engine.run(backend.as_mut())
+    #[cfg(target_os = "macos")]
+    {
+        platform::macos::run_application(engine, backend)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        engine.run(backend.as_mut())
+    }
 }
 
 fn log_debug_configuration(config: &Config, config_path: Option<&std::path::Path>) {

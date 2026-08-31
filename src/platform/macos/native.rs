@@ -44,20 +44,46 @@ pub(crate) fn remove_display_reconfiguration_callback() -> i32 {
     }
 }
 
-/// Check both layers that can disappear when macOS revokes input capture.
-///
-/// This is called only after the event-tap run loop has been idle for its
-/// bounded health interval; normal keyboard and pointer events never pay for
-/// either native query.
-pub(crate) fn event_tap_is_healthy(tap: &CFMachPort) -> bool {
+pub(crate) fn event_tap_identity(tap: &CFMachPort) -> usize {
+    tap.as_concrete_TypeRef() as usize
+}
+
+extern "C-unwind" fn event_tap_invalidated(
+    port: *mut objc2_core_foundation::CFMachPort,
+    _info: *mut c_void,
+) {
+    super::hook::event_tap_invalidated(port as usize);
+}
+
+fn update_event_tap_invalidation_callback(tap: &CFMachPort, install: bool) -> Result<(), String> {
     let raw = tap.as_concrete_TypeRef();
     // SAFETY: both crates wrap the same documented CFMachPortRef. `raw` comes
     // from the live CGEventTap owner and the typed reference cannot outlive
-    // this synchronous function; no retain or ownership transfer occurs.
-    let Some(tap) = (unsafe { raw.cast::<objc2_core_foundation::CFMachPort>().as_ref() }) else {
-        return false;
-    };
-    tap.is_valid() && objc2_core_graphics::CGEvent::tap_is_enabled(tap)
+    // this synchronous function. The installed function has Core Foundation's
+    // exact ABI, ignores the private event-tap `info` pointer and finds its
+    // Arc-owned state by port identity. Teardown clears it before invalidation.
+    unsafe {
+        let Some(tap) = raw.cast::<objc2_core_foundation::CFMachPort>().as_ref() else {
+            return Err("the macOS event-tap Mach port is unavailable".to_string());
+        };
+        if install && tap.invalidation_call_back().is_some() {
+            return Err(
+                "the macOS event-tap Mach port already has an invalidation callback".to_string(),
+            );
+        }
+        let callback: objc2_core_foundation::CFMachPortInvalidationCallBack =
+            install.then_some(event_tap_invalidated);
+        tap.set_invalidation_call_back(callback);
+    }
+    Ok(())
+}
+
+pub(crate) fn install_event_tap_invalidation_callback(tap: &CFMachPort) -> Result<(), String> {
+    update_event_tap_invalidation_callback(tap, true)
+}
+
+pub(crate) fn clear_event_tap_invalidation_callback(tap: &CFMachPort) {
+    let _ = update_event_tap_invalidation_callback(tap, false);
 }
 
 /// A Core Foundation object returned at +1 by a Create/Copy function.

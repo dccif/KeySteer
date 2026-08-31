@@ -117,8 +117,8 @@ working set、private bytes、handle 和 thread 数。
   scene 缩小时，多余 shape 与 label 会从父层移除并释放。
   因此 Grid 首屏的二级预览层不会在返回 Normal 后继续成为常驻高水位缓存。
 - 所有属性更新放在禁用隐式动画的 `CATransaction` 中，避免输入后出现动画拖尾。
-- 每次 present/dismiss 都有独立 autorelease pool，AppKit/QuartzCore 的临时对象不会依赖
-  下一次手动 run-loop pump 才释放。
+- 每次 present/dismiss 都有独立 autorelease pool，AppKit/QuartzCore 的临时对象在真正的
+  AppKit main run loop 中按当前提交边界释放，不依赖嵌套 event pump。
 - Hide 先移除 shape、label、cursor，清除 root view 的 layer 和 window 的 content view，
   再关闭 `NSPanel` 并释放 typed owner；隐藏期间不保留完整 layer tree 或 compositor backing。
 

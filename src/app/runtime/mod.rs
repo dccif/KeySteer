@@ -557,6 +557,12 @@ fn chords_conflict(left: &KeyChord, right: &KeyChord) -> bool {
         || right.activation_matches(left.activation_key())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RuntimeTurn {
+    pub(crate) event_processed: bool,
+    pub(crate) should_quit: bool,
+}
+
 pub struct Engine {
     config: Config,
     palette: Palette,
@@ -1172,8 +1178,7 @@ impl Engine {
         }
     }
 
-    /// Run until a backend event or a mode asks to quit.
-    pub fn run(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
+    pub(crate) fn start_runtime(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
         if let Err(error) = backend.start() {
             if let Err(shutdown_error) = backend.shutdown() {
                 crate::app::logging::report_error(
@@ -1257,46 +1262,89 @@ impl Engine {
             return Err(error);
         }
 
-        let result = (|| {
-            while !self.should_quit {
-                let timeout = self.next_timeout();
-                // A timeout returns `None`, which is our chance to run timers.
-                if let Some(event) = backend.poll(timeout)? {
-                    let event_result = self.handle_backend_event(event, backend);
-                    if let Err(error) = event_result
-                        && !self.recover_from_input_error(&error, backend)
-                    {
-                        return Err(error);
-                    }
-                }
-                let long_press_result = self.fire_due_long_press_toggles(backend);
-                if let Err(error) = long_press_result
-                    && !self.recover_from_input_error(&error, backend)
-                {
-                    return Err(error);
-                }
-                let drag_release_result = self.fire_due_drag_auto_release(backend);
-                if let Err(error) = drag_release_result
-                    && !self.recover_from_input_error(&error, backend)
-                {
-                    return Err(error);
-                }
-                let timer_result = self.fire_due_timers(backend);
-                if let Err(error) = timer_result
-                    && !self.recover_from_input_error(&error, backend)
-                {
-                    return Err(error);
-                }
-                let sequence_result = self.fire_due_sequences(backend);
-                if let Err(error) = sequence_result
-                    && !self.recover_from_input_error(&error, backend)
-                {
-                    return Err(error);
-                }
-            }
-            Ok(())
-        })();
+        Ok(())
+    }
 
+    pub(crate) fn run_runtime_turn(
+        &mut self,
+        backend: &mut dyn Backend,
+        timeout: Duration,
+    ) -> Result<RuntimeTurn, String> {
+        let event_processed = if let Some(event) = backend.poll(timeout)? {
+            let event_result = self.handle_backend_event(event, backend);
+            if let Err(error) = event_result
+                && !self.recover_from_input_error(&error, backend)
+            {
+                return Err(error);
+            }
+            true
+        } else {
+            false
+        };
+        let long_press_result = self.fire_due_long_press_toggles(backend);
+        if let Err(error) = long_press_result
+            && !self.recover_from_input_error(&error, backend)
+        {
+            return Err(error);
+        }
+        let drag_release_result = self.fire_due_drag_auto_release(backend);
+        if let Err(error) = drag_release_result
+            && !self.recover_from_input_error(&error, backend)
+        {
+            return Err(error);
+        }
+        let timer_result = self.fire_due_timers(backend);
+        if let Err(error) = timer_result
+            && !self.recover_from_input_error(&error, backend)
+        {
+            return Err(error);
+        }
+        let sequence_result = self.fire_due_sequences(backend);
+        if let Err(error) = sequence_result
+            && !self.recover_from_input_error(&error, backend)
+        {
+            return Err(error);
+        }
+
+        Ok(RuntimeTurn {
+            event_processed,
+            should_quit: self.should_quit,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn runtime_next_deadline(&self) -> Option<Duration> {
+        if self.timers.is_empty()
+            && self.pending_sequences.is_empty()
+            && self.pending_long_press_toggles.is_empty()
+            && self.drag_auto_release.fires_at.is_none()
+        {
+            return None;
+        }
+        let now = Instant::now();
+        self.timers
+            .values()
+            .map(|timer| timer.fires_at)
+            .chain(
+                self.pending_sequences
+                    .last()
+                    .map(|sequence| sequence.fires_at),
+            )
+            .chain(
+                self.pending_long_press_toggles
+                    .last()
+                    .map(|pending| pending.fires_at),
+            )
+            .chain(self.drag_auto_release.fires_at)
+            .map(|fires_at| fires_at.saturating_duration_since(now))
+            .min()
+    }
+
+    pub(crate) fn finish_runtime(
+        &mut self,
+        backend: &mut dyn Backend,
+        result: Result<(), String>,
+    ) -> Result<(), String> {
         let mut errors = crate::app::errors::ErrorBundle::default();
         errors.record("runtime", result);
         self.pending_sequences.clear();
@@ -1319,6 +1367,20 @@ impl Engine {
             );
         }
         errors.into_result()
+    }
+
+    /// Run until a backend event or a mode asks to quit.
+    pub fn run(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
+        self.start_runtime(backend)?;
+
+        let result = (|| {
+            while !self.should_quit {
+                let _ = self.run_runtime_turn(backend, self.next_timeout())?;
+            }
+            Ok(())
+        })();
+
+        self.finish_runtime(backend, result)
     }
 
     /// How long we may block before a timer needs servicing.

@@ -120,6 +120,12 @@ impl DisplayFrameClock {
         }
     }
 
+    /// Take a frame already delivered by AppKit without running a nested
+    /// run-loop turn. The application-owned main loop uses this path.
+    pub fn try_next(&self) -> Option<Duration> {
+        self.target.take_elapsed()
+    }
+
     /// Run the main run loop until AppKit delivers a display frame or the
     /// engine's own deadline expires. The deadline is a blocking bound, not a
     /// periodic movement timer.

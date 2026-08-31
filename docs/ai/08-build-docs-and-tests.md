@@ -34,8 +34,9 @@ release profile：`opt-level=3`、fat LTO、`codegen-units=1`、abort panic、st
 ## build.rs
 
 - Windows host 构建 Windows target 时，将 `assets/icons/keysteer.ico` 和版本资源嵌入 exe。
-- macOS host 构建 macOS target 时，编译 `vision_bridge.m` 和 `autostart_bridge.m`，最低
-  macOS 14，并链接 Foundation/CoreGraphics/ScreenCaptureKit/ServiceManagement/Vision。
+- macOS host 构建 macOS target 时，编译 `vision_bridge.m`、`autostart_bridge.m` 和
+  `app_runtime_bridge.m`，最低 macOS 14，并链接
+  AppKit/Foundation/CoreGraphics/ScreenCaptureKit/ServiceManagement/Vision。
 - 非原生 host 做 cross-check 时跳过必须依赖目标 SDK/resource compiler 的步骤，保证
   Rust 代码仍可检查。
 

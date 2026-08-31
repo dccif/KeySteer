@@ -101,27 +101,34 @@ fn macos_autostart_registers_the_keysteer_bundle_instead_of_open() {
 fn macos_status_item_is_created_once_after_appkit_launch() {
     let status_item = include_str!("../src/platform/macos/status_item.rs");
     let backend = include_str!("../src/platform/macos/mod.rs");
+    let runtime = include_str!("../src/platform/macos/app_runtime.rs");
+    let bridge = include_str!("../src/platform/macos/app_runtime_bridge.m");
+    let workspace = include_str!("../src/platform/macos/workspace.rs");
+    let build = include_str!("../build.rs");
     assert!(status_item.contains("NSSquareStatusItemLength"));
     assert!(!status_item.contains("NSVariableStatusItemLength"));
     assert!(status_item.contains("pub(super) fn prepare_application"));
-    let prepare = backend
-        .find("status_item::prepare_application(mtm);")
-        .expect("AppKit startup must be prepared");
-    let create = backend[prepare..]
-        .find("status_item::StatusItem::new(mtm")
-        .map(|offset| prepare + offset)
-        .expect("the status item must be created at the AppKit launch boundary");
-    let pump = backend[create..]
-        .find("workspace::pump_app_events();")
-        .map(|offset| create + offset)
-        .expect("AppKit must process one run-loop turn after status creation");
-    assert!(prepare < create && create < pump);
-    assert!(backend[create..].contains("let status_item = Some(status_item);"));
+    assert!(!status_item.contains("finishLaunching"));
+    assert!(runtime.contains("application_did_finish_launching_callback"));
+    assert!(runtime.contains("self.backend.install_status_item(mtm);"));
+    assert!(backend.contains("status_item: None"));
+    assert!(backend.contains("fn install_status_item"));
+    assert!(bridge.contains("applicationDidFinishLaunching:"));
+    assert!(bridge.contains("[NSApplication.sharedApplication run]"));
+    assert!(bridge.contains("kCFRunLoopAfterWaiting | kCFRunLoopBeforeWaiting"));
+    assert!(bridge.contains("CFRunLoopTimerCreate"));
+    assert!(build.contains("src/platform/macos/app_runtime_bridge.m"));
+    assert!(!workspace.contains("nextEventMatchingMask"));
+    assert!(!workspace.contains("pump_app_events"));
     assert!(!status_item.contains("button.window()"));
     assert!(!status_item.contains("rebuild_native_item"));
-    assert!(!status_item.contains("setAutosaveName"));
+    assert!(status_item.contains("STATUS_ITEM_AUTOSAVE_NAME"));
+    assert!(status_item.contains("setAutosaveName"));
+    assert!(status_item.contains("NSCellImagePosition::ImageOnly"));
     assert_eq!(status_item.matches("setVisible(true)").count(), 1);
     assert!(status_item.contains("let icon = status_icon(STATUS_ICON_SIZE);"));
+    assert!(status_item.contains("include_bytes!(\"../../../assets/icons/keysteer-icon.png\")"));
+    assert!(status_item.contains("image.setTemplate(false)"));
     assert!(!status_item.contains("NSApplicationActivationPolicy::Regular"));
     assert_eq!(status_item.matches("removeStatusItem").count(), 1);
 }
@@ -137,7 +144,10 @@ fn macos_tcc_fail_open_adds_no_per_event_stop_poll() {
         .expect("the macOS event-tap callback must remain inspectable");
     assert!(!callback.contains("stop.load"));
     assert!(callback.contains("signal_capture_loss"));
-    assert!(hook.contains("if !tap_state_processing_allowed(stopping)"));
+    assert!(hook.contains("CFRunLoop::run_current();"));
+    assert!(!hook.contains("RUN_LOOP_HEALTH_INTERVAL"));
+    assert!(!hook.contains("event_tap_is_healthy"));
+    assert!(hook.contains("event_tap_invalidated"));
 }
 
 #[test]

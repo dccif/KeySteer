@@ -13,7 +13,7 @@ const PER_FILE_BUDGET: &[(&str, usize)] = &[
     ("src/platform/macos/native.rs", 6),
     ("src/platform/macos/overlay.rs", 6),
     ("src/platform/macos/permissions.rs", 5),
-    ("src/platform/macos/status_item.rs", 3),
+    ("src/platform/macos/status_item.rs", 4),
     ("src/platform/macos/vision.rs", 5),
     ("src/platform/windows/accessibility.rs", 33),
     ("src/platform/windows/autostart.rs", 4),
