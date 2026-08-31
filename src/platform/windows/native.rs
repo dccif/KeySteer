@@ -106,7 +106,7 @@ impl Drop for ScreenDc {
 
         // SAFETY: this is the exact desktop DC acquired by `ScreenDc::acquire`.
         if unsafe { ReleaseDC(None, self.0) } == 0 {
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "windows-native",
                 "ReleaseDC failed for visual capture",
             );
@@ -166,7 +166,7 @@ impl GdiDibSurface {
                 Ok(bitmap) => bitmap,
                 Err(error) => {
                     if !DeleteDC(memory).as_bool() {
-                        crate::app::logging::report_error(
+                        crate::support::logging::report_error(
                             "windows-native",
                             "cannot delete failed GDI capture DC",
                         );
@@ -176,13 +176,13 @@ impl GdiDibSurface {
             };
             let Some(bits) = NonNull::new(raw_bits.cast::<u8>()) else {
                 if !DeleteObject(HGDIOBJ(bitmap.0)).as_bool() {
-                    crate::app::logging::report_error(
+                    crate::support::logging::report_error(
                         "windows-native",
                         "cannot delete null-buffer GDI capture bitmap",
                     );
                 }
                 if !DeleteDC(memory).as_bool() {
-                    crate::app::logging::report_error(
+                    crate::support::logging::report_error(
                         "windows-native",
                         "cannot delete null-buffer GDI capture DC",
                     );
@@ -192,13 +192,13 @@ impl GdiDibSurface {
             let previous = SelectObject(memory, HGDIOBJ(bitmap.0));
             if previous.0.is_null() || previous.0 as usize == usize::MAX {
                 if !DeleteObject(HGDIOBJ(bitmap.0)).as_bool() {
-                    crate::app::logging::report_error(
+                    crate::support::logging::report_error(
                         "windows-native",
                         "cannot delete unselected GDI capture bitmap",
                     );
                 }
                 if !DeleteDC(memory).as_bool() {
-                    crate::app::logging::report_error(
+                    crate::support::logging::report_error(
                         "windows-native",
                         "cannot delete unselected GDI capture DC",
                     );
@@ -321,16 +321,19 @@ impl Drop for GdiDibSurface {
             )
         };
         if restored.0.is_null() || restored.0 as usize == usize::MAX {
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "windows-native",
                 "cannot restore selected GDI capture object",
             );
         }
         if !bitmap_deleted {
-            crate::app::logging::report_error("windows-native", "cannot delete GDI capture bitmap");
+            crate::support::logging::report_error(
+                "windows-native",
+                "cannot delete GDI capture bitmap",
+            );
         }
         if !dc_deleted {
-            crate::app::logging::report_error("windows-native", "cannot delete GDI capture DC");
+            crate::support::logging::report_error("windows-native", "cannot delete GDI capture DC");
         }
     }
 }
@@ -466,7 +469,7 @@ fn software_bitmap_from_rows(
         Err(error) => {
             let error = format!("cannot lock SoftwareBitmap pixels: {error}");
             if let Err(close_error) = bitmap.Close() {
-                crate::app::logging::report_error(
+                crate::support::logging::report_error(
                     "windows-native",
                     format!("cannot close unlocked SoftwareBitmap: {close_error}"),
                 );
@@ -537,7 +540,7 @@ fn software_bitmap_from_rows(
             (Ok(()), Ok(())) => Ok(()),
             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
             (Err(error), Err(close_error)) => {
-                crate::app::logging::report_error("windows-native", close_error);
+                crate::support::logging::report_error("windows-native", close_error);
                 Err(error)
             }
         }
@@ -547,7 +550,7 @@ fn software_bitmap_from_rows(
         .map_err(|error| format!("cannot close SoftwareBitmap buffer: {error}"));
     let fail = |error| {
         if let Err(close_error) = bitmap.Close() {
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "windows-native",
                 format!("cannot close failed SoftwareBitmap: {close_error}"),
             );
@@ -558,7 +561,7 @@ fn software_bitmap_from_rows(
         (Ok(()), Ok(())) => Ok(bitmap),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => fail(error),
         (Err(error), Err(close_error)) => {
-            crate::app::logging::report_error("windows-native", close_error);
+            crate::support::logging::report_error("windows-native", close_error);
             fail(error)
         }
     }
@@ -755,7 +758,7 @@ impl Drop for OwnedModule {
         // SAFETY: this guard uniquely owns the successful LoadLibraryExW
         // result and is destroyed only after all exported pointers are dead.
         if let Err(error) = unsafe { FreeLibrary(self.0) } {
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "windows-native",
                 format!("cannot unload WeChat OCR bridge: {error}"),
             );

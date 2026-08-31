@@ -27,7 +27,7 @@ use windows_future::{
 };
 
 use crate::api::geometry::{Rect, UiTarget};
-use crate::app::worker::WorkerJoin;
+use crate::support::worker::WorkerJoin;
 
 use super::vision::{CaptureGeometry, image_to_desktop, valid_target_rect};
 
@@ -236,7 +236,7 @@ impl WechatOcr {
 impl Drop for WechatOcr {
     fn drop(&mut self) {
         if let Err(error) = self.shutdown() {
-            crate::app::logging::report_error("windows-vision", error);
+            crate::support::logging::report_error("windows-vision", error);
         }
     }
 }
@@ -249,7 +249,7 @@ struct Helper {
     reader: Option<WorkerJoin>,
     protocol_violation: Arc<AtomicBool>,
     stopped: bool,
-    _ledger: crate::app::perf_probe::ResourceGuard,
+    _ledger: crate::support::perf_probe::ResourceGuard,
 }
 
 struct StartingChild(Option<Child>);
@@ -277,7 +277,7 @@ impl Drop for StartingChild {
             Ok(Some(_)) => {}
             Ok(None) => {
                 if let Err(error) = child.kill() {
-                    crate::app::logging::report_error(
+                    crate::support::logging::report_error(
                         "windows-vision",
                         format!("cannot terminate unready WeChat OCR helper: {error}"),
                     );
@@ -285,17 +285,17 @@ impl Drop for StartingChild {
                 }
                 match child.try_wait() {
                     Ok(Some(_)) => {}
-                    Ok(None) => crate::app::logging::report_error(
+                    Ok(None) => crate::support::logging::report_error(
                         "windows-vision",
                         "unready WeChat OCR helper did not exit immediately after termination",
                     ),
-                    Err(error) => crate::app::logging::report_error(
+                    Err(error) => crate::support::logging::report_error(
                         "windows-vision",
                         format!("cannot query terminated WeChat OCR helper: {error}"),
                     ),
                 }
             }
-            Err(error) => crate::app::logging::report_error(
+            Err(error) => crate::support::logging::report_error(
                 "windows-vision",
                 format!("cannot query unready WeChat OCR helper: {error}"),
             ),
@@ -366,8 +366,8 @@ impl Helper {
             reader: Some(reader),
             protocol_violation,
             stopped: false,
-            _ledger: crate::app::perf_probe::ResourceGuard::new(
-                crate::app::perf_probe::ResourceKind::Helper,
+            _ledger: crate::support::perf_probe::ResourceGuard::new(
+                crate::support::perf_probe::ResourceKind::Helper,
             ),
         };
         let ready_deadline = deadline.min(Instant::now() + READY_TIMEOUT);
@@ -528,7 +528,7 @@ impl Helper {
 impl Drop for Helper {
     fn drop(&mut self) {
         if let Err(error) = self.shutdown() {
-            crate::app::logging::report_error("windows-vision", error);
+            crate::support::logging::report_error("windows-vision", error);
         }
     }
 }
@@ -569,7 +569,7 @@ struct TemporaryPng {
     owner: Option<File>,
     removed: bool,
     cleanup_delegated: bool,
-    _ledger: crate::app::perf_probe::ResourceGuard,
+    _ledger: crate::support::perf_probe::ResourceGuard,
 }
 
 impl TemporaryPng {
@@ -615,8 +615,8 @@ impl TemporaryPng {
             owner: Some(owner),
             removed: false,
             cleanup_delegated: false,
-            _ledger: crate::app::perf_probe::ResourceGuard::new(
-                crate::app::perf_probe::ResourceKind::TempFile,
+            _ledger: crate::support::perf_probe::ResourceGuard::new(
+                crate::support::perf_probe::ResourceKind::TempFile,
             ),
         };
         if let Err(error) = encode_png(bitmap, &temporary.path, deadline, cancelled) {
@@ -722,7 +722,7 @@ impl Drop for TemporaryPng {
         if let Err(error) = self.remove()
             && !self.cleanup_delegated
         {
-            crate::app::logging::report_error("windows-vision", error);
+            crate::support::logging::report_error("windows-vision", error);
         }
     }
 }
@@ -1535,8 +1535,8 @@ mod tests {
             owner: Some(owner),
             removed: false,
             cleanup_delegated: false,
-            _ledger: crate::app::perf_probe::ResourceGuard::new(
-                crate::app::perf_probe::ResourceKind::TempFile,
+            _ledger: crate::support::perf_probe::ResourceGuard::new(
+                crate::support::perf_probe::ResourceKind::TempFile,
             ),
         };
         temporary.remove().unwrap();

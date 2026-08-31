@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::api::{Binding, Key, KeyChord};
+use crate::api::{Binding, Key, KeyChord, KeyNameResolver};
 
 #[derive(Debug, Clone)]
 pub(super) struct CompiledBinding {
@@ -17,10 +17,10 @@ pub(super) struct CompiledKeymap {
 }
 
 impl CompiledKeymap {
-    pub fn compile(bindings: Vec<(String, Binding)>, aliases: &BTreeMap<String, String>) -> Self {
+    pub fn compile(bindings: Vec<(String, Binding)>, resolver: &KeyNameResolver) -> Self {
         let mut map = Self::default();
         for (text, binding) in bindings {
-            if let Ok(chord) = KeyChord::parse_with_aliases(&text, aliases) {
+            if let Ok(chord) = KeyChord::parse_with_resolver(&text, resolver) {
                 map.insert(chord, binding);
             }
         }
@@ -188,8 +188,9 @@ mod tests {
 
     #[test]
     fn custom_primary_side_is_enforced_by_the_compiled_keymap() {
-        let aliases = BTreeMap::from([("primary".into(), "left_alt".into())]);
-        let map = CompiledKeymap::compile(vec![("primary+e".into(), mode("normal"))], &aliases);
+        let resolver =
+            KeyNameResolver::from_resolved(BTreeMap::from([("primary".into(), "left_alt".into())]));
+        let map = CompiledKeymap::compile(vec![("primary+e".into(), mode("normal"))], &resolver);
         let e = Key::new("e").unwrap();
         let right = BTreeSet::from([Key::new("right_alt").unwrap(), e.clone()]);
         let left = BTreeSet::from([Key::new("left_alt").unwrap(), e.clone()]);
@@ -203,8 +204,9 @@ mod tests {
 
     #[test]
     fn generic_modifier_alias_accepts_both_physical_sides() {
-        let aliases = BTreeMap::from([("primary".into(), "alt".into())]);
-        let map = CompiledKeymap::compile(vec![("primary+e".into(), mode("normal"))], &aliases);
+        let resolver =
+            KeyNameResolver::from_resolved(BTreeMap::from([("primary".into(), "alt".into())]));
+        let map = CompiledKeymap::compile(vec![("primary+e".into(), mode("normal"))], &resolver);
         let e = Key::new("e").unwrap();
 
         for side in ["left_alt", "right_alt"] {
@@ -220,7 +222,7 @@ mod tests {
     fn strict_lookup_rejects_foreign_modifiers_but_accepts_owned_ones() {
         let map = CompiledKeymap::compile(
             vec![("h".into(), mode("normal")), ("alt+h".into(), mode("grid"))],
-            &BTreeMap::new(),
+            &KeyNameResolver::default(),
         );
         let h = Key::new("h").unwrap();
         let alt = Key::new("left_alt").unwrap();
@@ -247,7 +249,7 @@ mod tests {
     fn strict_lookup_allows_a_bare_parameterless_toggle_to_capture_a_modifier() {
         let map = CompiledKeymap::compile(
             vec![("n".into(), Binding::Toggle(Vec::new()))],
-            &BTreeMap::new(),
+            &KeyNameResolver::default(),
         );
         let n = Key::new("n").unwrap();
         let ctrl = Key::new("left_ctrl").unwrap();
@@ -265,7 +267,7 @@ mod tests {
                 ("n".into(), Binding::Toggle(Vec::new())),
                 ("ctrl+n".into(), mode("grid")),
             ],
-            &BTreeMap::new(),
+            &KeyNameResolver::default(),
         );
         let n = Key::new("n").unwrap();
         let ctrl = Key::new("left_ctrl").unwrap();
@@ -278,7 +280,10 @@ mod tests {
 
     #[test]
     fn disabled_binding_is_compiled_so_it_can_block_inheritance() {
-        let map = CompiledKeymap::compile(vec![("h".into(), Binding::Disabled)], &BTreeMap::new());
+        let map = CompiledKeymap::compile(
+            vec![("h".into(), Binding::Disabled)],
+            &KeyNameResolver::default(),
+        );
         let h = Key::new("h").unwrap();
         assert_eq!(
             map.lookup(&h, std::slice::from_ref(&h)),

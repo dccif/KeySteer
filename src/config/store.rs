@@ -6,10 +6,17 @@ use toml_edit::{DocumentMut, Item, Table};
 
 use super::{Config, ConfigError};
 
+pub type AtomicReplace = fn(&Path, &Path) -> std::io::Result<()>;
+
+fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
+}
+
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
     path: PathBuf,
     source: StoreSource,
+    atomic_replace: AtomicReplace,
 }
 
 #[derive(Debug, Clone)]
@@ -29,6 +36,14 @@ impl StoreSource {
 
 impl ConfigStore {
     pub fn open(path: impl Into<PathBuf>, fallback: &Config) -> Result<Self, ConfigError> {
+        Self::open_with(path, fallback, rename)
+    }
+
+    pub(crate) fn open_with(
+        path: impl Into<PathBuf>,
+        fallback: &Config,
+        atomic_replace: AtomicReplace,
+    ) -> Result<Self, ConfigError> {
         let path = path.into();
         let text = if path.is_file() {
             std::fs::read_to_string(&path)
@@ -37,15 +52,25 @@ impl ConfigStore {
             fallback.to_toml()?
         };
         Config::parse(&text)?;
-        Ok(Self::from_validated_text(path, text))
+        Ok(Self::from_validated_text_with(path, text, atomic_replace))
     }
 
+    #[cfg(test)]
     pub(crate) fn from_validated_text(path: impl Into<PathBuf>, text: String) -> Self {
+        Self::from_validated_text_with(path, text, rename)
+    }
+
+    pub(crate) fn from_validated_text_with(
+        path: impl Into<PathBuf>,
+        text: String,
+        atomic_replace: AtomicReplace,
+    ) -> Self {
         // The caller already parsed and validated this exact source. Keep the
         // compact text and defer the comment-preserving AST until the first edit.
         Self {
             path: path.into(),
             source: StoreSource::Raw(text),
+            atomic_replace,
         }
     }
 
@@ -96,7 +121,7 @@ impl ConfigStore {
         let text = candidate.to_string();
         let config = Config::parse(&text)?;
         config.validate()?;
-        atomic_write(&self.path, text.as_bytes())?;
+        atomic_write(&self.path, text.as_bytes(), self.atomic_replace)?;
         self.source = StoreSource::Parsed(candidate);
         Ok(config)
     }
@@ -120,7 +145,11 @@ fn set_item(table: &mut Table, path: &[&str], value: Item) -> Result<(), ConfigE
     set_item(child, tail, value)
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
+fn atomic_write(
+    path: &Path,
+    bytes: &[u8],
+    atomic_replace: AtomicReplace,
+) -> Result<(), ConfigError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent).map_err(|e| {
         ConfigError::Io(format!(
@@ -132,7 +161,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
     std::fs::write(&temp, bytes)
         .map_err(|e| ConfigError::Io(format!("cannot write {}: {e}", temp.display())))?;
 
-    crate::platform::atomic_replace(&temp, path)
+    atomic_replace(&temp, path)
         .map_err(|e| ConfigError::Io(format!("cannot replace {}: {e}", path.display())))?;
 
     Ok(())

@@ -5,7 +5,6 @@
 //! [`Command`]s. It never touches a platform API, which is what makes the
 //! built-in modes and third-party plugins interchangeable.
 
-use std::any::Any;
 use std::iter::FusedIterator;
 use std::ops::Index;
 use std::sync::Arc;
@@ -17,6 +16,7 @@ use super::binding::{ActionSequence, Binding};
 use super::geometry::{Point, Rect, Screen, UiTarget};
 use super::input::{Key, KeyState, ModeId};
 use super::overlay::{Color, OverlayScene};
+use super::settings::RuntimeSettings;
 use super::theme::Palette;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -495,7 +495,7 @@ pub enum ModeEvent {
     Timer { id: String, elapsed: Duration },
 
     /// The configuration was reloaded; re-read anything cached.
-    ConfigReloaded,
+    SettingsChanged,
 }
 
 /// Identity of the focused application, for per-app configuration.
@@ -604,27 +604,6 @@ pub struct UiScanResult {
     pub status: UiScanStatus,
 }
 
-/// Type-erased, read-only application settings exposed to modes.
-///
-/// The public API does not depend on a concrete configuration format. Built-in
-/// modes may downcast to the host's settings type during reconfiguration, while
-/// third-party plugins can remain independent of it.
-pub trait HostSettings: Any + Send + Sync {
-    fn as_any(&self) -> &dyn Any;
-}
-
-impl<T: Any + Send + Sync> HostSettings for T {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-impl dyn HostSettings + '_ {
-    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
-        self.as_any().downcast_ref()
-    }
-}
-
 /// Read-only view of host state, passed to a mode on every dispatch.
 #[derive(Clone)]
 pub struct HostContext<'a> {
@@ -632,7 +611,7 @@ pub struct HostContext<'a> {
     pub cursor: Point,
     pub focused_app: Option<&'a FocusedApp>,
     pub palette: &'a Palette,
-    pub config: &'a dyn HostSettings,
+    pub settings: &'a RuntimeSettings,
 }
 
 impl std::fmt::Debug for HostContext<'_> {
@@ -643,7 +622,7 @@ impl std::fmt::Debug for HostContext<'_> {
             .field("cursor", &self.cursor)
             .field("focused_app", &self.focused_app)
             .field("palette", &self.palette)
-            .field("config", &"<host settings>")
+            .field("settings", &"<runtime settings>")
             .finish()
     }
 }

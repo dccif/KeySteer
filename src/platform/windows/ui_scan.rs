@@ -15,9 +15,9 @@ use crate::api::command::UiScanStatus;
 #[cfg(test)]
 use crate::api::geometry::Rect;
 use crate::api::geometry::UiTarget;
-use crate::platform::partial_batcher::PartialBatcher;
-use crate::platform::scan_mailbox::ScanMailbox;
-use crate::platform::spatial_index::{SpatialIndex, rectangles_match};
+use crate::platform::common::partial_batcher::PartialBatcher;
+use crate::platform::common::scan_mailbox::ScanMailbox;
+use crate::platform::common::spatial_index::{SpatialIndex, rectangles_match};
 
 use super::EventSender;
 use super::accessibility::WindowsScanPlan;

@@ -1,13 +1,13 @@
 //! Application bootstrap and diagnostics.
 
-use crate::api::Key;
 use crate::config::{Config, ConfigStore};
-use crate::{Engine, modes, platform, plugins};
+use crate::{modes, platform, plugins, runtime::Engine};
 
 use super::cli::CliOptions;
+use super::config_repository;
 
 pub(crate) fn run(args: CliOptions) -> Result<(), String> {
-    crate::app::perf_probe::mark("bootstrap_started");
+    crate::support::perf_probe::mark("bootstrap_started");
     let rediscover_config_on_reload = args.config.is_none();
     let (config, config_path, loaded_from_file, config_source) = match &args.config {
         Some(name) => {
@@ -21,7 +21,7 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
                 ));
             }
             let path = crate::app::paths::explicit_config_file(name)?;
-            let loaded = Config::load_with_source(&path).map_err(|e| e.to_string())?;
+            let loaded = config_repository::load_with_source(&path).map_err(|e| e.to_string())?;
             (
                 loaded.config,
                 Some(loaded.path),
@@ -29,8 +29,8 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
                 Some(loaded.raw_text),
             )
         }
-        None => match Config::discover() {
-            Ok(Some(path)) => match Config::load_with_source(&path) {
+        None => match config_repository::discover() {
+            Ok(Some(path)) => match config_repository::load_with_source(&path) {
                 Ok(loaded) => (
                     loaded.config,
                     Some(loaded.path),
@@ -38,28 +38,43 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
                     Some(loaded.raw_text),
                 ),
                 Err(error) => {
-                    crate::app::logging::report_error(
+                    crate::support::logging::report_error(
                         "config",
                         format!(
                             "could not apply {}; using built-in defaults: {error}",
                             path.display()
                         ),
                     );
-                    (Config::default(), Config::default_write_path(), false, None)
+                    (
+                        Config::default(),
+                        config_repository::default_write_path(),
+                        false,
+                        None,
+                    )
                 }
             },
-            Ok(None) => (Config::default(), Config::default_write_path(), false, None),
+            Ok(None) => (
+                Config::default(),
+                config_repository::default_write_path(),
+                false,
+                None,
+            ),
             Err(error) => {
-                crate::app::logging::report_error(
+                crate::support::logging::report_error(
                     "config",
                     format!("could not discover configuration; using built-in defaults: {error}"),
                 );
-                (Config::default(), Config::default_write_path(), false, None)
+                (
+                    Config::default(),
+                    config_repository::default_write_path(),
+                    false,
+                    None,
+                )
             }
         },
     };
-    crate::app::logging::set_non_error_enabled(config.debug.enabled);
-    crate::app::logging::start_session();
+    crate::support::logging::set_non_error_enabled(config.debug.enabled);
+    crate::support::logging::start_session(platform::backend_name());
     if loaded_from_file {
         let path = config_path.as_deref().ok_or_else(|| {
             "configuration loader reported a file without retaining its path".to_string()
@@ -109,8 +124,12 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
     let store = if let Some(config_path) = config_path {
         Some(
             match config_source {
-                Some(source) => Ok(ConfigStore::from_validated_text(config_path, source)),
-                None => ConfigStore::open(config_path, &config),
+                Some(source) => Ok(ConfigStore::from_validated_text_with(
+                    config_path,
+                    source,
+                    platform::atomic_replace,
+                )),
+                None => ConfigStore::open_with(config_path, &config, platform::atomic_replace),
             }
             .map_err(|e| e.to_string())?,
         )
@@ -119,18 +138,20 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
     };
 
     let mut backend = platform::backend_for_ui_scan(config.ui_hint.strategy)?;
-    crate::app::perf_probe::mark("backend_created");
+    crate::support::perf_probe::mark("backend_created");
     let mut engine = Engine::new(config, backend.appearance());
+    engine.attach_config_simulator(super::config_simulator::url_for_config);
     if let Some(store) = store {
-        if rediscover_config_on_reload {
+        let repository = if rediscover_config_on_reload {
             if let Some(directory) = crate::app::paths::data_dir() {
-                engine.attach_discovered_config_store(store, directory);
+                config_repository::ConfigRepository::discovered(store, directory)
             } else {
-                engine.attach_config_store(store);
+                config_repository::ConfigRepository::fixed(store)
             }
         } else {
-            engine.attach_config_store(store);
-        }
+            config_repository::ConfigRepository::fixed(store)
+        };
+        engine.attach_config_repository(Box::new(repository));
     }
 
     for mode in built_in_modes {
@@ -153,7 +174,7 @@ fn log_debug_configuration(config: &Config, config_path: Option<&std::path::Path
     let config_path = config_path
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "<built-in; writes disabled>".to_string());
-    crate::app::logging::debug_args(
+    crate::support::logging::debug_args(
         "config",
         format_args!(
             "debug enabled; config={} backend={}",
@@ -161,13 +182,13 @@ fn log_debug_configuration(config: &Config, config_path: Option<&std::path::Path
             platform::backend_name()
         ),
     );
-    if let Ok(primary) = Key::new_with_aliases("primary", config.resolved_key_aliases()) {
-        crate::app::logging::debug_args(
+    if let Ok(primary) = config.key_name_resolver().key("primary") {
+        crate::support::logging::debug_args(
             "config",
             format_args!("primary resolves to {primary:?} for this configuration"),
         );
     }
-    crate::app::logging::debug_args(
+    crate::support::logging::debug_args(
         "config",
         format_args!(
             "categories: keys={} actions={} modes={} backend={} pointer={} motion={} overlay={} timers={}",
@@ -186,7 +207,7 @@ fn log_debug_configuration(config: &Config, config_path: Option<&std::path::Path
 fn doctor(config: &Config) -> Result<(), String> {
     println!("KeySteer {}", env!("CARGO_PKG_VERSION"));
     println!("backend: {}", platform::backend_name());
-    if let Some(path) = crate::app::logging::path() {
+    if let Some(path) = crate::support::logging::path() {
         println!("log:     {}", path.display());
     }
 
@@ -202,7 +223,10 @@ fn doctor(config: &Config) -> Result<(), String> {
     );
 
     let screens = backend.screens().unwrap_or_else(|error| {
-        crate::app::logging::report_error("doctor", format!("cannot enumerate screens: {error}"));
+        crate::support::logging::report_error(
+            "doctor",
+            format!("cannot enumerate screens: {error}"),
+        );
         Vec::new()
     });
     println!("screens:  {} detected", screens.len());

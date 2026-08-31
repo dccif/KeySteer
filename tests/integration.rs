@@ -11,7 +11,7 @@ use keysteer::api::{
     Rect, Screen, UiScanStrategy,
 };
 use keysteer::config::{Config, LifecycleAction, TargetingLifecycle};
-use keysteer::{Engine, modes, plugins};
+use keysteer::{modes, plugins, runtime::Engine};
 
 fn screens() -> Vec<Screen> {
     vec![Screen {
@@ -100,9 +100,9 @@ fn macos_autostart_registers_the_keysteer_bundle_instead_of_open() {
 #[test]
 fn macos_top_status_item_stays_inside_the_backend() {
     let status_item = include_str!("../src/platform/macos/status_item.rs");
-    let backend = include_str!("../src/platform/macos/mod.rs");
+    let backend = include_str!("../src/platform/macos.rs");
     let bootstrap = include_str!("../src/app/bootstrap.rs");
-    let runtime = include_str!("../src/app/runtime/mod.rs");
+    let runtime = include_str!("../src/runtime.rs");
     let workspace = include_str!("../src/platform/macos/workspace.rs");
     let build = include_str!("../build.rs");
 
@@ -172,7 +172,7 @@ fn macos_top_status_item_stays_inside_the_backend() {
 
 #[test]
 fn macos_shutdown_releases_input_before_waiting_for_workers() {
-    let backend = include_str!("../src/platform/macos/mod.rs");
+    let backend = include_str!("../src/platform/macos.rs");
     let shutdown = backend
         .split_once("fn shutdown_resources(&mut self)")
         .map(|(_, body)| body)
@@ -432,7 +432,7 @@ fn every_targeting_mode_returns_to_idle_on_escape() {
             cursor: Point::new(960.0, 540.0),
             focused_app: None,
             palette: &palette,
-            config: &config,
+            settings: &config,
         };
 
         mode.handle(&ModeEvent::Activated { previous: None }, &ctx);
@@ -462,7 +462,7 @@ fn a_grid_overlay_covers_the_active_screen_at_any_scale() {
         cursor: Point::new(960.0, 540.0),
         focused_app: None,
         palette: &palette,
-        config: &config,
+        settings: &config,
     };
 
     let mut grid = modes::GridMode::new(&config);
@@ -525,7 +525,7 @@ fn every_mode_has_a_binding_table_including_plugins() {
 fn windows_visual_capture_keeps_one_barrier_and_an_unscaled_copy_path() {
     let gpu = include_str!("../src/platform/windows/gpu_overlay.rs");
     let worker = include_str!("../src/platform/windows/overlay_worker.rs");
-    let native = include_str!("../src/platform/windows/native/mod.rs");
+    let native = include_str!("../src/platform/windows/native.rs");
 
     assert!(
         !gpu.contains("WaitForCommitCompletion"),

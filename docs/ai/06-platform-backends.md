@@ -7,17 +7,22 @@
 - Vision result 由 Rust RAII owner 释放，读取 slice 前验证 count<=2000 和非空指针。
 - COM apartment 显式 `!Send/!Sync`，确保 `CoUninitialize` 回到初始化线程。
 - 两个平台入口不放行 undocumented unsafe；每个最小块记录 `SAFETY` 契约。机械门禁当前为
-  不高于 220 个 unsafe expression/17 个文件，并同时禁止 `transmute`/`transmute_copy`；`domain` 与其余 portable 层使用编译期
+  不高于 220 个 unsafe expression/17 个文件，并同时禁止 `transmute`/`transmute_copy`；其余 portable 层使用编译期
   `forbid(unsafe_code)`/测试门禁保持零 unsafe。
 
 ## 共同契约
 
-两端都实现 `api::Backend`：poll、按键 disposition、屏幕/光标/前台应用、输入注入、
+两端都实现聚合 `api::Backend`，并具备 `EventPump`、`Input`、`Overlay`、`UiScan`、`Shell`
+能力视图：poll、按键 disposition、屏幕/光标/前台应用、输入注入、
 frame clock、overlay、UI scan、appearance、系统浏览器、状态栏开关和 autostart。目标后端由
-`src/platform/mod.rs` 在编译期选择。两端都跟踪本进程已注入的鼠标按钮状态；对已经按住
+`src/platform.rs` 在编译期选择。两端都跟踪本进程已注入的鼠标按钮状态；对已经按住
 的同一按钮再次请求 `Press` 必须幂等返回，不得向系统追加第二个 mouse-down。
 两端还实现动态 overlay 位置快路径；`None` 表示该层保持原位，跨屏、缩放或任何内容变化
 仍由完整 `present` 同步状态。
+
+跨平台扫描 mailbox、partial batcher、disposition mailbox 和 spatial index 位于
+`src/platform/common/`；latest-point mailbox 与 multi-click tracker 是 macOS 独占实现，位于
+`src/platform/macos/`。
 
 可失败的后台 owner 必须在显式 stop/join 成功后才从 Backend 中移除。`WorkerJoin` 超时会
 保留 handle 并转交显式 quarantine；backend poll 先检查非空原子标志，只有确有待回收线程
@@ -33,7 +38,7 @@ Web simulator URLs are passed directly to `ShellExecuteW` with the `open` verb.
 Do not route fragment-bearing URLs through `explorer.exe`: its command-line parser
 may open File Explorer instead of preserving the complete URL for the default browser.
 
-组合入口：`src/platform/windows/mod.rs`。
+组合入口：`src/platform/windows.rs`。
 
 ### 线程和事件
 
@@ -108,7 +113,7 @@ Windows 点击首先以完整 down/up 序列交给一次 `SendInput`；连续单
 
 `src/platform/macos/native.rs` owns Create/Copy-rule Core Foundation references in a pointer-sized, non-Clone wrapper. It neither retains nor allocates and replaces each former manual `CFRelease` one-for-one, including early-return cleanup.
 
-组合入口：`src/platform/macos/mod.rs`。Backend 必须在主线程创建，因为 AppKit status
+组合入口：`src/platform/macos.rs`。Backend 必须在主线程创建，因为 AppKit status
 item、window 和 display link 都有线程亲和性。
 
 ### 线程和事件
@@ -203,7 +208,7 @@ Retina 下快速重绘时文字基线出现单帧纵向抖动。
 
 ## 新增平台的最小边界
 
-新增 `src/platform/<os>/` 和 `platform/mod.rs` 的一个 cfg arm，实现 Backend。不要修改
+新增 `src/platform/<os>.rs`、对应子目录和 `platform.rs` 的一个 cfg arm，实现 Backend。不要修改
 Mode 以适配平台。配置中的 platform-specific 字段仍应在所有目标可反序列化，这样同一
 TOML 可跨平台复用，但只有对应 Backend 消费它。
 # Input and readiness latency invariants

@@ -29,7 +29,7 @@ pub struct Manifest {
     pub id: String,            // reverse-DNS 风格唯一 id，如 "com.example.zoom"
     pub name: String,          // 人类可读名称
     pub description: String,   // 一句话说明
-    pub api_version: u32,      // 必须等于 API_VERSION（当前 8）
+    pub api_version: u32,      // 必须等于 API_VERSION（当前 9）
     pub default_chords: Vec<KeyChord>,     // 直接激活插件模式的遗留组合键
     pub verbs: Vec<String>,                // 插件导出的带参动词
     pub default_bindings: Vec<(KeyChord, Binding)>, // 建议绑定（见下）
@@ -40,7 +40,7 @@ Manifest 提供链式构造方法：`Manifest::new(id, name).with_description(..
 
 **校验规则**（`Manifest::validate`，注册时宿主会校验）：
 
-- `api_version` 必须等于 `API_VERSION`（当前 `8`），否则整个插件被拒绝
+- `api_version` 必须等于 `API_VERSION`（当前 `9`），否则整个插件被拒绝
 
 ### API v8 overlay migration
 
@@ -103,7 +103,7 @@ share style through copy-on-write semantics.
 | `FocusChanged` / `ScreensChanged` / `ScreenRetargeted` | 应用 / 显示器拓扑变化 |
 | `UiScanned(UiScanResult)` | 一次 UI 扫描的结果 |
 | `Timer { id, elapsed }` | 自定义定时器到点 |
-| `ConfigReloaded` | 配置重载，需要刷新缓存的字段 |
+| `SettingsChanged` | 配置重载，需要刷新缓存的字段 |
 
 ### HostContext：只读的运行现场
 
@@ -138,11 +138,11 @@ temporary_mode_keys = ["primary"]
 插件在程序内部编译并注册（当前没有外部动态加载）：
 
 ```rust
-// src/plugins/mod.rs —— 内置插件统一在这里实例化。
+// src/plugins.rs —— 内置插件统一在这里实例化。
 // 别名解析失败会作为启动错误返回。
 pub fn bundled(config: &Config) -> Result<Vec<Box<dyn Plugin>>, String> {
-    Ok(vec![Box::new(ScreenSelector::with_key_aliases(
-        config.resolved_key_aliases(),
+    Ok(vec![Box::new(ScreenSelector::with_key_resolver(
+        config.key_name_resolver(),
     )?)])
 }
 
@@ -167,7 +167,7 @@ let manifest = Manifest::new("com.keysteer.screen-selector", "Screen Selector")
     .with_description("Switch displays directly or choose one from a numbered overlay")
     .with_verb(VERB);
 // primary+s 建议绑定为 "screen next"，不覆盖用户已有配置
-let manifest = match KeyChord::parse_with_aliases("primary+s", aliases) {
+let manifest = match KeyChord::parse_with_resolver("primary+s", resolver) {
     Ok(chord) => manifest.with_default_binding(chord, Binding::Invoke {
         verb: VERB.into(),
         args: vec!["next".into()],
@@ -180,9 +180,8 @@ let manifest = match KeyChord::parse_with_aliases("primary+s", aliases) {
 
 ```rust
 fn preserve(ctx: &HostContext<'_>) -> bool {
-    ctx.config
-        .downcast_ref::<Config>()
-        .and_then(|config| config.plugin_setting_bool(MODE_ID, "preserve"))
+    ctx.settings
+        .plugin_setting_bool(MODE_ID, "preserve")
         .unwrap_or(true)
 }
 ```

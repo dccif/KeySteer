@@ -450,11 +450,8 @@ impl Mode for NormalMode {
             ModeEvent::Resumed => {
                 Command::show_overlay(crate::api::overlay::OverlayScene::new()).into()
             }
-            ModeEvent::ConfigReloaded => {
-                let Some(config) = ctx.config.downcast_ref::<Config>() else {
-                    return CommandBatch::new();
-                };
-                *self = Self::new(config);
+            ModeEvent::SettingsChanged => {
+                *self = Self::new(ctx.settings);
                 CommandBatch::new()
             }
             _ => CommandBatch::new(),
@@ -508,7 +505,7 @@ mod tests {
                 cursor: Point::new(500.0, 400.0),
                 focused_app: None,
                 palette: &self.palette,
-                config: &self.config,
+                settings: &self.config,
             }
         }
     }
@@ -562,7 +559,7 @@ mod tests {
         config.normal.passthrough_unbound_keys = false;
         let env = Env::with(config);
 
-        let _ = mode.handle(&ModeEvent::ConfigReloaded, &env.ctx());
+        let _ = mode.handle(&ModeEvent::SettingsChanged, &env.ctx());
 
         assert!(mode.captures_keyboard());
     }

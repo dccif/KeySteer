@@ -44,8 +44,8 @@ use windows::core::{BOOL, Interface};
 use super::ui_scan::ScanSource;
 use crate::api::command::{UiScanRequest, UiScanStatus};
 use crate::api::geometry::{Rect, UiTarget};
-use crate::app::worker::WorkerJoin;
-use crate::platform::partial_batcher::PartialBatcher;
+use crate::platform::common::partial_batcher::PartialBatcher;
+use crate::support::worker::WorkerJoin;
 
 const PARTIAL_BATCH_SIZE: usize = 24;
 const MAX_TARGETS: usize = 2_000;
@@ -256,7 +256,7 @@ impl Drop for UiAutomationWorker {
             return;
         }
         if let Err(error) = self.stop() {
-            crate::app::logging::report_error("windows-uia", &error);
+            crate::support::logging::report_error("windows-uia", &error);
         }
     }
 }
@@ -385,8 +385,8 @@ fn worker_main(shared: Arc<SharedQueue>, thread_id: Arc<AtomicU32>) {
             return;
         }
     };
-    crate::app::perf_probe::mark("uia_prewarm_ready");
-    crate::app::perf_probe::mark("uia_ready");
+    crate::support::perf_probe::mark("uia_prewarm_ready");
+    crate::support::perf_probe::mark("uia_ready");
 
     let mut configured_timeout = None;
     while let Some(job) = next_job(&shared) {

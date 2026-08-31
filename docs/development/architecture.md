@@ -41,14 +41,17 @@ flowchart TB
 
 | 目录 | 负责什么 | 从哪里开始读 |
 | --- | --- | --- |
-| `src/api/` | 跨平台公共协议：按键、绑定、命令、事件、覆盖层、插件和后端 trait | `api/mod.rs`、`api/binding.rs`、`api/command.rs` |
-| `src/config/` | TOML 反序列化、默认值、校验、主题、继承和原子写入 | `config/mod.rs`、`config/store.rs` |
-| `src/app/` | CLI、路径、日志、启动组装和运行时编排 | `app/bootstrap.rs`、`app/runtime/mod.rs` |
+| `src/api/` | 跨平台公共协议：按键、绑定、命令、事件、覆盖层、插件和后端 trait | `api.rs`、`api/binding.rs`、`api/command.rs` |
+| `src/config/` | TOML 反序列化、默认值、校验、主题和继承；路径发现由 app 仓储负责 | `config.rs`、`config/store.rs` |
+| `src/support/` | 日志、错误聚合、worker join 和性能探针 | `support/logging.rs`、`support/worker.rs` |
+| `src/app/` | CLI、路径、配置仓储和启动组装 | `app/bootstrap.rs`、`app/config_repository.rs` |
+| `src/runtime.rs`、`src/runtime/` | Engine、输入路由、命令执行和 overlay 协调 | `runtime/input_router.rs`、`runtime/overlay_coordinator.rs` |
 | `src/modes/` | `idle`、`normal`、`grid`、`recursive_grid`、`ui_hint` 状态机 | 对应的 `.rs` 文件 |
-| `src/domain/hints/` | UI 标签分配、匹配和网格算法 | `labels.rs`、`matcher.rs` |
+| `src/modes/hint/` | UI Hint 私有标签与视觉分层算法 | `labeling.rs`、`matching.rs`、`view.rs` |
 | `src/plugins/` | 内置插件；也是插件的参考实现 | `builtin/screen_selector.rs` |
-| `src/platform/windows/` | Win32 Hook、SendInput、UIA、覆盖层、帧时钟和托盘 | `mod.rs` |
-| `src/platform/macos/` | CGEventTap、Core Graphics、AX、Vision、AppKit 和顶部状态项 | `mod.rs` |
+| `src/platform/common/` | mailbox、partial batcher 与 spatial index | `platform/common.rs` |
+| `src/platform/windows/` | Win32 Hook、SendInput、UIA、覆盖层、帧时钟和托盘 | `platform/windows.rs` |
+| `src/platform/macos/` | CGEventTap、Core Graphics、AX、Vision、AppKit 和顶部状态项 | `platform/macos.rs` |
 
 `src/lib.rs` 暴露公共 API；`src/main.rs` 只负责进入 CLI 和启动流程。平台后端由 `cfg(target_os)` 在编译期选择。
 

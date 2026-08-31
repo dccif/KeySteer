@@ -925,7 +925,7 @@ impl Drop for OwnedFont {
         // SAFETY: this HFONT came from CreateFontW and this guard is its sole
         // owner, so DeleteObject is called exactly once.
         if !unsafe { DeleteObject(self.0.into()) }.as_bool() {
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "windows-overlay",
                 "DeleteObject(font) failed during drop",
             );
@@ -1008,7 +1008,7 @@ impl TextRasterizer {
             // the color/background operations do not retain pointers.
             unsafe {
                 if SetBkMode(scratch.dc(), TRANSPARENT) == 0 {
-                    crate::app::logging::report_error(
+                    crate::support::logging::report_error(
                         "windows-overlay",
                         "SetBkMode failed while drawing text",
                     );
@@ -1173,7 +1173,7 @@ impl Default for Overlay {
 impl Drop for Overlay {
     fn drop(&mut self) {
         if let Err(error) = self.dismiss() {
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "windows-overlay",
                 format!("cannot destroy overlay during drop: {error}"),
             );

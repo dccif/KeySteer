@@ -76,7 +76,7 @@ settings；不能注入输入、创建窗口或直接扫描 UI。
 ### UI Hint (`src/modes/hint.rs`)
 
 - 激活后发送 `ScanUi`；按 scan id 接收多个 Partial 和一个终态。
-- 累积/去重 `UiTarget`，使用 `domain/hints` 重新分配短标签。
+- 累积/去重 `UiTarget`，使用 `modes/hint/labeling` 重新分配短标签。
 - 普通输入筛 label prefix；`/` 进入 accessible-name 搜索。
 - Partial 始终在 UIA/Vision 合并、去重、重新分配短标签后立即显示，并按累计发布批次用完整
   当前集合替换视觉计划。扫描期间 Shift 只读取已准备层号；晚到来源会触发完整集合重建，
@@ -100,7 +100,9 @@ settings；不能注入输入、创建窗口或直接扫描 UI。
 
 ## Finish 不是 Mode
 
-Finish 是当前 targeting session 的幂等完成态：
+Finish 是当前 targeting session 的幂等完成态。Grid、Recursive Grid 和 UI Hint 共享
+`modes/targeting.rs::TargetingSession` 保存 return mode/finished，并由同一处映射
+keep/restart/return/click 生命周期动作：
 
 1. 自然选择终点或 `finish` verb 产生 `FinishRequested`。
 2. Mode 设置 `finished = true`，保留最终目标/路径并绘制 finished scene。

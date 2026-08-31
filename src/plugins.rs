@@ -16,7 +16,7 @@ use crate::config::Config;
 
 /// Instantiate the bundled plugins.
 pub fn bundled(config: &Config) -> Result<Vec<Box<dyn Plugin>>, String> {
-    Ok(vec![Box::new(ScreenSelector::with_key_aliases(
-        config.resolved_key_aliases(),
+    Ok(vec![Box::new(ScreenSelector::with_key_resolver(
+        config.key_name_resolver(),
     )?)])
 }

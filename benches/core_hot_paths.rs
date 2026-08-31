@@ -7,10 +7,11 @@ use keysteer::api::{
     Appearance, Binding, Direction, HostContext, KeyState, LabelDirection, Mode, Rect, Screen,
     UiScanResult, UiScanStatus, UiTarget,
 };
-use keysteer::domain::hints::assign_into;
+use keysteer::api::{Key, ModeEvent, Point};
+use keysteer::config::Config;
 use keysteer::modes::hint::HintMode;
+use keysteer::modes::hint::labeling::assign_into;
 use keysteer::modes::normal::NormalMode;
-use keysteer::{Config, Key, ModeEvent, Point};
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 
 #[global_allocator]
@@ -41,7 +42,7 @@ fn benchmark_hint_owned_delivery() -> Result<(), String> {
         cursor: Point::default(),
         focused_app: None,
         palette: &palette,
-        config: &config,
+        settings: &config,
     };
 
     for targets in [24, 64, 100, 128, 500, 2_000] {
@@ -165,7 +166,7 @@ fn benchmark_normal_frame() -> Result<(), String> {
         cursor: Point::default(),
         focused_app: None,
         palette: &palette,
-        config: &config,
+        settings: &config,
     };
     let mut mode = NormalMode::new(&config);
     let _ = mode.handle(

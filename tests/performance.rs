@@ -7,9 +7,10 @@ use keysteer::api::{
     Appearance, Binding, Command, CommandBatch, Direction, HostContext, KeyState, LabelDirection,
     Mode, Rect,
 };
-use keysteer::domain::hints::assign_into;
+use keysteer::api::{Key, ModeEvent, Point};
+use keysteer::config::Config;
+use keysteer::modes::hint::labeling::assign_into;
 use keysteer::modes::normal::NormalMode;
-use keysteer::{Config, Key, ModeEvent, Point};
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 
 #[global_allocator]
@@ -24,7 +25,7 @@ fn steady_normal_frames_do_not_allocate() {
         cursor: Point::default(),
         focused_app: None,
         palette: &palette,
-        config: &config,
+        settings: &config,
     };
     let mut mode = NormalMode::new(&config);
     let key = Key::new("l").unwrap();

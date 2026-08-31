@@ -8,7 +8,7 @@ KeySteer 的高优先级路径是“原生键盘回调必须立即决定这个�
 - 每个物理键的 key-down 与 key-up 必须保持同一归属；Mode 切换后，持续移动、滚动、速度修饰和临时模式键仍由最初 owner 收尾。
 - 鼠标按住、长按点击 Toggle、普通点击指示颜色、定时序列、扫描 owner、覆盖层和帧时钟都有明确的清理点：模式结束/切换、配置重载失败、禁用与进程退出。
 - Mode 和 plugin 不直接调用 Win32、AppKit、UIA 或 AX。它们只产生公共 `Command`，由 Engine 和 Backend 处理平台细节。
-- 便携层（`api`、`app`、`config`、`domain`、`modes`、`plugins`）保持 safe Rust；原生 FFI 集中在平台层，并由局部封装维持所有权、线程和指针不变量。
+- 便携层（`api`、`app`、`config`、`modes`、`plugins`、`runtime`、`support`）保持 safe Rust；原生 FFI 集中在平台层，并由局部封装维持所有权、线程和指针不变量。
 - Mode 的常见 0/1/2 命令结果使用 safe Rust `CommandBatch` 内联存储；不得为省去这次分配
   在公共 API 引入 `MaybeUninit`、裸指针或手写 drop。
 

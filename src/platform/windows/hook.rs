@@ -20,10 +20,10 @@ use crate::api::backend::{BackendEvent, KeyDisposition};
 use crate::api::command::{ButtonAction, MouseButton};
 use crate::api::geometry::Point;
 use crate::api::input::{InputEvent, Key, KeyState};
-use crate::app::worker::WorkerJoin;
+use crate::support::worker::WorkerJoin;
 
 use super::input;
-use crate::platform::disposition_mailbox::DispositionMailbox;
+use crate::platform::common::disposition_mailbox::DispositionMailbox;
 
 pub const TIMEOUT_WARNING: &str =
     "keyboard disposition timed out; the key was forwarded and the hook remained active";
@@ -129,7 +129,7 @@ impl InjectionRequest {
                         // that had a Down edge is safe even when Windows
                         // accepted none of them, and keeps late asynchronous
                         // failures from leaving a modifier latched.
-                        let mut release_failures = crate::app::errors::ErrorBundle::default();
+                        let mut release_failures = crate::support::errors::ErrorBundle::default();
                         for (key, state) in events.iter().rev() {
                             if *state != KeyState::Down {
                                 continue;
@@ -513,7 +513,7 @@ impl Drop for HookThread {
             return;
         }
         if let Err(error) = self.stop() {
-            crate::app::logging::report_error("windows-hook", &error);
+            crate::support::logging::report_error("windows-hook", &error);
         }
     }
 }
@@ -556,7 +556,7 @@ fn hook_thread(
         HOOK_THREAD.store(0, Ordering::Release);
         return;
     }
-    crate::app::perf_probe::mark("hook_ready");
+    crate::support::perf_probe::mark("hook_ready");
 
     let mut message = MSG::default();
     loop {
@@ -585,7 +585,7 @@ fn hook_thread(
                         event: BackendEvent::InputInjectionFailed(message.clone()),
                         generation: None,
                     }) {
-                        crate::app::logging::report_error("windows-input", message);
+                        crate::support::logging::report_error("windows-input", message);
                     }
                 }
             }
@@ -831,8 +831,8 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         injected: false,
         timestamp_millis: info.time as u64,
     });
-    let correlation_id = crate::app::perf_probe::next_correlation_id();
-    crate::app::perf_probe::mark_correlated_value(
+    let correlation_id = crate::support::perf_probe::next_correlation_id();
+    crate::support::perf_probe::mark_correlated_value(
         "hook_received",
         correlation_id,
         info.vkCode as isize,
@@ -848,7 +848,7 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     } else {
         KeyDisposition::Forward
     };
-    crate::app::perf_probe::mark_correlated("disposition_returned", correlation_id);
+    crate::support::perf_probe::mark_correlated("disposition_returned", correlation_id);
     let virtual_key = info.vkCode as u16;
     let mask_menu = FORWARDED_ALT.with(|alt| {
         let mut alt_state = alt.get();

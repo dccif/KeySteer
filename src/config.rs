@@ -15,16 +15,14 @@ pub mod store;
 pub mod style;
 pub mod theme;
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
-
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::api::backend::Appearance;
 use crate::api::binding::Binding;
 use crate::api::command::{ButtonAction, FocusedApp, MouseButton, UiScanStrategy, VisionOptions};
 use crate::api::input::{
-    Key, KeyChord, ModeId, normalize_alias_name, normalize_builtin_key, with_key_aliases,
+    Key, KeyChord, KeyNameResolver, ModeId, normalize_alias_name, normalize_builtin_key,
 };
 
 pub use crate::api::hint::LabelDirection;
@@ -303,13 +301,7 @@ pub struct Config {
     #[serde(default)]
     pub app_configs: Vec<AppOverride>,
     #[serde(skip)]
-    resolved_key_aliases: BTreeMap<String, String>,
-}
-
-pub(crate) struct LoadedConfig {
-    pub(crate) config: Config,
-    pub(crate) raw_text: String,
-    pub(crate) path: PathBuf,
+    key_name_resolver: KeyNameResolver,
 }
 
 impl Default for Config {
@@ -330,7 +322,7 @@ impl Default for Config {
             mode_indicator: ModeIndicator::default(),
             plugin_modes: default_plugin_modes(),
             app_configs: Vec::new(),
-            resolved_key_aliases: BTreeMap::new(),
+            key_name_resolver: KeyNameResolver::default(),
         };
         let aliases = match config
             .key_aliases
@@ -340,7 +332,7 @@ impl Default for Config {
             Ok(aliases) => aliases,
             Err(error) => panic!("built-in key aliases must be valid: {error}"),
         };
-        config.resolved_key_aliases = aliases;
+        config.key_name_resolver = KeyNameResolver::from_resolved(aliases);
         if let Err(error) = config.apply_configured_key_aliases() {
             panic!("built-in bindings must be valid: {error}");
         }
@@ -1392,7 +1384,7 @@ fn compile_key_aliases(
 fn normalize_binding_keys(
     table: &mut Bindings,
     label: &str,
-    aliases: &BTreeMap<String, String>,
+    resolver: &KeyNameResolver,
 ) -> Result<(), ConfigError> {
     let source = std::mem::take(table);
     for (text, binding) in source {
@@ -1403,11 +1395,9 @@ fn normalize_binding_keys(
             vec![text.as_str()]
         };
         for name in names {
-            let uses_alias = name
-                .split('+')
-                .any(|part| aliases.contains_key(&normalize_alias_name(part)));
+            let uses_alias = name.split('+').any(|part| resolver.contains_alias(part));
             let canonical = if uses_alias {
-                KeyChord::parse_with_aliases(name, aliases)
+                KeyChord::parse_with_resolver(name, resolver)
                     .map_err(|error| {
                         ConfigError::Parse(format!(
                             "{label} binding {name:?} is not a valid key or chord: {error}"
@@ -1439,88 +1429,69 @@ fn normalize_binding_keys(
     Ok(())
 }
 
-fn normalize_key_list(
-    keys: &mut [String],
-    aliases: &BTreeMap<String, String>,
-) -> Result<(), ConfigError> {
+fn normalize_key_list(keys: &mut [String], resolver: &KeyNameResolver) -> Result<(), ConfigError> {
     for key in keys {
-        normalize_key_if_aliased(key, aliases)?;
+        normalize_key_if_aliased(key, resolver)?;
     }
     Ok(())
 }
 
 fn normalize_key_if_aliased(
     key: &mut String,
-    aliases: &BTreeMap<String, String>,
+    resolver: &KeyNameResolver,
 ) -> Result<(), ConfigError> {
-    if aliases.contains_key(&normalize_alias_name(key)) {
-        *key = Key::new_with_aliases(&*key, aliases)
-            .map_err(ConfigError::Parse)?
-            .to_string();
+    if resolver.contains_alias(key) {
+        *key = resolver.key(&*key).map_err(ConfigError::Parse)?.to_string();
+    }
+    Ok(())
+}
+
+fn resolve_binding_values(
+    value: &mut toml::Value,
+    resolver: &KeyNameResolver,
+) -> Result<(), ConfigError> {
+    let toml::Value::Table(table) = value else {
+        return Ok(());
+    };
+    for (name, child) in table {
+        if matches!(name.as_str(), "hotkeys" | "bindings") {
+            let toml::Value::Table(bindings) = child else {
+                continue;
+            };
+            for (key, binding) in bindings {
+                match binding {
+                    toml::Value::String(text) => {
+                        *text = Binding::parse_with_resolver(text, resolver)
+                            .map_err(|error| {
+                                ConfigError::Parse(format!("binding {key:?} is invalid: {error}"))
+                            })?
+                            .canonical();
+                    }
+                    toml::Value::Array(actions) => {
+                        for action in actions {
+                            let toml::Value::String(text) = action else {
+                                continue;
+                            };
+                            *text = Binding::parse_with_resolver(text, resolver)
+                                .map_err(|error| {
+                                    ConfigError::Parse(format!(
+                                        "binding {key:?} is invalid: {error}"
+                                    ))
+                                })?
+                                .canonical();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            resolve_binding_values(child, resolver)?;
+        }
     }
     Ok(())
 }
 
 impl Config {
-    /// Locate the first config in the active application data directory.
-    ///
-    /// Portable configs are named `keysteer.<name>.toml`. User profiles sort
-    /// by name; the annotated `keysteer.default.toml` example is considered
-    /// only when no user profile exists.
-    pub fn discover() -> Result<Option<PathBuf>, ConfigError> {
-        let Some(directory) = crate::app::paths::data_dir() else {
-            return Ok(None);
-        };
-        Self::discover_in(&directory)
-    }
-
-    pub(crate) fn discover_in(directory: &Path) -> Result<Option<PathBuf>, ConfigError> {
-        let entries = match std::fs::read_dir(directory) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(ConfigError::Io(format!(
-                    "cannot enumerate {}: {error}",
-                    directory.display()
-                )));
-            }
-        };
-        let mut matches = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|error| {
-                ConfigError::Io(format!("cannot enumerate {}: {error}", directory.display()))
-            })?;
-            let file_type = entry.file_type().map_err(|error| {
-                ConfigError::Io(format!(
-                    "cannot inspect {}: {error}",
-                    entry.path().display()
-                ))
-            })?;
-            if file_type.is_file() && Self::is_portable_config_name(&entry.file_name()) {
-                matches.push(entry.path());
-            }
-        }
-        matches.sort_by(|left, right| {
-            let left_name = left
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_ascii_lowercase();
-            let right_name = right
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_ascii_lowercase();
-            let left_is_default = left_name == "keysteer.default.toml";
-            let right_is_default = right_name == "keysteer.default.toml";
-            left_is_default
-                .cmp(&right_is_default)
-                .then_with(|| left_name.cmp(&right_name))
-                .then_with(|| left.cmp(right))
-        });
-        Ok(matches.into_iter().next())
-    }
-
     pub(crate) fn is_portable_config_name(name: &std::ffi::OsStr) -> bool {
         let name = name.to_string_lossy().to_ascii_lowercase();
         name.strip_prefix("keysteer.")
@@ -1528,28 +1499,8 @@ impl Config {
             .is_some_and(|profile| !profile.is_empty())
     }
 
-    pub fn default_write_path() -> Option<PathBuf> {
-        crate::app::paths::data_file("keysteer.user.toml")
-    }
-
-    pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        Self::load_with_source(path).map(|loaded| loaded.config)
-    }
-
-    pub(crate) fn load_with_source(path: &Path) -> Result<LoadedConfig, ConfigError> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| ConfigError::Io(format!("cannot read {}: {e}", path.display())))?;
-        let config = Self::parse(&text)?;
-        config.validate()?;
-        Ok(LoadedConfig {
-            config,
-            raw_text: text,
-            path: path.to_path_buf(),
-        })
-    }
-
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        let value: toml::Value =
+        let mut value: toml::Value =
             toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
         let key_aliases = value
             .get("key_aliases")
@@ -1559,9 +1510,11 @@ impl Config {
             .map_err(|e| ConfigError::Parse(e.to_string()))?
             .unwrap_or_default();
         let aliases = compile_key_aliases(&key_aliases.effective()?)?;
-        let mut config: Self = with_key_aliases(&aliases, || Self::deserialize(value))
-            .map_err(|e| ConfigError::Parse(e.to_string()))?;
-        config.resolved_key_aliases = aliases;
+        let resolver = KeyNameResolver::from_resolved(aliases);
+        resolve_binding_values(&mut value, &resolver)?;
+        let mut config: Self =
+            Self::deserialize(value).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        config.key_name_resolver = resolver;
         config.apply_configured_key_aliases()?;
         Ok(config)
     }
@@ -1572,27 +1525,27 @@ impl Config {
     /// `v = "fast"` and `b = "fast"`. Chords still use `+`, so
     /// `primary+f` remains one binding.
     fn apply_configured_key_aliases(&mut self) -> Result<(), ConfigError> {
-        let aliases = self.resolved_key_aliases.clone();
-        normalize_binding_keys(&mut self.hotkeys, "[hotkeys]", &aliases)?;
-        normalize_binding_keys(&mut self.normal.bindings, "[normal.bindings]", &aliases)?;
-        normalize_binding_keys(&mut self.grid.bindings, "[grid.bindings]", &aliases)?;
+        let resolver = self.key_name_resolver.clone();
+        normalize_binding_keys(&mut self.hotkeys, "[hotkeys]", &resolver)?;
+        normalize_binding_keys(&mut self.normal.bindings, "[normal.bindings]", &resolver)?;
+        normalize_binding_keys(&mut self.grid.bindings, "[grid.bindings]", &resolver)?;
         normalize_binding_keys(
             &mut self.recursive_grid.bindings,
             "[recursive_grid.bindings]",
-            &aliases,
+            &resolver,
         )?;
-        normalize_binding_keys(&mut self.ui_hint.bindings, "[ui_hint.bindings]", &aliases)?;
+        normalize_binding_keys(&mut self.ui_hint.bindings, "[ui_hint.bindings]", &resolver)?;
         for (id, mode) in &mut self.plugin_modes {
             normalize_binding_keys(
                 &mut mode.bindings,
                 &format!("[plugin_modes.{id:?}.bindings]"),
-                &aliases,
+                &resolver,
             )?;
             for over in &mut mode.app_configs {
                 normalize_binding_keys(
                     &mut over.bindings,
                     &format!("[[plugin_modes.{id:?}.app_configs]] {:?}", over.bundle_id),
-                    &aliases,
+                    &resolver,
                 )?;
             }
         }
@@ -1609,7 +1562,7 @@ impl Config {
                 normalize_binding_keys(
                     &mut over.bindings,
                     &format!("{label} {:?}", over.bundle_id),
-                    &aliases,
+                    &resolver,
                 )?;
             }
         }
@@ -1617,25 +1570,25 @@ impl Config {
             normalize_binding_keys(
                 &mut over.bindings,
                 &format!("[[ui_hint.app_configs]] {:?}", over.bundle_id),
-                &aliases,
+                &resolver,
             )?;
         }
-        normalize_key_if_aliased(&mut self.ui_hint.overlap_cycle_key, &aliases)?;
+        normalize_key_if_aliased(&mut self.ui_hint.overlap_cycle_key, &resolver)?;
         for keys in [
             &mut self.grid.temporary_mode_keys,
             &mut self.recursive_grid.temporary_mode_keys,
             &mut self.ui_hint.temporary_mode_keys,
         ] {
-            normalize_key_list(keys, &aliases)?;
+            normalize_key_list(keys, &resolver)?;
         }
         for mode in self.plugin_modes.values_mut() {
-            normalize_key_list(&mut mode.temporary_mode_keys, &aliases)?;
+            normalize_key_list(&mut mode.temporary_mode_keys, &resolver)?;
         }
         Ok(())
     }
 
-    pub(crate) fn resolved_key_aliases(&self) -> &BTreeMap<String, String> {
-        &self.resolved_key_aliases
+    pub fn key_name_resolver(&self) -> &KeyNameResolver {
+        &self.key_name_resolver
     }
 
     pub fn to_toml(&self) -> Result<String, ConfigError> {
@@ -2315,49 +2268,6 @@ mod tests {
     }
 
     #[test]
-    fn default_write_path_uses_the_application_data_directory() {
-        let expected = crate::app::paths::data_file("keysteer.user.toml").unwrap();
-        assert_eq!(Config::default_write_path(), Some(expected));
-    }
-
-    #[test]
-    fn portable_discovery_is_filtered_and_deterministic() {
-        let directory = std::env::temp_dir().join(format!(
-            "keysteer-config-discovery-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&directory).unwrap();
-        for name in [
-            "keysteer.zebra.toml",
-            "keysteer.Alpha.toml",
-            "KEYSTEER.DEFAULT.TOML",
-            "keysteer..toml",
-            "config.toml",
-        ] {
-            std::fs::write(directory.join(name), "").unwrap();
-        }
-
-        assert_eq!(
-            Config::discover_in(&directory).unwrap(),
-            Some(directory.join("keysteer.Alpha.toml"))
-        );
-
-        std::fs::remove_file(directory.join("keysteer.Alpha.toml")).unwrap();
-        std::fs::remove_file(directory.join("keysteer.zebra.toml")).unwrap();
-        assert_eq!(
-            Config::discover_in(&directory).unwrap(),
-            Some(directory.join("KEYSTEER.DEFAULT.TOML")),
-            "the annotated default should remain a fallback when no user profile exists"
-        );
-
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
     fn user_key_alias_can_override_primary_with_one_physical_side() {
         let config = Config::parse(
             r#"
@@ -2375,7 +2285,7 @@ mod tests {
         assert!(config.hotkeys.contains_key("left_alt+e"));
         assert!(config.hotkeys.contains_key("alt+f"));
         assert!(config.hotkeys.contains_key("right_alt+g"));
-        assert_eq!(config.resolved_key_aliases()["primary"], "left_alt");
+        assert_eq!(config.key_name_resolver().aliases()["primary"], "left_alt");
     }
 
     #[test]
@@ -2405,7 +2315,10 @@ mod tests {
 
         assert!(config.hotkeys.contains_key("left_shift+e"));
         assert!(config.hotkeys.contains_key("right_ctrl+g"));
-        assert_eq!(config.resolved_key_aliases()["primary"], "left_shift");
+        assert_eq!(
+            config.key_name_resolver().aliases()["primary"],
+            "left_shift"
+        );
     }
 
     #[test]
@@ -2451,10 +2364,7 @@ mod tests {
         let reparsed = Config::parse(&config.to_toml().unwrap()).unwrap();
 
         assert_eq!(reparsed.key_aliases, config.key_aliases);
-        assert_eq!(
-            reparsed.resolved_key_aliases(),
-            config.resolved_key_aliases()
-        );
+        assert_eq!(reparsed.key_name_resolver(), config.key_name_resolver());
     }
 
     #[test]

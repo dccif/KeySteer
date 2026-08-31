@@ -79,7 +79,7 @@ mod tests {
                 cursor: Point::new(500.0, 400.0),
                 focused_app: None,
                 palette: &self.palette,
-                config: &self.config,
+                settings: &self.config,
             }
         }
     }
@@ -110,7 +110,7 @@ mod tests {
             },
             ModeEvent::PointerMoved(Point::new(1.0, 2.0)),
             ModeEvent::ScreensChanged(env.screens.clone()),
-            ModeEvent::ConfigReloaded,
+            ModeEvent::SettingsChanged,
             ModeEvent::Deactivated,
         ];
         for event in events {

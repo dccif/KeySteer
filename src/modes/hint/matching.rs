@@ -1,4 +1,5 @@
-use super::Hint;
+#[cfg(test)]
+use super::labeling::Hint;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Match<T> {
@@ -7,6 +8,7 @@ pub enum Match<T> {
     None,
 }
 
+#[cfg(test)]
 pub fn match_input<T: Clone>(hints: &[Hint<T>], input: &str) -> Match<T> {
     if input.is_empty() {
         return Match::Partial {
@@ -32,6 +34,7 @@ pub fn match_input<T: Clone>(hints: &[Hint<T>], input: &str) -> Match<T> {
 mod tests {
     use super::*;
     use crate::api::Rect;
+    use crate::modes::hint::labeling::Hint;
 
     fn hint(label: &str, value: usize) -> Hint<usize> {
         Hint {

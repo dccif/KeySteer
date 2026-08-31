@@ -4,11 +4,10 @@
 use crate::api::binding::Binding;
 use crate::api::command::{Command, CommandBatch, HostContext, Mode, ModeEvent};
 use crate::api::geometry::Rect;
-use crate::api::input::{KeyChord, KeyState, ModeId};
+use crate::api::input::{KeyChord, KeyNameResolver, KeyState, ModeId};
 use crate::api::overlay::{Color, LabelStyle, OverlayLabel, OverlayScene, OverlayShape, Placement};
 use crate::api::plugin::{Manifest, Plugin};
-use crate::config::{Config, Palette};
-use std::collections::BTreeMap;
+use crate::config::Palette;
 
 const MODE_ID: &str = "plugin:screen-selector";
 const VERB: &str = "screen";
@@ -25,14 +24,14 @@ pub struct ScreenSelector {
 
 impl ScreenSelector {
     pub fn new() -> Result<Self, String> {
-        Self::with_key_aliases(&BTreeMap::new())
+        Self::with_key_resolver(&KeyNameResolver::default())
     }
 
-    pub(crate) fn with_key_aliases(aliases: &BTreeMap<String, String>) -> Result<Self, String> {
+    pub(crate) fn with_key_resolver(resolver: &KeyNameResolver) -> Result<Self, String> {
         let manifest = Manifest::new("com.keysteer.screen-selector", "Screen Selector")
             .with_description("Switch displays directly or choose one from a numbered overlay")
             .with_verb(VERB);
-        let manifest = match KeyChord::parse_with_aliases("primary+s", aliases) {
+        let manifest = match KeyChord::parse_with_resolver("primary+s", resolver) {
             Ok(chord) => manifest.with_default_binding(
                 chord,
                 Binding::Invoke {
@@ -53,9 +52,8 @@ impl ScreenSelector {
     }
 
     fn preserve(ctx: &HostContext<'_>) -> bool {
-        ctx.config
-            .downcast_ref::<Config>()
-            .and_then(|config| config.plugin_setting_bool(MODE_ID, "preserve"))
+        ctx.settings
+            .plugin_setting_bool(MODE_ID, "preserve")
             .unwrap_or(true)
     }
 
@@ -268,6 +266,7 @@ impl Plugin for ScreenSelector {
 mod tests {
     use super::*;
     use crate::api::geometry::{Point, Screen};
+    use crate::config::Config;
 
     fn screen(x: f64, primary: bool) -> Screen {
         Screen {
@@ -301,7 +300,7 @@ mod tests {
                 cursor: self.cursor,
                 focused_app: None,
                 palette: &self.palette,
-                config: &self.config,
+                settings: &self.config,
             }
         }
     }
@@ -336,8 +335,11 @@ mod tests {
 
     #[test]
     fn manifest_honours_the_configured_primary_alias() {
-        let aliases = BTreeMap::from([("primary".into(), "left_alt".into())]);
-        let plugin = ScreenSelector::with_key_aliases(&aliases).unwrap();
+        let resolver = KeyNameResolver::from_resolved(std::collections::BTreeMap::from([(
+            "primary".into(),
+            "left_alt".into(),
+        )]));
+        let plugin = ScreenSelector::with_key_resolver(&resolver).unwrap();
         assert_eq!(
             plugin.manifest().default_bindings[0].0.canonical(),
             "left_alt+s"

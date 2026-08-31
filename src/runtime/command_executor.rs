@@ -176,7 +176,7 @@ impl Engine {
                     self.cancel_scans_for_owner(owner, backend)?;
                     self.dispatch(ModeEvent::FinishRequested { cause }, backend)?;
                 }
-                Command::RestartMode => self.restart_active(backend)?,
+                Command::RestartMode => self.transition(ModeTransition::Restart, backend)?,
                 Command::Scroll { dx, dy } => {
                     let (invert_horizontal, invert_vertical) =
                         self.config.effective_scroll_invert();
@@ -209,7 +209,7 @@ impl Engine {
                     if let Err(error) = backend.send_key(&key, state) {
                         return Err(self.recoverable_input_error("keyboard input", error));
                     }
-                    crate::app::perf_probe::mark("injection_executed");
+                    crate::support::perf_probe::mark("injection_executed");
                     self.recoverable_input_succeeded();
                 }
                 Command::SendChord { keys } => {
@@ -217,7 +217,7 @@ impl Engine {
                         self.latched.extend(keys.into_iter().map(InputTarget::Key));
                         return Err(self.recoverable_input_error("keyboard chord", error));
                     }
-                    crate::app::perf_probe::mark("injection_executed");
+                    crate::support::perf_probe::mark("injection_executed");
                     self.recoverable_input_succeeded();
                 }
 
@@ -237,7 +237,7 @@ impl Engine {
                         ..request
                     };
                     let request_id = request.id;
-                    crate::app::perf_probe::mark_value(
+                    crate::support::perf_probe::mark_value(
                         "scan_requested",
                         isize::try_from(request_id).unwrap_or(isize::MAX),
                     );
@@ -255,10 +255,18 @@ impl Engine {
                 Command::SwitchMode(id) => {
                     let previous = Some(self.active.clone());
                     self.modal_stack.clear();
-                    self.activate(id, previous, backend)?;
+                    self.transition(
+                        ModeTransition::Activate {
+                            target: id,
+                            previous,
+                        },
+                        backend,
+                    )?;
                 }
-                Command::PushMode(id) => self.push_mode(id, backend)?,
-                Command::PopMode => self.pop_mode(backend)?,
+                Command::PushMode(id) => {
+                    self.transition(ModeTransition::Push(id), backend)?;
+                }
+                Command::PopMode => self.transition(ModeTransition::Pop, backend)?,
                 Command::RetargetScreen { index, preserve } => {
                     let Some(screen) = self.screens.get(index).cloned() else {
                         crate::report_warning!(
@@ -300,10 +308,10 @@ impl Engine {
 
                 Command::SetConfigValue { path, value } => {
                     let update = self
-                        .config_store
+                        .config_repository
                         .as_mut()
                         .ok_or_else(|| "no writable configuration source is attached".to_string())
-                        .and_then(|store| store.set(&path, &value).map_err(|e| e.to_string()));
+                        .and_then(|repository| repository.set(&path, &value));
                     match update {
                         Ok(config) => {
                             self.apply_config(config)?;
@@ -342,7 +350,7 @@ impl Engine {
                 self.recoverable_input_error(&format!("mouse button {button:?} {action:?}"), error)
             );
         }
-        crate::app::perf_probe::mark("injection_executed");
+        crate::support::perf_probe::mark("injection_executed");
         self.recoverable_input_succeeded();
         Ok(())
     }

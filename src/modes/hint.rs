@@ -10,6 +10,11 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+#[doc(hidden)]
+pub mod labeling;
+mod matching;
+mod view;
+
 use smallvec::SmallVec;
 
 use crate::api::binding::Binding;
@@ -24,7 +29,11 @@ use crate::api::overlay::{
 };
 use crate::config::style::AUTO;
 use crate::config::{Config, Palette, UiHint as HintsConfig};
-use crate::hints::{self, CompactHint, Match, VisualLayerPlan, build_visual_layer_plan};
+use labeling::{CompactHint, assign_compact_into};
+use matching::Match;
+use view::{VisualLayerPlan, build_visual_layer_plan};
+
+use super::targeting::TargetingSession;
 
 const SCAN_RETRY_TIMER_ID: &str = "ui_hint.scan_retry";
 const NO_WINDOW_UNDER_POINTER: &str =
@@ -79,7 +88,7 @@ pub struct HintMode {
     input: Input,
     scanning: bool,
     status: Option<String>,
-    return_mode: ModeId,
+    session: TargetingSession,
     scan_id: u64,
     retry_attempt: u32,
     retry_pending: bool,
@@ -96,7 +105,6 @@ pub struct HintMode {
     /// labels immediately would invalidate keys already visible to the user.
     pending_relabel: bool,
     selected: Option<usize>,
-    finished: bool,
     /// Prevent late asynchronous scan results from reviving an inactive mode.
     active: bool,
 }
@@ -120,7 +128,7 @@ impl HintMode {
             input: Input::Labels(OverlayText::default()),
             scanning: false,
             status: None,
-            return_mode: ModeId::idle(),
+            session: TargetingSession::default(),
             scan_id: 0,
             retry_attempt: 0,
             retry_pending: false,
@@ -131,7 +139,6 @@ impl HintMode {
             wide_placements: None,
             pending_relabel: false,
             selected: None,
-            finished: false,
             active: false,
         }
     }
@@ -187,7 +194,7 @@ impl HintMode {
         self.clear_scan_results(false);
         self.input = Input::Labels(OverlayText::default());
         self.selected = None;
-        self.finished = false;
+        self.session.restart();
         self.retry_attempt = 0;
         self.retry_pending = false;
         let request = self.scan_request(ctx);
@@ -320,7 +327,7 @@ impl HintMode {
     }
 
     fn handle_scan_result(&mut self, result: UiScanResult, ctx: &HostContext<'_>) -> CommandBatch {
-        if !self.active || self.finished || result.id != self.scan_id {
+        if !self.active || self.session.finished || result.id != self.scan_id {
             return CommandBatch::new();
         }
         let UiScanResult {
@@ -445,7 +452,7 @@ impl HintMode {
             })
             .map(|(index, target)| (target.rect, index));
 
-        if let Err(error) = hints::assign_compact_into(
+        if let Err(error) = assign_compact_into(
             &mut self.hints,
             candidates,
             &self.alphabet,
@@ -453,7 +460,7 @@ impl HintMode {
         ) {
             self.hints.clear();
             self.status = Some("Cannot assign Hint labels — check hint_characters".into());
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "ui-hint",
                 format!("cannot assign labels for scan {}: {error}", self.scan_id),
             );
@@ -703,7 +710,7 @@ impl HintMode {
     }
 
     fn redraw(&self, ctx: &HostContext<'_>) -> CommandBatch {
-        CommandBatch::one(Command::show_overlay(if self.finished {
+        CommandBatch::one(Command::show_overlay(if self.session.finished {
             self.finished_scene(ctx)
         } else {
             self.scene(ctx)
@@ -772,16 +779,16 @@ impl HintMode {
     fn cancel(&self) -> CommandBatch {
         CommandBatch::two(
             Command::HideOverlay,
-            Command::SwitchMode(self.return_mode.clone()),
+            Command::SwitchMode(self.session.return_mode.clone()),
         )
     }
 
     fn key_down(&mut self, key: &Key, ctx: &HostContext<'_>) -> CommandBatch {
-        if self.finished {
+        if self.session.finished {
             return match key.as_str() {
                 "esc" => self.cancel(),
                 "backspace" | "tab" => {
-                    self.finished = false;
+                    self.session.restart();
                     self.selected = None;
                     if let Input::Labels(typed) = &mut self.input {
                         typed.pop();
@@ -1047,26 +1054,21 @@ impl Mode for HintMode {
         match event {
             ModeEvent::Activated { previous } => {
                 self.active = true;
-                self.return_mode = previous.clone().unwrap_or_else(ModeId::idle);
+                self.session.activate(previous.as_ref());
                 self.request_scan(ctx)
             }
             ModeEvent::Restarted => {
                 self.active = true;
                 self.request_scan(ctx)
             }
-            ModeEvent::FinishRequested { .. } if self.finished => CommandBatch::new(),
+            ModeEvent::FinishRequested { .. } if self.session.finished => CommandBatch::new(),
             ModeEvent::FinishRequested { .. } => {
-                self.finished = true;
+                self.session.finish();
                 let mut commands = self.redraw(ctx);
-                commands.extend(super::lifecycle_commands(
-                    &self.config.lifecycle.after_finish,
-                    &self.return_mode,
-                ));
+                commands.extend(self.session.commands(&self.config.lifecycle.after_finish));
                 commands
             }
-            ModeEvent::Clicked { .. } => {
-                super::lifecycle_commands(&self.config.lifecycle.after_click, &self.return_mode)
-            }
+            ModeEvent::Clicked { .. } => self.session.commands(&self.config.lifecycle.after_click),
             ModeEvent::Deactivated => {
                 self.active = false;
                 self.clear_scan_results(true);
@@ -1077,12 +1079,12 @@ impl Mode for HintMode {
                 self.overlap_cycle = 0;
                 self.retry_pending = false;
                 self.selected = None;
-                self.finished = false;
+                self.session.restart();
                 CommandBatch::one(Command::CancelTimer {
                     id: SCAN_RETRY_TIMER_ID.into(),
                 })
             }
-            ModeEvent::UiScanned(result) if self.finished || result.id != self.scan_id => {
+            ModeEvent::UiScanned(result) if self.session.finished || result.id != self.scan_id => {
                 CommandBatch::new()
             }
             ModeEvent::UiScanned(result) => self.handle_scan_result(result.clone(), ctx),
@@ -1104,13 +1106,13 @@ impl Mode for HintMode {
             }
             // The tree we labelled belongs to the old window/geometry.
             ModeEvent::FocusChanged(_) | ModeEvent::ScreensChanged(_)
-                if self.active && !self.finished =>
+                if self.active && !self.session.finished =>
             {
                 self.request_scan(ctx)
             }
             ModeEvent::PointerMoved(_)
                 if self.active
-                    && !self.finished
+                    && !self.session.finished
                     && self
                         .scan_bounds
                         .is_some_and(|bounds| bounds != ctx.active_bounds()) =>
@@ -1120,22 +1122,19 @@ impl Mode for HintMode {
             ModeEvent::ScreenRetargeted { screen, .. } => {
                 CommandBatch::one(Command::warp_to(screen.bounds.center()))
             }
-            ModeEvent::Resumed if self.finished => self.redraw(ctx),
+            ModeEvent::Resumed if self.session.finished => self.redraw(ctx),
             ModeEvent::Resumed if self.scanning && self.hints.is_empty() => {
                 CommandBatch::one(Command::HideOverlay)
             }
             ModeEvent::Resumed if self.hints.is_empty() => self.status_scene(ctx),
             ModeEvent::Resumed => self.redraw(ctx),
-            ModeEvent::ConfigReloaded => {
-                let return_mode = self.return_mode.clone();
+            ModeEvent::SettingsChanged => {
+                let session = self.session.clone();
                 let scan_id = self.scan_id;
                 let scan_bounds = self.scan_bounds;
                 let active = self.active;
-                let Some(config) = ctx.config.downcast_ref::<Config>() else {
-                    return CommandBatch::new();
-                };
-                *self = Self::new(config);
-                self.return_mode = return_mode;
+                *self = Self::new(ctx.settings);
+                self.session = session;
                 self.scan_id = scan_id;
                 self.scan_bounds = scan_bounds;
                 self.active = active;
@@ -1213,7 +1212,7 @@ mod tests {
                 cursor: self.cursor,
                 focused_app: None,
                 palette: &self.palette,
-                config: &self.config,
+                settings: &self.config,
             }
         }
     }
@@ -1932,7 +1931,7 @@ mod tests {
                 .map(|index| target(&format!("Layer {index}"), 100.0))
                 .collect(),
         );
-        let top_text = |output: &_| top_label(scene_of(output)).text.clone();
+        let top_text = |output: &[Command]| top_label(scene_of(output)).text.clone();
         let mut observed = vec![top_text(&initial)];
         for index in 0_usize..5 {
             let shift = if index.is_multiple_of(2) {
@@ -1963,7 +1962,7 @@ mod tests {
             &env,
             vec![target("One", 100.0), target("Two", 100.0)],
         );
-        let top_text = |output: &_| top_label(scene_of(output)).text.clone();
+        let top_text = |output: &[Command]| top_label(scene_of(output)).text.clone();
         let initial_top = top_text(&initial);
         let first_top = top_text(&press(&mut mode, &env, "left_shift"));
         assert_ne!(first_top, initial_top);
@@ -1990,7 +1989,7 @@ mod tests {
             ],
         );
         let shifted = press(&mut mode, &env, "left_shift");
-        let normalize = |output: &_| {
+        let normalize = |output: &[Command]| {
             let mut labels = scene_of(output)
                 .labels
                 .iter()
@@ -3079,7 +3078,7 @@ mod tests {
             },
             &env.ctx(),
         );
-        assert!(mode.finished);
+        assert!(mode.session.finished);
         assert!(
             finished
                 .iter()
@@ -3101,7 +3100,7 @@ mod tests {
         );
 
         let reopened = press(&mut mode, &env, "backspace");
-        assert!(!mode.finished);
+        assert!(!mode.session.finished);
         assert!(
             reopened
                 .iter()

@@ -17,6 +17,8 @@ use crate::api::overlay::{Color, LabelStyle, OverlayLabel, OverlayScene, Overlay
 use crate::config::{Config, GridLayer, Palette, RecursiveGridUi, TargetingLifecycle};
 use smallvec::SmallVec;
 
+use super::targeting::TargetingSession;
+
 /// Grid shape at one depth.
 #[derive(Debug, Clone, PartialEq)]
 struct Layout {
@@ -41,9 +43,8 @@ pub struct RecursiveGridMode {
     path: SmallVec<[usize; 12]>,
     /// A leaf has been selected and the session is ready to finish.
     terminal: bool,
-    finished: bool,
+    session: TargetingSession,
     lifecycle: TargetingLifecycle,
-    return_mode: ModeId,
 }
 
 impl RecursiveGridMode {
@@ -65,9 +66,8 @@ impl RecursiveGridMode {
             stack: SmallVec::new(),
             path: SmallVec::new(),
             terminal: false,
-            finished: false,
+            session: TargetingSession::default(),
             lifecycle: rg.lifecycle.clone(),
-            return_mode: ModeId::idle(),
         }
     }
 
@@ -345,7 +345,7 @@ impl RecursiveGridMode {
     fn cancel(&self) -> CommandBatch {
         CommandBatch::two(
             Command::HideOverlay,
-            Command::SwitchMode(self.return_mode.clone()),
+            Command::SwitchMode(self.session.return_mode.clone()),
         )
     }
 
@@ -366,7 +366,7 @@ impl RecursiveGridMode {
         self.stack.push(bounds);
         self.path.clear();
         self.terminal = false;
-        self.finished = false;
+        self.session.restart();
         self.cursor_follow_selection = self.default_cursor_follow_selection;
     }
 
@@ -376,7 +376,7 @@ impl RecursiveGridMode {
         } else {
             SmallVec::new()
         };
-        let was_finished = preserve && self.finished;
+        let was_finished = preserve && self.session.finished;
         let follow = self.cursor_follow_selection;
         self.reset(bounds);
         if preserve {
@@ -393,7 +393,7 @@ impl RecursiveGridMode {
                 self.path.push(index);
             }
             self.terminal = self.depth() >= self.max_depth || !self.can_descend();
-            self.finished = was_finished;
+            self.session.finished = was_finished;
         }
         let mut commands =
             CommandBatch::one(Command::warp_to(self.current().unwrap_or(bounds).center()));
@@ -437,7 +437,7 @@ impl RecursiveGridMode {
                 self.stack.pop();
                 self.path.pop();
                 self.terminal = false;
-                self.finished = false;
+                self.session.restart();
                 return self.redraw(ctx.palette);
             }
             "space" => {
@@ -447,7 +447,7 @@ impl RecursiveGridMode {
             _ => {}
         }
 
-        if self.terminal || self.finished {
+        if self.terminal || self.session.finished {
             return CommandBatch::new();
         }
         let Some(ch) = key.as_char() else {
@@ -509,7 +509,7 @@ impl Mode for RecursiveGridMode {
     fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
         match event {
             ModeEvent::Activated { previous } => {
-                self.return_mode = previous.clone().unwrap_or_else(ModeId::idle);
+                self.session.activate(previous.as_ref());
                 self.reset(ctx.active_bounds());
                 self.redraw(ctx.palette)
             }
@@ -517,24 +517,19 @@ impl Mode for RecursiveGridMode {
                 self.reset(ctx.active_bounds());
                 self.redraw(ctx.palette)
             }
-            ModeEvent::FinishRequested { .. } if self.finished => CommandBatch::new(),
+            ModeEvent::FinishRequested { .. } if self.session.finished => CommandBatch::new(),
             ModeEvent::FinishRequested { .. } => {
-                self.finished = true;
+                self.session.finish();
                 let mut commands = self.redraw(ctx.palette);
-                commands.extend(super::lifecycle_commands(
-                    &self.lifecycle.after_finish,
-                    &self.return_mode,
-                ));
+                commands.extend(self.session.commands(&self.lifecycle.after_finish));
                 commands
             }
-            ModeEvent::Clicked { .. } => {
-                super::lifecycle_commands(&self.lifecycle.after_click, &self.return_mode)
-            }
+            ModeEvent::Clicked { .. } => self.session.commands(&self.lifecycle.after_click),
             ModeEvent::Deactivated => {
                 self.stack.clear();
                 self.path.clear();
                 self.terminal = false;
-                self.finished = false;
+                self.session.restart();
                 CommandBatch::new()
             }
             ModeEvent::ScreensChanged(_) => {
@@ -551,13 +546,10 @@ impl Mode for RecursiveGridMode {
                 self.redraw(ctx.palette)
             }
             ModeEvent::Resumed => self.redraw(ctx.palette),
-            ModeEvent::ConfigReloaded => {
-                let return_mode = self.return_mode.clone();
-                let Some(config) = ctx.config.downcast_ref::<Config>() else {
-                    return CommandBatch::new();
-                };
-                *self = Self::new(config);
-                self.return_mode = return_mode;
+            ModeEvent::SettingsChanged => {
+                let session = self.session.clone();
+                *self = Self::new(ctx.settings);
+                self.session = session;
                 self.reset(ctx.active_bounds());
                 self.redraw(ctx.palette)
             }
@@ -623,7 +615,7 @@ mod tests {
                 cursor: self.cursor,
                 focused_app: None,
                 palette: &self.palette,
-                config: &self.config,
+                settings: &self.config,
             }
         }
     }
@@ -1022,11 +1014,11 @@ mod tests {
             &env.ctx(),
         );
         assert!(clicked.is_empty());
-        assert!(!mode.finished);
+        assert!(!mode.session.finished);
         assert_eq!(mode.current(), selected);
 
         let continued = press(&mut mode, &env, "g");
-        assert!(!mode.finished);
+        assert!(!mode.session.finished);
         assert_eq!(mode.depth(), 2);
         assert!(
             continued
@@ -1049,7 +1041,7 @@ mod tests {
         mode.handle(&ModeEvent::Restarted, &env.ctx());
 
         assert_eq!(mode.depth(), 0);
-        assert!(!mode.finished);
-        assert_eq!(mode.return_mode, ModeId::normal());
+        assert!(!mode.session.finished);
+        assert_eq!(mode.session.return_mode, ModeId::normal());
     }
 }

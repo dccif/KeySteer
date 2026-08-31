@@ -12,7 +12,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::api::backend::{UpdateCheckResult, UpdateProgress};
-use crate::app::worker::WorkerJoin;
+use crate::support::worker::WorkerJoin;
 
 const LATEST_RELEASE_API: &str = "https://api.github.com/repos/dccif/KeySteer/releases/latest";
 const CDN_VERSIONS_API: &str = "https://data.jsdelivr.com/v1/package/gh/dccif/KeySteer";
@@ -41,7 +41,7 @@ impl UpdateWorker {
         match self.worker.reap_finished() {
             Ok(done) => done,
             Err(error) => {
-                crate::app::logging::report_error("update-check", &error);
+                crate::support::logging::report_error("update-check", &error);
                 true
             }
         }
@@ -81,7 +81,7 @@ impl Drop for UpdateWorker {
             return;
         }
         if let Err(error) = self.cancel_and_wait() {
-            crate::app::logging::report_error("update-check", &error);
+            crate::support::logging::report_error("update-check", &error);
         }
     }
 }

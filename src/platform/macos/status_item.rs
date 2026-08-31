@@ -74,10 +74,10 @@ define_class!(
                 self.mtm(),
                 self,
                 "About KeySteer",
-                &crate::app::about::details(),
+                &crate::about::details(),
                 None,
             ) {
-                crate::app::logging::report_error("macos-about", error);
+                crate::support::logging::report_error("macos-about", error);
             }
         }
 
@@ -102,7 +102,7 @@ define_class!(
             if !NSWorkspace::sharedWorkspace()
                 .selectFile_inFileViewerRootedAtPath(Some(&full_path), &root_path)
             {
-                crate::app::logging::report_error(
+                crate::support::logging::report_error(
                     "macos-update",
                     format!("Finder could not reveal {}", path.display()),
                 );
@@ -203,7 +203,7 @@ impl StatusItem {
         let autostart_enabled = match super::autostart::MacosAutostart::new().is_enabled() {
             Ok(enabled) => enabled,
             Err(error) => {
-                crate::app::logging::report_error("macos-autostart", error);
+                crate::support::logging::report_error("macos-autostart", error);
                 false
             }
         };
@@ -256,7 +256,7 @@ impl StatusItem {
         retry.attempts_remaining = retry.attempts_remaining.saturating_sub(1);
         if retry.attempts_remaining == 0 {
             self.icon_attach_retry = None;
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "macos-status-item",
                 "AppKit did not attach a button to the top status item after login",
             );

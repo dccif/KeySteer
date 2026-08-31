@@ -40,7 +40,7 @@ use crate::api::command::{ButtonAction, FocusedApp, MouseButton};
 use crate::api::geometry::{Point, Rect, Screen};
 use crate::api::input::{Key, KeyState};
 use crate::api::overlay::{LabelStyle, LabelTextAnalysis, OverlayScene};
-use crate::platform::scan_mailbox::ScanMailbox;
+use crate::platform::common::scan_mailbox::ScanMailbox;
 
 use self::overlay_worker::OverlayWorker;
 
@@ -130,7 +130,7 @@ pub struct WindowsBackend {
     console_control: Option<console_control::ConsoleControl>,
     ui_automation: Option<accessibility::UiAutomationWorker>,
     vision: vision::VisionWorker,
-    update_worker: Option<crate::app::update::UpdateWorker>,
+    update_worker: Option<crate::update::UpdateWorker>,
     held_buttons: Cell<u8>,
     shutdown_complete: bool,
     shutdown_attempted: bool,
@@ -218,7 +218,7 @@ impl WindowsBackend {
         };
         let appearance = system_appearance();
         let initial_screens = screens::list_screens().unwrap_or_else(|error| {
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "windows-screen",
                 format!("initial display enumeration failed: {error}"),
             );
@@ -287,7 +287,7 @@ impl WindowsBackend {
         let current = match screens::list_screens() {
             Ok(screens) => screens,
             Err(error) => {
-                crate::app::logging::report_error(
+                crate::support::logging::report_error(
                     "windows-screen",
                     format!("display re-enumeration failed: {error}"),
                 );
@@ -337,7 +337,7 @@ impl WindowsBackend {
         if mask == 0 {
             return Ok(());
         }
-        let mut errors = crate::app::errors::ErrorBundle::default();
+        let mut errors = crate::support::errors::ErrorBundle::default();
         for button in [
             MouseButton::Left,
             MouseButton::Right,
@@ -389,7 +389,7 @@ impl WindowsBackend {
         }
         let now = Instant::now();
         let deadline = now.checked_add(BACKEND_SHUTDOWN_TIMEOUT).unwrap_or(now);
-        let mut errors = crate::app::errors::ErrorBundle::default();
+        let mut errors = crate::support::errors::ErrorBundle::default();
         if let Some(worker) = self.update_worker.as_mut() {
             match worker.cancel_and_wait_until(deadline) {
                 Ok(()) => {
@@ -457,7 +457,7 @@ impl WindowsBackend {
         if self
             .update_worker
             .as_mut()
-            .is_some_and(crate::app::update::UpdateWorker::reap_finished)
+            .is_some_and(crate::update::UpdateWorker::reap_finished)
         {
             self.update_worker.take();
         }
@@ -469,7 +469,7 @@ impl WindowsBackend {
             .as_ref()
             .is_some_and(system_events::ForegroundWatcher::take_wake_failure)
         {
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "windows-events",
                 "cannot wake engine for a foreground change",
             );
@@ -514,7 +514,7 @@ impl Drop for WindowsBackend {
             // to the runtime boundary. Retry unfinished stages here, but do
             // not record the same failures a second time.
             if !self.shutdown_attempted {
-                crate::app::logging::report_error(
+                crate::support::logging::report_error(
                     "windows-backend",
                     format!("cannot clean up native resources during drop: {error}"),
                 );
@@ -534,7 +534,7 @@ impl Backend for WindowsBackend {
         if let Some(event) = self.try_event()? {
             return Ok(Some(event));
         }
-        crate::app::worker::reap_quarantined();
+        crate::support::worker::reap_quarantined();
 
         if !self.pump_messages() {
             return Ok(Some(BackendEvent::Quit));
@@ -790,7 +790,7 @@ impl Backend for WindowsBackend {
         }
         let progress_sender = self.event_tx.clone();
         let complete_sender = self.event_tx.clone();
-        self.update_worker = crate::app::update::check_async(
+        self.update_worker = crate::update::check_async(
             move |progress| {
                 let _ = progress_sender.send(BackendEvent::UpdateProgress(progress));
             },

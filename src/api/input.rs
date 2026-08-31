@@ -5,7 +5,6 @@
 //! what users already write (`Cmd`, `Super`, `Option`, `Return`, `PageUp`, …).
 
 use std::borrow::Borrow;
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
@@ -13,27 +12,39 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
-thread_local! {
-    static ACTIVE_KEY_ALIASES: RefCell<Option<BTreeMap<String, String>>> = const { RefCell::new(None) };
+/// Explicit, immutable key-name resolver compiled from configuration aliases.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct KeyNameResolver {
+    aliases: BTreeMap<String, String>,
 }
 
-struct KeyAliasScope(Option<BTreeMap<String, String>>);
-
-impl Drop for KeyAliasScope {
-    fn drop(&mut self) {
-        ACTIVE_KEY_ALIASES.with(|active| {
-            active.replace(self.0.take());
-        });
+impl KeyNameResolver {
+    pub fn from_resolved(aliases: BTreeMap<String, String>) -> Self {
+        Self { aliases }
     }
-}
 
-pub(crate) fn with_key_aliases<T>(
-    aliases: &BTreeMap<String, String>,
-    operation: impl FnOnce() -> T,
-) -> T {
-    let previous = ACTIVE_KEY_ALIASES.with(|active| active.replace(Some(aliases.clone())));
-    let _scope = KeyAliasScope(previous);
-    operation()
+    pub fn aliases(&self) -> &BTreeMap<String, String> {
+        &self.aliases
+    }
+
+    pub fn resolve_name(&self, value: &str) -> String {
+        self.aliases
+            .get(&normalize_alias_name(value))
+            .cloned()
+            .unwrap_or_else(|| normalize_builtin_key(value))
+    }
+
+    pub fn key(&self, value: impl AsRef<str>) -> Result<Key, String> {
+        Key::from_normalized(self.resolve_name(value.as_ref()))
+    }
+
+    pub fn chord(&self, value: &str) -> Result<KeyChord, String> {
+        KeyChord::parse_with(value, |part| self.key(part))
+    }
+
+    pub fn contains_alias(&self, value: &str) -> bool {
+        self.aliases.contains_key(&normalize_alias_name(value))
+    }
 }
 
 /// The modifier `primary` stands for on this platform.
@@ -60,19 +71,15 @@ impl Borrow<str> for Key {
 
 impl Key {
     pub fn new(value: impl AsRef<str>) -> Result<Self, String> {
-        let normalized = normalize_key(value.as_ref());
+        Self::from_normalized(normalize_builtin_key(value.as_ref()))
+    }
+
+    fn from_normalized(normalized: String) -> Result<Self, String> {
         if normalized.is_empty() {
             Err("key must not be empty".into())
         } else {
             Ok(Self(normalized.into()))
         }
-    }
-
-    pub(crate) fn new_with_aliases(
-        value: impl AsRef<str>,
-        aliases: &BTreeMap<String, String>,
-    ) -> Result<Self, String> {
-        with_key_aliases(aliases, || Self::new(value))
     }
 
     pub fn as_str(&self) -> &str {
@@ -169,19 +176,6 @@ impl Key {
                 | "fn"
         )
     }
-}
-
-fn normalize_key(value: &str) -> String {
-    let alias = normalize_alias_name(value);
-    if let Some(resolved) = ACTIVE_KEY_ALIASES.with(|active| {
-        active
-            .borrow()
-            .as_ref()
-            .and_then(|aliases| aliases.get(&alias).cloned())
-    }) {
-        return resolved;
-    }
-    normalize_builtin_key(value)
 }
 
 pub(crate) fn normalize_alias_name(value: &str) -> String {
@@ -281,9 +275,16 @@ pub struct KeyChord {
 
 impl KeyChord {
     pub fn parse(value: &str) -> Result<Self, String> {
+        Self::parse_with(value, |part| Key::new(part))
+    }
+
+    fn parse_with(
+        value: &str,
+        mut parse_key: impl FnMut(&str) -> Result<Key, String>,
+    ) -> Result<Self, String> {
         let keys = value
             .split('+')
-            .map(Key::new)
+            .map(&mut parse_key)
             .collect::<Result<Vec<_>, _>>()?;
         if keys.is_empty() {
             return Err("chord must contain a key".into());
@@ -304,11 +305,8 @@ impl KeyChord {
         Ok(Self { keys, activation })
     }
 
-    pub(crate) fn parse_with_aliases(
-        value: &str,
-        aliases: &BTreeMap<String, String>,
-    ) -> Result<Self, String> {
-        with_key_aliases(aliases, || Self::parse(value))
+    pub fn parse_with_resolver(value: &str, resolver: &KeyNameResolver) -> Result<Self, String> {
+        resolver.chord(value)
     }
 
     pub fn keys(&self) -> &[Key] {

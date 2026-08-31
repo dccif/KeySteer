@@ -5,10 +5,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::api::command::{UiScanRequest, UiScanStatus, UiScanStrategy};
-use crate::app::worker::WorkerJoin;
-use crate::platform::partial_batcher::PartialBatcher;
-use crate::platform::scan_mailbox::ScanMailbox;
-use crate::platform::spatial_index::{SpatialIndex, rectangles_match};
+use crate::platform::common::partial_batcher::PartialBatcher;
+use crate::platform::common::scan_mailbox::ScanMailbox;
+use crate::platform::common::spatial_index::{SpatialIndex, rectangles_match};
+use crate::support::worker::WorkerJoin;
 use objc2::rc::autoreleasepool;
 
 use super::{EventSender, accessibility, vision};
@@ -168,7 +168,7 @@ impl Drop for UiScanWorker {
             return;
         }
         if let Err(error) = self.shutdown() {
-            crate::app::logging::report_error("macos-ui-scan", &error);
+            crate::support::logging::report_error("macos-ui-scan", &error);
         }
     }
 }

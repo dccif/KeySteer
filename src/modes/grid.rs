@@ -13,6 +13,8 @@ use crate::api::overlay::{Color, LabelStyle, OverlayLabel, OverlayScene, Overlay
 use crate::config::{Config, GridUi, Palette, TargetingLifecycle};
 use smallvec::SmallVec;
 
+use super::targeting::TargetingSession;
+
 #[derive(Debug, Clone, PartialEq)]
 struct Layout {
     rows: usize,
@@ -38,9 +40,8 @@ pub struct GridMode {
     path: SmallVec<[usize; 12]>,
     /// A leaf has been selected and the session is ready to finish.
     terminal: bool,
-    finished: bool,
+    session: TargetingSession,
     lifecycle: TargetingLifecycle,
-    return_mode: ModeId,
 }
 
 impl GridMode {
@@ -59,9 +60,8 @@ impl GridMode {
             stack: SmallVec::new(),
             path: SmallVec::new(),
             terminal: false,
-            finished: false,
+            session: TargetingSession::default(),
             lifecycle: grid.lifecycle.clone(),
-            return_mode: ModeId::idle(),
         }
     }
 
@@ -379,7 +379,7 @@ impl GridMode {
         self.stack.push(bounds);
         self.path.clear();
         self.terminal = false;
-        self.finished = false;
+        self.session.restart();
         self.cursor_follow_selection = self.default_cursor_follow_selection;
     }
 
@@ -389,7 +389,7 @@ impl GridMode {
         } else {
             SmallVec::new()
         };
-        let was_finished = preserve && self.finished;
+        let was_finished = preserve && self.session.finished;
         let follow = self.cursor_follow_selection;
         self.reset(bounds);
         if preserve {
@@ -405,7 +405,7 @@ impl GridMode {
                 self.path.push(index);
             }
             self.terminal = self.depth() >= self.max_depth;
-            self.finished = was_finished;
+            self.session.finished = was_finished;
         }
         let mut commands =
             CommandBatch::one(Command::warp_to(self.current().unwrap_or(bounds).center()));
@@ -456,7 +456,7 @@ impl GridMode {
     fn cancel(&self) -> CommandBatch {
         CommandBatch::two(
             Command::HideOverlay,
-            Command::SwitchMode(self.return_mode.clone()),
+            Command::SwitchMode(self.session.return_mode.clone()),
         )
     }
 
@@ -471,7 +471,7 @@ impl GridMode {
                 self.stack.pop();
                 self.path.pop();
                 self.terminal = false;
-                self.finished = false;
+                self.session.restart();
                 return self.redraw(ctx.palette);
             }
             "space" => {
@@ -484,7 +484,7 @@ impl GridMode {
             _ => {}
         }
 
-        if self.terminal || self.finished {
+        if self.terminal || self.session.finished {
             return CommandBatch::new();
         }
         let Some(key) = key.as_char() else {
@@ -524,7 +524,7 @@ impl Mode for GridMode {
     fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
         match event {
             ModeEvent::Activated { previous } => {
-                self.return_mode = previous.clone().unwrap_or_else(ModeId::idle);
+                self.session.activate(previous.as_ref());
                 self.reset(ctx.active_bounds());
                 self.redraw(ctx.palette)
             }
@@ -532,19 +532,14 @@ impl Mode for GridMode {
                 self.reset(ctx.active_bounds());
                 self.redraw(ctx.palette)
             }
-            ModeEvent::FinishRequested { .. } if self.finished => CommandBatch::new(),
+            ModeEvent::FinishRequested { .. } if self.session.finished => CommandBatch::new(),
             ModeEvent::FinishRequested { .. } => {
-                self.finished = true;
+                self.session.finish();
                 let mut commands = self.redraw(ctx.palette);
-                commands.extend(super::lifecycle_commands(
-                    &self.lifecycle.after_finish,
-                    &self.return_mode,
-                ));
+                commands.extend(self.session.commands(&self.lifecycle.after_finish));
                 commands
             }
-            ModeEvent::Clicked { .. } => {
-                super::lifecycle_commands(&self.lifecycle.after_click, &self.return_mode)
-            }
+            ModeEvent::Clicked { .. } => self.session.commands(&self.lifecycle.after_click),
             ModeEvent::ScreensChanged(_) => {
                 self.reset(ctx.active_bounds());
                 self.redraw(ctx.palette)
@@ -561,16 +556,13 @@ impl Mode for GridMode {
                 self.stack.clear();
                 self.path.clear();
                 self.terminal = false;
-                self.finished = false;
+                self.session.restart();
                 CommandBatch::new()
             }
-            ModeEvent::ConfigReloaded => {
-                let return_mode = self.return_mode.clone();
-                let Some(config) = ctx.config.downcast_ref::<Config>() else {
-                    return CommandBatch::new();
-                };
-                *self = Self::new(config);
-                self.return_mode = return_mode;
+            ModeEvent::SettingsChanged => {
+                let session = self.session.clone();
+                *self = Self::new(ctx.settings);
+                self.session = session;
                 self.reset(ctx.active_bounds());
                 self.redraw(ctx.palette)
             }
@@ -629,7 +621,7 @@ mod tests {
                 cursor: self.cursor,
                 focused_app: None,
                 palette: &self.palette,
-                config: &self.config,
+                settings: &self.config,
             }
         }
     }
@@ -1018,7 +1010,7 @@ mod tests {
             },
             &env.ctx(),
         );
-        assert!(mode.finished);
+        assert!(mode.session.finished);
         assert_eq!(mode.current(), selected);
         let scene = scene_of(&finished);
         assert_eq!(scene.labels.len(), mode.layout.rows * mode.layout.cols);
@@ -1045,7 +1037,7 @@ mod tests {
         );
 
         press(&mut mode, &env, "backspace");
-        assert!(!mode.finished);
+        assert!(!mode.session.finished);
         assert_eq!(mode.depth(), 0);
     }
 

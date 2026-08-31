@@ -18,7 +18,6 @@ mod overlay_coordinator;
 #[cfg(test)]
 use std::collections::BTreeSet;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -34,8 +33,19 @@ use crate::api::command::{
 use crate::api::geometry::{Point, Screen};
 use crate::api::input::{Key, KeyChord, KeyState, ModeId};
 use crate::api::overlay::{CursorMarker, Indicator, OverlayScene};
-use crate::config::{Bindings, Config, ConfigStore, Palette};
+use crate::config::{Bindings, Config, Palette};
 use input_router::CompiledKeymap;
+
+pub(crate) trait ConfigRepositoryPort {
+    fn source_text(&self) -> String;
+    #[cfg(test)]
+    fn source_label(&self) -> String;
+    fn set(&mut self, path: &str, value: &str) -> Result<Config, String>;
+    /// Return the next valid settings plus a display label for its source.
+    fn reload(&mut self) -> Result<(Config, Option<String>), String>;
+}
+
+type ConfigSimulatorUrl = fn(&str) -> String;
 
 /// Internal classification for failures crossing the Engine loop. Public APIs
 /// keep their string errors, while recovery decisions never parse display text.
@@ -44,6 +54,17 @@ enum RuntimeError {
     RecoverableInput(String),
     Platform(String),
     Fatal(String),
+}
+
+#[derive(Debug, Clone)]
+enum ModeTransition {
+    Activate {
+        target: ModeId,
+        previous: Option<ModeId>,
+    },
+    Push(ModeId),
+    Pop,
+    Restart,
 }
 
 impl RuntimeError {
@@ -642,18 +663,31 @@ pub struct Engine {
     input_failure_active: bool,
     pending_runtime_error: Option<RuntimeError>,
     should_quit: bool,
-    config_store: Option<ConfigStore>,
-    /// Automatic startup keeps discovering this directory on every reload.
-    /// An explicit `--config` leaves this unset and remains pinned to its path.
-    config_discovery_directory: Option<PathBuf>,
+    config_repository: Option<Box<dyn ConfigRepositoryPort>>,
+    config_simulator_url: Option<ConfigSimulatorUrl>,
     /// Prevent rapid status-menu clicks from opening duplicate browser tabs.
     last_config_simulator_open: Option<Instant>,
     started_at: Instant,
 }
 
 impl Engine {
+    fn transition(
+        &mut self,
+        transition: ModeTransition,
+        backend: &mut dyn Backend,
+    ) -> Result<(), String> {
+        match transition {
+            ModeTransition::Activate { target, previous } => {
+                self.activate(target, previous, backend)
+            }
+            ModeTransition::Push(target) => self.push_mode(target, backend),
+            ModeTransition::Pop => self.pop_mode(backend),
+            ModeTransition::Restart => self.restart_active(backend),
+        }
+    }
+
     pub fn new(config: Config, appearance: Appearance) -> Self {
-        crate::app::logging::set_non_error_enabled(config.debug.enabled);
+        crate::support::logging::set_non_error_enabled(config.debug.enabled);
         let palette = config.palette(appearance);
         Self {
             config,
@@ -697,8 +731,8 @@ impl Engine {
             input_failure_active: false,
             pending_runtime_error: None,
             should_quit: false,
-            config_store: None,
-            config_discovery_directory: None,
+            config_repository: None,
+            config_simulator_url: None,
             last_config_simulator_open: None,
             started_at: Instant::now(),
         }
@@ -789,18 +823,19 @@ impl Engine {
         &self.config
     }
 
-    pub fn attach_config_store(&mut self, store: ConfigStore) {
-        self.config_store = Some(store);
-        self.config_discovery_directory = None;
+    pub(crate) fn attach_config_repository(&mut self, repository: Box<dyn ConfigRepositoryPort>) {
+        self.config_repository = Some(repository);
     }
 
-    pub(crate) fn attach_discovered_config_store(
-        &mut self,
-        store: ConfigStore,
-        directory: PathBuf,
-    ) {
-        self.config_store = Some(store);
-        self.config_discovery_directory = Some(directory);
+    pub(crate) fn attach_config_simulator(&mut self, url: ConfigSimulatorUrl) {
+        self.config_simulator_url = Some(url);
+    }
+
+    #[cfg(test)]
+    fn config_source_label(&self) -> Option<String> {
+        self.config_repository
+            .as_ref()
+            .map(|repository| repository.source_label())
     }
 
     fn recoverable_input_error(&mut self, action: &str, error: String) -> String {
@@ -825,7 +860,7 @@ impl Engine {
             .iter()
             .filter_map(|(&id, candidate)| (candidate == owner).then_some(id))
             .collect::<SmallVec<[u64; 1]>>();
-        let mut errors = crate::app::errors::ErrorBundle::default();
+        let mut errors = crate::support::errors::ErrorBundle::default();
         for id in ids {
             self.scan_owners.remove(&id);
             if let Err(error) = backend.cancel_ui_scan(id) {
@@ -842,7 +877,7 @@ impl Engine {
             .copied()
             .collect::<SmallVec<[u64; 2]>>();
         self.scan_owners.clear();
-        let mut errors = crate::app::errors::ErrorBundle::default();
+        let mut errors = crate::support::errors::ErrorBundle::default();
         for id in ids {
             if let Err(error) = backend.cancel_ui_scan(id) {
                 errors.push(format!("cancel UI scan {id}"), error);
@@ -870,7 +905,7 @@ impl Engine {
         backend: &mut dyn Backend,
     ) {
         if !self.input_failure_active {
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "input",
                 if capture_lost {
                     format!(
@@ -894,7 +929,7 @@ impl Engine {
         let previous = self.active.clone();
         self.pending_sequences.clear();
         if let Err(cancel_error) = self.cancel_transient_clicks(backend) {
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "input",
                 format!("cannot cancel pending mouse presses during recovery: {cancel_error}"),
             );
@@ -905,7 +940,7 @@ impl Engine {
         self.modal_stack.clear();
         self.timers.clear();
         if let Err(cancel_error) = self.cancel_all_scans(backend) {
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "ui-scan",
                 format!("cannot cancel scans during input recovery: {cancel_error}"),
             );
@@ -918,7 +953,7 @@ impl Engine {
         }
 
         if let Err(release_error) = self.release_latched(backend) {
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "input",
                 format!("cannot release every held input during recovery: {release_error}"),
             );
@@ -930,7 +965,7 @@ impl Engine {
                 cursor: self.cursor,
                 focused_app: self.focused_app.as_ref(),
                 palette: &self.palette,
-                config: &self.config,
+                settings: &self.config,
             };
             if let Some(mode) = self.modes.get_mut(&previous) {
                 // Let the mode clear its private session state, but discard
@@ -943,7 +978,7 @@ impl Engine {
                 cursor: self.cursor,
                 focused_app: self.focused_app.as_ref(),
                 palette: &self.palette,
-                config: &self.config,
+                settings: &self.config,
             };
             if let Some(idle) = self.modes.get_mut(&ModeId::idle()) {
                 let _ = idle.handle(
@@ -956,7 +991,7 @@ impl Engine {
         }
 
         if let Err(dismiss_error) = backend.dismiss() {
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "overlay",
                 format!("cannot dismiss overlay during input recovery: {dismiss_error}"),
             );
@@ -974,7 +1009,7 @@ impl Engine {
 
     fn report_action_error(&mut self, error: String, backend: &mut dyn Backend) {
         if !self.recover_from_input_error(&error, backend) {
-            crate::app::logging::report_error("action", format!("action failed: {error}"));
+            crate::support::logging::report_error("action", format!("action failed: {error}"));
         }
     }
 
@@ -1055,7 +1090,7 @@ impl Engine {
                 .unwrap_or_default();
             let table = self.config.bindings_for(id.as_str()).map(|configured| {
                 let merged = self.merge_overrides(id.as_str(), configured);
-                CompiledKeymap::compile(merged, self.config.resolved_key_aliases())
+                CompiledKeymap::compile(merged, self.config.key_name_resolver())
             });
             routes.push((id, table, temporary_chords));
         }
@@ -1121,7 +1156,7 @@ impl Engine {
             cursor: self.cursor,
             focused_app: self.focused_app.as_ref(),
             palette: &self.palette,
-            config: &self.config,
+            settings: &self.config,
         }
     }
 
@@ -1132,7 +1167,7 @@ impl Engine {
                 self.started_at.elapsed().as_secs_f64() * 1000.0,
                 message.as_ref()
             );
-            crate::app::logging::debug_args(category, format_args!("{message}"));
+            crate::support::logging::debug_args(category, format_args!("{message}"));
         }
     }
 
@@ -1175,18 +1210,18 @@ impl Engine {
     fn start_runtime(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
         if let Err(error) = backend.start() {
             if let Err(shutdown_error) = backend.shutdown() {
-                crate::app::logging::report_error(
+                crate::support::logging::report_error(
                     "backend",
                     format!("shutdown after startup failure also failed: {shutdown_error}"),
                 );
             }
             return Err(RuntimeError::Platform(error).into_message());
         }
-        crate::app::logging::info_args(
+        crate::support::logging::info_args(
             "backend",
             format_args!("{} backend started", backend.name()),
         );
-        crate::app::perf_probe::mark("backend_started");
+        crate::support::perf_probe::mark("backend_started");
         self.trace_lazy(self.config.debug.backend, "backend", || {
             format!("started {} backend", backend.name())
         });
@@ -1198,21 +1233,27 @@ impl Engine {
             let reason = backend
                 .keyboard_unavailable_reason()
                 .unwrap_or_else(|| "the keyboard cannot be observed".to_string());
-            crate::app::logging::report_error("keyboard", reason);
+            crate::support::logging::report_error("keyboard", reason);
         }
 
         self.appearance = backend.appearance();
         self.palette = self.config.palette(self.appearance);
         self.screens = backend.screens().unwrap_or_else(|error| {
-            crate::app::logging::report_error("backend", format!("cannot read screens: {error}"));
+            crate::support::logging::report_error(
+                "backend",
+                format!("cannot read screens: {error}"),
+            );
             Vec::new()
         });
         self.cursor = backend.pointer().unwrap_or_else(|error| {
-            crate::app::logging::report_error("backend", format!("cannot read pointer: {error}"));
+            crate::support::logging::report_error(
+                "backend",
+                format!("cannot read pointer: {error}"),
+            );
             Point::default()
         });
         self.focused_app = backend.focused_app().unwrap_or_else(|error| {
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "backend",
                 format!("cannot read focused application: {error}"),
             );
@@ -1220,7 +1261,7 @@ impl Engine {
         });
         self.focused_app_excluded =
             Self::excluded_app_matches(&self.config, self.focused_app.as_ref());
-        crate::app::logging::info_args(
+        crate::support::logging::info_args(
             "backend",
             format_args!(
                 "initial state screens={} appearance={:?} keyboard_available={}",
@@ -1232,7 +1273,7 @@ impl Engine {
         // Bootstrap defers registration compilation until the backend can
         // provide its initial app profile. This is the only startup build.
         self.rebuild_tables();
-        crate::app::perf_probe::mark("engine_ready");
+        crate::support::perf_probe::mark("engine_ready");
         self.trace_lazy(self.config.debug.backend, "backend", || {
             format!(
                 "screens={} cursor=({:.1},{:.1}) focused_app={:?}",
@@ -1246,9 +1287,15 @@ impl Engine {
 
         // Enter the initial mode so it can arm timers and draw. Once start has
         // succeeded, even this early error must pass through native shutdown.
-        if let Err(error) = self.activate(ModeId::idle(), None, backend) {
+        if let Err(error) = self.transition(
+            ModeTransition::Activate {
+                target: ModeId::idle(),
+                previous: None,
+            },
+            backend,
+        ) {
             if let Err(shutdown_error) = backend.shutdown() {
-                crate::app::logging::report_error(
+                crate::support::logging::report_error(
                     "backend",
                     format!("shutdown after activation failure also failed: {shutdown_error}"),
                 );
@@ -1305,7 +1352,7 @@ impl Engine {
         backend: &mut dyn Backend,
         result: Result<(), String>,
     ) -> Result<(), String> {
-        let mut errors = crate::app::errors::ErrorBundle::default();
+        let mut errors = crate::support::errors::ErrorBundle::default();
         errors.record("runtime", result);
         self.pending_sequences.clear();
         errors.record(
@@ -1320,8 +1367,8 @@ impl Engine {
         let shutdown_succeeded = shutdown.is_ok();
         errors.record("backend shutdown", shutdown);
         if shutdown_succeeded {
-            crate::app::perf_probe::mark("shutdown_complete");
-            crate::app::logging::info_args(
+            crate::support::perf_probe::mark("shutdown_complete");
+            crate::support::logging::info_args(
                 "backend",
                 format_args!("{} backend stopped", backend.name()),
             );
@@ -1345,6 +1392,10 @@ impl Engine {
 
     /// How long we may block before a timer needs servicing.
     fn next_timeout(&self) -> Duration {
+        self.next_timeout_at(Instant::now())
+    }
+
+    fn next_timeout_at(&self, now: Instant) -> Duration {
         const MAX: Duration = Duration::from_millis(50);
         if self.timers.is_empty()
             && self.pending_sequences.is_empty()
@@ -1353,7 +1404,6 @@ impl Engine {
         {
             return MAX;
         }
-        let now = Instant::now();
         self.timers
             .values()
             .map(|t| t.fires_at)
@@ -1375,13 +1425,20 @@ impl Engine {
     }
 
     fn fire_due_long_press_toggles(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
+        self.fire_due_long_press_toggles_at(Instant::now(), backend)
+    }
+
+    fn fire_due_long_press_toggles_at(
+        &mut self,
+        now: Instant,
+        backend: &mut dyn Backend,
+    ) -> Result<(), String> {
         if self.pending_long_press_toggles.is_empty() {
             return Ok(());
         }
         if self.should_quit || !self.enabled || self.is_excluded_app() {
             return self.cancel_transient_clicks(backend).map(|_| ());
         }
-        let now = Instant::now();
         while self
             .pending_long_press_toggles
             .last()
@@ -1457,6 +1514,10 @@ impl Engine {
     }
 
     fn note_drag_pointer_moved(&mut self) {
+        self.note_drag_pointer_moved_at(Instant::now());
+    }
+
+    fn note_drag_pointer_moved_at(&mut self, now: Instant) {
         if self.drag_auto_release.buttons == 0 || self.active != ModeId::normal() {
             return;
         }
@@ -1470,7 +1531,7 @@ impl Engine {
         if delay_ms == 0 {
             return;
         }
-        self.drag_auto_release.fires_at = Some(Instant::now() + Duration::from_millis(delay_ms));
+        self.drag_auto_release.fires_at = Some(now + Duration::from_millis(delay_ms));
     }
 
     fn take_drag_release_targets(&mut self) -> TargetBuffer {
@@ -1513,10 +1574,18 @@ impl Engine {
     }
 
     fn fire_due_drag_auto_release(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
+        self.fire_due_drag_auto_release_at(Instant::now(), backend)
+    }
+
+    fn fire_due_drag_auto_release_at(
+        &mut self,
+        now: Instant,
+        backend: &mut dyn Backend,
+    ) -> Result<(), String> {
         let Some(fires_at) = self.drag_auto_release.fires_at else {
             return Ok(());
         };
-        if fires_at > Instant::now() {
+        if fires_at > now {
             return Ok(());
         }
         if self.release_drag_auto_release(backend)? {
@@ -1529,10 +1598,17 @@ impl Engine {
     }
 
     fn fire_due_sequences(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
+        self.fire_due_sequences_at(Instant::now(), backend)
+    }
+
+    fn fire_due_sequences_at(
+        &mut self,
+        now: Instant,
+        backend: &mut dyn Backend,
+    ) -> Result<(), String> {
         if self.pending_sequences.is_empty() {
             return Ok(());
         }
-        let now = Instant::now();
         while self
             .pending_sequences
             .last()
@@ -1544,7 +1620,7 @@ impl Engine {
             if let Err(error) =
                 self.continue_sequence(sequence.actions, sequence.owner, sequence.input, backend)
             {
-                crate::app::logging::report_error(
+                crate::support::logging::report_error(
                     "action",
                     format!("delayed action sequence stopped: {error}"),
                 );
@@ -1554,10 +1630,17 @@ impl Engine {
     }
 
     fn fire_due_timers(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
+        self.fire_due_timers_at(Instant::now(), backend)
+    }
+
+    fn fire_due_timers_at(
+        &mut self,
+        now: Instant,
+        backend: &mut dyn Backend,
+    ) -> Result<(), String> {
         if self.timers.is_empty() {
             return Ok(());
         }
-        let now = Instant::now();
         let mut due: Vec<String> = self
             .timers
             .iter()
@@ -1603,7 +1686,7 @@ impl Engine {
     ) -> Result<(), String> {
         match event {
             BackendEvent::Input(input) => {
-                crate::app::perf_probe::mark("input_received");
+                crate::support::perf_probe::mark("input_received");
                 self.handle_key(input, backend)?;
             }
             BackendEvent::InputInjectionFailed(message) => {
@@ -1681,7 +1764,7 @@ impl Engine {
                 self.refresh_overlay(backend)?;
             }
             BackendEvent::UiScanned(result) => {
-                crate::app::perf_probe::mark_value(
+                crate::support::perf_probe::mark_value(
                     if result.status == UiScanStatus::Partial {
                         "ui_scan_partial"
                     } else {
@@ -1690,17 +1773,17 @@ impl Engine {
                     isize::try_from(result.id).unwrap_or(isize::MAX),
                 );
                 match &result.status {
-                    UiScanStatus::Failed(error) => crate::app::logging::report_error(
+                    UiScanStatus::Failed(error) => crate::support::logging::report_error(
                         "ui-scan",
                         format!("scan {} failed: {error}", result.id),
                     ),
                     UiScanStatus::PermissionDenied(error) | UiScanStatus::Unsupported(error) => {
-                        crate::app::logging::report_warning_args(
+                        crate::support::logging::report_warning_args(
                             "ui-scan",
                             format_args!("scan {} unavailable: {error}", result.id),
                         );
                     }
-                    UiScanStatus::TimedOut => crate::app::logging::report_warning_args(
+                    UiScanStatus::TimedOut => crate::support::logging::report_warning_args(
                         "ui-scan",
                         format_args!("scan {} timed out", result.id),
                     ),
@@ -1719,24 +1802,30 @@ impl Engine {
             }
             BackendEvent::ReloadConfig => {
                 if let Err(error) = self.reload_config(backend) {
-                    crate::app::logging::report_error("config", error);
+                    crate::support::logging::report_error("config", error);
                 }
             }
             BackendEvent::OpenConfigSimulator => {
                 let now = Instant::now();
                 if self.last_config_simulator_open.is_some_and(|previous| {
-                    now.saturating_duration_since(previous)
-                        < crate::app::config_simulator::OPEN_DEBOUNCE
+                    now.saturating_duration_since(previous) < Duration::from_millis(750)
                 }) {
                     return Ok(());
                 }
-                let source = match self.config_store.as_ref() {
-                    Some(store) => store.source_text(),
+                let source = match self.config_repository.as_ref() {
+                    Some(repository) => repository.source_text(),
                     None => self.config.to_toml().map_err(|error| error.to_string())?,
                 };
-                let url = crate::app::config_simulator::url_for_config(&source);
+                let Some(build_url) = self.config_simulator_url else {
+                    crate::support::logging::report_warning_args(
+                        "config-simulator",
+                        format_args!("configuration simulator service is unavailable"),
+                    );
+                    return Ok(());
+                };
+                let url = build_url(&source);
                 if let Err(error) = backend.open_url(&url) {
-                    crate::app::logging::report_error("config-simulator", error);
+                    crate::support::logging::report_error("config-simulator", error);
                 } else {
                     self.last_config_simulator_open = Some(now);
                 }
@@ -1750,7 +1839,13 @@ impl Engine {
                     let _ = self.cancel_transient_clicks(backend)?;
                     self.drag_auto_release.clear();
                     self.release_latched(backend)?;
-                    self.activate(ModeId::idle(), None, backend)?;
+                    self.transition(
+                        ModeTransition::Activate {
+                            target: ModeId::idle(),
+                            previous: None,
+                        },
+                        backend,
+                    )?;
                     self.hide_overlay(backend)?;
                 }
             }
@@ -1760,21 +1855,21 @@ impl Engine {
                     "login-time startup {}",
                     if enabled { "enabled" } else { "disabled" }
                 ),
-                Err(error) => crate::app::logging::report_error("autostart", error),
+                Err(error) => crate::support::logging::report_error("autostart", error),
             },
             BackendEvent::CheckForUpdates => {
                 if let Err(error) = backend.check_for_updates() {
-                    crate::app::logging::report_error("update-check", error);
+                    crate::support::logging::report_error("update-check", error);
                 }
             }
             BackendEvent::UpdateProgress(progress) => {
                 if let Err(error) = backend.present_update_progress(&progress) {
-                    crate::app::logging::report_error("update-check", error);
+                    crate::support::logging::report_error("update-check", error);
                 }
             }
             BackendEvent::UpdateChecked(result) => {
                 if let Err(error) = backend.present_update_result(&result) {
-                    crate::app::logging::report_error("update-check", error);
+                    crate::support::logging::report_error("update-check", error);
                 }
             }
             BackendEvent::Quit => self.should_quit = true,
@@ -1786,55 +1881,17 @@ impl Engine {
     }
 
     fn reload_config(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
-        let discovered_path = if let Some(directory) = self.config_discovery_directory.clone() {
-            let (config, store, path) = match Config::discover_in(&directory) {
-                Ok(Some(path)) => {
-                    let loaded = Config::load_with_source(&path).map_err(|error| {
-                        format!(
-                            "configuration reload rejected; keeping the last valid configuration: {error}"
-                        )
-                    })?;
-                    let store =
-                        ConfigStore::from_validated_text(loaded.path.clone(), loaded.raw_text);
-                    (loaded.config, store, Some(loaded.path))
-                }
-                Ok(None) => {
-                    let config = Config::default();
-                    let path = directory.join("keysteer.user.toml");
-                    let store = ConfigStore::from_validated_text(
-                        path,
-                        config.to_toml().map_err(|error| error.to_string())?,
-                    );
-                    (config, store, None)
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "configuration reload rejected; discovery failed: {error}"
-                    ));
-                }
-            };
-            if let Err(error) = self.cancel_transient_clicks(backend) {
-                self.report_action_error(error, backend);
-            }
-            self.apply_config(config)?;
-            self.config_store = Some(store);
-            path
-        } else if let Some(current) = self.config_store.as_ref() {
-            // Reload into a detached candidate. A malformed file must not
-            // replace the active source or cancel an in-flight short click.
-            let mut candidate = current.clone();
-            let config = candidate.reload().map_err(|error| {
+        let source = if let Some(repository) = self.config_repository.as_mut() {
+            let (config, source) = repository.reload().map_err(|error| {
                 format!(
                     "configuration reload rejected; keeping the last valid configuration: {error}"
                 )
             })?;
-            let path = candidate.path().to_path_buf();
             if let Err(error) = self.cancel_transient_clicks(backend) {
                 self.report_action_error(error, backend);
             }
             self.apply_config(config)?;
-            self.config_store = Some(candidate);
-            Some(path)
+            source
         } else {
             if let Err(error) = self.cancel_transient_clicks(backend) {
                 self.report_action_error(error, backend);
@@ -1845,11 +1902,11 @@ impl Engine {
         };
         self.drag_auto_release.clear();
         self.notify_config_reloaded(backend)?;
-        if let Some(path) = discovered_path {
+        if let Some(source) = source {
             crate::log_info!(
                 "config",
                 "configuration reloaded successfully from {}",
-                path.display()
+                source
             );
         } else {
             crate::log_info!(
@@ -1863,7 +1920,7 @@ impl Engine {
     /// Swap in a new configuration at runtime.
     pub fn apply_config(&mut self, config: Config) -> Result<(), String> {
         config.validate().map_err(|e| e.to_string())?;
-        crate::app::logging::set_non_error_enabled(config.debug.enabled);
+        crate::support::logging::set_non_error_enabled(config.debug.enabled);
         self.drag_auto_release.clear();
         self.config = config;
         self.focused_app_excluded =
@@ -2706,7 +2763,7 @@ impl Engine {
     /// The caller can use the returned dirty bit to rebuild the overlay once.
     fn cancel_transient_clicks(&mut self, backend: &mut dyn Backend) -> Result<bool, String> {
         let pending = std::mem::take(&mut self.pending_long_press_toggles);
-        let mut errors = crate::app::errors::ErrorBundle::default();
+        let mut errors = crate::support::errors::ErrorBundle::default();
         let mut feedback_changed = false;
         for pending in pending {
             match self.cancel_pending_long_press(pending, backend) {
@@ -3080,7 +3137,13 @@ impl Engine {
                 {
                     self.cursor = pointer;
                 }
-                self.activate(next, Some(self.active.clone()), backend)?;
+                self.transition(
+                    ModeTransition::Activate {
+                        target: next,
+                        previous: Some(self.active.clone()),
+                    },
+                    backend,
+                )?;
                 Ok(true)
             }
 
@@ -3109,7 +3172,13 @@ impl Engine {
                     // `press`/`toggle` are explicit engine-wide latches, not
                     // mode-owned gestures. Escape changes mode but must not
                     // synthesize an Up edge for them.
-                    self.activate(ModeId::idle(), Some(self.active.clone()), backend)?;
+                    self.transition(
+                        ModeTransition::Activate {
+                            target: ModeId::idle(),
+                            previous: Some(self.active.clone()),
+                        },
+                        backend,
+                    )?;
                 }
                 Ok(true)
             }
@@ -3298,7 +3367,7 @@ impl Engine {
                         Ok(()) => {
                             self.latched.remove(rollback);
                         }
-                        Err(rollback_error) => crate::app::logging::report_error(
+                        Err(rollback_error) => crate::support::logging::report_error(
                             "action",
                             format!("cannot roll back held input: {rollback_error}"),
                         ),
@@ -3318,7 +3387,7 @@ impl Engine {
         force: bool,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
-        let mut errors = crate::app::errors::ErrorBundle::default();
+        let mut errors = crate::support::errors::ErrorBundle::default();
         for target in targets.iter().rev() {
             let matched = self.matching_latched_target(target);
             if !force && matched.is_none() {
@@ -3357,7 +3426,7 @@ impl Engine {
             };
             if let Err(error) = result {
                 if let Err(rollback_error) = self.restore_latched(&original, backend) {
-                    crate::app::logging::report_error(
+                    crate::support::logging::report_error(
                         "action",
                         format!("cannot roll back toggle action: {rollback_error}"),
                     );
@@ -3459,14 +3528,14 @@ impl Engine {
                 cursor: self.cursor,
                 focused_app: self.focused_app.as_ref(),
                 palette: &self.palette,
-                config: &self.config,
+                settings: &self.config,
             };
             let Some(mode) = self.modes.get_mut(&owner) else {
                 continue;
             };
-            let _ = mode.handle(&ModeEvent::ConfigReloaded, &context);
+            let _ = mode.handle(&ModeEvent::SettingsChanged, &context);
         }
-        self.dispatch_to(&active, ModeEvent::ConfigReloaded, backend)
+        self.dispatch_to(&active, ModeEvent::SettingsChanged, backend)
     }
 
     fn mode_index_for_dispatch(&mut self, owner: &ModeId) -> Option<usize> {
@@ -3499,14 +3568,14 @@ impl Engine {
             cursor: self.cursor,
             focused_app: self.focused_app.as_ref(),
             palette: &self.palette,
-            config: &self.config,
+            settings: &self.config,
         };
         let Some(mode) = self.modes.get_index_mut(mode_index) else {
             return Ok(());
         };
         let commands = mode.handle(&event, &context);
-        crate::app::perf_probe::mark("mode_handled");
-        crate::app::perf_probe::mark("commands_ready");
+        crate::support::perf_probe::mark("mode_handled");
+        crate::support::perf_probe::mark("commands_ready");
         self.execute_for(owner, commands, backend)
     }
 
@@ -3527,14 +3596,14 @@ impl Engine {
             cursor: self.cursor,
             focused_app: self.focused_app.as_ref(),
             palette: &self.palette,
-            config: &self.config,
+            settings: &self.config,
         };
         let Some(mode) = self.modes.get_index_mut(mode_index) else {
             return Ok(());
         };
         let commands = mode.handle_owned(event, &context);
-        crate::app::perf_probe::mark("mode_handled");
-        crate::app::perf_probe::mark("commands_ready");
+        crate::support::perf_probe::mark("mode_handled");
+        crate::support::perf_probe::mark("commands_ready");
         self.execute_for(owner, commands, backend)
     }
 
@@ -3639,7 +3708,7 @@ impl Engine {
                 cursor: self.cursor,
                 focused_app: self.focused_app.as_ref(),
                 palette: &self.palette,
-                config: &self.config,
+                settings: &self.config,
             };
             if let Some(old) = self.modes.get_mut(&self.active) {
                 let commands = old.handle(&ModeEvent::Deactivated, &context);
@@ -3739,6 +3808,8 @@ mod tests {
     use crate::api::binding::Direction;
     use crate::api::geometry::Rect;
     use crate::api::input::InputEvent;
+    use crate::app::config_repository::ConfigRepository as AppConfigRepository;
+    use crate::config::ConfigStore;
     use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
     use std::alloc::System;
     use std::sync::{Arc, Mutex};
@@ -3934,10 +4005,10 @@ mod tests {
     fn simulator_menu_uses_the_active_config_source() {
         let source = "# current profile\n[normal]\nlong_press_toggle_ms = 777\n";
         let mut engine = Engine::new(Config::parse(source).unwrap(), Appearance::Dark);
-        engine.attach_config_store(ConfigStore::from_validated_text(
-            "keysteer.profile.toml",
-            source.to_string(),
-        ));
+        engine.attach_config_repository(Box::new(AppConfigRepository::fixed(
+            ConfigStore::from_validated_text("keysteer.profile.toml", source.to_string()),
+        )));
+        engine.attach_config_simulator(crate::app::config_simulator::url_for_config);
         let (mut backend, log) = FakeBackend::new(vec![BackendEvent::OpenConfigSimulator]);
 
         engine.run(&mut backend).unwrap();
@@ -3953,6 +4024,7 @@ mod tests {
         let config = Config::default();
         let expected = crate::app::config_simulator::url_for_config(&config.to_toml().unwrap());
         let mut engine = Engine::new(config, Appearance::Dark);
+        engine.attach_config_simulator(crate::app::config_simulator::url_for_config);
         let (mut backend, log) = FakeBackend::new(vec![BackendEvent::OpenConfigSimulator]);
 
         engine.run(&mut backend).unwrap();
@@ -3963,6 +4035,7 @@ mod tests {
     #[test]
     fn simulator_menu_debounces_rapid_repeated_clicks() {
         let mut engine = Engine::new(Config::default(), Appearance::Dark);
+        engine.attach_config_simulator(crate::app::config_simulator::url_for_config);
         let (mut backend, log) = FakeBackend::new(vec![
             BackendEvent::OpenConfigSimulator,
             BackendEvent::OpenConfigSimulator,
@@ -4638,7 +4711,7 @@ mod tests {
         let build = || {
             CompiledKeymap::compile(
                 vec![("a".into(), Binding::Move(Direction::Left))],
-                config.resolved_key_aliases(),
+                config.key_name_resolver(),
             )
         };
         let mode = ModeId::normal();
@@ -4734,7 +4807,7 @@ mod tests {
                 ModeEvent::PointerMoved(_) => "pointer",
                 ModeEvent::Frame { .. } => "frame",
                 ModeEvent::FocusChanged(_) => "focus",
-                ModeEvent::ConfigReloaded => "reloaded",
+                ModeEvent::SettingsChanged => "reloaded",
             };
             self.seen
                 .lock()
@@ -4742,7 +4815,7 @@ mod tests {
                 .push(format!("{}:{label}", self.id));
             CommandBatch::from(match event {
                 ModeEvent::Key { .. } => self.on_key.clone(),
-                ModeEvent::ConfigReloaded => self.on_reload.clone(),
+                ModeEvent::SettingsChanged => self.on_reload.clone(),
                 _ => Vec::new(),
             })
         }
@@ -10028,7 +10101,10 @@ mod tests {
         let default_write_path = directory.join("keysteer.user.toml");
         let store = ConfigStore::open(&default_write_path, &defaults).unwrap();
         let mut engine = Engine::new(defaults, Appearance::Dark);
-        engine.attach_discovered_config_store(store, directory.clone());
+        engine.attach_config_repository(Box::new(AppConfigRepository::discovered(
+            store,
+            directory.clone(),
+        )));
 
         let discovered_path = directory.join("keysteer.created-later.toml");
         std::fs::write(&discovered_path, "[pointer]\ninitial_speed = 321\n").unwrap();
@@ -10037,8 +10113,8 @@ mod tests {
 
         assert_eq!(engine.config.pointer.initial_speed, 321.0);
         assert_eq!(
-            engine.config_store.as_ref().unwrap().path(),
-            discovered_path
+            engine.config_source_label().as_deref(),
+            Some(discovered_path.to_string_lossy().as_ref())
         );
 
         std::fs::remove_file(&discovered_path).unwrap();
@@ -10048,8 +10124,8 @@ mod tests {
             Config::default().pointer.initial_speed
         );
         assert_eq!(
-            engine.config_store.as_ref().unwrap().path(),
-            default_write_path
+            engine.config_source_label().as_deref(),
+            Some(default_write_path.to_string_lossy().as_ref())
         );
 
         std::fs::remove_dir_all(directory).unwrap();
@@ -10069,10 +10145,12 @@ mod tests {
 
         let explicit_path = directory.join("keysteer.explicit.toml");
         std::fs::write(&explicit_path, "[pointer]\ninitial_speed = 200\n").unwrap();
-        let config = Config::load(&explicit_path).unwrap();
+        let config = crate::app::config_repository::load_with_source(&explicit_path)
+            .unwrap()
+            .config;
         let store = ConfigStore::open(&explicit_path, &config).unwrap();
         let mut engine = Engine::new(config, Appearance::Dark);
-        engine.attach_config_store(store);
+        engine.attach_config_repository(Box::new(AppConfigRepository::fixed(store)));
 
         std::fs::write(
             directory.join("keysteer.aaa.toml"),
@@ -10084,7 +10162,10 @@ mod tests {
         engine.reload_config(&mut backend).unwrap();
 
         assert_eq!(engine.config.pointer.initial_speed, 456.0);
-        assert_eq!(engine.config_store.as_ref().unwrap().path(), explicit_path);
+        assert_eq!(
+            engine.config_source_label().as_deref(),
+            Some(explicit_path.to_string_lossy().as_ref())
+        );
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -10106,7 +10187,7 @@ mod tests {
         let mut config = engine.config.clone();
         std::fs::write(&path, config.to_toml().unwrap()).unwrap();
         let store = ConfigStore::open(&path, &config).unwrap();
-        engine.attach_config_store(store);
+        engine.attach_config_repository(Box::new(AppConfigRepository::fixed(store)));
         engine.active = ModeId::normal();
         let (mut backend, log) = FakeBackend::new(Vec::new());
 

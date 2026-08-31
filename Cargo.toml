@@ -176,10 +176,8 @@ cc = "1.2"
 [target.'cfg(windows)'.build-dependencies]
 winresource = { version = "0.1.31", default-features = false }
 
-[target.'cfg(windows)'.dev-dependencies]
-loom = "0.7.2"
-
 [dev-dependencies]
+loom = "0.7.2"
 stats_alloc = "0.1.10"
 
 [[bench]]

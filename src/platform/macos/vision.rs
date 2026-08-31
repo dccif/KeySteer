@@ -3,7 +3,7 @@ use std::ptr::NonNull;
 
 use crate::api::command::{UiScanStatus, VisionOptions};
 use crate::api::geometry::{Rect, UiTarget};
-use crate::platform::spatial_index::SpatialIndex;
+use crate::platform::common::spatial_index::SpatialIndex;
 
 #[repr(C)]
 #[derive(Clone, Copy)]

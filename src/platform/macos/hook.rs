@@ -16,8 +16,8 @@ use crate::api::backend::{BackendEvent, KeyDisposition};
 use crate::api::command::MouseButton;
 use crate::api::geometry::Point;
 use crate::api::input::{InputEvent, Key, KeyState};
-use crate::app::worker::WorkerJoin;
 use crate::platform::multi_click::ClickTracker;
+use crate::support::worker::WorkerJoin;
 
 use super::input;
 
@@ -345,7 +345,7 @@ impl Drop for HookStartup {
         if let Some(mut worker) = self.worker.take()
             && let Err(error) = worker.join_timeout(STOP_TIMEOUT)
         {
-            crate::app::logging::report_error("macos-hook", &error);
+            crate::support::logging::report_error("macos-hook", &error);
         }
     }
 }
@@ -448,7 +448,7 @@ impl HookThread {
 
     fn reap_finished(&mut self) {
         if let Err(error) = self.worker.reap_finished() {
-            crate::app::logging::report_error("macos-hook", &error);
+            crate::support::logging::report_error("macos-hook", &error);
         }
     }
 
@@ -619,7 +619,7 @@ impl Drop for HookThread {
             return;
         }
         if let Err(error) = self.stop() {
-            crate::app::logging::report_error("macos-hook", &error);
+            crate::support::logging::report_error("macos-hook", &error);
         }
     }
 }
@@ -712,7 +712,7 @@ fn event_tap_thread(handshake: HookHandshake, context: HookThreadContext) {
         detach_event_tap_source(&run_loop, &source, &shared_run_loop);
         return;
     }
-    crate::app::perf_probe::mark("hook_ready");
+    crate::support::perf_probe::mark("hook_ready");
 
     let mut timeout_retried = false;
     loop {
@@ -986,10 +986,10 @@ fn disposition_for(
     mailbox: &crate::platform::disposition_mailbox::DispositionMailbox,
     event: BackendEvent,
 ) -> CallbackResult {
-    let correlation_id = crate::app::perf_probe::next_correlation_id();
-    crate::app::perf_probe::mark_correlated("hook_received", correlation_id);
+    let correlation_id = crate::support::perf_probe::next_correlation_id();
+    crate::support::perf_probe::mark_correlated("hook_received", correlation_id);
     let Some(generation) = mailbox.try_begin() else {
-        crate::app::perf_probe::mark_correlated("disposition_returned", correlation_id);
+        crate::support::perf_probe::mark_correlated("disposition_returned", correlation_id);
         return CallbackResult::Keep;
     };
     if sender
@@ -999,7 +999,7 @@ fn disposition_for(
         })
         .is_err()
     {
-        crate::app::perf_probe::mark_correlated("disposition_returned", correlation_id);
+        crate::support::perf_probe::mark_correlated("disposition_returned", correlation_id);
         return CallbackResult::Keep;
     }
     super::workspace::wake_main_run_loop();
@@ -1015,7 +1015,7 @@ fn disposition_for(
             CallbackResult::Keep
         }
     };
-    crate::app::perf_probe::mark_correlated("disposition_returned", correlation_id);
+    crate::support::perf_probe::mark_correlated("disposition_returned", correlation_id);
     result
 }
 

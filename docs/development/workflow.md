@@ -80,13 +80,13 @@ pnpm docs:build
 1. 在 `src/api/binding.rs` 修改解析、规范化和序列化。
 2. 为合法输入、错误输入和数组顺序增加测试。
 3. 更新 `keysteer.default.toml`、[模式与动作](/reference/modes-and-actions) 和配置模拟器需要展示的动作分类。
-4. 检查 `src/app/runtime/mod.rs` 中的命令执行分支、配置校验和集成测试。
+4. 检查 `src/runtime.rs` 中的命令执行分支、配置校验和集成测试。
 
 ### 改 Mode
 
 1. 先确认 ModeEvent、Command 和生命周期语义。
 2. 在 Mode 内保存状态，使用 `Command` 请求宿主能力。
-3. 验证 `Activated`、`Deactivated`、`Restarted`、`FinishRequested` 和 `ConfigReloaded`。
+3. 验证 `Activated`、`Deactivated`、`Restarted`、`FinishRequested` 和 `SettingsChanged`。
 4. 检查 overlay、输入释放和模式切换后的 owner。
 
 ### 改平台后端

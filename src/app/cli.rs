@@ -29,29 +29,29 @@ pub fn run_cli() -> ExitCode {
     if let Some(exit) = run_internal_wechat_helper() {
         return exit;
     }
-    let log_path = match super::logging::init() {
+    let log_path = match crate::support::logging::init(super::paths::data_file("keysteer.log")) {
         Ok(path) => Some(path.to_path_buf()),
         Err(error) => {
             crate::report_error!("logging", "{error}");
             None
         }
     };
-    super::logging::install_panic_hook();
+    crate::support::logging::install_panic_hook();
     match parse_args().and_then(|args| args.map_or(Ok(()), super::bootstrap::run)) {
         Ok(()) => {
-            super::logging::end_session();
-            super::logging::flush();
+            crate::support::logging::end_session();
+            crate::support::logging::flush();
             ExitCode::SUCCESS
         }
         Err(error) => {
             crate::report_error!("cli", "{error}");
             if let Some(log_path) = log_path {
-                super::logging::emergency_console(format_args!(
+                crate::support::logging::emergency_console(format_args!(
                     "diagnostic log: {}",
                     log_path.display()
                 ));
             }
-            super::logging::flush();
+            crate::support::logging::flush();
             ExitCode::FAILURE
         }
     }
@@ -184,7 +184,7 @@ CONFIGURATION:
         version = env!("CARGO_PKG_VERSION"),
         backend = crate::platform::backend_name(),
     );
-    if let Some(path) = super::logging::path() {
+    if let Some(path) = crate::support::logging::path() {
         println!(
             "\nDIAGNOSTICS:\n    Always-on runtime log: {}",
             path.display()

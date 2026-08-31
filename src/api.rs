@@ -17,27 +17,29 @@ pub mod hint;
 pub mod input;
 pub mod overlay;
 pub mod plugin;
+pub mod settings;
 pub mod theme;
 
 pub use autostart::Autostart;
 pub use backend::{
-    Appearance, Backend, BackendEvent, KeyDisposition, UpdateCheckResult, UpdateProgress,
+    Appearance, Backend, BackendEvent, EventPump, Input, KeyDisposition, Overlay, Shell, UiScan,
+    UpdateCheckResult, UpdateProgress,
 };
 pub use binding::{
     Action, ActionPhase, ActionSequence, Binding, Button, DEFAULT_WAIT_MS, Direction, InputTarget,
     ScrollAmount, Speed,
 };
 pub use command::{
-    ButtonAction, Command, CommandBatch, FinishCause, FocusedApp, HostContext, HostSettings, Mode,
-    ModeEvent, MouseButton, UiScanRequest, UiScanResult, UiScanStatus, UiScanStrategy,
-    VisionOptions,
+    ButtonAction, Command, CommandBatch, FinishCause, FocusedApp, HostContext, Mode, ModeEvent,
+    MouseButton, UiScanRequest, UiScanResult, UiScanStatus, UiScanStrategy, VisionOptions,
 };
 pub use geometry::{Point, Rect, Screen, UiTarget};
 pub use hint::LabelDirection;
-pub use input::{InputEvent, Key, KeyChord, KeyState, ModeId};
+pub use input::{InputEvent, Key, KeyChord, KeyNameResolver, KeyState, ModeId};
 pub use overlay::{
     Color, Indicator, LabelStyle, OverlayLabel, OverlayScene, OverlayShape, OverlayText, Placement,
     SharedLabelStyle,
 };
 pub use plugin::{API_VERSION, Manifest, Plugin};
+pub use settings::RuntimeSettings;
 pub use theme::Palette;

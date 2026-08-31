@@ -3,13 +3,11 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use miniz_oxide::deflate::compress_to_vec_zlib;
-use std::time::Duration;
 
 const SIMULATOR_URL: &str = "https://dccif.github.io/KeySteer/simulator";
 const PROTOCOL_VERSION: &str = "v1";
 const MAX_SOURCE_BYTES: usize = 256 * 1024;
 const MAX_FRAGMENT_BYTES: usize = 24 * 1024;
-pub(crate) const OPEN_DEBOUNCE: Duration = Duration::from_secs(2);
 
 pub(crate) fn url_for_config(source: &str) -> String {
     if source.len() > MAX_SOURCE_BYTES {

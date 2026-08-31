@@ -9,7 +9,7 @@ main.rs
      -> logging::init + panic hook
      -> cli::parse_args
      -> bootstrap::run
-        -> Config::discover/load 或 Config::default
+        -> app::config_repository::discover/load 或 Config::default
         -> platform::backend
         -> Engine::new
         -> modes::built_in 注册
@@ -20,7 +20,7 @@ main.rs
 Windows 二进制默认无控制台；只有携带 CLI 参数时才尝试附加父控制台。无配置文件不是
 错误：程序使用 `Config::default()` 静默进入 Windows 托盘或 macOS 顶部状态区域并进入 `idle`。
 
-诊断统一经过 `app::logging`：`report_error!`/`report_error` 与 panic 不受 debug 配置控制，始终写入 stderr 和日志文件并
+诊断统一经过 `support::logging`：`report_error!`/`report_error` 与 panic 不受 debug 配置控制，始终写入 stderr 和日志文件并
 立即 flush；debug/info/warning（包括 `report_warning`）继续受 `debug.enabled` 控制。
 首选日志目录不可写时退到系统临时目录的 `KeySteer/keysteer.log`，并把这次降级本身
 记录为 ERROR。包括 CLI 在内的应用代码不得直接写 stderr；初始化和日志 I/O 失败也只能
@@ -45,7 +45,8 @@ emergency stderr 使用不 panic 的 `Write` 路径，且不创建后台日志�
 `src/api/` 是唯一允许跨层传递的词汇：
 
 - 原生层向上只产生 `BackendEvent`。
-- Engine 向 Mode 只发送 `ModeEvent` 和只读 `HostContext`。
+- Engine 向 Mode 只发送 `ModeEvent` 和只读 `HostContext`；设置通过
+  `settings: &RuntimeSettings` 显式传递，不使用 `Any`/downcast。
 - Mode/Plugin 向外只返回 `CommandBatch`；批次只包含 `Command`。
 - Engine 将 `Command` 翻译成 `Backend` 调用或新的 Mode 事件。
 
@@ -68,7 +69,7 @@ Engine 的 Frame、指针、按键等通用热路径直接调用借用式 `Mode:
 
 ## Engine 拥有什么
 
-`src/app/runtime/mod.rs::Engine` 的状态分为几组：
+`src/runtime.rs::Engine` 的状态分为几组：
 
 - 配置/主题：`Config`、`Palette`、当前 `Appearance`。
 - 模式：稳定的连续 `ModeRegistry`/`ModeSlot`、缓存的活动 slot、modal stack、插件默认绑定
@@ -81,6 +82,11 @@ Engine 的 Frame、指针、按键等通用热路径直接调用借用式 `Mode:
 - 环境：屏幕、权威光标坐标、当前应用。
 - 绘制：Mode 原始 scene、加装饰后的最后 scene、可见状态。
 - 控制：启用/暂停、退出、配置存储、输入失败抑制。
+
+所有 activate/push/pop/restart 请求先收敛为内部 `ModeTransition`，再进入对应清理路径；timer、
+sequence、长按和自动释放的到期核心均接收显式 `Instant`，事件循环包装层才读取当前单调时钟。
+配置持久化/重新发现由 App 实现 `ConfigRepositoryPort` 后注入 Runtime，Runtime 生产代码不反向
+引用组合层。
 
 绑定表只在配置、模式注册或实际生效的 per-app override profile 变化时重建。仅窗口标题
 变化但合并后的绑定不变，不应触发表重编译。
