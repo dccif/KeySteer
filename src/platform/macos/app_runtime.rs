@@ -73,7 +73,13 @@ impl ApplicationRuntime {
                 }
                 Ok(turn) => {
                     if !turn.event_processed {
-                        match self.engine.runtime_next_deadline() {
+                        let next_deadline = self
+                            .engine
+                            .runtime_next_deadline()
+                            .into_iter()
+                            .chain(self.backend.runtime_next_deadline())
+                            .min();
+                        match next_deadline {
                             Some(next_timeout) if next_timeout.is_zero() => {}
                             Some(next_timeout) => {
                                 Self::schedule(next_timeout);

@@ -16,6 +16,8 @@ use crate::api::backend::KeyDisposition;
 struct Slot {
     generation: u64,
     disposition: Option<KeyDisposition>,
+    #[cfg(any(target_os = "macos", test))]
+    closed: bool,
 }
 
 #[derive(Default)]
@@ -26,11 +28,26 @@ pub(super) struct DispositionMailbox {
 
 impl DispositionMailbox {
     /// Reserve the reusable slot for one native callback.
+    #[cfg(any(not(target_os = "macos"), test))]
     pub(super) fn begin(&self) -> u64 {
         let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
         slot.generation = slot.generation.wrapping_add(1);
         slot.disposition = None;
         slot.generation
+    }
+
+    /// Reserve the macOS callback slot unless native input capture has entered
+    /// its terminal state. The check shares the existing slot lock, so it adds
+    /// no atomic, allocation, or second synchronization step to the callback.
+    #[cfg(any(target_os = "macos", test))]
+    pub(super) fn try_begin(&self) -> Option<u64> {
+        let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
+        if slot.closed {
+            return None;
+        }
+        slot.generation = slot.generation.wrapping_add(1);
+        slot.disposition = None;
+        Some(slot.generation)
     }
 
     /// Complete `generation`; returns false when that callback already timed
@@ -61,14 +78,13 @@ impl DispositionMailbox {
             .flatten()
     }
 
-    /// Fail-open any callback currently waiting for the engine.
-    ///
-    /// Native hook shutdown and permission revocation must not wait for the
-    /// normal disposition timeout. Advancing the generation makes the old
-    /// waiter stale and the notification wakes it immediately.
+    /// Permanently fail open this mailbox. A native callback racing with
+    /// shutdown either reserves its generation before this lock and is woken,
+    /// or observes `closed` and returns without waiting.
     #[cfg(any(target_os = "macos", test))]
-    pub(super) fn cancel_pending(&self) {
+    pub(super) fn close(&self) {
         let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
+        slot.closed = true;
         slot.generation = slot.generation.wrapping_add(1);
         slot.disposition = None;
         self.ready.notify_all();
@@ -108,12 +124,13 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_invalidates_a_pending_callback() {
+    fn close_invalidates_current_and_rejects_future_callbacks() {
         let mailbox = DispositionMailbox::default();
-        let generation = mailbox.begin();
-        mailbox.cancel_pending();
+        let generation = mailbox.try_begin().unwrap();
+        mailbox.close();
 
         assert_eq!(mailbox.wait(generation, Duration::ZERO), None);
         assert!(!mailbox.complete(generation, KeyDisposition::Consume));
+        assert_eq!(mailbox.try_begin(), None);
     }
 }

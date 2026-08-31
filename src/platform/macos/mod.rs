@@ -205,6 +205,12 @@ impl MacOsBackend {
         }
     }
 
+    fn runtime_next_deadline(&self) -> Option<Duration> {
+        self.status_item
+            .as_ref()
+            .and_then(status_item::StatusItem::next_maintenance_deadline)
+    }
+
     fn try_event(&mut self) -> Option<BackendEvent> {
         if let Some(event) = self.hook.as_mut().and_then(HookThread::take_capture_loss) {
             return Some(event);
@@ -261,11 +267,22 @@ impl MacOsBackend {
         let now = Instant::now();
         let deadline = now.checked_add(BACKEND_SHUTDOWN_TIMEOUT).unwrap_or(now);
 
-        // Stop every producer before tearing down the AppKit objects they may
-        // wake or update. All operations are idempotent so Drop can safely use
-        // the same path after an earlier error.
+        // Phase one never waits. Make the synchronous event tap fail open
+        // before joining any worker; otherwise physical input arriving while
+        // Vision is stopping would wait for an Engine disposition that can no
+        // longer be sent.
         let mut errors = crate::app::errors::ErrorBundle::default();
+        if let Some(hook) = self.hook.as_mut() {
+            hook.request_stop();
+        }
         self.status_item.take();
+        self.frame_clock.stop();
+        self.scan_worker.request_stop();
+        if let Some(worker) = self.update_worker.as_ref() {
+            worker.request_cancel();
+        }
+        errors.record("held mouse buttons", self.release_held_buttons());
+        errors.record("overlay dismiss", self.overlay.dismiss());
         if let Some(watcher) = self.display_watcher.as_mut() {
             match watcher.stop() {
                 Ok(()) => {
@@ -274,7 +291,17 @@ impl MacOsBackend {
                 Err(error) => errors.push("display watcher", error),
             }
         }
-        self.frame_clock.stop();
+
+        // Phase two joins only producers that were cancelled above. Every
+        // stage shares the same absolute deadline.
+        if let Some(hook) = self.hook.as_mut() {
+            match hook.stop_until(deadline) {
+                Ok(()) => {
+                    self.hook.take();
+                }
+                Err(error) => errors.push("input hook", error),
+            }
+        }
         errors.record("UI scan worker", self.scan_worker.shutdown_until(deadline));
         if let Some(worker) = self.update_worker.as_mut() {
             match worker.cancel_and_wait_until(deadline) {
@@ -284,17 +311,6 @@ impl MacOsBackend {
                 Err(error) => errors.push("update worker", error),
             }
         }
-
-        errors.record("held mouse buttons", self.release_held_buttons());
-        if let Some(hook) = self.hook.as_mut() {
-            match hook.stop_until(deadline) {
-                Ok(()) => {
-                    self.hook.take();
-                }
-                Err(error) => errors.push("input hook", error),
-            }
-        }
-        errors.record("overlay dismiss", self.overlay.dismiss());
         if errors.is_empty() {
             self.shutdown_complete = true;
         }
@@ -304,18 +320,14 @@ impl MacOsBackend {
 
 impl Drop for MacOsBackend {
     fn drop(&mut self) {
-        if self.shutdown_complete {
+        if self.shutdown_complete || self.shutdown_attempted {
             return;
         }
         if let Err(error) = self.shutdown_resources() {
-            // Explicit shutdown returns the aggregate to the runtime logger.
-            // Drop retries only unfinished owners and avoids duplicate output.
-            if !self.shutdown_attempted {
-                crate::app::logging::report_error(
-                    "macos-shutdown",
-                    format!("cannot completely release macOS backend resources: {error}"),
-                );
-            }
+            crate::app::logging::report_error(
+                "macos-shutdown",
+                format!("cannot completely release macOS backend resources: {error}"),
+            );
         }
     }
 }

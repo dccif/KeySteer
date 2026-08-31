@@ -122,8 +122,9 @@ fn macos_status_item_is_created_once_after_appkit_launch() {
     assert!(!workspace.contains("pump_app_events"));
     assert!(!status_item.contains("button.window()"));
     assert!(!status_item.contains("rebuild_native_item"));
-    assert!(status_item.contains("STATUS_ITEM_AUTOSAVE_NAME"));
-    assert!(status_item.contains("setAutosaveName"));
+    assert!(!status_item.contains("setAutosaveName"));
+    assert!(status_item.contains("next_maintenance_deadline"));
+    assert!(runtime.contains("self.backend.runtime_next_deadline()"));
     assert!(status_item.contains("NSCellImagePosition::ImageOnly"));
     assert_eq!(status_item.matches("setVisible(true)").count(), 1);
     assert!(status_item.contains("let icon = status_icon(STATUS_ICON_SIZE);"));
@@ -131,6 +132,40 @@ fn macos_status_item_is_created_once_after_appkit_launch() {
     assert!(status_item.contains("image.setTemplate(false)"));
     assert!(!status_item.contains("NSApplicationActivationPolicy::Regular"));
     assert_eq!(status_item.matches("removeStatusItem").count(), 1);
+    let native_item = status_item
+        .split_once("fn create_native_item(")
+        .map(|(_, body)| body)
+        .expect("native status-item constructor must remain inspectable");
+    let menu = native_item.find("item.setMenu").unwrap();
+    let visible = native_item.find("item.setVisible(true)").unwrap();
+    let button = native_item.find("item.button(mtm)").unwrap();
+    assert!(menu < visible && visible < button);
+    assert!(bridge.contains("NSEventTypeApplicationDefined"));
+    assert!(bridge.contains("postEvent:wakeEvent atStart:YES"));
+}
+
+#[test]
+fn macos_shutdown_releases_input_before_waiting_for_workers() {
+    let backend = include_str!("../src/platform/macos/mod.rs");
+    let shutdown = backend
+        .split_once("fn shutdown_resources(&mut self)")
+        .map(|(_, body)| body)
+        .and_then(|body| body.split_once("impl Drop for MacOsBackend"))
+        .map(|(body, _)| body)
+        .expect("macOS shutdown must remain inspectable");
+    let release_input = shutdown.find("hook.request_stop()").unwrap();
+    let remove_status_item = shutdown.find("self.status_item.take()").unwrap();
+    let stop_scan = shutdown.find("self.scan_worker.request_stop()").unwrap();
+    let join_hook = shutdown.find("hook.stop_until(deadline)").unwrap();
+    let join_scan = shutdown
+        .find("self.scan_worker.shutdown_until(deadline)")
+        .unwrap();
+    assert!(release_input < remove_status_item);
+    assert!(release_input < join_hook);
+    assert!(release_input < join_scan);
+    assert!(stop_scan < join_hook);
+    assert!(stop_scan < join_scan);
+    assert!(backend.contains("self.shutdown_complete || self.shutdown_attempted"));
 }
 
 #[test]

@@ -111,12 +111,16 @@ impl UiScanWorker {
         self.shutdown_until(deadline)
     }
 
-    pub(super) fn shutdown_until(&mut self, deadline: Instant) -> Result<(), String> {
+    pub(super) fn request_stop(&self) {
         LATEST_SCAN.store(0, Ordering::Release);
         vision::mark_latest(0);
         if let Some(queue) = self.queue.as_ref() {
             queue.stop();
         }
+    }
+
+    pub(super) fn shutdown_until(&mut self, deadline: Instant) -> Result<(), String> {
+        self.request_stop();
         let Some(worker) = self.worker.as_mut() else {
             self.shutdown_failure_returned = false;
             return Ok(());

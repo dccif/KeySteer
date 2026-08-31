@@ -1,6 +1,11 @@
-import { defineComponent, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, defineComponent, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useData, withBase } from 'vitepress'
-import { RELEASE_TAG, RELEASE_URL, RELEASES_URL, releaseAssetUrl } from '../generated/release'
+import {
+  fetchLatestRelease,
+  LATEST_RELEASE_URL,
+  type LatestRelease,
+  RELEASES_URL,
+} from '../latest-release'
 
 interface DownloadAsset {
   key: string
@@ -85,19 +90,23 @@ function detectAsset(): DownloadAsset {
   return ASSETS[0]
 }
 
-function assetUrl(asset: DownloadAsset) {
-  return releaseAssetUrl(asset.target)
-}
-
 export default defineComponent({
   name: 'DownloadButton',
   setup() {
     const { lang } = useData()
     const detected = ref<DownloadAsset>(detectAsset())
+    const latestRelease = ref<LatestRelease>()
     const menuOpen = ref(false)
+    const releaseRequest = new AbortController()
     const isEnglish = () => lang.value === 'en-US'
     const text = (zh: string, en: string) => isEnglish() ? en : zh
     const localPath = (path: string) => withBase(`${isEnglish() ? '/en' : ''}${path}`)
+    const versionLabel = computed(() => latestRelease.value?.tag ?? text('最新版', 'Latest'))
+    const assetUrl = (asset: DownloadAsset) => (
+      latestRelease.value?.assets[asset.target]
+      ?? latestRelease.value?.url
+      ?? LATEST_RELEASE_URL
+    )
 
     const closeMenu = () => {
       menuOpen.value = false
@@ -106,9 +115,17 @@ export default defineComponent({
     onMounted(() => {
       detected.value = detectAsset()
       document.addEventListener('click', closeMenu)
+      void fetchLatestRelease(ASSETS.map((asset) => asset.target), releaseRequest.signal)
+        .then((release) => { latestRelease.value = release })
+        .catch((error: unknown) => {
+          if (!(error instanceof DOMException && error.name === 'AbortError')) {
+            console.warn('Could not load the latest KeySteer release', error)
+          }
+        })
     })
 
     onBeforeUnmount(() => {
+      releaseRequest.abort()
       document.removeEventListener('click', closeMenu)
     })
 
@@ -121,7 +138,10 @@ export default defineComponent({
             title={text(`下载 KeySteer ${detected.value.platformLabel} ${detected.value.label}`, `Download KeySteer for ${detected.value.platformLabel} ${detected.value.label}`)}
           >
             <span class="hero-download-emoji" aria-hidden="true">💾</span>
-            <strong>{text('立即下载', 'Download now')}</strong>
+            <span class="hero-download-copy">
+              <strong>{text('立即下载', 'Download now')}</strong>
+              <small>{versionLabel.value}</small>
+            </span>
           </a>
           <button
             class="hero-download-toggle"

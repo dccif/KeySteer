@@ -26,8 +26,9 @@ use super::EventSender;
 static SENDER: OnceLock<Mutex<Option<EventSender>>> = OnceLock::new();
 
 const STATUS_BUTTON_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+const STATUS_BUTTON_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(1);
 const STATUS_BUTTON_RETRY_ATTEMPTS: u8 = 120;
-const STATUS_ITEM_AUTOSAVE_NAME: &str = "com.keysteer.app.status-item";
+const STATUS_VISIBILITY_CHECK_DELAY: Duration = Duration::from_secs(1);
 const STATUS_ICON_PNG: &[u8] = include_bytes!("../../../assets/icons/keysteer-icon.png");
 const STATUS_ICON_SIZE: f64 = 18.0;
 
@@ -224,6 +225,7 @@ pub struct StatusItem {
     update_item: Retained<NSMenuItem>,
     enabled: bool,
     button_retry: Option<StatusButtonRetry>,
+    visibility_check_at: Option<Instant>,
 }
 
 struct StatusButtonRetry {
@@ -297,37 +299,70 @@ impl StatusItem {
             update_item,
             enabled: true,
             button_retry: (!button_configured).then(|| StatusButtonRetry {
-                next_check: Instant::now(),
+                // Yield through one real AppKit turn before the first retry so
+                // Tahoe's Control Center host can attach the native button.
+                next_check: Instant::now() + STATUS_BUTTON_INITIAL_RETRY_DELAY,
                 attempts_remaining: STATUS_BUTTON_RETRY_ATTEMPTS,
             }),
+            visibility_check_at: Some(Instant::now() + STATUS_VISIBILITY_CHECK_DELAY),
         }
+    }
+
+    /// Return the next status-item maintenance deadline for the single AppKit
+    /// runtime timer. Tahoe may attach the native button one run-loop turn
+    /// after the item becomes visible; without this deadline an otherwise idle
+    /// application could sleep before configuring its icon.
+    pub(super) fn next_maintenance_deadline(&self) -> Option<Duration> {
+        let now = Instant::now();
+        self.button_retry
+            .as_ref()
+            .map(|retry| retry.next_check.saturating_duration_since(now))
+            .into_iter()
+            .chain(
+                self.visibility_check_at
+                    .map(|deadline| deadline.saturating_duration_since(now)),
+            )
+            .min()
     }
 
     /// Retry only configuring the button of the single retained status item.
     /// A cold login may briefly return no button while AppKit attaches the
     /// menu-bar scene; never remove or replace the native item in response.
     pub(super) fn maintain_button_configuration(&mut self) {
-        let Some(retry) = self.button_retry.as_mut() else {
-            return;
-        };
         let now = Instant::now();
-        if now < retry.next_check {
-            return;
+        if self
+            .button_retry
+            .as_ref()
+            .is_some_and(|retry| now >= retry.next_check)
+        {
+            if let Some(button) = self.item.button(self._target.mtm()) {
+                configure_status_button(&button, self._icon.as_deref());
+                self.button_retry = None;
+            } else if let Some(retry) = self.button_retry.as_mut() {
+                retry.attempts_remaining = retry.attempts_remaining.saturating_sub(1);
+                if retry.attempts_remaining == 0 {
+                    self.button_retry = None;
+                    crate::app::logging::report_error(
+                        "macos-status-item",
+                        "AppKit did not provide a status-bar button during startup",
+                    );
+                } else {
+                    retry.next_check = now + STATUS_BUTTON_RETRY_INTERVAL;
+                }
+            }
         }
-        if let Some(button) = self.item.button(self._target.mtm()) {
-            configure_status_button(&button, self._icon.as_deref());
-            self.button_retry = None;
-            return;
-        }
-        retry.attempts_remaining = retry.attempts_remaining.saturating_sub(1);
-        if retry.attempts_remaining == 0 {
-            self.button_retry = None;
-            crate::app::logging::report_error(
-                "macos-status-item",
-                "AppKit did not provide a status-bar button during startup",
-            );
-        } else {
-            retry.next_check = now + STATUS_BUTTON_RETRY_INTERVAL;
+
+        if self
+            .visibility_check_at
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.visibility_check_at = None;
+            if !self.item.isVisible() {
+                crate::app::logging::report_error(
+                    "macos-status-item",
+                    "macOS hid the KeySteer menu-bar item; enable KeySteer in System Settings > Menu Bar, or use Reset Control Centre on macOS Tahoe",
+                );
+            }
         }
     }
 
@@ -512,19 +547,16 @@ fn create_native_item(
 ) -> (Retained<NSStatusItem>, bool) {
     let status_bar = NSStatusBar::systemStatusBar();
     let item = status_bar.statusItemWithLength(NSSquareStatusItemLength);
-    let autosave_name = NSString::from_str(STATUS_ITEM_AUTOSAVE_NAME);
-    item.setAutosaveName(Some(&autosave_name));
+    item.setMenu(Some(menu));
+    // Expose the item before asking AppKit for its hosted button. Tahoe may
+    // defer button creation while Control Center attaches the status item.
+    item.setVisible(true);
     let button_configured = if let Some(button) = item.button(mtm) {
         configure_status_button(&button, icon);
         true
     } else {
         false
     };
-    item.setMenu(Some(menu));
-    // KeySteer is an accessory-only app with no Dock fallback, so every start
-    // explicitly exposes its only control surface. Do not restore a stale
-    // hidden value left by an older status-item autosave identity.
-    item.setVisible(true);
     (item, button_configured)
 }
 

@@ -339,7 +339,7 @@ impl Drop for HookStartup {
         self.stop.store(true, Ordering::Release);
         self.active.store(false, Ordering::Release);
         self.signals.drag_modifier_flags.store(0, Ordering::Relaxed);
-        self.mailbox.cancel_pending();
+        self.mailbox.close();
         let _ = self.activate.try_send(());
         stop_run_loop(&self.run_loop);
         if let Some(mut worker) = self.worker.take()
@@ -409,7 +409,7 @@ impl HookThread {
         }
 
         self.pending = None;
-        self.mailbox.cancel_pending();
+        self.mailbox.close();
         self.signals.drag_modifier_flags.store(0, Ordering::Relaxed);
         self.latest_pointer.clear();
         while let Ok(envelope) = self.receiver.try_recv() {
@@ -469,18 +469,25 @@ impl HookThread {
         self.stop_until(deadline)
     }
 
-    pub fn stop_until(&mut self, deadline: Instant) -> Result<(), String> {
+    /// Make the synchronous event tap fail open immediately. Joining the
+    /// worker stays separate so shutdown can release input before waiting on
+    /// unrelated scan or network workers.
+    pub(super) fn request_stop(&mut self) {
+        self.mailbox.close();
         self.signals.disarm_tap_capture();
         self.stop.store(true, Ordering::Release);
         self.active.store(false, Ordering::Release);
         self.signals.drag_modifier_flags.store(0, Ordering::Relaxed);
-        self.mailbox.cancel_pending();
+        self.pending = None;
         stop_run_loop(&self.run_loop);
+    }
+
+    pub fn stop_until(&mut self, deadline: Instant) -> Result<(), String> {
+        self.request_stop();
         let now = Instant::now();
         let local_deadline = deadline.min(now.checked_add(STOP_TIMEOUT).unwrap_or(deadline));
         let result = self.worker.join_until(local_deadline);
         self.stop_failure_returned = result.is_err();
-        self.pending = None;
         result
     }
 }
@@ -511,7 +518,7 @@ impl TapCaptureLifecycle {
         self.active.store(false, Ordering::Release);
         self.stop.store(true, Ordering::Release);
         self.signals.drag_modifier_flags.store(0, Ordering::Relaxed);
-        self.mailbox.cancel_pending();
+        self.mailbox.close();
         if self
             .signals
             .capture_loss
@@ -744,7 +751,7 @@ fn event_tap_thread(handshake: HookHandshake, context: HookThreadContext) {
     }
     signals.drag_modifier_flags.store(0, Ordering::Relaxed);
     active.store(false, Ordering::Release);
-    callback_mailbox.cancel_pending();
+    callback_mailbox.close();
     detach_event_tap_source(&run_loop, &source, &shared_run_loop);
 }
 
@@ -981,7 +988,10 @@ fn disposition_for(
 ) -> CallbackResult {
     let correlation_id = crate::app::perf_probe::next_correlation_id();
     crate::app::perf_probe::mark_correlated("hook_received", correlation_id);
-    let generation = mailbox.begin();
+    let Some(generation) = mailbox.try_begin() else {
+        crate::app::perf_probe::mark_correlated("disposition_returned", correlation_id);
+        return CallbackResult::Keep;
+    };
     if sender
         .try_send(Envelope {
             event,

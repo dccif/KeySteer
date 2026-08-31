@@ -126,16 +126,17 @@ GitHub Pages。需要更新线上文档时，在 Actions 页面运行 `Deploy do
 
 工具链：VitePress 1.6、Vue 3 TSX、`smol-toml`、pnpm。主要脚本：
 
-- `pnpm docs:dev`：同步 default TOML/icon 和 Release 元数据后启动开发服务器。
+- `pnpm docs:dev`：同步 default TOML/icon 后启动开发服务器。
 - `pnpm docs:test`：Node tests，覆盖浏览器端绑定继承、配置 clone 和模拟状态。
 - `pnpm docs:check`：先同步生成文件，再执行 `tsc --noEmit`。当前文档组件全部是 `.ts`/`.tsx`，不使用 Vue SFC；
   直接使用仓库固定的 TypeScript 可避免 `vue-tsc` 对编译器私有子路径的版本耦合。
-- `pnpm docs:build`：同步静态资源和 Release 元数据后生产构建。
+- `pnpm docs:build`：同步静态资源后生产构建。
 
-`scripts/sync-doc-assets.mjs` 以 `Cargo.toml` 的 `[package].version` 为唯一版本来源，生成
-被忽略的 `docs/.vitepress/generated/release.ts`。下载组件用它构造当前 tag 和四个
-`KeySteer-v<version>-<target>.zip` 直链，因此只要修改 Cargo 版本并运行文档构建，页面
-就会自动指向同版本的 GitHub Release；不需要手改前端版本号。
+`scripts/sync-doc-assets.mjs` 只复制文档站需要的 default TOML/icon。首页下载组件在浏览器
+挂载后调用 GitHub 的 latest release API，从返回的 `tag_name`、Release URL 和真实
+`browser_download_url` 解析版本及四个平台资产；Cargo 版本或 Release 变化不需要重新构建
+GitHub Pages。API 暂时不可用、限流或某个平台资产缺失时，下载入口降级到 latest Release
+页面，不保留构建时的旧 tag 直链。
 
 模拟器重点是键位和 Grid/Recursive Grid/UI Hint 样式可视化，不是完整 Rust runtime。它：
 

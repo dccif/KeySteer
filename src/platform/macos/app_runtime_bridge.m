@@ -170,7 +170,23 @@ void KskScheduleAppRuntime(double afterSeconds) {
 
 void KskStopApplication(void) {
     if (KskRuntimeDriver == nil) return;
-    [NSApplication.sharedApplication stop:nil];
+    NSApplication *application = NSApplication.sharedApplication;
+    [application stop:nil];
+    // `stop:` only updates the application-loop flag. When it is called from
+    // our CFRunLoop observer there may be no NSEvent for `run` to return from,
+    // so a single application-defined event makes shutdown immediate even
+    // while the app is otherwise idle.
+    NSEvent *wakeEvent = [NSEvent
+        otherEventWithType:NSEventTypeApplicationDefined
+                   location:NSZeroPoint
+              modifierFlags:0
+                  timestamp:0
+               windowNumber:0
+                    context:nil
+                    subtype:0
+                      data1:0
+                      data2:0];
+    [application postEvent:wakeEvent atStart:YES];
     CFRunLoopWakeUp(CFRunLoopGetMain());
 }
 

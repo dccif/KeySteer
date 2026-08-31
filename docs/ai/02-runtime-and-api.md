@@ -101,8 +101,8 @@ Engine 内部把同一语义拆成 `start_runtime`、一次只处理一个原生
 `run_runtime_turn` 和 `finish_runtime`。Windows 与其他平台的 `Engine::run` 仍按原阻塞循环
 调用这三步；macOS 则让真正的 `NSApplication.run` 常驻主线程，在
 `applicationDidFinishLaunching` 后启动 Engine，并由 common-mode CFRunLoop observer 以零
-等待单步排空事件。所有 producer 只需唤醒主 run loop；一只复用 timer 只承载 Engine 的下一
-deadline，不做周期轮询。这样 AppKit 自己派发菜单栏、窗口和系统事件，不再用嵌套
+等待单步排空事件。所有 producer 只需唤醒主 run loop；一只复用 timer 承载 Engine 与状态项
+启动维护的最近 deadline，不做周期轮询。这样 AppKit 自己派发菜单栏、窗口和系统事件，不再用嵌套
 `nextEventMatchingMask` 手动泵事件，同时保持 Hook、timer、sequence 与 shutdown 的原有顺序。
 
 原生输入捕获永久丢失与普通合成注入失败是两条不同恢复路径。前者通过

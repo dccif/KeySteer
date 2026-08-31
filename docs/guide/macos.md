@@ -58,4 +58,4 @@ invert_vertical = true
 
 ## 菜单栏图标
 
-开机启动时，在系统允许显示的前提下，KeySteer 会在 macOS 菜单栏准备完成后自动确认并恢复未挂接的图标。如果“活动监视器”里能看到 KeySteer，但菜单栏仍没有图标，请在 macOS 26 及以上检查[“系统设置 → 菜单栏”](https://support.apple.com/guide/mac-help/mchlad96d366/mac)中是否允许 KeySteer 显示；系统也可能在菜单栏空间不足时隐藏部分图标。
+直接启动和开机启动都会在 AppKit 完成启动后创建同一个 KeySteer 程序图标；Tahoe 延迟准备菜单栏按钮时，KeySteer 会通过主事件循环继续完成配置。如果“活动监视器”里能看到 KeySteer，但菜单栏仍没有图标，请在 macOS 26 及以上检查[“系统设置 → 菜单栏”](https://support.apple.com/guide/mac-help/mchlad96d366/mac)中是否允许 KeySteer 显示。若已经允许仍不显示，请在该页面使用“重置控制中心”，再重新启动 KeySteer；Tahoe 26.6.2 可能错误保留其他程序造成的隐藏记录。系统也可能在菜单栏空间不足时临时隐藏部分图标。

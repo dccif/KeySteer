@@ -127,7 +127,7 @@ item、window 和 display link 都有线程亲和性。
   没有 terminal/stop 的情况下意外返回，同样立即按输入捕获丢失终止，不能原地空转。
 - `app_runtime.rs` 让真正的 `NSApplication.run` 拥有主线程。ARC bridge 在
   `applicationDidFinishLaunching` 创建状态项，并用 common-mode observer 驱动 Engine 的
-  zero-wait 单步；一只复用 CFRunLoopTimer 只表示下一个 Engine deadline。worker/Hook 唤醒后
+  zero-wait 单步；一只复用 CFRunLoopTimer 表示下一个 Engine 或状态项启动维护 deadline。worker/Hook 唤醒后
   observer 立即排空有界批次，不做嵌套 AppKit event pump 或周期轮询。workspace 先比较 PID，
   只有前台进程变化时才分配 bundle ID，appearance 与静态 `NSString` 直接比较。
 - `ui_scan.rs` 有一个持久扫描 worker；Hybrid 内部只在本次 job scope 并发 AX。
@@ -181,10 +181,12 @@ Retina 下快速重绘时文字基线出现单帧纵向抖动。
   交付它并丢弃旧 KeyDown/Pointer，Engine 随后取消 scan、释放合成输入、撤下可能存在的普通指示器
   并回到 Idle。撤权路径不在 TCC 正在改动时调用 `AXIsProcessTrusted`。`TapDisabledByTimeout` 全进程
   只自动恢复一次，再次超时同样停止。
-- macOS Backend 的幂等 shutdown 顺序为：先移除 status item/系统回调，再停止 display
-  link、失效并停止 UI scan、取消更新、释放 held input、停止 Hook、关闭 overlay。扫描和更新
-  event tap、扫描和更新使用公共 `WorkerJoin`；成功 shutdown 必须完成 join，deadline 超时作为错误传播并立即退出
-  进程，不能在后台 worker 仍存活时继续驻留。
+- macOS Backend 的幂等 shutdown 分两阶段：第一阶段不等待，先把 Event Tap disposition mailbox
+  永久切到 fail-open 终态，再移除 status item、停止 display link、取消 scan/update、释放 held input
+  并关闭 overlay；第二阶段才在同一 deadline 内 join Hook、扫描和更新 worker。终态同时唤醒已有
+  waiter，并让停止窗口内的后到回调直接透传，因此主线程等待不可立即取消的 Vision 请求时，实体输入
+  不会再产生新的 100 ms disposition 等待。显式 shutdown 已返回失败后，Backend `Drop` 不再开启第二轮
+  等待；对应 owner 把未结束 worker 转入既有 quarantine，进程退出负责最终终止。
 - Vision 屏幕内容检测需要 Screen Recording。
 - Vision 自动扫描只做 Screen Recording preflight；权限申请不得从扫描 worker 发起，以免
   在用户修改 TCC 设置时与 System Settings 竞争。
@@ -193,8 +195,9 @@ Retina 下快速重绘时文字基线出现单帧纵向抖动。
 - `SMAppService` 需要 bundle 上下文，裸二进制不等同正式 `.app` 登录项。
 - macOS 状态项使用固定方形图标槽。直接点开与 `SMAppService` 开机自启走同一初始化路径：AppKit
   delegate 在真实 `applicationDidFinishLaunching` 回调中创建一次状态项，并强持有
-  item/menu/target/icon 到 shutdown。状态项使用固定 autosave identity、`ImageOnly` 按钮和原有
-  KeySteer 程序 PNG；每次启动显式 `setVisible(true)`。KeySteer 没有 Dock 控制面，不使用
+  item/menu/target/icon 到 shutdown。创建顺序固定为 menu → visible → button；Tahoe 延迟提供 button
+  时，其重试 deadline 进入同一 AppKit timer，而不是依赖无关输入唤醒。单状态项使用 AppKit 自动身份，
+  `ImageOnly` 按钮和原有 KeySteer 程序 PNG；每次启动显式 `setVisible(true)`。KeySteer 没有 Dock 控制面，不使用
   `button.window` 等未承诺的附着状态推断健康，也不在运行中删除、重建或切换 Dock；shutdown
   只移除当前唯一 status item。
 

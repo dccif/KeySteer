@@ -56,11 +56,17 @@ impl UpdateWorker {
         self.cancel_and_wait_until(deadline)
     }
 
+    /// Signal cancellation without waiting. Platform shutdown paths call this
+    /// before joining any worker so synchronous input can be released first.
+    pub(crate) fn request_cancel(&self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+
     /// Request cancellation without extending a caller-owned shutdown
     /// deadline. The update worker keeps its shorter 250 ms local cap so a
     /// blocking network operation cannot consume the rest of backend cleanup.
     pub(crate) fn cancel_and_wait_until(&mut self, deadline: Instant) -> Result<(), String> {
-        self.cancel.store(true, Ordering::Release);
+        self.request_cancel();
         let now = Instant::now();
         let local_deadline = deadline.min(now.checked_add(UPDATE_STOP_WAIT).unwrap_or(deadline));
         let result = self.worker.join_until(local_deadline);
