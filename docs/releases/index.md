@@ -2,9 +2,9 @@
 
 ## 0.9.12
 
-修复 macOS 上 UI Hint 视觉识别失败和状态栏图标可能始终隐藏的问题。
+修复 macOS 上 UI Hint 视觉识别失败、状态栏图标不显示，以及滚动列表的窗口外元素仍生成标签的问题。
 
-Fixed UI Hint visual recognition failures and menu-bar icons remaining hidden on macOS.
+Fixed UI Hint visual recognition failures, missing menu-bar icons, and hints appearing for off-screen list items on macOS.
 
 ## 0.9.11
 

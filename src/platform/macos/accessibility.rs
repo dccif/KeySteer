@@ -61,6 +61,8 @@ struct AxAttributes {
     enabled: CFString,
     hidden: CFString,
     children: CFString,
+    visible_children: CFString,
+    visible_rows: CFString,
     position: CFString,
     size: CFString,
     title: CFString,
@@ -76,6 +78,8 @@ impl AxAttributes {
             enabled: CFString::new("AXEnabled"),
             hidden: CFString::new("AXHidden"),
             children: CFString::new("AXChildren"),
+            visible_children: CFString::new("AXVisibleChildren"),
+            visible_rows: CFString::new("AXVisibleRows"),
             position: CFString::new("AXPosition"),
             size: CFString::new("AXSize"),
             title: CFString::new("AXTitle"),
@@ -173,13 +177,26 @@ pub(crate) fn scan_process_stream(
 
     let attributes = AxAttributes::new();
     let focused_window = copy_attribute(application.as_ptr(), &attributes.focused_window);
-    let root = focused_window
-        .as_ref()
-        .filter(|window| is_ax_element(window.as_ptr()))
-        .map_or(application.as_ptr(), OwnedCf::as_ptr);
+    let focused_window = match focused_window.as_ref() {
+        Some(window) if is_ax_element(window.as_ptr()) => Some(window),
+        // A window transition can briefly expose a stale or unexpected value.
+        // Do not publish unbounded application-root targets in that state.
+        Some(_) => return Ok(()),
+        None => None,
+    };
+    let window_bounds =
+        focused_window.and_then(|window| element_rect(window.as_ptr(), &attributes));
+    if focused_window.is_some() && window_bounds.is_none() {
+        return Ok(());
+    }
+    let Ok(scan_bounds) = visible_scan_bounds(window_bounds, request.bounds) else {
+        return Ok(());
+    };
+    let root = focused_window.map_or(application.as_ptr(), |window| window.as_ptr());
     let allowed_roles = ax_roles_for(&request.roles).into_iter().collect();
     let mut scan = Scan {
         request,
+        scan_bounds,
         attributes,
         allowed_roles,
         deadline: Instant::now() + SCAN_BUDGET,
@@ -199,6 +216,7 @@ pub(crate) fn scan_process_stream(
 
 struct Scan<'a> {
     request: &'a UiScanRequest,
+    scan_bounds: Option<Rect>,
     attributes: AxAttributes,
     allowed_roles: HashSet<String>,
     deadline: Instant,
@@ -228,14 +246,15 @@ impl Scan<'_> {
         }
 
         let role = copy_string_attribute(element, &self.attributes.role).unwrap_or_default();
+        let (prefer_visible_rows, prefer_visible_children) =
+            visible_collection_preferences(&role, self.request.visible_only);
         let role_allowed =
             self.request.roles.is_empty() || self.allowed_roles.contains(role.as_str());
         let rect = role_allowed
             .then(|| element_rect(element, &self.attributes))
             .flatten();
         let in_bounds = rect.is_some_and(|rect| {
-            self.request
-                .bounds
+            self.scan_bounds
                 .is_none_or(|bounds| bounds.contains(&rect.center()))
         });
         let enabled =
@@ -275,10 +294,12 @@ impl Scan<'_> {
         if depth == self.request.max_depth {
             return;
         }
-        let Some(children_ref) = copy_attribute(element, &self.attributes.children) else {
-            return;
-        };
-        let Some(children) = downcast_cf::<CFArray<*const c_void>>(children_ref) else {
+        let Some(children) = visible_children_for_role(
+            element,
+            prefer_visible_rows,
+            prefer_visible_children,
+            &self.attributes,
+        ) else {
             return;
         };
         for child in &children {
@@ -291,6 +312,53 @@ impl Scan<'_> {
             }
         }
     }
+}
+
+/// Prefer the AX server's viewport-aware collections for scroll containers.
+/// Unsupported attributes fall back to AXChildren, preserving compatibility
+/// with custom controls while avoiding traversal of off-screen table rows in
+/// standard AppKit lists.
+fn visible_children_for_role(
+    element: AXUIElementRef,
+    prefer_visible_rows: bool,
+    prefer_visible_children: bool,
+    attributes: &AxAttributes,
+) -> Option<CFArray<*const c_void>> {
+    let visible = if prefer_visible_rows {
+        copy_array_attribute(element, &attributes.visible_children)
+            .or_else(|| copy_array_attribute(element, &attributes.visible_rows))
+    } else if prefer_visible_children {
+        copy_array_attribute(element, &attributes.visible_children)
+    } else {
+        None
+    };
+    visible.or_else(|| copy_array_attribute(element, &attributes.children))
+}
+
+fn prefers_visible_rows(role: &str) -> bool {
+    matches!(role, "AXTable" | "AXOutline" | "AXGrid")
+}
+
+fn prefers_visible_children(role: &str) -> bool {
+    matches!(
+        role,
+        "AXScrollArea" | "AXList" | "AXBrowser" | "AXCollectionList" | "AXWebArea"
+    )
+}
+
+fn visible_collection_preferences(role: &str, visible_only: bool) -> (bool, bool) {
+    if visible_only {
+        (prefers_visible_rows(role), prefers_visible_children(role))
+    } else {
+        (false, false)
+    }
+}
+
+fn copy_array_attribute(
+    element: AXUIElementRef,
+    name: &CFString,
+) -> Option<CFArray<*const c_void>> {
+    downcast_cf(copy_attribute(element, name)?)
 }
 
 fn copy_attribute(element: AXUIElementRef, name: &CFString) -> Option<OwnedCf> {
@@ -449,6 +517,16 @@ fn normalized_rect(rect: Rect) -> (i64, i64, i64, i64) {
     )
 }
 
+/// Restrict AX targets to the visible portion of the focused window on the
+/// requested display. `Err(())` means the two regions do not overlap at all.
+fn visible_scan_bounds(window: Option<Rect>, requested: Option<Rect>) -> Result<Option<Rect>, ()> {
+    match (window, requested) {
+        (Some(window), Some(requested)) => window.intersect(&requested).map(Some).ok_or(()),
+        (Some(window), None) => Ok(Some(window)),
+        (None, requested) => Ok(requested),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,9 +558,38 @@ mod tests {
     }
 
     #[test]
+    fn scroll_containers_prefer_viewport_aware_ax_collections() {
+        assert!(prefers_visible_rows("AXTable"));
+        assert!(prefers_visible_rows("AXOutline"));
+        assert!(!prefers_visible_rows("AXGroup"));
+        assert!(prefers_visible_children("AXScrollArea"));
+        assert!(prefers_visible_children("AXList"));
+        assert!(!prefers_visible_children("AXGroup"));
+        assert_eq!(
+            visible_collection_preferences("AXTable", false),
+            (false, false)
+        );
+    }
+
+    #[test]
     fn normalized_rect_deduplicates_subpixel_noise() {
         let first = normalized_rect(Rect::new(10.01, 20.01, 30.01, 40.01));
         let second = normalized_rect(Rect::new(10.02, 20.02, 30.02, 40.02));
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn visible_scan_bounds_clip_ax_targets_to_the_focused_window() {
+        let window = Rect::new(100.0, 100.0, 800.0, 600.0);
+        let display = Rect::new(0.0, 0.0, 600.0, 500.0);
+        assert_eq!(
+            visible_scan_bounds(Some(window), Some(display)),
+            Ok(Some(Rect::new(100.0, 100.0, 500.0, 400.0)))
+        );
+        assert_eq!(visible_scan_bounds(Some(window), None), Ok(Some(window)));
+        assert_eq!(
+            visible_scan_bounds(Some(window), Some(Rect::new(0.0, 0.0, 50.0, 50.0))),
+            Err(())
+        );
     }
 }

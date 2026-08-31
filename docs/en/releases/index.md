@@ -2,7 +2,7 @@
 
 ## 0.9.12
 
-Fixed UI Hint visual recognition failures and menu-bar icons remaining hidden on macOS.
+Fixed UI Hint visual recognition failures, missing menu-bar icons, and hints appearing for off-screen list items on macOS.
 
 ## 0.9.11
 

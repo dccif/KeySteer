@@ -98,18 +98,30 @@ fn macos_autostart_registers_the_keysteer_bundle_instead_of_open() {
 }
 
 #[test]
-fn macos_status_item_has_cold_login_recovery_primitives() {
+fn macos_status_item_is_created_once_after_appkit_launch() {
     let status_item = include_str!("../src/platform/macos/status_item.rs");
+    let backend = include_str!("../src/platform/macos/mod.rs");
     assert!(status_item.contains("NSSquareStatusItemLength"));
     assert!(!status_item.contains("NSVariableStatusItemLength"));
-    assert!(status_item.contains("button.window().is_none()"));
-    assert!(status_item.contains("rebuild_native_item"));
-    assert!(status_item.contains("STATUS_ITEM_RECOVERY_WINDOW"));
-    assert!(status_item.contains("com.keysteer.app.status-item"));
-    assert!(status_item.contains("item.setAutosaveName"));
-    assert!(status_item.contains("item.isVisible()"));
-    assert!(status_item.contains("item.setVisible(true)"));
-    assert!(status_item.contains("NSApplicationActivationPolicy::Regular"));
+    assert!(status_item.contains("pub(super) fn prepare_application"));
+    let prepare = backend
+        .find("status_item::prepare_application(mtm);")
+        .expect("AppKit startup must be prepared");
+    let pump = backend[prepare..]
+        .find("workspace::pump_app_events();")
+        .map(|offset| prepare + offset)
+        .expect("AppKit must process one run-loop turn before status creation");
+    let create = backend[pump..]
+        .find("status_item::StatusItem::new(mtm")
+        .map(|offset| pump + offset)
+        .expect("the status item must be created after AppKit startup");
+    assert!(prepare < pump && pump < create);
+    assert!(!status_item.contains("button.window()"));
+    assert!(!status_item.contains("rebuild_native_item"));
+    assert!(!status_item.contains("setAutosaveName"));
+    assert_eq!(status_item.matches("setVisible(true)").count(), 1);
+    assert!(!status_item.contains("NSApplicationActivationPolicy::Regular"));
+    assert_eq!(status_item.matches("removeStatusItem").count(), 1);
 }
 
 #[test]

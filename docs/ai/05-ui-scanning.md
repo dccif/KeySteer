@@ -157,6 +157,10 @@ AX：`src/platform/macos/accessibility.rs`。
 - 设置每节点 messaging timeout，受总 deadline 和 max depth 限制；该 C API 的 timeout
   参数是 32 位 `Float`/`c_float`，FFI 声明不得扩大为 `double`，否则系统会返回
   `kAXErrorIllegalArgument`，并在获取窗口范围前同时阻断 AX 与 Vision。
+- AX 目标必须位于 focused window bounds 与请求屏幕 bounds 的交集内。`visible_only`
+  扫描中的表格、列表、outline 和 scroll area 优先遍历
+  `AXVisibleRows`/`AXVisibleChildren`，仅在应用不支持这些标准可见集合时回退
+  `AXChildren`，避免为滚动区域中的离屏元素生成标签。
 - 读取 role、frame、enabled、actions 和 accessible name，语义 role 映射在本文件。
 - 一次扫描复用固定的 AX 属性名 `CFString`；矩形去重使用预分配 `HashSet`。
 - 遍历过程把拥有所有权的 24 项 batch 直接交给共享发布器，不保留完整目标数组或深拷贝

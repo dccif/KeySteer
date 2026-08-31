@@ -180,12 +180,10 @@ Retina 下快速重绘时文字基线出现单帧纵向抖动。
 - 权限绑定应用 bundle identity；正式用户必须运行打包的 `KeySteer.app`，不能让 Terminal
   代替应用申请权限。
 - `SMAppService` 需要 bundle 上下文，裸二进制不等同正式 `.app` 登录项。
-- macOS 状态项使用固定方形图标槽。登录项可能早于菜单栏 scene 完全就绪，因此在十秒
-  启动稳定窗口内验证 status item 的 button 已挂到原生 window；未挂接时复用 Backend
-  现有 poll 最多重建三次，不增加线程或系统 timer。状态项使用稳定的 autosave identity，
-  但 KeySteer 在 accessory 模式没有 Dock 入口，因此启动时必须覆盖陈旧的隐藏状态；隐藏或
-  未挂接状态持续到稳定窗口结束时切换为 Dock 图标，避免进程无入口常驻。shutdown 仍只
-  移除当前唯一 status item。
+- macOS 状态项使用固定方形图标槽。登录项可能早于菜单栏 scene 完全就绪，因此先完成
+  AppKit 启动并处理一个 run-loop turn，再创建一次状态项并由 Backend 强持有到 shutdown。
+  不使用 `button.window` 等未承诺的附着状态做轮询，不设置会恢复陈旧隐藏状态的 autosave
+  identity，也不在运行中删除、重建或切换 Dock；shutdown 只移除当前唯一 status item。
 
 ## 新增平台的最小边界
 

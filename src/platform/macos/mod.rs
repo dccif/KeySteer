@@ -128,12 +128,15 @@ impl MacOsBackend {
         let hook_start = HookStartup::spawn(Arc::clone(&click_tracker));
         let mtm = MainThreadMarker::new()
             .ok_or_else(|| "macOS backend must be created on the main thread".to_string())?;
-        let mut status_item = status_item::StatusItem::new(mtm, event_tx.clone());
-        // `finishLaunching` posts AppKit work. Process that first turn before
-        // the hook startup may wait, then keep a bounded repair active for the
-        // slower login-item path where the menu-bar scene is not ready yet.
+        status_item::prepare_application(mtm);
+        // Login items can start before AppKit has attached its menu-bar scene.
+        // Finish launching and process that work before creating the one
+        // strongly-owned status item; AppKit will attach it when the scene is
+        // available without destructive polling or native-item replacement.
         workspace::pump_app_events();
-        status_item.maintain_startup();
+        let mut status_item = status_item::StatusItem::new(mtm, event_tx.clone());
+        workspace::pump_app_events();
+        status_item.maintain_button_configuration();
         let status_item = Some(status_item);
         let frame_clock = display_link::DisplayFrameClock::new(mtm);
         let initial_screens = screens::list_screens().unwrap_or_else(|error| {
@@ -187,7 +190,7 @@ impl MacOsBackend {
     fn refresh_native_events(&mut self) {
         self.pending.extend(self.workspace.refresh());
         if let Some(item) = self.status_item.as_mut() {
-            item.maintain_startup();
+            item.maintain_button_configuration();
         }
         if self
             .display_watcher
