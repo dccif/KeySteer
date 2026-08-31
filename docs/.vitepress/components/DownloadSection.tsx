@@ -101,7 +101,7 @@ export default defineComponent({
     const isEnglish = () => lang.value === 'en-US'
     const text = (zh: string, en: string) => isEnglish() ? en : zh
     const localPath = (path: string) => withBase(`${isEnglish() ? '/en' : ''}${path}`)
-    const versionLabel = computed(() => latestRelease.value?.tag ?? text('最新版', 'Latest'))
+    const downloadLabel = computed(() => text('立即下载', 'Download now'))
     const assetUrl = (asset: DownloadAsset) => (
       latestRelease.value?.assets[asset.target]
       ?? latestRelease.value?.url
@@ -139,8 +139,8 @@ export default defineComponent({
           >
             <span class="hero-download-emoji" aria-hidden="true">💾</span>
             <span class="hero-download-copy">
-              <strong>{text('立即下载', 'Download now')}</strong>
-              <small>{versionLabel.value}</small>
+              <strong>{downloadLabel.value}</strong>
+              {latestRelease.value?.tag && <small>{latestRelease.value.tag}</small>}
             </span>
           </a>
           <button
