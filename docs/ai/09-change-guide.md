@@ -15,7 +15,7 @@
 | 修改 Windows 扫描 | `platform/windows/accessibility.rs` | COM thread、popup/Z-order、timeout、实机 UIA |
 | 修改 macOS 扫描 | `platform/macos/ui_scan.rs` + AX/Vision | 权限、单 worker、Objective-C bridge、macOS 14 |
 | 修改覆盖层性能 | 两端 `overlay.rs` | `OverlayScene` equality、dismiss 内存、DPI/Retina |
-| 修改状态栏/开机启动 | 两端 `status_item.rs`/`autostart.rs` | `BackendEvent`、打包应用身份 |
+| 修改托盘/顶部状态图标或开机启动 | 两端 `status_item.rs`/`autostart.rs` | `BackendEvent`、打包应用身份、平台 backend 生命周期 |
 | 修改配置路径 | `app/paths.rs`, `config::discover` | packaged app 与 portable tests、README |
 | 修改打包 | `packaging/<os>/`、`build.rs` | CI + release matrix、图标/签名、仅发布平台 ZIP |
 | 修改网页模拟器 | `docs/.vitepress/components/ConfigStudio.tsx` | style controls、Node tests、typecheck/build |
@@ -31,7 +31,8 @@
 5. 更新 default TOML、用户文档、网页模拟器需要显示的子集。
 6. 加集成测试锁定默认体验。
 
-不要先在一个 Backend 做专用入口再让核心知道其 concrete type。
+不要先在一个 Backend 做专用入口再让核心知道其 concrete type；AppKit/Win32 的启动和事件泵
+也必须留在对应 Backend，`bootstrap` 与 Engine 运行入口保持平台无关。
 
 ## 高风险不变量
 

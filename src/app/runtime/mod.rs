@@ -557,12 +557,6 @@ fn chords_conflict(left: &KeyChord, right: &KeyChord) -> bool {
         || right.activation_matches(left.activation_key())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RuntimeTurn {
-    pub(crate) event_processed: bool,
-    pub(crate) should_quit: bool,
-}
-
 pub struct Engine {
     config: Config,
     palette: Palette,
@@ -1178,7 +1172,7 @@ impl Engine {
         }
     }
 
-    pub(crate) fn start_runtime(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
+    fn start_runtime(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
         if let Err(error) = backend.start() {
             if let Err(shutdown_error) = backend.shutdown() {
                 crate::app::logging::report_error(
@@ -1265,22 +1259,19 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) fn run_runtime_turn(
+    fn run_runtime_turn(
         &mut self,
         backend: &mut dyn Backend,
         timeout: Duration,
-    ) -> Result<RuntimeTurn, String> {
-        let event_processed = if let Some(event) = backend.poll(timeout)? {
+    ) -> Result<(), String> {
+        if let Some(event) = backend.poll(timeout)? {
             let event_result = self.handle_backend_event(event, backend);
             if let Err(error) = event_result
                 && !self.recover_from_input_error(&error, backend)
             {
                 return Err(error);
             }
-            true
-        } else {
-            false
-        };
+        }
         let long_press_result = self.fire_due_long_press_toggles(backend);
         if let Err(error) = long_press_result
             && !self.recover_from_input_error(&error, backend)
@@ -1306,41 +1297,10 @@ impl Engine {
             return Err(error);
         }
 
-        Ok(RuntimeTurn {
-            event_processed,
-            should_quit: self.should_quit,
-        })
+        Ok(())
     }
 
-    #[cfg(target_os = "macos")]
-    pub(crate) fn runtime_next_deadline(&self) -> Option<Duration> {
-        if self.timers.is_empty()
-            && self.pending_sequences.is_empty()
-            && self.pending_long_press_toggles.is_empty()
-            && self.drag_auto_release.fires_at.is_none()
-        {
-            return None;
-        }
-        let now = Instant::now();
-        self.timers
-            .values()
-            .map(|timer| timer.fires_at)
-            .chain(
-                self.pending_sequences
-                    .last()
-                    .map(|sequence| sequence.fires_at),
-            )
-            .chain(
-                self.pending_long_press_toggles
-                    .last()
-                    .map(|pending| pending.fires_at),
-            )
-            .chain(self.drag_auto_release.fires_at)
-            .map(|fires_at| fires_at.saturating_duration_since(now))
-            .min()
-    }
-
-    pub(crate) fn finish_runtime(
+    fn finish_runtime(
         &mut self,
         backend: &mut dyn Backend,
         result: Result<(), String>,
@@ -1375,7 +1335,7 @@ impl Engine {
 
         let result = (|| {
             while !self.should_quit {
-                let _ = self.run_runtime_turn(backend, self.next_timeout())?;
+                self.run_runtime_turn(backend, self.next_timeout())?;
             }
             Ok(())
         })();

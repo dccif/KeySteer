@@ -44,7 +44,7 @@ invert_vertical = true
 
 ## Permission problems
 
-If the menu-bar icon appears but keys do nothing:
+If the top status icon appears but keys do nothing:
 
 1. Check that the Accessibility list authorises `KeySteer.app`.
 2. Quit and reopen KeySteer.
@@ -53,6 +53,6 @@ If the menu-bar icon appears but keys do nothing:
 
 Because future builds may not have a stable Developer ID signature, upgrades can require you to grant permission again.
 
-## Menu-bar icon
+## Top status icon
 
-Direct and login launches create the same KeySteer application icon after AppKit finishes launching. If Tahoe attaches the menu-bar button later, KeySteer completes its configuration through the main event loop. If KeySteer appears in Activity Monitor but no icon is visible, on macOS 26 or later check that KeySteer is allowed under [**System Settings → Menu Bar**](https://support.apple.com/guide/mac-help/mchlad96d366/mac). If it is already allowed, use **Reset Control Centre** on that page and restart KeySteer; Tahoe 26.6.2 can retain an incorrect hidden record associated with another application. macOS can also hide items temporarily when menu-bar space is limited.
+Direct and login launches create one KeySteer status icon at the right side of the top bar after AppKit finishes launching. Click it to open the controls for pausing, reloading configuration, checking for updates, and quitting. KeySteer does not create a regular application main menu or Dock icon.

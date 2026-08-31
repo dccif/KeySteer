@@ -1,4 +1,4 @@
-//! Native menu-bar controls.
+//! Native top-status-item controls.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -25,78 +25,10 @@ use super::EventSender;
 
 static SENDER: OnceLock<Mutex<Option<EventSender>>> = OnceLock::new();
 
-const STATUS_BUTTON_RETRY_INTERVAL: Duration = Duration::from_millis(250);
-const STATUS_BUTTON_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(1);
-const STATUS_BUTTON_RETRY_ATTEMPTS: u8 = 120;
-const STATUS_VISIBILITY_CHECK_DELAY: Duration = Duration::from_secs(1);
+const STATUS_ICON_ATTACH_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+const STATUS_ICON_ATTACH_RETRY_ATTEMPTS: u8 = 120;
 const STATUS_ICON_PNG: &[u8] = include_bytes!("../../../assets/icons/keysteer-icon.png");
 const STATUS_ICON_SIZE: f64 = 18.0;
-
-// SAFETY: these no-pointer process-singleton entry points validate lifecycle
-// and main-thread state inside the ARC Objective-C bridge. The only arguments
-// are permanent Rust function addresses or finite scalar deadline values.
-unsafe extern "C" {
-    #[link_name = "KskInstallAppRuntimeDriver"]
-    safe fn install_app_runtime_driver(
-        did_finish_launching: extern "C" fn(),
-        drive: extern "C" fn(),
-    ) -> i32;
-    #[link_name = "KskRunApplication"]
-    safe fn run_application_loop();
-    #[link_name = "KskScheduleAppRuntime"]
-    safe fn schedule_app_runtime(after_seconds: f64);
-    #[link_name = "KskStopApplication"]
-    safe fn stop_application_loop();
-    #[link_name = "KskDestroyAppRuntimeDriver"]
-    safe fn destroy_app_runtime_driver();
-}
-
-/// Main-thread owner of the process-wide AppKit delegate and run-loop sources.
-///
-/// The bridge has no caller-provided pointers or borrowed context: callbacks
-/// enter Rust through main-thread TLS, while Objective-C owns all AppKit/Core
-/// Foundation lifetimes. This wrapper's marker prevents moving teardown away
-/// from the main thread that installed the driver.
-pub(super) struct AppRuntimeDriver {
-    _main_thread: MainThreadMarker,
-}
-
-impl AppRuntimeDriver {
-    pub(super) fn new(
-        mtm: MainThreadMarker,
-        did_finish_launching: extern "C" fn(),
-        drive: extern "C" fn(),
-    ) -> Result<Self, String> {
-        match install_app_runtime_driver(did_finish_launching, drive) {
-            0 => Ok(Self { _main_thread: mtm }),
-            1 => Err("the AppKit runtime driver must be installed on the main thread".into()),
-            2 => Err("the AppKit runtime driver is already installed".into()),
-            3 => Err("cannot create the AppKit engine run-loop observer".into()),
-            4 => Err("cannot create the AppKit engine deadline timer".into()),
-            code => Err(format!(
-                "cannot install the AppKit runtime driver (native status {code})"
-            )),
-        }
-    }
-
-    pub(super) fn run(&self) {
-        run_application_loop();
-    }
-
-    pub(super) fn schedule_current(timeout: Duration) {
-        schedule_app_runtime(timeout.as_secs_f64().max(f64::EPSILON));
-    }
-
-    pub(super) fn stop_current() {
-        stop_application_loop();
-    }
-}
-
-impl Drop for AppRuntimeDriver {
-    fn drop(&mut self) {
-        destroy_app_runtime_driver();
-    }
-}
 
 struct StatusTargetIvars {
     update_alert: RefCell<Option<Retained<NSPanel>>>,
@@ -224,18 +156,17 @@ pub struct StatusItem {
     autostart_item: Retained<NSMenuItem>,
     update_item: Retained<NSMenuItem>,
     enabled: bool,
-    button_retry: Option<StatusButtonRetry>,
-    visibility_check_at: Option<Instant>,
+    icon_attach_retry: Option<IconAttachRetry>,
 }
 
-struct StatusButtonRetry {
-    next_check: Instant,
+struct IconAttachRetry {
+    next_attempt: Instant,
     attempts_remaining: u8,
 }
 
-/// Configure the accessory application before entering `NSApplication.run`.
-/// AppKit itself completes launch and the delegate creates the status item in
-/// `applicationDidFinishLaunching` for both direct and login-item starts.
+/// Finish AppKit startup on the main thread before creating the top status
+/// item. The backend owns subsequent event dispatch, so the portable runtime
+/// remains unaware of NSApplication.
 pub(super) fn prepare_application(mtm: MainThreadMarker) -> Result<(), String> {
     let application = NSApplication::sharedApplication(mtm);
     if !application.setActivationPolicy(NSApplicationActivationPolicy::Accessory)
@@ -243,6 +174,7 @@ pub(super) fn prepare_application(mtm: MainThreadMarker) -> Result<(), String> {
     {
         return Err("AppKit rejected the accessory activation policy".into());
     }
+    application.finishLaunching();
     Ok(())
 }
 
@@ -287,7 +219,7 @@ impl StatusItem {
         menu.addItem(&quit_item);
 
         let icon = status_icon(STATUS_ICON_SIZE);
-        let (item, button_configured) = create_native_item(mtm, &menu, icon.as_deref());
+        let (item, icon_attached) = create_native_item(mtm, &menu, icon.as_deref());
 
         Self {
             item,
@@ -298,71 +230,38 @@ impl StatusItem {
             autostart_item,
             update_item,
             enabled: true,
-            button_retry: (!button_configured).then(|| StatusButtonRetry {
-                // Yield through one real AppKit turn before the first retry so
-                // Tahoe's Control Center host can attach the native button.
-                next_check: Instant::now() + STATUS_BUTTON_INITIAL_RETRY_DELAY,
-                attempts_remaining: STATUS_BUTTON_RETRY_ATTEMPTS,
+            icon_attach_retry: (!icon_attached).then(|| IconAttachRetry {
+                next_attempt: Instant::now(),
+                attempts_remaining: STATUS_ICON_ATTACH_RETRY_ATTEMPTS,
             }),
-            visibility_check_at: Some(Instant::now() + STATUS_VISIBILITY_CHECK_DELAY),
         }
     }
 
-    /// Return the next status-item maintenance deadline for the single AppKit
-    /// runtime timer. Tahoe may attach the native button one run-loop turn
-    /// after the item becomes visible; without this deadline an otherwise idle
-    /// application could sleep before configuring its icon.
-    pub(super) fn next_maintenance_deadline(&self) -> Option<Duration> {
+    /// Complete icon attachment when a cold login creates the status item
+    /// before its native button is hosted. This reuses Backend::poll and never
+    /// creates a timer, thread, item replacement, or visibility loop.
+    pub(super) fn maintain_icon_attachment(&mut self) {
+        let Some(retry) = self.icon_attach_retry.as_mut() else {
+            return;
+        };
         let now = Instant::now();
-        self.button_retry
-            .as_ref()
-            .map(|retry| retry.next_check.saturating_duration_since(now))
-            .into_iter()
-            .chain(
-                self.visibility_check_at
-                    .map(|deadline| deadline.saturating_duration_since(now)),
-            )
-            .min()
-    }
-
-    /// Retry only configuring the button of the single retained status item.
-    /// A cold login may briefly return no button while AppKit attaches the
-    /// menu-bar scene; never remove or replace the native item in response.
-    pub(super) fn maintain_button_configuration(&mut self) {
-        let now = Instant::now();
-        if self
-            .button_retry
-            .as_ref()
-            .is_some_and(|retry| now >= retry.next_check)
-        {
-            if let Some(button) = self.item.button(self._target.mtm()) {
-                configure_status_button(&button, self._icon.as_deref());
-                self.button_retry = None;
-            } else if let Some(retry) = self.button_retry.as_mut() {
-                retry.attempts_remaining = retry.attempts_remaining.saturating_sub(1);
-                if retry.attempts_remaining == 0 {
-                    self.button_retry = None;
-                    crate::app::logging::report_error(
-                        "macos-status-item",
-                        "AppKit did not provide a status-bar button during startup",
-                    );
-                } else {
-                    retry.next_check = now + STATUS_BUTTON_RETRY_INTERVAL;
-                }
-            }
+        if now < retry.next_attempt {
+            return;
         }
-
-        if self
-            .visibility_check_at
-            .is_some_and(|deadline| now >= deadline)
-        {
-            self.visibility_check_at = None;
-            if !self.item.isVisible() {
-                crate::app::logging::report_error(
-                    "macos-status-item",
-                    "macOS hid the KeySteer menu-bar item; enable KeySteer in System Settings > Menu Bar, or use Reset Control Centre on macOS Tahoe",
-                );
-            }
+        if let Some(button) = self.item.button(self._target.mtm()) {
+            configure_status_button(&button, self._icon.as_deref());
+            self.icon_attach_retry = None;
+            return;
+        }
+        retry.attempts_remaining = retry.attempts_remaining.saturating_sub(1);
+        if retry.attempts_remaining == 0 {
+            self.icon_attach_retry = None;
+            crate::app::logging::report_error(
+                "macos-status-item",
+                "AppKit did not attach a button to the top status item after login",
+            );
+        } else {
+            retry.next_attempt = now + STATUS_ICON_ATTACH_RETRY_INTERVAL;
         }
     }
 
@@ -547,17 +446,17 @@ fn create_native_item(
 ) -> (Retained<NSStatusItem>, bool) {
     let status_bar = NSStatusBar::systemStatusBar();
     let item = status_bar.statusItemWithLength(NSSquareStatusItemLength);
+    // This is the status item's pop-up control menu, not NSApplication's main
+    // menu. AppKit presents it when the user clicks the top status icon.
     item.setMenu(Some(menu));
-    // Expose the item before asking AppKit for its hosted button. Tahoe may
-    // defer button creation while Control Center attaches the status item.
     item.setVisible(true);
-    let button_configured = if let Some(button) = item.button(mtm) {
+    let icon_attached = if let Some(button) = item.button(mtm) {
         configure_status_button(&button, icon);
         true
     } else {
         false
     };
-    (item, button_configured)
+    (item, icon_attached)
 }
 
 fn configure_status_button(button: &objc2_app_kit::NSStatusBarButton, icon: Option<&NSImage>) {

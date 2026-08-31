@@ -12,7 +12,7 @@ hero:
 features:
   - icon: ⚡
     title: Native and responsive
-    details: Starts quietly in the tray or menu bar with very low CPU and memory usage.
+    details: Starts quietly in the Windows tray or macOS top status area with very low CPU and memory usage.
   - icon: 🎯
     title: A mode for every task
     details: Move and click day to day, or jump to a screen region in seconds.

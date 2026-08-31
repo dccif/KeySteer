@@ -98,35 +98,50 @@ fn macos_autostart_registers_the_keysteer_bundle_instead_of_open() {
 }
 
 #[test]
-fn macos_status_item_is_created_once_after_appkit_launch() {
+fn macos_top_status_item_stays_inside_the_backend() {
     let status_item = include_str!("../src/platform/macos/status_item.rs");
     let backend = include_str!("../src/platform/macos/mod.rs");
-    let runtime = include_str!("../src/platform/macos/app_runtime.rs");
-    let bridge = include_str!("../src/platform/macos/app_runtime_bridge.m");
+    let bootstrap = include_str!("../src/app/bootstrap.rs");
+    let runtime = include_str!("../src/app/runtime/mod.rs");
     let workspace = include_str!("../src/platform/macos/workspace.rs");
     let build = include_str!("../build.rs");
+
+    assert!(bootstrap.contains("platform::backend_for_ui_scan"));
+    assert!(bootstrap.contains("engine.run(backend.as_mut())"));
+    assert!(!bootstrap.contains("run_application"));
+    assert!(!runtime.contains("RuntimeTurn"));
+    assert!(!runtime.contains("runtime_next_deadline"));
+    assert!(!build.contains("app_runtime_bridge.m"));
+    assert!(
+        !std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/platform/macos/app_runtime.rs")
+            .exists()
+    );
+    assert!(
+        !std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/platform/macos/app_runtime_bridge.m")
+            .exists()
+    );
+
     assert!(status_item.contains("NSSquareStatusItemLength"));
     assert!(!status_item.contains("NSVariableStatusItemLength"));
     assert!(status_item.contains("pub(super) fn prepare_application"));
-    assert!(!status_item.contains("finishLaunching"));
-    assert!(runtime.contains("application_did_finish_launching_callback"));
-    assert!(runtime.contains("self.backend.install_status_item(mtm);"));
-    assert!(backend.contains("status_item: None"));
-    assert!(backend.contains("fn install_status_item"));
-    assert!(bridge.contains("applicationDidFinishLaunching:"));
-    assert!(bridge.contains("[NSApplication.sharedApplication run]"));
-    assert!(bridge.contains("kCFRunLoopAfterWaiting | kCFRunLoopBeforeWaiting"));
-    assert!(bridge.contains("CFRunLoopTimerCreate"));
-    assert!(build.contains("src/platform/macos/app_runtime_bridge.m"));
-    assert!(!workspace.contains("nextEventMatchingMask"));
-    assert!(!workspace.contains("pump_app_events"));
+    assert!(status_item.contains("finishLaunching"));
+    assert!(backend.contains("status_item: Some(status_item)"));
+    assert!(!backend.contains("fn install_status_item"));
+    assert!(workspace.contains("MAX_APP_EVENTS_PER_POLL"));
+    assert!(workspace.contains("nextEventMatchingMask_untilDate_inMode_dequeue"));
+    assert!(workspace.contains("pump_app_events();"));
     assert!(!status_item.contains("button.window()"));
     assert!(!status_item.contains("rebuild_native_item"));
     assert!(!status_item.contains("setAutosaveName"));
-    assert!(status_item.contains("next_maintenance_deadline"));
-    assert!(runtime.contains("self.backend.runtime_next_deadline()"));
+    assert!(!status_item.contains("next_maintenance_deadline"));
+    assert!(!status_item.contains("maintain_button_configuration"));
+    assert!(!status_item.contains("setMainMenu"));
+    assert!(status_item.contains("NSStatusBar::systemStatusBar()"));
+    assert!(status_item.contains("statusItemWithLength(NSSquareStatusItemLength)"));
     assert!(status_item.contains("NSCellImagePosition::ImageOnly"));
-    assert_eq!(status_item.matches("setVisible(true)").count(), 1);
+    assert!(status_item.contains("setVisible(true)"));
     assert!(status_item.contains("let icon = status_icon(STATUS_ICON_SIZE);"));
     assert!(status_item.contains("include_bytes!(\"../../../assets/icons/keysteer-icon.png\")"));
     assert!(status_item.contains("image.setTemplate(false)"));
@@ -139,9 +154,20 @@ fn macos_status_item_is_created_once_after_appkit_launch() {
     let menu = native_item.find("item.setMenu").unwrap();
     let visible = native_item.find("item.setVisible(true)").unwrap();
     let button = native_item.find("item.button(mtm)").unwrap();
-    assert!(menu < visible && visible < button);
-    assert!(bridge.contains("NSEventTypeApplicationDefined"));
-    assert!(bridge.contains("postEvent:wakeEvent atStart:YES"));
+    assert!(menu < visible);
+    assert!(visible < button);
+
+    let prepare = backend
+        .find("status_item::prepare_application(mtm)?")
+        .unwrap();
+    let create = backend
+        .find("status_item::StatusItem::new(mtm, event_tx.clone())")
+        .unwrap();
+    let first_pump = backend.find("workspace::pump_app_events()").unwrap();
+    let permission_check = backend.find("permissions::is_trusted()").unwrap();
+    assert!(prepare < create);
+    assert!(create < first_pump);
+    assert!(first_pump < permission_check);
 }
 
 #[test]

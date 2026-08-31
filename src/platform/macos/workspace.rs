@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use objc2::MainThreadMarker;
 use objc2::rc::autoreleasepool;
-use objc2_app_kit::NSWorkspace;
+use objc2_app_kit::{NSApplication, NSEventMask, NSWorkspace};
 use objc2_core_foundation::CFRunLoop;
 use objc2_foundation::{NSComparisonResult, NSDate, NSRunLoop, NSUserDefaults, ns_string};
 
@@ -12,6 +12,7 @@ use crate::api::backend::{Appearance, BackendEvent};
 use crate::api::command::FocusedApp;
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_APP_EVENTS_PER_POLL: usize = 64;
 
 /// Wake AppKit's main run loop after a backend producer queues an event.
 /// A Rust channel wake alone does not commit pending NSWindow/NSView updates.
@@ -60,6 +61,7 @@ impl Workspace {
     }
 
     pub fn refresh(&mut self) -> Vec<BackendEvent> {
+        pump_app_events();
         if Instant::now() < self.next_refresh {
             return Vec::new();
         }
@@ -81,6 +83,32 @@ impl Workspace {
         }
         events
     }
+}
+
+/// Dispatch a bounded batch of AppKit events on the backend's main thread.
+///
+/// `Engine::run` remains platform-independent: macOS owns its AppKit event
+/// integration here, while the fixed budget prevents a native event burst
+/// from starving synchronous input disposition or shutdown.
+pub fn pump_app_events() {
+    autoreleasepool(|_| {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let application = NSApplication::sharedApplication(mtm);
+        let expiration = NSDate::distantPast();
+        for _ in 0..MAX_APP_EVENTS_PER_POLL {
+            let Some(event) = application.nextEventMatchingMask_untilDate_inMode_dequeue(
+                NSEventMask::Any,
+                Some(&expiration),
+                super::native::default_run_loop_modes().foundation,
+                true,
+            ) else {
+                break;
+            };
+            application.sendEvent(&event);
+        }
+    });
 }
 
 fn focused_app() -> Option<FocusedApp> {
@@ -127,5 +155,10 @@ mod tests {
     fn refresh_interval_is_short_but_not_a_hot_loop() {
         assert!(REFRESH_INTERVAL >= Duration::from_millis(100));
         assert!(REFRESH_INTERVAL <= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn app_event_dispatch_has_a_finite_budget() {
+        assert!((1..=128).contains(&MAX_APP_EVENTS_PER_POLL));
     }
 }

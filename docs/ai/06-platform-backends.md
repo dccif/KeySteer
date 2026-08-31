@@ -113,8 +113,10 @@ item、window 和 display link 都有线程亲和性。
 
 ### 线程和事件
 
-- `hook.rs` 在专用 CFRunLoop thread 安装 CGEventTap，并做 disposition handshake。tap 的创建与
-  status item、frame clock、屏幕和 workspace 初始化并行，Backend 完成前才启用，启动期间
+- `MacOsBackend::new` 先在主线程完成 accessory 应用初始化并创建、强持有顶部 `NSStatusItem`，
+  然后才进入权限检查、Hook 启动和屏幕枚举等可能较慢的工作。直接点开与登录启动共用这条
+  backend 初始化路径，不需要应用层的 macOS 专用入口。
+- `hook.rs` 在专用 CFRunLoop thread 安装 CGEventTap，并做 disposition handshake。Backend 完成前
   的异步事件先进入 fallback channel，成功后通过共享 `OnceLock` 路由到有界 Hook 队列。
 - EventTap 的修饰键和 tap-disabled 状态使用单写者原子字段，不在同步 callback 中锁
   `Mutex<TapState>`。`TapDisabledByUserInput` 在 callback 内只用原子状态、disposition cancel 和
@@ -125,11 +127,10 @@ item、window 和 display link 都有线程亲和性。
   解释，port 地址只用于从冷路径 registry 取得 Arc owner；显式 shutdown 先 disarm、清除 callback
   和 registry，再让 `CGEventTap` invalidate，避免悬垂指针与错误撤权事件。若 active run loop 在
   没有 terminal/stop 的情况下意外返回，同样立即按输入捕获丢失终止，不能原地空转。
-- `app_runtime.rs` 让真正的 `NSApplication.run` 拥有主线程。ARC bridge 在
-  `applicationDidFinishLaunching` 创建状态项，并用 common-mode observer 驱动 Engine 的
-  zero-wait 单步；一只复用 CFRunLoopTimer 表示下一个 Engine 或状态项启动维护 deadline。worker/Hook 唤醒后
-  observer 立即排空有界批次，不做嵌套 AppKit event pump 或周期轮询。workspace 先比较 PID，
-  只有前台进程变化时才分配 bundle ID，appearance 与静态 `NSString` 直接比较。
+- macOS 仍使用公共 `Engine::run`。`MacOsBackend::poll` 每轮有界派发 AppKit 事件，再按 Engine
+  提供的准确 timeout 等待主 run loop、display link 或原生生产者；应用层不持有 AppKit delegate、
+  observer 或 timer。`workspace` 先比较 PID，只有前台进程变化时才分配 bundle ID，appearance
+  与静态 `NSString` 直接比较。
 - `ui_scan.rs` 有一个持久扫描 worker；Hybrid 内部只在本次 job scope 并发 AX。
 - worker/menu event 通过 hook queue 或 channel 发送，并显式唤醒主 run loop。
 - frame clock 绑定 overlay cursor view，跨屏后 AppKit 自动跟踪目标显示器 cadence。
@@ -154,12 +155,11 @@ item、window 和 display link 都有线程亲和性。
 | `screens.rs` | NSScreen/CG display 坐标与变化监听 |
 | `overlay.rs` | nonactivating click-through AppKit window 与 Core Graphics 绘制 |
 | `display_link.rs` | macOS 14 `NSView.displayLinkWithTarget:selector:` |
-| `app_runtime.rs`/bridge | `NSApplication.run`、launch delegate、Engine observer 和 deadline timer |
 | `accessibility.rs` | AXUIElement 流式树遍历 |
 | `vision.rs` | Rust FFI 封装和视觉候选后处理 |
 | `vision_bridge.m` | ScreenCaptureKit + Vision Objective-C bridge |
-| `workspace.rs` | 前台应用、appearance、run-loop wait/wake |
-| `status_item.rs` | NSStatusItem 菜单、非模态 NSAlert 和网页打开请求 |
+| `workspace.rs` | 前台应用、appearance、有界 AppKit 事件派发和 run-loop wait/wake |
+| `status_item.rs` | 顶部 NSStatusItem、点击弹出的控制菜单和非模态提示窗口 |
 | `permissions.rs` | Accessibility trust 检测、提示和设置入口 |
 | `autostart.rs`/bridge | ServiceManagement `SMAppService` 登录项 |
 
@@ -171,7 +171,7 @@ Retina 下快速重绘时文字基线出现单帧纵向抖动。
 
 ### 权限和应用身份
 
-- 键盘捕获需要 Accessibility；缺失时 Backend 仍能启动菜单栏，但
+- 键盘捕获需要 Accessibility；缺失时 Backend 仍能显示顶部状态图标，但
   `keyboard_available=false` 并给出说明。
 - 运行中撤销 Accessibility 时，`TapDisabledByUserInput` 被视为用户意图：Hook 立即
   fail-open 并停止，不自动重新启用；port 被销毁时 invalidation callback 执行同一终态转换。两者
@@ -193,13 +193,13 @@ Retina 下快速重绘时文字基线出现单帧纵向抖动。
 - 权限绑定应用 bundle identity；正式用户必须运行打包的 `KeySteer.app`，不能让 Terminal
   代替应用申请权限。
 - `SMAppService` 需要 bundle 上下文，裸二进制不等同正式 `.app` 登录项。
-- macOS 状态项使用固定方形图标槽。直接点开与 `SMAppService` 开机自启走同一初始化路径：AppKit
-  delegate 在真实 `applicationDidFinishLaunching` 回调中创建一次状态项，并强持有
-  item/menu/target/icon 到 shutdown。创建顺序固定为 menu → visible → button；Tahoe 延迟提供 button
-  时，其重试 deadline 进入同一 AppKit timer，而不是依赖无关输入唤醒。单状态项使用 AppKit 自动身份，
-  `ImageOnly` 按钮和原有 KeySteer 程序 PNG；每次启动显式 `setVisible(true)`。KeySteer 没有 Dock 控制面，不使用
-  `button.window` 等未承诺的附着状态推断健康，也不在运行中删除、重建或切换 Dock；shutdown
-  只移除当前唯一 status item。
+- macOS 顶部状态图标直接使用 `NSStatusBar::systemStatusBar()` 创建一个固定方形
+  `NSStatusItem`。直接点开与 `SMAppService` 开机自启都在 `MacOsBackend::new` 的最前段完成
+  AppKit launch 并创建状态项，随后立即给 button 设置 `ImageOnly` 和原有 KeySteer 程序 PNG、
+  挂接点击时弹出的控制 `NSMenu`，并强持有 item/menu/target/icon 到 shutdown。冷登录期间若
+  AppKit 尚未提供 button，仅复用 backend poll 做有界补挂；不创建线程或系统 timer，也不删除、
+  重建状态项。这里不创建 `NSApplication` main menu，不做 autosave、可见性轮询或 Dock 切换；
+  shutdown 只移除当前唯一 status item。
 
 ## 新增平台的最小边界
 
@@ -208,11 +208,11 @@ Mode 以适配平台。配置中的 platform-specific 字段仍应在所有目�
 TOML 可跨平台复用，但只有对应 Backend 消费它。
 # Input and readiness latency invariants
 
-- macOS synchronous CGEventTap input has a dedicated bounded lane. Menu,
-  update, and status events use an independent unbounded lane; poll priority is
-  hook, scan/pending, then async. The AppKit-owned run-loop observer drains a
-  bounded batch after each wake, and a non-frame wake returns to backend polling
-  immediately without a nested AppKit event pump.
+- macOS synchronous CGEventTap input has a dedicated bounded lane. Top-status,
+  update, and other asynchronous events use an independent unbounded lane; poll
+  priority is hook, scan/pending, then async. The backend dispatches only a
+  bounded AppKit batch per poll turn, then returns to Engine ordering or waits
+  on the main run loop until the requested deadline.
 - macOS display reconfiguration callbacks use no userdata. Registration and
   explicit removal return errors, eliminating ownership ambiguity and the old
   callback-userdata lifetime risk.

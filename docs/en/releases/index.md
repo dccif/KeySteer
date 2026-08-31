@@ -2,7 +2,7 @@
 
 ## 0.9.12
 
-Fixed UI Hint visual recognition failures, missing menu-bar icons, and hints appearing for off-screen list items on macOS.
+Fixed UI Hint visual recognition failures, missing top status icons, and hints appearing for off-screen list items on macOS.
 
 ## 0.9.11
 
@@ -66,7 +66,7 @@ Fix update checks on Windows and macOS, open the simulator in the Windows browse
 
 ## 0.8.11
 
-Open the current configuration safely in the web simulator from the tray or menu bar, and fix macOS update-check crashes and worker cleanup on exit.
+Open the current configuration safely in the web simulator from the Windows tray or macOS top status icon, and fix macOS update-check crashes and worker cleanup on exit.
 
 ## 0.8.10
 

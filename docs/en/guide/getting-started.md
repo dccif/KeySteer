@@ -4,7 +4,7 @@
 import KeyLayout from '../../.vitepress/components/KeyLayout'
 </script>
 
-When KeySteer starts, it quietly waits in the tray or menu bar and does not interfere with normal typing. For your first use, **you do not need to memorise every command or create a configuration file**.
+When KeySteer starts, it quietly waits in the Windows tray or the macOS top status area and does not interfere with normal typing. For your first use, **you do not need to memorise every command or create a configuration file**.
 
 ::: tip One simple session
 `Primary+E` to start → `h j k l` to move → `;` to click → `Esc` to finish
@@ -112,7 +112,7 @@ Open the [Configuration & Simulator](/en/editor/) to view the keyboard, edit bin
 <details>
 <summary><strong>Status menu, diagnostics, and configuration locations</strong></summary>
 
-Right-click the tray icon or click the menu-bar icon to pause, reload configuration, send the active configuration to the web simulator, enable launch at login, check for updates, or quit.
+Right-click the Windows tray icon or click the macOS top status icon to pause, reload configuration, send the active configuration to the web simulator, enable launch at login, check for updates, or quit.
 
 Use these commands to inspect a configuration or diagnose the environment:
 

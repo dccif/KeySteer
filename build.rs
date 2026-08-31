@@ -4,7 +4,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=src/platform/windows/compositor_clock.c");
     println!("cargo:rerun-if-changed=src/platform/macos/vision_bridge.m");
     println!("cargo:rerun-if-changed=src/platform/macos/autostart_bridge.m");
-    println!("cargo:rerun-if-changed=src/platform/macos/app_runtime_bridge.m");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
     println!("cargo:rustc-env=KEYSTEER_BUILD_DATE={}", build_date()?);
 
@@ -98,7 +97,6 @@ fn compile_macos_bridge() {
     cc::Build::new()
         .file("src/platform/macos/vision_bridge.m")
         .file("src/platform/macos/autostart_bridge.m")
-        .file("src/platform/macos/app_runtime_bridge.m")
         .flag("-fobjc-arc")
         .flag("-fblocks")
         .flag(format!("-mmacosx-version-min={MIN_MACOS}"))

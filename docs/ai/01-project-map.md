@@ -72,16 +72,14 @@ Windows：
 
 macOS：
 
-- `app_runtime.rs` 在主线程把 Engine 的 start/单步/finish 生命周期接入真正的
-  `NSApplication.run`；`app_runtime_bridge.m` 只拥有 AppKit delegate、CFRunLoop observer
-  和一只可复用 deadline timer。
 - `hook.rs` CGEventTap 与同步 consume/forward 握手。
 - `input.rs` Core Graphics 输入注入。
 - `overlay.rs` AppKit/Core Graphics 分层覆盖层。
 - `accessibility.rs` AX 树遍历；`vision.rs`/`vision_bridge.m` 视觉检测。
 - `ui_scan.rs` 单一持久 worker、AX/Vision/Hybrid 调度。
 - `display_link.rs` macOS 14 AppKit `CADisplayLink`。
-- `status_item.rs` 菜单栏、AppKit runtime owner、非模态更新提示与浏览器打开；
+- `workspace.rs` 前台应用、appearance、主 AppKit run loop 的有界事件派发与等待/唤醒。
+- `status_item.rs` 顶部 `NSStatusItem`、点击弹出的控制菜单、非模态更新提示与浏览器打开；
   `autostart.rs`/`autostart_bridge.m` 登录启动。
 
 ## 文档站

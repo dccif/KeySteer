@@ -5,7 +5,6 @@
 //! macOS backend composed from isolated native services.
 
 mod accessibility;
-mod app_runtime;
 mod autostart;
 mod display_link;
 mod hook;
@@ -41,8 +40,6 @@ use crate::platform::scan_mailbox::ScanMailbox;
 use self::hook::{HookStartup, HookThread};
 use self::overlay::Overlay;
 use crate::platform::multi_click::ClickTracker;
-
-pub(crate) use app_runtime::run_application;
 
 const BACKEND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -113,6 +110,15 @@ impl MacOsBackend {
     pub fn new() -> Result<Self, String> {
         let (async_tx, async_rx) = mpsc::channel();
         let event_tx = EventSender::new(async_tx);
+        let mtm = MainThreadMarker::new()
+            .ok_or_else(|| "macOS backend must be created on the main thread".to_string())?;
+        status_item::prepare_application(mtm)?;
+        // Install the top status item before permissions, Hook startup, screen
+        // enumeration, or any other work that can be slow during login.
+        let mut status_item = status_item::StatusItem::new(mtm, event_tx.clone());
+        workspace::pump_app_events();
+        status_item.maintain_icon_attachment();
+
         let scan_mailbox = Arc::new(ScanMailbox::default());
         let configured_interval = NSEvent::doubleClickInterval();
         let double_click_interval = if configured_interval.is_finite() && configured_interval > 0.0
@@ -129,8 +135,6 @@ impl MacOsBackend {
 
         let hook_deadline = Instant::now() + Duration::from_secs(2);
         let hook_start = HookStartup::spawn(Arc::clone(&click_tracker));
-        let mtm = MainThreadMarker::new()
-            .ok_or_else(|| "macOS backend must be created on the main thread".to_string())?;
         let frame_clock = display_link::DisplayFrameClock::new(mtm);
         let initial_screens = screens::list_screens().unwrap_or_else(|error| {
             crate::app::logging::report_error(
@@ -165,7 +169,7 @@ impl MacOsBackend {
             display_watcher: Some(display_watcher),
             frame_clock,
             workspace,
-            status_item: None,
+            status_item: Some(status_item),
             update_worker: None,
             held_buttons: Cell::new(0),
             click_tracker,
@@ -180,16 +184,10 @@ impl MacOsBackend {
         self.hook.as_ref().is_some_and(HookThread::is_active)
     }
 
-    fn install_status_item(&mut self, mtm: MainThreadMarker) {
-        if self.status_item.is_none() {
-            self.status_item = Some(status_item::StatusItem::new(mtm, self.event_tx.clone()));
-        }
-    }
-
     fn refresh_native_events(&mut self) {
         self.pending.extend(self.workspace.refresh());
         if let Some(item) = self.status_item.as_mut() {
-            item.maintain_button_configuration();
+            item.maintain_icon_attachment();
         }
         if self
             .display_watcher
@@ -203,12 +201,6 @@ impl MacOsBackend {
             self.pending
                 .push_back(BackendEvent::ScreensChanged(current));
         }
-    }
-
-    fn runtime_next_deadline(&self) -> Option<Duration> {
-        self.status_item
-            .as_ref()
-            .and_then(status_item::StatusItem::next_maintenance_deadline)
     }
 
     fn try_event(&mut self) -> Option<BackendEvent> {
@@ -344,9 +336,6 @@ impl Backend for MacOsBackend {
             self.refresh_native_events();
             if let Some(event) = self.try_event() {
                 return Ok(Some(event));
-            }
-            if let Some(elapsed) = self.frame_clock.try_next() {
-                return Ok(Some(BackendEvent::Frame(elapsed)));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {

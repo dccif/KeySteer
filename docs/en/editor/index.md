@@ -2,7 +2,7 @@
 
 Configuration & Simulator is for trying a change before saving it: edit bindings in the browser, preview pointer actions, and adjust Grid, Recursive Grid, and UI Hint styles. Data stays in your browser and is never uploaded. For complex actions, external commands, and advanced fields, treat the TOML documentation as authoritative.
 
-With KeySteer 0.8.11 or later, choose **Configuration & Simulator...** in the tray or menu-bar menu to open the active configuration directly. The configuration is passed to the browser in a URL fragment, which GitHub Pages requests never receive; the page clears it immediately after reading it. A browser extension could theoretically read the page address during the handoff, so do not keep passwords or tokens in configuration commands.
+With KeySteer 0.8.11 or later, choose **Configuration & Simulator...** from the Windows tray or macOS top status menu to open the active configuration directly. The configuration is passed to the browser in a URL fragment, which GitHub Pages requests never receive; the page clears it immediately after reading it. A browser extension could theoretically read the page address during the handoff, so do not keep passwords or tokens in configuration commands.
 
 <p class="ks-open-simulator"><a href="../simulator" target="_blank" rel="noopener">Open Configuration & Simulator ↗</a></p>
 

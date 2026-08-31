@@ -4,7 +4,7 @@
 import KeyLayout from '../.vitepress/components/KeyLayout'
 </script>
 
-KeySteer 启动后默认安静地待在托盘或菜单栏，不会影响正常打字。第一次使用时，**可以先不去记操作 ，也不需要创建配置文件**。
+KeySteer 启动后默认安静地待在 Windows 托盘或 macOS 顶部状态栏，不会影响正常打字。第一次使用时，**可以先不去记操作 ，也不需要创建配置文件**。
 
 ::: tip 简单的一次启动
 `Primary+E` 开始 → `h j k l` 移动 → `;` 点击 → `Esc` 结束
@@ -114,7 +114,7 @@ flowchart LR
 <details>
 <summary><strong>状态栏、诊断和配置位置</strong></summary>
 
-右键托盘或点击菜单栏图标，可以暂停、重载配置、把当前配置直接带入网页模拟器、设置开机启动、检查更新或退出。
+右键 Windows 托盘图标或点击 macOS 顶部状态图标，可以暂停、重载配置、把当前配置直接带入网页模拟器、设置开机启动、检查更新或退出。
 
 需要检查配置或诊断环境时运行：
 

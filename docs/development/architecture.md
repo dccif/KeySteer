@@ -48,7 +48,7 @@ flowchart TB
 | `src/domain/hints/` | UI 标签分配、匹配和网格算法 | `labels.rs`、`matcher.rs` |
 | `src/plugins/` | 内置插件；也是插件的参考实现 | `builtin/screen_selector.rs` |
 | `src/platform/windows/` | Win32 Hook、SendInput、UIA、覆盖层、帧时钟和托盘 | `mod.rs` |
-| `src/platform/macos/` | CGEventTap、Core Graphics、AX、Vision、AppKit 和菜单栏 | `mod.rs` |
+| `src/platform/macos/` | CGEventTap、Core Graphics、AX、Vision、AppKit 和顶部状态项 | `mod.rs` |
 
 `src/lib.rs` 暴露公共 API；`src/main.rs` 只负责进入 CLI 和启动流程。平台后端由 `cfg(target_os)` 在编译期选择。
 

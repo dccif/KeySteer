@@ -4,7 +4,7 @@
 
 修复 macOS 上 UI Hint 视觉识别失败、状态栏图标不显示、运行中撤销辅助功能权限可能造成输入卡住，以及滚动列表的窗口外元素仍生成标签的问题。
 
-Fixed UI Hint visual recognition failures, missing menu-bar icons, input becoming unresponsive after Accessibility access was revoked, and hints appearing for off-screen list items on macOS.
+Fixed UI Hint visual recognition failures, missing top status icons, input becoming unresponsive after Accessibility access was revoked, and hints appearing for off-screen list items on macOS.
 
 ## 0.9.11
 
@@ -98,9 +98,9 @@ Fix update checks on Windows and macOS, open the simulator in the Windows browse
 
 ## 0.8.11
 
-新增从托盘或菜单栏一键将当前配置安全带入网页模拟器，并修复 macOS 检查更新闪退及更新线程退出清理问题。
+新增从 Windows 托盘或 macOS 顶部状态图标一键将当前配置安全带入网页模拟器，并修复 macOS 检查更新闪退及更新线程退出清理问题。
 
-Open the current configuration safely in the web simulator from the tray or menu bar, and fix macOS update-check crashes and worker cleanup on exit.
+Open the current configuration safely in the web simulator from the Windows tray or macOS top status icon, and fix macOS update-check crashes and worker cleanup on exit.
 
 ## 0.8.10
 

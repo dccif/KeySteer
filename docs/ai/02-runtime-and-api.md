@@ -14,12 +14,11 @@ main.rs
         -> Engine::new
         -> modes::built_in 注册
         -> plugins::bundled 注册
-        -> Engine::run（Windows/其他平台）
-        -> macOS run_application + NSApplication.run
+        -> Engine::run
 ```
 
 Windows 二进制默认无控制台；只有携带 CLI 参数时才尝试附加父控制台。无配置文件不是
-错误：程序使用 `Config::default()` 静默进入托盘/菜单栏和 `idle`。
+错误：程序使用 `Config::default()` 静默进入 Windows 托盘或 macOS 顶部状态区域并进入 `idle`。
 
 诊断统一经过 `app::logging`：`report_error!`/`report_error` 与 panic 不受 debug 配置控制，始终写入 stderr 和日志文件并
 立即 flush；debug/info/warning（包括 `report_warning`）继续受 `debug.enabled` 控制。
@@ -97,13 +96,12 @@ Engine 的 Frame、指针、按键等通用热路径直接调用借用式 `Mode:
 5. 处理一个 `BackendEvent`，随后触发到期 timer 和延迟动作序列。
 6. 退出时释放所有 latched 输入、隐藏覆盖层并关闭 backend。
 
-Engine 内部把同一语义拆成 `start_runtime`、一次只处理一个原生事件的
-`run_runtime_turn` 和 `finish_runtime`。Windows 与其他平台的 `Engine::run` 仍按原阻塞循环
-调用这三步；macOS 则让真正的 `NSApplication.run` 常驻主线程，在
-`applicationDidFinishLaunching` 后启动 Engine，并由 common-mode CFRunLoop observer 以零
-等待单步排空事件。所有 producer 只需唤醒主 run loop；一只复用 timer 承载 Engine 与状态项
-启动维护的最近 deadline，不做周期轮询。这样 AppKit 自己派发菜单栏、窗口和系统事件，不再用嵌套
-`nextEventMatchingMask` 手动泵事件，同时保持 Hook、timer、sequence 与 shutdown 的原有顺序。
+`Engine::run` 是所有目标的统一入口；启动、单次事件处理和结束辅助函数都是运行时私有实现，
+`bootstrap` 不引用 `MacOsBackend`、`NSApplication` 或其他平台专用类型。平台事件循环的差异只
+存在于 `Backend::poll`：Windows 集成 Win32 message pump，macOS 在主线程有界派发 AppKit
+事件，并通过主 run loop 等到生产者唤醒、显示帧或 Engine 的准确 deadline。状态图标、窗口和
+AppKit 生命周期因此完全留在 macOS backend 内，同时保持 Hook、timer、sequence 与 shutdown
+的原有顺序。
 
 原生输入捕获永久丢失与普通合成注入失败是两条不同恢复路径。前者通过
 `InputCaptureLost` 可靠上报，并额外清空物理 pressed/disposition 状态，因为对应 KeyUp
