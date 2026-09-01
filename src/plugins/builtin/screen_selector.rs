@@ -1,13 +1,13 @@
 //! Multi-display selection and switching implemented only with the public mode,
 //! command, geometry, overlay and plugin APIs.
 
+use crate::api::Palette;
 use crate::api::binding::Binding;
 use crate::api::command::{Command, CommandBatch, HostContext, Mode, ModeEvent};
 use crate::api::geometry::Rect;
 use crate::api::input::{KeyChord, KeyState, ModeId};
 use crate::api::overlay::{Color, LabelStyle, OverlayLabel, OverlayScene, OverlayShape, Placement};
 use crate::api::plugin::{Manifest, Plugin};
-use crate::config::{Config, Palette};
 use std::collections::BTreeMap;
 
 const MODE_ID: &str = "plugin:screen-selector";
@@ -21,14 +21,18 @@ pub struct ScreenSelector {
     input: String,
     modal: bool,
     return_mode: ModeId,
+    preserve: bool,
 }
 
 impl ScreenSelector {
     pub fn new() -> Result<Self, String> {
-        Self::with_key_aliases(&BTreeMap::new())
+        Self::with_settings(&BTreeMap::new(), true)
     }
 
-    pub(crate) fn with_key_aliases(aliases: &BTreeMap<String, String>) -> Result<Self, String> {
+    pub(crate) fn with_settings(
+        aliases: &BTreeMap<String, String>,
+        preserve: bool,
+    ) -> Result<Self, String> {
         let manifest = Manifest::new("com.keysteer.screen-selector", "Screen Selector")
             .with_description("Switch displays directly or choose one from a numbered overlay")
             .with_verb(VERB);
@@ -49,14 +53,8 @@ impl ScreenSelector {
             input: String::new(),
             modal: false,
             return_mode: ModeId::idle(),
+            preserve,
         })
-    }
-
-    fn preserve(ctx: &HostContext<'_>) -> bool {
-        ctx.config
-            .downcast_ref::<Config>()
-            .and_then(|config| config.plugin_setting_bool(MODE_ID, "preserve"))
-            .unwrap_or(true)
     }
 
     fn build(&mut self, ctx: &HostContext<'_>) {
@@ -138,14 +136,14 @@ impl ScreenSelector {
         }
     }
 
-    fn retarget(index: usize, ctx: &HostContext<'_>) -> CommandBatch {
+    fn retarget(&self, index: usize) -> CommandBatch {
         CommandBatch::one(Command::RetargetScreen {
             index,
-            preserve: Self::preserve(ctx),
+            preserve: self.preserve,
         })
     }
 
-    fn close_and_retarget(&self, index: usize, ctx: &HostContext<'_>) -> CommandBatch {
+    fn close_and_retarget(&self, index: usize) -> CommandBatch {
         let close = if self.modal {
             Command::PopMode
         } else {
@@ -154,7 +152,7 @@ impl ScreenSelector {
         let mut batch = CommandBatch::two(Command::HideOverlay, close);
         batch.push(Command::RetargetScreen {
             index,
-            preserve: Self::preserve(ctx),
+            preserve: self.preserve,
         });
         batch
     }
@@ -182,7 +180,7 @@ impl ScreenSelector {
             return CommandBatch::one(Command::show_overlay(self.scene(ctx)));
         };
         if !multiple && exact {
-            return self.close_and_retarget(index, ctx);
+            return self.close_and_retarget(index);
         }
         CommandBatch::one(Command::show_overlay(self.scene(ctx)))
     }
@@ -204,7 +202,7 @@ impl Mode for ScreenSelector {
                     CommandBatch::one(Command::PushMode(self.id.clone()))
                 } else {
                     Self::resolve_target(args, ctx)
-                        .map(|index| Self::retarget(index, ctx))
+                        .map(|index| self.retarget(index))
                         .unwrap_or_default()
                 }
             }
@@ -243,7 +241,7 @@ impl Mode for ScreenSelector {
                     .cells
                     .iter()
                     .find(|(label, _, _)| label == &self.input)
-                    .map(|(_, index, _)| self.close_and_retarget(*index, ctx))
+                    .map(|(_, index, _)| self.close_and_retarget(*index))
                     .unwrap_or_default(),
                 _ => match key.as_char().filter(char::is_ascii_digit) {
                     Some(character) => {
@@ -282,7 +280,6 @@ mod tests {
     struct Env {
         screens: Vec<Screen>,
         palette: Palette,
-        config: Config,
         cursor: Point,
     }
 
@@ -291,7 +288,6 @@ mod tests {
             Self {
                 screens,
                 palette: Palette::default(),
-                config: Config::default(),
                 cursor: Point::new(10.0, 10.0),
             }
         }
@@ -301,7 +297,6 @@ mod tests {
                 cursor: self.cursor,
                 focused_app: None,
                 palette: &self.palette,
-                config: &self.config,
             }
         }
     }
@@ -337,7 +332,7 @@ mod tests {
     #[test]
     fn manifest_honours_the_configured_primary_alias() {
         let aliases = BTreeMap::from([("primary".into(), "left_alt".into())]);
-        let plugin = ScreenSelector::with_key_aliases(&aliases).unwrap();
+        let plugin = ScreenSelector::with_settings(&aliases, true).unwrap();
         assert_eq!(
             plugin.manifest().default_bindings[0].0.canonical(),
             "left_alt+s"

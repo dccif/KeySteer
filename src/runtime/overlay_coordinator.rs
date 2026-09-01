@@ -57,8 +57,8 @@ impl Engine {
         mut scene: Arc<OverlayScene>,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
-        if self.command_batch_depth > 0 {
-            self.pending_overlay = Some(PendingOverlay::Show(scene));
+        if self.overlay.command_batch_depth > 0 {
+            self.overlay.pending = Some(PendingOverlay::Show(scene));
             return Ok(());
         }
         // Static primitives keep their order for the lifetime of the mode
@@ -73,7 +73,7 @@ impl Engine {
         scene: Arc<OverlayScene>,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
-        self.overlay_content = Some(Arc::clone(&scene));
+        self.overlay.content = Some(Arc::clone(&scene));
         self.present_overlay(scene.as_ref().clone(), backend)
     }
 
@@ -82,7 +82,7 @@ impl Engine {
         mut scene: OverlayScene,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
-        let starts_visible_session = !self.overlay_visible;
+        let starts_visible_session = !self.overlay.visible;
         let cursor_only = scene.clip.is_none()
             && scene.backdrop.is_none()
             && scene.labels.is_empty()
@@ -110,8 +110,8 @@ impl Engine {
                 crate::api::binding::Button::Right,
             ]
             .into_iter()
-            .find(|button| self.latched.contains(&InputTarget::Mouse(*button)))
-            .or_else(|| self.active_click_indicators.latest_button());
+            .find(|button| self.input.latched.contains(&InputTarget::Mouse(*button)))
+            .or_else(|| self.input.active_click_indicators.latest_button());
             let pressed_color = match pressed_button {
                 Some(crate::api::binding::Button::Left) => cursor.left_pressed_color,
                 Some(crate::api::binding::Button::Middle) => cursor.middle_pressed_color,
@@ -121,7 +121,7 @@ impl Engine {
             .and_then(|color| color.resolve(self.palette.appearance));
             let fill = pressed_color.map_or_else(
                 || {
-                    crate::config::style::resolve(
+                    crate::api::style::resolve(
                         cursor.fill_color,
                         self.palette.appearance,
                         self.palette.accent.with_alpha(34),
@@ -130,7 +130,7 @@ impl Engine {
                 |color| color.with_opacity(0.2),
             );
             let stroke = pressed_color.unwrap_or_else(|| {
-                crate::config::style::resolve(
+                crate::api::style::resolve(
                     cursor.stroke_color,
                     self.palette.appearance,
                     self.palette.accent_alt.with_alpha(210),
@@ -163,9 +163,9 @@ impl Engine {
                 Screen::containing(&self.screens, &self.cursor).map(|screen| screen.bounds);
         }
         let trace_overlay = if cursor_only {
-            self.config.debug.motion
+            self.settings.debug.motion
         } else {
-            self.config.debug.overlay
+            self.settings.debug.overlay
         };
         self.trace_lazy(trace_overlay, "overlay", || {
             format!(
@@ -190,14 +190,15 @@ impl Engine {
                 .indicator
                 .map(|geometry| geometry.position(self.cursor, &self.screens)),
         };
-        if self.overlay_visible
+        if self.overlay.visible
             && self
+                .overlay
                 .last_scene
                 .as_deref()
                 .is_some_and(|previous| previous == &scene)
         {
-            self.overlay_dynamic = dynamic;
-            self.overlay_positions = Some(positions);
+            self.overlay.dynamic = dynamic;
+            self.overlay.positions = Some(positions);
             return Ok(());
         }
         let scene = Arc::new(scene);
@@ -206,45 +207,45 @@ impl Engine {
         backend.present(Arc::clone(&scene))?;
         crate::support::perf_probe::mark("overlay_presented");
         self.trace(trace_overlay, "overlay", "backend present: ok");
-        self.last_scene = Some(scene);
-        self.overlay_visible = true;
-        self.overlay_dynamic = dynamic;
-        self.overlay_positions = Some(positions);
+        self.overlay.last_scene = Some(scene);
+        self.overlay.visible = true;
+        self.overlay.dynamic = dynamic;
+        self.overlay.positions = Some(positions);
         if starts_visible_session {
-            self.overlay_position_fast_path_disabled = false;
+            self.overlay.position_fast_path_disabled = false;
         }
         Ok(())
     }
 
     pub(super) fn hide_overlay(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
-        if self.command_batch_depth > 0 {
-            self.pending_overlay = Some(PendingOverlay::Hide);
+        if self.overlay.command_batch_depth > 0 {
+            self.overlay.pending = Some(PendingOverlay::Hide);
             return Ok(());
         }
         self.hide_overlay_now(backend)
     }
 
     fn hide_overlay_now(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
-        self.overlay_content = None;
+        self.overlay.content = None;
         if self.active != ModeId::idle() {
             return self.present_overlay(OverlayScene::new(), backend);
         }
-        if self.overlay_visible {
+        if self.overlay.visible {
             backend.dismiss()?;
         }
-        self.last_scene = None;
-        self.overlay_visible = false;
-        self.overlay_dynamic = DynamicOverlayState::default();
-        self.overlay_positions = None;
-        self.overlay_position_fast_path_disabled = false;
+        self.overlay.last_scene = None;
+        self.overlay.visible = false;
+        self.overlay.dynamic = DynamicOverlayState::default();
+        self.overlay.positions = None;
+        self.overlay.position_fast_path_disabled = false;
         crate::support::perf_probe::mark("overlay_hidden");
         Ok(())
     }
 
     pub(super) fn refresh_overlay(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
-        if self.command_batch_depth > 0 {
-            if matches!(self.pending_overlay, None | Some(PendingOverlay::Positions)) {
-                self.pending_overlay = Some(PendingOverlay::Refresh);
+        if self.overlay.command_batch_depth > 0 {
+            if matches!(self.overlay.pending, None | Some(PendingOverlay::Positions)) {
+                self.overlay.pending = Some(PendingOverlay::Refresh);
             }
             return Ok(());
         }
@@ -255,7 +256,7 @@ impl Engine {
         if self.active == ModeId::idle() {
             return Ok(());
         }
-        let scene = self.overlay_content.as_deref().cloned().unwrap_or_default();
+        let scene = self.overlay.content.as_deref().cloned().unwrap_or_default();
         self.present_overlay(scene, backend)
     }
 
@@ -265,36 +266,43 @@ impl Engine {
         &mut self,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
-        if self.active == ModeId::idle() || !self.overlay_visible {
+        if self.active == ModeId::idle() || !self.overlay.visible {
             return Ok(());
         }
-        if self.overlay_dynamic.follows_cursor_screen {
+        if self.overlay.dynamic.follows_cursor_screen {
             let current_clip =
                 Screen::containing(&self.screens, &self.cursor).map(|screen| screen.bounds);
-            if self.last_scene.as_deref().and_then(|scene| scene.clip) != current_clip {
+            if self
+                .overlay
+                .last_scene
+                .as_deref()
+                .and_then(|scene| scene.clip)
+                != current_clip
+            {
                 return self.refresh_overlay(backend);
             }
         }
 
         let positions = OverlayPositions {
-            cursor: self.overlay_dynamic.cursor.then_some(self.cursor),
+            cursor: self.overlay.dynamic.cursor.then_some(self.cursor),
             indicator: self
-                .overlay_dynamic
+                .overlay
+                .dynamic
                 .indicator
                 .map(|geometry| geometry.position(self.cursor, &self.screens)),
         };
         if positions.cursor.is_none() && positions.indicator.is_none() {
             return Ok(());
         }
-        if self.overlay_positions == Some(positions) {
+        if self.overlay.positions == Some(positions) {
             return Ok(());
         }
-        if self.overlay_position_fast_path_disabled {
+        if self.overlay.position_fast_path_disabled {
             return self.refresh_overlay(backend);
         }
-        if self.command_batch_depth > 0 {
-            if self.pending_overlay.is_none() {
-                self.pending_overlay = Some(PendingOverlay::Positions);
+        if self.overlay.command_batch_depth > 0 {
+            if self.overlay.pending.is_none() {
+                self.overlay.pending = Some(PendingOverlay::Positions);
             }
             return Ok(());
         }
@@ -302,15 +310,15 @@ impl Engine {
         crate::support::perf_probe::mark("native_submitted");
         match backend.update_overlay_positions(positions.cursor, positions.indicator) {
             Ok(true) => {
-                self.overlay_positions = Some(positions);
+                self.overlay.positions = Some(positions);
                 Ok(())
             }
             Ok(false) => {
-                self.overlay_position_fast_path_disabled = true;
+                self.overlay.position_fast_path_disabled = true;
                 self.refresh_overlay_now(backend)
             }
             Err(error) => {
-                self.overlay_position_fast_path_disabled = true;
+                self.overlay.position_fast_path_disabled = true;
                 crate::support::logging::report_error(
                     "overlay",
                     format!(
@@ -326,7 +334,7 @@ impl Engine {
         &mut self,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
-        match self.pending_overlay.take() {
+        match self.overlay.pending.take() {
             Some(PendingOverlay::Refresh) => self.refresh_overlay_now(backend),
             Some(PendingOverlay::Positions) => self.refresh_overlay_positions(backend),
             Some(PendingOverlay::Show(mut scene)) => {
@@ -354,7 +362,7 @@ impl Engine {
             self.palette.readable_on(background),
             self.palette.accent,
         );
-        let held_text = held_targets_text(&self.latched);
+        let held_text = held_targets_text(&self.input.latched);
         let text_width = |character_count: usize| {
             (character_count as f64 * style.font_size * 0.75 + style.padding_x * 2.0)
                 .max(style.font_size * 2.0)

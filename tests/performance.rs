@@ -8,7 +8,6 @@ use keysteer::api::{
     Mode, Rect,
 };
 use keysteer::modes::hint::labeling::assign_into;
-use keysteer::modes::normal::NormalMode;
 use keysteer::{Config, Key, ModeEvent, Point};
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 
@@ -24,9 +23,8 @@ fn steady_normal_frames_do_not_allocate() {
         cursor: Point::default(),
         focused_app: None,
         palette: &palette,
-        config: &config,
     };
-    let mut mode = NormalMode::new(&config);
+    let mut mode = keysteer::app::mode_catalog::normal(&config);
     let key = Key::new("l").unwrap();
     let _ = mode.handle(
         &ModeEvent::Binding {

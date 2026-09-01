@@ -1,6 +1,36 @@
 //! Configuration-independent, fully resolved theme values.
 
+use serde::{Deserialize, Serialize};
+
 use super::{Appearance, Color};
+
+/// A color that may differ between light and dark appearance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ThemedColor {
+    Both(String),
+    PerAppearance { light: String, dark: String },
+}
+
+impl ThemedColor {
+    pub fn is_valid(&self) -> bool {
+        match self {
+            Self::Both(value) => Color::parse(value).is_some(),
+            Self::PerAppearance { light, dark } => {
+                Color::parse(light).is_some() && Color::parse(dark).is_some()
+            }
+        }
+    }
+
+    pub fn resolve(&self, appearance: Appearance) -> Option<Color> {
+        let raw = match (self, appearance) {
+            (Self::Both(value), _) => value,
+            (Self::PerAppearance { light, .. }, Appearance::Light) => light,
+            (Self::PerAppearance { dark, .. }, Appearance::Dark) => dark,
+        };
+        Color::parse(raw)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Palette {

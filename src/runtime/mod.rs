@@ -14,6 +14,11 @@
 mod command_executor;
 mod input_router;
 mod overlay_coordinator;
+mod plan;
+
+pub use plan::{
+    AppRouteOverride, DebugSettings, EngineSettings, ModeRoute, PaletteSet, RuntimePlan,
+};
 
 #[cfg(test)]
 use std::collections::BTreeSet;
@@ -224,10 +229,6 @@ struct ModeSlot {
     pointer_events: bool,
     table: Option<CompiledKeymap>,
     temporary_chords: Vec<TemporaryChord>,
-}
-
-fn builtin_wants_pointer_events(id: &ModeId) -> bool {
-    id != &ModeId::idle() && id != &ModeId::normal()
 }
 
 #[derive(Default)]
@@ -547,6 +548,37 @@ struct DynamicOverlayState {
     follows_cursor_screen: bool,
 }
 
+#[derive(Debug, Default)]
+struct InputState {
+    pressed: PressedKeys,
+    key_dispositions: KeyMap<KeyDisposition>,
+    active_gestures: KeyMap<ActiveGesture>,
+    active_click_indicators: ActiveClickIndicators,
+    latched: LatchedTargets,
+    active_default_toggles: DefaultToggleKeys,
+    pending_long_press_toggles: SmallVec<[PendingLongPressToggle; 4]>,
+    drag_auto_release: DragAutoRelease,
+}
+
+#[derive(Debug, Default)]
+struct Scheduler {
+    sequences: Vec<PendingSequence>,
+    timers: HashMap<String, Timer>,
+    frame_clock_owner: Option<ModeId>,
+}
+
+#[derive(Default)]
+struct OverlayCoordinator {
+    last_scene: Option<Arc<OverlayScene>>,
+    content: Option<Arc<OverlayScene>>,
+    visible: bool,
+    dynamic: DynamicOverlayState,
+    positions: Option<OverlayPositions>,
+    position_fast_path_disabled: bool,
+    command_batch_depth: usize,
+    pending: Option<PendingOverlay>,
+}
+
 struct TemporaryChord {
     chord: KeyChord,
     conflicts_with_ui_hint_overlap: bool,
@@ -557,8 +589,20 @@ fn chords_conflict(left: &KeyChord, right: &KeyChord) -> bool {
         || right.activation_matches(left.activation_key())
 }
 
+fn app_pattern_matches(pattern: &str, app: &FocusedApp) -> bool {
+    !pattern.is_empty()
+        && (pattern.eq_ignore_ascii_case(&app.bundle_id)
+            || app
+                .window_title
+                .to_lowercase()
+                .contains(&pattern.to_lowercase()))
+}
+
 pub struct Engine {
     config: Config,
+    settings: EngineSettings,
+    palettes: PaletteSet,
+    routes: BTreeMap<ModeId, ModeRoute>,
     palette: Palette,
     appearance: Appearance,
 
@@ -585,56 +629,40 @@ pub struct Engine {
     /// Cached because this guard is checked for every physical key edge.
     focused_app_excluded: bool,
 
-    pressed: PressedKeys,
     /// The OS must see matching down/up halves even if a mode switch happens
     /// between them (for example Ctrl down in idle, then Ctrl+E enters normal).
-    key_dispositions: KeyMap<KeyDisposition>,
     /// Held bindings currently in effect, keyed by the key that started them.
     ///
     /// A release cannot be resolved by looking the chord up again: the key (and
     /// possibly its modifiers) are no longer held, so the chord would not match.
     /// Remembering the binding is what guarantees every press is followed by
     /// its release, rather than movement sticking on forever.
-    active_gestures: KeyMap<ActiveGesture>,
     /// Direct clicks awaiting short/long-press resolution, or completed atomic
     /// clicks whose physical activation keys remain down. This drives cursor
     /// color only and does not represent mouse-button state.
-    active_click_indicators: ActiveClickIndicators,
     /// Synthetic keyboard keys and mouse buttons held by `press` or `toggle`.
     /// Keeping one shared set makes these actions idempotent and lets the UI
     /// report exactly what the engine is responsible for releasing.
-    latched: LatchedTargets,
     /// Physically held activation keys for parameterless `toggle`. The value is
     /// true once a companion target was toggled during this press. Releasing an
     /// unused activation key clears every currently latched input instead.
-    active_default_toggles: DefaultToggleKeys,
-    pending_sequences: Vec<PendingSequence>,
+    input: InputState,
     /// Click keys and parameterless toggle activations waiting to cross the
     /// configured hold threshold. A short click completes on key-up; firing
     /// delegates only the held target to the latched-input toggle state machine.
-    pending_long_press_toggles: SmallVec<[PendingLongPressToggle; 4]>,
     /// Optional modifier-assisted drag release. This is separate from
     /// `latched` so explicit press/toggle actions keep their existing manual
     /// lifetime.
-    drag_auto_release: DragAutoRelease,
-    timers: HashMap<String, Timer>,
     scan_owners: HashMap<u64, ModeId>,
     /// Mode that owns native display frames. This can differ from `active`
     /// when grid or hint mode inherits normal-mode movement bindings.
-    frame_clock_owner: Option<ModeId>,
+    scheduler: Scheduler,
 
     /// Last scene presented, so redundant presents can be skipped.
-    last_scene: Option<Arc<OverlayScene>>,
     /// Mode-owned scene before cursor decorations are added.
-    overlay_content: Option<Arc<OverlayScene>>,
-    overlay_visible: bool,
-    overlay_dynamic: DynamicOverlayState,
-    overlay_positions: Option<OverlayPositions>,
     /// Avoid retrying a rejected native position-only update on every pointer
     /// event. A fresh visible overlay session gets one new attempt.
-    overlay_position_fast_path_disabled: bool,
-    command_batch_depth: usize,
-    pending_overlay: Option<PendingOverlay>,
+    overlay: OverlayCoordinator,
 
     enabled: bool,
     /// Suppress repeated reports while the focused window rejects a stream of
@@ -653,10 +681,24 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(config: Config, appearance: Appearance) -> Self {
-        crate::support::logging::set_non_error_enabled(config.debug.enabled);
-        let palette = config.palette(appearance);
+        let plan = match crate::app::configuration::compile(&config) {
+            Ok(plan) => plan,
+            Err(error) => panic!("Engine::new requires a validated configuration: {error}"),
+        };
+        let RuntimePlan {
+            settings,
+            palettes,
+            routes,
+            modes: _,
+            plugins: _,
+        } = plan;
+        crate::support::logging::set_non_error_enabled(settings.debug.enabled);
+        let palette = palettes.for_appearance(appearance);
         Self {
             config,
+            settings,
+            palettes,
+            routes,
             palette,
             appearance,
             modes: ModeRegistry::default(),
@@ -673,26 +715,10 @@ impl Engine {
             cursor: Point::default(),
             focused_app: None,
             focused_app_excluded: false,
-            pressed: PressedKeys::default(),
-            key_dispositions: KeyMap::default(),
-            active_gestures: KeyMap::default(),
-            active_click_indicators: ActiveClickIndicators::default(),
-            latched: LatchedTargets::default(),
-            active_default_toggles: DefaultToggleKeys::default(),
-            pending_sequences: Vec::new(),
-            pending_long_press_toggles: SmallVec::new(),
-            drag_auto_release: DragAutoRelease::default(),
-            timers: HashMap::new(),
+            input: InputState::default(),
             scan_owners: HashMap::new(),
-            frame_clock_owner: None,
-            last_scene: None,
-            overlay_content: None,
-            overlay_visible: false,
-            overlay_dynamic: DynamicOverlayState::default(),
-            overlay_positions: None,
-            overlay_position_fast_path_disabled: false,
-            command_batch_depth: 0,
-            pending_overlay: None,
+            scheduler: Scheduler::default(),
+            overlay: OverlayCoordinator::default(),
             enabled: true,
             input_failure_active: false,
             pending_runtime_error: None,
@@ -702,6 +728,32 @@ impl Engine {
             last_config_simulator_open: None,
             started_at: Instant::now(),
         }
+    }
+
+    pub(crate) fn from_plan(
+        config: Config,
+        plan: RuntimePlan,
+        appearance: Appearance,
+    ) -> Result<Self, String> {
+        let mut engine = Self::new(config, appearance);
+        let RuntimePlan {
+            settings,
+            palettes,
+            routes,
+            modes,
+            plugins,
+        } = plan;
+        engine.settings = settings;
+        engine.palettes = palettes;
+        engine.routes = routes;
+        engine.palette = engine.palettes.for_appearance(appearance);
+        for mode in modes {
+            engine.register_deferred(mode);
+        }
+        for plugin in plugins {
+            engine.register_plugin_dyn_deferred(plugin)?;
+        }
+        Ok(engine)
     }
 
     /// Register a mode. Later registrations replace earlier ones with the same
@@ -720,11 +772,7 @@ impl Engine {
 
     fn insert_mode(&mut self, mode: Box<dyn Mode>) {
         let id = mode.id();
-        // Pointer interest is an internal optimisation for the two built-in
-        // modes that deliberately ignore physical motion. Keeping it out of
-        // the public Mode vtable avoids perturbing every mode's hot dispatch;
-        // plugins retain the compatible default of receiving pointer events.
-        let pointer_events = builtin_wants_pointer_events(&id);
+        let pointer_events = mode.wants_pointer_events();
         let index = self.modes.insert(id.clone(), mode, pointer_events);
         if id == self.active {
             self.active_slot = Some(index);
@@ -887,32 +935,32 @@ impl Engine {
             // The native capture source has stopped, so the matching physical
             // key-up edges can never arrive. This is intentionally not done
             // for ordinary injection failure while the hook remains alive.
-            self.pressed.clear();
-            self.key_dispositions.clear();
+            self.input.pressed.clear();
+            self.input.key_dispositions.clear();
         }
 
         let previous = self.active.clone();
-        self.pending_sequences.clear();
+        self.scheduler.sequences.clear();
         if let Err(cancel_error) = self.cancel_transient_clicks(backend) {
             crate::support::logging::report_error(
                 "input",
                 format!("cannot cancel pending mouse presses during recovery: {cancel_error}"),
             );
         }
-        self.active_default_toggles.clear();
-        self.active_gestures.clear();
-        self.drag_auto_release.clear();
+        self.input.active_default_toggles.clear();
+        self.input.active_gestures.clear();
+        self.input.drag_auto_release.clear();
         self.modal_stack.clear();
-        self.timers.clear();
+        self.scheduler.timers.clear();
         if let Err(cancel_error) = self.cancel_all_scans(backend) {
             crate::support::logging::report_error(
                 "ui-scan",
                 format!("cannot cancel scans during input recovery: {cancel_error}"),
             );
         }
-        self.frame_clock_owner = None;
+        self.scheduler.frame_clock_owner = None;
         if let Err(clock_error) = backend.set_frame_clock(false) {
-            self.trace_lazy(self.config.debug.backend, "backend", || {
+            self.trace_lazy(self.settings.debug.backend, "backend", || {
                 format!("cannot stop frame clock during input recovery: {clock_error}")
             });
         }
@@ -930,7 +978,6 @@ impl Engine {
                 cursor: self.cursor,
                 focused_app: self.focused_app.as_ref(),
                 palette: &self.palette,
-                config: &self.config,
             };
             if let Some(mode) = self.modes.get_mut(&previous) {
                 // Let the mode clear its private session state, but discard
@@ -943,7 +990,6 @@ impl Engine {
                 cursor: self.cursor,
                 focused_app: self.focused_app.as_ref(),
                 palette: &self.palette,
-                config: &self.config,
             };
             if let Some(idle) = self.modes.get_mut(&ModeId::idle()) {
                 let _ = idle.handle(
@@ -963,9 +1009,9 @@ impl Engine {
         }
         // Keep the logical state clean even if the native window was already
         // unavailable. A later scene must be rebuilt from scratch.
-        self.overlay_content = None;
-        self.last_scene = None;
-        self.overlay_visible = false;
+        self.overlay.content = None;
+        self.overlay.last_scene = None;
+        self.overlay.visible = false;
     }
 
     fn recoverable_input_succeeded(&mut self) {
@@ -1019,8 +1065,15 @@ impl Engine {
 
     fn binding_profile_key_for(&self, app: Option<&FocusedApp>) -> Vec<Bindings> {
         let ids = self.binding_mode_ids();
-        self.config
-            .binding_profile_key(ids.iter().map(|id| id.as_str()), app)
+        let profile: Vec<Bindings> = ids
+            .iter()
+            .map(|id| self.resolved_app_overrides(id, app))
+            .collect();
+        if profile.iter().all(Bindings::is_empty) {
+            Vec::new()
+        } else {
+            profile
+        }
     }
 
     /// Resolve every mode's binding table from the configuration.
@@ -1029,18 +1082,17 @@ impl Engine {
     /// binding can differ per application, and disabled entries are dropped.
     fn rebuild_tables(&mut self) {
         let ids = self.binding_mode_ids();
-        let binding_profile_key = self
-            .config
-            .binding_profile_key(ids.iter().map(|id| id.as_str()), self.focused_app.as_ref());
+        let binding_profile_key = self.binding_profile_key_for(self.focused_app.as_ref());
 
-        let ui_hint_overlap_chord = KeyChord::parse(&self.config.ui_hint.overlap_cycle_key).ok();
+        let ui_hint_overlap_chord = KeyChord::parse(&self.settings.ui_hint_overlap_key).ok();
         let mut routes = Vec::with_capacity(ids.len());
         for id in ids {
             let temporary_chords = self
-                .config
-                .inheritance_for(id.as_str())
-                .map(|(_, _, temporary_keys)| {
-                    temporary_keys
+                .routes
+                .get(&id)
+                .map(|route| {
+                    route
+                        .temporary_keys
                         .iter()
                         .filter_map(|text| {
                             KeyChord::parse(text).ok().map(|chord| TemporaryChord {
@@ -1053,9 +1105,9 @@ impl Engine {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            let table = self.config.bindings_for(id.as_str()).map(|configured| {
-                let merged = self.merge_overrides(id.as_str(), configured);
-                CompiledKeymap::compile(merged, self.config.resolved_key_aliases())
+            let table = self.routes.get(&id).map(|route| {
+                let merged = self.merge_overrides(&id, &route.bindings);
+                CompiledKeymap::compile(merged, &self.settings.resolved_key_aliases)
             });
             routes.push((id, table, temporary_chords));
         }
@@ -1086,26 +1138,34 @@ impl Engine {
     }
 
     /// Apply the focused application's overrides to one mode's table.
-    fn merge_overrides(&self, mode_id: &str, base: &Bindings) -> Vec<(String, Binding)> {
+    fn merge_overrides(&self, mode_id: &ModeId, base: &Bindings) -> Vec<(String, Binding)> {
         let mut merged: BTreeMap<String, Binding> = base.clone();
-        if let Some(app) = &self.focused_app {
-            for (pattern, bindings) in self.config.app_binding_overrides_for(mode_id) {
-                if crate::config::app_override_matches(pattern, app) {
-                    for (chord, binding) in bindings {
-                        merged.insert(chord.clone(), binding.clone());
-                    }
-                }
-            }
+        for (chord, binding) in self.resolved_app_overrides(mode_id, self.focused_app.as_ref()) {
+            merged.insert(chord, binding);
         }
         merged.into_iter().collect()
     }
 
-    fn excluded_app_matches(config: &Config, app: Option<&FocusedApp>) -> bool {
+    fn resolved_app_overrides(&self, mode_id: &ModeId, app: Option<&FocusedApp>) -> Bindings {
+        let Some(app) = app else {
+            return Bindings::new();
+        };
+        let mut resolved = Bindings::new();
+        if let Some(route) = self.routes.get(mode_id) {
+            for entry in &route.app_overrides {
+                if app_pattern_matches(&entry.pattern, app) {
+                    resolved.extend(entry.bindings.clone());
+                }
+            }
+        }
+        resolved
+    }
+
+    fn excluded_app_matches(&self, app: Option<&FocusedApp>) -> bool {
         let Some(app) = app else {
             return false;
         };
-        config
-            .general
+        self.settings
             .excluded_apps
             .iter()
             .any(|e| e.eq_ignore_ascii_case(&app.bundle_id))
@@ -1121,12 +1181,11 @@ impl Engine {
             cursor: self.cursor,
             focused_app: self.focused_app.as_ref(),
             palette: &self.palette,
-            config: &self.config,
         }
     }
 
     fn trace(&self, category_enabled: bool, category: &str, message: impl AsRef<str>) {
-        if self.config.debug.enabled && category_enabled {
+        if self.settings.debug.enabled && category_enabled {
             let message = format!(
                 "+{:>7.2}ms {}",
                 self.started_at.elapsed().as_secs_f64() * 1000.0,
@@ -1137,13 +1196,13 @@ impl Engine {
     }
 
     fn trace_lazy(&self, category_enabled: bool, category: &str, message: impl FnOnce() -> String) {
-        if self.config.debug.enabled && category_enabled {
+        if self.settings.debug.enabled && category_enabled {
             self.trace(true, category, message());
         }
     }
 
     fn trace_binding_tables(&self) {
-        if !self.config.debug.enabled || !self.config.debug.keys {
+        if !self.settings.debug.enabled || !self.settings.debug.keys {
             return;
         }
         for (mode, table) in self.modes.tables() {
@@ -1160,12 +1219,13 @@ impl Engine {
                     format!("  mode={mode} key={chord:?} -> {action:?}"),
                 );
             }
-            if let Some((inherits, temporary, keys)) = self.config.inheritance_for(mode.as_str()) {
+            if let Some(route) = self.routes.get(mode) {
                 self.trace(
                     true,
                     "bindings",
                     format!(
-                        "  inherits={inherits:?} temporary_mode={temporary:?} temporary_keys={keys:?}"
+                        "  inherits={:?} temporary_mode={:?} temporary_keys={:?}",
+                        route.inherits, route.temporary_mode, route.temporary_keys
                     ),
                 );
             }
@@ -1187,7 +1247,7 @@ impl Engine {
             format_args!("{} backend started", backend.name()),
         );
         crate::support::perf_probe::mark("backend_started");
-        self.trace_lazy(self.config.debug.backend, "backend", || {
+        self.trace_lazy(self.settings.debug.backend, "backend", || {
             format!("started {} backend", backend.name())
         });
 
@@ -1202,7 +1262,7 @@ impl Engine {
         }
 
         self.appearance = backend.appearance();
-        self.palette = self.config.palette(self.appearance);
+        self.palette = self.palettes.for_appearance(self.appearance);
         self.screens = backend.screens().unwrap_or_else(|error| {
             crate::support::logging::report_error(
                 "backend",
@@ -1224,8 +1284,7 @@ impl Engine {
             );
             None
         });
-        self.focused_app_excluded =
-            Self::excluded_app_matches(&self.config, self.focused_app.as_ref());
+        self.focused_app_excluded = self.excluded_app_matches(self.focused_app.as_ref());
         crate::support::logging::info_args(
             "backend",
             format_args!(
@@ -1239,7 +1298,7 @@ impl Engine {
         // provide its initial app profile. This is the only startup build.
         self.rebuild_tables();
         crate::support::perf_probe::mark("engine_ready");
-        self.trace_lazy(self.config.debug.backend, "backend", || {
+        self.trace_lazy(self.settings.debug.backend, "backend", || {
             format!(
                 "screens={} cursor=({:.1},{:.1}) focused_app={:?}",
                 self.screens.len(),
@@ -1313,12 +1372,12 @@ impl Engine {
     ) -> Result<(), String> {
         let mut errors = crate::support::errors::ErrorBundle::default();
         errors.record("runtime", result);
-        self.pending_sequences.clear();
+        self.scheduler.sequences.clear();
         errors.record(
             "cancel pending mouse presses",
             self.cancel_transient_clicks(backend).map(|_| ()),
         );
-        self.drag_auto_release.clear();
+        self.input.drag_auto_release.clear();
         errors.record("cancel scans", self.cancel_all_scans(backend));
         errors.record("release held inputs", self.release_latched(backend));
         errors.record("dismiss overlay", backend.dismiss());
@@ -1352,28 +1411,31 @@ impl Engine {
     /// How long we may block before a timer needs servicing.
     fn next_timeout(&self) -> Duration {
         const MAX: Duration = Duration::from_millis(50);
-        if self.timers.is_empty()
-            && self.pending_sequences.is_empty()
-            && self.pending_long_press_toggles.is_empty()
-            && self.drag_auto_release.fires_at.is_none()
+        if self.scheduler.timers.is_empty()
+            && self.scheduler.sequences.is_empty()
+            && self.input.pending_long_press_toggles.is_empty()
+            && self.input.drag_auto_release.fires_at.is_none()
         {
             return MAX;
         }
         let now = Instant::now();
-        self.timers
+        self.scheduler
+            .timers
             .values()
             .map(|t| t.fires_at)
             .chain(
-                self.pending_sequences
+                self.scheduler
+                    .sequences
                     .last()
                     .map(|sequence| sequence.fires_at),
             )
             .chain(
-                self.pending_long_press_toggles
+                self.input
+                    .pending_long_press_toggles
                     .last()
                     .map(|pending| pending.fires_at),
             )
-            .chain(self.drag_auto_release.fires_at)
+            .chain(self.input.drag_auto_release.fires_at)
             .map(|fires_at| fires_at.saturating_duration_since(now))
             .min()
             .unwrap_or(MAX)
@@ -1381,7 +1443,7 @@ impl Engine {
     }
 
     fn fire_due_long_press_toggles(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
-        if self.pending_long_press_toggles.is_empty() {
+        if self.input.pending_long_press_toggles.is_empty() {
             return Ok(());
         }
         if self.should_quit || !self.enabled || self.is_excluded_app() {
@@ -1389,14 +1451,15 @@ impl Engine {
         }
         let now = Instant::now();
         while self
+            .input
             .pending_long_press_toggles
             .last()
             .is_some_and(|toggle| toggle.fires_at <= now)
         {
-            let Some(toggle) = self.pending_long_press_toggles.pop() else {
+            let Some(toggle) = self.input.pending_long_press_toggles.pop() else {
                 break;
             };
-            if !self.pressed.contains(&toggle.key) {
+            if !self.input.pressed.contains(&toggle.key) {
                 self.cancel_pending_long_press(toggle, backend)?;
                 continue;
             }
@@ -1407,7 +1470,7 @@ impl Engine {
             // press still toggles the latch off here.
             let long_pressed_click = toggle.short_action.is_some();
             if long_pressed_click {
-                self.latched.insert(toggle.target.clone());
+                self.input.latched.insert(toggle.target.clone());
             } else {
                 self.toggle_targets(std::slice::from_ref(&toggle.target), backend)?;
             }
@@ -1416,14 +1479,14 @@ impl Engine {
             // keeps the same pressed decoration until it is released, without
             // letting a still-held activation key resurrect stale feedback.
             if let InputTarget::Mouse(button) = &toggle.target {
-                self.active_click_indicators.release(&toggle.key);
+                self.input.active_click_indicators.release(&toggle.key);
                 if long_pressed_click {
                     self.begin_drag_auto_release(*button);
                 }
             }
             self.transfer_pending_long_press_targets(std::slice::from_ref(&toggle.target));
             if matches!(&toggle.target, InputTarget::Key(key) if key == &toggle.key)
-                && let Some(used) = self.active_default_toggles.get_mut(&toggle.key)
+                && let Some(used) = self.input.active_default_toggles.get_mut(&toggle.key)
             {
                 *used = true;
             }
@@ -1433,25 +1496,26 @@ impl Engine {
     }
 
     fn begin_drag_auto_release(&mut self, button: Button) {
-        if self.config.normal.auto_release_ms == 0 || self.active != ModeId::normal() {
+        if self.settings.auto_release_ms == 0 || self.active != ModeId::normal() {
             return;
         }
         let button_bit = drag_button_bit(button);
-        if self.drag_auto_release.buttons == 0 {
-            self.drag_auto_release.modifiers = self.forwarded_modifier_mask();
+        if self.input.drag_auto_release.buttons == 0 {
+            self.input.drag_auto_release.modifiers = self.forwarded_modifier_mask();
         }
         // All auto-managed buttons deliberately share one deadline. A newly
         // added button must still observe a real pointer movement of its own
         // generation, so an older button's nearly-expired deadline cannot
         // release it immediately.
-        if self.drag_auto_release.buttons & button_bit == 0 {
-            self.drag_auto_release.fires_at = None;
+        if self.input.drag_auto_release.buttons & button_bit == 0 {
+            self.input.drag_auto_release.fires_at = None;
         }
-        self.drag_auto_release.buttons |= button_bit;
+        self.input.drag_auto_release.buttons |= button_bit;
     }
 
     fn forwarded_modifier_mask(&self) -> u8 {
-        self.key_dispositions
+        self.input
+            .key_dispositions
             .iter()
             .fold(0, |mask, (key, disposition)| {
                 if matches!(disposition, KeyDisposition::Defer | KeyDisposition::Forward) {
@@ -1463,25 +1527,28 @@ impl Engine {
     }
 
     fn note_drag_pointer_moved(&mut self) {
-        if self.drag_auto_release.buttons == 0 || self.active != ModeId::normal() {
+        if self.input.drag_auto_release.buttons == 0 || self.active != ModeId::normal() {
             return;
         }
         // A modifier is required only to start the automatic release. Once
         // armed, releasing every modifier early leaves the existing deadline
         // active and later pointer movement continues to extend it.
-        if self.drag_auto_release.fires_at.is_none() && self.drag_auto_release.modifiers == 0 {
+        if self.input.drag_auto_release.fires_at.is_none()
+            && self.input.drag_auto_release.modifiers == 0
+        {
             return;
         }
-        let delay_ms = self.config.normal.auto_release_ms;
+        let delay_ms = self.settings.auto_release_ms;
         if delay_ms == 0 {
             return;
         }
-        self.drag_auto_release.fires_at = Some(Instant::now() + Duration::from_millis(delay_ms));
+        self.input.drag_auto_release.fires_at =
+            Some(Instant::now() + Duration::from_millis(delay_ms));
     }
 
     fn take_drag_release_targets(&mut self) -> TargetBuffer {
-        let buttons = self.drag_auto_release.buttons;
-        self.drag_auto_release.clear();
+        let buttons = self.input.drag_auto_release.buttons;
+        self.input.drag_auto_release.clear();
         [Button::Left, Button::Right, Button::Middle]
             .into_iter()
             .filter(|button| buttons & drag_button_bit(*button) != 0)
@@ -1490,14 +1557,14 @@ impl Engine {
     }
 
     fn forget_drag_button(&mut self, button: Button) {
-        self.drag_auto_release.buttons &= !drag_button_bit(button);
-        if self.drag_auto_release.buttons == 0 {
-            self.drag_auto_release.clear();
+        self.input.drag_auto_release.buttons &= !drag_button_bit(button);
+        if self.input.drag_auto_release.buttons == 0 {
+            self.input.drag_auto_release.clear();
         }
     }
 
     fn release_drag_auto_release(&mut self, backend: &mut dyn Backend) -> Result<bool, String> {
-        let buttons = self.drag_auto_release.buttons;
+        let buttons = self.input.drag_auto_release.buttons;
         if buttons == 0 {
             return Ok(false);
         }
@@ -1508,18 +1575,18 @@ impl Engine {
         // the same button. Otherwise that late deadline could immediately
         // latch the button again after the idle release. A primed short click
         // still owns a native MouseDown and must keep its later MouseUp path.
-        self.pending_long_press_toggles.retain(|pending| {
+        self.input.pending_long_press_toggles.retain(|pending| {
             let InputTarget::Mouse(button) = &pending.target else {
                 return true;
             };
             buttons & drag_button_bit(*button) == 0 || pending.short_action.is_some()
         });
-        self.active_click_indicators.release_buttons(buttons);
+        self.input.active_click_indicators.release_buttons(buttons);
         Ok(true)
     }
 
     fn fire_due_drag_auto_release(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
-        let Some(fires_at) = self.drag_auto_release.fires_at else {
+        let Some(fires_at) = self.input.drag_auto_release.fires_at else {
             return Ok(());
         };
         if fires_at > Instant::now() {
@@ -1535,16 +1602,17 @@ impl Engine {
     }
 
     fn fire_due_sequences(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
-        if self.pending_sequences.is_empty() {
+        if self.scheduler.sequences.is_empty() {
             return Ok(());
         }
         let now = Instant::now();
         while self
-            .pending_sequences
+            .scheduler
+            .sequences
             .last()
             .is_some_and(|sequence| sequence.fires_at <= now)
         {
-            let Some(sequence) = self.pending_sequences.pop() else {
+            let Some(sequence) = self.scheduler.sequences.pop() else {
                 break;
             };
             if let Err(error) =
@@ -1560,11 +1628,12 @@ impl Engine {
     }
 
     fn fire_due_timers(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
-        if self.timers.is_empty() {
+        if self.scheduler.timers.is_empty() {
             return Ok(());
         }
         let now = Instant::now();
         let mut due: Vec<String> = self
+            .scheduler
             .timers
             .iter()
             .filter(|(_, t)| t.fires_at <= now)
@@ -1573,15 +1642,21 @@ impl Engine {
         due.sort();
 
         for id in due {
-            let Some(owner) = self.timers.get(&id).map(|timer| timer.owner.clone()) else {
+            let Some(owner) = self
+                .scheduler
+                .timers
+                .get(&id)
+                .map(|timer| timer.owner.clone())
+            else {
                 continue;
             };
             let elapsed = self
+                .scheduler
                 .timers
                 .get(&id)
                 .map(|timer| now.saturating_duration_since(timer.last_fired))
                 .unwrap_or_default();
-            match self.timers.get_mut(&id) {
+            match self.scheduler.timers.get_mut(&id) {
                 Some(timer) => match timer.interval {
                     // Re-arm from now to avoid drift storms after a stall.
                     Some(interval) => {
@@ -1589,12 +1664,12 @@ impl Engine {
                         timer.fires_at = now + interval;
                     }
                     None => {
-                        self.timers.remove(&id);
+                        self.scheduler.timers.remove(&id);
                     }
                 },
                 None => continue,
             }
-            self.trace_lazy(self.config.debug.timers, "timer", || {
+            self.trace_lazy(self.settings.debug.timers, "timer", || {
                 format!("fire id={id:?} owner={} elapsed={elapsed:?}", owner)
             });
             self.dispatch_to(&owner, ModeEvent::Timer { id, elapsed }, backend)?;
@@ -1626,7 +1701,7 @@ impl Engine {
                 self.cursor = p;
                 if changed {
                     self.note_drag_pointer_moved();
-                    self.trace_lazy(self.config.debug.pointer, "pointer", || {
+                    self.trace_lazy(self.settings.debug.pointer, "pointer", || {
                         format!("position=({:.1},{:.1})", p.x, p.y)
                     });
                 }
@@ -1645,7 +1720,7 @@ impl Engine {
                 }
             }
             BackendEvent::Frame(elapsed) => {
-                if let Some(owner) = self.frame_clock_owner.clone() {
+                if let Some(owner) = self.scheduler.frame_clock_owner.clone() {
                     self.dispatch_to(&owner, ModeEvent::Frame { elapsed }, backend)?;
                 }
             }
@@ -1662,8 +1737,7 @@ impl Engine {
                         self.binding_profile_key_for(app.as_ref()) != self.binding_profile_key
                     };
                 self.focused_app = app.clone();
-                self.focused_app_excluded =
-                    Self::excluded_app_matches(&self.config, self.focused_app.as_ref());
+                self.focused_app_excluded = self.excluded_app_matches(self.focused_app.as_ref());
                 if self.focused_app_excluded {
                     let click_feedback_changed = self.cancel_transient_clicks(backend)?;
                     let released_drag = self.release_drag_auto_release(backend)?;
@@ -1683,7 +1757,7 @@ impl Engine {
             }
             BackendEvent::AppearanceChanged(appearance) => {
                 self.appearance = appearance;
-                self.palette = self.config.palette(appearance);
+                self.palette = self.palettes.for_appearance(appearance);
                 self.refresh_overlay(backend)?;
             }
             BackendEvent::UiScanned(result) => {
@@ -1752,9 +1826,9 @@ impl Engine {
                 backend.set_enabled(self.enabled)?;
                 if !self.enabled {
                     self.cancel_all_scans(backend)?;
-                    self.pending_sequences.clear();
+                    self.scheduler.sequences.clear();
                     let _ = self.cancel_transient_clicks(backend)?;
-                    self.drag_auto_release.clear();
+                    self.input.drag_auto_release.clear();
                     self.release_latched(backend)?;
                     self.activate(ModeId::idle(), None, backend)?;
                     self.hide_overlay(backend)?;
@@ -1819,10 +1893,7 @@ impl Engine {
                     ));
                 }
             };
-            if let Err(error) = self.cancel_transient_clicks(backend) {
-                self.report_action_error(error, backend);
-            }
-            self.apply_config(config)?;
+            self.apply_config_and_restart(config, backend)?;
             self.config_store = Some(store);
             path
         } else if let Some(current) = self.config_store.as_ref() {
@@ -1835,22 +1906,13 @@ impl Engine {
                 )
             })?;
             let path = candidate.path().to_path_buf();
-            if let Err(error) = self.cancel_transient_clicks(backend) {
-                self.report_action_error(error, backend);
-            }
-            self.apply_config(config)?;
+            self.apply_config_and_restart(config, backend)?;
             self.config_store = Some(candidate);
             Some(path)
         } else {
-            if let Err(error) = self.cancel_transient_clicks(backend) {
-                self.report_action_error(error, backend);
-            }
-            self.palette = self.config.palette(self.appearance);
-            self.rebuild_tables();
+            self.apply_config_and_restart(self.config.clone(), backend)?;
             None
         };
-        self.drag_auto_release.clear();
-        self.notify_config_reloaded(backend)?;
         if let Some(path) = discovered_path {
             crate::log_info!(
                 "config",
@@ -1868,16 +1930,108 @@ impl Engine {
 
     /// Swap in a new configuration at runtime.
     pub fn apply_config(&mut self, config: Config) -> Result<(), String> {
-        config.validate().map_err(|e| e.to_string())?;
-        crate::support::logging::set_non_error_enabled(config.debug.enabled);
-        self.drag_auto_release.clear();
+        let plan = crate::app::configuration::compile(&config)?;
+        let RuntimePlan {
+            settings,
+            palettes,
+            routes,
+            modes: _,
+            plugins: _,
+        } = plan;
+        crate::support::logging::set_non_error_enabled(settings.debug.enabled);
+        self.input.drag_auto_release.clear();
         self.config = config;
-        self.focused_app_excluded =
-            Self::excluded_app_matches(&self.config, self.focused_app.as_ref());
-        self.palette = self.config.palette(self.appearance);
+        self.settings = settings;
+        self.palettes = palettes;
+        self.routes = routes;
+        self.focused_app_excluded = self.excluded_app_matches(self.focused_app.as_ref());
+        self.palette = self.palettes.for_appearance(self.appearance);
         self.rebuild_tables();
         self.trace_binding_tables();
         Ok(())
+    }
+
+    fn apply_config_and_restart(
+        &mut self,
+        config: Config,
+        backend: &mut dyn Backend,
+    ) -> Result<(), String> {
+        // Compilation is deliberately first. A bad candidate cannot cancel a
+        // timer, release input, replace a mode, or alter the current palette.
+        let plan = crate::app::configuration::compile(&config)?;
+        self.apply_runtime_plan(plan, backend)?;
+        self.config = config;
+        Ok(())
+    }
+
+    fn apply_runtime_plan(
+        &mut self,
+        plan: RuntimePlan,
+        backend: &mut dyn Backend,
+    ) -> Result<(), String> {
+        let RuntimePlan {
+            settings,
+            palettes,
+            routes,
+            modes,
+            plugins,
+        } = plan;
+
+        // Keep physical pressed/disposition pairs until their real KeyUp, but
+        // retire every task and every synthetic input owned by the old plan.
+        let previous = self.active.clone();
+        let context = HostContext {
+            screens: &self.screens,
+            cursor: self.cursor,
+            focused_app: self.focused_app.as_ref(),
+            palette: &self.palette,
+        };
+        if let Some(mode) = self.modes.get_mut(&previous) {
+            let _ = mode.handle(&ModeEvent::Deactivated, &context);
+        }
+        self.scheduler.sequences.clear();
+        self.scheduler.timers.clear();
+        self.modal_stack.clear();
+        self.input.active_gestures.clear();
+        self.input.active_default_toggles.clear();
+        self.input.active_click_indicators.clear();
+        self.input.drag_auto_release.clear();
+        self.release_toggle_session_for_safe_mode(backend)?;
+        self.cancel_all_scans(backend)?;
+        self.scheduler.frame_clock_owner = None;
+        backend.set_frame_clock(false)?;
+        backend.dismiss()?;
+        self.overlay.content = None;
+        self.overlay.last_scene = None;
+        self.overlay.visible = false;
+        self.overlay.dynamic = DynamicOverlayState::default();
+        self.overlay.positions = None;
+        self.overlay.pending = None;
+
+        self.settings = settings;
+        self.palettes = palettes;
+        self.routes = routes;
+        self.palette = self.palettes.for_appearance(self.appearance);
+        self.focused_app_excluded = self.excluded_app_matches(self.focused_app.as_ref());
+        self.modes = ModeRegistry::default();
+        self.plugin_bindings.clear();
+        self.plugin_verbs.clear();
+        self.active_slot = None;
+        for mode in modes {
+            self.register_deferred(mode);
+        }
+        for plugin in plugins {
+            self.register_plugin_dyn_deferred(plugin)?;
+        }
+        self.rebuild_tables();
+        self.trace_binding_tables();
+        self.set_active(ModeId::idle());
+        self.dispatch(
+            ModeEvent::Activated {
+                previous: Some(previous),
+            },
+            backend,
+        )
     }
 
     fn handle_key(
@@ -1888,7 +2042,7 @@ impl Engine {
         // Holding a key can generate dozens of repeats per second. The normal
         // debug stream records the physical down/up edges; opt into `motion`
         // only when every OS repeat is needed for a performance trace.
-        let trace_key = self.config.debug.keys && (!input.repeat || self.config.debug.motion);
+        let trace_key = self.settings.debug.keys && (!input.repeat || self.settings.debug.motion);
         // Never re-process our own injected events, or modes would loop.
         if input.injected {
             return self.dispose_input(&input, KeyOutcome::Forwarded, trace_key, backend);
@@ -1899,16 +2053,19 @@ impl Engine {
             .then(|| self.display_mode());
         let (completed_default_toggle, pressed_changed) = match input.state {
             KeyState::Down => {
-                let changed = self.pressed.insert_ref(&input.key);
+                let changed = self.input.pressed.insert_ref(&input.key);
                 (None, changed)
             }
             KeyState::Up => {
-                let changed = self.pressed.remove(&input.key);
-                (self.active_default_toggles.remove(&input.key), changed)
+                let changed = self.input.pressed.remove(&input.key);
+                (
+                    self.input.active_default_toggles.remove(&input.key),
+                    changed,
+                )
             }
         };
         let click_indicator_released =
-            input.state == KeyState::Up && self.active_click_indicators.release(&input.key);
+            input.state == KeyState::Up && self.input.active_click_indicators.release(&input.key);
         // A physical Down may have reached the foreground application before a
         // later `press`/`toggle` action took ownership of that same key. Its
         // matching physical Up will clear the application's synthetic state as
@@ -1916,9 +2073,9 @@ impl Engine {
         // removes the Down decision. Consumed keys already keep the synthetic
         // Down alive and must not receive a redundant edge.
         let released_forwarded_key = input.state == KeyState::Up
-            && !self.latched.is_empty()
+            && !self.input.latched.is_empty()
             && matches!(
-                self.key_dispositions.get(&input.key),
+                self.input.key_dispositions.get(&input.key),
                 Some(KeyDisposition::Defer | KeyDisposition::Forward)
             );
         let completed_long_press = (input.state == KeyState::Up)
@@ -1927,9 +2084,10 @@ impl Engine {
         let captures_default_toggle_partner = input.state == KeyState::Down
             && !input.repeat
             && self
+                .input
                 .active_default_toggles
                 .keys()
-                .any(|key| key != &input.key && self.pressed.contains(key));
+                .any(|key| key != &input.key && self.input.pressed.contains(key));
         let display_changed = pressed_changed
             && display_before.is_some_and(|display_before| display_before != self.display_mode());
 
@@ -1974,24 +2132,24 @@ impl Engine {
         // release we use the gesture that press started, because the chord no
         // longer matches once the keys are up.
         let mut bound = match input.state {
-            KeyState::Down if input.repeat => {
-                self.active_gestures
-                    .get(&input.key)
-                    .cloned()
-                    .map(|gesture| ResolvedBinding {
-                        binding: gesture.binding,
-                        owner: gesture.owner,
-                    })
-            }
+            KeyState::Down if input.repeat => self
+                .input
+                .active_gestures
+                .get(&input.key)
+                .cloned()
+                .map(|gesture| ResolvedBinding {
+                    binding: gesture.binding,
+                    owner: gesture.owner,
+                }),
             KeyState::Down => self.lookup(&input.key),
-            KeyState::Up => {
-                self.active_gestures
-                    .remove(&input.key)
-                    .map(|gesture| ResolvedBinding {
-                        binding: gesture.binding,
-                        owner: gesture.owner,
-                    })
-            }
+            KeyState::Up => self
+                .input
+                .active_gestures
+                .remove(&input.key)
+                .map(|gesture| ResolvedBinding {
+                    binding: gesture.binding,
+                    owner: gesture.owner,
+                }),
         };
 
         // A key pressed after a parameterless toggle activation becomes that
@@ -2043,7 +2201,7 @@ impl Engine {
             // normal gesture even while grid, recursive_grid or ui_hint remains
             // the active mode.
             if input.state == KeyState::Down && resolved.binding.is_held() {
-                self.active_gestures.insert(
+                self.input.active_gestures.insert(
                     input.key.clone(),
                     ActiveGesture {
                         binding: resolved.binding.clone(),
@@ -2068,7 +2226,8 @@ impl Engine {
             });
             let duplicate_pending = deferred_button.is_some()
                 && pending_long_press.as_ref().is_some_and(|pending| {
-                    self.pending_long_press_toggles
+                    self.input
+                        .pending_long_press_toggles
                         .iter()
                         .any(|current| Self::targets_match(&current.target, &pending.target))
                 });
@@ -2100,12 +2259,14 @@ impl Engine {
                 && !duplicate_pending
                 && let Some(pending) = pending_long_press
             {
-                self.pending_long_press_toggles
+                self.input
+                    .pending_long_press_toggles
                     .retain(|current| current.key != pending.key);
                 let index = self
+                    .input
                     .pending_long_press_toggles
                     .partition_point(|current| current.fires_at > pending.fires_at);
-                self.pending_long_press_toggles.insert(index, pending);
+                self.input.pending_long_press_toggles.insert(index, pending);
                 if let Some(button) = deferred_button
                     && let Err(error) = self.activate_click_indicator(&input, button, backend)
                 {
@@ -2188,11 +2349,11 @@ impl Engine {
         self.trace_lazy(trace_key, "resolve", || match bound {
             Some(resolved) => format!(
                 "key={} pressed={:?} mode={} owner={} action={:?}",
-                input.key, self.pressed, self.active, resolved.owner, resolved.binding
+                input.key, self.input.pressed, self.active, resolved.owner, resolved.binding
             ),
             None => format!(
                 "key={} pressed={:?} mode={} action=<unbound>",
-                input.key, self.pressed, self.active
+                input.key, self.input.pressed, self.active
             ),
         });
         if bound.is_none()
@@ -2208,7 +2369,7 @@ impl Engine {
                     .unwrap_or_default();
                 format!(
                     "idle chord did not match; pressed={:?}; configured launchers={available:?}",
-                    self.pressed
+                    self.input.pressed
                 )
             });
         }
@@ -2221,7 +2382,7 @@ impl Engine {
     ) -> KeyOutcome {
         match input.state {
             KeyState::Down => {
-                if let Some(disposition) = self.key_dispositions.get(&input.key) {
+                if let Some(disposition) = self.input.key_dispositions.get(&input.key) {
                     return match disposition {
                         KeyDisposition::Consume => KeyOutcome::Consumed,
                         KeyDisposition::Defer | KeyDisposition::Forward => KeyOutcome::Forwarded,
@@ -2231,10 +2392,12 @@ impl Engine {
                     KeyOutcome::Consumed => KeyDisposition::Consume,
                     KeyOutcome::Forwarded => KeyDisposition::Forward,
                 };
-                self.key_dispositions.insert(input.key.clone(), disposition);
+                self.input
+                    .key_dispositions
+                    .insert(input.key.clone(), disposition);
                 current
             }
-            KeyState::Up => match self.key_dispositions.remove(&input.key) {
+            KeyState::Up => match self.input.key_dispositions.remove(&input.key) {
                 Some(KeyDisposition::Consume) => KeyOutcome::Consumed,
                 Some(KeyDisposition::Defer | KeyDisposition::Forward) => KeyOutcome::Forwarded,
                 None => current,
@@ -2247,7 +2410,7 @@ impl Engine {
             chords.iter().any(|entry| {
                 let reserved_for_overlap =
                     self.active == ModeId::ui_hint() && entry.conflicts_with_ui_hint_overlap;
-                !reserved_for_overlap && entry.chord.matches_pressed(&self.pressed)
+                !reserved_for_overlap && entry.chord.matches_pressed(&self.input.pressed)
             })
         })
     }
@@ -2275,13 +2438,12 @@ impl Engine {
         if self.active == ModeId::idle() {
             return self.active.clone();
         }
-        let Some((_, temporary_mode, _)) = self.config.inheritance_for(self.active.as_str()) else {
+        let Some(route) = self.routes.get(&self.active) else {
             return self.active.clone();
         };
         let temporary_active = self.temporary_mode_is_active(&self.active);
         if temporary_active
-            && let Some(source) = temporary_mode
-            && let Ok(target) = Self::source_mode_id(source)
+            && let Some(target) = route.temporary_mode.clone()
             && self.modes.contains_key(&target)
         {
             return target;
@@ -2309,8 +2471,7 @@ impl Engine {
             return None;
         }
 
-        let Some((inherits, temporary_mode, _)) = self.config.inheritance_for(self.active.as_str())
-        else {
+        let Some(route) = self.routes.get(&self.active) else {
             return active_match.map(|(binding, _)| ResolvedBinding {
                 binding,
                 owner: self.active.clone(),
@@ -2318,9 +2479,9 @@ impl Engine {
         };
         let temporary_active = self.temporary_mode_is_active(&self.active);
         let temporary_match = temporary_active
-            .then_some(temporary_mode)
+            .then_some(route.temporary_mode.as_ref())
             .flatten()
-            .and_then(|source| Self::source_mode_id(source).ok())
+            .cloned()
             .and_then(|owner| {
                 self.lookup_with_specificity_in(&owner, key)
                     .map(|(binding, specificity)| (binding, owner, specificity))
@@ -2341,12 +2502,11 @@ impl Engine {
                 owner: self.active.clone(),
             }),
             None if self.active_claims_raw_key(key) => None,
-            None => inherits.iter().find_map(|source| {
-                let owner = Self::source_mode_id(source).ok()?;
-                if owner == self.active {
+            None => route.inherits.iter().find_map(|owner| {
+                if *owner == self.active {
                     return None;
                 }
-                self.lookup_inherited(&owner, key, &mut SmallVec::new())
+                self.lookup_inherited(owner, key, &mut SmallVec::new())
             }),
         }
     }
@@ -2367,46 +2527,16 @@ impl Engine {
                 owner: owner.clone(),
             });
         }
-        let (sources, _, _) = self.config.inheritance_for(owner.as_str())?;
-        sources.iter().find_map(|source| {
-            let source = Self::source_mode_id(source).ok()?;
-            self.lookup_inherited(&source, key, visited)
-        })
+        let sources = &self.routes.get(owner)?.inherits;
+        sources
+            .iter()
+            .find_map(|source| self.lookup_inherited(source, key, visited))
     }
 
     fn active_claims_raw_key(&self, key: &Key) -> bool {
-        if self.active == ModeId::ui_hint() && self.ui_hint_overlap_matches(key) {
-            return true;
-        }
-        let Some(character) = key.as_char() else {
-            return false;
-        };
-        match self.active.as_str() {
-            "grid" => self.config.grid.keys.contains(character),
-            "recursive_grid" => {
-                self.config.recursive_grid.keys.contains(character)
-                    || self
-                        .config
-                        .recursive_grid
-                        .layers
-                        .iter()
-                        .filter_map(|layer| layer.keys.as_ref())
-                        .any(|keys| keys.contains(character))
-            }
-            "ui_hint" => {
-                character.is_ascii_alphanumeric()
-                    || self.config.ui_hint.hint_characters.contains(character)
-            }
-            _ => false,
-        }
-    }
-
-    fn source_mode_id(source: &str) -> Result<ModeId, String> {
-        if source == "hotkeys" {
-            Ok(ModeId::idle())
-        } else {
-            ModeId::parse_borrowed(source)
-        }
+        self.modes
+            .get(&self.active)
+            .is_some_and(|mode| mode.claims_key(key))
     }
 
     fn lookup_in(&self, mode: &ModeId, key: &Key) -> Option<Arc<Binding>> {
@@ -2421,19 +2551,19 @@ impl Engine {
     ) -> Option<(Arc<Binding>, usize)> {
         let table = self.modes.table(mode)?;
         if self.strict_modifier_matching_enabled() {
-            table.lookup_with_specificity_strict(key, &self.pressed, |modifier| {
+            table.lookup_with_specificity_strict(key, &self.input.pressed, |modifier| {
                 matches!(
-                    self.key_dispositions.get(modifier),
+                    self.input.key_dispositions.get(modifier),
                     Some(KeyDisposition::Consume)
                 )
             })
         } else {
-            table.lookup_with_specificity(key, &self.pressed)
+            table.lookup_with_specificity(key, &self.input.pressed)
         }
     }
 
     fn update_drag_modifier(&mut self, input: &crate::api::input::InputEvent) -> bool {
-        if self.drag_auto_release.buttons == 0 || self.active != ModeId::normal() {
+        if self.input.drag_auto_release.buttons == 0 || self.active != ModeId::normal() {
             return false;
         }
         let Some(bit) = drag_modifier_bit(&input.key) else {
@@ -2446,19 +2576,19 @@ impl Engine {
                 // cannot be retroactively forwarded, so preserve the paired
                 // disposition until the user releases and presses it again.
                 if matches!(
-                    self.key_dispositions.get(&input.key),
+                    self.input.key_dispositions.get(&input.key),
                     Some(KeyDisposition::Consume)
                 ) {
                     return false;
                 }
-                self.drag_auto_release.modifiers |= bit;
+                self.input.drag_auto_release.modifiers |= bit;
                 true
             }
             KeyState::Up => {
-                if self.drag_auto_release.modifiers & bit == 0 {
+                if self.input.drag_auto_release.modifiers & bit == 0 {
                     return false;
                 }
-                self.drag_auto_release.modifiers &= !bit;
+                self.input.drag_auto_release.modifiers &= !bit;
                 true
             }
         }
@@ -2466,12 +2596,12 @@ impl Engine {
 
     fn drag_move_binding(&self, key: &Key) -> Option<ResolvedBinding> {
         if self.active != ModeId::normal()
-            || self.drag_auto_release.buttons == 0
-            || self.drag_auto_release.modifiers == 0
+            || self.input.drag_auto_release.buttons == 0
+            || self.input.drag_auto_release.modifiers == 0
         {
             return None;
         }
-        let ignored_modifiers = self.drag_auto_release.modifiers;
+        let ignored_modifiers = self.input.drag_auto_release.modifiers;
         let table = self.modes.table(&ModeId::normal())?;
         // Preserve an explicit binding for the complete physical chord even
         // when that binding is `none`. `lookup()` intentionally represents
@@ -2481,7 +2611,7 @@ impl Engine {
             return None;
         }
         let binding = table.lookup_move_with_pressed(key, |configured| {
-            self.pressed.iter().any(|physical| {
+            self.input.pressed.iter().any(|physical| {
                 if !Self::keys_match(configured, physical) {
                     return false;
                 }
@@ -2511,19 +2641,18 @@ impl Engine {
         if self.lookup_with_specificity_in(owner, key).is_some() {
             return true;
         }
-        let Some((sources, _, _)) = self.config.inheritance_for(owner.as_str()) else {
+        let Some(route) = self.routes.get(owner) else {
             return false;
         };
-        sources.iter().any(|source| {
-            Self::source_mode_id(source)
-                .ok()
-                .is_some_and(|source| self.binding_chain_matches(&source, key, visited))
-        })
+        route
+            .inherits
+            .iter()
+            .any(|source| self.binding_chain_matches(source, key, visited))
     }
 
     fn strict_modifier_matching_enabled(&self) -> bool {
         self.active == ModeId::idle()
-            || (self.active == ModeId::normal() && self.config.normal.passthrough_unbound_keys)
+            || (self.active == ModeId::normal() && self.settings.passthrough_unbound_keys)
     }
 
     fn injected_key(key: &Key) -> Key {
@@ -2568,14 +2697,15 @@ impl Engine {
     }
 
     fn matching_latched_target(&self, target: &InputTarget) -> Option<InputTarget> {
-        self.latched
+        self.input
+            .latched
             .iter()
             .find(|latched| Self::targets_match(latched, target))
             .cloned()
     }
 
     fn latched_key_matches(&self, key: &Key) -> bool {
-        self.latched.iter().any(
+        self.input.latched.iter().any(
             |target| matches!(target, InputTarget::Key(latched) if Self::keys_match(latched, key)),
         )
     }
@@ -2591,7 +2721,7 @@ impl Engine {
             return Ok(());
         }
         let result = {
-            let Some(key) = self.latched.iter().find_map(|target| match target {
+            let Some(key) = self.input.latched.iter().find_map(|target| match target {
                 InputTarget::Key(latched) if Self::keys_match(latched, &input.key) => Some(latched),
                 _ => None,
             }) else {
@@ -2614,7 +2744,7 @@ impl Engine {
         resolved: &ResolvedBinding,
         input: &crate::api::input::InputEvent,
     ) -> Option<PendingLongPressToggle> {
-        if self.config.normal.long_press_toggle_ms == 0
+        if self.settings.long_press_toggle_ms == 0
             || resolved.owner != ModeId::normal()
             || input.state != KeyState::Down
             || input.repeat
@@ -2636,8 +2766,7 @@ impl Engine {
         };
         let short_action = short_action.filter(|_| self.matching_latched_target(&target).is_none());
         Some(PendingLongPressToggle {
-            fires_at: Instant::now()
-                + Duration::from_millis(self.config.normal.long_press_toggle_ms),
+            fires_at: Instant::now() + Duration::from_millis(self.settings.long_press_toggle_ms),
             key: input.key.clone(),
             target,
             short_action,
@@ -2646,10 +2775,11 @@ impl Engine {
 
     fn take_pending_long_press_toggle(&mut self, key: &Key) -> Option<PendingLongPressToggle> {
         let index = self
+            .input
             .pending_long_press_toggles
             .iter()
             .position(|pending| &pending.key == key)?;
-        Some(self.pending_long_press_toggles.remove(index))
+        Some(self.input.pending_long_press_toggles.remove(index))
     }
 
     fn complete_pending_mouse_click(
@@ -2693,7 +2823,7 @@ impl Engine {
             let target = InputTarget::Mouse(button);
             self.release_primed_mouse_button(target, map_button(button), backend)?;
         }
-        Ok(self.active_click_indicators.release(&key))
+        Ok(self.input.active_click_indicators.release(&key))
     }
 
     fn release_primed_mouse_button(
@@ -2702,16 +2832,16 @@ impl Engine {
         button: MouseButton,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
-        self.latched.insert(target.clone());
+        self.input.latched.insert(target.clone());
         self.inject_mouse_button(button, ButtonAction::Release, backend)?;
-        self.latched.remove(&target);
+        self.input.latched.remove(&target);
         Ok(())
     }
 
     /// Cancel native pending clicks and clear every activation-key decoration.
     /// The caller can use the returned dirty bit to rebuild the overlay once.
     fn cancel_transient_clicks(&mut self, backend: &mut dyn Backend) -> Result<bool, String> {
-        let pending = std::mem::take(&mut self.pending_long_press_toggles);
+        let pending = std::mem::take(&mut self.input.pending_long_press_toggles);
         let mut errors = crate::support::errors::ErrorBundle::default();
         let mut feedback_changed = false;
         for pending in pending {
@@ -2720,13 +2850,13 @@ impl Engine {
                 Err(error) => errors.push("release pending mouse press", error),
             }
         }
-        feedback_changed |= self.active_click_indicators.clear();
+        feedback_changed |= self.input.active_click_indicators.clear();
         errors.into_result().map(|()| feedback_changed)
     }
 
     fn transfer_pending_long_press_targets(&mut self, targets: &[InputTarget]) -> TargetBuffer {
         let mut primed = TargetBuffer::new();
-        self.pending_long_press_toggles.retain(|pending| {
+        self.input.pending_long_press_toggles.retain(|pending| {
             let matched = targets
                 .iter()
                 .any(|target| Self::targets_match(target, &pending.target));
@@ -2735,7 +2865,7 @@ impl Engine {
             }
             !matched
         });
-        self.latched.extend(primed.iter().cloned());
+        self.input.latched.extend(primed.iter().cloned());
         primed
     }
 
@@ -2753,7 +2883,7 @@ impl Engine {
     }
 
     fn has_pressed_toggle_partner(&self, activation: &Key) -> bool {
-        self.pressed.iter().any(|key| key != activation)
+        self.input.pressed.iter().any(|key| key != activation)
     }
 
     fn push_unique_toggle_target(targets: &mut TargetBuffer, target: &InputTarget) {
@@ -2803,10 +2933,10 @@ impl Engine {
     }
 
     fn toggle_key_is_held(&self, configured: &Key) -> bool {
-        self.pressed
+        self.input.pressed
             .iter()
             .any(|physical| Self::keys_match(configured, physical))
-            || self.latched.iter().any(|target| {
+            || self.input.latched.iter().any(|target| {
                 matches!(target, InputTarget::Key(key) if Self::keys_match(configured, key))
             })
     }
@@ -2831,7 +2961,7 @@ impl Engine {
 
     fn pressed_toggle_targets(&self, activation: &Key) -> TargetBuffer {
         let mut targets = TargetBuffer::new();
-        for key in self.pressed.iter().filter(|key| *key != activation) {
+        for key in self.input.pressed.iter().filter(|key| *key != activation) {
             Self::extend_unique_toggle_targets(
                 &mut targets,
                 self.normal_toggle_partner_targets(key),
@@ -2846,10 +2976,10 @@ impl Engine {
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
         let targets = self.normal_toggle_partner_targets(key);
-        for used in self.active_default_toggles.values_mut() {
+        for used in self.input.active_default_toggles.values_mut() {
             *used = true;
         }
-        self.pending_long_press_toggles.retain(
+        self.input.pending_long_press_toggles.retain(
             |pending| {
                 !matches!(&pending.target, InputTarget::Key(target) if target == &pending.key)
             },
@@ -2864,7 +2994,7 @@ impl Engine {
         used: Option<bool>,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
-        if used == Some(false) && !self.latched.is_empty() {
+        if used == Some(false) && !self.input.latched.is_empty() {
             self.release_latched(backend)?;
             self.refresh_overlay(backend)?;
         }
@@ -2921,7 +3051,7 @@ impl Engine {
                     return Ok(());
                 }
                 const MAX_PENDING_SEQUENCES: usize = 256;
-                if self.pending_sequences.len() >= MAX_PENDING_SEQUENCES {
+                if self.scheduler.sequences.len() >= MAX_PENDING_SEQUENCES {
                     return Err("too many action sequences are waiting".into());
                 }
                 let delay = random_wait_ms(min_ms, max_ms);
@@ -2932,9 +3062,10 @@ impl Engine {
                     input,
                 };
                 let index = self
-                    .pending_sequences
+                    .scheduler
+                    .sequences
                     .partition_point(|current| current.fires_at > pending.fires_at);
-                self.pending_sequences.insert(index, pending);
+                self.scheduler.sequences.insert(index, pending);
                 return Ok(());
             }
             let nested = ResolvedBinding {
@@ -2960,7 +3091,7 @@ impl Engine {
         let binding = resolved.binding.as_ref();
         let is_press = input.state == KeyState::Down;
         self.trace_lazy(
-            self.config.debug.actions && (!input.repeat || self.config.debug.motion),
+            self.settings.debug.actions && (!input.repeat || self.settings.debug.motion),
             "action",
             || {
                 format!(
@@ -3111,7 +3242,7 @@ impl Engine {
 
             Binding::Escape => {
                 if is_press {
-                    self.pending_sequences.clear();
+                    self.scheduler.sequences.clear();
                     // `press`/`toggle` are explicit engine-wide latches, not
                     // mode-owned gestures. Escape changes mode but must not
                     // synthesize an Up edge for them.
@@ -3214,8 +3345,10 @@ impl Engine {
                         self.press_targets(&inferred, backend)?;
                         self.refresh_overlay(backend)?;
                     }
-                    if self.pressed.contains(&input.key) {
-                        self.active_default_toggles.insert(input.key.clone(), used);
+                    if self.input.pressed.contains(&input.key) {
+                        self.input
+                            .active_default_toggles
+                            .insert(input.key.clone(), used);
                     }
                 } else {
                     let toggle = self.unprimed_toggle_targets(targets);
@@ -3251,11 +3384,12 @@ impl Engine {
         if input.injected
             || input.state != KeyState::Down
             || input.repeat
-            || !self.pressed.contains(&input.key)
+            || !self.input.pressed.contains(&input.key)
         {
             return Ok(());
         }
-        self.active_click_indicators
+        self.input
+            .active_click_indicators
             .activate(input.key.clone(), button);
         self.refresh_overlay(backend)
     }
@@ -3302,7 +3436,7 @@ impl Engine {
                 for rollback in pressed.iter().rev() {
                     match Self::inject_target(rollback, KeyState::Up, backend) {
                         Ok(()) => {
-                            self.latched.remove(rollback);
+                            self.input.latched.remove(rollback);
                         }
                         Err(rollback_error) => crate::support::logging::report_error(
                             "action",
@@ -3312,7 +3446,7 @@ impl Engine {
                 }
                 return Err(self.recoverable_input_error("input press", error));
             }
-            self.latched.insert(actual.clone());
+            self.input.latched.insert(actual.clone());
             pressed.push(actual);
         }
         Ok(())
@@ -3336,7 +3470,7 @@ impl Engine {
             });
             match Self::inject_target(&actual, KeyState::Up, backend) {
                 Ok(()) => {
-                    self.latched.remove(&actual);
+                    self.input.latched.remove(&actual);
                     if let InputTarget::Mouse(button) = &actual {
                         self.forget_drag_button(*button);
                     }
@@ -3354,7 +3488,7 @@ impl Engine {
         targets: &[InputTarget],
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
-        let original: TargetBuffer = self.latched.iter().cloned().collect();
+        let original: TargetBuffer = self.input.latched.iter().cloned().collect();
         for target in targets {
             let result = if self.matching_latched_target(target).is_some() {
                 self.release_targets(std::slice::from_ref(target), false, backend)
@@ -3380,6 +3514,7 @@ impl Engine {
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
         let release: TargetBuffer = self
+            .input
             .latched
             .iter()
             .filter(|target| original.binary_search(target).is_err())
@@ -3388,14 +3523,14 @@ impl Engine {
         self.release_targets(&release, false, backend)?;
         let press: TargetBuffer = original
             .iter()
-            .filter(|target| !self.latched.contains(target))
+            .filter(|target| !self.input.latched.contains(target))
             .cloned()
             .collect();
         self.press_targets(&press, backend)
     }
 
     fn release_latched(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
-        let held: TargetBuffer = self.latched.iter().cloned().collect();
+        let held: TargetBuffer = self.input.latched.iter().cloned().collect();
         self.release_targets(&held, false, backend)
     }
 
@@ -3407,14 +3542,14 @@ impl Engine {
         // Transfer that ownership to the common latch set before clearing the
         // deadline, so one reverse-order release path handles every target and
         // retains any failed MouseUp/KeyUp for recovery or shutdown retry.
-        for pending in std::mem::take(&mut self.pending_long_press_toggles) {
+        for pending in std::mem::take(&mut self.input.pending_long_press_toggles) {
             if pending.short_action.is_some() {
-                self.latched.insert(pending.target);
+                self.input.latched.insert(pending.target);
             }
         }
-        self.active_default_toggles.clear();
-        self.active_click_indicators.clear();
-        self.drag_auto_release.clear();
+        self.input.active_default_toggles.clear();
+        self.input.active_click_indicators.clear();
+        self.input.drag_auto_release.clear();
         self.release_latched(backend)
     }
 
@@ -3434,7 +3569,9 @@ impl Engine {
             // A batch failure may mean that Windows accepted only a prefix.
             // Record every member conservatively; redundant key-up events are
             // harmless and safer than leaving a modifier held.
-            self.latched.extend(keys.into_iter().map(InputTarget::Key));
+            self.input
+                .latched
+                .extend(keys.into_iter().map(InputTarget::Key));
             return Err(self.recoverable_input_error("keyboard chord", error));
         }
         Ok(())
@@ -3444,35 +3581,6 @@ impl Engine {
     fn dispatch(&mut self, event: ModeEvent, backend: &mut dyn Backend) -> Result<(), String> {
         let owner = self.active.clone();
         self.dispatch_to(&owner, event, backend)
-    }
-
-    /// Refresh configuration cached by every registered mode. Commands emitted
-    /// by inactive modes are deliberately discarded: they may request overlays
-    /// or scans that only make sense while active. The active mode runs last and
-    /// its redraw/reconfiguration commands are executed normally.
-    fn notify_config_reloaded(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
-        let active = self.active.clone();
-        let inactive: Vec<ModeId> = self
-            .modes
-            .keys()
-            .filter(|id| **id != active)
-            .cloned()
-            .collect();
-
-        for owner in inactive {
-            let context = HostContext {
-                screens: &self.screens,
-                cursor: self.cursor,
-                focused_app: self.focused_app.as_ref(),
-                palette: &self.palette,
-                config: &self.config,
-            };
-            let Some(mode) = self.modes.get_mut(&owner) else {
-                continue;
-            };
-            let _ = mode.handle(&ModeEvent::ConfigReloaded, &context);
-        }
-        self.dispatch_to(&active, ModeEvent::ConfigReloaded, backend)
     }
 
     fn mode_index_for_dispatch(&mut self, owner: &ModeId) -> Option<usize> {
@@ -3505,7 +3613,6 @@ impl Engine {
             cursor: self.cursor,
             focused_app: self.focused_app.as_ref(),
             palette: &self.palette,
-            config: &self.config,
         };
         let Some(mode) = self.modes.get_index_mut(mode_index) else {
             return Ok(());
@@ -3533,7 +3640,6 @@ impl Engine {
             cursor: self.cursor,
             focused_app: self.focused_app.as_ref(),
             palette: &self.palette,
-            config: &self.config,
         };
         let Some(mode) = self.modes.get_index_mut(mode_index) else {
             return Ok(());
@@ -3581,7 +3687,9 @@ impl Engine {
         let current = self.active.clone();
         self.dispatch(ModeEvent::Deactivated, backend)?;
         self.cancel_scans_for_owner(&current, backend)?;
-        self.timers.retain(|_, timer| timer.owner != current);
+        self.scheduler
+            .timers
+            .retain(|_, timer| timer.owner != current);
         self.set_active(previous);
         self.dispatch(ModeEvent::Resumed, backend)
     }
@@ -3593,7 +3701,7 @@ impl Engine {
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
         if !self.modes.contains_key(&target) {
-            self.trace_lazy(self.config.debug.modes, "mode", || {
+            self.trace_lazy(self.settings.debug.modes, "mode", || {
                 format!(
                     "ignored switch {} -> {target}: target is not registered",
                     self.active
@@ -3612,21 +3720,22 @@ impl Engine {
             self.release_toggle_session_for_safe_mode(backend)?;
         }
 
-        self.trace_lazy(self.config.debug.modes, "mode", || {
+        self.trace_lazy(self.settings.debug.modes, "mode", || {
             format!("switch {} -> {target}, previous={previous:?}", self.active)
         });
 
         if target != self.active {
-            self.pending_sequences.clear();
-            self.active_default_toggles.clear();
+            self.scheduler.sequences.clear();
+            self.input.active_default_toggles.clear();
             // Toggle state may cross temporary targeting modes, but entry into
             // Normal or Idle released it above. Physical held gestures remain
             // owned by the outgoing mode and need a synthetic release here.
             // Deliver the release of anything still held, so the outgoing mode
             // can stop its timers rather than moving the pointer forever.
-            let pending: Vec<(Key, ActiveGesture)> = std::mem::take(&mut self.active_gestures)
-                .into_iter()
-                .collect();
+            let pending: Vec<(Key, ActiveGesture)> =
+                std::mem::take(&mut self.input.active_gestures)
+                    .into_iter()
+                    .collect();
             for (key, gesture) in pending {
                 self.dispatch_to(
                     &gesture.owner,
@@ -3645,14 +3754,13 @@ impl Engine {
                 cursor: self.cursor,
                 focused_app: self.focused_app.as_ref(),
                 palette: &self.palette,
-                config: &self.config,
             };
             if let Some(old) = self.modes.get_mut(&self.active) {
                 let commands = old.handle(&ModeEvent::Deactivated, &context);
                 let old_id = old.id();
                 self.execute(commands, backend)?;
                 self.cancel_scans_for_owner(&old_id, backend)?;
-                self.timers.retain(|_, t| t.owner != old_id);
+                self.scheduler.timers.retain(|_, t| t.owner != old_id);
             }
             self.set_active(target);
         }
@@ -3662,9 +3770,12 @@ impl Engine {
 
     fn restart_active(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
         let active = self.active.clone();
-        self.pending_sequences
+        self.scheduler
+            .sequences
             .retain(|sequence| sequence.owner != active);
-        self.timers.retain(|_, timer| timer.owner != active);
+        self.scheduler
+            .timers
+            .retain(|_, timer| timer.owner != active);
         self.dispatch(ModeEvent::Restarted, backend)
     }
 }
@@ -4027,9 +4138,12 @@ mod tests {
         let mut engine = engine_with_probes(&seen, &[]);
         engine.active = ModeId::normal();
         let key = Key::new("h").unwrap();
-        engine.pressed.insert(key.clone());
-        engine.key_dispositions.insert(key, KeyDisposition::Consume);
-        engine.frame_clock_owner = Some(ModeId::normal());
+        engine.input.pressed.insert(key.clone());
+        engine
+            .input
+            .key_dispositions
+            .insert(key, KeyDisposition::Consume);
+        engine.scheduler.frame_clock_owner = Some(ModeId::normal());
         let (mut backend, _) = FakeBackend::new(Vec::new());
 
         engine
@@ -4039,9 +4153,9 @@ mod tests {
             )
             .unwrap();
 
-        assert!(engine.pressed.is_empty());
-        assert!(engine.key_dispositions.is_empty());
-        assert!(engine.frame_clock_owner.is_none());
+        assert!(engine.input.pressed.is_empty());
+        assert!(engine.input.key_dispositions.is_empty());
+        assert!(engine.scheduler.frame_clock_owner.is_none());
         assert_eq!(engine.active_mode(), &ModeId::idle());
     }
 
@@ -4105,7 +4219,7 @@ mod tests {
         fn configured_idle_engine() -> Engine {
             let config = Config::default();
             let mut engine = Engine::new(config.clone(), Appearance::Dark);
-            engine.register(Box::new(crate::modes::idle::IdleMode::new(&config)));
+            engine.register(Box::new(crate::modes::idle::IdleMode::new()));
             engine.active = ModeId::idle();
             engine.screens = vec![Screen {
                 bounds: Rect::new(0.0, 0.0, 1_000.0, 800.0),
@@ -4209,7 +4323,7 @@ mod tests {
         let config = Config::default();
         let key = Key::new("left_shift").unwrap();
         let mut engine = Engine::new(config.clone(), Appearance::Dark);
-        engine.register(Box::new(crate::modes::idle::IdleMode::new(&config)));
+        engine.register(Box::new(crate::modes::idle::IdleMode::new()));
         let compiled = measure(|| engine.ui_hint_overlap_matches(&key));
         let parsed = measure(|| config.ui_hint.overlap_cycle_matches(&key));
 
@@ -4467,7 +4581,13 @@ mod tests {
                     std::hint::black_box(cached_value);
                 },
                 || {
-                    std::hint::black_box(Engine::excluded_app_matches(config, Some(&app)));
+                    std::hint::black_box(
+                        config
+                            .general
+                            .excluded_apps
+                            .iter()
+                            .any(|entry| entry.eq_ignore_ascii_case(&app.bundle_id)),
+                    );
                 },
             )
         };
@@ -4575,9 +4695,9 @@ mod tests {
 
         let config = Config::default();
         let mut registry = ModeRegistry::default();
-        for mode in crate::modes::built_in(&config) {
+        for mode in crate::app::mode_catalog::built_in(&config) {
             let id = mode.id();
-            let pointer_events = builtin_wants_pointer_events(&id);
+            let pointer_events = mode.wants_pointer_events();
             registry.insert(id, mode, pointer_events);
         }
         let active = ModeId::ui_hint();
@@ -4698,7 +4818,6 @@ mod tests {
         captures: bool,
         seen: Arc<Mutex<Vec<String>>>,
         on_key: Vec<Command>,
-        on_reload: Vec<Command>,
     }
 
     impl ProbeMode {
@@ -4708,7 +4827,6 @@ mod tests {
                 captures: true,
                 seen,
                 on_key: Vec::new(),
-                on_reload: Vec::new(),
             }
         }
     }
@@ -4719,6 +4837,16 @@ mod tests {
         }
         fn captures_keyboard(&self) -> bool {
             self.captures
+        }
+        fn claims_key(&self, key: &Key) -> bool {
+            match self.id.as_str() {
+                "grid" => key.as_char() == Some('g'),
+                "recursive_grid" => key.as_char() == Some('r'),
+                "ui_hint" => key
+                    .as_char()
+                    .is_some_and(|character| character.is_ascii_alphanumeric()),
+                _ => false,
+            }
         }
         fn handle(&mut self, event: &ModeEvent, _ctx: &HostContext<'_>) -> CommandBatch {
             let label = match event {
@@ -4740,7 +4868,6 @@ mod tests {
                 ModeEvent::PointerMoved(_) => "pointer",
                 ModeEvent::Frame { .. } => "frame",
                 ModeEvent::FocusChanged(_) => "focus",
-                ModeEvent::ConfigReloaded => "reloaded",
             };
             self.seen
                 .lock()
@@ -4748,7 +4875,6 @@ mod tests {
                 .push(format!("{}:{label}", self.id));
             CommandBatch::from(match event {
                 ModeEvent::Key { .. } => self.on_key.clone(),
-                ModeEvent::ConfigReloaded => self.on_reload.clone(),
                 _ => Vec::new(),
             })
         }
@@ -4946,6 +5072,7 @@ mod tests {
         assert_eq!(builds.get(), 0);
 
         engine.config.debug.enabled = true;
+        engine.settings.debug.enabled = true;
         engine.trace_lazy(false, "test", || {
             builds.set(builds.get() + 1);
             "disabled category".to_string()
@@ -4972,36 +5099,11 @@ mod tests {
     }
 
     #[test]
-    fn config_reload_refreshes_inactive_modes_without_running_their_commands() {
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let mut engine = Engine::new(Config::default(), Appearance::Dark);
-        let mut idle = ProbeMode::new("idle", seen.clone());
-        idle.captures = false;
-        engine.register(Box::new(idle));
-        let mut normal = ProbeMode::new("normal", seen.clone());
-        normal.on_reload = vec![Command::MovePointer { dx: 99.0, dy: 0.0 }];
-        engine.register(Box::new(normal));
-        engine.register(Box::new(ProbeMode::new("grid", seen.clone())));
-        let (mut backend, log) = FakeBackend::new(Vec::new());
-
-        engine.notify_config_reloaded(&mut backend).unwrap();
-
-        let seen = seen.lock().unwrap();
-        for mode in ["idle", "normal", "grid"] {
-            assert!(seen.contains(&format!("{mode}:reloaded")), "{seen:?}");
-        }
-        assert!(
-            log.lock().unwrap().moves.is_empty(),
-            "inactive mode reload commands must not reach the backend"
-        );
-    }
-
-    #[test]
     fn reload_while_idle_updates_grid_max_depth_before_activation() {
         let mut initial = Config::default();
         initial.grid.max_depth = 2;
         let mut engine = Engine::new(initial.clone(), Appearance::Dark);
-        for mode in crate::modes::built_in(&initial) {
+        for mode in crate::app::mode_catalog::built_in(&initial) {
             engine.register(mode);
         }
         engine.screens = vec![Screen {
@@ -5015,8 +5117,9 @@ mod tests {
 
         let mut reloaded = initial;
         reloaded.grid.max_depth = 3;
-        engine.apply_config(reloaded).unwrap();
-        engine.notify_config_reloaded(&mut backend).unwrap();
+        engine
+            .apply_config_and_restart(reloaded, &mut backend)
+            .unwrap();
         engine
             .activate(ModeId::grid(), Some(ModeId::normal()), &mut backend)
             .unwrap();
@@ -5066,7 +5169,7 @@ mod tests {
                 KeyDisposition::Forward,
             ]
         );
-        assert!(engine.key_dispositions.is_empty());
+        assert!(engine.input.key_dispositions.is_empty());
     }
 
     #[test]
@@ -5095,7 +5198,7 @@ mod tests {
             ]
         );
         assert_eq!(engine.active_mode(), &ModeId::normal());
-        assert!(engine.key_dispositions.is_empty());
+        assert!(engine.input.key_dispositions.is_empty());
     }
 
     #[test]
@@ -5274,7 +5377,7 @@ mod tests {
             engine.complete_key_disposition(&input(KeyState::Up, false), KeyOutcome::Forwarded),
             KeyOutcome::Consumed
         );
-        assert!(engine.key_dispositions.is_empty());
+        assert!(engine.input.key_dispositions.is_empty());
     }
 
     #[test]
@@ -5320,8 +5423,8 @@ mod tests {
                 KeyDisposition::Forward,
             ]
         );
-        assert!(engine.active_gestures.is_empty());
-        assert!(engine.key_dispositions.is_empty());
+        assert!(engine.input.active_gestures.is_empty());
+        assert!(engine.input.key_dispositions.is_empty());
     }
 
     #[test]
@@ -5427,7 +5530,7 @@ mod tests {
     fn real_normal_mode_moves_immediately_and_decorations_follow_the_pointer() {
         let config = Config::default();
         let mut engine = Engine::new(config.clone(), Appearance::Dark);
-        for mode in crate::modes::built_in(&config) {
+        for mode in crate::app::mode_catalog::built_in(&config) {
             engine.register(mode);
         }
         let mut script = enter_normal();
@@ -5498,11 +5601,11 @@ mod tests {
         let circle = scene.cursor_marker.as_ref().expect("cursor circle");
         assert_eq!(circle.center, Point::new(200.0, 300.0));
         assert!(
-            engine.timers.is_empty(),
+            engine.scheduler.timers.is_empty(),
             "normal movement and scrolling must never create a timer"
         );
         assert!(
-            engine.active_gestures.is_empty(),
+            engine.input.active_gestures.is_empty(),
             "every tapped held action must receive its release"
         );
     }
@@ -5511,7 +5614,7 @@ mod tests {
     fn physical_pointer_after_normal_movement_reanchors_the_next_keyboard_move() {
         let config = Config::default();
         let mut engine = Engine::new(config.clone(), Appearance::Dark);
-        for mode in crate::modes::built_in(&config) {
+        for mode in crate::app::mode_catalog::built_in(&config) {
             engine.register(mode);
         }
         let physical = Point::new(200.0, 300.0);
@@ -5558,7 +5661,7 @@ mod tests {
     fn inherited_normal_movement_receives_frames_while_grid_is_active() {
         let config = Config::default();
         let mut engine = Engine::new(config.clone(), Appearance::Dark);
-        for mode in crate::modes::built_in(&config) {
+        for mode in crate::app::mode_catalog::built_in(&config) {
             engine.register(mode);
         }
         let mut script = enter_normal();
@@ -5578,7 +5681,7 @@ mod tests {
             2,
             "initial key-down and the display frame must both reach normal"
         );
-        assert!(engine.frame_clock_owner.is_none());
+        assert!(engine.scheduler.frame_clock_owner.is_none());
     }
 
     #[test]
@@ -5784,7 +5887,7 @@ mod tests {
             engine
                 .handle_backend_event(key_down("x"), &mut backend)
                 .unwrap();
-            assert_eq!(engine.pending_long_press_toggles.len(), 1);
+            assert_eq!(engine.input.pending_long_press_toggles.len(), 1);
             assert_eq!(
                 log.lock().unwrap().buttons,
                 [(map_button(button), ButtonAction::Press)],
@@ -5794,7 +5897,7 @@ mod tests {
             engine
                 .handle_backend_event(key_up("x"), &mut backend)
                 .unwrap();
-            assert!(engine.pending_long_press_toggles.is_empty());
+            assert!(engine.input.pending_long_press_toggles.is_empty());
             let expected = if action == ButtonAction::DoubleClick {
                 vec![
                     (map_button(button), ButtonAction::Press),
@@ -5821,13 +5924,14 @@ mod tests {
         ] {
             let mut engine = engine_with_normal_binding("x", binding);
             engine.config.normal.long_press_toggle_ms = 0;
+            engine.apply_config(engine.config.clone()).unwrap();
             engine.active = ModeId::normal();
             let (mut backend, log) = FakeBackend::new(Vec::new());
 
             engine
                 .handle_backend_event(key_down("x"), &mut backend)
                 .unwrap();
-            assert!(engine.pending_long_press_toggles.is_empty());
+            assert!(engine.input.pending_long_press_toggles.is_empty());
             assert_eq!(
                 log.lock().unwrap().buttons,
                 vec![(map_button(button), action)],
@@ -5875,9 +5979,9 @@ mod tests {
             engine
                 .handle_backend_event(key_down("x"), &mut backend)
                 .unwrap();
-            assert_eq!(engine.pending_long_press_toggles.len(), 1);
+            assert_eq!(engine.input.pending_long_press_toggles.len(), 1);
             assert!(
-                !engine.latched.contains(&InputTarget::Mouse(button)),
+                !engine.input.latched.contains(&InputTarget::Mouse(button)),
                 "binding={binding}"
             );
             assert_eq!(
@@ -5885,18 +5989,18 @@ mod tests {
                 [(map_button(button), ButtonAction::Press)],
                 "binding={binding}"
             );
-            engine.pending_long_press_toggles[0].fires_at = Instant::now();
+            engine.input.pending_long_press_toggles[0].fires_at = Instant::now();
             engine.fire_due_long_press_toggles(&mut backend).unwrap();
 
             assert!(
-                engine.latched.contains(&InputTarget::Mouse(button)),
+                engine.input.latched.contains(&InputTarget::Mouse(button)),
                 "binding={binding}"
             );
             engine
                 .handle_backend_event(key_up("x"), &mut backend)
                 .unwrap();
             assert!(
-                engine.latched.contains(&InputTarget::Mouse(button)),
+                engine.input.latched.contains(&InputTarget::Mouse(button)),
                 "key release must not undo toggle for {binding}"
             );
             assert_eq!(
@@ -5911,7 +6015,7 @@ mod tests {
         let mut config = Config::default();
         config.normal.auto_release_ms = 300;
         let mut engine = Engine::new(config.clone(), Appearance::Dark);
-        for mode in crate::modes::built_in(&config) {
+        for mode in crate::app::mode_catalog::built_in(&config) {
             engine.register(mode);
         }
         engine.active = ModeId::normal();
@@ -5929,6 +6033,7 @@ mod tests {
     fn latch_drag_button(engine: &mut Engine, key: &str, backend: &mut dyn Backend) {
         engine.handle_backend_event(key_down(key), backend).unwrap();
         engine
+            .input
             .pending_long_press_toggles
             .last_mut()
             .expect("pending long press")
@@ -5944,24 +6049,24 @@ mod tests {
         latch_drag_button(&mut engine, ";", &mut backend);
 
         assert_eq!(
-            engine.drag_auto_release.buttons,
+            engine.input.drag_auto_release.buttons,
             drag_button_bit(Button::Left)
         );
-        assert!(engine.drag_auto_release.fires_at.is_none());
+        assert!(engine.input.drag_auto_release.fires_at.is_none());
 
         engine
             .execute([Command::MovePointer { dx: 10.0, dy: 0.0 }], &mut backend)
             .unwrap();
         assert!(
-            engine.drag_auto_release.fires_at.is_none(),
+            engine.input.drag_auto_release.fires_at.is_none(),
             "movement without a forwarded modifier must keep manual release"
         );
 
         engine
             .handle_backend_event(key_down("left_ctrl"), &mut backend)
             .unwrap();
-        assert_ne!(engine.drag_auto_release.modifiers, 0);
-        assert!(engine.drag_auto_release.fires_at.is_none());
+        assert_ne!(engine.input.drag_auto_release.modifiers, 0);
+        assert!(engine.input.drag_auto_release.fires_at.is_none());
 
         engine
             .handle_backend_event(BackendEvent::PointerMoved(engine.cursor), &mut backend)
@@ -5976,7 +6081,7 @@ mod tests {
             )
             .unwrap();
         assert!(
-            engine.drag_auto_release.fires_at.is_none(),
+            engine.input.drag_auto_release.fires_at.is_none(),
             "a coordinate report or warp without displacement must not arm release"
         );
 
@@ -5986,7 +6091,7 @@ mod tests {
                 &mut backend,
             )
             .unwrap();
-        assert!(engine.drag_auto_release.fires_at.is_some());
+        assert!(engine.input.drag_auto_release.fires_at.is_some());
         assert_eq!(
             log.lock().unwrap().buttons,
             [(MouseButton::Left, ButtonAction::Press)]
@@ -6014,7 +6119,7 @@ mod tests {
                 .handle_backend_event(key_down(key), &mut backend)
                 .unwrap();
         }
-        assert_eq!(engine.drag_auto_release.modifiers.count_ones(), 8);
+        assert_eq!(engine.input.drag_auto_release.modifiers.count_ones(), 8);
 
         engine
             .handle_backend_event(key_down("h"), &mut backend)
@@ -6026,24 +6131,24 @@ mod tests {
             !log.lock().unwrap().moves.is_empty(),
             "forwarded modifiers must not hide the effective Normal movement binding"
         );
-        assert!(engine.drag_auto_release.fires_at.is_some());
+        assert!(engine.input.drag_auto_release.fires_at.is_some());
 
         engine
             .handle_backend_event(key_up("left_alt"), &mut backend)
             .unwrap();
-        assert_eq!(engine.drag_auto_release.modifiers.count_ones(), 7);
+        assert_eq!(engine.input.drag_auto_release.modifiers.count_ones(), 7);
         for key in MODIFIERS.into_iter().filter(|key| *key != "left_alt") {
             engine
                 .handle_backend_event(key_up(key), &mut backend)
                 .unwrap();
         }
-        assert_eq!(engine.drag_auto_release.modifiers, 0);
+        assert_eq!(engine.input.drag_auto_release.modifiers, 0);
         assert!(
-            engine.drag_auto_release.fires_at.is_some(),
+            engine.input.drag_auto_release.fires_at.is_some(),
             "an armed deadline survives an early release of every modifier"
         );
 
-        engine.drag_auto_release.fires_at = Some(Instant::now());
+        engine.input.drag_auto_release.fires_at = Some(Instant::now());
         engine
             .handle_backend_event(
                 BackendEvent::PointerMoved(Point::new(430.0, 300.0)),
@@ -6052,16 +6157,22 @@ mod tests {
             .unwrap();
         assert!(
             engine
+                .input
                 .drag_auto_release
                 .fires_at
                 .is_some_and(|deadline| deadline > Instant::now()),
             "movement keeps resetting an already-armed deadline after every modifier is up"
         );
 
-        engine.drag_auto_release.fires_at = Some(Instant::now());
+        engine.input.drag_auto_release.fires_at = Some(Instant::now());
         engine.fire_due_drag_auto_release(&mut backend).unwrap();
-        assert!(engine.drag_auto_release.fires_at.is_none());
-        assert!(!engine.latched.contains(&InputTarget::Mouse(Button::Left)));
+        assert!(engine.input.drag_auto_release.fires_at.is_none());
+        assert!(
+            !engine
+                .input
+                .latched
+                .contains(&InputTarget::Mouse(Button::Left))
+        );
 
         let log = log.lock().unwrap();
         assert_eq!(
@@ -6118,11 +6229,11 @@ mod tests {
                 &mut backend,
             )
             .unwrap();
-        engine.drag_auto_release.fires_at = Some(Instant::now());
+        engine.input.drag_auto_release.fires_at = Some(Instant::now());
         let scenes_before_release = log.lock().unwrap().scenes.len();
         engine.fire_due_drag_auto_release(&mut backend).unwrap();
 
-        assert!(engine.latched.is_empty());
+        assert!(engine.input.latched.is_empty());
         let log = log.lock().unwrap();
         assert_eq!(log.scenes.len(), scenes_before_release + 1);
         let scene = log.scenes.last().expect("auto-released drag scene");
@@ -6152,10 +6263,15 @@ mod tests {
         engine
             .handle_backend_event(key_down(";"), &mut backend)
             .unwrap();
-        engine.pending_long_press_toggles[0].fires_at = Instant::now();
+        engine.input.pending_long_press_toggles[0].fires_at = Instant::now();
         engine.fire_due_long_press_toggles(&mut backend).unwrap();
-        assert!(engine.active_click_indicators.is_empty());
-        assert!(engine.latched.contains(&InputTarget::Mouse(Button::Left)));
+        assert!(engine.input.active_click_indicators.is_empty());
+        assert!(
+            engine
+                .input
+                .latched
+                .contains(&InputTarget::Mouse(Button::Left))
+        );
 
         engine
             .handle_backend_event(key_down("left_ctrl"), &mut backend)
@@ -6166,11 +6282,11 @@ mod tests {
                 &mut backend,
             )
             .unwrap();
-        engine.drag_auto_release.fires_at = Some(Instant::now());
+        engine.input.drag_auto_release.fires_at = Some(Instant::now());
         engine.fire_due_drag_auto_release(&mut backend).unwrap();
 
-        assert!(engine.active_click_indicators.is_empty());
-        assert!(engine.latched.is_empty());
+        assert!(engine.input.active_click_indicators.is_empty());
+        assert!(engine.input.latched.is_empty());
         let pressed = crate::api::overlay::Color::rgb(0, 255, 0);
         assert_ne!(
             log.lock()
@@ -6218,17 +6334,21 @@ mod tests {
         engine
             .handle_backend_event(key_down(";"), &mut backend)
             .unwrap();
-        assert_eq!(engine.pending_long_press_toggles.len(), 1);
-        assert!(engine.pending_long_press_toggles[0].short_action.is_none());
-        engine.drag_auto_release.fires_at = Some(Instant::now());
+        assert_eq!(engine.input.pending_long_press_toggles.len(), 1);
+        assert!(
+            engine.input.pending_long_press_toggles[0]
+                .short_action
+                .is_none()
+        );
+        engine.input.drag_auto_release.fires_at = Some(Instant::now());
         engine.fire_due_drag_auto_release(&mut backend).unwrap();
 
-        assert!(engine.pending_long_press_toggles.is_empty());
-        assert!(engine.active_click_indicators.is_empty());
+        assert!(engine.input.pending_long_press_toggles.is_empty());
+        assert!(engine.input.active_click_indicators.is_empty());
         engine
             .handle_backend_event(key_up(";"), &mut backend)
             .unwrap();
-        assert!(engine.latched.is_empty());
+        assert!(engine.input.latched.is_empty());
         let log = log.lock().unwrap();
         assert_eq!(
             log.buttons,
@@ -6256,6 +6376,7 @@ mod tests {
         for long_pressed in [false, true] {
             let mut engine = drag_auto_release_engine();
             engine.config.general.excluded_apps = vec!["com.example.excluded".into()];
+            engine.apply_config(engine.config.clone()).unwrap();
             let (mut backend, log) = FakeBackend::new(Vec::new());
             if long_pressed {
                 latch_drag_button(&mut engine, ";", &mut backend);
@@ -6276,9 +6397,9 @@ mod tests {
                 )
                 .unwrap();
 
-            assert!(engine.pending_long_press_toggles.is_empty());
-            assert!(engine.active_click_indicators.is_empty());
-            assert!(engine.latched.is_empty());
+            assert!(engine.input.pending_long_press_toggles.is_empty());
+            assert!(engine.input.active_click_indicators.is_empty());
+            assert!(engine.input.latched.is_empty());
             let log = log.lock().unwrap();
             let scene = log.scenes.last().expect("released excluded-app scene");
             assert_eq!(
@@ -6314,13 +6435,14 @@ mod tests {
         let mut engine = drag_auto_release_engine();
         engine.config.normal.long_press_toggle_ms = 0;
         engine.config.general.excluded_apps = vec!["com.example.excluded".into()];
+        engine.apply_config(engine.config.clone()).unwrap();
         let (mut backend, log) = FakeBackend::new(Vec::new());
 
         engine
             .handle_backend_event(key_down(";"), &mut backend)
             .unwrap();
-        assert!(engine.pending_long_press_toggles.is_empty());
-        assert!(!engine.active_click_indicators.is_empty());
+        assert!(engine.input.pending_long_press_toggles.is_empty());
+        assert!(!engine.input.active_click_indicators.is_empty());
         let scenes_before_focus = log.lock().unwrap().scenes.len();
 
         engine
@@ -6334,7 +6456,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(engine.active_click_indicators.is_empty());
+        assert!(engine.input.active_click_indicators.is_empty());
         let log = log.lock().unwrap();
         assert_eq!(log.scenes.len(), scenes_before_focus + 1);
         assert_ne!(
@@ -6368,16 +6490,22 @@ mod tests {
                 &mut backend,
             )
             .unwrap();
-        engine.drag_auto_release.fires_at = Some(Instant::now());
+        engine.input.drag_auto_release.fires_at = Some(Instant::now());
 
         engine.fire_due_drag_auto_release(&mut backend).unwrap();
 
         assert!(
             engine
+                .input
                 .latched
                 .contains(&InputTarget::Key(Key::new("left_ctrl").unwrap()))
         );
-        assert!(!engine.latched.contains(&InputTarget::Mouse(Button::Left)));
+        assert!(
+            !engine
+                .input
+                .latched
+                .contains(&InputTarget::Mouse(Button::Left))
+        );
         assert_eq!(
             log.lock()
                 .unwrap()
@@ -6397,7 +6525,7 @@ mod tests {
             .normal
             .bindings
             .insert("ctrl+shift+h".into(), Binding::parse("send home").unwrap());
-        engine.rebuild_tables();
+        engine.apply_config(engine.config.clone()).unwrap();
         let (mut backend, log) = FakeBackend::new(Vec::new());
         latch_drag_button(&mut engine, ";", &mut backend);
 
@@ -6428,7 +6556,7 @@ mod tests {
             .normal
             .bindings
             .insert("ctrl+h".into(), Binding::Disabled);
-        engine.rebuild_tables();
+        engine.apply_config(engine.config.clone()).unwrap();
         let (mut backend, log) = FakeBackend::new(Vec::new());
         latch_drag_button(&mut engine, ";", &mut backend);
 
@@ -6455,7 +6583,7 @@ mod tests {
             .config
             .hotkeys
             .insert("ctrl+h".into(), Binding::Disabled);
-        engine.rebuild_tables();
+        engine.apply_config(engine.config.clone()).unwrap();
         let (mut backend, log) = FakeBackend::new(Vec::new());
         latch_drag_button(&mut engine, ";", &mut backend);
 
@@ -6481,7 +6609,7 @@ mod tests {
         let (mut backend, log) = FakeBackend::new(Vec::new());
         latch_drag_button(&mut engine, ";", &mut backend);
         latch_drag_button(&mut engine, "'", &mut backend);
-        assert_eq!(engine.drag_auto_release.buttons.count_ones(), 2);
+        assert_eq!(engine.input.drag_auto_release.buttons.count_ones(), 2);
 
         engine
             .handle_backend_event(key_down("left_ctrl"), &mut backend)
@@ -6492,10 +6620,10 @@ mod tests {
                 &mut backend,
             )
             .unwrap();
-        engine.drag_auto_release.fires_at = Some(Instant::now());
+        engine.input.drag_auto_release.fires_at = Some(Instant::now());
         engine.fire_due_drag_auto_release(&mut backend).unwrap();
 
-        assert!(engine.latched.is_empty());
+        assert!(engine.input.latched.is_empty());
         assert_eq!(
             log.lock().unwrap().buttons,
             [
@@ -6521,21 +6649,31 @@ mod tests {
                 &mut backend,
             )
             .unwrap();
-        engine.drag_auto_release.fires_at = Some(Instant::now());
+        engine.input.drag_auto_release.fires_at = Some(Instant::now());
         engine
             .handle_backend_event(key_up("left_ctrl"), &mut backend)
             .unwrap();
 
         latch_drag_button(&mut engine, "'", &mut backend);
 
-        assert_eq!(engine.drag_auto_release.buttons.count_ones(), 2);
+        assert_eq!(engine.input.drag_auto_release.buttons.count_ones(), 2);
         assert!(
-            engine.drag_auto_release.fires_at.is_none(),
+            engine.input.drag_auto_release.fires_at.is_none(),
             "a newly owned button must not inherit a nearly-expired deadline"
         );
         engine.fire_due_drag_auto_release(&mut backend).unwrap();
-        assert!(engine.latched.contains(&InputTarget::Mouse(Button::Left)));
-        assert!(engine.latched.contains(&InputTarget::Mouse(Button::Right)));
+        assert!(
+            engine
+                .input
+                .latched
+                .contains(&InputTarget::Mouse(Button::Left))
+        );
+        assert!(
+            engine
+                .input
+                .latched
+                .contains(&InputTarget::Mouse(Button::Right))
+        );
 
         engine
             .handle_backend_event(key_down("left_ctrl"), &mut backend)
@@ -6546,11 +6684,21 @@ mod tests {
                 &mut backend,
             )
             .unwrap();
-        assert!(engine.drag_auto_release.fires_at.is_some());
-        engine.drag_auto_release.fires_at = Some(Instant::now());
+        assert!(engine.input.drag_auto_release.fires_at.is_some());
+        engine.input.drag_auto_release.fires_at = Some(Instant::now());
         engine.fire_due_drag_auto_release(&mut backend).unwrap();
-        assert!(!engine.latched.contains(&InputTarget::Mouse(Button::Left)));
-        assert!(!engine.latched.contains(&InputTarget::Mouse(Button::Right)));
+        assert!(
+            !engine
+                .input
+                .latched
+                .contains(&InputTarget::Mouse(Button::Left))
+        );
+        assert!(
+            !engine
+                .input
+                .latched
+                .contains(&InputTarget::Mouse(Button::Right))
+        );
     }
 
     #[test]
@@ -6561,7 +6709,7 @@ mod tests {
             .normal
             .bindings
             .insert("ctrl+x".into(), Binding::parse("press mouse_left").unwrap());
-        engine.rebuild_tables();
+        engine.apply_config(engine.config.clone()).unwrap();
         let (mut backend, log) = FakeBackend::new(Vec::new());
         latch_drag_button(&mut engine, ";", &mut backend);
         latch_drag_button(&mut engine, "'", &mut backend);
@@ -6574,23 +6722,43 @@ mod tests {
                 &mut backend,
             )
             .unwrap();
-        assert!(engine.drag_auto_release.fires_at.is_some());
+        assert!(engine.input.drag_auto_release.fires_at.is_some());
 
         engine
             .handle_backend_event(key_down("x"), &mut backend)
             .unwrap();
 
         assert_eq!(
-            engine.drag_auto_release.buttons,
+            engine.input.drag_auto_release.buttons,
             drag_button_bit(Button::Right),
             "explicit ownership removes only the matching auto button"
         );
-        assert!(engine.latched.contains(&InputTarget::Mouse(Button::Left)));
-        assert!(engine.latched.contains(&InputTarget::Mouse(Button::Right)));
-        engine.drag_auto_release.fires_at = Some(Instant::now());
+        assert!(
+            engine
+                .input
+                .latched
+                .contains(&InputTarget::Mouse(Button::Left))
+        );
+        assert!(
+            engine
+                .input
+                .latched
+                .contains(&InputTarget::Mouse(Button::Right))
+        );
+        engine.input.drag_auto_release.fires_at = Some(Instant::now());
         engine.fire_due_drag_auto_release(&mut backend).unwrap();
-        assert!(engine.latched.contains(&InputTarget::Mouse(Button::Left)));
-        assert!(!engine.latched.contains(&InputTarget::Mouse(Button::Right)));
+        assert!(
+            engine
+                .input
+                .latched
+                .contains(&InputTarget::Mouse(Button::Left))
+        );
+        assert!(
+            !engine
+                .input
+                .latched
+                .contains(&InputTarget::Mouse(Button::Right))
+        );
         assert_eq!(
             log.lock()
                 .unwrap()
@@ -6634,8 +6802,13 @@ mod tests {
             .handle_backend_event(key_down(";"), &mut backend)
             .unwrap();
 
-        assert_eq!(engine.drag_auto_release.buttons, 0);
-        assert!(engine.latched.contains(&InputTarget::Mouse(Button::Left)));
+        assert_eq!(engine.input.drag_auto_release.buttons, 0);
+        assert!(
+            engine
+                .input
+                .latched
+                .contains(&InputTarget::Mouse(Button::Left))
+        );
         engine.fire_due_drag_auto_release(&mut backend).unwrap();
         assert_eq!(
             log.lock().unwrap().buttons,
@@ -6651,21 +6824,31 @@ mod tests {
         engine
             .handle_backend_event(key_down("left_ctrl"), &mut backend)
             .unwrap();
-        assert_ne!(engine.drag_auto_release.buttons, 0);
+        assert_ne!(engine.input.drag_auto_release.buttons, 0);
 
         let mut replacement = engine.config.clone();
         replacement.normal.auto_release_ms = 50;
         engine.apply_config(replacement).unwrap();
 
-        assert_eq!(engine.drag_auto_release.buttons, 0);
-        assert!(engine.latched.contains(&InputTarget::Mouse(Button::Left)));
+        assert_eq!(engine.input.drag_auto_release.buttons, 0);
+        assert!(
+            engine
+                .input
+                .latched
+                .contains(&InputTarget::Mouse(Button::Left))
+        );
         engine
             .handle_backend_event(key_up("left_ctrl"), &mut backend)
             .unwrap();
         engine
             .release_targets(&[InputTarget::Mouse(Button::Left)], false, &mut backend)
             .unwrap();
-        assert!(!engine.latched.contains(&InputTarget::Mouse(Button::Left)));
+        assert!(
+            !engine
+                .input
+                .latched
+                .contains(&InputTarget::Mouse(Button::Left))
+        );
         let log = log.lock().unwrap();
         assert_eq!(
             log.buttons,
@@ -6701,10 +6884,16 @@ mod tests {
             .activate(ModeId::grid(), Some(ModeId::normal()), &mut backend)
             .unwrap();
 
-        assert_eq!(engine.drag_auto_release.buttons, 0);
-        assert!(!engine.latched.contains(&InputTarget::Mouse(Button::Left)));
+        assert_eq!(engine.input.drag_auto_release.buttons, 0);
+        assert!(
+            !engine
+                .input
+                .latched
+                .contains(&InputTarget::Mouse(Button::Left))
+        );
         assert!(
             engine
+                .input
                 .latched
                 .contains(&InputTarget::Key(Key::new("left_ctrl").unwrap())),
             "an unrelated explicit latch keeps its existing targeting lifetime"
@@ -6726,7 +6915,7 @@ mod tests {
             .bindings
             .insert("x".into(), Binding::parse("toggle mouse_left").unwrap());
         let mut engine = Engine::new(config.clone(), Appearance::Dark);
-        for mode in crate::modes::built_in(&config) {
+        for mode in crate::app::mode_catalog::built_in(&config) {
             engine.register(mode);
         }
         engine.active = ModeId::normal();
@@ -6736,9 +6925,14 @@ mod tests {
             engine.handle_backend_event(event, &mut backend).unwrap();
         }
 
-        assert!(engine.latched.contains(&InputTarget::Mouse(Button::Left)));
-        assert_eq!(engine.drag_auto_release.buttons, 0);
-        assert!(engine.drag_auto_release.fires_at.is_none());
+        assert!(
+            engine
+                .input
+                .latched
+                .contains(&InputTarget::Mouse(Button::Left))
+        );
+        assert_eq!(engine.input.drag_auto_release.buttons, 0);
+        assert!(engine.input.drag_auto_release.fires_at.is_none());
     }
 
     #[test]
@@ -6765,7 +6959,7 @@ mod tests {
             log.lock().unwrap().buttons,
             [(MouseButton::Left, ButtonAction::Press)]
         );
-        engine.pending_long_press_toggles[0].fires_at = Instant::now();
+        engine.input.pending_long_press_toggles[0].fires_at = Instant::now();
         engine.fire_due_long_press_toggles(&mut backend).unwrap();
         engine
             .handle_backend_event(key_up("x"), &mut backend)
@@ -6779,13 +6973,18 @@ mod tests {
             vec![(MouseButton::Left, ButtonAction::Press)],
             "a latched button must not receive an atomic click"
         );
-        engine.pending_long_press_toggles[0].fires_at = Instant::now();
+        engine.input.pending_long_press_toggles[0].fires_at = Instant::now();
         engine.fire_due_long_press_toggles(&mut backend).unwrap();
         engine
             .handle_backend_event(key_up("x"), &mut backend)
             .unwrap();
 
-        assert!(!engine.latched.contains(&InputTarget::Mouse(Button::Left)));
+        assert!(
+            !engine
+                .input
+                .latched
+                .contains(&InputTarget::Mouse(Button::Left))
+        );
         assert_eq!(
             log.lock().unwrap().buttons,
             vec![
@@ -6804,12 +7003,12 @@ mod tests {
         engine
             .handle_backend_event(key_down("x"), &mut backend)
             .unwrap();
-        engine.pressed.remove(&Key::new("x").unwrap());
-        engine.pending_long_press_toggles[0].fires_at = Instant::now();
+        engine.input.pressed.remove(&Key::new("x").unwrap());
+        engine.input.pending_long_press_toggles[0].fires_at = Instant::now();
         engine.fire_due_long_press_toggles(&mut backend).unwrap();
 
-        assert!(engine.pending_long_press_toggles.is_empty());
-        assert!(engine.latched.is_empty());
+        assert!(engine.input.pending_long_press_toggles.is_empty());
+        assert!(engine.input.latched.is_empty());
         assert_eq!(
             log.lock().unwrap().buttons,
             [
@@ -6846,13 +7045,13 @@ mod tests {
         engine
             .handle_backend_event(key_down("y"), &mut backend)
             .unwrap();
-        assert_eq!(engine.pending_long_press_toggles.len(), 1);
-        for pending in &mut engine.pending_long_press_toggles {
+        assert_eq!(engine.input.pending_long_press_toggles.len(), 1);
+        for pending in &mut engine.input.pending_long_press_toggles {
             pending.fires_at = Instant::now();
         }
         engine.fire_due_long_press_toggles(&mut backend).unwrap();
 
-        assert!(engine.pending_long_press_toggles.is_empty());
+        assert!(engine.input.pending_long_press_toggles.is_empty());
         assert_eq!(
             log.lock().unwrap().buttons,
             [(MouseButton::Left, ButtonAction::Press)]
@@ -6881,8 +7080,8 @@ mod tests {
         engine
             .handle_backend_event(key_up("x"), &mut backend)
             .unwrap();
-        assert!(engine.pending_long_press_toggles.is_empty());
-        assert!(engine.latched.is_empty());
+        assert!(engine.input.pending_long_press_toggles.is_empty());
+        assert!(engine.input.latched.is_empty());
         assert_eq!(
             log.lock().unwrap().buttons,
             [
@@ -6892,10 +7091,11 @@ mod tests {
         );
 
         engine.config.normal.long_press_toggle_ms = 0;
+        engine.apply_config(engine.config.clone()).unwrap();
         engine
             .handle_backend_event(key_down("x"), &mut backend)
             .unwrap();
-        assert!(engine.pending_long_press_toggles.is_empty());
+        assert!(engine.input.pending_long_press_toggles.is_empty());
         assert_eq!(
             log.lock().unwrap().buttons,
             [
@@ -6918,7 +7118,7 @@ mod tests {
         engine
             .handle_backend_event(key_down("x"), &mut backend)
             .unwrap();
-        assert!(engine.pending_long_press_toggles.is_empty());
+        assert!(engine.input.pending_long_press_toggles.is_empty());
     }
 
     #[test]
@@ -6936,11 +7136,18 @@ mod tests {
             engine
                 .handle_backend_event(key_down(key), &mut backend)
                 .unwrap();
-            assert_eq!(engine.pending_long_press_toggles.len(), 1, "key={key}");
+            assert_eq!(
+                engine.input.pending_long_press_toggles.len(),
+                1,
+                "key={key}"
+            );
             engine
                 .handle_backend_event(key_down("n"), &mut backend)
                 .unwrap();
-            assert!(engine.pending_long_press_toggles.is_empty(), "key={key}");
+            assert!(
+                engine.input.pending_long_press_toggles.is_empty(),
+                "key={key}"
+            );
             engine.fire_due_long_press_toggles(&mut backend).unwrap();
             assert_eq!(
                 log.lock().unwrap().buttons,
@@ -7038,18 +7245,18 @@ mod tests {
         engine
             .handle_backend_event(key_down("x"), &mut backend)
             .unwrap();
-        assert!(!engine.active_click_indicators.is_empty());
-        assert_eq!(engine.pending_long_press_toggles.len(), 1);
+        assert!(!engine.input.active_click_indicators.is_empty());
+        assert_eq!(engine.input.pending_long_press_toggles.len(), 1);
         engine
             .activate(ModeId::grid(), Some(ModeId::normal()), &mut backend)
             .unwrap();
-        assert!(!engine.active_click_indicators.is_empty());
-        assert_eq!(engine.pending_long_press_toggles.len(), 1);
+        assert!(!engine.input.active_click_indicators.is_empty());
+        assert_eq!(engine.input.pending_long_press_toggles.len(), 1);
         engine
             .handle_backend_event(key_up("x"), &mut backend)
             .unwrap();
-        assert!(engine.active_click_indicators.is_empty());
-        assert!(engine.pending_long_press_toggles.is_empty());
+        assert!(engine.input.active_click_indicators.is_empty());
+        assert!(engine.input.pending_long_press_toggles.is_empty());
         assert_eq!(
             log.lock().unwrap().buttons,
             [
@@ -7068,11 +7275,11 @@ mod tests {
         engine
             .handle_backend_event(key_down("x"), &mut backend)
             .unwrap();
-        assert!(engine.active_click_indicators.is_empty());
+        assert!(engine.input.active_click_indicators.is_empty());
         engine
             .handle_backend_event(key_up("x"), &mut backend)
             .unwrap();
-        assert!(engine.active_click_indicators.is_empty());
+        assert!(engine.input.active_click_indicators.is_empty());
 
         let mut engine = engine_with_normal_binding("x", "left_click");
         engine.active = ModeId::normal();
@@ -7085,7 +7292,7 @@ mod tests {
                 &mut backend,
             )
             .unwrap();
-        assert!(engine.active_click_indicators.is_empty());
+        assert!(engine.input.active_click_indicators.is_empty());
 
         let delayed_input = InputEvent {
             key: Key::new("x").unwrap(),
@@ -7102,7 +7309,7 @@ mod tests {
                 &mut backend,
             )
             .unwrap();
-        assert!(engine.active_click_indicators.is_empty());
+        assert!(engine.input.active_click_indicators.is_empty());
     }
 
     #[test]
@@ -7113,13 +7320,13 @@ mod tests {
         engine
             .handle_backend_event(key_down("x"), &mut backend)
             .unwrap();
-        assert!(!engine.active_click_indicators.is_empty());
-        assert_eq!(engine.pending_long_press_toggles.len(), 1);
+        assert!(!engine.input.active_click_indicators.is_empty());
+        assert_eq!(engine.input.pending_long_press_toggles.len(), 1);
         engine
             .handle_backend_event(BackendEvent::ToggleEnabled, &mut backend)
             .unwrap();
-        assert!(engine.active_click_indicators.is_empty());
-        assert!(engine.pending_long_press_toggles.is_empty());
+        assert!(engine.input.active_click_indicators.is_empty());
+        assert!(engine.input.pending_long_press_toggles.is_empty());
         assert_eq!(
             log.lock().unwrap().buttons,
             [
@@ -7141,7 +7348,7 @@ mod tests {
         engine
             .handle_backend_event(key_up("x"), &mut backend)
             .unwrap();
-        assert!(engine.pending_long_press_toggles.is_empty());
+        assert!(engine.input.pending_long_press_toggles.is_empty());
         assert_eq!(
             log.lock().unwrap().buttons,
             [
@@ -7162,7 +7369,7 @@ mod tests {
                 &mut backend,
             )
             .unwrap();
-        assert!(engine.pending_long_press_toggles.is_empty());
+        assert!(engine.input.pending_long_press_toggles.is_empty());
         assert_eq!(
             log.lock().unwrap().buttons,
             [
@@ -7186,8 +7393,8 @@ mod tests {
             .handle_backend_event(key_up("x"), &mut backend)
             .unwrap();
 
-        assert!(engine.pending_long_press_toggles.is_empty());
-        assert!(engine.latched.is_empty());
+        assert!(engine.input.pending_long_press_toggles.is_empty());
+        assert!(engine.input.latched.is_empty());
         assert_eq!(
             log.lock().unwrap().buttons,
             [
@@ -7202,8 +7409,8 @@ mod tests {
     fn shutdown_cancels_a_pending_click_and_clears_its_indicator() {
         let mut engine = engine_with_normal_binding("x", "left_click");
         let log = run_in_normal(&mut engine, vec![key_down("x")]);
-        assert!(engine.active_click_indicators.is_empty());
-        assert!(engine.pending_long_press_toggles.is_empty());
+        assert!(engine.input.active_click_indicators.is_empty());
+        assert!(engine.input.pending_long_press_toggles.is_empty());
         let log = log.lock().unwrap();
         assert_eq!(log.clicks, 0);
         assert!(log.scenes.iter().any(|scene| {
@@ -7280,7 +7487,7 @@ mod tests {
         // already finished this must be a no-op, not another click.
         config.grid.lifecycle.after_click = crate::config::LifecycleAction::Finish;
         let mut engine = Engine::new(config.clone(), Appearance::Dark);
-        for mode in crate::modes::built_in(&config) {
+        for mode in crate::app::mode_catalog::built_in(&config) {
             engine.register(mode);
         }
         let mut script = enter_normal();
@@ -7299,7 +7506,7 @@ mod tests {
     fn clicking_before_grid_max_depth_finishes_and_returns_to_normal_by_default() {
         let config = Config::default();
         let mut engine = Engine::new(config.clone(), Appearance::Dark);
-        for mode in crate::modes::built_in(&config) {
+        for mode in crate::app::mode_catalog::built_in(&config) {
             engine.register(mode);
         }
         let mut script = enter_normal();
@@ -7370,18 +7577,18 @@ mod tests {
     fn temporary_modifier_changes_only_the_display_mode() {
         let config = Config::default();
         let mut engine = Engine::new(config.clone(), Appearance::Dark);
-        for mode in crate::modes::built_in(&config) {
+        for mode in crate::app::mode_catalog::built_in(&config) {
             engine.register(mode);
         }
         engine.active = ModeId::grid();
         assert_eq!(engine.display_mode(), ModeId::grid());
 
         let primary = Key::new(&config.grid.temporary_mode_keys[0]).unwrap();
-        engine.pressed.insert(primary.clone());
+        engine.input.pressed.insert(primary.clone());
         assert_eq!(engine.display_mode(), ModeId::normal());
         assert_eq!(engine.active, ModeId::grid(), "grid state remains active");
 
-        engine.pressed.remove(&primary);
+        engine.input.pressed.remove(&primary);
         assert_eq!(engine.display_mode(), ModeId::grid());
         assert_eq!(engine.active, ModeId::grid());
     }
@@ -7390,7 +7597,7 @@ mod tests {
     fn temporary_modifier_repaints_badge_without_leaving_grid() {
         let config = Config::default();
         let mut engine = Engine::new(config.clone(), Appearance::Dark);
-        for mode in crate::modes::built_in(&config) {
+        for mode in crate::app::mode_catalog::built_in(&config) {
             engine.register(mode);
         }
         let primary = Key::new(&config.grid.temporary_mode_keys[0]).unwrap();
@@ -7475,23 +7682,23 @@ mod tests {
         engine.register(Box::new(ProbeMode::new("recursive_grid", log)));
 
         engine.active = ModeId::grid();
-        engine.pressed.insert(Key::new("g").unwrap());
+        engine.input.pressed.insert(Key::new("g").unwrap());
         assert!(
             engine.lookup(&Key::new("g").unwrap()).is_none(),
             "the grid's raw label must beat inherited normal bindings"
         );
-        engine.pressed.clear();
-        engine.pressed.insert(Key::new("h").unwrap());
+        engine.input.pressed.clear();
+        engine.input.pressed.insert(Key::new("h").unwrap());
         let inherited = engine.lookup(&Key::new("h").unwrap()).unwrap();
         assert_eq!(inherited.owner, ModeId::normal());
 
-        engine.pressed.insert(Key::new("left_ctrl").unwrap());
+        engine.input.pressed.insert(Key::new("left_ctrl").unwrap());
         let resolved = engine.lookup(&Key::new("h").unwrap()).unwrap();
         assert_eq!(resolved.owner, ModeId::normal());
         assert_eq!(resolved.binding.as_ref(), &Binding::Move(Direction::Left));
 
-        engine.pressed.clear();
-        engine.pressed.insert(Key::new("h").unwrap());
+        engine.input.pressed.clear();
+        engine.input.pressed.insert(Key::new("h").unwrap());
         engine.active = ModeId::recursive_grid();
         let resolved = engine.lookup(&Key::new("h").unwrap()).unwrap();
         assert_eq!(resolved.owner, ModeId::normal());
@@ -7508,11 +7715,11 @@ mod tests {
             Binding::Click(crate::api::binding::Button::Middle),
         );
         let mut engine = Engine::new(config.clone(), Appearance::Dark);
-        for mode in crate::modes::built_in(&config) {
+        for mode in crate::app::mode_catalog::built_in(&config) {
             engine.register(mode);
         }
         let key = Key::new("left_alt").unwrap();
-        engine.pressed.insert(key.clone());
+        engine.input.pressed.insert(key.clone());
 
         engine.active = ModeId::ui_hint();
         assert!(
@@ -7552,8 +7759,8 @@ mod tests {
         )));
         engine.active = ModeId::normal();
 
-        engine.pressed.insert(Key::new("left_shift").unwrap());
-        engine.pressed.insert(Key::new("e").unwrap());
+        engine.input.pressed.insert(Key::new("left_shift").unwrap());
+        engine.input.pressed.insert(Key::new("e").unwrap());
         assert_eq!(
             engine
                 .lookup(&Key::new("e").unwrap())
@@ -7561,7 +7768,10 @@ mod tests {
             Some(Binding::Scroll(Direction::Down, ScrollAmount::Half))
         );
 
-        engine.pressed.remove(&Key::new("left_shift").unwrap());
+        engine
+            .input
+            .pressed
+            .remove(&Key::new("left_shift").unwrap());
         assert_eq!(
             engine
                 .lookup(&Key::new("e").unwrap())
@@ -7844,7 +8054,7 @@ mod tests {
                 .bindings
                 .insert(chord.into(), Binding::parse(binding).unwrap());
             let mut engine = Engine::new(config.clone(), Appearance::Dark);
-            for mode in crate::modes::built_in(&config) {
+            for mode in crate::app::mode_catalog::built_in(&config) {
                 engine.register(mode);
             }
             engine.active = ModeId::normal();
@@ -7886,7 +8096,7 @@ mod tests {
             for event in [key_down(target), key_down("n"), key_up("n"), key_up(target)] {
                 engine.handle_backend_event(event, &mut backend).unwrap();
             }
-            assert!(engine.latched.is_empty(), "target={target}");
+            assert!(engine.input.latched.is_empty(), "target={target}");
             assert_eq!(
                 log.lock().unwrap().sent.last(),
                 Some(&(injected.into(), KeyState::Up)),
@@ -7905,7 +8115,7 @@ mod tests {
                 .bindings
                 .insert(activation.into(), Binding::Toggle(Vec::new()));
             let mut engine = Engine::new(config.clone(), Appearance::Dark);
-            for mode in crate::modes::built_in(&config) {
+            for mode in crate::app::mode_catalog::built_in(&config) {
                 engine.register(mode);
             }
             engine.active = ModeId::normal();
@@ -7919,9 +8129,10 @@ mod tests {
             engine
                 .handle_backend_event(key_down(activation), &mut backend)
                 .unwrap();
-            assert!(engine.pending_long_press_toggles.is_empty());
+            assert!(engine.input.pending_long_press_toggles.is_empty());
             assert!(
                 engine
+                    .input
                     .latched
                     .contains(&InputTarget::Key(Key::new("left_ctrl").unwrap()))
             );
@@ -7940,6 +8151,7 @@ mod tests {
 
             assert!(
                 engine
+                    .input
                     .latched
                     .contains(&InputTarget::Key(Key::new("left_ctrl").unwrap()))
             );
@@ -7967,7 +8179,7 @@ mod tests {
                 .bindings
                 .insert(ACTIVATION.into(), Binding::Toggle(Vec::new()));
             let mut engine = Engine::new(config.clone(), Appearance::Dark);
-            for mode in crate::modes::built_in(&config) {
+            for mode in crate::app::mode_catalog::built_in(&config) {
                 engine.register(mode);
             }
             engine.active = ModeId::normal();
@@ -7993,10 +8205,11 @@ mod tests {
                 }
             }
 
-            assert!(engine.pending_long_press_toggles.is_empty());
+            assert!(engine.input.pending_long_press_toggles.is_empty());
             for partner in PARTNERS {
                 assert!(
                     engine
+                        .input
                         .latched
                         .contains(&InputTarget::Key(Key::new(partner).unwrap())),
                     "partner={partner} partners_first={partners_first}"
@@ -8051,7 +8264,7 @@ mod tests {
                     .bindings
                     .insert(partner.into(), Binding::Click(button));
                 let mut engine = Engine::new(config.clone(), Appearance::Dark);
-                for mode in crate::modes::built_in(&config) {
+                for mode in crate::app::mode_catalog::built_in(&config) {
                     engine.register(mode);
                 }
                 engine.active = ModeId::normal();
@@ -8076,7 +8289,7 @@ mod tests {
                         .unwrap();
                 }
 
-                assert!(engine.latched.contains(&InputTarget::Mouse(button)));
+                assert!(engine.input.latched.contains(&InputTarget::Mouse(button)));
                 assert!(
                     engine
                         .matching_latched_target(&InputTarget::Key(Key::new(partner).unwrap()))
@@ -8114,7 +8327,7 @@ mod tests {
                     engine.handle_backend_event(event, &mut backend).unwrap();
                 }
 
-                assert!(engine.latched.is_empty());
+                assert!(engine.input.latched.is_empty());
                 assert_eq!(
                     log.lock().unwrap().buttons,
                     [(mouse, ButtonAction::Press), (mouse, ButtonAction::Release),],
@@ -8143,7 +8356,7 @@ mod tests {
             .bindings
             .insert("ctrl+x".into(), Binding::Click(Button::Right));
         let mut engine = Engine::new(config.clone(), Appearance::Dark);
-        for mode in crate::modes::built_in(&config) {
+        for mode in crate::app::mode_catalog::built_in(&config) {
             engine.register(mode);
         }
         engine.active = ModeId::normal();
@@ -8165,8 +8378,18 @@ mod tests {
                 .matching_latched_target(&InputTarget::Key(Key::new("left_ctrl").unwrap()))
                 .is_some()
         );
-        assert!(engine.latched.contains(&InputTarget::Mouse(Button::Right)));
-        assert!(!engine.latched.contains(&InputTarget::Mouse(Button::Left)));
+        assert!(
+            engine
+                .input
+                .latched
+                .contains(&InputTarget::Mouse(Button::Right))
+        );
+        assert!(
+            !engine
+                .input
+                .latched
+                .contains(&InputTarget::Mouse(Button::Left))
+        );
         assert_eq!(
             log.lock().unwrap().buttons,
             [(MouseButton::Right, ButtonAction::Press)]
@@ -8190,7 +8413,7 @@ mod tests {
                 .insert(key.into(), Binding::Click(Button::Left));
         }
         let mut engine = Engine::new(config.clone(), Appearance::Dark);
-        for mode in crate::modes::built_in(&config) {
+        for mode in crate::app::mode_catalog::built_in(&config) {
             engine.register(mode);
         }
         engine.active = ModeId::normal();
@@ -8214,7 +8437,7 @@ mod tests {
         for event in [key_down("n"), key_up("n")] {
             engine.handle_backend_event(event, &mut backend).unwrap();
         }
-        assert!(engine.latched.is_empty());
+        assert!(engine.input.latched.is_empty());
         assert_eq!(
             log.lock().unwrap().buttons,
             [
@@ -8247,7 +8470,7 @@ mod tests {
             log.sent,
             [("e".into(), KeyState::Down), ("e".into(), KeyState::Up)]
         );
-        assert!(engine.latched.is_empty());
+        assert!(engine.input.latched.is_empty());
     }
 
     #[test]
@@ -8263,7 +8486,7 @@ mod tests {
             Binding::Click(crate::api::binding::Button::Left),
         );
         let mut engine = Engine::new(config.clone(), Appearance::Dark);
-        for mode in crate::modes::built_in(&config) {
+        for mode in crate::app::mode_catalog::built_in(&config) {
             engine.register(mode);
         }
         engine.active = ModeId::normal();
@@ -8290,7 +8513,7 @@ mod tests {
             ]
         );
         assert_eq!(log.clicks, 0, "the partner's click action must not run");
-        assert!(engine.latched.is_empty());
+        assert!(engine.input.latched.is_empty());
     }
 
     #[test]
@@ -8303,13 +8526,14 @@ mod tests {
             engine
                 .handle_backend_event(key_down(activation), &mut backend)
                 .unwrap();
-            assert_eq!(engine.pending_long_press_toggles.len(), 1);
+            assert_eq!(engine.input.pending_long_press_toggles.len(), 1);
             assert!(log.lock().unwrap().sent.is_empty());
 
-            engine.pending_long_press_toggles[0].fires_at = Instant::now();
+            engine.input.pending_long_press_toggles[0].fires_at = Instant::now();
             engine.fire_due_long_press_toggles(&mut backend).unwrap();
             assert!(
                 engine
+                    .input
                     .latched
                     .contains(&InputTarget::Key(Key::new(activation).unwrap())),
                 "activation={activation}"
@@ -8374,9 +8598,9 @@ mod tests {
                 InputTarget::Key(Key::new("left_shift").unwrap()),
                 InputTarget::Key(Key::new("e").unwrap()),
             ]);
-            assert_eq!(engine.latched, expected);
+            assert_eq!(engine.input.latched, expected);
             assert!(
-                engine.pending_long_press_toggles.is_empty(),
+                engine.input.pending_long_press_toggles.is_empty(),
                 "a partner must cancel the activation key's self-latch deadline"
             );
             let sent_down: BTreeSet<_> = log
@@ -8444,20 +8668,20 @@ mod tests {
         engine
             .handle_backend_event(key_down("n"), &mut backend)
             .unwrap();
-        assert_eq!(engine.pending_long_press_toggles.len(), 1);
-        assert_eq!(engine.pending_long_press_toggles[0].target, target);
+        assert_eq!(engine.input.pending_long_press_toggles.len(), 1);
+        assert_eq!(engine.input.pending_long_press_toggles[0].target, target);
         assert!(log.lock().unwrap().sent.is_empty());
 
-        engine.pending_long_press_toggles[0].fires_at = Instant::now();
+        engine.input.pending_long_press_toggles[0].fires_at = Instant::now();
         engine.fire_due_long_press_toggles(&mut backend).unwrap();
-        assert!(engine.latched.contains(&InputTarget::Key(n.clone())));
+        assert!(engine.input.latched.contains(&InputTarget::Key(n.clone())));
         assert_eq!(log.lock().unwrap().sent, vec![("n".into(), KeyState::Down)]);
 
         engine
             .handle_backend_event(key_up("n"), &mut backend)
             .unwrap();
         assert!(
-            engine.latched.contains(&InputTarget::Key(n.clone())),
+            engine.input.latched.contains(&InputTarget::Key(n.clone())),
             "the physical release must not undo the long-press latch"
         );
         assert_eq!(log.lock().unwrap().sent.len(), 1);
@@ -8465,21 +8689,22 @@ mod tests {
         engine
             .handle_backend_event(key_down("n"), &mut backend)
             .unwrap();
-        assert_eq!(engine.pending_long_press_toggles.len(), 1);
+        assert_eq!(engine.input.pending_long_press_toggles.len(), 1);
         engine
             .handle_backend_event(key_up("n"), &mut backend)
             .unwrap();
-        assert!(engine.latched.is_empty());
+        assert!(engine.input.latched.is_empty());
         assert_eq!(
             log.lock().unwrap().sent,
             vec![("n".into(), KeyState::Down), ("n".into(), KeyState::Up),]
         );
 
         engine.config.normal.long_press_toggle_ms = 0;
+        engine.apply_config(engine.config.clone()).unwrap();
         engine
             .handle_backend_event(key_down("n"), &mut backend)
             .unwrap();
-        assert!(engine.pending_long_press_toggles.is_empty());
+        assert!(engine.input.pending_long_press_toggles.is_empty());
         engine
             .handle_backend_event(key_up("n"), &mut backend)
             .unwrap();
@@ -8536,7 +8761,7 @@ mod tests {
                 (MouseButton::Left, ButtonAction::Release),
             ]
         );
-        assert!(engine.latched.is_empty());
+        assert!(engine.input.latched.is_empty());
     }
 
     #[test]
@@ -8554,6 +8779,7 @@ mod tests {
 
         assert!(
             engine
+                .input
                 .latched
                 .contains(&InputTarget::Key(Key::new("caps_lock").unwrap()))
         );
@@ -8676,11 +8902,11 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("key-up"));
         assert_eq!(
-            engine.latched,
+            engine.input.latched,
             BTreeSet::from([InputTarget::Key(Key::new("home").unwrap())])
         );
         engine.release_latched(&mut backend).unwrap();
-        assert!(engine.latched.is_empty());
+        assert!(engine.input.latched.is_empty());
         assert_eq!(
             log.lock().unwrap().sent,
             vec![
@@ -8707,7 +8933,7 @@ mod tests {
                 &mut backend,
             )
             .unwrap();
-        assert!(engine.latched.is_empty());
+        assert!(engine.input.latched.is_empty());
         assert_eq!(
             log.lock().unwrap().sent,
             vec![
@@ -8730,7 +8956,7 @@ mod tests {
                 &mut backend,
             )
             .unwrap();
-        assert_eq!(engine.latched.len(), 2);
+        assert_eq!(engine.input.latched.len(), 2);
         engine
             .release_targets(
                 &[InputTarget::Key(Key::new("right_shift").unwrap())],
@@ -8740,11 +8966,13 @@ mod tests {
             .unwrap();
         assert!(
             engine
+                .input
                 .latched
                 .contains(&InputTarget::Key(Key::new("left_shift").unwrap()))
         );
         assert!(
             !engine
+                .input
                 .latched
                 .contains(&InputTarget::Key(Key::new("right_shift").unwrap()))
         );
@@ -8771,7 +8999,7 @@ mod tests {
         engine
             .toggle_targets(&[InputTarget::Key(Key::new("ctrl").unwrap())], &mut backend)
             .unwrap();
-        assert!(engine.latched.is_empty());
+        assert!(engine.input.latched.is_empty());
         assert_eq!(
             log.lock().unwrap().sent,
             vec![
@@ -8821,8 +9049,8 @@ mod tests {
             .continue_sequence(actions, ModeId::normal(), input, &mut backend)
             .unwrap();
         assert_eq!(log.lock().unwrap().sent.len(), 2);
-        assert_eq!(engine.pending_sequences.len(), 1);
-        engine.pending_sequences[0].fires_at = Instant::now();
+        assert_eq!(engine.scheduler.sequences.len(), 1);
+        engine.scheduler.sequences[0].fires_at = Instant::now();
         engine.fire_due_sequences(&mut backend).unwrap();
         assert_eq!(
             log.lock().unwrap().sent,
@@ -8833,7 +9061,7 @@ mod tests {
                 ("home".into(), KeyState::Up),
             ]
         );
-        assert!(engine.pending_sequences.is_empty());
+        assert!(engine.scheduler.sequences.is_empty());
     }
 
     #[test]
@@ -8848,7 +9076,7 @@ mod tests {
             injected: false,
             timestamp_millis: 0,
         };
-        engine.pending_sequences = vec![
+        engine.scheduler.sequences = vec![
             PendingSequence {
                 fires_at: now,
                 actions: VecDeque::from([Binding::Warp { x: 1, y: 2 }]),
@@ -8917,12 +9145,12 @@ mod tests {
             log.lock().unwrap().buttons,
             [(MouseButton::Left, ButtonAction::Press)]
         );
-        assert_eq!(engine.latched.len(), 2);
+        assert_eq!(engine.input.latched.len(), 2);
 
         engine
             .activate(ModeId::normal(), Some(grid.clone()), &mut backend)
             .unwrap();
-        assert!(engine.latched.is_empty());
+        assert!(engine.input.latched.is_empty());
         assert_eq!(
             log.lock().unwrap().sent,
             [
@@ -8948,7 +9176,7 @@ mod tests {
             .activate(ModeId::idle(), Some(grid), &mut backend)
             .unwrap();
 
-        assert!(engine.latched.is_empty());
+        assert!(engine.input.latched.is_empty());
         assert_eq!(
             log.lock().unwrap().sent,
             [
@@ -8987,10 +9215,10 @@ mod tests {
         engine
             .push_mode(ModeId::new("grid").unwrap(), &mut backend)
             .unwrap();
-        assert_eq!(engine.latched.len(), 2);
+        assert_eq!(engine.input.latched.len(), 2);
         engine.pop_mode(&mut backend).unwrap();
 
-        assert!(engine.latched.is_empty());
+        assert!(engine.input.latched.is_empty());
         assert_eq!(
             log.lock().unwrap().sent,
             [
@@ -9016,7 +9244,7 @@ mod tests {
         engine
             .handle_backend_event(key_down(";"), &mut backend)
             .unwrap();
-        assert_eq!(engine.pending_long_press_toggles.len(), 1);
+        assert_eq!(engine.input.pending_long_press_toggles.len(), 1);
         assert_eq!(
             log.lock().unwrap().buttons,
             [(MouseButton::Left, ButtonAction::Press)]
@@ -9029,8 +9257,8 @@ mod tests {
             .handle_backend_event(key_up(";"), &mut backend)
             .unwrap();
 
-        assert!(engine.pending_long_press_toggles.is_empty());
-        assert!(engine.latched.is_empty());
+        assert!(engine.input.pending_long_press_toggles.is_empty());
+        assert!(engine.input.latched.is_empty());
         let log = log.lock().unwrap();
         assert_eq!(log.clicks, 0);
         assert_eq!(
@@ -9133,7 +9361,7 @@ mod tests {
     fn visible_normal_overlay() -> (Engine, FakeBackend, Arc<Mutex<Recorder>>) {
         let config = Config::default();
         let mut engine = Engine::new(config.clone(), Appearance::Dark);
-        for mode in crate::modes::built_in(&config) {
+        for mode in crate::app::mode_catalog::built_in(&config) {
             engine.register(mode);
         }
         engine.active = ModeId::normal();
@@ -9255,6 +9483,7 @@ mod tests {
         let mut engine = engine_with_normal_binding("n", "toggle");
         engine.active = ModeId::normal();
         engine
+            .input
             .pending_long_press_toggles
             .push(PendingLongPressToggle {
                 fires_at: Instant::now() + Duration::from_secs(60),
@@ -9287,7 +9516,10 @@ mod tests {
 
         let region = Region::new(TEST_ALLOCATOR);
         for _ in 0..10_000 {
-            engine.pending_long_press_toggles.push(pending.clone());
+            engine
+                .input
+                .pending_long_press_toggles
+                .push(pending.clone());
             std::hint::black_box(engine.take_pending_long_press_toggle(&pending.key));
         }
         let change = region.change();
@@ -9359,7 +9591,7 @@ mod tests {
             let mut engine = Engine::new(Config::default(), Appearance::Dark);
             let now = Instant::now();
             for index in 0..count {
-                engine.timers.insert(
+                engine.scheduler.timers.insert(
                     format!("timer-{index}"),
                     Timer {
                         fires_at: now + Duration::from_secs(30),
@@ -9673,7 +9905,10 @@ mod tests {
         let (mut backend, _) = FakeBackend::new(enter_normal());
         engine.run(&mut backend).unwrap();
 
-        assert!(engine.timers.is_empty(), "idle's timer outlived idle");
+        assert!(
+            engine.scheduler.timers.is_empty(),
+            "idle's timer outlived idle"
+        );
     }
 
     #[test]
@@ -9822,8 +10057,8 @@ mod tests {
     #[test]
     fn bootstrap_registration_compiles_binding_tables_once() {
         let config = Config::default();
-        let modes = crate::modes::built_in(&config);
-        let plugins = crate::plugins::bundled(&config).unwrap();
+        let modes = crate::app::mode_catalog::built_in(&config);
+        let plugins = crate::app::mode_catalog::bundled_plugins(&config).unwrap();
         let mut engine = Engine::new(config, Appearance::Dark);
 
         for mode in modes {
@@ -9901,7 +10136,7 @@ mod tests {
             2,
             "the release must still arrive: {log:?}"
         );
-        assert!(engine.active_gestures.is_empty());
+        assert!(engine.input.active_gestures.is_empty());
     }
 
     #[test]
@@ -9933,7 +10168,7 @@ mod tests {
             2,
             "switching modes should release the gesture: {log:?}"
         );
-        assert!(engine.active_gestures.is_empty());
+        assert!(engine.input.active_gestures.is_empty());
         assert_eq!(engine.active_mode().as_str(), "idle");
     }
 
@@ -10121,7 +10356,7 @@ mod tests {
             .unwrap();
         std::fs::write(&path, "not valid toml = [").unwrap();
         assert!(engine.reload_config(&mut backend).is_err());
-        assert_eq!(engine.pending_long_press_toggles.len(), 1);
+        assert_eq!(engine.input.pending_long_press_toggles.len(), 1);
         assert_eq!(
             log.lock().unwrap().buttons,
             [(MouseButton::Left, ButtonAction::Press)]
@@ -10130,8 +10365,8 @@ mod tests {
         config.pointer.initial_speed = 456.0;
         std::fs::write(&path, config.to_toml().unwrap()).unwrap();
         engine.reload_config(&mut backend).unwrap();
-        assert!(engine.pending_long_press_toggles.is_empty());
-        assert!(engine.latched.is_empty());
+        assert!(engine.input.pending_long_press_toggles.is_empty());
+        assert!(engine.input.latched.is_empty());
         assert_eq!(engine.config.pointer.initial_speed, 456.0);
         assert_eq!(
             log.lock().unwrap().buttons,

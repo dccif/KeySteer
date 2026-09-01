@@ -2,7 +2,7 @@
 
 use crate::api::Key;
 use crate::config::{Config, ConfigStore};
-use crate::{Engine, modes, platform, plugins};
+use crate::{Engine, platform};
 
 use super::cli::CliOptions;
 
@@ -104,8 +104,7 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
         return doctor(&config);
     }
 
-    let built_in_modes = modes::built_in(&config);
-    let bundled_plugins = plugins::bundled(&config)?;
+    let plan = super::configuration::compile(&config)?;
     let store = if let Some(config_path) = config_path {
         Some(
             match config_source {
@@ -120,7 +119,7 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
 
     let mut backend = platform::backend_for_ui_scan(config.ui_hint.strategy)?;
     crate::support::perf_probe::mark("backend_created");
-    let mut engine = Engine::new(config, backend.appearance());
+    let mut engine = Engine::from_plan(config, plan, backend.appearance())?;
     if let Some(store) = store {
         if rediscover_config_on_reload {
             if let Some(directory) = crate::app::paths::data_dir() {
@@ -130,15 +129,6 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
             }
         } else {
             engine.attach_config_store(store);
-        }
-    }
-
-    for mode in built_in_modes {
-        engine.register_deferred(mode);
-    }
-    for plugin in bundled_plugins {
-        if let Err(error) = engine.register_plugin_dyn_deferred(plugin) {
-            crate::report_warning!("plugin", "skipping plugin: {error}");
         }
     }
 

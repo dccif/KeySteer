@@ -5,6 +5,8 @@
 mod bootstrap;
 mod cli;
 pub(crate) mod config_simulator;
+pub mod configuration;
+pub mod mode_catalog;
 pub(crate) mod paths;
 
 pub use cli::{prepare_console_for_cli, run_cli};

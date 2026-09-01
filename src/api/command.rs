@@ -5,7 +5,6 @@
 //! [`Command`]s. It never touches a platform API, which is what makes the
 //! built-in modes and third-party plugins interchangeable.
 
-use std::any::Any;
 use std::iter::FusedIterator;
 use std::ops::Index;
 use std::sync::Arc;
@@ -493,9 +492,6 @@ pub enum ModeEvent {
     /// by the runtime so animation and movement stay independent of display
     /// refresh rate and scheduler jitter.
     Timer { id: String, elapsed: Duration },
-
-    /// The configuration was reloaded; re-read anything cached.
-    ConfigReloaded,
 }
 
 /// Identity of the focused application, for per-app configuration.
@@ -604,27 +600,6 @@ pub struct UiScanResult {
     pub status: UiScanStatus,
 }
 
-/// Type-erased, read-only application settings exposed to modes.
-///
-/// The public API does not depend on a concrete configuration format. Built-in
-/// modes may downcast to the host's settings type during reconfiguration, while
-/// third-party plugins can remain independent of it.
-pub trait HostSettings: Any + Send + Sync {
-    fn as_any(&self) -> &dyn Any;
-}
-
-impl<T: Any + Send + Sync> HostSettings for T {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-impl dyn HostSettings + '_ {
-    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
-        self.as_any().downcast_ref()
-    }
-}
-
 /// Read-only view of host state, passed to a mode on every dispatch.
 #[derive(Clone)]
 pub struct HostContext<'a> {
@@ -632,7 +607,6 @@ pub struct HostContext<'a> {
     pub cursor: Point,
     pub focused_app: Option<&'a FocusedApp>,
     pub palette: &'a Palette,
-    pub config: &'a dyn HostSettings,
 }
 
 impl std::fmt::Debug for HostContext<'_> {
@@ -643,7 +617,6 @@ impl std::fmt::Debug for HostContext<'_> {
             .field("cursor", &self.cursor)
             .field("focused_app", &self.focused_app)
             .field("palette", &self.palette)
-            .field("config", &"<host settings>")
             .finish()
     }
 }
@@ -694,6 +667,17 @@ pub trait Mode: Send {
     /// host swallows keys instead of passing them to the focused app — which
     /// is what grid and hint modes need, and idle does not.
     fn captures_keyboard(&self) -> bool {
+        true
+    }
+
+    /// Whether an otherwise-unbound physical key belongs to this mode's own
+    /// input alphabet.
+    fn claims_key(&self, _key: &Key) -> bool {
+        false
+    }
+
+    /// Whether pointer motion should be delivered to this mode.
+    fn wants_pointer_events(&self) -> bool {
         true
     }
 

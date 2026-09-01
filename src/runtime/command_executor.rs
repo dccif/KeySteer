@@ -68,15 +68,15 @@ impl Engine {
         commands: impl IntoIterator<Item = Command>,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
-        self.command_batch_depth += 1;
+        self.overlay.command_batch_depth += 1;
         let result = self.execute_commands(owner, commands, backend);
-        self.command_batch_depth -= 1;
+        self.overlay.command_batch_depth -= 1;
 
         if result.is_err() {
-            self.pending_overlay = None;
+            self.overlay.pending = None;
             return result;
         }
-        if self.command_batch_depth == 0 {
+        if self.overlay.command_batch_depth == 0 {
             self.flush_pending_overlay(backend)?;
         }
         Ok(())
@@ -90,9 +90,9 @@ impl Engine {
     ) -> Result<(), String> {
         for command in commands {
             let trace_command = if matches!(&command, Command::MovePointer { .. }) {
-                self.config.debug.motion
+                self.settings.debug.motion
             } else {
-                self.config.debug.actions
+                self.settings.debug.actions
             };
             self.trace_lazy(trace_command, "command", || {
                 format!("owner={owner} active={} command={command:?}", self.active)
@@ -133,7 +133,7 @@ impl Engine {
                         return Err(self.recoverable_input_error("pointer movement", error));
                     }
                     self.recoverable_input_succeeded();
-                    self.trace_lazy(self.config.debug.motion, "backend", || {
+                    self.trace_lazy(self.settings.debug.motion, "backend", || {
                         format!(
                             "move_pointer requested=({dx:.3},{dy:.3}) actual=({actual_dx:.3},{actual_dy:.3}): ok"
                         )
@@ -157,7 +157,7 @@ impl Engine {
                         return Err(self.recoverable_input_error("pointer warp", error));
                     }
                     self.recoverable_input_succeeded();
-                    self.trace_lazy(self.config.debug.motion, "backend", || {
+                    self.trace_lazy(self.settings.debug.motion, "backend", || {
                         format!("warp_pointer x={:.3} y={:.3}: ok", to.x, to.y)
                     });
                     self.cursor = to;
@@ -178,25 +178,24 @@ impl Engine {
                 }
                 Command::RestartMode => self.restart_active(backend)?,
                 Command::Scroll { dx, dy } => {
-                    let (invert_horizontal, invert_vertical) =
-                        self.config.effective_scroll_invert();
+                    let (invert_horizontal, invert_vertical) = self.settings.invert_scroll;
                     let dx = dx * if invert_horizontal { -1.0 } else { 1.0 };
                     let dy = dy * if invert_vertical { -1.0 } else { 1.0 };
                     if let Err(error) = backend.scroll(dx, dy) {
                         return Err(self.recoverable_input_error("scroll", error));
                     }
                     self.recoverable_input_succeeded();
-                    self.trace_lazy(self.config.debug.backend, "backend", || {
+                    self.trace_lazy(self.settings.debug.backend, "backend", || {
                         format!("scroll dx={dx:.3} dy={dy:.3}: ok")
                     });
                 }
                 Command::SetFrameClock(active) => {
-                    self.frame_clock_owner = active.then(|| owner.clone());
+                    self.scheduler.frame_clock_owner = active.then(|| owner.clone());
                     if let Err(error) = backend.set_frame_clock(active) {
-                        self.frame_clock_owner = None;
+                        self.scheduler.frame_clock_owner = None;
                         // A platform without a native display link retains
                         // keyboard-repeat movement as its compatibility path.
-                        self.trace_lazy(self.config.debug.backend, "backend", || {
+                        self.trace_lazy(self.settings.debug.backend, "backend", || {
                             format!("set_frame_clock active={active}: {error}")
                         });
                     }
@@ -214,7 +213,9 @@ impl Engine {
                 }
                 Command::SendChord { keys } => {
                     if let Err(error) = backend.send_chord(&keys) {
-                        self.latched.extend(keys.into_iter().map(InputTarget::Key));
+                        self.input
+                            .latched
+                            .extend(keys.into_iter().map(InputTarget::Key));
                         return Err(self.recoverable_input_error("keyboard chord", error));
                     }
                     crate::support::perf_probe::mark("injection_executed");
@@ -227,7 +228,7 @@ impl Engine {
                         .bounds
                         .unwrap_or_else(|| self.context().active_bounds());
                     let roles = if request.roles.is_empty() {
-                        self.config.ui_hint.clickable_roles.clone()
+                        self.settings.default_scan_roles.clone()
                     } else {
                         request.roles
                     };
@@ -278,7 +279,7 @@ impl Engine {
                     repeating,
                 } => {
                     let now = Instant::now();
-                    self.timers.insert(
+                    self.scheduler.timers.insert(
                         id.clone(),
                         Timer {
                             fires_at: now + delay,
@@ -287,13 +288,13 @@ impl Engine {
                             owner: owner.clone(),
                         },
                     );
-                    self.trace_lazy(self.config.debug.timers, "timer", || {
+                    self.trace_lazy(self.settings.debug.timers, "timer", || {
                         format!("set id={id:?} owner={owner} delay={delay:?} repeating={repeating}")
                     });
                 }
                 Command::CancelTimer { id } => {
-                    self.timers.remove(&id);
-                    self.trace_lazy(self.config.debug.timers, "timer", || {
+                    self.scheduler.timers.remove(&id);
+                    self.trace_lazy(self.settings.debug.timers, "timer", || {
                         format!("cancel id={id:?} owner={owner}")
                     });
                 }
@@ -306,8 +307,7 @@ impl Engine {
                         .and_then(|store| store.set(&path, &value).map_err(|e| e.to_string()));
                     match update {
                         Ok(config) => {
-                            self.apply_config(config)?;
-                            self.notify_config_reloaded(backend)?;
+                            self.apply_config_and_restart(config, backend)?;
                         }
                         Err(error) => {
                             return Err(format!(

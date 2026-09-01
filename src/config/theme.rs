@@ -7,39 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::backend::Appearance;
 use crate::api::overlay::Color;
-pub use crate::api::theme::Palette;
-
-/// A color that may differ between light and dark appearance.
-///
-/// Accepts either a bare string or `{ light = "...", dark = "..." }`, matching
-/// neru's documented forms.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum ThemedColor {
-    Both(String),
-    PerAppearance { light: String, dark: String },
-}
-
-impl ThemedColor {
-    /// Whether every configured appearance uses canonical `#RRGGBBAA`.
-    pub fn is_valid(&self) -> bool {
-        match self {
-            Self::Both(value) => Color::parse(value).is_some(),
-            Self::PerAppearance { light, dark } => {
-                Color::parse(light).is_some() && Color::parse(dark).is_some()
-            }
-        }
-    }
-
-    pub fn resolve(&self, appearance: Appearance) -> Option<Color> {
-        let raw = match (self, appearance) {
-            (Self::Both(s), _) => s,
-            (Self::PerAppearance { light, .. }, Appearance::Light) => light,
-            (Self::PerAppearance { dark, .. }, Appearance::Dark) => dark,
-        };
-        Color::parse(raw)
-    }
-}
+pub use crate::api::theme::{Palette, ThemedColor};
 
 /// The five base colors, as documented for `[theme.light]` / `[theme.dark]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

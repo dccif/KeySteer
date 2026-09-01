@@ -14,9 +14,6 @@ use super::binding::Binding;
 use super::command::Mode;
 use super::input::KeyChord;
 
-/// Version of the mode/command vocabulary. Bumped on breaking changes.
-pub const API_VERSION: u32 = 8;
-
 /// Metadata describing a plugin to the host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
@@ -24,8 +21,6 @@ pub struct Manifest {
     pub id: String,
     pub name: String,
     pub description: String,
-    /// Must equal [`API_VERSION`].
-    pub api_version: u32,
     /// Legacy chords that activate the plugin mode directly.
     pub default_chords: Vec<KeyChord>,
     /// Parameterized verbs routed to this plugin while any mode is active.
@@ -41,7 +36,6 @@ impl Manifest {
             id: id.into(),
             name: name.into(),
             description: String::new(),
-            api_version: API_VERSION,
             default_chords: Vec::new(),
             verbs: Vec::new(),
             default_bindings: Vec::new(),
@@ -69,12 +63,6 @@ impl Manifest {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.api_version != API_VERSION {
-            return Err(format!(
-                "plugin {} targets API v{}, host provides v{API_VERSION}",
-                self.id, self.api_version
-            ));
-        }
         if self.id.is_empty()
             || !self
                 .id
@@ -104,13 +92,6 @@ pub trait Plugin: Mode {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn rejects_mismatched_api_version() {
-        let mut m = Manifest::new("com.example.a", "A");
-        m.api_version = API_VERSION + 1;
-        assert!(m.validate().is_err());
-    }
 
     #[test]
     fn rejects_ids_with_spaces() {

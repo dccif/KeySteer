@@ -6,12 +6,12 @@
 //! configuration stays valid, that the five modes fit together, and that a
 //! plugin is treated exactly like a built-in mode.
 
+use keysteer::Engine;
 use keysteer::api::{
     Appearance, Binding, Command, Direction, HostContext, KeyChord, Mode, ModeEvent, ModeId, Point,
     Rect, Screen, UiScanStrategy,
 };
 use keysteer::config::{Config, LifecycleAction, TargetingLifecycle};
-use keysteer::{Engine, modes, plugins};
 
 fn screens() -> Vec<Screen> {
     vec![Screen {
@@ -328,13 +328,16 @@ fn the_shipped_config_uses_no_action_prefix() {
 
 #[test]
 fn defaults_and_shipped_config_agree_on_mode_availability() {
-    let ids: Vec<ModeId> = modes::built_in(&shipped()).iter().map(|m| m.id()).collect();
+    let ids: Vec<ModeId> = keysteer::app::mode_catalog::built_in(&shipped())
+        .iter()
+        .map(|m| m.id())
+        .collect();
     assert_eq!(ids.len(), 5, "expected all five modes: {ids:?}");
 }
 
 #[test]
 fn idle_and_default_normal_let_unbound_keys_reach_the_focused_app() {
-    for mode in modes::built_in(&Config::default()) {
+    for mode in keysteer::app::mode_catalog::built_in(&Config::default()) {
         let expected = !matches!(mode.id().as_str(), "idle" | "normal");
         assert_eq!(
             mode.captures_keyboard(),
@@ -349,10 +352,10 @@ fn idle_and_default_normal_let_unbound_keys_reach_the_focused_app() {
 fn plugins_register_through_the_same_path_as_built_ins() {
     let config = Config::default();
     let mut engine = Engine::new(config.clone(), Appearance::Dark);
-    for mode in modes::built_in(&config) {
+    for mode in keysteer::app::mode_catalog::built_in(&config) {
         engine.register(mode);
     }
-    for plugin in plugins::bundled(&config).unwrap() {
+    for plugin in keysteer::app::mode_catalog::bundled_plugins(&config).unwrap() {
         engine.register_plugin_dyn(plugin).unwrap();
     }
 
@@ -370,10 +373,10 @@ fn a_plugin_chord_is_bound_in_normal_like_any_other_mode() {
     // A plugin's suggested chord must land in the table the user works in.
     let config = Config::default();
     let mut engine = Engine::new(config.clone(), Appearance::Dark);
-    for mode in modes::built_in(&config) {
+    for mode in keysteer::app::mode_catalog::built_in(&config) {
         engine.register(mode);
     }
-    for plugin in plugins::bundled(&config).unwrap() {
+    for plugin in keysteer::app::mode_catalog::bundled_plugins(&config).unwrap() {
         engine.register_plugin_dyn(plugin).unwrap();
     }
 
@@ -400,10 +403,10 @@ fn a_users_binding_beats_a_plugins_suggestion() {
         .insert("alt+s".into(), Binding::parse("move_left").unwrap());
 
     let mut engine = Engine::new(config.clone(), Appearance::Dark);
-    for mode in modes::built_in(&config) {
+    for mode in keysteer::app::mode_catalog::built_in(&config) {
         engine.register(mode);
     }
-    for plugin in plugins::bundled(&config).unwrap() {
+    for plugin in keysteer::app::mode_catalog::bundled_plugins(&config).unwrap() {
         engine.register_plugin_dyn(plugin).unwrap();
     }
 
@@ -422,7 +425,7 @@ fn every_targeting_mode_returns_to_idle_on_escape() {
     let screens = screens();
     let palette = config.palette(Appearance::Dark);
 
-    for mut mode in modes::built_in(&config) {
+    for mut mode in keysteer::app::mode_catalog::built_in(&config) {
         // idle has nowhere to go; normal's escape is the engine's job.
         if mode.id() == ModeId::idle() || mode.id() == ModeId::normal() {
             continue;
@@ -432,7 +435,6 @@ fn every_targeting_mode_returns_to_idle_on_escape() {
             cursor: Point::new(960.0, 540.0),
             focused_app: None,
             palette: &palette,
-            config: &config,
         };
 
         mode.handle(&ModeEvent::Activated { previous: None }, &ctx);
@@ -462,10 +464,9 @@ fn a_grid_overlay_covers_the_active_screen_at_any_scale() {
         cursor: Point::new(960.0, 540.0),
         focused_app: None,
         palette: &palette,
-        config: &config,
     };
 
-    let mut grid = modes::GridMode::new(&config);
+    let mut grid = keysteer::app::mode_catalog::grid(&config);
     let out = grid.handle(&ModeEvent::Activated { previous: None }, &ctx);
 
     let scene = out

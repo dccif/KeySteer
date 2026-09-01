@@ -1,3 +1,4 @@
+#[cfg(test)]
 use super::labeling::Hint;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -7,6 +8,7 @@ pub enum Match<T> {
     None,
 }
 
+#[cfg(test)]
 pub fn match_input<T: Clone>(hints: &[Hint<T>], input: &str) -> Match<T> {
     if input.is_empty() {
         return Match::Partial {

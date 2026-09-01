@@ -15,8 +15,10 @@ pub mod command;
 pub mod geometry;
 pub mod hint;
 pub mod input;
+pub mod lifecycle;
 pub mod overlay;
 pub mod plugin;
+pub mod style;
 pub mod theme;
 
 pub use autostart::Autostart;
@@ -28,16 +30,20 @@ pub use binding::{
     ScrollAmount, Speed,
 };
 pub use command::{
-    ButtonAction, Command, CommandBatch, FinishCause, FocusedApp, HostContext, HostSettings, Mode,
-    ModeEvent, MouseButton, UiScanRequest, UiScanResult, UiScanStatus, UiScanStrategy,
-    VisionOptions,
+    ButtonAction, Command, CommandBatch, FinishCause, FocusedApp, HostContext, Mode, ModeEvent,
+    MouseButton, UiScanRequest, UiScanResult, UiScanStatus, UiScanStrategy, VisionOptions,
 };
 pub use geometry::{Point, Rect, Screen, UiTarget};
 pub use hint::LabelDirection;
 pub use input::{InputEvent, Key, KeyChord, KeyState, ModeId};
+pub use lifecycle::{LifecycleAction, TargetingLifecycle};
 pub use overlay::{
     Color, Indicator, LabelStyle, OverlayLabel, OverlayScene, OverlayShape, OverlayText, Placement,
     SharedLabelStyle,
 };
-pub use plugin::{API_VERSION, Manifest, Plugin};
-pub use theme::Palette;
+pub use plugin::{Manifest, Plugin};
+pub use style::{
+    Anchor, BoundaryHighlight, CursorIndicatorOverride, CursorIndicatorUi, HintPlacement,
+    IndicatorUi, IndicatorUiOverride, LabelUi, ModeIndicator, ModeIndicatorEntry, SearchInputUi,
+};
+pub use theme::{Palette, ThemedColor};

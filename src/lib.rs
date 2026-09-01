@@ -39,5 +39,5 @@ pub use api::{
     FinishCause, HostContext, Key, KeyChord, Mode, ModeEvent, ModeId, OverlayScene, Point, Rect,
     Screen,
 };
-pub use config::{Config, ConfigError, Palette, Theme};
+pub use config::{Config, ConfigError, ConfigFile, Palette, Theme};
 pub use engine::Engine;

@@ -12,11 +12,18 @@ pub mod builtin;
 pub use builtin::ScreenSelector;
 
 use crate::api::Plugin;
-use crate::config::Config;
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundledSettings {
+    pub key_aliases: BTreeMap<String, String>,
+    pub screen_selector_preserve: bool,
+}
 
 /// Instantiate the bundled plugins.
-pub fn bundled(config: &Config) -> Result<Vec<Box<dyn Plugin>>, String> {
-    Ok(vec![Box::new(ScreenSelector::with_key_aliases(
-        config.resolved_key_aliases(),
+pub fn bundled(settings: BundledSettings) -> Result<Vec<Box<dyn Plugin>>, String> {
+    Ok(vec![Box::new(ScreenSelector::with_settings(
+        &settings.key_aliases,
+        settings.screen_selector_preserve,
     )?)])
 }
