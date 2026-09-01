@@ -83,9 +83,9 @@ Engine 的 Frame、指针、按键等通用热路径直接调用借用式 `Mode:
 
 `RuntimePlan` 不再分别保存 route、Mode 和 Plugin 三套可失配集合。每个 `ModeSpec` 原子包含
 实例、`ModeRoute` 和实例种类；Engine 安装计划时从同一项建立 registry slot、路由和插件
-manifest/default binding。`mode_registry.rs` 负责注册、查找、活动 slot、modal stack 和生命周期
-分派；`mode_routes.rs` 负责路由编译，`mode_runtime.rs` 负责 Mode 输出编排。输入、scheduler 和
-overlay 的状态分别只存于 `InputState`、`Scheduler` 与 `OverlayCoordinator`。
+manifest/default binding。`registry.rs` 将 Mode 注册、查找、路由编译、事件分派和生命周期放在同一
+模块中，避免同一模式子系统横跨多个只包含 `impl Engine` 的文件。输入、scheduler 和 overlay
+的状态分别只存于 `InputState`、`Scheduler` 与 `OverlayCoordinator`。
 
 绑定表只在配置、模式注册或实际生效的 per-app override profile 变化时重建。仅窗口标题
 变化但合并后的绑定不变，不应触发表重编译。
@@ -171,6 +171,18 @@ GitHub 不可用时从 jsDelivr 版本元数据选择最高稳定 SemVer。回�
 drop request-scoped Agent 及原生 TLS 连接。Windows 提示在线程内使用同线程临时 owner，
 关闭后销毁 owner 并结束线程；macOS 提示保持非 modal，OK action 关闭窗口并释放唯一 retained
 Alert。不得累积更新 worker、弹窗或连接。它不是启动任务，也没有定时轮询。
+Windows 使用更新器专用的已签名原始 EXE，macOS 继续使用 ZIP；公共下载器按目标平台检查
+`MZ`/ZIP 文件头、GitHub 提供的大小和 SHA-256。Windows 用户确认安装后，平台私有
+`update_installer` 校验大小、PE 架构、Windows 版本资源和 Authenticode 文件摘要，并要求
+候选与当前进程的叶代码签名证书 SHA-256 指纹一致。完整系统信任链成功时直接接受；自签证书
+仅允许 `CERT_E_UNTRUSTEDROOT` 这一种失败，并且仍须与当前 EXE 指纹相同，其他摘要、过期、
+撤销或链错误全部拒绝。下载文件验证通过后以受限大小复制到安装目录同卷临时文件，并对暂存
+副本重复校验；签名
+临时 helper 打开父进程并完成握手后，tray 才发送普通 `Quit`，因此所有 Hook、合成输入、扫描和
+overlay 仍走 Engine 的有序 shutdown。helper 使用 `ReplaceFileW` 保存旧 EXE，启动新版本并等到
+Engine 已完成初始环境、路由和 Idle 激活后的第一次 backend poll；启动失败或超时必须杀掉候选、
+原子恢复旧 EXE 并重启旧版本。当前或候选未签名、签名无效、签名者不同、安装目录不可写时
+不得修改当前 EXE，只保留手动安装入口。macOS 仍只下载并交给用户手动替换。
 更新 worker 使用 512 KiB 临时栈；`ureq` 显式编译完整的 `native-tls` HTTPS connector，
 macOS 整个 worker 运行在 autorelease pool 内，结束时集中释放原生临时对象。
 两端 Backend 持有更新任务的 cancel token，并通过公共 `WorkerJoin` 管理完成通知和
@@ -187,7 +199,7 @@ macOS 更新事件在 Hook 有界队列忙时转入 fallback channel，后台线
 
 ## 可恢复输入失败
 
-合成输入在 Windows 高权限窗口等环境可能因权限被拒绝。`command_executor.rs` 把这类
+合成输入在 Windows 高权限窗口等环境可能因权限被拒绝。`runtime/mod.rs` 的命令执行路径把这类
 错误记录为 crate-private `RuntimeError::RecoverableInput`，Engine 按类型而非错误字符串
 前缀决定是否恢复；平台文字即使包含相同内容也不能误触发。公开接口仍返回兼容的
 `String`。恢复时 Engine 会：

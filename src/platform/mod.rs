@@ -58,6 +58,11 @@ pub(crate) fn run_internal_wechat_ocr_helper(
 }
 
 #[cfg(target_os = "windows")]
+pub(crate) fn run_internal_update_helper() -> Option<Result<(), String>> {
+    windows::run_internal_update_helper()
+}
+
+#[cfg(target_os = "windows")]
 pub(crate) fn windows_vision_diagnostics() -> Vec<String> {
     windows::vision_diagnostics()
 }

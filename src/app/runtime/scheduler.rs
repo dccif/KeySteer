@@ -1,4 +1,4 @@
-//! Runtime responsibility extracted from the Engine composition root.
+//! Timer and delayed-sequence state, deadline calculation, and due-work dispatch.
 
 use super::*;
 

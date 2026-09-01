@@ -4,9 +4,9 @@
 
 | 需求 | 主修改点 | 通常还要检查 |
 | --- | --- | --- |
-| 新增/修改动作 verb | `src/api/binding.rs` | `command_executor.rs`、default TOML、配置文档、模拟器分类 |
+| 新增/修改动作 verb | `src/api/binding.rs` | `src/app/runtime/mod.rs`、default TOML、配置文档、模拟器分类 |
 | 修改按键匹配/别名 | `src/api/input.rs`, `src/config/aliases.rs` | `input_router.rs`、integration tests、网页 `bindings.ts` |
-| 修改模式切换 | `src/app/runtime/mod.rs`, `mode_registry.rs`, `mode_runtime.rs` | `command_executor.rs`、所有 Mode 的 Activated/Deactivated |
+| 修改模式切换 | `src/app/runtime/registry.rs` | `src/app/runtime/mod.rs`、所有 Mode 的 Activated/Deactivated |
 | 修改 Finish/click 语义 | `src/modes/targeting.rs` + targeting Mode | 生命周期验证、Engine semantic Clicked tests |
 | 修改 Normal 移动 | `src/modes/normal.rs` | 两端 frame clock、pointer config、实机手感 |
 | 修改 Grid 绘制 | `src/modes/grid.rs` | overlay API、两端 overlay、default style |
@@ -16,8 +16,9 @@
 | 修改 macOS 扫描 | `platform/macos/ui_scan.rs` + AX/Vision | 权限、单 worker、Objective-C bridge、macOS 14 |
 | 修改覆盖层性能 | 两端 `overlay.rs` | `OverlayScene` equality、dismiss 内存、DPI/Retina |
 | 修改托盘/顶部状态图标或开机启动 | 两端 `status_item.rs`/`autostart.rs` | `BackendEvent`、打包应用身份、平台 backend 生命周期 |
+| 修改 Windows 自动更新/签名 | `platform/windows/update_installer/`, `packaging/windows/` | 有序 Quit、同签名者、同卷 ReplaceFile、ready/rollback、CI secrets |
 | 修改配置路径 | `app/paths.rs`, `config::discover` | packaged app 与 portable tests、README |
-| 修改打包 | `packaging/<os>/`、`build.rs` | CI + release matrix、图标/签名、仅发布平台 ZIP |
+| 修改打包 | `packaging/<os>/`、`build.rs` | CI + release matrix、图标/签名、平台 ZIP + Windows 更新器 EXE |
 | 修改网页模拟器 | `docs/.vitepress/components/ConfigStudio.tsx` | style controls、Node tests、typecheck/build |
 
 ## 跨层改动顺序

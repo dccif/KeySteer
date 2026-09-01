@@ -83,9 +83,17 @@ may open File Explorer instead of preserving the complete URL for the default br
 | `wechat_ocr.rs` | 微信 OCR 自动发现、PE 校验、WIC PNG 与隐藏 helper IPC |
 | `frame_clock.rs` | `DwmFlush` 合成帧 |
 | `status_item.rs` | notification-area 图标、菜单、非阻塞更新提示和网页打开请求 |
+| `update_installer/` | Authenticode 同签名者校验、候选暂存、临时 helper、原子替换、ready/rollback |
 | `autostart.rs` | 当前用户登录启动注册表项 |
 | `system_events.rs` | foreground/display/appearance 变化 |
 | `console_control.rs` | 控制台关闭和进程退出事件 |
+
+Windows 自动安装要求当前 EXE 与候选 EXE 的 Authenticode 摘要有效且叶证书 SHA-256 指纹
+完全相同；仅自签根不受系统信任时可以接受 `CERT_E_UNTRUSTEDROOT`，不接受其他 trust failure，
+因此用户不需要安装自签证书。临时 helper 是当前已签名 EXE 的字节副本，以隐藏内部参数启动；内部 helper
+和微信 OCR helper 都不得附加控制台。父进程握手完成前不能发送 Quit，第一次 backend poll
+之前不能发 ready。替换、备份和候选位于同一卷，`ReplaceFileW` 失败或 ready 超时不得留下
+半更新状态；用户配置和 `keysteer.default.toml` 不参与替换。
 
 ### 权限边界
 

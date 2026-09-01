@@ -1,5 +1,9 @@
 # Release notes
 
+## 0.9.13
+
+Reorganized the internal configuration, mode, and runtime boundaries and optimized large UI Hint label batches without changing matching, occlusion, or display-layer switching semantics. Signed Windows releases can now verify the same publisher, replace and restart automatically after downloading, and restore the previous version if startup fails.
+
 ## 0.9.12
 
 Fixed UI Hint visual recognition failures, missing top status icons, and hints appearing for off-screen list items on macOS.

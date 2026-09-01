@@ -82,7 +82,7 @@ pnpm docs:build
 1. 在 `src/api/binding.rs` 修改解析、规范化和序列化。
 2. 为合法输入、错误输入和数组顺序增加测试。
 3. 更新 `keysteer.default.toml`、[模式与动作](/reference/modes-and-actions) 和配置模拟器需要展示的动作分类。
-4. 检查 `src/app/runtime/command_executor.rs` 中的命令执行分支、配置编译和集成测试。
+4. 检查 `src/app/runtime/mod.rs` 中的命令执行分支、配置编译和集成测试。
 
 ### 改 Mode
 

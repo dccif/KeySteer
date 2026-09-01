@@ -12,9 +12,8 @@
 //! partial config file is valid.
 
 mod aliases;
-mod modes;
+mod settings;
 pub mod store;
-pub mod style;
 pub mod theme;
 mod validation;
 
@@ -32,19 +31,19 @@ use crate::api::input::{
 
 pub use crate::api::hint::LabelDirection;
 pub use crate::api::lifecycle::{LifecycleAction, TargetingLifecycle};
+pub use crate::api::style::{
+    Anchor, BoundaryHighlight, CursorIndicatorOverride, CursorIndicatorUi, HintPlacement,
+    IndicatorUi, IndicatorUiOverride, LabelUi, ModeIndicator, ModeIndicatorEntry, SearchInputUi,
+};
 pub use aliases::KeyAliases;
 use aliases::{
     compile_key_aliases, normalize_binding_keys, normalize_key_if_aliased, normalize_key_list,
     platform_warning,
 };
-pub use modes::{
+pub use settings::{
     Grid, GridLayer, GridUi, Normal, Pointer, RecursiveGrid, RecursiveGridUi, Scroll, UiHint,
 };
 pub use store::{ConfigStore, ReplaceFile};
-pub use style::{
-    Anchor, BoundaryHighlight, CursorIndicatorOverride, CursorIndicatorUi, HintPlacement,
-    IndicatorUi, IndicatorUiOverride, LabelUi, ModeIndicator, ModeIndicatorEntry, SearchInputUi,
-};
 pub use theme::{Palette, Theme, ThemeColors, ThemedColor};
 
 /// A binding table: chord text -> what it does.

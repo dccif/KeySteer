@@ -513,4 +513,3 @@ fn follow_binding_is_dispatched_once_to_the_active_mode() {
         "follow must be a single mode binding, got {log:?}"
     );
 }
-

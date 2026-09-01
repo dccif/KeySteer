@@ -1,8 +1,10 @@
 #![cfg(test)]
 
+use super::input_router::CompiledKeymap;
 use super::*;
 use crate::TEST_ALLOCATOR;
 use crate::api::CommandBatch;
+use crate::api::Mode;
 use crate::api::binding::Direction;
 use crate::api::geometry::Rect;
 use crate::api::input::InputEvent;

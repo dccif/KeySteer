@@ -1,4 +1,4 @@
-//! TOML DTOs for built-in mode sections.
+//! TOML settings DTOs for built-in mode sections.
 
 use serde::{Deserialize, Serialize};
 

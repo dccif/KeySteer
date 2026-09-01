@@ -536,17 +536,36 @@ pub(super) fn present_update_result(result: &UpdateCheckResult) -> Result<(), St
                 } => show_message(
                         "KeySteer Update",
                         &format!(
-                            "KeySteer {latest} was downloaded successfully.\n\nSaved to:\n{}\n\nQuit KeySteer, extract the ZIP, and replace version {current} when ready.\n\nOpen the download folder now?",
+                            "KeySteer {latest} was downloaded successfully.\n\nThe updater will verify the new executable's signature and require the same publisher certificate as KeySteer {current}, then restart KeySteer. If startup fails, the previous version is restored.\n\nInstall and restart now?\n\nDownloaded to:\n{}",
                             path.display()
                         ),
                         false,
                         true,
                     )
-                    .and_then(|open| {
-                        if open {
-                            open_download_folder(&path)
-                        } else {
-                            Ok(())
+                    .and_then(|install| {
+                        if !install {
+                            return Ok(());
+                        }
+                        match super::update_installer::prepare_and_launch(&path, &latest) {
+                            Ok(()) => {
+                                emit(BackendEvent::Quit);
+                                Ok(())
+                            }
+                            Err(error) => show_message(
+                                "KeySteer Update",
+                                &format!(
+                                    "Automatic installation was not started, and the current KeySteer was not changed.\n\n{error}\n\nOpen the download folder for manual installation?"
+                                ),
+                                true,
+                                true,
+                            )
+                            .and_then(|open| {
+                                if open {
+                                    open_download_folder(&path)
+                                } else {
+                                    Ok(())
+                                }
+                            }),
                         }
                     }),
                 UpdateCheckResult::UpToDate { current } => show_message(

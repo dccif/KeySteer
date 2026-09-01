@@ -90,19 +90,42 @@ jobs:
           test -n "$version"
           cargo update --package keysteer --precise "$version"
 
+      - name: Prepare Windows code-signing certificate
+        shell: pwsh
+        env:
+          SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SIGNING_PFX_BASE64)) {
+            throw "WINDOWS_SIGNING_PFX_BASE64 is required for Windows release artifacts"
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP "keysteer-signing.pfx"
+          [IO.File]::WriteAllBytes(
+            $pfx,
+            [Convert]::FromBase64String($env:SIGNING_PFX_BASE64)
+          )
+          "KEYSTEER_SIGNING_PFX=$pfx" | Out-File -FilePath $env:GITHUB_ENV -Append
+
       - name: Package Windows x64
         shell: pwsh
-        run: ./packaging/windows/package.ps1 -Target x86_64-pc-windows-msvc
+        env:
+          KEYSTEER_SIGNING_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}
+          KEYSTEER_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+        run: ./packaging/windows/package.ps1 -Target x86_64-pc-windows-msvc -RequireSigning -TrustSelfSignedForBuild
 
       - name: Package Windows ARM64
         shell: pwsh
-        run: ./packaging/windows/package.ps1 -Target aarch64-pc-windows-msvc -SkipConfigCheck
+        env:
+          KEYSTEER_SIGNING_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}
+          KEYSTEER_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+        run: ./packaging/windows/package.ps1 -Target aarch64-pc-windows-msvc -SkipConfigCheck -RequireSigning -TrustSelfSignedForBuild
 
       - name: Upload Windows x64 package
         uses: actions/upload-artifact@v7
         with:
           name: KeySteer-Windows-x64
-          path: dist/x86_64-pc-windows-msvc/*.zip
+          path: |
+            dist/x86_64-pc-windows-msvc/*.zip
+            dist/x86_64-pc-windows-msvc/*.exe
           if-no-files-found: error
           retention-days: 30
 
@@ -110,7 +133,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: KeySteer-Windows-ARM64
-          path: dist/aarch64-pc-windows-msvc/*.zip
+          path: |
+            dist/aarch64-pc-windows-msvc/*.zip
+            dist/aarch64-pc-windows-msvc/*.exe
           if-no-files-found: error
           retention-days: 30
 
@@ -200,6 +225,7 @@ jobs:
         shell: bash
         run: |
           test "$(find release-assets -maxdepth 1 -name '*.zip' | wc -l)" -eq 4
+          test "$(find release-assets -maxdepth 1 -name '*.exe' | wc -l)" -eq 2
           test "$(find release-assets -maxdepth 1 -name '*.sha256' | wc -l)" -eq 0
           find release-assets -maxdepth 1 -type f -printf '%f\n' | sort
 
@@ -219,4 +245,5 @@ jobs:
             --title "KeySteer v$VERSION" \
             --generate-notes \
             --notes "$(cat release-body.md)" \
-            release-assets/*.zip
+            release-assets/*.zip \
+            release-assets/*.exe

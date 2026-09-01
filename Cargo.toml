@@ -1,6 +1,6 @@
 [package]
 name = "keysteer"
-version = "0.9.12"
+version = "0.9.13"
 authors = ["dccif"]
 edition = "2024"
 rust-version = "1.98"
@@ -138,6 +138,10 @@ features = [
     "Storage_Streams",
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+    "Win32_Security_WinTrust",
     "Win32_Graphics_Direct2D",
     "Win32_Graphics_Direct2D_Common",
     "Win32_Graphics_Direct3D",

@@ -1,5 +1,11 @@
 # 更新日志 / Release Notes
 
+## 0.9.13
+
+重整内部配置、模式与运行时边界并优化大批量 UI Hint 标签生成，在保持原有匹配、遮挡和显示层切换语义的同时减少分配；Windows 正式签名版现在支持下载后验证同一发布者、自动替换和重启，启动失败会恢复旧版本。
+
+Reorganized the internal configuration, mode, and runtime boundaries and optimized large UI Hint label batches without changing matching, occlusion, or display-layer switching semantics. Signed Windows releases can now verify the same publisher, replace and restart automatically after downloading, and restore the previous version if startup fails.
+
 ## 0.9.12
 
 修复 macOS 上 UI Hint 视觉识别失败、状态栏图标不显示、运行中撤销辅助功能权限可能造成输入卡住，以及滚动列表的窗口外元素仍生成标签的问题。

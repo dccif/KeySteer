@@ -113,6 +113,9 @@ Open the [Configuration & Simulator](/en/editor/) to view the keyboard, edit bin
 <summary><strong>Status menu, diagnostics, and configuration locations</strong></summary>
 
 Right-click the Windows tray icon or click the macOS top status icon to pause, reload configuration, send the active configuration to the web simulator, enable launch at login, check for updates, or quit.
+Signed Windows releases can install and restart after downloading. KeySteer first verifies that both
+versions use the same publisher certificate and restores the previous version if startup fails. Unsigned
+development builds and macOS downloads continue to use manual replacement.
 
 Use these commands to inspect a configuration or diagnose the environment:
 

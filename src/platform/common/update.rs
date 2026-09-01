@@ -397,7 +397,12 @@ fn release_target() -> Result<&'static str, String> {
 }
 
 fn release_asset_name(version: &Version, target: &str) -> String {
-    format!("KeySteer-v{version}-{target}.zip")
+    let extension = if target.ends_with("windows-msvc") {
+        "exe"
+    } else {
+        "zip"
+    };
+    format!("KeySteer-v{version}-{target}.{extension}")
 }
 
 fn download_release(
@@ -433,6 +438,7 @@ fn download_release(
     if let Err(direct_error) = download_and_validate(
         &url,
         partial_guard.path(),
+        target,
         release.asset.as_ref(),
         progress,
         cancel,
@@ -443,6 +449,7 @@ fn download_release(
         download_and_validate(
             &proxy_url,
             partial_guard.path(),
+            target,
             release.asset.as_ref(),
             progress,
             cancel,
@@ -464,13 +471,14 @@ fn gh_proxy_url(original: &str) -> String {
 fn download_and_validate(
     url: &str,
     path: &Path,
+    target: &str,
     asset: Option<&ReleaseAsset>,
     progress: &dyn Fn(u8),
     cancel: &AtomicBool,
 ) -> Result<(), String> {
     let receipt = download_to(url, path, asset.map(|asset| asset.size), progress, cancel)?;
     ensure_not_cancelled(cancel)?;
-    validate_zip(path)?;
+    validate_release_payload(path, target)?;
     if let Some(asset) = asset {
         if receipt.bytes != asset.size {
             return Err(format!(
@@ -588,16 +596,27 @@ fn download_percent(received: u64, total: u64) -> u8 {
     ((u128::from(received) * 100 / u128::from(total)).min(100)) as u8
 }
 
-fn validate_zip(path: &Path) -> Result<(), String> {
+fn validate_release_payload(path: &Path, target: &str) -> Result<(), String> {
     let mut file = File::open(path)
         .map_err(|error| format!("cannot validate download {}: {error}", path.display()))?;
-    let mut signature = [0_u8; 4];
-    file.read_exact(&mut signature)
-        .map_err(|error| format!("downloaded update is incomplete: {error}"))?;
-    if matches!(signature, [b'P', b'K', 3, 4] | [b'P', b'K', 5, 6]) {
-        Ok(())
+    if target.ends_with("windows-msvc") {
+        let mut signature = [0_u8; 2];
+        file.read_exact(&mut signature)
+            .map_err(|error| format!("downloaded update is incomplete: {error}"))?;
+        if signature == *b"MZ" {
+            Ok(())
+        } else {
+            Err("downloaded Windows update is not a PE executable".into())
+        }
     } else {
-        Err("downloaded update is not a valid ZIP archive".into())
+        let mut signature = [0_u8; 4];
+        file.read_exact(&mut signature)
+            .map_err(|error| format!("downloaded update is incomplete: {error}"))?;
+        if matches!(signature, [b'P', b'K', 3, 4] | [b'P', b'K', 5, 6]) {
+            Ok(())
+        } else {
+            Err("downloaded update is not a valid ZIP archive".into())
+        }
     }
 }
 
@@ -817,6 +836,10 @@ mod tests {
             release_asset_name(&Version::new(0, 5, 0), "aarch64-apple-darwin"),
             "KeySteer-v0.5.0-aarch64-apple-darwin.zip"
         );
+        assert_eq!(
+            release_asset_name(&Version::new(0, 5, 0), "x86_64-pc-windows-msvc"),
+            "KeySteer-v0.5.0-x86_64-pc-windows-msvc.exe"
+        );
     }
 
     #[test]
@@ -910,14 +933,28 @@ mod tests {
     }
 
     #[test]
-    fn invalid_download_body_is_not_accepted_as_a_zip() {
+    fn invalid_download_body_is_not_accepted_as_a_release_payload() {
         let path = std::env::temp_dir().join(format!(
             "keysteer-invalid-update-{}.zip",
             std::process::id()
         ));
         fs::write(&path, b"<html>gateway error</html>").unwrap();
 
-        assert!(validate_zip(&path).is_err());
+        assert!(validate_release_payload(&path, "aarch64-apple-darwin").is_err());
+        assert!(validate_release_payload(&path, "x86_64-pc-windows-msvc").is_err());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn platform_release_payload_magic_is_checked() {
+        let path =
+            std::env::temp_dir().join(format!("keysteer-update-magic-{}", std::process::id()));
+        fs::write(&path, b"MZpayload").unwrap();
+        assert!(validate_release_payload(&path, "aarch64-pc-windows-msvc").is_ok());
+        assert!(validate_release_payload(&path, "aarch64-apple-darwin").is_err());
+        fs::write(&path, b"PK\x03\x04payload").unwrap();
+        assert!(validate_release_payload(&path, "aarch64-apple-darwin").is_ok());
+        assert!(validate_release_payload(&path, "aarch64-pc-windows-msvc").is_err());
         fs::remove_file(path).unwrap();
     }
 

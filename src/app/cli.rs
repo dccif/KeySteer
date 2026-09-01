@@ -7,7 +7,15 @@ use std::process::ExitCode;
 /// Attach one only when command-line options explicitly request CLI behaviour.
 #[cfg(target_os = "windows")]
 pub fn prepare_console_for_cli() {
-    if std::env::args_os().len() <= 1 {
+    let first = std::env::args_os().nth(1);
+    if first.is_none()
+        || matches!(
+            first.as_deref(),
+            Some(value)
+                if value == std::ffi::OsStr::new("--internal-wechat-ocr-helper")
+                    || value == std::ffi::OsStr::new("--internal-apply-update")
+        )
+    {
         return;
     }
     crate::platform::prepare_console_for_cli();
@@ -25,6 +33,14 @@ pub(crate) struct CliOptions {
 }
 
 pub fn run_cli() -> ExitCode {
+    #[cfg(target_os = "windows")]
+    if let Some(result) = crate::platform::run_internal_update_helper() {
+        return if result.is_ok() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
     #[cfg(target_os = "windows")]
     if let Some(exit) = run_internal_wechat_helper() {
         return exit;

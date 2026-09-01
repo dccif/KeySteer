@@ -7,7 +7,7 @@
 不能静默忽略。
 
 配置内部按变化原因拆分：`mod.rs` 保留文档 schema/default 和稳定 re-export，Mode DTO 位于
-`modes.rs`，键别名规范化位于 `aliases.rs`，跨 section 约束位于 `validation.rs`，持久化位于
+`settings.rs`，键别名规范化位于 `aliases.rs`，跨 section 约束位于 `validation.rs`，持久化位于
 `store.rs`。这些模块都只描述配置文档，不实例化运行时对象。
 
 主要 section：

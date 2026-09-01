@@ -220,4 +220,3 @@ fn injected_keys_are_never_dispatched_to_modes() {
     let log = seen.lock().unwrap().clone();
     assert!(!log.iter().any(|e| e.ends_with(":key")), "{log:?}");
 }
-

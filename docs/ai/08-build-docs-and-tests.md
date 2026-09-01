@@ -55,12 +55,38 @@ GitHub 自动生成的 commit/PR notes 之前；版本条目缺失、重复或�
 `packaging/windows/package.ps1 [target]`：
 
 1. `cargo build --locked --release --target`。
-2. 复制图标已嵌入、GUI-subsystem 的 `KeySteer.exe` 与
+2. 使用 `KEYSTEER_SIGNING_PFX` + `KEYSTEER_SIGNING_PASSWORD` 或
+   `KEYSTEER_SIGNING_THUMBPRINT` 对 EXE 做 SHA-256 Authenticode 签名和 RFC 3161 时间戳，再由
+   `signtool verify /pa /all` 验证；`-RequireSigning` 禁止产生不可自动安装的正式包。
+   `-TrustSelfSignedForBuild` 只在 verify 期间把自签证书临时加入构建用户 Root，并在 finally
+   中移除，不会把 CER 放进发布包，也不要求最终用户安装证书。
+3. 复制图标已嵌入、GUI-subsystem 的 `KeySteer.exe` 与
    `keysteer.default.toml` 到 `dist/<target>/KeySteer/`。
-3. 生成包含该目录的 `dist/<target>/KeySteer-v<version>-<target>.zip`。
-4. 不生成独立 checksum 附件；面向用户的发布资产只有平台 ZIP。
+4. 生成包含该目录的 `dist/<target>/KeySteer-v<version>-<target>.zip`，并把相同的已签名 EXE
+   复制为 `KeySteer-v<version>-<target>.exe`，仅供自动更新器直接下载和验证。
+5. 不生成独立 checksum 附件；Windows 每个架构发布便携 ZIP 和更新器 EXE。
 
 支持 `x86_64-pc-windows-msvc`、`aarch64-pc-windows-msvc`。
+GitHub Windows packaging job 从 `WINDOWS_SIGNING_PFX_BASE64` 与
+`WINDOWS_SIGNING_PASSWORD` secrets 恢复短生命周期 PFX 文件并强制签名；可用
+`WINDOWS_TIMESTAMP_URL` repository variable 覆盖默认时间戳服务。两种架构必须使用同一证书，
+否则跨架构包身份会分裂。workflow 允许自签 PFX，并只在 runner 的 `signtool verify` 期间建立
+临时当前用户信任；公开受信任 CA 的证书不需要这一步。
+
+`packaging/windows/new-development-certificate.ps1` 在 `CurrentUser\\My` 创建带 Code Signing
+EKU 的可导出自签名 X.509 证书，并输出被 gitignore 的 PFX/CER。PFX 可导入 Kleopatra 做备份和
+查看，也可直接交给 SignTool；Kleopatra/OpenPGP 不是 Authenticode 签名后端。只有显式传入
+`-TrustOnThisMachine` 时脚本才把自签 CER 加入当前用户 Root，用于在本机查看系统信任效果；
+自动更新本身不需要这个开关，最终用户也不需要安装 CER。不用本机信任后应删除该 Root 条目。
+自签名证书不会让其他用户看到公开受信任的“已验证的发布者”；若需要该 Windows UI 身份，正式发布必须使用受信任 CA
+颁发的代码签名证书并保护、轮换私钥。由于自动更新固定比较当前叶证书指纹，换证前必须规划
+一次带过渡信任策略的版本，不能直接用新证书覆盖发布。
+`packaging/windows/test-authenticode-update.ps1` 使用系统 Windows PowerShell 临时创建一天有效、
+不可导出的测试证书，不加入用户信任库；它签名两个临时 EXE，运行 Rust `WinVerifyTrust`
+同证书测试，并确认被篡改的已签 EXE 会拒绝。传入 `-VerifyPackaging` 时由 package script 仅在
+`signtool verify` 期间临时加入当前用户 Root，并在工作区 `tmp/` 的隔离输出根完成构建、签名及
+x64 ZIP/更新器 EXE 验证，不污染可发布的 `dist/`；`finally` 总会删除测试证书、Root 条目和
+所有临时文件。
 
 `tools/benchmark-windows-dist.ps1 [target]` starts the unpacked
 `dist/<target>/KeySteer/KeySteer.exe` and writes in-memory startup/resource
@@ -97,7 +123,8 @@ sampling directly from an isolated A/B target directory before packaging.
 - docs job 使用 Node 24 + pnpm 10，跑 test/typecheck/build。
 
 同一 workflow 手动运行时会构建所选平台；选择 `checks` 时仅运行上述检查，选择 `all` 时，待四个平台的
-ZIP 都成功后，以 Cargo 版本创建 `v<version>` GitHub Release，并且只上传四个 ZIP。
+四个平台 ZIP 和两个 Windows 更新器 EXE 都成功后，以 Cargo 版本创建 `v<version>` GitHub
+Release。原始 EXE 避免运行时引入 ZIP/DEFLATE 解析依赖；便携 ZIP 仍供用户手动下载。
 只构建单个平台时保留 workflow artifact，但不创建不完整的 Release。macOS 证书和
 notarization 通过 secrets 注入。创建 Release 时把 `.github/release-notes.md` 的固定安装
 提示置于 GitHub 自动生成的变更说明之前；该文件必须保留未 notarize macOS 下载包所需的

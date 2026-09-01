@@ -22,6 +22,7 @@ mod screens;
 mod status_item;
 mod system_events;
 mod ui_scan;
+mod update_installer;
 mod vision;
 mod wechat_ocr;
 
@@ -67,6 +68,10 @@ pub(crate) fn run_internal_wechat_ocr_helper(
         component,
         runtime,
     })
+}
+
+pub(crate) fn run_internal_update_helper() -> Option<Result<(), String>> {
+    update_installer::run_internal_helper()
 }
 
 pub(crate) fn vision_diagnostics() -> Vec<String> {
@@ -132,6 +137,7 @@ pub struct WindowsBackend {
     vision: vision::VisionWorker,
     update_worker: Option<crate::platform::common::update::UpdateWorker>,
     held_buttons: Cell<u8>,
+    update_ready_signaled: bool,
     shutdown_complete: bool,
     shutdown_attempted: bool,
 }
@@ -243,6 +249,7 @@ impl WindowsBackend {
             vision,
             update_worker: None,
             held_buttons: Cell::new(0),
+            update_ready_signaled: false,
             shutdown_complete: false,
             shutdown_attempted: false,
         })
@@ -530,6 +537,13 @@ impl Backend for WindowsBackend {
     }
 
     fn poll(&mut self, timeout: Duration) -> Result<Option<BackendEvent>, String> {
+        // The first poll happens only after Engine has loaded its environment,
+        // compiled routes and activated Idle. A successful signal therefore
+        // means the replacement is usable, not merely that its hook started.
+        if !self.update_ready_signaled {
+            update_installer::signal_update_ready()?;
+            self.update_ready_signaled = true;
+        }
         self.reap_update_worker();
         if let Some(event) = self.try_event()? {
             return Ok(Some(event));

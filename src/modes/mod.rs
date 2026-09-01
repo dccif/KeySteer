@@ -10,10 +10,10 @@
 //! The flow between them:
 //!
 //! ```text
-//!   idle ──alt+e──► normal ──g───────► grid ─────────┐
-//!    ▲               │  ▲   ──v───────► recursive_grid │
-//!    │               │  │   ──Primary+f► ui_hint ───────┤
-//!    └──────esc──────┘  └───────────────────esc/pick───┘
+//!   idle ──alt+e──► normal ──g───────► grid ───────────┐
+//!    ▲               │  ▲ ──f───────► recursive_grid  │
+//!    │               │   │  ──Primary+f► ui_hint ──────┤
+//!    └──────esc──────┘   └───────────────────esc/pick───┘
 //! ```
 //!
 //! `idle` is silent, `normal` does the work, and the three targeting modes each
