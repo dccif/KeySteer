@@ -67,9 +67,9 @@ Engine 的 Frame、指针、按键等通用热路径直接调用借用式 `Mode:
 
 ## Engine 拥有什么
 
-`src/app/runtime/mod.rs::Engine` 的状态分为几组：
+`src/app/runtime/mod.rs::Engine` 是组合根；具体状态按所有权分布在相邻协作者中：
 
-- 计划/主题：`EngineSettings`、`PaletteSet`、路由和当前 `Appearance`；Mode 不读取 TOML。
+- 计划/主题：`EngineSettings`、`PaletteSet` 和当前 `Appearance`；Mode 不读取 TOML。
 - 模式：稳定的连续 `ModeRegistry`/`ModeSlot`、缓存的活动 slot、modal stack、插件默认绑定
   和 verb 所有者。slot 同时拥有该 Mode 的 binding table、temporary chords 和 pointer
   interest；Frame/Pointer 的常见分派不再重复走树查找。
@@ -80,6 +80,12 @@ Engine 的 Frame、指针、按键等通用热路径直接调用借用式 `Mode:
 - 环境：屏幕、权威光标坐标、当前应用。
 - 绘制：`OverlayCoordinator` 持有 Mode 原始 scene、最后 scene、去重和位置快路状态。
 - 控制：启用/暂停、退出、配置存储、输入失败抑制。
+
+`RuntimePlan` 不再分别保存 route、Mode 和 Plugin 三套可失配集合。每个 `ModeSpec` 原子包含
+实例、`ModeRoute` 和实例种类；Engine 安装计划时从同一项建立 registry slot、路由和插件
+manifest/default binding。`mode_registry.rs` 负责注册、查找、活动 slot、modal stack 和生命周期
+分派；`mode_routes.rs` 负责路由编译，`mode_runtime.rs` 负责 Mode 输出编排。输入、scheduler 和
+overlay 的状态分别只存于 `InputState`、`Scheduler` 与 `OverlayCoordinator`。
 
 绑定表只在配置、模式注册或实际生效的 per-app override profile 变化时重建。仅窗口标题
 变化但合并后的绑定不变，不应触发表重编译。

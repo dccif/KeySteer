@@ -1,16 +1,15 @@
 //! Compile a validated TOML document into the runtime's native input model.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[cfg(test)]
 use super::runtime::Engine;
 use super::runtime::{
-    AppRouteOverride, ConfigurationCandidate, ConfigurationRepository, DebugSettings,
-    EngineSettings, ModeRoute, PaletteSet, RuntimePlan,
+    ConfigurationCandidate, ConfigurationRepository, DebugSettings, EngineSettings, PaletteSet,
+    RuntimePlan,
 };
-use crate::api::{Appearance, ModeId};
-use crate::config::{AppOverride, Bindings, ConfigFile, ConfigStore, UiHintAppOverride};
+use crate::api::Appearance;
+use crate::config::{ConfigFile, ConfigStore};
 
 #[derive(Clone)]
 pub(crate) struct ConfigRepository {
@@ -145,14 +144,12 @@ impl Engine {
             Ok(source) => source,
             Err(error) => panic!("Engine::new requires a serializable configuration: {error}"),
         };
-        let mut plan = compile(&config)
+        let plan = compile(&config)
             .unwrap_or_else(|error| panic!("Engine::new requires valid configuration: {error}"));
-        // `new` is a low-level assembly convenience used by tests and custom
-        // callers that register their own modes. Production bootstrap passes
-        // the complete catalog through `from_plan` instead.
-        plan.modes.clear();
-        plan.plugins.clear();
-        let mut engine = match Self::from_plan(plan, appearance) {
+        // `new` is a low-level test assembly convenience whose callers
+        // register probes explicitly. Production always installs complete
+        // ModeSpec values through `from_plan`.
+        let mut engine = match Self::from_plan_without_modes(plan, appearance) {
             Ok(engine) => engine,
             Err(error) => panic!("Engine::new requires a valid catalog: {error}"),
         };
@@ -175,21 +172,14 @@ impl Engine {
 pub fn compile(config: &ConfigFile) -> Result<RuntimePlan, String> {
     config.validate().map_err(|error| error.to_string())?;
 
-    let modes = super::mode_catalog::built_in(config);
-    let plugins = super::mode_catalog::bundled_plugins(config)?;
-    let mut ids: Vec<ModeId> = modes.iter().map(|mode| mode.id()).collect();
-    ids.extend(plugins.iter().map(|plugin| plugin.id()));
+    let mut specs = super::mode_catalog::built_in_specs(config)?;
+    specs.extend(super::mode_catalog::bundled_specs(config)?);
+    let mut ids: Vec<_> = specs.iter().map(|spec| spec.id()).collect();
     ids.sort();
-    ids.dedup();
-
-    let routes = ids
-        .into_iter()
-        .filter_map(|id| {
-            route(config, &id)
-                .transpose()
-                .map(|route| route.map(|route| (id, route)))
-        })
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let duplicate = ids.windows(2).find(|ids| ids[0] == ids[1]);
+    if let Some(ids) = duplicate {
+        return Err(format!("duplicate mode id in catalog: {}", ids[0]));
+    }
 
     Ok(RuntimePlan {
         settings: EngineSettings {
@@ -218,78 +208,15 @@ pub fn compile(config: &ConfigFile) -> Result<RuntimePlan, String> {
             light: config.palette(Appearance::Light),
             dark: config.palette(Appearance::Dark),
         },
-        routes,
-        modes,
-        plugins,
+        modes: specs,
     })
-}
-
-fn route(config: &ConfigFile, id: &ModeId) -> Result<Option<ModeRoute>, String> {
-    let Some(bindings) = config.bindings_for(id.as_str()).cloned() else {
-        return Ok(None);
-    };
-    let (inherits, temporary_mode, temporary_keys) = config
-        .inheritance_for(id.as_str())
-        .unwrap_or((&[], None, &[]));
-    let inherits = inherits
-        .iter()
-        .map(|source| parse_source(source))
-        .collect::<Result<Vec<_>, _>>()?;
-    let temporary_mode = temporary_mode.map(ModeId::parse_borrowed).transpose()?;
-    let app_overrides = app_overrides(config, id)
-        .into_iter()
-        .map(|(pattern, bindings)| AppRouteOverride { pattern, bindings })
-        .collect();
-    Ok(Some(ModeRoute {
-        bindings,
-        inherits,
-        temporary_mode,
-        temporary_keys: temporary_keys.to_vec(),
-        app_overrides,
-    }))
-}
-
-fn parse_source(source: &str) -> Result<ModeId, String> {
-    if source == "hotkeys" {
-        Ok(ModeId::idle())
-    } else {
-        ModeId::parse_borrowed(source)
-    }
-}
-
-fn app_overrides(config: &ConfigFile, id: &ModeId) -> Vec<(String, Bindings)> {
-    if id == &ModeId::ui_hint() {
-        return config
-            .ui_hint
-            .app_configs
-            .iter()
-            .map(ui_hint_override)
-            .collect();
-    }
-    let values: &[AppOverride] = match id.as_str() {
-        "idle" => &config.app_configs,
-        "normal" => &config.normal.app_configs,
-        "grid" => &config.grid.app_configs,
-        "recursive_grid" => &config.recursive_grid.app_configs,
-        other => config
-            .plugin_modes
-            .get(other)
-            .map(|mode| mode.app_configs.as_slice())
-            .unwrap_or(&[]),
-    };
-    values
-        .iter()
-        .map(|value| (value.bundle_id.clone(), value.bindings.clone()))
-        .collect()
-}
-
-fn ui_hint_override(value: &UiHintAppOverride) -> (String, Bindings) {
-    (value.bundle_id.clone(), value.bindings.clone())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::ModeId;
+    use crate::config::{AppOverride, Bindings};
 
     #[test]
     fn compiles_unique_catalog_and_enable_flags() {
@@ -299,7 +226,7 @@ mod tests {
         let ids: Vec<_> = plan.mode_ids().collect();
         assert!(!ids.contains(&ModeId::grid()));
         assert_eq!(ids.iter().filter(|id| **id == ModeId::idle()).count(), 1);
-        assert!(plan.routes.contains_key(&ModeId::normal()));
+        assert!(plan.route(&ModeId::normal()).is_some());
     }
 
     #[test]
@@ -310,10 +237,10 @@ mod tests {
             bindings: Bindings::new(),
         });
         let plan = compile(&config).unwrap();
-        let grid = &plan.routes[&ModeId::grid()];
+        let grid = plan.route(&ModeId::grid()).unwrap();
         assert_eq!(grid.inherits, [ModeId::idle(), ModeId::normal()]);
         assert_eq!(
-            plan.routes[&ModeId::normal()].app_overrides[0].pattern,
+            plan.route(&ModeId::normal()).unwrap().app_overrides[0].pattern,
             "com.example.Editor"
         );
     }

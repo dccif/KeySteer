@@ -15,6 +15,8 @@ use crate::api::style::LabelUi;
 use crate::api::theme::{Palette, ThemedColor};
 use smallvec::SmallVec;
 
+use super::targeting::TargetingSession;
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct VisualSettings {
     pub label: LabelUi,
@@ -49,18 +51,8 @@ struct Cell {
 pub struct GridMode {
     layout: Layout,
     max_depth: u32,
-    default_cursor_follow_selection: bool,
-    cursor_follow_selection: bool,
     ui: VisualSettings,
-    /// Areas from the active display to the selected leaf.
-    stack: SmallVec<[Rect; 12]>,
-    /// Row-major cell indices used to replay the selection on another display.
-    path: SmallVec<[usize; 12]>,
-    /// A leaf has been selected and the session is ready to finish.
-    terminal: bool,
-    finished: bool,
-    lifecycle: TargetingLifecycle,
-    return_mode: ModeId,
+    session: TargetingSession,
 }
 
 impl GridMode {
@@ -72,28 +64,21 @@ impl GridMode {
                 keys: settings.keys.chars().collect(),
             },
             max_depth: settings.max_depth.max(1),
-            default_cursor_follow_selection: settings.cursor_follow_selection,
-            cursor_follow_selection: settings.cursor_follow_selection,
             ui: settings.ui,
-            stack: SmallVec::new(),
-            path: SmallVec::new(),
-            terminal: false,
-            finished: false,
-            lifecycle: settings.lifecycle,
-            return_mode: ModeId::idle(),
+            session: TargetingSession::new(settings.cursor_follow_selection, settings.lifecycle),
         }
     }
 
     fn depth(&self) -> u32 {
-        self.stack.len().saturating_sub(1) as u32
+        self.session.depth()
     }
 
     fn current(&self) -> Option<Rect> {
-        self.stack.last().copied()
+        self.session.current()
     }
 
     fn root(&self) -> Option<Rect> {
-        self.stack.first().copied()
+        self.session.root()
     }
 
     #[cfg(test)]
@@ -122,7 +107,7 @@ impl GridMode {
     }
 
     fn previews_second_layer(&self) -> bool {
-        !self.terminal && self.depth() == 0 && self.max_depth > 1
+        !self.session.terminal && self.depth() == 0 && self.max_depth > 1
     }
 
     fn push_rulings(
@@ -289,7 +274,7 @@ impl GridMode {
         } else {
             0
         };
-        let shape_capacity = if self.terminal {
+        let shape_capacity = if self.session.terminal {
             1
         } else {
             1 + outer_rulings + preview_rulings
@@ -301,12 +286,12 @@ impl GridMode {
                 .saturating_mul(self.layout.keys.len())
                 .saturating_add(self.layout.keys.len())
         } else {
-            usize::from(!self.terminal) * self.layout.keys.len()
+            usize::from(!self.session.terminal) * self.layout.keys.len()
         };
         let mut scene = OverlayScene::with_capacity(shape_capacity, label_capacity);
         let style = self.style(palette);
 
-        if self.terminal {
+        if self.session.terminal {
             if let Some(rect) = self.current() {
                 scene.push_shape(OverlayShape::Rect {
                     rect,
@@ -382,11 +367,8 @@ impl GridMode {
     }
 
     fn toggle_cursor_follow(&mut self, palette: &Palette) -> CommandBatch {
-        self.cursor_follow_selection = !self.cursor_follow_selection;
         let mut commands = CommandBatch::new();
-        if self.cursor_follow_selection
-            && let Some(area) = self.current()
-        {
+        if let Some(area) = self.session.toggle_cursor_follow() {
             commands.push(Command::warp_to(area.center()));
         }
         commands.extend(self.redraw(palette));
@@ -394,25 +376,20 @@ impl GridMode {
     }
 
     fn reset(&mut self, bounds: Rect) {
-        self.stack.clear();
-        self.stack.push(bounds);
-        self.path.clear();
-        self.terminal = false;
-        self.finished = false;
-        self.cursor_follow_selection = self.default_cursor_follow_selection;
+        self.session.reset(bounds);
     }
 
     fn retarget(&mut self, bounds: Rect, preserve: bool, palette: &Palette) -> CommandBatch {
         let path = if preserve {
-            self.path.clone()
+            self.session.path.clone()
         } else {
             SmallVec::new()
         };
-        let was_finished = preserve && self.finished;
-        let follow = self.cursor_follow_selection;
+        let was_finished = preserve && self.session.finished;
+        let follow = self.session.cursor_follow_selection;
         self.reset(bounds);
         if preserve {
-            self.cursor_follow_selection = follow;
+            self.session.cursor_follow_selection = follow;
             for index in path {
                 let Some(cell) = self
                     .current()
@@ -420,11 +397,11 @@ impl GridMode {
                 else {
                     break;
                 };
-                self.stack.push(cell);
-                self.path.push(index);
+                self.session.stack.push(cell);
+                self.session.path.push(index);
             }
-            self.terminal = self.depth() >= self.max_depth;
-            self.finished = was_finished;
+            self.session.terminal = self.depth() >= self.max_depth;
+            self.session.finished = was_finished;
         }
         let mut commands =
             CommandBatch::one(Command::warp_to(self.current().unwrap_or(bounds).center()));
@@ -433,13 +410,13 @@ impl GridMode {
     }
 
     fn select(&mut self, index: usize, cell: Rect, palette: &Palette) -> CommandBatch {
-        self.stack.push(cell);
-        self.path.push(index);
+        self.session.stack.push(cell);
+        self.session.path.push(index);
         if self.depth() >= self.max_depth {
-            self.terminal = true;
+            self.session.terminal = true;
         }
 
-        if self.terminal {
+        if self.session.terminal {
             let mut commands = CommandBatch::two(
                 Command::warp_to(cell.center()),
                 Command::show_overlay(self.scene(palette)),
@@ -451,7 +428,7 @@ impl GridMode {
         }
 
         let mut commands = CommandBatch::new();
-        if self.cursor_follow_selection {
+        if self.session.cursor_follow_selection {
             commands.push(Command::warp_to(cell.center()));
         }
         commands.extend(self.redraw(palette));
@@ -475,7 +452,7 @@ impl GridMode {
     fn cancel(&self) -> CommandBatch {
         CommandBatch::two(
             Command::HideOverlay,
-            Command::SwitchMode(self.return_mode.clone()),
+            Command::SwitchMode(self.session.return_mode.clone()),
         )
     }
 
@@ -484,13 +461,13 @@ impl GridMode {
             "esc" => return self.cancel(),
             "enter" => return self.commit_current(ctx.palette),
             "backspace" | "tab" => {
-                if self.stack.len() <= 1 {
+                if self.session.stack.len() <= 1 {
                     return self.cancel();
                 }
-                self.stack.pop();
-                self.path.pop();
-                self.terminal = false;
-                self.finished = false;
+                self.session.stack.pop();
+                self.session.path.pop();
+                self.session.terminal = false;
+                self.session.finished = false;
                 return self.redraw(ctx.palette);
             }
             "space" => {
@@ -503,7 +480,7 @@ impl GridMode {
             _ => {}
         }
 
-        if self.terminal || self.finished {
+        if self.session.terminal || self.session.finished {
             return CommandBatch::new();
         }
         let Some(key) = key.as_char() else {
@@ -548,7 +525,7 @@ impl Mode for GridMode {
     fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
         match event {
             ModeEvent::Activated { previous } => {
-                self.return_mode = previous.clone().unwrap_or_else(ModeId::idle);
+                self.session.return_mode = previous.clone().unwrap_or_else(ModeId::idle);
                 self.reset(ctx.active_bounds());
                 self.redraw(ctx.palette)
             }
@@ -556,19 +533,20 @@ impl Mode for GridMode {
                 self.reset(ctx.active_bounds());
                 self.redraw(ctx.palette)
             }
-            ModeEvent::FinishRequested { .. } if self.finished => CommandBatch::new(),
+            ModeEvent::FinishRequested { .. } if self.session.finished => CommandBatch::new(),
             ModeEvent::FinishRequested { .. } => {
-                self.finished = true;
+                self.session.finished = true;
                 let mut commands = self.redraw(ctx.palette);
                 commands.extend(super::targeting::lifecycle_commands(
-                    &self.lifecycle.after_finish,
-                    &self.return_mode,
+                    &self.session.lifecycle.after_finish,
+                    &self.session.return_mode,
                 ));
                 commands
             }
-            ModeEvent::Clicked { .. } => {
-                super::targeting::lifecycle_commands(&self.lifecycle.after_click, &self.return_mode)
-            }
+            ModeEvent::Clicked { .. } => super::targeting::lifecycle_commands(
+                &self.session.lifecycle.after_click,
+                &self.session.return_mode,
+            ),
             ModeEvent::ScreensChanged(_) => {
                 self.reset(ctx.active_bounds());
                 self.redraw(ctx.palette)
@@ -582,10 +560,10 @@ impl Mode for GridMode {
             }
             ModeEvent::Resumed => self.redraw(ctx.palette),
             ModeEvent::Deactivated => {
-                self.stack.clear();
-                self.path.clear();
-                self.terminal = false;
-                self.finished = false;
+                self.session.stack.clear();
+                self.session.path.clear();
+                self.session.terminal = false;
+                self.session.finished = false;
                 CommandBatch::new()
             }
             ModeEvent::Binding {
@@ -828,14 +806,14 @@ mod tests {
         let out = press(&mut mode, &env, "1");
         assert_eq!(mode.current(), Some(second));
         assert_eq!(mode.depth(), 2);
-        assert!(!mode.terminal);
+        assert!(!mode.session.terminal);
         assert!(out.contains(&Command::warp_to(second.center())));
 
         let third = mode.cells()[0].rect;
         let out = press(&mut mode, &env, "1");
         assert_eq!(mode.current(), Some(third));
         assert_eq!(mode.depth(), 3);
-        assert!(mode.terminal);
+        assert!(mode.session.terminal);
         assert!(out.contains(&Command::warp_to(third.center())));
         assert!(
             out.iter()
@@ -904,7 +882,7 @@ mod tests {
         activate(&mut mode, &env);
 
         toggle_follow(&mut mode, &env);
-        assert!(!mode.cursor_follow_selection);
+        assert!(!mode.session.cursor_follow_selection);
         let out = press(&mut mode, &env, "1");
         assert!(
             !out.iter()
@@ -924,7 +902,7 @@ mod tests {
 
         let out = toggle_follow(&mut mode, &env);
 
-        assert!(mode.cursor_follow_selection);
+        assert!(mode.session.cursor_follow_selection);
         assert_eq!(mode.depth(), depth, "toggle must not select another layer");
         assert!(out.contains(&Command::warp_to(selected.center())));
         assert!(
@@ -965,7 +943,7 @@ mod tests {
         activate(&mut mode, &env);
         press(&mut mode, &env, "q");
         press(&mut mode, &env, "w");
-        assert_eq!(mode.path.as_slice(), [5, 6]);
+        assert_eq!(mode.session.path.as_slice(), [5, 6]);
         let target = Screen {
             bounds: Rect::new(1000.0, 0.0, 1600.0, 900.0),
             work_area: Rect::new(1000.0, 0.0, 1600.0, 900.0),
@@ -981,7 +959,7 @@ mod tests {
             },
             &env.ctx(),
         );
-        assert_eq!(mode.path.as_slice(), [5, 6]);
+        assert_eq!(mode.session.path.as_slice(), [5, 6]);
         assert_eq!(mode.depth(), 2);
         assert_eq!(scene_of(&out).clip, Some(target.bounds));
         assert!(out.contains(&Command::warp_to(mode.current().unwrap().center())));
@@ -993,7 +971,7 @@ mod tests {
             },
             &env.ctx(),
         );
-        assert!(mode.path.is_empty());
+        assert!(mode.session.path.is_empty());
         assert_eq!(mode.depth(), 0);
         assert_eq!(mode.current(), Some(target.bounds));
         assert_eq!(scene_of(&out).clip, Some(target.bounds));
@@ -1010,7 +988,7 @@ mod tests {
 
         press(&mut mode, &env, "backspace");
         assert_eq!(mode.depth(), 1);
-        assert!(!mode.terminal);
+        assert!(!mode.session.terminal);
         press(&mut mode, &env, "space");
         assert_eq!(mode.depth(), 0);
         assert_eq!(mode.current(), Some(env.screens[0].bounds));
@@ -1032,7 +1010,7 @@ mod tests {
             },
             &env.ctx(),
         );
-        assert!(mode.finished);
+        assert!(mode.session.finished);
         assert_eq!(mode.current(), selected);
         let scene = scene_of(&finished);
         assert_eq!(scene.labels.len(), mode.layout.rows * mode.layout.cols);
@@ -1059,7 +1037,7 @@ mod tests {
         );
 
         press(&mut mode, &env, "backspace");
-        assert!(!mode.finished);
+        assert!(!mode.session.finished);
         assert_eq!(mode.depth(), 0);
     }
 

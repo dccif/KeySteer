@@ -1,4 +1,64 @@
-use crate::api::{Command, CommandBatch, FinishCause, LifecycleAction, ModeId};
+use smallvec::SmallVec;
+
+use crate::api::{
+    Command, CommandBatch, FinishCause, LifecycleAction, ModeId, Rect, TargetingLifecycle,
+};
+
+/// Shared session state for grid-style targeting modes. Layout calculation and
+/// rendering remain owned by each concrete mode.
+pub(crate) struct TargetingSession {
+    pub(crate) default_cursor_follow_selection: bool,
+    pub(crate) cursor_follow_selection: bool,
+    pub(crate) stack: SmallVec<[Rect; 12]>,
+    pub(crate) path: SmallVec<[usize; 12]>,
+    pub(crate) terminal: bool,
+    pub(crate) finished: bool,
+    pub(crate) lifecycle: TargetingLifecycle,
+    pub(crate) return_mode: ModeId,
+}
+
+impl TargetingSession {
+    pub(crate) fn new(cursor_follow_selection: bool, lifecycle: TargetingLifecycle) -> Self {
+        Self {
+            default_cursor_follow_selection: cursor_follow_selection,
+            cursor_follow_selection,
+            stack: SmallVec::new(),
+            path: SmallVec::new(),
+            terminal: false,
+            finished: false,
+            lifecycle,
+            return_mode: ModeId::idle(),
+        }
+    }
+
+    pub(crate) fn depth(&self) -> u32 {
+        self.stack.len().saturating_sub(1) as u32
+    }
+
+    pub(crate) fn current(&self) -> Option<Rect> {
+        self.stack.last().copied()
+    }
+
+    pub(crate) fn root(&self) -> Option<Rect> {
+        self.stack.first().copied()
+    }
+
+    pub(crate) fn reset(&mut self, bounds: Rect) {
+        self.stack.clear();
+        self.stack.push(bounds);
+        self.path.clear();
+        self.terminal = false;
+        self.finished = false;
+        self.cursor_follow_selection = self.default_cursor_follow_selection;
+    }
+
+    pub(crate) fn toggle_cursor_follow(&mut self) -> Option<Rect> {
+        self.cursor_follow_selection = !self.cursor_follow_selection;
+        self.cursor_follow_selection
+            .then(|| self.current())
+            .flatten()
+    }
+}
 
 pub(crate) fn lifecycle_commands(action: &LifecycleAction, return_mode: &ModeId) -> CommandBatch {
     match action {

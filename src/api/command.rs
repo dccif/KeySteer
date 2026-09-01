@@ -503,6 +503,18 @@ pub struct FocusedApp {
     pub process_id: u32,
 }
 
+impl FocusedApp {
+    /// Match the shared per-app configuration syntax used by routes and modes.
+    pub(crate) fn matches_pattern(&self, pattern: &str) -> bool {
+        !pattern.is_empty()
+            && (pattern.eq_ignore_ascii_case(&self.bundle_id)
+                || self
+                    .window_title
+                    .to_lowercase()
+                    .contains(&pattern.to_lowercase()))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UiScanStrategy {

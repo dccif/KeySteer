@@ -8,9 +8,10 @@ KeySteer 保持单 crate，并采用混合模块布局：聚合目录使用 `mod
 ## 配置编译
 
 `config::ConfigFile` 只代表 TOML 文档、默认值和校验。`app::configuration::compile` 是唯一编译
-边界，产出与 TOML 无关的 `app::runtime::RuntimePlan`：Engine settings、明暗 palette、路由、应用
-override，以及已经实例化的 Mode/Plugin。`app::mode_catalog` 是唯一内置 Mode 注册点，每个
-构造函数只接收自己的强类型 `Settings`。
+边界，产出与 TOML 无关的 `app::runtime::RuntimePlan`：Engine settings、明暗 palette，以及
+原子聚合的 `ModeSpec`。每个 spec 同时持有 Mode/Plugin 实例和完整 `ModeRoute`，不会出现实例、
+路由或 ID 漏配。`app::mode_catalog` 是唯一内置 Mode 注册点，每个构造函数只接收自己的强类型
+`Settings`，并在同一个 catalog 项编译 enable、继承、temporary keys 与 app override。
 
 Engine 只持有 `app::runtime::ConfigurationRepository` trait object；TOML、配置发现、comment-preserving
 store 和平台原子替换由 `app::configuration::ConfigRepository` 适配。库的常规公开面只保留
@@ -21,7 +22,8 @@ store 和平台原子替换由 `app::configuration::ConfigRepository` 适配。�
 
 Engine 组合四类有状态协作者：`ModeRegistry`、`InputState`、`Scheduler` 和
 `OverlayCoordinator`。Mode 通过 `claims_key` 与 `wants_pointer_events` 声明自己的输入兴趣；
-Engine 不识别 Grid/UI Hint 字符表。
+Engine 不识别 Grid/UI Hint 字符表。`ModeRegistry` 独占实例、活动 slot、路由、插件 manifest、
+modal stack 和生命周期；其他三个协作者分别独占输入配对、deadline 与 overlay 呈现状态。
 
 ## 原子热重载
 

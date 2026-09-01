@@ -62,13 +62,48 @@ pub struct ModeRoute {
     pub app_overrides: Vec<AppRouteOverride>,
 }
 
+/// One atomically installed runtime mode and the route compiled for it.
+///
+/// Keeping these together prevents a plan from containing a live mode without
+/// a binding table (or a stale route without a corresponding instance).
+pub struct ModeSpec {
+    pub route: ModeRoute,
+    pub instance: ModeInstance,
+}
+
+pub enum ModeInstance {
+    BuiltIn(Box<dyn Mode>),
+    Plugin(Box<dyn Plugin>),
+}
+
+impl ModeSpec {
+    pub fn built_in(mode: Box<dyn Mode>, route: ModeRoute) -> Self {
+        Self {
+            route,
+            instance: ModeInstance::BuiltIn(mode),
+        }
+    }
+
+    pub fn plugin(plugin: Box<dyn Plugin>, route: ModeRoute) -> Self {
+        Self {
+            route,
+            instance: ModeInstance::Plugin(plugin),
+        }
+    }
+
+    pub fn id(&self) -> ModeId {
+        match &self.instance {
+            ModeInstance::BuiltIn(mode) => mode.id(),
+            ModeInstance::Plugin(plugin) => plugin.id(),
+        }
+    }
+}
+
 /// Fully compiled, TOML-independent runtime input.
 pub struct RuntimePlan {
     pub settings: EngineSettings,
     pub palettes: PaletteSet,
-    pub routes: BTreeMap<ModeId, ModeRoute>,
-    pub modes: Vec<Box<dyn Mode>>,
-    pub plugins: Vec<Box<dyn Plugin>>,
+    pub modes: Vec<ModeSpec>,
 }
 
 /// A compiled candidate and the repository state that produced it. The engine
@@ -93,6 +128,13 @@ pub trait ConfigurationRepository: Send {
 
 impl RuntimePlan {
     pub fn mode_ids(&self) -> impl Iterator<Item = ModeId> + '_ {
-        self.modes.iter().map(|mode| mode.id())
+        self.modes.iter().map(ModeSpec::id)
+    }
+
+    pub fn route(&self, id: &ModeId) -> Option<&ModeRoute> {
+        self.modes
+            .iter()
+            .find(|spec| spec.id() == *id)
+            .map(|spec| &spec.route)
     }
 }

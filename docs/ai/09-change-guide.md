@@ -5,13 +5,13 @@
 | 需求 | 主修改点 | 通常还要检查 |
 | --- | --- | --- |
 | 新增/修改动作 verb | `src/api/binding.rs` | `command_executor.rs`、default TOML、配置文档、模拟器分类 |
-| 修改按键匹配/别名 | `src/api/input.rs`, `src/config/mod.rs` | `input_router.rs`、integration tests、网页 `bindings.ts` |
-| 修改模式切换 | `src/app/runtime/mod.rs` | `command_executor.rs`、所有 Mode 的 Activated/Deactivated |
+| 修改按键匹配/别名 | `src/api/input.rs`, `src/config/aliases.rs` | `input_router.rs`、integration tests、网页 `bindings.ts` |
+| 修改模式切换 | `src/app/runtime/mod.rs`, `mode_registry.rs`, `mode_runtime.rs` | `command_executor.rs`、所有 Mode 的 Activated/Deactivated |
 | 修改 Finish/click 语义 | `src/modes/targeting.rs` + targeting Mode | 生命周期验证、Engine semantic Clicked tests |
 | 修改 Normal 移动 | `src/modes/normal.rs` | 两端 frame clock、pointer config、实机手感 |
 | 修改 Grid 绘制 | `src/modes/grid.rs` | overlay API、两端 overlay、default style |
 | 修改 Recursive Grid | `recursive_grid.rs` | layers/min-size/Backspace/keep tests、网页预览 |
-| 修改 UI Hint 标签逻辑 | `modes/hint.rs`, `modes/hint/` | 两端扫描终态/Partial、retry tests |
+| 修改 UI Hint 标签逻辑 | `modes/hint/mod.rs`, `modes/hint/session.rs`, `modes/hint/labeling.rs`, `modes/hint/view.rs` | 两端扫描终态/Partial、retry tests |
 | 修改 Windows 扫描 | `platform/windows/accessibility.rs` | COM thread、popup/Z-order、timeout、实机 UIA |
 | 修改 macOS 扫描 | `platform/macos/ui_scan.rs` + AX/Vision | 权限、单 worker、Objective-C bridge、macOS 14 |
 | 修改覆盖层性能 | 两端 `overlay.rs` | `OverlayScene` equality、dismiss 内存、DPI/Retina |

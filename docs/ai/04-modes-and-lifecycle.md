@@ -61,19 +61,20 @@ settings；不能注入输入、创建窗口或直接扫描 UI。
 - 以当前屏幕为 root，按 `grid_rows * grid_cols` 和 `keys` 逐层缩小。
 - depth 0 在每个一级格中央绘制醒目的大号第一键，并在其下绘制淡色的小号第二键装饰
   网格；它不修改 stack/path，第一次选择后的 depth 1 及后续 scene 保持原有单层行为。
-- 保存选择路径、当前区域、return mode、finished、cursor-follow session 状态。
+- 与 Recursive Grid 共用 `targeting::TargetingSession` 保存选择路径、return mode、finished、
+  cursor-follow 和生命周期公共转换；Grid 自己只拥有矩形布局和绘制状态。
 - 每层 label 自动缩放以适应单元格；最终层建立完成态再触发生命周期。
 - finished 后 Backspace 取消完成态并回退一层；`keep` 不重建 Mode。
 
 ### Recursive Grid (`src/modes/recursive_grid.rs`)
 
-- 保存 Rect stack 和选择路径，每次按键在当前区域继续递归细分。
+- 复用 `targeting::TargetingSession` 保存 Rect stack、选择路径和生命周期状态，每次按键在当前区域继续递归细分。
 - `layers` 可按 depth 覆盖形状；`min_size`/`max_depth` 决定自然终点。
 - 支持 label background、最小字号、自动隐藏和下层 key preview。
 - 当前默认点击后 `keep`，仍可继续输入字母细分；不是冻结完成态。
 - Backspace 弹出 stack，Space/重启语义重置当前 session。
 
-### UI Hint (`src/modes/hint.rs`)
+### UI Hint (`src/modes/hint/mod.rs`)
 
 - 激活后发送 `ScanUi`；按 scan id 接收多个 Partial 和一个终态。
 - 累积/去重 `UiTarget`，使用 `modes/hint/labeling.rs` 重新分配短标签。
@@ -97,6 +98,10 @@ settings；不能注入输入、创建窗口或直接扫描 UI。
 - Windows 每代扫描的是原生提交瞬间鼠标下的窗口组；普通鼠标移动不轮询、不持续重扫。鼠标下没有应用窗口时只显示移动鼠标提示，不假定用户仍使用默认重扫快捷键。
 - 离开或完成本轮 UI Hint 时取消仍在进行的原生扫描；再次进入始终重新获取目标，不能复用
   上一轮可能已经过期的控件坐标。`Deactivated` 会标记实例 inactive、清空目标/搜索/重叠计划并释放大型 backing；迟到的异步结果不能让 Normal/Idle 后台重新启动扫描。
+
+`hint/session.rs::ScanSession` 是 scan generation、Partial 去重结果、retry、搜索缓存和
+finished/active 标志的唯一 owner；`labeling.rs` 与 `view.rs` 保持纯标签和视觉层算法。前缀匹配
+直接作用于 session 的紧凑 Hint 索引，不保留只供测试使用的重复 matching 实现。
 
 ## Finish 不是 Mode
 

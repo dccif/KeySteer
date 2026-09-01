@@ -4,10 +4,12 @@
 //! strongly typed settings and remains unaware of TOML or the application
 //! configuration document.
 
-use crate::api::{Mode, Plugin};
-use crate::config::Config;
+use crate::api::{Mode, ModeId, Plugin};
+use crate::config::{AppOverride, Bindings, Config, UiHintAppOverride};
 use crate::modes::{self, GridMode, HintMode, IdleMode, NormalMode, RecursiveGridMode};
 use crate::plugins::BundledSettings;
+
+use super::runtime::{AppRouteOverride, ModeRoute, ModeSpec};
 
 pub(crate) fn normal_settings(config: &Config) -> modes::normal::Settings {
     modes::normal::Settings {
@@ -143,6 +145,7 @@ pub fn hint(config: &Config) -> HintMode {
 }
 
 #[doc(hidden)]
+#[allow(dead_code)]
 pub fn built_in(config: &Config) -> Vec<Box<dyn Mode>> {
     let mut catalog: Vec<Box<dyn Mode>> = vec![Box::new(IdleMode::new()), Box::new(normal(config))];
     if config.grid.enabled {
@@ -169,6 +172,145 @@ pub(crate) fn bundled_plugin_settings(config: &Config) -> BundledSettings {
 #[doc(hidden)]
 pub fn bundled_plugins(config: &Config) -> Result<Vec<Box<dyn Plugin>>, String> {
     crate::plugins::bundled(bundled_plugin_settings(config))
+}
+
+/// Build the complete built-in catalog. Instance construction and route
+/// compilation intentionally live together so adding a mode has one assembly
+/// point and cannot produce a route/instance mismatch.
+pub(crate) fn built_in_specs(config: &Config) -> Result<Vec<ModeSpec>, String> {
+    let mut specs = Vec::with_capacity(5);
+    specs.push(ModeSpec::built_in(
+        Box::new(IdleMode::new()),
+        compile_route(
+            &config.hotkeys,
+            &[],
+            None,
+            &[],
+            app_overrides(&config.app_configs),
+        )?,
+    ));
+    specs.push(ModeSpec::built_in(
+        Box::new(normal(config)),
+        compile_route(
+            &config.normal.bindings,
+            &config.normal.inherits,
+            None,
+            &[],
+            app_overrides(&config.normal.app_configs),
+        )?,
+    ));
+    if config.grid.enabled {
+        specs.push(ModeSpec::built_in(
+            Box::new(grid(config)),
+            compile_route(
+                &config.grid.bindings,
+                &config.grid.inherits,
+                config.grid.temporary_mode.as_deref(),
+                &config.grid.temporary_mode_keys,
+                app_overrides(&config.grid.app_configs),
+            )?,
+        ));
+    }
+    if config.recursive_grid.enabled {
+        specs.push(ModeSpec::built_in(
+            Box::new(recursive_grid(config)),
+            compile_route(
+                &config.recursive_grid.bindings,
+                &config.recursive_grid.inherits,
+                config.recursive_grid.temporary_mode.as_deref(),
+                &config.recursive_grid.temporary_mode_keys,
+                app_overrides(&config.recursive_grid.app_configs),
+            )?,
+        ));
+    }
+    if config.ui_hint.enabled {
+        specs.push(ModeSpec::built_in(
+            Box::new(hint(config)),
+            compile_route(
+                &config.ui_hint.bindings,
+                &config.ui_hint.inherits,
+                config.ui_hint.temporary_mode.as_deref(),
+                &config.ui_hint.temporary_mode_keys,
+                ui_hint_overrides(&config.ui_hint.app_configs),
+            )?,
+        ));
+    }
+    Ok(specs)
+}
+
+pub(crate) fn bundled_specs(config: &Config) -> Result<Vec<ModeSpec>, String> {
+    bundled_plugins(config)?
+        .into_iter()
+        .map(|plugin| {
+            let id = plugin.id();
+            let route = match config.plugin_modes.get(id.as_str()) {
+                Some(section) => compile_route(
+                    &section.bindings,
+                    &section.inherits,
+                    section.temporary_mode.as_deref(),
+                    &section.temporary_mode_keys,
+                    app_overrides(&section.app_configs),
+                )?,
+                None => empty_route(),
+            };
+            Ok(ModeSpec::plugin(plugin, route))
+        })
+        .collect()
+}
+
+fn compile_route(
+    bindings: &Bindings,
+    inherits: &[String],
+    temporary_mode: Option<&str>,
+    temporary_keys: &[String],
+    app_overrides: Vec<AppRouteOverride>,
+) -> Result<ModeRoute, String> {
+    Ok(ModeRoute {
+        bindings: bindings.clone(),
+        inherits: inherits
+            .iter()
+            .map(|source| {
+                if source == "hotkeys" {
+                    Ok(ModeId::idle())
+                } else {
+                    ModeId::parse_borrowed(source)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        temporary_mode: temporary_mode.map(ModeId::parse_borrowed).transpose()?,
+        temporary_keys: temporary_keys.to_vec(),
+        app_overrides,
+    })
+}
+
+fn empty_route() -> ModeRoute {
+    ModeRoute {
+        bindings: Bindings::new(),
+        inherits: Vec::new(),
+        temporary_mode: None,
+        temporary_keys: Vec::new(),
+        app_overrides: Vec::new(),
+    }
+}
+
+fn app_overrides(values: &[AppOverride]) -> Vec<AppRouteOverride> {
+    values
+        .iter()
+        .map(|value| AppRouteOverride {
+            pattern: value.bundle_id.clone(),
+            bindings: value.bindings.clone(),
+        })
+        .collect()
+}
+
+fn ui_hint_overrides(values: &[UiHintAppOverride]) -> Vec<AppRouteOverride> {
+    values
+        .iter()
+        .map(|value| AppRouteOverride {
+            pattern: value.bundle_id.clone(),
+            bindings: value.bindings.clone(),
+        })
+        .collect()
 }
 
 #[cfg(test)]

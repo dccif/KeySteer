@@ -7,7 +7,6 @@
 //! `/` enters search mode, where typing filters elements by their accessible
 //! name instead of matching labels.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use smallvec::SmallVec;
@@ -27,12 +26,19 @@ use crate::api::overlay::{
 use crate::api::style::{AUTO, BoundaryHighlight, HintPlacement, LabelUi, SearchInputUi};
 use crate::api::theme::Palette;
 pub mod labeling;
-mod matching;
+mod session;
 mod view;
 
 use labeling::{self as hints, CompactHint};
-use matching::Match;
+use session::ScanSession;
 use view::{VisualLayerPlan, build_visual_layer_plan};
+
+#[derive(Debug, Clone, PartialEq)]
+enum Match<T> {
+    Complete(T),
+    Partial { remaining: usize },
+    None,
+}
 
 const SCAN_RETRY_TIMER_ID: &str = "ui_hint.scan_retry";
 const NO_WINDOW_UNDER_POINTER: &str =
@@ -87,14 +93,7 @@ impl Settings {
         };
         self.app_overrides
             .iter()
-            .find(|entry| {
-                !entry.pattern.is_empty()
-                    && (entry.pattern.eq_ignore_ascii_case(&app.bundle_id)
-                        || app
-                            .window_title
-                            .to_lowercase()
-                            .contains(&entry.pattern.to_lowercase()))
-            })
+            .find(|entry| app.matches_pattern(&entry.pattern))
             .and_then(|entry| entry.strategy)
             .unwrap_or(self.strategy)
     }
@@ -122,41 +121,15 @@ pub struct HintMode {
     config: Settings,
     alphabet: Vec<char>,
     overlap_cycle_chord: Option<KeyChord>,
-
-    /// Everything the current scan has returned so far.
-    scanned: Vec<UiTarget>,
-    scanned_names_lower: Vec<String>,
-    search_names_initialized: bool,
-    /// Rectangles normally identify one target. A tiny inline collision list
-    /// preserves distinct controls sharing bounds without owning a second copy
-    /// of every target name and role.
-    seen_targets: HashMap<(i64, i64, i64, i64), SmallVec<[usize; 2]>>,
-    /// Labelled subset currently on screen; the value is an index into
-    /// `scanned`.
-    hints: Vec<CompactHint<usize>>,
+    session: ScanSession,
     input: Input,
-    scanning: bool,
-    status: Option<String>,
     return_mode: ModeId,
-    scan_id: u64,
-    retry_attempt: u32,
-    retry_pending: bool,
-    /// Display bounds used by the newest scan. Pointer movement to another
-    /// display invalidates both pending and rendered results.
-    scan_bounds: Option<Rect>,
     held_overlap_keys: SmallVec<[Key; 2]>,
     overlap_cycle: usize,
     /// Source-agnostic visual layers over the merged UIA/Vision Hint list.
     /// Rebuilt at each exponentially batched Partial so overlap input stays hot.
     overlap_plan: VisualLayerPlan,
     wide_placements: Option<Vec<(usize, Rect)>>,
-    /// Targets that arrived after a label prefix was typed. Reassigning those
-    /// labels immediately would invalidate keys already visible to the user.
-    pending_relabel: bool,
-    selected: Option<usize>,
-    finished: bool,
-    /// Prevent late asynchronous scan results from reviving an inactive mode.
-    active: bool,
 }
 
 impl HintMode {
@@ -169,53 +142,22 @@ impl HintMode {
                 .collect(),
             overlap_cycle_chord: KeyChord::parse(&config.overlap_cycle_key).ok(),
             config,
-            scanned: Vec::new(),
-            scanned_names_lower: Vec::new(),
-            search_names_initialized: false,
-            seen_targets: HashMap::new(),
-            hints: Vec::new(),
+            session: ScanSession::default(),
             input: Input::Labels(OverlayText::default()),
-            scanning: false,
-            status: None,
             return_mode: ModeId::idle(),
-            scan_id: 0,
-            retry_attempt: 0,
-            retry_pending: false,
-            scan_bounds: None,
             held_overlap_keys: SmallVec::new(),
             overlap_cycle: 0,
             overlap_plan: VisualLayerPlan::default(),
             wide_placements: None,
-            pending_relabel: false,
-            selected: None,
-            finished: false,
-            active: false,
         }
     }
 
     fn clear_scan_results(&mut self, release_large_buffers: bool) {
-        self.scanned.clear();
-        self.scanned_names_lower.clear();
-        self.search_names_initialized = false;
-        self.seen_targets.clear();
-        self.hints.clear();
+        self.session.clear_results(release_large_buffers);
         self.overlap_plan.clear();
-        self.pending_relabel = false;
         if release_large_buffers {
             self.overlap_plan.release_retained();
             self.wide_placements = None;
-            if self.scanned.capacity() > MAX_IDLE_RETAINED_TARGETS {
-                self.scanned = Vec::new();
-            }
-            if self.scanned_names_lower.capacity() > MAX_IDLE_RETAINED_TARGETS {
-                self.scanned_names_lower = Vec::new();
-            }
-            if self.hints.capacity() > MAX_IDLE_RETAINED_TARGETS {
-                self.hints = Vec::new();
-            }
-            if self.seen_targets.capacity() > MAX_IDLE_RETAINED_TARGETS {
-                self.seen_targets = HashMap::new();
-            }
         }
     }
 
@@ -239,14 +181,14 @@ impl HintMode {
     }
 
     fn request_scan(&mut self, ctx: &HostContext<'_>) -> CommandBatch {
-        self.scanning = true;
-        self.status = None;
+        self.session.scanning = true;
+        self.session.status = None;
         self.clear_scan_results(false);
         self.input = Input::Labels(OverlayText::default());
-        self.selected = None;
-        self.finished = false;
-        self.retry_attempt = 0;
-        self.retry_pending = false;
+        self.session.selected = None;
+        self.session.finished = false;
+        self.session.retry_attempt = 0;
+        self.session.retry_pending = false;
         let request = self.scan_request(ctx);
         let mut commands = CommandBatch::two(
             Command::CancelTimer {
@@ -259,24 +201,24 @@ impl HintMode {
     }
 
     fn retry_scan(&mut self, ctx: &HostContext<'_>) -> CommandBatch {
-        self.retry_attempt = self.retry_attempt.saturating_add(1);
-        self.retry_pending = false;
-        self.scanning = true;
+        self.session.retry_attempt = self.session.retry_attempt.saturating_add(1);
+        self.session.retry_pending = false;
+        self.session.scanning = true;
         CommandBatch::one(self.scan_request(ctx))
     }
 
     fn scan_request(&mut self, ctx: &HostContext<'_>) -> Command {
-        self.scan_id = self.scan_id.wrapping_add(1);
+        self.session.scan_id = self.session.scan_id.wrapping_add(1);
         let bounds = ctx.active_bounds();
-        self.scan_bounds = Some(bounds);
-        let timeout_multiplier = u64::from(self.retry_attempt).saturating_add(1);
+        self.session.scan_bounds = Some(bounds);
+        let timeout_multiplier = u64::from(self.session.retry_attempt).saturating_add(1);
         let timeout_ms = self
             .config
             .scan_timeout_ms
             .saturating_mul(timeout_multiplier)
             .min(MAX_SCAN_TIMEOUT_MS);
         Command::scan_ui(UiScanRequest {
-            id: self.scan_id,
+            id: self.session.scan_id,
             timeout_ms,
             bounds: Some(bounds),
             roles: self.config.clickable_roles.clone(),
@@ -289,95 +231,8 @@ impl HintMode {
         })
     }
 
-    fn target_key(target: &UiTarget) -> (i64, i64, i64, i64) {
-        let rect = target.rect;
-        (
-            (rect.x * 4.0).round() as i64,
-            (rect.y * 4.0).round() as i64,
-            (rect.width * 4.0).round() as i64,
-            (rect.height * 4.0).round() as i64,
-        )
-    }
-
-    fn append_target(&mut self, target: UiTarget) -> bool {
-        if !self
-            .scan_bounds
-            .is_none_or(|bounds| bounds.contains(&target.rect.center()))
-        {
-            return false;
-        }
-        let key = Self::target_key(&target);
-        let duplicate = self.seen_targets.get(&key).is_some_and(|indices| {
-            indices.iter().any(|&index| {
-                let existing = &self.scanned[index];
-                existing.name == target.name && existing.role == target.role
-            })
-        });
-        if duplicate {
-            return false;
-        }
-        let index = self.scanned.len();
-        if self.search_names_initialized {
-            self.scanned_names_lower.push(target.name.to_lowercase());
-        }
-        self.scanned.push(target);
-        self.seen_targets.entry(key).or_default().push(index);
-        true
-    }
-
-    fn append_targets_owned(&mut self, targets: Vec<UiTarget>) -> bool {
-        let before = self.scanned.len();
-
-        // On the first small result, take ownership of the platform Vec so the
-        // common 24/64/100-target path does not allocate a second backing
-        // buffer. A retained session buffer is already cheaper to fill by move.
-        if self.scanned.is_empty()
-            && self.scanned.capacity() == 0
-            && self.seen_targets.is_empty()
-            && !self.search_names_initialized
-            && targets.len() <= MAX_IDLE_RETAINED_TARGETS
-        {
-            self.scanned = targets;
-            self.scanned.retain(|target| {
-                self.scan_bounds
-                    .is_none_or(|bounds| bounds.contains(&target.rect.center()))
-            });
-            self.seen_targets.reserve(self.scanned.len());
-
-            let mut index = 0;
-            while index < self.scanned.len() {
-                let key = Self::target_key(&self.scanned[index]);
-                let duplicate = self.seen_targets.get(&key).is_some_and(|indices| {
-                    indices.iter().any(|&existing_index| {
-                        let existing = &self.scanned[existing_index];
-                        let candidate = &self.scanned[index];
-                        existing.name == candidate.name && existing.role == candidate.role
-                    })
-                });
-                if duplicate {
-                    self.scanned.remove(index);
-                } else {
-                    self.seen_targets.entry(key).or_default().push(index);
-                    index += 1;
-                }
-            }
-            return !self.scanned.is_empty();
-        }
-
-        let incoming = targets.len();
-        self.scanned.reserve(incoming);
-        self.seen_targets.reserve(incoming);
-        if self.search_names_initialized {
-            self.scanned_names_lower.reserve(incoming);
-        }
-        for target in targets {
-            self.append_target(target);
-        }
-        self.scanned.len() != before
-    }
-
     fn handle_scan_result(&mut self, result: UiScanResult, ctx: &HostContext<'_>) -> CommandBatch {
-        if !self.active || self.finished || result.id != self.scan_id {
+        if !self.session.active || self.session.finished || result.id != self.session.scan_id {
             return CommandBatch::new();
         }
         let UiScanResult {
@@ -390,7 +245,7 @@ impl HintMode {
             return self.request_scan(ctx);
         }
 
-        let added = self.append_targets_owned(targets);
+        let added = self.session.append_targets(targets);
         // Once the user starts typing, preserve the labels they can already
         // see and select. With no input, every partial remains visible. A
         // source-agnostic plan is rebuilt from the merged UIA/Vision labels at
@@ -401,13 +256,13 @@ impl HintMode {
                 true
             } else {
                 if added {
-                    self.pending_relabel = true;
+                    self.session.pending_relabel = true;
                 }
                 false
             };
 
         if status == UiScanStatus::Partial {
-            self.status = None;
+            self.session.status = None;
             return if labels_changed {
                 self.redraw(ctx)
             } else {
@@ -415,15 +270,15 @@ impl HintMode {
             };
         }
 
-        let retryable_empty = self.hints.is_empty()
+        let retryable_empty = self.session.hints.is_empty()
             && matches!(status, UiScanStatus::Success | UiScanStatus::TimedOut)
-            && self.retry_attempt < self.config.scan_retry_count;
+            && self.session.retry_attempt < self.config.scan_retry_count;
         if retryable_empty {
-            self.scanning = true;
-            self.retry_pending = true;
-            self.status = Some(format!(
+            self.session.scanning = true;
+            self.session.retry_pending = true;
+            self.session.status = Some(format!(
                 "UI scan is taking longer - retrying {}/{}",
-                self.retry_attempt + 1,
+                self.session.retry_attempt + 1,
                 self.config.scan_retry_count
             ));
             let mut commands = self.status_scene(ctx);
@@ -437,10 +292,10 @@ impl HintMode {
 
         if status == UiScanStatus::Success
             && !labels_changed
-            && !self.hints.is_empty()
-            && self.status.is_none()
+            && !self.session.hints.is_empty()
+            && self.session.status.is_none()
         {
-            self.scanning = false;
+            self.session.scanning = false;
             let needs_redraw = if !self.overlap_plan.is_ready() {
                 self.rebuild_overlap_plan(ctx)
             } else {
@@ -453,12 +308,12 @@ impl HintMode {
             };
         }
 
-        self.scanning = false;
-        if !self.hints.is_empty() && !self.overlap_plan.is_ready() {
+        self.session.scanning = false;
+        if !self.session.hints.is_empty() && !self.overlap_plan.is_ready() {
             self.rebuild_overlap_plan(ctx);
         }
-        self.status = match &status {
-            UiScanStatus::Success if self.hints.is_empty() => {
+        self.session.status = match &status {
+            UiScanStatus::Success if self.session.hints.is_empty() => {
                 Some("No accessible targets — Esc to exit".into())
             }
             UiScanStatus::Success => None,
@@ -469,10 +324,10 @@ impl HintMode {
             | UiScanStatus::Unsupported(message)
             | UiScanStatus::Failed(message) => Some(format!("{message} — Esc to exit")),
             UiScanStatus::TimedOut => Some("UI scan timed out — Esc to exit".into()),
-            UiScanStatus::Partial => self.status.clone(),
+            UiScanStatus::Partial => self.session.status.clone(),
             UiScanStatus::ContextChanged => None,
         };
-        if self.hints.is_empty() {
+        if self.session.hints.is_empty() {
             return self.status_scene(ctx);
         }
         self.redraw(ctx)
@@ -486,43 +341,42 @@ impl HintMode {
             Input::Search(query) => Some(query.as_str()),
             Input::Labels(_) => None,
         };
-        if query.is_some() && !self.search_names_initialized {
-            self.scanned_names_lower.clear();
-            self.scanned_names_lower
-                .extend(self.scanned.iter().map(|target| target.name.to_lowercase()));
-            self.search_names_initialized = true;
+        if query.is_some() {
+            self.session.ensure_search_names();
         }
 
         let candidates = self
+            .session
             .scanned
             .iter()
             .enumerate()
             .filter(|(index, _)| {
-                query.is_none_or(|query| self.scanned_names_lower[*index].contains(query))
+                query.is_none_or(|query| self.session.scanned_names_lower[*index].contains(query))
             })
             .map(|(index, target)| (target.rect, index));
 
         if hints::assign_compact_into(
-            &mut self.hints,
+            &mut self.session.hints,
             candidates,
             &self.alphabet,
             self.config.label_direction,
         )
         .is_err()
         {
-            self.hints.clear();
-            self.status = Some("Cannot assign Hint labels — check hint_characters".into());
+            self.session.hints.clear();
+            self.session.status = Some("Cannot assign Hint labels — check hint_characters".into());
         }
-        self.pending_relabel = false;
+        self.session.pending_relabel = false;
         self.refresh_overlap_plan(ctx);
     }
 
     fn rebuild_overlap_plan(&mut self, ctx: &HostContext<'_>) -> bool {
         let style = self.resolved_hint_label_style(ctx.palette);
-        let visual_scale = visual_layer_scale(ctx, self.scan_bounds);
+        let visual_scale = visual_layer_scale(ctx, self.session.scan_bounds);
         let visual_padding_x = (style.padding_x * visual_scale).round();
         let visual_padding_y = (style.padding_y * visual_scale).round();
         let visible = self
+            .session
             .hints
             .iter()
             .filter(|hint| self.hint_is_visible(hint))
@@ -533,7 +387,8 @@ impl HintMode {
             let mut placements = self.wide_placements.take().unwrap_or_default();
             placements.clear();
             placements.extend(
-                self.hints
+                self.session
+                    .hints
                     .iter()
                     .enumerate()
                     .filter(|(_, hint)| self.hint_is_visible(hint))
@@ -544,13 +399,14 @@ impl HintMode {
             );
             build_visual_layer_plan(
                 &placements,
-                self.hints.len(),
+                self.session.hints.len(),
                 stacked,
                 &mut self.overlap_plan,
             );
             self.wide_placements = Some(placements);
         } else {
             let placements: SmallVec<[(usize, Rect); 128]> = self
+                .session
                 .hints
                 .iter()
                 .enumerate()
@@ -562,7 +418,7 @@ impl HintMode {
                 .collect();
             build_visual_layer_plan(
                 &placements,
-                self.hints.len(),
+                self.session.hints.len(),
                 stacked,
                 &mut self.overlap_plan,
             );
@@ -632,7 +488,7 @@ impl HintMode {
                 removed && was_last && self.overlap_plan.layer_count() > 1
             }
         };
-        if active_layer_changed && !self.hints.is_empty() {
+        if active_layer_changed && !self.session.hints.is_empty() {
             self.redraw(ctx)
         } else {
             CommandBatch::new()
@@ -654,6 +510,7 @@ impl HintMode {
     fn scene(&self, ctx: &HostContext<'_>) -> OverlayScene {
         let palette = ctx.palette;
         let visible_count = self
+            .session
             .hints
             .iter()
             .filter(|hint| self.hint_is_visible(hint))
@@ -665,7 +522,10 @@ impl HintMode {
         };
         let label_capacity = visible_count + usize::from(matches!(&self.input, Input::Search(_)));
         let mut scene = OverlayScene::with_capacity(shape_capacity, label_capacity);
-        scene.clip = self.scan_bounds.or_else(|| Some(ctx.active_bounds()));
+        scene.clip = self
+            .session
+            .scan_bounds
+            .or_else(|| Some(ctx.active_bounds()));
 
         let mut label_style = self.resolved_hint_label_style(palette);
         // This highlight belongs specifically to UI Hint's typed-prefix
@@ -678,7 +538,12 @@ impl HintMode {
         // Optional outlines behind only the currently visible candidates.
         if self.config.boundary_highlight.enabled {
             let bh = &self.config.boundary_highlight;
-            for hint in self.hints.iter().filter(|hint| self.hint_is_visible(hint)) {
+            for hint in self
+                .session
+                .hints
+                .iter()
+                .filter(|hint| self.hint_is_visible(hint))
+            {
                 scene.push_shape(OverlayShape::Rect {
                     rect: hint.bounds,
                     fill: bh.fill(palette),
@@ -714,6 +579,7 @@ impl HintMode {
         );
         for z_index in HINT_LAYER_Z_BASE..=final_z {
             for (hint_index, hint) in self
+                .session
                 .hints
                 .iter()
                 .enumerate()
@@ -758,7 +624,7 @@ impl HintMode {
     }
 
     fn redraw(&self, ctx: &HostContext<'_>) -> CommandBatch {
-        CommandBatch::one(Command::show_overlay(if self.finished {
+        CommandBatch::one(Command::show_overlay(if self.session.finished {
             self.finished_scene(ctx)
         } else {
             self.scene(ctx)
@@ -767,8 +633,15 @@ impl HintMode {
 
     fn finished_scene(&self, ctx: &HostContext<'_>) -> OverlayScene {
         let mut scene = OverlayScene::new();
-        scene.clip = self.scan_bounds.or_else(|| Some(ctx.active_bounds()));
-        let Some(target) = self.selected.and_then(|index| self.scanned.get(index)) else {
+        scene.clip = self
+            .session
+            .scan_bounds
+            .or_else(|| Some(ctx.active_bounds()));
+        let Some(target) = self
+            .session
+            .selected
+            .and_then(|index| self.session.scanned.get(index))
+        else {
             return scene;
         };
         let boundary = &self.config.boundary_highlight;
@@ -792,6 +665,7 @@ impl HintMode {
             palette.accent,
         );
         let text = self
+            .session
             .status
             .as_deref()
             .unwrap_or("No accessible targets — Esc to exit");
@@ -805,17 +679,17 @@ impl HintMode {
             height,
         );
         let mut scene = OverlayScene::new();
-        scene.clip = self.scan_bounds.or(Some(bounds));
+        scene.clip = self.session.scan_bounds.or(Some(bounds));
         scene.push_label(OverlayLabel::new(text, rect, style).with_z_index(10));
         CommandBatch::one(Command::show_overlay(scene))
     }
 
     fn select(&mut self, index: usize) -> CommandBatch {
-        let Some(target) = self.scanned.get(index) else {
+        let Some(target) = self.session.scanned.get(index) else {
             return self.cancel();
         };
         let point = target.rect.center();
-        self.selected = Some(index);
+        self.session.selected = Some(index);
         CommandBatch::two(
             Command::warp_to(point),
             Command::FinishMode {
@@ -832,12 +706,12 @@ impl HintMode {
     }
 
     fn key_down(&mut self, key: &Key, ctx: &HostContext<'_>) -> CommandBatch {
-        if self.finished {
+        if self.session.finished {
             return match key.as_str() {
                 "esc" => self.cancel(),
                 "backspace" | "tab" => {
-                    self.finished = false;
-                    self.selected = None;
+                    self.session.finished = false;
+                    self.session.selected = None;
                     if let Input::Labels(typed) = &mut self.input {
                         typed.pop();
                     }
@@ -848,7 +722,7 @@ impl HintMode {
         }
         // Before the first batch arrives only allow bailing out. Once partial
         // labels exist they are immediately usable while scanning continues.
-        if self.scanning && self.hints.is_empty() {
+        if self.session.scanning && self.session.hints.is_empty() {
             return if key.as_str() == "esc" {
                 self.cancel()
             } else {
@@ -895,7 +769,7 @@ impl HintMode {
                     }
                 }
                 if matches!(self.input, Input::Search(_))
-                    || (self.input.text().is_empty() && self.pending_relabel)
+                    || (self.input.text().is_empty() && self.session.pending_relabel)
                 {
                     self.relabel(ctx);
                 } else {
@@ -906,7 +780,12 @@ impl HintMode {
             "enter" => {
                 // Accept the first visible candidate, never one filtered out by
                 // the label prefix.
-                return match self.hints.iter().find(|hint| self.hint_is_visible(hint)) {
+                return match self
+                    .session
+                    .hints
+                    .iter()
+                    .find(|hint| self.hint_is_visible(hint))
+                {
                     Some(hint) => self.select(hint.value),
                     None => self.cancel(),
                 };
@@ -932,7 +811,7 @@ impl HintMode {
                     return CommandBatch::new();
                 }
                 typed.push(ch);
-                match match_compact_input(&self.hints, typed) {
+                match match_compact_input(&self.session.hints, typed) {
                     Match::Complete(index) => self.select(index),
                     Match::Partial { .. } => {
                         self.refresh_overlap_plan(ctx);
@@ -943,7 +822,7 @@ impl HintMode {
                         if let Input::Labels(typed) = &mut self.input {
                             typed.pop();
                         }
-                        if self.input.text().is_empty() && self.pending_relabel {
+                        if self.input.text().is_empty() && self.session.pending_relabel {
                             self.relabel(ctx);
                             self.redraw(ctx)
                         } else {
@@ -1110,17 +989,17 @@ impl Mode for HintMode {
     fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
         match event {
             ModeEvent::Activated { previous } => {
-                self.active = true;
+                self.session.active = true;
                 self.return_mode = previous.clone().unwrap_or_else(ModeId::idle);
                 self.request_scan(ctx)
             }
             ModeEvent::Restarted => {
-                self.active = true;
+                self.session.active = true;
                 self.request_scan(ctx)
             }
-            ModeEvent::FinishRequested { .. } if self.finished => CommandBatch::new(),
+            ModeEvent::FinishRequested { .. } if self.session.finished => CommandBatch::new(),
             ModeEvent::FinishRequested { .. } => {
-                self.finished = true;
+                self.session.finished = true;
                 let mut commands = self.redraw(ctx);
                 commands.extend(super::targeting::lifecycle_commands(
                     &self.config.lifecycle.after_finish,
@@ -1133,30 +1012,32 @@ impl Mode for HintMode {
                 &self.return_mode,
             ),
             ModeEvent::Deactivated => {
-                self.active = false;
+                self.session.active = false;
                 self.clear_scan_results(true);
-                self.scanning = false;
-                self.scan_bounds = None;
+                self.session.scanning = false;
+                self.session.scan_bounds = None;
                 self.input = Input::Labels(OverlayText::default());
                 self.held_overlap_keys.clear();
                 self.overlap_cycle = 0;
-                self.retry_pending = false;
-                self.selected = None;
-                self.finished = false;
+                self.session.retry_pending = false;
+                self.session.selected = None;
+                self.session.finished = false;
                 CommandBatch::one(Command::CancelTimer {
                     id: SCAN_RETRY_TIMER_ID.into(),
                 })
             }
-            ModeEvent::UiScanned(result) if self.finished || result.id != self.scan_id => {
+            ModeEvent::UiScanned(result)
+                if self.session.finished || result.id != self.session.scan_id =>
+            {
                 CommandBatch::new()
             }
             ModeEvent::UiScanned(result) => self.handle_scan_result(result.clone(), ctx),
             ModeEvent::Timer { id, .. }
                 if id == SCAN_RETRY_TIMER_ID
-                    && self.active
-                    && self.retry_pending
-                    && self.scanning
-                    && self.hints.is_empty() =>
+                    && self.session.active
+                    && self.session.retry_pending
+                    && self.session.scanning
+                    && self.session.hints.is_empty() =>
             {
                 self.retry_scan(ctx)
             }
@@ -1164,19 +1045,20 @@ impl Mode for HintMode {
                 binding,
                 state: KeyState::Down,
                 ..
-            } if self.active && matches!(binding.as_ref(), Binding::RescanUi) => {
+            } if self.session.active && matches!(binding.as_ref(), Binding::RescanUi) => {
                 self.request_scan(ctx)
             }
             // The tree we labelled belongs to the old window/geometry.
             ModeEvent::FocusChanged(_) | ModeEvent::ScreensChanged(_)
-                if self.active && !self.finished =>
+                if self.session.active && !self.session.finished =>
             {
                 self.request_scan(ctx)
             }
             ModeEvent::PointerMoved(_)
-                if self.active
-                    && !self.finished
+                if self.session.active
+                    && !self.session.finished
                     && self
+                        .session
                         .scan_bounds
                         .is_some_and(|bounds| bounds != ctx.active_bounds()) =>
             {
@@ -1185,11 +1067,11 @@ impl Mode for HintMode {
             ModeEvent::ScreenRetargeted { screen, .. } => {
                 CommandBatch::one(Command::warp_to(screen.bounds.center()))
             }
-            ModeEvent::Resumed if self.finished => self.redraw(ctx),
-            ModeEvent::Resumed if self.scanning && self.hints.is_empty() => {
+            ModeEvent::Resumed if self.session.finished => self.redraw(ctx),
+            ModeEvent::Resumed if self.session.scanning && self.session.hints.is_empty() => {
                 CommandBatch::one(Command::HideOverlay)
             }
-            ModeEvent::Resumed if self.hints.is_empty() => self.status_scene(ctx),
+            ModeEvent::Resumed if self.session.hints.is_empty() => self.status_scene(ctx),
             ModeEvent::Resumed => self.redraw(ctx),
             ModeEvent::Key {
                 key,
@@ -1282,7 +1164,7 @@ mod tests {
     fn deliver(mode: &mut HintMode, env: &Env, targets: Vec<UiTarget>) -> Vec<Command> {
         mode.handle_owned(
             ModeEvent::UiScanned(crate::api::UiScanResult {
-                id: mode.scan_id,
+                id: mode.session.scan_id,
                 targets,
                 status: UiScanStatus::Success,
             }),
@@ -1375,23 +1257,23 @@ mod tests {
     fn deactivation_releases_large_scan_buffers() {
         let env = Env::new();
         let mut mode = crate::app::mode_catalog::hint(&env.config);
-        mode.scanned.reserve(1_024);
-        mode.scanned_names_lower.reserve(1_024);
-        mode.seen_targets.reserve(1_024);
-        mode.hints.reserve(1_024);
+        mode.session.scanned.reserve(1_024);
+        mode.session.scanned_names_lower.reserve(1_024);
+        mode.session.seen_targets.reserve(1_024);
+        mode.session.hints.reserve(1_024);
         mode.overlap_plan.reserve_for_test(1_024);
-        assert!(mode.scanned.capacity() >= 1_024);
-        assert!(mode.scanned_names_lower.capacity() >= 1_024);
-        assert!(mode.seen_targets.capacity() >= 1_024);
-        assert!(mode.hints.capacity() >= 1_024);
+        assert!(mode.session.scanned.capacity() >= 1_024);
+        assert!(mode.session.scanned_names_lower.capacity() >= 1_024);
+        assert!(mode.session.seen_targets.capacity() >= 1_024);
+        assert!(mode.session.hints.capacity() >= 1_024);
         assert!(mode.overlap_plan.retained_capacity() >= 1_024);
 
         mode.handle(&ModeEvent::Deactivated, &env.ctx());
 
-        assert_eq!(mode.scanned.capacity(), 0);
-        assert_eq!(mode.scanned_names_lower.capacity(), 0);
-        assert_eq!(mode.seen_targets.capacity(), 0);
-        assert_eq!(mode.hints.capacity(), 0);
+        assert_eq!(mode.session.scanned.capacity(), 0);
+        assert_eq!(mode.session.scanned_names_lower.capacity(), 0);
+        assert_eq!(mode.session.seen_targets.capacity(), 0);
+        assert_eq!(mode.session.hints.capacity(), 0);
         assert_eq!(mode.overlap_plan.retained_capacity(), 128);
     }
 
@@ -1407,17 +1289,17 @@ mod tests {
                 .map(|index| target(&format!("Target {index}"), index as f64 * 2.0))
                 .collect(),
         );
-        assert_eq!(mode.scanned.len(), 100);
+        assert_eq!(mode.session.scanned.len(), 100);
 
         mode.handle(&ModeEvent::Deactivated, &env.ctx());
 
-        assert!(mode.scanned.is_empty());
-        assert!(mode.scanned.capacity() >= 100);
-        assert_eq!(mode.scanned_names_lower.capacity(), 0);
-        assert!(mode.seen_targets.is_empty());
-        assert!(mode.seen_targets.capacity() >= 100);
-        assert!(mode.hints.is_empty());
-        assert!(mode.hints.capacity() >= 100);
+        assert!(mode.session.scanned.is_empty());
+        assert!(mode.session.scanned.capacity() >= 100);
+        assert_eq!(mode.session.scanned_names_lower.capacity(), 0);
+        assert!(mode.session.seen_targets.is_empty());
+        assert!(mode.session.seen_targets.capacity() >= 100);
+        assert!(mode.session.hints.is_empty());
+        assert!(mode.session.hints.capacity() >= 100);
         assert!(mode.overlap_plan.retained_capacity() <= 128);
     }
 
@@ -1426,7 +1308,7 @@ mod tests {
         let env = Env::new();
         let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
-        let retired_scan_id = mode.scan_id;
+        let retired_scan_id = mode.session.scan_id;
 
         mode.handle(&ModeEvent::Deactivated, &env.ctx());
         let out = mode.handle_owned(
@@ -1439,11 +1321,11 @@ mod tests {
         );
 
         assert!(out.is_empty());
-        assert!(!mode.active);
-        assert!(!mode.scanning);
-        assert_eq!(mode.scan_id, retired_scan_id);
-        assert!(mode.scanned.is_empty());
-        assert!(mode.hints.is_empty());
+        assert!(!mode.session.active);
+        assert!(!mode.session.scanning);
+        assert_eq!(mode.session.scan_id, retired_scan_id);
+        assert!(mode.session.scanned.is_empty());
+        assert!(mode.session.hints.is_empty());
     }
 
     #[test]
@@ -1479,7 +1361,7 @@ mod tests {
         });
         let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
-        let old_scan_id = mode.scan_id;
+        let old_scan_id = mode.session.scan_id;
 
         env.cursor = Point::new(1500.0, 300.0);
         let out = mode.handle(&ModeEvent::PointerMoved(env.cursor), &env.ctx());
@@ -1493,7 +1375,7 @@ mod tests {
 
         assert!(request.id > old_scan_id);
         assert_eq!(request.bounds, Some(env.screens[1].bounds));
-        assert_eq!(mode.scan_bounds, Some(env.screens[1].bounds));
+        assert_eq!(mode.session.scan_bounds, Some(env.screens[1].bounds));
     }
 
     #[test]
@@ -1524,18 +1406,18 @@ mod tests {
 
         let first = mode.handle(
             &ModeEvent::UiScanned(crate::api::UiScanResult {
-                id: mode.scan_id,
+                id: mode.session.scan_id,
                 targets: vec![target("First", 100.0)],
                 status: UiScanStatus::Partial,
             }),
             &env.ctx(),
         );
-        assert!(mode.scanning);
+        assert!(mode.session.scanning);
         assert_eq!(scene_of(&first).labels.len(), 1);
 
         let second = mode.handle(
             &ModeEvent::UiScanned(crate::api::UiScanResult {
-                id: mode.scan_id,
+                id: mode.session.scan_id,
                 targets: vec![target("Second", 100.0)],
                 status: UiScanStatus::Partial,
             }),
@@ -1556,9 +1438,9 @@ mod tests {
         );
 
         let completed = deliver(&mut mode, &env, Vec::new());
-        assert!(!mode.scanning);
+        assert!(!mode.session.scanning);
         assert!(completed.is_empty(), "terminal reuses the prepared plan");
-        assert_eq!(mode.hints.len(), 2);
+        assert_eq!(mode.session.hints.len(), 2);
         assert!(mode.overlap_plan.is_ready());
         assert_eq!(mode.overlap_plan.len(), 2);
         assert_eq!(mode.overlap_plan.layer_count(), 2);
@@ -1583,7 +1465,7 @@ mod tests {
 
         mode.handle(
             &ModeEvent::UiScanned(UiScanResult {
-                id: mode.scan_id,
+                id: mode.session.scan_id,
                 targets: vec![target("Vision one", 100.0), target("Vision two", 100.0)],
                 status: UiScanStatus::Partial,
             }),
@@ -1593,14 +1475,14 @@ mod tests {
 
         mode.handle(
             &ModeEvent::UiScanned(UiScanResult {
-                id: mode.scan_id,
+                id: mode.session.scan_id,
                 targets: vec![target("UIA one", 400.0), target("UIA two", 400.0)],
                 status: UiScanStatus::Partial,
             }),
             &env.ctx(),
         );
 
-        assert_eq!(mode.hints.len(), 4);
+        assert_eq!(mode.session.hints.len(), 4);
         assert_eq!(mode.overlap_plan.len(), 4);
         assert_eq!(
             mode.overlap_plan.layer_count(),
@@ -1618,7 +1500,7 @@ mod tests {
         fn prepared(env: &Env) -> HintMode {
             let mut mode = crate::app::mode_catalog::hint(&env.config);
             activate(&mut mode, env);
-            let scan_id = mode.scan_id;
+            let scan_id = mode.session.scan_id;
             mode.handle_owned(
                 ModeEvent::UiScanned(UiScanResult {
                     id: scan_id,
@@ -1651,7 +1533,7 @@ mod tests {
 
         let env = Env::new();
         let mut fast = prepared(&env);
-        let scan_id = fast.scan_id;
+        let scan_id = fast.session.scan_id;
         let no_op = measure(|| {
             std::hint::black_box(fast.handle_owned(
                 ModeEvent::UiScanned(UiScanResult {
@@ -1679,13 +1561,13 @@ mod tests {
         activate(&mut mode, &env);
         mode.handle(
             &ModeEvent::UiScanned(crate::api::UiScanResult {
-                id: mode.scan_id,
+                id: mode.session.scan_id,
                 targets: vec![target("First", 100.0)],
                 status: UiScanStatus::Partial,
             }),
             &env.ctx(),
         );
-        let label = mode.hints[0].label.clone();
+        let label = mode.session.hints[0].label.clone();
         let out = press(&mut mode, &env, &label);
         assert!(
             out.iter()
@@ -1704,8 +1586,8 @@ mod tests {
             vec![target("Current", 100.0), target("Other display", 1500.0)],
         );
 
-        assert_eq!(mode.scanned.len(), 1);
-        assert_eq!(mode.scanned[0].name, "Current");
+        assert_eq!(mode.session.scanned.len(), 1);
+        assert_eq!(mode.session.scanned[0].name, "Current");
         assert_eq!(scene_of(&out).labels.len(), 1);
         assert_eq!(scene_of(&out).clip, Some(env.screens[0].bounds));
     }
@@ -1721,19 +1603,20 @@ mod tests {
             .map(|i| target(&format!("target {i}"), i as f64 * 25.0))
             .collect();
         deliver(&mut mode, &env, targets);
-        let total = mode.hints.len();
+        let total = mode.session.hints.len();
         let prefix = mode
             .alphabet
             .iter()
             .copied()
             .find(|prefix| {
                 let prefix = prefix.to_string();
-                mode.hints
+                mode.session
+                    .hints
                     .iter()
                     .filter(|hint| hint.label.starts_with(&prefix))
                     .count()
                     > 1
-                    && mode.hints.iter().all(|hint| hint.label != prefix)
+                    && mode.session.hints.iter().all(|hint| hint.label != prefix)
             })
             .expect("test data should produce a partial prefix");
 
@@ -1762,19 +1645,20 @@ mod tests {
                 .map(|index| target(&format!("Target {index}"), 100.0))
                 .collect(),
         );
-        let total = mode.hints.len();
+        let total = mode.session.hints.len();
         let prefix = mode
             .alphabet
             .iter()
             .copied()
             .find(|prefix| {
                 let prefix = prefix.to_string();
-                mode.hints
+                mode.session
+                    .hints
                     .iter()
                     .filter(|hint| hint.label.starts_with(&prefix))
                     .count()
                     > 1
-                    && mode.hints.iter().all(|hint| hint.label != prefix)
+                    && mode.session.hints.iter().all(|hint| hint.label != prefix)
             })
             .expect("test data should produce a partial prefix");
 
@@ -1782,7 +1666,7 @@ mod tests {
         let visible = scene_of(&filtered).labels.len();
         assert!(visible > 1 && visible < total);
         assert!(mode.overlap_plan.is_ready());
-        assert_eq!(mode.overlap_plan.len(), mode.hints.len());
+        assert_eq!(mode.overlap_plan.len(), mode.session.hints.len());
         assert_eq!(mode.overlap_plan.layer_count(), visible);
 
         let raised_label = |output: &Vec<Command>| top_label(scene_of(output)).text.clone();
@@ -1805,7 +1689,7 @@ mod tests {
 
         let restored = press(&mut mode, &env, "backspace");
         assert_eq!(scene_of(&restored).labels.len(), total);
-        assert_eq!(mode.overlap_plan.len(), mode.hints.len());
+        assert_eq!(mode.overlap_plan.len(), mode.session.hints.len());
     }
 
     #[cfg(target_os = "windows")]
@@ -1823,24 +1707,27 @@ mod tests {
                 .collect(),
         );
 
-        for (index, hint) in mode.hints.iter_mut().enumerate() {
+        for (index, hint) in mode.session.hints.iter_mut().enumerate() {
             hint.bounds = Rect::new(1_000.0 + index as f64 * 100.0, 300.0, 20.0, 20.0);
         }
         let ajh = mode
+            .session
             .hints
             .iter()
             .position(|hint| hint.label.as_str() == "ajh")
             .expect("100 labels should include ajh");
         let ajj = mode
+            .session
             .hints
             .iter()
             .position(|hint| hint.label.as_str() == "ajj")
             .expect("100 labels should include ajj");
         let style = mode.resolved_hint_label_style(&env.palette);
-        mode.hints[ajh].bounds = Rect::new(50.0, 100.0, 20.0, 20.0);
-        let logical_ajh = placed_hint_rect(&mode.config, &mode.hints[ajh], &style);
-        mode.hints[ajj].bounds = Rect::new(50.0 + logical_ajh.width * 1.10, 100.0, 20.0, 20.0);
-        let logical_ajj = placed_hint_rect(&mode.config, &mode.hints[ajj], &style);
+        mode.session.hints[ajh].bounds = Rect::new(50.0, 100.0, 20.0, 20.0);
+        let logical_ajh = placed_hint_rect(&mode.config, &mode.session.hints[ajh], &style);
+        mode.session.hints[ajj].bounds =
+            Rect::new(50.0 + logical_ajh.width * 1.10, 100.0, 20.0, 20.0);
+        let logical_ajj = placed_hint_rect(&mode.config, &mode.session.hints[ajj], &style);
         assert!(
             logical_ajh.intersect(&logical_ajj).is_none(),
             "the old 96-DPI planner must miss this real-world overlap"
@@ -2253,8 +2140,8 @@ mod tests {
             .iter()
             .map(|label| label.rect)
             .collect();
-        assert_eq!(mode.scanned.len(), 128);
-        assert_eq!(mode.hints.len(), 128);
+        assert_eq!(mode.session.scanned.len(), 128);
+        assert_eq!(mode.session.hints.len(), 128);
         assert_eq!(completed_labels.len(), 128);
         assert_eq!(mode.overlap_plan.len(), 128);
         assert_eq!(mode.overlap_plan.layer_count(), 128);
@@ -2321,7 +2208,7 @@ mod tests {
         activate(&mut mode, &env);
         mode.handle(
             &ModeEvent::UiScanned(crate::api::UiScanResult {
-                id: mode.scan_id,
+                id: mode.session.scan_id,
                 targets: vec![target("One", 100.0), target("Two", 100.0)],
                 status: UiScanStatus::Partial,
             }),
@@ -2337,7 +2224,7 @@ mod tests {
 
         let streamed = mode.handle(
             &ModeEvent::UiScanned(crate::api::UiScanResult {
-                id: mode.scan_id,
+                id: mode.session.scan_id,
                 targets: vec![target("Three", 100.0), target("Four", 100.0)],
                 status: UiScanStatus::Partial,
             }),
@@ -2345,7 +2232,11 @@ mod tests {
         );
         let streamed_scene = scene_of(&streamed);
         assert_eq!(streamed_scene.labels.len(), 4);
-        assert_eq!(mode.hints.len(), 4, "new partial labels remain visible");
+        assert_eq!(
+            mode.session.hints.len(),
+            4,
+            "new partial labels remain visible"
+        );
         assert!(mode.overlap_plan.is_ready());
         assert_eq!(mode.overlap_plan.len(), 4);
         assert_eq!(mode.overlap_plan.layer_count(), 4);
@@ -2357,7 +2248,7 @@ mod tests {
 
         let completed = deliver(&mut mode, &env, Vec::new());
         assert!(completed.is_empty(), "terminal reuses the merged plan");
-        assert!(!mode.scanning);
+        assert!(!mode.session.scanning);
         assert!(mode.overlap_plan.is_ready());
         assert_eq!(mode.overlap_plan.len(), 4);
         assert_eq!(mode.overlap_plan.layer_count(), 4);
@@ -2385,7 +2276,7 @@ mod tests {
         activate(&mut mode, &env);
         mode.handle(
             &ModeEvent::UiScanned(UiScanResult {
-                id: mode.scan_id,
+                id: mode.session.scan_id,
                 targets: (0..30)
                     .map(|index| target(&format!("Initial {index}"), index as f64 * 24.0))
                     .collect(),
@@ -2393,26 +2284,27 @@ mod tests {
             }),
             &env.ctx(),
         );
-        let original_hint_count = mode.hints.len();
+        let original_hint_count = mode.session.hints.len();
         let prefix = mode
             .alphabet
             .iter()
             .copied()
             .find(|prefix| {
                 let prefix = prefix.to_string();
-                mode.hints
+                mode.session
+                    .hints
                     .iter()
                     .filter(|hint| hint.label.starts_with(&prefix))
                     .count()
                     > 1
-                    && mode.hints.iter().all(|hint| hint.label != prefix)
+                    && mode.session.hints.iter().all(|hint| hint.label != prefix)
             })
             .expect("test data should provide a partial label prefix");
         press(&mut mode, &env, &prefix.to_string());
 
         let late = mode.handle(
             &ModeEvent::UiScanned(UiScanResult {
-                id: mode.scan_id,
+                id: mode.session.scan_id,
                 targets: (0..5)
                     .map(|index| target(&format!("Late {index}"), 720.0 + index as f64 * 24.0))
                     .collect(),
@@ -2421,18 +2313,18 @@ mod tests {
             &env.ctx(),
         );
         assert!(late.is_empty(), "typed label codes must remain stable");
-        assert_eq!(mode.hints.len(), original_hint_count);
-        assert_eq!(mode.scanned.len(), original_hint_count + 5);
-        assert!(mode.pending_relabel);
+        assert_eq!(mode.session.hints.len(), original_hint_count);
+        assert_eq!(mode.session.scanned.len(), original_hint_count + 5);
+        assert!(mode.session.pending_relabel);
 
         deliver(&mut mode, &env, Vec::new());
-        assert_eq!(mode.hints.len(), original_hint_count);
-        assert!(mode.pending_relabel);
+        assert_eq!(mode.session.hints.len(), original_hint_count);
+        assert!(mode.session.pending_relabel);
 
         let merged = press(&mut mode, &env, "backspace");
-        assert_eq!(scene_of(&merged).labels.len(), mode.scanned.len());
-        assert_eq!(mode.hints.len(), mode.scanned.len());
-        assert!(!mode.pending_relabel);
+        assert_eq!(scene_of(&merged).labels.len(), mode.session.scanned.len());
+        assert_eq!(mode.session.hints.len(), mode.session.scanned.len());
+        assert!(!mode.session.pending_relabel);
         assert!(mode.overlap_plan.is_ready());
     }
 
@@ -2519,15 +2411,15 @@ mod tests {
         activate(&mut mode, &env);
         let out = mode.handle(
             &ModeEvent::UiScanned(crate::api::UiScanResult {
-                id: mode.scan_id.wrapping_add(1),
+                id: mode.session.scan_id.wrapping_add(1),
                 targets: vec![target("stale", 0.0)],
                 status: UiScanStatus::Success,
             }),
             &env.ctx(),
         );
         assert!(out.is_empty());
-        assert!(mode.scanning);
-        assert!(mode.scanned.is_empty());
+        assert!(mode.session.scanning);
+        assert!(mode.session.scanned.is_empty());
     }
 
     #[test]
@@ -2541,8 +2433,8 @@ mod tests {
             vec![target("Save", 0.0), target("Cancel", 200.0)],
         );
 
-        let label = mode.hints[1].label.clone();
-        let expected = mode.scanned[1].rect.center();
+        let label = mode.session.hints[1].label.clone();
+        let expected = mode.session.scanned[1].rect.center();
         let mut out = Vec::new();
         for ch in label.chars() {
             out = press(&mut mode, &env, &ch.to_string());
@@ -2614,7 +2506,7 @@ mod tests {
         let env = Env::with(config);
         let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
-        let first_id = mode.scan_id;
+        let first_id = mode.session.scan_id;
 
         let timed_out = mode.handle(
             &ModeEvent::UiScanned(crate::api::UiScanResult {
@@ -2624,7 +2516,10 @@ mod tests {
             }),
             &env.ctx(),
         );
-        assert!(mode.scanning, "retry wait still captures hint input");
+        assert!(
+            mode.session.scanning,
+            "retry wait still captures hint input"
+        );
         assert!(timed_out.iter().any(|command| matches!(
             command,
             Command::SetTimer { id, delay, repeating: false }
@@ -2655,8 +2550,8 @@ mod tests {
         let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         deliver(&mut mode, &env, vec![target("Old", 20.0)]);
-        let retired_scan_id = mode.scan_id;
-        mode.retry_attempt = 2;
+        let retired_scan_id = mode.session.scan_id;
+        mode.session.retry_attempt = 2;
 
         let out = mode.handle_owned(
             ModeEvent::UiScanned(crate::api::UiScanResult {
@@ -2667,11 +2562,11 @@ mod tests {
             &env.ctx(),
         );
 
-        assert!(mode.scan_id > retired_scan_id);
-        assert_eq!(mode.retry_attempt, 0);
-        assert!(mode.scanning);
-        assert!(mode.scanned.is_empty());
-        assert!(mode.hints.is_empty());
+        assert!(mode.session.scan_id > retired_scan_id);
+        assert_eq!(mode.session.retry_attempt, 0);
+        assert!(mode.session.scanning);
+        assert!(mode.session.scanned.is_empty());
+        assert!(mode.session.hints.is_empty());
         assert!(
             out.iter()
                 .any(|command| matches!(command, Command::ScanUi(_)))
@@ -2690,15 +2585,18 @@ mod tests {
 
         let out = mode.handle_owned(
             ModeEvent::UiScanned(crate::api::UiScanResult {
-                id: mode.scan_id,
+                id: mode.session.scan_id,
                 targets: Vec::new(),
                 status: UiScanStatus::Failed(NO_WINDOW_UNDER_POINTER.into()),
             }),
             &env.ctx(),
         );
 
-        assert!(!mode.scanning);
-        assert_eq!(mode.status.as_deref(), Some(NO_WINDOW_UNDER_POINTER));
+        assert!(!mode.session.scanning);
+        assert_eq!(
+            mode.session.status.as_deref(),
+            Some(NO_WINDOW_UNDER_POINTER)
+        );
         assert!(
             out.iter()
                 .all(|command| !matches!(command, Command::SetTimer { .. }))
@@ -2716,7 +2614,7 @@ mod tests {
         activate(&mut mode, &env);
         mode.handle(
             &ModeEvent::UiScanned(crate::api::UiScanResult {
-                id: mode.scan_id,
+                id: mode.session.scan_id,
                 targets: vec![target("Ready", 100.0)],
                 status: UiScanStatus::Partial,
             }),
@@ -2725,13 +2623,13 @@ mod tests {
 
         let completed = mode.handle(
             &ModeEvent::UiScanned(crate::api::UiScanResult {
-                id: mode.scan_id,
+                id: mode.session.scan_id,
                 targets: Vec::new(),
                 status: UiScanStatus::TimedOut,
             }),
             &env.ctx(),
         );
-        assert!(!mode.scanning);
+        assert!(!mode.session.scanning);
         assert_eq!(scene_of(&completed).labels.len(), 1);
         assert!(
             completed
@@ -2747,13 +2645,13 @@ mod tests {
         activate(&mut mode, &env);
         let out = mode.handle(
             &ModeEvent::UiScanned(crate::api::UiScanResult {
-                id: mode.scan_id,
+                id: mode.session.scan_id,
                 targets: Vec::new(),
                 status: UiScanStatus::PermissionDenied("Screen Recording required".into()),
             }),
             &env.ctx(),
         );
-        assert!(!mode.scanning);
+        assert!(!mode.session.scanning);
         assert!(
             out.iter()
                 .all(|command| !matches!(command, Command::SwitchMode(_)))
@@ -2804,15 +2702,18 @@ mod tests {
             &env,
             vec![target("Save", 0.0), target("Cancel", 200.0)],
         );
-        assert!(!mode.search_names_initialized);
-        assert!(mode.scanned_names_lower.is_empty());
+        assert!(!mode.session.search_names_initialized);
+        assert!(mode.session.scanned_names_lower.is_empty());
 
         press(&mut mode, &env, "/");
-        assert!(mode.search_names_initialized);
-        assert_eq!(mode.scanned_names_lower, ["save", "cancel"]);
+        assert!(mode.session.search_names_initialized);
+        assert_eq!(mode.session.scanned_names_lower, ["save", "cancel"]);
         let out = press(&mut mode, &env, "c");
-        assert_eq!(mode.hints.len(), 1, "only Cancel should survive");
-        assert_eq!(mode.scanned[mode.hints[0].value].name, "Cancel");
+        assert_eq!(mode.session.hints.len(), 1, "only Cancel should survive");
+        assert_eq!(
+            mode.session.scanned[mode.session.hints[0].value].name,
+            "Cancel"
+        );
 
         // The search box is drawn with the query.
         assert!(
@@ -2834,7 +2735,7 @@ mod tests {
 
         press(&mut mode, &env, "/");
         let filtered = press(&mut mode, &env, "a");
-        assert_eq!(mode.hints.len(), 2);
+        assert_eq!(mode.session.hints.len(), 2);
         assert_eq!(mode.overlap_plan.len(), 2);
         // Two hint labels plus the search input label.
         assert_eq!(scene_of(&filtered).labels.len(), 3);
@@ -2865,8 +2766,11 @@ mod tests {
         press(&mut mode, &env, "É");
 
         assert_eq!(mode.input.text(), "é");
-        assert_eq!(mode.hints.len(), 1);
-        assert_eq!(mode.scanned[mode.hints[0].value].name, "École");
+        assert_eq!(mode.session.hints.len(), 1);
+        assert_eq!(
+            mode.session.scanned[mode.session.hints[0].value].name,
+            "École"
+        );
     }
 
     #[test]
@@ -2932,10 +2836,10 @@ mod tests {
             vec![save.clone(), save, different_name, different_role],
         );
 
-        assert_eq!(mode.scanned.len(), 3);
-        assert_eq!(mode.seen_targets.len(), 1);
-        assert_eq!(mode.seen_targets.values().next().unwrap().len(), 3);
-        assert!(mode.scanned_names_lower.is_empty());
+        assert_eq!(mode.session.scanned.len(), 3);
+        assert_eq!(mode.session.seen_targets.len(), 1);
+        assert_eq!(mode.session.seen_targets.values().next().unwrap().len(), 3);
+        assert!(mode.session.scanned_names_lower.is_empty());
     }
 
     #[test]
@@ -2947,7 +2851,7 @@ mod tests {
         let targets = vec![target("Save 设置", 20.0), target("Cancel", 120.0)];
         let targets_ptr = targets.as_ptr();
         let name_ptr = targets[0].name.as_ptr();
-        let scan_id = mode.scan_id;
+        let scan_id = mode.session.scan_id;
         let _ = mode.handle_owned(
             ModeEvent::UiScanned(UiScanResult {
                 id: scan_id,
@@ -2957,10 +2861,11 @@ mod tests {
             &env.ctx(),
         );
 
-        assert_eq!(mode.scanned.as_ptr(), targets_ptr);
-        assert_eq!(mode.scanned[0].name.as_ptr(), name_ptr);
+        assert_eq!(mode.session.scanned.as_ptr(), targets_ptr);
+        assert_eq!(mode.session.scanned[0].name.as_ptr(), name_ptr);
         assert_eq!(
-            mode.scanned
+            mode.session
+                .scanned
                 .iter()
                 .map(|target| target.name.as_str())
                 .collect::<Vec<_>>(),
@@ -2994,7 +2899,7 @@ mod tests {
             .collect();
         deliver(&mut mode, &env, targets);
 
-        let first = mode.hints[0].label.chars().next().unwrap();
+        let first = mode.session.hints[0].label.chars().next().unwrap();
         press(&mut mode, &env, &first.to_string());
         let before = mode.input.text().to_string();
 
@@ -3004,6 +2909,7 @@ mod tests {
             .iter()
             .find(|c| {
                 !mode
+                    .session
                     .hints
                     .iter()
                     .any(|h| h.label.starts_with(&format!("{before}{c}")))
@@ -3026,7 +2932,7 @@ mod tests {
 
         let out = mode.handle(&ModeEvent::FocusChanged(None), &env.ctx());
         assert!(out.iter().any(|c| matches!(c, Command::ScanUi { .. })));
-        assert!(mode.hints.is_empty(), "stale hints must be dropped");
+        assert!(mode.session.hints.is_empty(), "stale hints must be dropped");
     }
 
     #[test]
@@ -3098,7 +3004,12 @@ mod tests {
                 .map(|i| target(&format!("b{i}"), i as f64 * 10.0))
                 .collect(),
         );
-        let labels: Vec<&str> = mode.hints.iter().map(|h| h.label.as_str()).collect();
+        let labels: Vec<&str> = mode
+            .session
+            .hints
+            .iter()
+            .map(|h| h.label.as_str())
+            .collect();
         assert_eq!(labels, ["aa", "sa", "da", "fa", "as"]);
     }
 
@@ -3110,7 +3021,7 @@ mod tests {
         let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         deliver(&mut mode, &env, vec![target("Save", 100.0)]);
-        let label = mode.hints[0].label.clone();
+        let label = mode.session.hints[0].label.clone();
         let selected = press(&mut mode, &env, &label);
         assert!(selected.iter().any(|command| matches!(
             command,
@@ -3125,7 +3036,7 @@ mod tests {
             },
             &env.ctx(),
         );
-        assert!(mode.finished);
+        assert!(mode.session.finished);
         assert!(
             finished
                 .iter()
@@ -3147,7 +3058,7 @@ mod tests {
         );
 
         let reopened = press(&mut mode, &env, "backspace");
-        assert!(!mode.finished);
+        assert!(!mode.session.finished);
         assert!(
             reopened
                 .iter()

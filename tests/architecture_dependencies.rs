@@ -15,7 +15,16 @@ fn rust_files(root: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
 }
 
 fn production_source(path: &Path) -> std::io::Result<String> {
+    if path
+        .components()
+        .any(|component| component.as_os_str() == "tests")
+    {
+        return Ok(String::new());
+    }
     let source = std::fs::read_to_string(path)?.replace("\r\n", "\n");
+    if source.starts_with("#![cfg(test)]") {
+        return Ok(String::new());
+    }
     Ok(source
         .split_once("#[cfg(test)]\nmod tests")
         .map_or(source.as_str(), |(production, _)| production)

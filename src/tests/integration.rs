@@ -515,10 +515,13 @@ fn every_mode_has_a_binding_table_including_plugins() {
         },
     );
 
+    let plan = keysteer::app::configuration::compile(&config).unwrap();
     for mode in ["idle", "normal", "grid", "recursive_grid", "ui_hint"] {
-        assert!(config.bindings_for(mode).is_some(), "{mode} has no table");
+        let id = ModeId::new(mode).unwrap();
+        assert!(plan.route(&id).is_some(), "{mode} has no table");
     }
-    assert!(config.bindings_for("plugin:screen-selector").is_some());
+    let plugin = ModeId::new("plugin:screen-selector").unwrap();
+    assert!(plan.route(&plugin).is_some());
     config.validate().unwrap();
 }
 

@@ -51,6 +51,78 @@ fn held_targets_text(targets: &LatchedTargets) -> Option<HeldTargetsText> {
     })
 }
 
+/// Last overlay intent produced by one (possibly nested) command batch.
+/// Pointer injection still happens immediately; only expensive presentation is
+/// coalesced until the outermost batch completes.
+pub(super) enum PendingOverlay {
+    Refresh,
+    Positions,
+    Show(Arc<OverlayScene>),
+    Hide,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct OverlayPositions {
+    pub(super) cursor: Option<Point>,
+    pub(super) indicator: Option<Point>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct IndicatorGeometry {
+    pub(super) width: f64,
+    pub(super) height: f64,
+    pub(super) x_offset: f64,
+    pub(super) y_offset: f64,
+}
+
+impl IndicatorGeometry {
+    pub(super) fn position(self, cursor: Point, screens: &[Screen]) -> Point {
+        let mut position = Point::new(cursor.x + self.x_offset, cursor.y + self.y_offset);
+        if let Some(screen) = Screen::containing(screens, &cursor) {
+            position.x = position.x.clamp(
+                (screen.bounds.x + self.width).min(screen.bounds.right()),
+                screen.bounds.right(),
+            );
+            position.y = position.y.clamp(
+                screen.bounds.y,
+                (screen.bounds.bottom() - self.height).max(screen.bounds.y),
+            );
+        }
+        position
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct DynamicOverlayState {
+    pub(super) cursor: bool,
+    pub(super) indicator: Option<IndicatorGeometry>,
+    pub(super) follows_cursor_screen: bool,
+}
+
+#[derive(Default)]
+pub(super) struct OverlayCoordinator {
+    pub(super) last_scene: Option<Arc<OverlayScene>>,
+    pub(super) content: Option<Arc<OverlayScene>>,
+    pub(super) visible: bool,
+    pub(super) dynamic: DynamicOverlayState,
+    pub(super) positions: Option<OverlayPositions>,
+    pub(super) position_fast_path_disabled: bool,
+    pub(super) command_batch_depth: usize,
+    pub(super) pending: Option<PendingOverlay>,
+}
+
+impl OverlayCoordinator {
+    pub(super) fn reset(&mut self) {
+        self.last_scene = None;
+        self.content = None;
+        self.visible = false;
+        self.dynamic = DynamicOverlayState::default();
+        self.positions = None;
+        self.position_fast_path_disabled = false;
+        self.command_batch_depth = 0;
+        self.pending = None;
+    }
+}
 impl Engine {
     pub(super) fn show_overlay(
         &mut self,
@@ -170,7 +242,7 @@ impl Engine {
         self.trace_lazy(trace_overlay, "overlay", || {
             format!(
                 "present mode={} shapes={} labels={} indicator={} clip={:?}",
-                self.active,
+                self.registry.active,
                 scene.shapes.len(),
                 scene.labels.len(),
                 scene
@@ -227,7 +299,7 @@ impl Engine {
 
     fn hide_overlay_now(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
         self.overlay.content = None;
-        if self.active != ModeId::idle() {
+        if self.registry.active != ModeId::idle() {
             return self.present_overlay(OverlayScene::new(), backend);
         }
         if self.overlay.visible {
@@ -253,7 +325,7 @@ impl Engine {
     }
 
     fn refresh_overlay_now(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
-        if self.active == ModeId::idle() {
+        if self.registry.active == ModeId::idle() {
             return Ok(());
         }
         let scene = self.overlay.content.as_deref().cloned().unwrap_or_default();
@@ -266,7 +338,7 @@ impl Engine {
         &mut self,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
-        if self.active == ModeId::idle() || !self.overlay.visible {
+        if self.registry.active == ModeId::idle() || !self.overlay.visible {
             return Ok(());
         }
         if self.overlay.dynamic.follows_cursor_screen {
@@ -347,7 +419,7 @@ impl Engine {
     }
 
     fn build_indicator(&self, display_mode: &ModeId) -> Option<(Indicator, IndicatorGeometry)> {
-        let mode = self.modes.get(display_mode)?;
+        let mode = self.registry.get(display_mode)?;
         let (text, ui) = self
             .settings
             .mode_indicator

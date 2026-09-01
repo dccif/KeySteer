@@ -6,6 +6,10 @@
 配置合法。根类型和大多数结构使用 `deny_unknown_fields`，拼错字段应在加载时明确失败，
 不能静默忽略。
 
+配置内部按变化原因拆分：`mod.rs` 保留文档 schema/default 和稳定 re-export，Mode DTO 位于
+`modes.rs`，键别名规范化位于 `aliases.rs`，跨 section 约束位于 `validation.rs`，持久化位于
+`store.rs`。这些模块都只描述配置文档，不实例化运行时对象。
+
 主要 section：
 
 - `general`、`debug`、`platform`
@@ -115,6 +119,10 @@ Engine 为每个 Mode 编译有效 keymap：
 
 `temporary_mode`/`temporary_mode_keys` 允许 targeting mode 暂时使用另一个 Mode（默认为
 Normal）的绑定，而不销毁当前选择路径。
+
+DTO 到强类型 Mode `Settings`、enable/disable、继承、temporary keys、app override 和插件
+默认绑定的汇合点统一是 `app/mode_catalog.rs`。`configuration::compile` 只验证 catalog ID
+唯一性并组装 `RuntimePlan`；不要重新增加按 Mode ID 分散查询配置的 `match`。
 
 ## targeting 生命周期配置
 

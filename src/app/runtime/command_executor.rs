@@ -58,7 +58,7 @@ impl Engine {
         commands: impl IntoIterator<Item = Command>,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
-        let owner = self.active.clone();
+        let owner = self.registry.active.clone();
         self.execute_for(&owner, commands, backend)
     }
 
@@ -95,7 +95,10 @@ impl Engine {
                 self.settings.debug.actions
             };
             self.trace_lazy(trace_command, "command", || {
-                format!("owner={owner} active={} command={command:?}", self.active)
+                format!(
+                    "owner={owner} active={} command={command:?}",
+                    self.registry.active
+                )
             });
             match command {
                 Command::DispatchActions(actions) => {
@@ -254,8 +257,8 @@ impl Engine {
                 }
 
                 Command::SwitchMode(id) => {
-                    let previous = Some(self.active.clone());
-                    self.modal_stack.clear();
+                    let previous = Some(self.registry.active.clone());
+                    self.registry.modal_stack.clear();
                     self.activate(id, previous, backend)?;
                 }
                 Command::PushMode(id) => self.push_mode(id, backend)?,
@@ -367,4 +370,377 @@ fn clamp_to_screen(point: Point, screen: &Screen) -> Point {
         point.x.clamp(bounds.left(), max_x),
         point.y.clamp(bounds.top(), max_y),
     )
+}
+
+impl Engine {
+    pub(super) fn flatten_sequence(&self, actions: &[Binding]) -> Vec<Binding> {
+        fn append(binding: &Binding, flattened: &mut Vec<Binding>) {
+            match binding {
+                Binding::Sequence(nested) => {
+                    for action in nested {
+                        append(action, flattened);
+                    }
+                }
+                action => flattened.push(action.clone()),
+            }
+        }
+
+        let mut flattened = Vec::new();
+        for action in actions {
+            append(action, &mut flattened);
+        }
+
+        // Two identical key sends are a double tap. Give the focused app the
+        // same default interval as an explicit `wait`/`wait 0`, while leaving
+        // an explicitly configured wait untouched.
+        let mut expanded = Vec::with_capacity(flattened.len());
+        for action in flattened {
+            if matches!(
+                (expanded.last(), &action),
+                (Some(Binding::Send(previous)), Binding::Send(current)) if previous == current
+            ) {
+                expanded.push(Binding::Wait {
+                    min_ms: DEFAULT_WAIT_MS,
+                    max_ms: DEFAULT_WAIT_MS,
+                });
+            }
+            expanded.push(action);
+        }
+        expanded
+    }
+
+    pub(super) fn continue_sequence(
+        &mut self,
+        mut actions: VecDeque<Binding>,
+        owner: ModeId,
+        mut input: crate::api::input::InputEvent,
+        backend: &mut dyn Backend,
+    ) -> Result<(), String> {
+        input.repeat = false;
+        while let Some(action) = actions.pop_front() {
+            if let Binding::Wait { min_ms, max_ms } = action {
+                if actions.is_empty() {
+                    return Ok(());
+                }
+                const MAX_PENDING_SEQUENCES: usize = 256;
+                if self.scheduler.sequences.len() >= MAX_PENDING_SEQUENCES {
+                    return Err("too many action sequences are waiting".into());
+                }
+                let delay = random_wait_ms(min_ms, max_ms);
+                let pending = PendingSequence {
+                    fires_at: Instant::now() + Duration::from_millis(delay),
+                    actions,
+                    owner,
+                    input,
+                };
+                let index = self
+                    .scheduler
+                    .sequences
+                    .partition_point(|current| current.fires_at > pending.fires_at);
+                self.scheduler.sequences.insert(index, pending);
+                return Ok(());
+            }
+            let nested = ResolvedBinding {
+                binding: Arc::new(action),
+                owner: owner.clone(),
+            };
+            self.apply_binding(nested, &input, backend)?;
+        }
+        Ok(())
+    }
+
+    /// Act on a resolved binding.
+    ///
+    /// Returns whether the key was consumed. Host-level verbs are executed
+    /// here; everything else is forwarded to the mode as a
+    /// [`ModeEvent::Binding`], which is what a plugin sees too.
+    pub(super) fn apply_binding(
+        &mut self,
+        resolved: ResolvedBinding,
+        input: &crate::api::input::InputEvent,
+        backend: &mut dyn Backend,
+    ) -> Result<bool, String> {
+        let binding = resolved.binding.as_ref();
+        let is_press = input.state == KeyState::Down;
+        self.trace_lazy(
+            self.settings.debug.actions && (!input.repeat || self.settings.debug.motion),
+            "action",
+            || {
+                format!(
+                    "phase={:?} owner={} active={} action={binding:?}",
+                    input.state, resolved.owner, self.registry.active
+                )
+            },
+        );
+
+        // Held bindings need both edges; the rest act on the press only.
+        if !is_press && !binding.is_held() {
+            // Still consume the release so the app never sees half a gesture.
+            return Ok(true);
+        }
+        // Auto-repeat must not re-trigger a discrete action.
+        if input.repeat && !binding.is_held() {
+            return Ok(true);
+        }
+
+        // Stateful gestures and mode-specific discrete actions are owned by
+        // the receiving mode. Transfer the resolved binding's Arc directly;
+        // a held key already stored the one clone needed for its release edge.
+        if matches!(
+            binding,
+            Binding::Move(_)
+                | Binding::Scroll(..)
+                | Binding::Speed(_)
+                | Binding::ToggleCursorFollowSelection
+                | Binding::RescanUi
+        ) {
+            return self
+                .dispatch_to(
+                    &resolved.owner,
+                    ModeEvent::Binding {
+                        binding: resolved.binding,
+                        state: input.state,
+                        key: input.key.clone(),
+                    },
+                    backend,
+                )
+                .map(|_| true);
+        }
+
+        match binding {
+            Binding::Sequence(actions) => {
+                let actions = self.flatten_sequence(actions);
+                let has_held = actions.iter().any(Binding::is_held);
+                if has_held
+                    && actions
+                        .iter()
+                        .any(|action| matches!(action, Binding::Wait { .. }))
+                {
+                    return Err(
+                        "`wait` cannot be combined with held movement, scroll, or speed actions"
+                            .into(),
+                    );
+                }
+                if has_held
+                    && actions.iter().any(|action| {
+                        matches!(
+                            action,
+                            Binding::Mode(_)
+                                | Binding::Invoke { .. }
+                                | Binding::FinishMode
+                                | Binding::RestartMode
+                                | Binding::Escape
+                                | Binding::Quit
+                        )
+                    })
+                {
+                    return Err("held movement, scroll, or speed actions cannot be combined with mode-changing actions".into());
+                }
+                if is_press {
+                    let actions = if input.repeat {
+                        actions.into_iter().filter(Binding::is_held).collect()
+                    } else {
+                        actions
+                    };
+                    self.continue_sequence(
+                        actions.into(),
+                        resolved.owner.clone(),
+                        input.clone(),
+                        backend,
+                    )?;
+                } else {
+                    // Stateful movement/scroll bindings still receive their
+                    // release immediately; waits only order discrete actions.
+                    for action in actions.into_iter().filter(Binding::is_held) {
+                        let nested = ResolvedBinding {
+                            binding: Arc::new(action),
+                            owner: resolved.owner.clone(),
+                        };
+                        self.apply_binding(nested, input, backend)?;
+                    }
+                }
+                Ok(true)
+            }
+
+            Binding::Mode(id) => {
+                if !is_press {
+                    return Ok(true);
+                }
+                if !self.registry.contains_key(id) {
+                    crate::report_warning!(
+                        "binding",
+                        "binding targets unknown mode {:?}; is the plugin registered?",
+                        id.as_str()
+                    );
+                    return Ok(true);
+                }
+                // Pressing a mode's own key while it is active leaves it.
+                let next = if *id == self.registry.active {
+                    ModeId::idle()
+                } else {
+                    id.clone()
+                };
+                // A coalesced pointer event can still be pending when the mode
+                // hotkey arrives. Query the OS once so normal and every
+                // targeting mode activate against the display actually under
+                // the mouse rather than the last reported display.
+                if let Ok(pointer) = backend.pointer()
+                    && let Some(pointer) = self.constrain_absolute_pointer(pointer)
+                {
+                    self.cursor = pointer;
+                }
+                self.activate(next, Some(self.registry.active.clone()), backend)?;
+                Ok(true)
+            }
+
+            Binding::Invoke { verb, args } => {
+                if !is_press {
+                    return Ok(true);
+                }
+                let Some(owner) = self.registry.plugin_verbs.get(verb).cloned() else {
+                    crate::report_warning!("plugin", "no plugin exports verb {verb:?}");
+                    return Ok(true);
+                };
+                self.dispatch_to(
+                    &owner,
+                    ModeEvent::Invoked {
+                        verb: verb.clone(),
+                        args: args.clone(),
+                    },
+                    backend,
+                )?;
+                Ok(true)
+            }
+
+            Binding::Escape => {
+                if is_press {
+                    self.scheduler.sequences.clear();
+                    // `press`/`toggle` are explicit engine-wide latches, not
+                    // mode-owned gestures. Escape changes mode but must not
+                    // synthesize an Up edge for them.
+                    self.activate(ModeId::idle(), Some(self.registry.active.clone()), backend)?;
+                }
+                Ok(true)
+            }
+
+            Binding::Quit => {
+                self.should_quit = true;
+                Ok(true)
+            }
+
+            Binding::Send(chord) => {
+                self.send_chord(chord, backend)?;
+                Ok(true)
+            }
+
+            Binding::Warp { x, y } => {
+                self.execute(
+                    [Command::WarpPointer {
+                        x: *x as f64,
+                        y: *y as f64,
+                    }],
+                    backend,
+                )?;
+                Ok(true)
+            }
+
+            Binding::Exec { program, args } => {
+                std::process::Command::new(program)
+                    .args(args)
+                    .spawn()
+                    .map_err(|error| format!("cannot run {program}: {error}"))?;
+                Ok(true)
+            }
+
+            Binding::ReloadConfig => {
+                self.reload_config(backend)?;
+                Ok(true)
+            }
+            Binding::FinishMode => {
+                self.execute(
+                    [Command::FinishMode {
+                        cause: FinishCause::Explicit,
+                    }],
+                    backend,
+                )?;
+                Ok(true)
+            }
+            Binding::RestartMode => {
+                self.execute([Command::RestartMode], backend)?;
+                Ok(true)
+            }
+            Binding::SetConfig { path, value } => {
+                self.execute(
+                    [Command::SetConfigValue {
+                        path: path.clone(),
+                        value: value.clone(),
+                    }],
+                    backend,
+                )?;
+                Ok(true)
+            }
+
+            Binding::Click(button) => {
+                self.execute([Command::click(map_button(*button))], backend)?;
+                self.activate_click_indicator(input, *button, backend)?;
+                Ok(true)
+            }
+            Binding::DoubleClick(button) => {
+                self.execute(
+                    [Command::MouseButton {
+                        button: map_button(*button),
+                        action: ButtonAction::DoubleClick,
+                    }],
+                    backend,
+                )?;
+                self.activate_click_indicator(input, *button, backend)?;
+                Ok(true)
+            }
+            Binding::Press(targets) => {
+                self.transfer_pending_long_press_targets(targets);
+                self.press_targets(targets, backend)?;
+                self.refresh_overlay(backend)?;
+                Ok(true)
+            }
+            Binding::Release(targets) => {
+                self.transfer_pending_long_press_targets(targets);
+                self.release_targets(targets, true, backend)?;
+                self.refresh_overlay(backend)?;
+                Ok(true)
+            }
+            Binding::Toggle(targets) => {
+                if targets.is_empty() {
+                    let inferred = self.pressed_toggle_targets(&input.key);
+                    let used = !inferred.is_empty();
+                    if used {
+                        self.transfer_pending_long_press_targets(&inferred);
+                        self.press_targets(&inferred, backend)?;
+                        self.refresh_overlay(backend)?;
+                    }
+                    if self.input.pressed.contains(&input.key) {
+                        self.input
+                            .active_default_toggles
+                            .insert(input.key.clone(), used);
+                    }
+                } else {
+                    let toggle = self.unprimed_toggle_targets(targets);
+                    self.toggle_targets(&toggle, backend)?;
+                    self.refresh_overlay(backend)?;
+                }
+                Ok(true)
+            }
+            Binding::Wait { .. } => Ok(true),
+
+            Binding::Move(_)
+            | Binding::Scroll(..)
+            | Binding::Speed(_)
+            | Binding::ToggleCursorFollowSelection
+            | Binding::RescanUi => {
+                Err("stateful binding reached the stateless runtime dispatch boundary".into())
+            }
+
+            // Filtered out when the table was built.
+            Binding::Disabled => Ok(false),
+        }
+    }
 }
