@@ -130,7 +130,7 @@ pub struct WindowsBackend {
     console_control: Option<console_control::ConsoleControl>,
     ui_automation: Option<accessibility::UiAutomationWorker>,
     vision: vision::VisionWorker,
-    update_worker: Option<crate::update::UpdateWorker>,
+    update_worker: Option<crate::platform::common::update::UpdateWorker>,
     held_buttons: Cell<u8>,
     shutdown_complete: bool,
     shutdown_attempted: bool,
@@ -457,7 +457,7 @@ impl WindowsBackend {
         if self
             .update_worker
             .as_mut()
-            .is_some_and(crate::update::UpdateWorker::reap_finished)
+            .is_some_and(crate::platform::common::update::UpdateWorker::reap_finished)
         {
             self.update_worker.take();
         }
@@ -790,7 +790,7 @@ impl Backend for WindowsBackend {
         }
         let progress_sender = self.event_tx.clone();
         let complete_sender = self.event_tx.clone();
-        self.update_worker = crate::update::check_async(
+        self.update_worker = crate::platform::common::update::check_async(
             move |progress| {
                 let _ = progress_sender.send(BackendEvent::UpdateProgress(progress));
             },

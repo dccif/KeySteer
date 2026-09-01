@@ -11,134 +11,37 @@
 //! Nothing is required: every section and field has a default, so an absent or
 //! partial config file is valid.
 
+mod modes;
 pub mod store;
 pub mod style;
 pub mod theme;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
 
 use crate::api::backend::Appearance;
 use crate::api::binding::Binding;
-use crate::api::command::{ButtonAction, FocusedApp, MouseButton, UiScanStrategy, VisionOptions};
+use crate::api::command::{FocusedApp, UiScanStrategy};
 use crate::api::input::{
-    Key, KeyChord, KeyNameResolver, ModeId, normalize_alias_name, normalize_builtin_key,
+    Key, KeyChord, ModeId, normalize_alias_name, normalize_builtin_key, with_key_aliases,
 };
 
 pub use crate::api::hint::LabelDirection;
-pub use store::ConfigStore;
+pub use crate::api::lifecycle::{LifecycleAction, TargetingLifecycle};
+pub use modes::{
+    Grid, GridLayer, GridUi, Normal, Pointer, RecursiveGrid, RecursiveGridUi, Scroll, UiHint,
+};
+pub use store::{ConfigStore, ReplaceFile};
 pub use style::{
     Anchor, BoundaryHighlight, CursorIndicatorOverride, CursorIndicatorUi, HintPlacement,
-    IndicatorUi, IndicatorUiOverride, LabelUi, SearchInputUi,
+    IndicatorUi, IndicatorUiOverride, LabelUi, ModeIndicator, ModeIndicatorEntry, SearchInputUi,
 };
 pub use theme::{Palette, Theme, ThemeColors, ThemedColor};
 
 /// A binding table: chord text -> what it does.
 pub type Bindings = BTreeMap<String, Binding>;
-
-/// What a targeting mode does after a semantic lifecycle event.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LifecycleAction {
-    Keep,
-    Finish,
-    Restart,
-    Return,
-    Mode(ModeId),
-    Click {
-        button: MouseButton,
-        action: ButtonAction,
-    },
-}
-
-impl LifecycleAction {
-    pub fn parse(text: &str) -> Result<Self, String> {
-        Ok(match text.trim() {
-            "keep" => Self::Keep,
-            "finish" => Self::Finish,
-            "restart" => Self::Restart,
-            "return" => Self::Return,
-            "left_click" => Self::Click {
-                button: MouseButton::Left,
-                action: ButtonAction::Click,
-            },
-            "right_click" => Self::Click {
-                button: MouseButton::Right,
-                action: ButtonAction::Click,
-            },
-            "middle_click" => Self::Click {
-                button: MouseButton::Middle,
-                action: ButtonAction::Click,
-            },
-            "double_click" => Self::Click {
-                button: MouseButton::Left,
-                action: ButtonAction::DoubleClick,
-            },
-            mode => Self::Mode(ModeId::new(mode)?),
-        })
-    }
-
-    pub fn canonical(&self) -> &str {
-        match self {
-            Self::Keep => "keep",
-            Self::Finish => "finish",
-            Self::Restart => "restart",
-            Self::Return => "return",
-            Self::Mode(mode) => mode.as_str(),
-            Self::Click {
-                button: MouseButton::Left,
-                action: ButtonAction::Click,
-            } => "left_click",
-            Self::Click {
-                button: MouseButton::Right,
-                action: ButtonAction::Click,
-            } => "right_click",
-            Self::Click {
-                button: MouseButton::Middle,
-                action: ButtonAction::Click,
-            } => "middle_click",
-            Self::Click {
-                button: MouseButton::Left,
-                action: ButtonAction::DoubleClick,
-            } => "double_click",
-            Self::Click { .. } => "unsupported_click",
-        }
-    }
-}
-
-impl Serialize for LifecycleAction {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.canonical())
-    }
-}
-
-impl<'de> Deserialize<'de> for LifecycleAction {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let text = String::deserialize(deserializer)?;
-        Self::parse(&text).map_err(D::Error::custom)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct TargetingLifecycle {
-    pub after_finish: LifecycleAction,
-    pub after_click: LifecycleAction,
-}
-
-impl Default for TargetingLifecycle {
-    fn default() -> Self {
-        Self {
-            after_finish: LifecycleAction::Keep,
-            after_click: LifecycleAction::Keep,
-        }
-    }
-}
 
 /// User-defined key names shared by every platform, with optional
 /// platform-specific overrides.
@@ -257,7 +160,7 @@ fn platform_warning(chord: &KeyChord) -> Option<String> {
 /// Root configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Config {
+pub struct ConfigFile {
     #[serde(default)]
     pub general: General,
     /// User-defined key names. Values resolve to one concrete key before the
@@ -301,10 +204,20 @@ pub struct Config {
     #[serde(default)]
     pub app_configs: Vec<AppOverride>,
     #[serde(skip)]
-    key_name_resolver: KeyNameResolver,
+    resolved_key_aliases: BTreeMap<String, String>,
 }
 
-impl Default for Config {
+/// Compatibility name for internal and test callers while the application
+/// migrates to the document-oriented terminology.
+pub type Config = ConfigFile;
+
+pub(crate) struct LoadedConfig {
+    pub(crate) config: Config,
+    pub(crate) raw_text: String,
+    pub(crate) path: PathBuf,
+}
+
+impl Default for ConfigFile {
     fn default() -> Self {
         let mut config = Self {
             general: General::default(),
@@ -322,7 +235,7 @@ impl Default for Config {
             mode_indicator: ModeIndicator::default(),
             plugin_modes: default_plugin_modes(),
             app_configs: Vec::new(),
-            key_name_resolver: KeyNameResolver::default(),
+            resolved_key_aliases: BTreeMap::new(),
         };
         let aliases = match config
             .key_aliases
@@ -332,7 +245,7 @@ impl Default for Config {
             Ok(aliases) => aliases,
             Err(error) => panic!("built-in key aliases must be valid: {error}"),
         };
-        config.key_name_resolver = KeyNameResolver::from_resolved(aliases);
+        config.resolved_key_aliases = aliases;
         if let Err(error) = config.apply_configured_key_aliases() {
             panic!("built-in bindings must be valid: {error}");
         }
@@ -382,7 +295,7 @@ fn builtin_bindings(entries: &[(&str, &str)]) -> Bindings {
         .collect()
 }
 
-impl Config {
+impl ConfigFile {
     /// Bindings for `mode_id`, or `None` if that mode has no table.
     ///
     /// Every mode resolves its keys the same way, including plugin modes:
@@ -457,40 +370,6 @@ impl Config {
             .iter()
             .map(|over| (over.bundle_id.as_str(), &over.bindings))
             .collect()
-    }
-
-    /// Exact per-mode override patches that affect compiled binding tables.
-    ///
-    /// Storing the merged patch rather than the matching pattern indices means
-    /// two applications resolving to identical bindings can share compiled
-    /// tables even if they matched different configuration entries.
-    pub(crate) fn binding_profile_key<'a>(
-        &self,
-        mode_ids: impl IntoIterator<Item = &'a str>,
-        app: Option<&FocusedApp>,
-    ) -> Vec<Bindings> {
-        let Some(app) = app else {
-            return Vec::new();
-        };
-        let profile: Vec<Bindings> = mode_ids
-            .into_iter()
-            .map(|mode_id| {
-                let mut resolved = Bindings::new();
-                for (pattern, bindings) in self.app_binding_overrides_for(mode_id) {
-                    if app_override_matches(pattern, app) {
-                        for (chord, binding) in bindings {
-                            resolved.insert(chord.clone(), binding.clone());
-                        }
-                    }
-                }
-                resolved
-            })
-            .collect();
-        if profile.iter().all(Bindings::is_empty) {
-            Vec::new()
-        } else {
-            profile
-        }
     }
 }
 
@@ -622,647 +501,6 @@ pub struct UiHintAppOverride {
 }
 
 // ---------------------------------------------------------------------------
-// [normal]
-// ---------------------------------------------------------------------------
-
-/// The working mode: move the pointer, click, scroll, and enter the other
-/// modes.
-///
-/// Everything here is a plain binding table, so a user can rebind `hjkl` to
-/// anything, add `t = "home"`, or point a key at a plugin mode.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Normal {
-    pub inherits: Vec<String>,
-    /// Forward keyboard input that does not match a complete KeySteer binding.
-    pub passthrough_unbound_keys: bool,
-    /// Hold a physical key bound to click/double-click for this many
-    /// milliseconds to toggle that mouse button. The same threshold lets a
-    /// parameterless toggle activation key latch itself. Zero disables both.
-    pub long_press_toggle_ms: u64,
-    /// Release a direct click/double-click button latched by long press after
-    /// a physical-modifier drag has remained still. Zero disables it.
-    pub auto_release_ms: u64,
-    pub bindings: Bindings,
-    pub app_configs: Vec<AppOverride>,
-}
-
-impl Default for Normal {
-    fn default() -> Self {
-        Self {
-            inherits: vec!["hotkeys".into()],
-            passthrough_unbound_keys: true,
-            long_press_toggle_ms: 500,
-            auto_release_ms: 0,
-            bindings: default_normal_bindings(),
-            app_configs: Vec::new(),
-        }
-    }
-}
-
-/// Defaults for `normal`: vim-style movement, clicks, scrolling, the three
-/// targeting modes, and the navigation keys.
-///
-/// Bare letters are free for pointer control, while unbound keys pass through
-/// by default. Complete modifier combinations take precedence over bare-key
-/// bindings so external shortcuts remain usable.
-fn default_normal_bindings() -> Bindings {
-    let entries: &[(&str, &str)] = &[
-        // Movement and speed modifiers, held alongside a direction.
-        ("h", "move_left"),
-        ("j", "move_down"),
-        ("k", "move_up"),
-        ("l", "move_right"),
-        ("caps_lock", "precision"),
-        ("left_shift", "slow"),
-        ("v", "fast"),
-        ("b", "fast"),
-        // Scroll takes effect immediately on a tap and repeats while held.
-        ("m", "wheel_down"),
-        (",", "wheel_up"),
-        // Pointer buttons.
-        (";", "left_click"),
-        ("'", "right_click"),
-        ("right_shift", "middle_click"),
-        ("n", "toggle"),
-        // Targeting modes available directly from normal.
-        ("g", "grid"),
-        ("f", "recursive_grid"),
-        ("primary+f", "ui_hint"),
-        ("primary+s", "screen next"),
-        // Navigation keys sent to the focused application.
-        ("u", "page_down"),
-        ("i", "page_up"),
-        ("t", "home"),
-        ("y", "end"),
-        // Normal has no label-key conflict, so bare q exits immediately.
-        ("q", "idle"),
-        ("esc", "idle"),
-    ];
-    builtin_bindings(entries)
-}
-
-// ---------------------------------------------------------------------------
-// [ui_hint]
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct UiHint {
-    pub enabled: bool,
-    pub strategy: UiScanStrategy,
-    pub vision: VisionOptions,
-    /// Characters used to build hint labels.
-    pub hint_characters: String,
-    pub label_direction: LabelDirection,
-    /// Accessibility tree depth limit; 0 means unlimited.
-    pub max_depth: u32,
-    /// Soft budget for one accessibility scan. Incremental results remain
-    /// visible while the scan continues.
-    pub scan_timeout_ms: u64,
-    /// Automatic retries when a scan times out or returns no targets.
-    pub scan_retry_count: u32,
-    /// Delay before an automatic retry, allowing a busy UI provider to settle.
-    pub scan_retry_delay_ms: u64,
-    /// Semantic roles that receive a hint.
-    pub clickable_roles: Vec<String>,
-    /// Skip the clickability heuristic and hint every matching role.
-    pub ignore_clickable_check: bool,
-    /// Hit-test each element; slower but removes occluded hints.
-    pub visible_check_enabled: bool,
-    pub placement: HintPlacement,
-    /// Pixel offsets applied after placing each label relative to its element.
-    pub label_x_offset: i32,
-    pub label_y_offset: i32,
-    pub ui: LabelUi,
-    pub boundary_highlight: BoundaryHighlight,
-    pub search_input_ui: SearchInputUi,
-    pub inherits: Vec<String>,
-    pub temporary_mode: Option<String>,
-    pub temporary_mode_keys: Vec<String>,
-    pub lifecycle: TargetingLifecycle,
-    /// Modifier held to expose the next label in each overlapping group.
-    pub overlap_cycle_key: String,
-    pub bindings: Bindings,
-    pub app_configs: Vec<UiHintAppOverride>,
-}
-
-impl UiHint {
-    pub fn strategy_for(&self, app: Option<&FocusedApp>) -> UiScanStrategy {
-        let Some(app) = app else {
-            return self.strategy;
-        };
-        self.app_configs
-            .iter()
-            .find(|over| app_override_matches(&over.bundle_id, app))
-            .and_then(|over| over.strategy)
-            .unwrap_or(self.strategy)
-    }
-
-    /// Side-agnostic modifiers such as `shift` match either physical key.
-    pub fn overlap_cycle_matches(&self, key: &Key) -> bool {
-        KeyChord::parse(&self.overlap_cycle_key).is_ok_and(|chord| chord.activation_matches(key))
-    }
-
-    /// Whether a temporary-mode key denotes the same physical modifier family
-    /// as the overlap key. In UI Hint, overlap cycling deliberately wins.
-    pub fn overlap_cycle_conflicts_with(&self, temporary_key: &str) -> bool {
-        let (Ok(overlap), Ok(temporary)) = (
-            KeyChord::parse(&self.overlap_cycle_key),
-            KeyChord::parse(temporary_key),
-        ) else {
-            return false;
-        };
-        overlap.activation_matches(temporary.activation_key())
-            || temporary.activation_matches(overlap.activation_key())
-    }
-}
-
-impl Default for UiHint {
-    fn default() -> Self {
-        let ui = LabelUi {
-            font_size: 17,
-            ..Default::default()
-        };
-        let search_input_ui = SearchInputUi {
-            label: LabelUi {
-                font_size: 14,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        Self {
-            enabled: true,
-            strategy: UiScanStrategy::Hybrid,
-            vision: VisionOptions::default(),
-            hint_characters: "asdfghjkl".into(),
-            label_direction: LabelDirection::Normal,
-            max_depth: 50,
-            scan_timeout_ms: 2_500,
-            scan_retry_count: 1,
-            scan_retry_delay_ms: 200,
-            clickable_roles: default_clickable_roles(),
-            ignore_clickable_check: false,
-            visible_check_enabled: false,
-            placement: HintPlacement::Bottom,
-            label_x_offset: 0,
-            label_y_offset: -8,
-            ui,
-            boundary_highlight: BoundaryHighlight::default(),
-            search_input_ui,
-            inherits: vec!["hotkeys".into(), "normal".into()],
-            temporary_mode: Some("normal".into()),
-            temporary_mode_keys: vec!["primary".into()],
-            lifecycle: TargetingLifecycle {
-                after_finish: LifecycleAction::Mode(ModeId::normal()),
-                after_click: LifecycleAction::Mode(ModeId::normal()),
-            },
-            overlap_cycle_key: "shift".into(),
-            bindings: Bindings::from([
-                ("primary+r".into(), Binding::RescanUi),
-                ("primary+q".into(), Binding::Mode(ModeId::normal())),
-            ]),
-            app_configs: Vec::new(),
-        }
-    }
-}
-
-/// Neru's semantic role vocabulary. Backends map these to native roles.
-fn default_clickable_roles() -> Vec<String> {
-    [
-        "button",
-        "menu_button",
-        "popup_button",
-        "combo_box",
-        "link",
-        "checkbox",
-        "radio",
-        "switch",
-        "text_field",
-        "text_area",
-        "search_field",
-        "slider",
-        "stepper",
-        "tab",
-        "menu_item",
-        "cell",
-        "list_item",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
-}
-
-// ---------------------------------------------------------------------------
-// [grid]
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Grid {
-    pub enabled: bool,
-    /// Columns in every selection layer.
-    pub grid_cols: u32,
-    /// Rows in every selection layer.
-    pub grid_rows: u32,
-    /// One selection key per cell, in row-major keyboard order.
-    pub keys: String,
-    /// Number of selection layers before the current cell becomes the target.
-    pub max_depth: u32,
-    /// Move the pointer to each selected cell's centre while drilling down.
-    pub cursor_follow_selection: bool,
-    pub inherits: Vec<String>,
-    pub temporary_mode: Option<String>,
-    pub temporary_mode_keys: Vec<String>,
-    pub lifecycle: TargetingLifecycle,
-    pub ui: GridUi,
-    pub bindings: Bindings,
-    pub app_configs: Vec<AppOverride>,
-}
-
-impl Default for Grid {
-    fn default() -> Self {
-        let ui = GridUi {
-            label: LabelUi {
-                font_size: 20,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        Self {
-            enabled: true,
-            grid_cols: 5,
-            grid_rows: 4,
-            keys: "12345qwertasdfgzxcvb".into(),
-            max_depth: 3,
-            cursor_follow_selection: true,
-            inherits: vec!["hotkeys".into(), "normal".into()],
-            temporary_mode: Some("normal".into()),
-            temporary_mode_keys: vec!["primary".into()],
-            lifecycle: TargetingLifecycle {
-                after_finish: LifecycleAction::Mode(ModeId::normal()),
-                after_click: LifecycleAction::Finish,
-            },
-            ui,
-            bindings: Bindings::from([
-                ("`".into(), Binding::ToggleCursorFollowSelection),
-                ("primary+q".into(), Binding::Mode(ModeId::normal())),
-            ]),
-            app_configs: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct GridUi {
-    #[serde(flatten)]
-    pub label: LabelUi,
-    pub matched_background_color: Option<ThemedColor>,
-    pub matched_border_color: Option<ThemedColor>,
-}
-
-// ---------------------------------------------------------------------------
-// [recursive_grid]
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct RecursiveGrid {
-    pub enabled: bool,
-    pub grid_cols: u32,
-    pub grid_rows: u32,
-    /// Cell keys; must hold `grid_cols * grid_rows` characters.
-    pub keys: String,
-    pub min_size_width: u32,
-    pub min_size_height: u32,
-    /// Recursion limit, 1..=20.
-    pub max_depth: u32,
-    /// Move the pointer to each selected cell's centre while drilling down.
-    pub cursor_follow_selection: bool,
-    pub inherits: Vec<String>,
-    pub temporary_mode: Option<String>,
-    pub temporary_mode_keys: Vec<String>,
-    pub lifecycle: TargetingLifecycle,
-    /// Per-depth layout overrides.
-    pub layers: Vec<GridLayer>,
-    pub ui: RecursiveGridUi,
-    pub bindings: Bindings,
-    pub app_configs: Vec<AppOverride>,
-}
-
-impl Default for RecursiveGrid {
-    fn default() -> Self {
-        let ui = RecursiveGridUi {
-            label: LabelUi {
-                font_size: 20,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        Self {
-            enabled: true,
-            grid_cols: 3,
-            grid_rows: 3,
-            keys: "qweasdzxc".into(),
-            min_size_width: 1,
-            min_size_height: 1,
-            max_depth: 10,
-            cursor_follow_selection: true,
-            inherits: vec!["hotkeys".into(), "normal".into()],
-            temporary_mode: Some("normal".into()),
-            temporary_mode_keys: vec!["primary".into()],
-            lifecycle: TargetingLifecycle::default(),
-            layers: Vec::new(),
-            ui,
-            bindings: Bindings::from([
-                ("`".into(), Binding::ToggleCursorFollowSelection),
-                ("primary+q".into(), Binding::Mode(ModeId::normal())),
-            ]),
-            app_configs: Vec::new(),
-        }
-    }
-}
-
-/// Overrides the grid shape at one recursion depth.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GridLayer {
-    /// Zero-based depth this entry applies to.
-    pub depth: u32,
-    pub grid_cols: Option<u32>,
-    pub grid_rows: Option<u32>,
-    pub keys: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct RecursiveGridUi {
-    #[serde(flatten)]
-    pub label: LabelUi,
-    pub line_width: i32,
-    pub line_color: Option<ThemedColor>,
-    pub highlight_color: Option<ThemedColor>,
-    /// Draw a filled pill behind each cell key.
-    pub label_background: bool,
-    pub label_background_color: Option<ThemedColor>,
-    /// Replace every cell label with this character, e.g. `·`.
-    pub label_char: String,
-    /// Hide labels when fitting them would require a smaller font.
-    pub label_min_font_size: i32,
-    /// Hide labels once a cell is smaller than the fitted font size times this
-    /// multiplier. `0` disables this additional threshold.
-    pub label_autohide_multiplier: f64,
-    pub sub_key_preview: bool,
-    pub sub_key_preview_font_size: i32,
-    pub sub_key_preview_text_color: Option<ThemedColor>,
-    pub sub_key_preview_autohide_multiplier: f64,
-}
-
-impl Default for RecursiveGridUi {
-    fn default() -> Self {
-        Self {
-            label: LabelUi::default(),
-            line_width: 1,
-            line_color: None,
-            highlight_color: None,
-            label_background: false,
-            label_background_color: None,
-            label_char: String::new(),
-            label_min_font_size: 6,
-            label_autohide_multiplier: 1.5,
-            sub_key_preview: false,
-            sub_key_preview_font_size: 8,
-            sub_key_preview_text_color: None,
-            sub_key_preview_autohide_multiplier: 1.5,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// [scroll] and [pointer]
-//
-// These are tuning parameters, not modes: scrolling is a set of bindings that
-// any mode can use, so there is no `scroll` mode to enter.
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Scroll {
-    /// Pixels for `scroll_up` and friends.
-    pub scroll_step: i32,
-    /// Pixels for `scroll_half_up` and friends.
-    pub scroll_step_half: i32,
-    /// Pixels for `scroll_full_up` and friends.
-    pub scroll_step_full: i32,
-    /// Deprecated compatibility input. Use `platform.macos.scroll.invert`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub invert_scroll: Option<bool>,
-}
-
-impl Default for Scroll {
-    fn default() -> Self {
-        Self {
-            scroll_step: 50,
-            scroll_step_half: 500,
-            scroll_step_full: 1_000_000,
-            invert_scroll: None,
-        }
-    }
-}
-
-impl Scroll {
-    /// Pixels for one scroll binding.
-    pub fn pixels(&self, amount: crate::api::binding::ScrollAmount) -> f64 {
-        use crate::api::binding::ScrollAmount as A;
-        match amount {
-            A::Step => self.scroll_step as f64,
-            A::Half => self.scroll_step_half as f64,
-            A::Full => self.scroll_step_full as f64,
-        }
-    }
-}
-
-/// Keyboard-driven pointer acceleration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Pointer {
-    /// Initial pointer velocity in pixels per second.
-    pub initial_speed: f64,
-    /// Maximum pointer velocity in pixels per second.
-    pub max_speed: f64,
-    /// Velocity added per second while held, in pixels per second².
-    pub acceleration: f64,
-    /// Ease acceleration at both ends instead of changing velocity linearly.
-    pub smooth_acceleration: bool,
-    /// Immediate pixel distance for a tap shorter than the next display update.
-    pub tap_distance: f64,
-    pub slow_multiplier: f64,
-    pub precision_multiplier: f64,
-    pub fast_multiplier: f64,
-}
-
-impl Default for Pointer {
-    fn default() -> Self {
-        Self {
-            initial_speed: 1000.0,
-            max_speed: 2200.0,
-            acceleration: 3000.0,
-            smooth_acceleration: true,
-            tap_distance: 2.5,
-            slow_multiplier: 0.35,
-            precision_multiplier: 0.12,
-            fast_multiplier: 2.0,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// [mode_indicator]
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ModeIndicator {
-    pub cursor: CursorIndicatorUi,
-    pub ui: IndicatorUi,
-    /// Per-mode overrides, keyed by mode id.
-    ///
-    /// A nested table rather than flattened entries, because `flatten` and
-    /// `deny_unknown_fields` cannot be combined: together they reject every
-    /// sibling key, including `ui`.
-    pub modes: BTreeMap<String, ModeIndicatorEntry>,
-}
-
-impl Default for ModeIndicator {
-    fn default() -> Self {
-        let ui = IndicatorUi {
-            label: LabelUi {
-                font_size: 11,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        Self {
-            cursor: CursorIndicatorUi::default(),
-            ui,
-            modes: BTreeMap::from([(
-                "normal".into(),
-                ModeIndicatorEntry {
-                    enabled: Some(true),
-                    text: Some("Normal".into()),
-                    ..Default::default()
-                },
-            )]),
-        }
-    }
-}
-
-impl ModeIndicator {
-    /// Whether to show a badge for `mode_id`, and its merged visual style.
-    pub fn for_mode(&self, mode_id: &str, display_name: &str) -> Option<(String, IndicatorUi)> {
-        self.for_mode_with(mode_id, || display_name.to_owned())
-    }
-
-    pub(crate) fn for_mode_with(
-        &self,
-        mode_id: &str,
-        display_name: impl FnOnce() -> String,
-    ) -> Option<(String, IndicatorUi)> {
-        let entry = self.modes.get(mode_id);
-        let enabled = entry.and_then(|e| e.enabled).unwrap_or(mode_id != "idle");
-        if !enabled {
-            return None;
-        }
-        let text = entry
-            .and_then(|e| e.text.clone())
-            .unwrap_or_else(display_name);
-        let ui = entry
-            .map(|entry| entry.ui.apply(&self.ui))
-            .unwrap_or_else(|| self.ui.clone());
-        Some((text, ui))
-    }
-
-    pub fn cursor_for_mode(&self, mode_id: &str) -> Option<CursorIndicatorUi> {
-        self.cursor_for_mode_ref(mode_id)
-            .map(ResolvedCursorIndicatorUi::into_owned)
-    }
-
-    pub(crate) fn cursor_for_mode_ref(
-        &self,
-        mode_id: &str,
-    ) -> Option<ResolvedCursorIndicatorUi<'_>> {
-        if mode_id == "idle" {
-            return None;
-        }
-        let override_cursor = self.modes.get(mode_id).map(|entry| &entry.cursor);
-        let cursor = ResolvedCursorIndicatorUi {
-            enabled: override_cursor
-                .and_then(|cursor| cursor.enabled)
-                .unwrap_or(self.cursor.enabled),
-            radius: override_cursor
-                .and_then(|cursor| cursor.radius)
-                .unwrap_or(self.cursor.radius),
-            fill_color: override_cursor
-                .and_then(|cursor| cursor.fill_color.as_ref())
-                .or(self.cursor.fill_color.as_ref()),
-            stroke_color: override_cursor
-                .and_then(|cursor| cursor.stroke_color.as_ref())
-                .or(self.cursor.stroke_color.as_ref()),
-            left_pressed_color: override_cursor
-                .and_then(|cursor| cursor.left_pressed_color.as_ref())
-                .or(self.cursor.left_pressed_color.as_ref()),
-            middle_pressed_color: override_cursor
-                .and_then(|cursor| cursor.middle_pressed_color.as_ref())
-                .or(self.cursor.middle_pressed_color.as_ref()),
-            right_pressed_color: override_cursor
-                .and_then(|cursor| cursor.right_pressed_color.as_ref())
-                .or(self.cursor.right_pressed_color.as_ref()),
-            stroke_width: override_cursor
-                .and_then(|cursor| cursor.stroke_width)
-                .unwrap_or(self.cursor.stroke_width),
-        };
-        cursor.enabled.then_some(cursor)
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct ResolvedCursorIndicatorUi<'a> {
-    pub enabled: bool,
-    pub radius: i32,
-    pub fill_color: Option<&'a ThemedColor>,
-    pub stroke_color: Option<&'a ThemedColor>,
-    pub left_pressed_color: Option<&'a ThemedColor>,
-    pub middle_pressed_color: Option<&'a ThemedColor>,
-    pub right_pressed_color: Option<&'a ThemedColor>,
-    pub stroke_width: i32,
-}
-
-impl ResolvedCursorIndicatorUi<'_> {
-    fn into_owned(self) -> CursorIndicatorUi {
-        CursorIndicatorUi {
-            enabled: self.enabled,
-            radius: self.radius,
-            fill_color: self.fill_color.cloned(),
-            stroke_color: self.stroke_color.cloned(),
-            left_pressed_color: self.left_pressed_color.cloned(),
-            middle_pressed_color: self.middle_pressed_color.cloned(),
-            right_pressed_color: self.right_pressed_color.cloned(),
-            stroke_width: self.stroke_width,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ModeIndicatorEntry {
-    pub enabled: Option<bool>,
-    pub text: Option<String>,
-    pub cursor: CursorIndicatorOverride,
-    pub ui: IndicatorUiOverride,
-}
-
-// ---------------------------------------------------------------------------
 // Loading & validation
 // ---------------------------------------------------------------------------
 
@@ -1384,7 +622,7 @@ fn compile_key_aliases(
 fn normalize_binding_keys(
     table: &mut Bindings,
     label: &str,
-    resolver: &KeyNameResolver,
+    aliases: &BTreeMap<String, String>,
 ) -> Result<(), ConfigError> {
     let source = std::mem::take(table);
     for (text, binding) in source {
@@ -1395,9 +633,11 @@ fn normalize_binding_keys(
             vec![text.as_str()]
         };
         for name in names {
-            let uses_alias = name.split('+').any(|part| resolver.contains_alias(part));
+            let uses_alias = name
+                .split('+')
+                .any(|part| aliases.contains_key(&normalize_alias_name(part)));
             let canonical = if uses_alias {
-                KeyChord::parse_with_resolver(name, resolver)
+                KeyChord::parse_with_aliases(name, aliases)
                     .map_err(|error| {
                         ConfigError::Parse(format!(
                             "{label} binding {name:?} is not a valid key or chord: {error}"
@@ -1429,69 +669,76 @@ fn normalize_binding_keys(
     Ok(())
 }
 
-fn normalize_key_list(keys: &mut [String], resolver: &KeyNameResolver) -> Result<(), ConfigError> {
+fn normalize_key_list(
+    keys: &mut [String],
+    aliases: &BTreeMap<String, String>,
+) -> Result<(), ConfigError> {
     for key in keys {
-        normalize_key_if_aliased(key, resolver)?;
+        normalize_key_if_aliased(key, aliases)?;
     }
     Ok(())
 }
 
 fn normalize_key_if_aliased(
     key: &mut String,
-    resolver: &KeyNameResolver,
+    aliases: &BTreeMap<String, String>,
 ) -> Result<(), ConfigError> {
-    if resolver.contains_alias(key) {
-        *key = resolver.key(&*key).map_err(ConfigError::Parse)?.to_string();
+    if aliases.contains_key(&normalize_alias_name(key)) {
+        *key = Key::new_with_aliases(&*key, aliases)
+            .map_err(ConfigError::Parse)?
+            .to_string();
     }
     Ok(())
 }
 
-fn resolve_binding_values(
-    value: &mut toml::Value,
-    resolver: &KeyNameResolver,
-) -> Result<(), ConfigError> {
-    let toml::Value::Table(table) = value else {
-        return Ok(());
-    };
-    for (name, child) in table {
-        if matches!(name.as_str(), "hotkeys" | "bindings") {
-            let toml::Value::Table(bindings) = child else {
-                continue;
-            };
-            for (key, binding) in bindings {
-                match binding {
-                    toml::Value::String(text) => {
-                        *text = Binding::parse_with_resolver(text, resolver)
-                            .map_err(|error| {
-                                ConfigError::Parse(format!("binding {key:?} is invalid: {error}"))
-                            })?
-                            .canonical();
-                    }
-                    toml::Value::Array(actions) => {
-                        for action in actions {
-                            let toml::Value::String(text) = action else {
-                                continue;
-                            };
-                            *text = Binding::parse_with_resolver(text, resolver)
-                                .map_err(|error| {
-                                    ConfigError::Parse(format!(
-                                        "binding {key:?} is invalid: {error}"
-                                    ))
-                                })?
-                                .canonical();
-                        }
-                    }
-                    _ => {}
-                }
+impl ConfigFile {
+    pub(crate) fn discover_in(directory: &Path) -> Result<Option<PathBuf>, ConfigError> {
+        let entries = match std::fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(ConfigError::Io(format!(
+                    "cannot enumerate {}: {error}",
+                    directory.display()
+                )));
             }
-        } else {
-            resolve_binding_values(child, resolver)?;
+        };
+        let mut matches = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                ConfigError::Io(format!("cannot enumerate {}: {error}", directory.display()))
+            })?;
+            let file_type = entry.file_type().map_err(|error| {
+                ConfigError::Io(format!(
+                    "cannot inspect {}: {error}",
+                    entry.path().display()
+                ))
+            })?;
+            if file_type.is_file() && Self::is_portable_config_name(&entry.file_name()) {
+                matches.push(entry.path());
+            }
         }
+        matches.sort_by(|left, right| {
+            let left_name = left
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            let right_name = right
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            let left_is_default = left_name == "keysteer.default.toml";
+            let right_is_default = right_name == "keysteer.default.toml";
+            left_is_default
+                .cmp(&right_is_default)
+                .then_with(|| left_name.cmp(&right_name))
+                .then_with(|| left.cmp(right))
+        });
+        Ok(matches.into_iter().next())
     }
-    Ok(())
-}
 
-impl Config {
     pub(crate) fn is_portable_config_name(name: &std::ffi::OsStr) -> bool {
         let name = name.to_string_lossy().to_ascii_lowercase();
         name.strip_prefix("keysteer.")
@@ -1499,8 +746,24 @@ impl Config {
             .is_some_and(|profile| !profile.is_empty())
     }
 
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        Self::load_with_source(path).map(|loaded| loaded.config)
+    }
+
+    pub(crate) fn load_with_source(path: &Path) -> Result<LoadedConfig, ConfigError> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| ConfigError::Io(format!("cannot read {}: {e}", path.display())))?;
+        let config = Self::parse(&text)?;
+        config.validate()?;
+        Ok(LoadedConfig {
+            config,
+            raw_text: text,
+            path: path.to_path_buf(),
+        })
+    }
+
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        let mut value: toml::Value =
+        let value: toml::Value =
             toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
         let key_aliases = value
             .get("key_aliases")
@@ -1510,11 +773,9 @@ impl Config {
             .map_err(|e| ConfigError::Parse(e.to_string()))?
             .unwrap_or_default();
         let aliases = compile_key_aliases(&key_aliases.effective()?)?;
-        let resolver = KeyNameResolver::from_resolved(aliases);
-        resolve_binding_values(&mut value, &resolver)?;
-        let mut config: Self =
-            Self::deserialize(value).map_err(|e| ConfigError::Parse(e.to_string()))?;
-        config.key_name_resolver = resolver;
+        let mut config: Self = with_key_aliases(&aliases, || Self::deserialize(value))
+            .map_err(|e| ConfigError::Parse(e.to_string()))?;
+        config.resolved_key_aliases = aliases;
         config.apply_configured_key_aliases()?;
         Ok(config)
     }
@@ -1525,27 +786,27 @@ impl Config {
     /// `v = "fast"` and `b = "fast"`. Chords still use `+`, so
     /// `primary+f` remains one binding.
     fn apply_configured_key_aliases(&mut self) -> Result<(), ConfigError> {
-        let resolver = self.key_name_resolver.clone();
-        normalize_binding_keys(&mut self.hotkeys, "[hotkeys]", &resolver)?;
-        normalize_binding_keys(&mut self.normal.bindings, "[normal.bindings]", &resolver)?;
-        normalize_binding_keys(&mut self.grid.bindings, "[grid.bindings]", &resolver)?;
+        let aliases = self.resolved_key_aliases.clone();
+        normalize_binding_keys(&mut self.hotkeys, "[hotkeys]", &aliases)?;
+        normalize_binding_keys(&mut self.normal.bindings, "[normal.bindings]", &aliases)?;
+        normalize_binding_keys(&mut self.grid.bindings, "[grid.bindings]", &aliases)?;
         normalize_binding_keys(
             &mut self.recursive_grid.bindings,
             "[recursive_grid.bindings]",
-            &resolver,
+            &aliases,
         )?;
-        normalize_binding_keys(&mut self.ui_hint.bindings, "[ui_hint.bindings]", &resolver)?;
+        normalize_binding_keys(&mut self.ui_hint.bindings, "[ui_hint.bindings]", &aliases)?;
         for (id, mode) in &mut self.plugin_modes {
             normalize_binding_keys(
                 &mut mode.bindings,
                 &format!("[plugin_modes.{id:?}.bindings]"),
-                &resolver,
+                &aliases,
             )?;
             for over in &mut mode.app_configs {
                 normalize_binding_keys(
                     &mut over.bindings,
                     &format!("[[plugin_modes.{id:?}.app_configs]] {:?}", over.bundle_id),
-                    &resolver,
+                    &aliases,
                 )?;
             }
         }
@@ -1562,7 +823,7 @@ impl Config {
                 normalize_binding_keys(
                     &mut over.bindings,
                     &format!("{label} {:?}", over.bundle_id),
-                    &resolver,
+                    &aliases,
                 )?;
             }
         }
@@ -1570,25 +831,25 @@ impl Config {
             normalize_binding_keys(
                 &mut over.bindings,
                 &format!("[[ui_hint.app_configs]] {:?}", over.bundle_id),
-                &resolver,
+                &aliases,
             )?;
         }
-        normalize_key_if_aliased(&mut self.ui_hint.overlap_cycle_key, &resolver)?;
+        normalize_key_if_aliased(&mut self.ui_hint.overlap_cycle_key, &aliases)?;
         for keys in [
             &mut self.grid.temporary_mode_keys,
             &mut self.recursive_grid.temporary_mode_keys,
             &mut self.ui_hint.temporary_mode_keys,
         ] {
-            normalize_key_list(keys, &resolver)?;
+            normalize_key_list(keys, &aliases)?;
         }
         for mode in self.plugin_modes.values_mut() {
-            normalize_key_list(&mut mode.temporary_mode_keys, &resolver)?;
+            normalize_key_list(&mut mode.temporary_mode_keys, &aliases)?;
         }
         Ok(())
     }
 
-    pub fn key_name_resolver(&self) -> &KeyNameResolver {
-        &self.key_name_resolver
+    pub(crate) fn resolved_key_aliases(&self) -> &BTreeMap<String, String> {
+        &self.resolved_key_aliases
     }
 
     pub fn to_toml(&self) -> Result<String, ConfigError> {
@@ -2251,8 +1512,8 @@ fn validate_inheritance(config: &Config) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::ModeId;
     use crate::api::binding::{Button, Direction, ScrollAmount, Speed};
+    use crate::api::{ButtonAction, ModeId, MouseButton, VisionOptions};
 
     #[test]
     fn portable_config_names_require_a_profile() {
@@ -2265,6 +1526,49 @@ mod tests {
         assert!(!Config::is_portable_config_name("keysteer.toml".as_ref()));
         assert!(!Config::is_portable_config_name("keysteer..toml".as_ref()));
         assert!(!Config::is_portable_config_name("config.toml".as_ref()));
+    }
+
+    #[test]
+    fn default_write_path_uses_the_application_data_directory() {
+        let expected = crate::app::paths::data_file("keysteer.user.toml").unwrap();
+        assert_eq!(Config::default_write_path(), Some(expected));
+    }
+
+    #[test]
+    fn portable_discovery_is_filtered_and_deterministic() {
+        let directory = std::env::temp_dir().join(format!(
+            "keysteer-config-discovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        for name in [
+            "keysteer.zebra.toml",
+            "keysteer.Alpha.toml",
+            "KEYSTEER.DEFAULT.TOML",
+            "keysteer..toml",
+            "config.toml",
+        ] {
+            std::fs::write(directory.join(name), "").unwrap();
+        }
+
+        assert_eq!(
+            Config::discover_in(&directory).unwrap(),
+            Some(directory.join("keysteer.Alpha.toml"))
+        );
+
+        std::fs::remove_file(directory.join("keysteer.Alpha.toml")).unwrap();
+        std::fs::remove_file(directory.join("keysteer.zebra.toml")).unwrap();
+        assert_eq!(
+            Config::discover_in(&directory).unwrap(),
+            Some(directory.join("KEYSTEER.DEFAULT.TOML")),
+            "the annotated default should remain a fallback when no user profile exists"
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -2285,7 +1589,7 @@ mod tests {
         assert!(config.hotkeys.contains_key("left_alt+e"));
         assert!(config.hotkeys.contains_key("alt+f"));
         assert!(config.hotkeys.contains_key("right_alt+g"));
-        assert_eq!(config.key_name_resolver().aliases()["primary"], "left_alt");
+        assert_eq!(config.resolved_key_aliases()["primary"], "left_alt");
     }
 
     #[test]
@@ -2315,10 +1619,7 @@ mod tests {
 
         assert!(config.hotkeys.contains_key("left_shift+e"));
         assert!(config.hotkeys.contains_key("right_ctrl+g"));
-        assert_eq!(
-            config.key_name_resolver().aliases()["primary"],
-            "left_shift"
-        );
+        assert_eq!(config.resolved_key_aliases()["primary"], "left_shift");
     }
 
     #[test]
@@ -2364,7 +1665,10 @@ mod tests {
         let reparsed = Config::parse(&config.to_toml().unwrap()).unwrap();
 
         assert_eq!(reparsed.key_aliases, config.key_aliases);
-        assert_eq!(reparsed.key_name_resolver(), config.key_name_resolver());
+        assert_eq!(
+            reparsed.resolved_key_aliases(),
+            config.resolved_key_aliases()
+        );
     }
 
     #[test]

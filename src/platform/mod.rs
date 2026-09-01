@@ -17,16 +17,14 @@ pub mod macos;
 pub(crate) mod common;
 
 #[cfg(target_os = "macos")]
-pub(crate) use common::disposition_mailbox;
-#[cfg(target_os = "macos")]
 pub(crate) use macos::{latest_point_mailbox, multi_click};
 
 // Keep portable unit coverage for macOS-only state machines on non-macOS CI.
 #[cfg(all(test, not(target_os = "macos")))]
-#[path = "platform/macos/latest_point_mailbox.rs"]
+#[path = "macos/latest_point_mailbox.rs"]
 mod latest_point_mailbox_tests;
 #[cfg(all(test, not(target_os = "macos")))]
-#[path = "platform/macos/multi_click.rs"]
+#[path = "macos/multi_click.rs"]
 mod multi_click_tests;
 
 #[cfg(target_os = "windows")]

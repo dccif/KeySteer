@@ -20,9 +20,45 @@ use crate::api::binding::{Binding, Direction, ScrollAmount, Speed};
 use crate::api::command::{Command, CommandBatch, HostContext, Mode, ModeEvent};
 use crate::api::input::{Key, KeyState, ModeId};
 use crate::api::overlay::Color;
-use crate::config::{Config, Palette, Pointer, Scroll};
+use crate::api::theme::Palette;
 use smallvec::SmallVec;
 use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PointerSettings {
+    pub initial_speed: f64,
+    pub max_speed: f64,
+    pub acceleration: f64,
+    pub smooth_acceleration: bool,
+    pub tap_distance: f64,
+    pub slow_multiplier: f64,
+    pub precision_multiplier: f64,
+    pub fast_multiplier: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScrollSettings {
+    pub scroll_step: i32,
+    pub scroll_step_half: i32,
+    pub scroll_step_full: i32,
+}
+
+impl ScrollSettings {
+    fn pixels(&self, amount: ScrollAmount) -> f64 {
+        match amount {
+            ScrollAmount::Step => self.scroll_step as f64,
+            ScrollAmount::Half => self.scroll_step_half as f64,
+            ScrollAmount::Full => self.scroll_step_full as f64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Settings {
+    pub pointer: PointerSettings,
+    pub scroll: ScrollSettings,
+    pub passthrough_unbound_keys: bool,
+}
 
 /// A tiny key-owned map optimized for the usual one-to-four held gestures.
 /// Linear lookup is faster than a tree at this size and avoids node allocation.
@@ -141,7 +177,7 @@ impl Motion {
     fn step(
         &mut self,
         directions: DirectionMask,
-        profile: &Pointer,
+        profile: &PointerSettings,
         multiplier: f64,
         elapsed: Duration,
     ) -> (f64, f64) {
@@ -169,12 +205,12 @@ impl Motion {
     /// keeps total travel independent of display cadence, including a frame
     /// that crosses from acceleration into cruising speed.
     #[cfg(test)]
-    fn distance(profile: &Pointer, start: f64, end: f64) -> f64 {
+    fn distance(profile: &PointerSettings, start: f64, end: f64) -> f64 {
         Self::travel_at(profile, end) - Self::travel_at(profile, start)
     }
 
     /// Distance travelled from the beginning of the gesture through `time`.
-    fn travel_at(profile: &Pointer, time: f64) -> f64 {
+    fn travel_at(profile: &PointerSettings, time: f64) -> f64 {
         let time = time.max(0.0);
         let max_speed = profile.max_speed;
         let initial_speed = profile.initial_speed.min(max_speed);
@@ -204,7 +240,12 @@ impl Motion {
 
     /// Move once immediately so a press-and-release faster than the next
     /// display update remains observable without synthesising a frame interval.
-    fn tap(&mut self, directions: DirectionMask, profile: &Pointer, multiplier: f64) -> (f64, f64) {
+    fn tap(
+        &mut self,
+        directions: DirectionMask,
+        profile: &PointerSettings,
+        multiplier: f64,
+    ) -> (f64, f64) {
         self.advance(directions, profile.tap_distance * multiplier)
     }
 
@@ -233,8 +274,8 @@ impl Motion {
 }
 
 pub struct NormalMode {
-    profile: Pointer,
-    scroll: Scroll,
+    profile: PointerSettings,
+    scroll: ScrollSettings,
     passthrough_unbound_keys: bool,
 
     /// Directions currently held, keyed by the key holding them so releasing
@@ -259,11 +300,11 @@ pub struct NormalMode {
 }
 
 impl NormalMode {
-    pub fn new(config: &Config) -> Self {
+    pub fn new(settings: Settings) -> Self {
         Self {
-            profile: config.pointer.clone(),
-            scroll: config.scroll.clone(),
-            passthrough_unbound_keys: config.normal.passthrough_unbound_keys,
+            profile: settings.pointer,
+            scroll: settings.scroll,
+            passthrough_unbound_keys: settings.passthrough_unbound_keys,
             moving: SmallKeyMap::default(),
             scrolling: SmallKeyMap::default(),
             speeds: SmallKeyMap::default(),
@@ -423,11 +464,15 @@ impl Mode for NormalMode {
         !self.passthrough_unbound_keys
     }
 
+    fn wants_pointer_events(&self) -> bool {
+        false
+    }
+
     fn indicator_color(&self, palette: &Palette) -> Option<Color> {
         Some(palette.accent)
     }
 
-    fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
+    fn handle(&mut self, event: &ModeEvent, _ctx: &HostContext<'_>) -> CommandBatch {
         match event {
             ModeEvent::Activated { .. } => {
                 self.release_all();
@@ -450,10 +495,6 @@ impl Mode for NormalMode {
             ModeEvent::Resumed => {
                 Command::show_overlay(crate::api::overlay::OverlayScene::new()).into()
             }
-            ModeEvent::SettingsChanged => {
-                *self = Self::new(ctx.settings);
-                CommandBatch::new()
-            }
             _ => CommandBatch::new(),
         }
     }
@@ -463,6 +504,7 @@ impl Mode for NormalMode {
 mod tests {
     use super::*;
     use crate::api::geometry::{Point, Rect, Screen};
+    use crate::config::Config;
     use std::time::Duration;
 
     #[test]
@@ -505,9 +547,12 @@ mod tests {
                 cursor: Point::new(500.0, 400.0),
                 focused_app: None,
                 palette: &self.palette,
-                settings: &self.config,
             }
         }
+    }
+
+    fn pointer_settings() -> PointerSettings {
+        crate::app::mode_catalog::normal_settings(&Config::default()).pointer
     }
 
     fn send(
@@ -547,27 +592,15 @@ mod tests {
     #[test]
     fn normal_capture_policy_follows_unbound_passthrough() {
         let mut config = Config::default();
-        assert!(!NormalMode::new(&config).captures_keyboard());
+        assert!(!crate::app::mode_catalog::normal(&config).captures_keyboard());
         config.normal.passthrough_unbound_keys = false;
-        assert!(NormalMode::new(&config).captures_keyboard());
-    }
-
-    #[test]
-    fn config_reload_updates_normal_capture_policy() {
-        let mut mode = NormalMode::new(&Config::default());
-        let mut config = Config::default();
-        config.normal.passthrough_unbound_keys = false;
-        let env = Env::with(config);
-
-        let _ = mode.handle(&ModeEvent::SettingsChanged, &env.ctx());
-
-        assert!(mode.captures_keyboard());
+        assert!(crate::app::mode_catalog::normal(&config).captures_keyboard());
     }
 
     #[test]
     fn first_press_moves_once_without_arming_a_timer() {
         let env = Env::new();
-        let mut mode = NormalMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::normal(&env.config);
         let out = down(&mut mode, &env, Binding::Move(Direction::Right), "l");
         assert!(horizontal(&out).is_some_and(|dx| dx > 0.0), "{out:?}");
         assert!(!out.iter().any(|command| matches!(
@@ -579,7 +612,7 @@ mod tests {
     #[test]
     fn release_stops_the_gesture_and_display_clock() {
         let env = Env::new();
-        let mut mode = NormalMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::normal(&env.config);
         down(&mut mode, &env, Binding::Move(Direction::Right), "l");
         let out = up(&mut mode, &env, Binding::Move(Direction::Right), "l");
         assert_eq!(out, vec![Command::SetFrameClock(false)]);
@@ -588,7 +621,7 @@ mod tests {
 
     #[test]
     fn linear_acceleration_respects_max_speed() {
-        let mut profile = Config::default().pointer;
+        let mut profile = pointer_settings();
         profile.initial_speed = 100.0;
         profile.max_speed = 200.0;
         profile.acceleration = 500.0;
@@ -606,7 +639,7 @@ mod tests {
 
     #[test]
     fn smooth_acceleration_eases_the_ramp_without_changing_total_ramp_travel() {
-        let mut smooth = Config::default().pointer;
+        let mut smooth = pointer_settings();
         smooth.initial_speed = 100.0;
         smooth.max_speed = 200.0;
         smooth.acceleration = 100.0;
@@ -624,7 +657,7 @@ mod tests {
 
     #[test]
     fn smooth_acceleration_integrates_across_the_cruise_boundary() {
-        let mut profile = Config::default().pointer;
+        let mut profile = pointer_settings();
         profile.initial_speed = 100.0;
         profile.max_speed = 200.0;
         profile.acceleration = 100.0;
@@ -637,7 +670,7 @@ mod tests {
 
     #[test]
     fn zero_acceleration_and_inverted_speed_range_use_constant_speed() {
-        let mut profile = Config::default().pointer;
+        let mut profile = pointer_settings();
         profile.initial_speed = 100.0;
         profile.max_speed = 200.0;
         profile.acceleration = 0.0;
@@ -650,7 +683,7 @@ mod tests {
 
     #[test]
     fn equal_wall_clock_time_has_equal_travel_at_any_update_cadence() {
-        let mut profile = Config::default().pointer;
+        let mut profile = pointer_settings();
         profile.initial_speed = 100.0;
         profile.max_speed = 600.0;
         profile.acceleration = 500.0;
@@ -671,7 +704,7 @@ mod tests {
     #[test]
     fn native_display_updates_take_over_from_keyboard_repeat() {
         let env = Env::new();
-        let mut mode = NormalMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::normal(&env.config);
         down(&mut mode, &env, Binding::Move(Direction::Right), "l");
         let frame = mode.handle(
             &ModeEvent::Frame {
@@ -691,7 +724,7 @@ mod tests {
     #[test]
     fn diagonal_travel_is_normalised() {
         let env = Env::new();
-        let mut mode = NormalMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::normal(&env.config);
         down(&mut mode, &env, Binding::Move(Direction::Right), "l");
         down(&mut mode, &env, Binding::Move(Direction::Down), "j");
 
@@ -720,7 +753,7 @@ mod tests {
     #[test]
     fn opposed_directions_cancel() {
         let env = Env::new();
-        let mut mode = NormalMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::normal(&env.config);
         down(&mut mode, &env, Binding::Move(Direction::Left), "h");
         down(&mut mode, &env, Binding::Move(Direction::Right), "l");
         for _ in 0..5 {
@@ -736,7 +769,7 @@ mod tests {
     fn releasing_one_key_keeps_the_other_direction() {
         // Keys are tracked individually, so releasing `l` must not stop `j`.
         let env = Env::new();
-        let mut mode = NormalMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::normal(&env.config);
         down(&mut mode, &env, Binding::Move(Direction::Right), "l");
         down(&mut mode, &env, Binding::Move(Direction::Down), "j");
         up(&mut mode, &env, Binding::Move(Direction::Right), "l");
@@ -759,7 +792,7 @@ mod tests {
     #[test]
     fn direction_change_restarts_acceleration() {
         let env = Env::new();
-        let mut mode = NormalMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::normal(&env.config);
         down(&mut mode, &env, Binding::Move(Direction::Right), "l");
         for _ in 0..10 {
             down(&mut mode, &env, Binding::Move(Direction::Right), "l");
@@ -779,7 +812,7 @@ mod tests {
     #[test]
     fn scrolling_fires_on_initial_and_os_repeat_key_downs() {
         let env = Env::new();
-        let mut mode = NormalMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::normal(&env.config);
         let out = down(
             &mut mode,
             &env,
@@ -806,7 +839,7 @@ mod tests {
     #[test]
     fn releasing_a_scroll_key_stops_scrolling() {
         let env = Env::new();
-        let mut mode = NormalMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::normal(&env.config);
         let binding = Binding::Scroll(Direction::Down, ScrollAmount::Step);
         down(&mut mode, &env, binding.clone(), "e");
         let out = up(&mut mode, &env, binding, "e");
@@ -817,7 +850,7 @@ mod tests {
     #[test]
     fn scroll_amounts_use_their_configured_distance() {
         let env = Env::new();
-        let mut mode = NormalMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::normal(&env.config);
         let out = down(
             &mut mode,
             &env,
@@ -845,7 +878,7 @@ mod tests {
                 (Direction::Left, (-1.0, 0.0)),
                 (Direction::Right, (1.0, 0.0)),
             ] {
-                let mut mode = NormalMode::new(&env.config);
+                let mut mode = crate::app::mode_catalog::normal(&env.config);
                 down(&mut mode, &env, Binding::Speed(speed), "shift");
                 let out = down(
                     &mut mode,
@@ -869,7 +902,7 @@ mod tests {
     /// Total horizontal travel over equal wall-clock intervals, optionally
     /// holding a modifier.
     fn travel_right(env: &Env, speed: Option<Speed>, updates: usize) -> f64 {
-        let mut mode = NormalMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::normal(&env.config);
         if let Some(speed) = speed {
             down(&mut mode, env, Binding::Speed(speed), "shift");
         }
@@ -914,7 +947,7 @@ mod tests {
     #[test]
     fn deactivation_clears_state_without_canceling_a_timer() {
         let env = Env::new();
-        let mut mode = NormalMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::normal(&env.config);
         down(&mut mode, &env, Binding::Move(Direction::Right), "l");
         let out = mode.handle(&ModeEvent::Deactivated, &env.ctx());
         assert!(out.is_empty());
@@ -927,7 +960,7 @@ mod tests {
         // Clicks and mode switches never reach a mode, so handling them here
         // would be dead code.
         let env = Env::new();
-        let mut mode = NormalMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::normal(&env.config);
         for binding in [
             Binding::Click(crate::api::binding::Button::Left),
             Binding::Mode(ModeId::grid()),
@@ -943,7 +976,7 @@ mod tests {
     #[test]
     fn timer_events_never_drive_normal_mode() {
         let env = Env::new();
-        let mut mode = NormalMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::normal(&env.config);
         down(&mut mode, &env, Binding::Move(Direction::Right), "l");
         let out = mode.handle(
             &ModeEvent::Timer {

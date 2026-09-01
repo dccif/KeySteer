@@ -40,8 +40,8 @@ use crate::api::overlay::OverlayScene;
 use crate::platform::common::scan_mailbox::ScanMailbox;
 
 use self::hook::{HookStartup, HookThread};
-use self::multi_click::ClickTracker;
 use self::overlay::Overlay;
+use crate::platform::multi_click::ClickTracker;
 
 const BACKEND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -99,7 +99,7 @@ pub struct MacOsBackend {
     frame_clock: display_link::DisplayFrameClock,
     workspace: workspace::Workspace,
     status_item: Option<status_item::StatusItem>,
-    update_worker: Option<crate::update::UpdateWorker>,
+    update_worker: Option<crate::platform::common::update::UpdateWorker>,
     held_buttons: Cell<u8>,
     click_tracker: Arc<Mutex<ClickTracker>>,
     warned_about_permissions: bool,
@@ -248,7 +248,7 @@ impl MacOsBackend {
         if self
             .update_worker
             .as_mut()
-            .is_some_and(crate::update::UpdateWorker::reap_finished)
+            .is_some_and(crate::platform::common::update::UpdateWorker::reap_finished)
         {
             self.update_worker.take();
         }
@@ -506,7 +506,7 @@ impl Backend for MacOsBackend {
         }
         let progress_sender = self.event_tx.clone();
         let complete_sender = self.event_tx.clone();
-        self.update_worker = crate::update::check_async(
+        self.update_worker = crate::platform::common::update::check_async(
             move |progress| {
                 let _ = progress_sender.send(BackendEvent::UpdateProgress(progress));
             },

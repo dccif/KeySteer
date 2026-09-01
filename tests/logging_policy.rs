@@ -38,7 +38,6 @@ fn application_diagnostics_use_the_unified_logger() -> Result<(), Box<dyn std::e
                 "OutputDebugString",
                 "WriteConsole",
                 "STD_ERROR_HANDLE",
-                "log::",
                 "tracing::",
                 "env_logger::",
                 "slog::",
@@ -51,6 +50,20 @@ fn application_diagnostics_use_the_unified_logger() -> Result<(), Box<dyn std::e
                     path.display()
                 );
             }
+            let bypasses_log_facade = source.match_indices("log::").any(|(index, _)| {
+                index == 0
+                    || !source[..index]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|character| {
+                            character.is_ascii_alphanumeric() || character == '_'
+                        })
+            });
+            assert!(
+                !bypasses_log_facade,
+                "diagnostics must go through support::logging (log::): {}",
+                path.display()
+            );
         }
         assert!(
             !source.contains("log_warning!"),

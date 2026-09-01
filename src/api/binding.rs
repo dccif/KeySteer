@@ -24,7 +24,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use super::input::{Key, KeyChord, KeyNameResolver, ModeId};
+use super::input::{Key, KeyChord, ModeId};
 
 /// Default interval used by `wait`/`wait 0` and repeated synthetic keystrokes.
 pub const DEFAULT_WAIT_MS: u64 = 100;
@@ -77,7 +77,7 @@ pub enum InputTarget {
 }
 
 impl InputTarget {
-    fn parse_with(value: &str, resolver: Option<&KeyNameResolver>) -> Result<Self, String> {
+    fn parse(value: &str) -> Result<Self, String> {
         let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
         let button = match normalized.as_str() {
             "mouse_left" => Some(Button::Left),
@@ -88,14 +88,10 @@ impl InputTarget {
         if let Some(button) = button {
             return Ok(Self::Mouse(button));
         }
-        let key = match resolver {
-            Some(resolver) => resolver.key(value)?,
-            None => Key::new(value)?,
-        };
-        if !Key::is_known(key.as_str()) {
+        if !Key::is_known(value) {
             return Err(format!("unknown input target: {value:?}"));
         }
-        Ok(Self::Key(key))
+        Key::new(value).map(Self::Key)
     }
 
     pub(crate) fn canonical_str(&self) -> &str {
@@ -188,14 +184,6 @@ impl Binding {
     /// known key name, then a mode id. Anything else is an error, so a typo
     /// surfaces at load time instead of silently doing nothing.
     pub fn parse(value: &str) -> Result<Self, String> {
-        Self::parse_with(value, None)
-    }
-
-    pub fn parse_with_resolver(value: &str, resolver: &KeyNameResolver) -> Result<Self, String> {
-        Self::parse_with(value, Some(resolver))
-    }
-
-    fn parse_with(value: &str, resolver: Option<&KeyNameResolver>) -> Result<Self, String> {
         let text = value.trim();
         if text.is_empty() {
             return Err("binding must not be empty".into());
@@ -224,11 +212,7 @@ impl Binding {
                 if rest.is_empty() {
                     return Err("`send` needs a key or chord, e.g. `send ctrl+c`".into());
                 }
-                let chord = match resolver {
-                    Some(resolver) => resolver.chord(&rest.join("")),
-                    None => KeyChord::parse(&rest.join("")),
-                }?;
-                return Ok(Binding::Send(chord));
+                return KeyChord::parse(&rest.join("")).map(Binding::Send);
             }
             "exec" => {
                 let (program, args) = rest
@@ -269,7 +253,7 @@ impl Binding {
                 }
                 let targets = rest
                     .iter()
-                    .map(|target| InputTarget::parse_with(target, resolver))
+                    .map(|target| InputTarget::parse(target))
                     .collect::<Result<Vec<_>, _>>()?;
                 if targets.iter().collect::<BTreeSet<_>>().len() != targets.len() {
                     return Err(format!("`{head}` contains a duplicate input target"));
@@ -331,22 +315,11 @@ impl Binding {
             return Ok(binding);
         }
         if head.contains('+') {
-            let chord = match resolver {
-                Some(resolver) => resolver.chord(head),
-                None => KeyChord::parse(head),
-            }?;
-            return Ok(Binding::Send(chord));
+            return KeyChord::parse(head).map(Binding::Send);
         }
         // A bare key name sends that key: `t = "home"`.
-        let resolved_head = resolver
-            .map(|resolver| resolver.resolve_name(head))
-            .unwrap_or_else(|| head.to_string());
-        if Key::is_known(&resolved_head) {
-            let chord = match resolver {
-                Some(resolver) => resolver.chord(head),
-                None => KeyChord::parse(head),
-            }?;
-            return Ok(Binding::Send(chord));
+        if Key::is_known(head) {
+            return KeyChord::parse(head).map(Binding::Send);
         }
         // Otherwise it must name a mode. A bare word has to be a built-in;
         // plugin modes are namespaced, which keeps typos from resolving to a

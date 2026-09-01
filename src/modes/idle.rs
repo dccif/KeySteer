@@ -7,12 +7,11 @@
 
 use crate::api::command::{Command, CommandBatch, HostContext, Mode, ModeEvent};
 use crate::api::input::ModeId;
-use crate::config::Config;
 
 pub struct IdleMode;
 
 impl IdleMode {
-    pub fn new(_config: &Config) -> Self {
+    pub fn new() -> Self {
         Self
     }
 }
@@ -37,6 +36,10 @@ impl Mode for IdleMode {
         false
     }
 
+    fn wants_pointer_events(&self) -> bool {
+        false
+    }
+
     fn handle(&mut self, event: &ModeEvent, _ctx: &HostContext<'_>) -> CommandBatch {
         match event {
             // Clear anything the previous mode left on screen.
@@ -56,7 +59,6 @@ mod tests {
     struct Env {
         screens: Vec<Screen>,
         palette: Palette,
-        config: Config,
     }
 
     impl Env {
@@ -70,7 +72,6 @@ mod tests {
                     name: None,
                 }],
                 palette: Palette::default(),
-                config: Config::default(),
             }
         }
         fn ctx(&self) -> HostContext<'_> {
@@ -79,20 +80,19 @@ mod tests {
                 cursor: Point::new(500.0, 400.0),
                 focused_app: None,
                 palette: &self.palette,
-                settings: &self.config,
             }
         }
     }
 
     #[test]
     fn idle_never_captures_the_keyboard() {
-        assert!(!IdleMode::new(&Config::default()).captures_keyboard());
+        assert!(!IdleMode::new().captures_keyboard());
     }
 
     #[test]
     fn idle_clears_the_overlay_on_entry() {
         let env = Env::new();
-        let mut mode = IdleMode::new(&env.config);
+        let mut mode = IdleMode::new();
         let out = mode.handle(&ModeEvent::Activated { previous: None }, &env.ctx());
         assert_eq!(out, vec![Command::HideOverlay]);
     }
@@ -101,7 +101,7 @@ mod tests {
     fn idle_ignores_everything_else() {
         // The silence guarantee: no timers, no overlays, no pointer commands.
         let env = Env::new();
-        let mut mode = IdleMode::new(&env.config);
+        let mut mode = IdleMode::new();
         let events = [
             ModeEvent::Key {
                 key: Key::new("h").unwrap(),
@@ -110,7 +110,6 @@ mod tests {
             },
             ModeEvent::PointerMoved(Point::new(1.0, 2.0)),
             ModeEvent::ScreensChanged(env.screens.clone()),
-            ModeEvent::SettingsChanged,
             ModeEvent::Deactivated,
         ];
         for event in events {

@@ -3,15 +3,10 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use keysteer::api::{
-    Appearance, Binding, Direction, HostContext, KeyState, LabelDirection, Mode, Rect, Screen,
-    UiScanResult, UiScanStatus, UiTarget,
+use keysteer::benchmark::{
+    Appearance, Binding, Config, Direction, HostContext, Key, KeyState, LabelDirection, Mode,
+    ModeEvent, Point, Rect, Screen, UiScanResult, UiScanStatus, UiTarget, assign_into,
 };
-use keysteer::api::{Key, ModeEvent, Point};
-use keysteer::config::Config;
-use keysteer::modes::hint::HintMode;
-use keysteer::modes::hint::labeling::assign_into;
-use keysteer::modes::normal::NormalMode;
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 
 #[global_allocator]
@@ -42,7 +37,6 @@ fn benchmark_hint_owned_delivery() -> Result<(), String> {
         cursor: Point::default(),
         focused_app: None,
         palette: &palette,
-        settings: &config,
     };
 
     for targets in [24, 64, 100, 128, 500, 2_000] {
@@ -88,7 +82,7 @@ fn measure_hint_delivery_allocations(
     owned: bool,
 ) -> (usize, usize) {
     let values = hint_targets(count);
-    let mut mode = HintMode::new(config);
+    let mut mode = keysteer::benchmark::hint(config);
     black_box(mode.handle(&ModeEvent::Activated { previous: None }, context));
     let region = Region::new(GLOBAL);
     if owned {
@@ -119,7 +113,7 @@ fn measure_hint_delivery(
     owned: bool,
 ) -> u128 {
     let values = hint_targets(count);
-    let mut mode = HintMode::new(config);
+    let mut mode = keysteer::benchmark::hint(config);
     black_box(mode.handle(&ModeEvent::Activated { previous: None }, context));
     let started = Instant::now();
     if owned {
@@ -166,9 +160,8 @@ fn benchmark_normal_frame() -> Result<(), String> {
         cursor: Point::default(),
         focused_app: None,
         palette: &palette,
-        settings: &config,
     };
-    let mut mode = NormalMode::new(&config);
+    let mut mode = keysteer::benchmark::normal(&config);
     let _ = mode.handle(
         &ModeEvent::Binding {
             binding: Arc::new(Binding::Move(Direction::Right)),

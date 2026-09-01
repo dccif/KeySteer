@@ -16,7 +16,6 @@ use super::binding::{ActionSequence, Binding};
 use super::geometry::{Point, Rect, Screen, UiTarget};
 use super::input::{Key, KeyState, ModeId};
 use super::overlay::{Color, OverlayScene};
-use super::settings::RuntimeSettings;
 use super::theme::Palette;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -493,9 +492,6 @@ pub enum ModeEvent {
     /// by the runtime so animation and movement stay independent of display
     /// refresh rate and scheduler jitter.
     Timer { id: String, elapsed: Duration },
-
-    /// The configuration was reloaded; re-read anything cached.
-    SettingsChanged,
 }
 
 /// Identity of the focused application, for per-app configuration.
@@ -611,7 +607,6 @@ pub struct HostContext<'a> {
     pub cursor: Point,
     pub focused_app: Option<&'a FocusedApp>,
     pub palette: &'a Palette,
-    pub settings: &'a RuntimeSettings,
 }
 
 impl std::fmt::Debug for HostContext<'_> {
@@ -622,7 +617,6 @@ impl std::fmt::Debug for HostContext<'_> {
             .field("cursor", &self.cursor)
             .field("focused_app", &self.focused_app)
             .field("palette", &self.palette)
-            .field("settings", &"<runtime settings>")
             .finish()
     }
 }
@@ -673,6 +667,17 @@ pub trait Mode: Send {
     /// host swallows keys instead of passing them to the focused app — which
     /// is what grid and hint modes need, and idle does not.
     fn captures_keyboard(&self) -> bool {
+        true
+    }
+
+    /// Whether an otherwise-unbound physical key belongs to this mode's own
+    /// input alphabet.
+    fn claims_key(&self, _key: &Key) -> bool {
+        false
+    }
+
+    /// Whether pointer motion should be delivered to this mode.
+    fn wants_pointer_events(&self) -> bool {
         true
     }
 

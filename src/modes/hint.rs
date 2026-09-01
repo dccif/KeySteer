@@ -10,30 +10,29 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-#[doc(hidden)]
-pub mod labeling;
-mod matching;
-mod view;
-
 use smallvec::SmallVec;
 
 use crate::api::binding::Binding;
 use crate::api::command::{
-    Command, CommandBatch, FinishCause, HostContext, Mode, ModeEvent, UiScanRequest, UiScanResult,
-    UiScanStatus,
+    Command, CommandBatch, FinishCause, FocusedApp, HostContext, Mode, ModeEvent, UiScanRequest,
+    UiScanResult, UiScanStatus, UiScanStrategy, VisionOptions,
 };
 use crate::api::geometry::{Rect, UiTarget};
+use crate::api::hint::LabelDirection;
 use crate::api::input::{Key, KeyChord, KeyState, ModeId};
+use crate::api::lifecycle::TargetingLifecycle;
 use crate::api::overlay::{
     Color, LabelStyle, OverlayLabel, OverlayScene, OverlayShape, OverlayText, SharedLabelStyle,
 };
-use crate::config::style::AUTO;
-use crate::config::{Config, Palette, UiHint as HintsConfig};
-use labeling::{CompactHint, assign_compact_into};
+use crate::api::style::{AUTO, BoundaryHighlight, HintPlacement, LabelUi, SearchInputUi};
+use crate::api::theme::Palette;
+pub mod labeling;
+mod matching;
+mod view;
+
+use labeling::{self as hints, CompactHint};
 use matching::Match;
 use view::{VisualLayerPlan, build_visual_layer_plan};
-
-use super::targeting::TargetingSession;
 
 const SCAN_RETRY_TIMER_ID: &str = "ui_hint.scan_retry";
 const NO_WINDOW_UNDER_POINTER: &str =
@@ -50,6 +49,56 @@ const SEARCH_INPUT_Z_INDEX: i32 = 10_000;
 const MAX_SCAN_TIMEOUT_MS: u64 = 30_000;
 const AUTO_HINT_PADDING_X_RATIO: f64 = 2.0 / 17.0;
 const AUTO_HINT_PADDING_Y_RATIO: f64 = 0.06;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppStrategyOverride {
+    pub pattern: String,
+    pub strategy: Option<UiScanStrategy>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Settings {
+    pub strategy: UiScanStrategy,
+    pub vision: VisionOptions,
+    pub hint_characters: String,
+    pub label_direction: LabelDirection,
+    pub max_depth: u32,
+    pub scan_timeout_ms: u64,
+    pub scan_retry_count: u32,
+    pub scan_retry_delay_ms: u64,
+    pub clickable_roles: Vec<String>,
+    pub ignore_clickable_check: bool,
+    pub visible_check_enabled: bool,
+    pub placement: HintPlacement,
+    pub label_x_offset: i32,
+    pub label_y_offset: i32,
+    pub ui: LabelUi,
+    pub boundary_highlight: BoundaryHighlight,
+    pub search_input_ui: SearchInputUi,
+    pub lifecycle: TargetingLifecycle,
+    pub overlap_cycle_key: String,
+    pub app_overrides: Vec<AppStrategyOverride>,
+}
+
+impl Settings {
+    fn strategy_for(&self, app: Option<&FocusedApp>) -> UiScanStrategy {
+        let Some(app) = app else {
+            return self.strategy;
+        };
+        self.app_overrides
+            .iter()
+            .find(|entry| {
+                !entry.pattern.is_empty()
+                    && (entry.pattern.eq_ignore_ascii_case(&app.bundle_id)
+                        || app
+                            .window_title
+                            .to_lowercase()
+                            .contains(&entry.pattern.to_lowercase()))
+            })
+            .and_then(|entry| entry.strategy)
+            .unwrap_or(self.strategy)
+    }
+}
 /// What the keyboard is currently doing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Input {
@@ -70,7 +119,7 @@ impl Input {
 }
 
 pub struct HintMode {
-    config: HintsConfig,
+    config: Settings,
     alphabet: Vec<char>,
     overlap_cycle_chord: Option<KeyChord>,
 
@@ -88,7 +137,7 @@ pub struct HintMode {
     input: Input,
     scanning: bool,
     status: Option<String>,
-    session: TargetingSession,
+    return_mode: ModeId,
     scan_id: u64,
     retry_attempt: u32,
     retry_pending: bool,
@@ -105,21 +154,21 @@ pub struct HintMode {
     /// labels immediately would invalidate keys already visible to the user.
     pending_relabel: bool,
     selected: Option<usize>,
+    finished: bool,
     /// Prevent late asynchronous scan results from reviving an inactive mode.
     active: bool,
 }
 
 impl HintMode {
-    pub fn new(config: &Config) -> Self {
+    pub fn new(config: Settings) -> Self {
         Self {
-            config: config.ui_hint.clone(),
             alphabet: config
-                .ui_hint
                 .hint_characters
                 .chars()
                 .filter_map(|character| Key::new(character.to_string()).ok()?.as_char())
                 .collect(),
-            overlap_cycle_chord: KeyChord::parse(&config.ui_hint.overlap_cycle_key).ok(),
+            overlap_cycle_chord: KeyChord::parse(&config.overlap_cycle_key).ok(),
+            config,
             scanned: Vec::new(),
             scanned_names_lower: Vec::new(),
             search_names_initialized: false,
@@ -128,7 +177,7 @@ impl HintMode {
             input: Input::Labels(OverlayText::default()),
             scanning: false,
             status: None,
-            session: TargetingSession::default(),
+            return_mode: ModeId::idle(),
             scan_id: 0,
             retry_attempt: 0,
             retry_pending: false,
@@ -139,6 +188,7 @@ impl HintMode {
             wide_placements: None,
             pending_relabel: false,
             selected: None,
+            finished: false,
             active: false,
         }
     }
@@ -194,7 +244,7 @@ impl HintMode {
         self.clear_scan_results(false);
         self.input = Input::Labels(OverlayText::default());
         self.selected = None;
-        self.session.restart();
+        self.finished = false;
         self.retry_attempt = 0;
         self.retry_pending = false;
         let request = self.scan_request(ctx);
@@ -327,7 +377,7 @@ impl HintMode {
     }
 
     fn handle_scan_result(&mut self, result: UiScanResult, ctx: &HostContext<'_>) -> CommandBatch {
-        if !self.active || self.session.finished || result.id != self.scan_id {
+        if !self.active || self.finished || result.id != self.scan_id {
             return CommandBatch::new();
         }
         let UiScanResult {
@@ -452,18 +502,16 @@ impl HintMode {
             })
             .map(|(index, target)| (target.rect, index));
 
-        if let Err(error) = assign_compact_into(
+        if hints::assign_compact_into(
             &mut self.hints,
             candidates,
             &self.alphabet,
             self.config.label_direction,
-        ) {
+        )
+        .is_err()
+        {
             self.hints.clear();
             self.status = Some("Cannot assign Hint labels — check hint_characters".into());
-            crate::support::logging::report_error(
-                "ui-hint",
-                format!("cannot assign labels for scan {}: {error}", self.scan_id),
-            );
         }
         self.pending_relabel = false;
         self.refresh_overlap_plan(ctx);
@@ -710,7 +758,7 @@ impl HintMode {
     }
 
     fn redraw(&self, ctx: &HostContext<'_>) -> CommandBatch {
-        CommandBatch::one(Command::show_overlay(if self.session.finished {
+        CommandBatch::one(Command::show_overlay(if self.finished {
             self.finished_scene(ctx)
         } else {
             self.scene(ctx)
@@ -779,16 +827,16 @@ impl HintMode {
     fn cancel(&self) -> CommandBatch {
         CommandBatch::two(
             Command::HideOverlay,
-            Command::SwitchMode(self.session.return_mode.clone()),
+            Command::SwitchMode(self.return_mode.clone()),
         )
     }
 
     fn key_down(&mut self, key: &Key, ctx: &HostContext<'_>) -> CommandBatch {
-        if self.session.finished {
+        if self.finished {
             return match key.as_str() {
                 "esc" => self.cancel(),
                 "backspace" | "tab" => {
-                    self.session.restart();
+                    self.finished = false;
                     self.selected = None;
                     if let Input::Labels(typed) = &mut self.input {
                         typed.pop();
@@ -929,7 +977,7 @@ fn match_compact_input(hints: &[CompactHint<usize>], input: &str) -> Match<usize
     }
 }
 
-fn placed_hint_rect(config: &HintsConfig, hint: &CompactHint<usize>, style: &LabelStyle) -> Rect {
+fn placed_hint_rect(config: &Settings, hint: &CompactHint<usize>, style: &LabelStyle) -> Rect {
     let width =
         style.font_size * 0.75 * hint.label.as_str().chars().count() as f64 + style.padding_x * 2.0;
     let height = style.font_size * 1.4 + style.padding_y * 2.0;
@@ -1046,6 +1094,15 @@ impl Mode for HintMode {
         "Hints".into()
     }
 
+    fn claims_key(&self, key: &Key) -> bool {
+        self.overlap_cycle_chord
+            .as_ref()
+            .is_some_and(|chord| chord.activation_matches(key))
+            || key.as_char().is_some_and(|character| {
+                character.is_ascii_alphanumeric() || self.alphabet.contains(&character)
+            })
+    }
+
     fn indicator_color(&self, palette: &Palette) -> Option<Color> {
         Some(palette.accent)
     }
@@ -1054,21 +1111,27 @@ impl Mode for HintMode {
         match event {
             ModeEvent::Activated { previous } => {
                 self.active = true;
-                self.session.activate(previous.as_ref());
+                self.return_mode = previous.clone().unwrap_or_else(ModeId::idle);
                 self.request_scan(ctx)
             }
             ModeEvent::Restarted => {
                 self.active = true;
                 self.request_scan(ctx)
             }
-            ModeEvent::FinishRequested { .. } if self.session.finished => CommandBatch::new(),
+            ModeEvent::FinishRequested { .. } if self.finished => CommandBatch::new(),
             ModeEvent::FinishRequested { .. } => {
-                self.session.finish();
+                self.finished = true;
                 let mut commands = self.redraw(ctx);
-                commands.extend(self.session.commands(&self.config.lifecycle.after_finish));
+                commands.extend(super::targeting::lifecycle_commands(
+                    &self.config.lifecycle.after_finish,
+                    &self.return_mode,
+                ));
                 commands
             }
-            ModeEvent::Clicked { .. } => self.session.commands(&self.config.lifecycle.after_click),
+            ModeEvent::Clicked { .. } => super::targeting::lifecycle_commands(
+                &self.config.lifecycle.after_click,
+                &self.return_mode,
+            ),
             ModeEvent::Deactivated => {
                 self.active = false;
                 self.clear_scan_results(true);
@@ -1079,12 +1142,12 @@ impl Mode for HintMode {
                 self.overlap_cycle = 0;
                 self.retry_pending = false;
                 self.selected = None;
-                self.session.restart();
+                self.finished = false;
                 CommandBatch::one(Command::CancelTimer {
                     id: SCAN_RETRY_TIMER_ID.into(),
                 })
             }
-            ModeEvent::UiScanned(result) if self.session.finished || result.id != self.scan_id => {
+            ModeEvent::UiScanned(result) if self.finished || result.id != self.scan_id => {
                 CommandBatch::new()
             }
             ModeEvent::UiScanned(result) => self.handle_scan_result(result.clone(), ctx),
@@ -1106,13 +1169,13 @@ impl Mode for HintMode {
             }
             // The tree we labelled belongs to the old window/geometry.
             ModeEvent::FocusChanged(_) | ModeEvent::ScreensChanged(_)
-                if self.active && !self.session.finished =>
+                if self.active && !self.finished =>
             {
                 self.request_scan(ctx)
             }
             ModeEvent::PointerMoved(_)
                 if self.active
-                    && !self.session.finished
+                    && !self.finished
                     && self
                         .scan_bounds
                         .is_some_and(|bounds| bounds != ctx.active_bounds()) =>
@@ -1122,28 +1185,12 @@ impl Mode for HintMode {
             ModeEvent::ScreenRetargeted { screen, .. } => {
                 CommandBatch::one(Command::warp_to(screen.bounds.center()))
             }
-            ModeEvent::Resumed if self.session.finished => self.redraw(ctx),
+            ModeEvent::Resumed if self.finished => self.redraw(ctx),
             ModeEvent::Resumed if self.scanning && self.hints.is_empty() => {
                 CommandBatch::one(Command::HideOverlay)
             }
             ModeEvent::Resumed if self.hints.is_empty() => self.status_scene(ctx),
             ModeEvent::Resumed => self.redraw(ctx),
-            ModeEvent::SettingsChanged => {
-                let session = self.session.clone();
-                let scan_id = self.scan_id;
-                let scan_bounds = self.scan_bounds;
-                let active = self.active;
-                *self = Self::new(ctx.settings);
-                self.session = session;
-                self.scan_id = scan_id;
-                self.scan_bounds = scan_bounds;
-                self.active = active;
-                if active {
-                    self.request_scan(ctx)
-                } else {
-                    CommandBatch::new()
-                }
-            }
             ModeEvent::Key {
                 key,
                 state,
@@ -1179,6 +1226,7 @@ impl Mode for HintMode {
 mod tests {
     use super::*;
     use crate::api::geometry::{Point, Screen};
+    use crate::config::Config;
     use std::collections::HashSet;
 
     struct Env {
@@ -1212,7 +1260,6 @@ mod tests {
                 cursor: self.cursor,
                 focused_app: None,
                 palette: &self.palette,
-                settings: &self.config,
             }
         }
     }
@@ -1301,7 +1348,7 @@ mod tests {
     #[test]
     fn default_auto_padding_resolves_to_compact_hint_spacing() {
         let env = Env::new();
-        let mode = HintMode::new(&env.config);
+        let mode = crate::app::mode_catalog::hint(&env.config);
         let style = mode.resolved_hint_label_style(&env.palette);
 
         assert_eq!(mode.config.ui.padding_x, AUTO);
@@ -1317,7 +1364,7 @@ mod tests {
         config.ui_hint.ui.padding_x = 7;
         config.ui_hint.ui.padding_y = 3;
         let env = Env::with(config);
-        let mode = HintMode::new(&env.config);
+        let mode = crate::app::mode_catalog::hint(&env.config);
         let style = mode.resolved_hint_label_style(&env.palette);
 
         assert_eq!(style.padding_x, 7.0);
@@ -1327,7 +1374,7 @@ mod tests {
     #[test]
     fn deactivation_releases_large_scan_buffers() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         mode.scanned.reserve(1_024);
         mode.scanned_names_lower.reserve(1_024);
         mode.seen_targets.reserve(1_024);
@@ -1351,7 +1398,7 @@ mod tests {
     #[test]
     fn deactivation_reuses_only_small_empty_container_capacity() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         deliver(
             &mut mode,
@@ -1377,7 +1424,7 @@ mod tests {
     #[test]
     fn late_context_change_cannot_restart_a_deactivated_hint_mode() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         let retired_scan_id = mode.scan_id;
 
@@ -1402,7 +1449,7 @@ mod tests {
     #[test]
     fn activation_requests_a_scan_with_configured_roles() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         let out = activate(&mut mode, &env);
         let request = out
             .iter()
@@ -1430,7 +1477,7 @@ mod tests {
             scale: 2.0,
             name: None,
         });
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         let old_scan_id = mode.scan_id;
 
@@ -1452,7 +1499,7 @@ mod tests {
     #[test]
     fn scan_results_produce_one_label_per_target() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         let scanning = activate(&mut mode, &env);
         assert!(scanning.contains(&Command::HideOverlay));
         assert!(
@@ -1472,7 +1519,7 @@ mod tests {
     #[test]
     fn partial_scan_batches_appear_immediately_and_remain_after_completion() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
 
         let first = mode.handle(
@@ -1531,7 +1578,7 @@ mod tests {
     #[test]
     fn later_partial_rebuilds_the_merged_plan_instead_of_appending_layers() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
 
         mode.handle(
@@ -1569,7 +1616,7 @@ mod tests {
         const SAMPLES: usize = 20_000;
 
         fn prepared(env: &Env) -> HintMode {
-            let mut mode = HintMode::new(&env.config);
+            let mut mode = crate::app::mode_catalog::hint(&env.config);
             activate(&mut mode, env);
             let scan_id = mode.scan_id;
             mode.handle_owned(
@@ -1628,7 +1675,7 @@ mod tests {
     #[test]
     fn partial_labels_can_be_selected_before_the_scan_finishes() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         mode.handle(
             &ModeEvent::UiScanned(crate::api::UiScanResult {
@@ -1649,7 +1696,7 @@ mod tests {
     #[test]
     fn scan_results_outside_the_requested_screen_are_discarded() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         let out = deliver(
             &mut mode,
@@ -1668,7 +1715,7 @@ mod tests {
         let mut config = Config::default();
         config.ui_hint.boundary_highlight.enabled = true;
         let env = Env::with(config);
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         let targets = (0..30)
             .map(|i| target(&format!("target {i}"), i as f64 * 25.0))
@@ -1706,7 +1753,7 @@ mod tests {
     #[test]
     fn typed_prefix_rebuilds_overlap_layers_for_visible_labels() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         deliver(
             &mut mode,
@@ -1766,7 +1813,7 @@ mod tests {
     fn high_dpi_ajh_and_ajj_switch_before_and_after_prefix_filtering() {
         let mut env = Env::new();
         env.screens[0].scale = 1.5;
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         deliver(
             &mut mode,
@@ -1861,7 +1908,7 @@ mod tests {
     #[test]
     fn matched_prefix_color_defaults_inside_ui_hint_and_allows_an_override() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         let out = deliver(&mut mode, &env, vec![target("Save", 0.0)]);
         assert_eq!(
@@ -1873,7 +1920,7 @@ mod tests {
         config.ui_hint.ui.matched_text_color =
             Some(crate::config::ThemedColor::Both("#FF0000FF".to_owned()));
         let env = Env::with(config);
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         let out = deliver(&mut mode, &env, vec![target("Save", 0.0)]);
         assert_eq!(
@@ -1885,7 +1932,7 @@ mod tests {
     #[test]
     fn shift_cycles_overlapping_labels_and_release_restores_default_order() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         let initial = deliver(
             &mut mode,
@@ -1922,7 +1969,7 @@ mod tests {
     #[test]
     fn shift_cycles_every_computed_layer_instead_of_stopping_at_three() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         let initial = deliver(
             &mut mode,
@@ -1931,7 +1978,7 @@ mod tests {
                 .map(|index| target(&format!("Layer {index}"), 100.0))
                 .collect(),
         );
-        let top_text = |output: &[Command]| top_label(scene_of(output)).text.clone();
+        let top_text = |output: &_| top_label(scene_of(output)).text.clone();
         let mut observed = vec![top_text(&initial)];
         for index in 0_usize..5 {
             let shift = if index.is_multiple_of(2) {
@@ -1955,14 +2002,14 @@ mod tests {
     #[test]
     fn two_layers_show_the_other_layer_on_every_shift_press() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         let initial = deliver(
             &mut mode,
             &env,
             vec![target("One", 100.0), target("Two", 100.0)],
         );
-        let top_text = |output: &[Command]| top_label(scene_of(output)).text.clone();
+        let top_text = |output: &_| top_label(scene_of(output)).text.clone();
         let initial_top = top_text(&initial);
         let first_top = top_text(&press(&mut mode, &env, "left_shift"));
         assert_ne!(first_top, initial_top);
@@ -1977,7 +2024,7 @@ mod tests {
     #[test]
     fn layer_switch_changes_only_draw_order_and_z_index() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         let initial = deliver(
             &mut mode,
@@ -1989,7 +2036,7 @@ mod tests {
             ],
         );
         let shifted = press(&mut mode, &env, "left_shift");
-        let normalize = |output: &[Command]| {
+        let normalize = |output: &_| {
             let mut labels = scene_of(output)
                 .labels
                 .iter()
@@ -2189,7 +2236,7 @@ mod tests {
     #[test]
     fn final_layer_plan_never_removes_or_moves_scan_labels() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         let targets = (0..128)
             .map(|index| target(&format!("Target {index}"), 100.0))
@@ -2270,7 +2317,7 @@ mod tests {
     #[test]
     fn overlap_key_during_scan_uses_all_merged_partial_labels() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         mode.handle(
             &ModeEvent::UiScanned(crate::api::UiScanResult {
@@ -2334,7 +2381,7 @@ mod tests {
     #[test]
     fn partials_after_a_typed_prefix_merge_when_the_prefix_is_cleared() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         mode.handle(
             &ModeEvent::UiScanned(UiScanResult {
@@ -2392,7 +2439,7 @@ mod tests {
     #[test]
     fn repeated_overlap_down_does_not_cycle_again_while_held() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         deliver(
             &mut mode,
@@ -2436,7 +2483,7 @@ mod tests {
         let mut config = Config::default();
         config.ui_hint.overlap_cycle_key = "alt".into();
         let env = Env::with(config);
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         deliver(
             &mut mode,
@@ -2468,7 +2515,7 @@ mod tests {
     #[test]
     fn stale_scan_results_are_ignored() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         let out = mode.handle(
             &ModeEvent::UiScanned(crate::api::UiScanResult {
@@ -2486,7 +2533,7 @@ mod tests {
     #[test]
     fn typing_a_label_moves_and_requests_finish_without_clicking() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         deliver(
             &mut mode,
@@ -2528,7 +2575,7 @@ mod tests {
         let mut config = Config::default();
         config.ui_hint.scan_retry_count = 0;
         let env = Env::with(config);
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         let out = deliver(&mut mode, &env, vec![]);
         assert!(
@@ -2565,7 +2612,7 @@ mod tests {
         config.ui_hint.scan_retry_count = 2;
         config.ui_hint.scan_retry_delay_ms = 125;
         let env = Env::with(config);
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         let first_id = mode.scan_id;
 
@@ -2605,7 +2652,7 @@ mod tests {
     #[test]
     fn context_change_retargets_immediately_without_consuming_retry_budget() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         deliver(&mut mode, &env, vec![target("Old", 20.0)]);
         let retired_scan_id = mode.scan_id;
@@ -2638,7 +2685,7 @@ mod tests {
     #[test]
     fn no_window_prompt_does_not_retry_or_advertise_a_fixed_shortcut() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
 
         let out = mode.handle_owned(
@@ -2665,7 +2712,7 @@ mod tests {
     #[test]
     fn partial_timeout_keeps_labels_without_retrying() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         mode.handle(
             &ModeEvent::UiScanned(crate::api::UiScanResult {
@@ -2696,7 +2743,7 @@ mod tests {
     #[test]
     fn scan_failure_status_stays_visible_without_leaving_hint_mode() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         let out = mode.handle(
             &ModeEvent::UiScanned(crate::api::UiScanResult {
@@ -2722,7 +2769,7 @@ mod tests {
     #[test]
     fn activation_key_repeat_does_not_select_an_f_hint() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         deliver(&mut mode, &env, vec![target("A", 0.0), target("F", 200.0)]);
         let out = mode.handle(
@@ -2740,7 +2787,7 @@ mod tests {
     #[test]
     fn keys_are_ignored_while_the_scan_is_in_flight() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         assert!(press(&mut mode, &env, "a").is_empty());
         // Escape still works, so the user is never stuck.
@@ -2750,7 +2797,7 @@ mod tests {
     #[test]
     fn slash_opens_search_and_filters_by_name() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         deliver(
             &mut mode,
@@ -2777,7 +2824,7 @@ mod tests {
     #[test]
     fn name_search_rebuilds_overlap_layers_for_each_query() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         deliver(
             &mut mode,
@@ -2806,7 +2853,7 @@ mod tests {
     #[test]
     fn unicode_search_uses_the_normalized_key_without_changing_matches() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         deliver(
             &mut mode,
@@ -2871,7 +2918,7 @@ mod tests {
     #[test]
     fn spatial_dedup_reuses_canonical_strings_but_keeps_real_collisions() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
 
         let save = target("Save", 0.0);
@@ -2894,7 +2941,7 @@ mod tests {
     #[test]
     fn owned_first_partial_adopts_target_and_string_storage() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
 
         let targets = vec![target("Save 设置", 20.0), target("Cancel", 120.0)];
@@ -2924,7 +2971,7 @@ mod tests {
     #[test]
     fn escape_leaves_search_before_leaving_the_mode() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         deliver(&mut mode, &env, vec![target("Save", 0.0)]);
 
@@ -2939,7 +2986,7 @@ mod tests {
     #[test]
     fn unmatched_character_is_dropped_and_hints_stay_up() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         // Enough targets that labels are two characters long.
         let targets: Vec<UiTarget> = (0..30)
@@ -2973,7 +3020,7 @@ mod tests {
     #[test]
     fn focus_change_triggers_a_fresh_scan() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         deliver(&mut mode, &env, vec![target("Save", 0.0)]);
 
@@ -2987,7 +3034,7 @@ mod tests {
         let mut config = Config::default();
         config.ui_hint.boundary_highlight.enabled = true;
         let env = Env::with(config);
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         let out = deliver(
             &mut mode,
@@ -3002,7 +3049,7 @@ mod tests {
         let mut config = Config::default();
         config.ui_hint.placement = crate::api::overlay::Placement::Top;
         let env = Env::with(config);
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         let out = deliver(&mut mode, &env, vec![target("Save", 0.0)]);
 
@@ -3022,7 +3069,7 @@ mod tests {
         config.ui_hint.label_x_offset = 7;
         config.ui_hint.label_y_offset = -9;
         let env = Env::with(config);
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         let out = deliver(&mut mode, &env, vec![target("Save", 0.0)]);
 
@@ -3042,7 +3089,7 @@ mod tests {
         config.ui_hint.label_direction = crate::config::LabelDirection::Reverse;
         config.ui_hint.hint_characters = "asdf".into();
         let env = Env::with(config);
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         deliver(
             &mut mode,
@@ -3060,7 +3107,7 @@ mod tests {
         let mut config = Config::default();
         config.ui_hint.lifecycle.after_finish = crate::config::LifecycleAction::Keep;
         let env = Env::with(config);
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
         deliver(&mut mode, &env, vec![target("Save", 100.0)]);
         let label = mode.hints[0].label.clone();
@@ -3078,7 +3125,7 @@ mod tests {
             },
             &env.ctx(),
         );
-        assert!(mode.session.finished);
+        assert!(mode.finished);
         assert!(
             finished
                 .iter()
@@ -3100,7 +3147,7 @@ mod tests {
         );
 
         let reopened = press(&mut mode, &env, "backspace");
-        assert!(!mode.session.finished);
+        assert!(!mode.finished);
         assert!(
             reopened
                 .iter()
@@ -3116,7 +3163,7 @@ mod tests {
     #[test]
     fn default_finish_returns_to_normal_without_clicking_or_rescanning() {
         let env = Env::new();
-        let mut mode = HintMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
         mode.handle(
             &ModeEvent::Activated {
                 previous: Some(ModeId::normal()),

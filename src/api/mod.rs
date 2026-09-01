@@ -15,15 +15,15 @@ pub mod command;
 pub mod geometry;
 pub mod hint;
 pub mod input;
+pub mod lifecycle;
 pub mod overlay;
 pub mod plugin;
-pub mod settings;
+pub mod style;
 pub mod theme;
 
 pub use autostart::Autostart;
 pub use backend::{
-    Appearance, Backend, BackendEvent, EventPump, Input, KeyDisposition, Overlay, Shell, UiScan,
-    UpdateCheckResult, UpdateProgress,
+    Appearance, Backend, BackendEvent, KeyDisposition, UpdateCheckResult, UpdateProgress,
 };
 pub use binding::{
     Action, ActionPhase, ActionSequence, Binding, Button, DEFAULT_WAIT_MS, Direction, InputTarget,
@@ -35,11 +35,15 @@ pub use command::{
 };
 pub use geometry::{Point, Rect, Screen, UiTarget};
 pub use hint::LabelDirection;
-pub use input::{InputEvent, Key, KeyChord, KeyNameResolver, KeyState, ModeId};
+pub use input::{InputEvent, Key, KeyChord, KeyState, ModeId};
+pub use lifecycle::{LifecycleAction, TargetingLifecycle};
 pub use overlay::{
     Color, Indicator, LabelStyle, OverlayLabel, OverlayScene, OverlayShape, OverlayText, Placement,
     SharedLabelStyle,
 };
-pub use plugin::{API_VERSION, Manifest, Plugin};
-pub use settings::RuntimeSettings;
-pub use theme::Palette;
+pub use plugin::{Manifest, Plugin};
+pub use style::{
+    Anchor, BoundaryHighlight, CursorIndicatorOverride, CursorIndicatorUi, HintPlacement,
+    IndicatorUi, IndicatorUiOverride, LabelUi, ModeIndicator, ModeIndicatorEntry, SearchInputUi,
+};
+pub use theme::{Palette, ThemedColor};

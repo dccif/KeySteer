@@ -35,7 +35,7 @@ Mode 是平台无关的状态机：它接收事件和只读运行现场，返回
 1. 在 `src/api/` 确认已有的 `ModeEvent` 和 `Command` 是否够用。
 2. 在 `src/modes/` 新建状态机，保存会话状态，不直接调用 Win32、AppKit 或 Backend。
 3. 实现 `api::Mode` 的 `id`、`display_name` 和 `handle`。
-4. 在 `src/modes.rs` 的 `built_in()` 注册，并让配置决定是否启用。
+4. 在 `src/app/mode_catalog.rs` 增加唯一 catalog 项，把配置 DTO 转成该 Mode 的强类型 `Settings`。
 5. 为按键、完成、取消、配置重载和失败清理补测试。
 6. 同步更新默认 TOML、用户文档、侧边栏和 AI 项目手册。
 
@@ -63,9 +63,9 @@ impl Mode for MyMode {
 基本步骤：
 
 1. 在 `src/plugins/builtin/` 实现 `Mode`。
-2. 用 `Manifest` 声明稳定 id、名称、描述、API 版本、动词和建议绑定。
-3. 在 `src/plugins.rs` 的 `bundled()` 返回它。
-4. 在 `src/app/bootstrap.rs` 注册；注册时会校验 Manifest。
+2. 用 `Manifest` 声明稳定 id、名称、描述、动词和建议绑定。
+3. 在 `src/app/mode_catalog.rs` 的 `bundled_plugins()` 返回它；catalog 会校验 Manifest。
+4. 由 `RuntimePlan` 启动或热重载时整体注册，不在 bootstrap 逐项拼装。
 5. 在 `[plugin_modes."plugin:<id>"]` 提供继承、绑定和插件专属 `settings`；只使用 `PluginModeConfig` 已声明的字段，不要假设插件也有内置定位 Mode 的 `lifecycle` 段。
 6. 给动词参数、默认绑定不覆盖用户配置、配置重载和模式退出写测试。
 
@@ -83,7 +83,7 @@ ModeEvent + HostContext → Plugin 状态机 → Vec<Command>
 
 1. **解析**：在 `src/api/binding.rs` 添加语法、参数数量和错误信息。
 2. **公共命令**：在 `src/api/command.rs` 添加平台无关的 `Command` 变体。
-3. **执行**：在 `src/runtime.rs` 的运行时命令执行路径处理该命令；涉及原生能力时调用 `Backend`。
+3. **执行**：在 `src/app/runtime/command_executor.rs` 的运行时命令执行路径处理该命令；涉及原生能力时调用 `Backend`。
 4. **验证和文档**：增加单元/集成测试，更新 `keysteer.default.toml`、[模式与动作](/reference/modes-and-actions)、模拟器动作列表和 AI 手册。
 
 绑定解析有意在加载阶段拒绝拼写错误。不要把未知输入静默当成“什么都不做”，否则用户只能在运行时猜原因。

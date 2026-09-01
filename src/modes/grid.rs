@@ -9,11 +9,29 @@ use crate::api::binding::Binding;
 use crate::api::command::{Command, CommandBatch, FinishCause, HostContext, Mode, ModeEvent};
 use crate::api::geometry::{Point, Rect};
 use crate::api::input::{Key, KeyState, ModeId};
+use crate::api::lifecycle::TargetingLifecycle;
 use crate::api::overlay::{Color, LabelStyle, OverlayLabel, OverlayScene, OverlayShape};
-use crate::config::{Config, GridUi, Palette, TargetingLifecycle};
+use crate::api::style::LabelUi;
+use crate::api::theme::{Palette, ThemedColor};
 use smallvec::SmallVec;
 
-use super::targeting::TargetingSession;
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VisualSettings {
+    pub label: LabelUi,
+    pub matched_background_color: Option<ThemedColor>,
+    pub matched_border_color: Option<ThemedColor>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Settings {
+    pub grid_cols: u32,
+    pub grid_rows: u32,
+    pub keys: String,
+    pub max_depth: u32,
+    pub cursor_follow_selection: bool,
+    pub lifecycle: TargetingLifecycle,
+    pub ui: VisualSettings,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 struct Layout {
@@ -33,35 +51,36 @@ pub struct GridMode {
     max_depth: u32,
     default_cursor_follow_selection: bool,
     cursor_follow_selection: bool,
-    ui: GridUi,
+    ui: VisualSettings,
     /// Areas from the active display to the selected leaf.
     stack: SmallVec<[Rect; 12]>,
     /// Row-major cell indices used to replay the selection on another display.
     path: SmallVec<[usize; 12]>,
     /// A leaf has been selected and the session is ready to finish.
     terminal: bool,
-    session: TargetingSession,
+    finished: bool,
     lifecycle: TargetingLifecycle,
+    return_mode: ModeId,
 }
 
 impl GridMode {
-    pub fn new(config: &Config) -> Self {
-        let grid = &config.grid;
+    pub fn new(settings: Settings) -> Self {
         Self {
             layout: Layout {
-                rows: grid.grid_rows.max(1) as usize,
-                cols: grid.grid_cols.max(1) as usize,
-                keys: grid.keys.chars().collect(),
+                rows: settings.grid_rows.max(1) as usize,
+                cols: settings.grid_cols.max(1) as usize,
+                keys: settings.keys.chars().collect(),
             },
-            max_depth: grid.max_depth.max(1),
-            default_cursor_follow_selection: grid.cursor_follow_selection,
-            cursor_follow_selection: grid.cursor_follow_selection,
-            ui: grid.ui.clone(),
+            max_depth: settings.max_depth.max(1),
+            default_cursor_follow_selection: settings.cursor_follow_selection,
+            cursor_follow_selection: settings.cursor_follow_selection,
+            ui: settings.ui,
             stack: SmallVec::new(),
             path: SmallVec::new(),
             terminal: false,
-            session: TargetingSession::default(),
-            lifecycle: grid.lifecycle.clone(),
+            finished: false,
+            lifecycle: settings.lifecycle,
+            return_mode: ModeId::idle(),
         }
     }
 
@@ -154,7 +173,7 @@ impl GridMode {
         // outer boundary, avoiding per-cell duplicate edges and alpha blending.
         let preview_rows = self.layout.rows.saturating_mul(self.layout.rows);
         let preview_cols = self.layout.cols.saturating_mul(self.layout.cols);
-        let line_color = crate::config::style::resolve(
+        let line_color = crate::api::style::resolve(
             self.ui.matched_border_color.as_ref(),
             palette.appearance,
             style.border_color,
@@ -379,7 +398,7 @@ impl GridMode {
         self.stack.push(bounds);
         self.path.clear();
         self.terminal = false;
-        self.session.restart();
+        self.finished = false;
         self.cursor_follow_selection = self.default_cursor_follow_selection;
     }
 
@@ -389,7 +408,7 @@ impl GridMode {
         } else {
             SmallVec::new()
         };
-        let was_finished = preserve && self.session.finished;
+        let was_finished = preserve && self.finished;
         let follow = self.cursor_follow_selection;
         self.reset(bounds);
         if preserve {
@@ -405,7 +424,7 @@ impl GridMode {
                 self.path.push(index);
             }
             self.terminal = self.depth() >= self.max_depth;
-            self.session.finished = was_finished;
+            self.finished = was_finished;
         }
         let mut commands =
             CommandBatch::one(Command::warp_to(self.current().unwrap_or(bounds).center()));
@@ -456,7 +475,7 @@ impl GridMode {
     fn cancel(&self) -> CommandBatch {
         CommandBatch::two(
             Command::HideOverlay,
-            Command::SwitchMode(self.session.return_mode.clone()),
+            Command::SwitchMode(self.return_mode.clone()),
         )
     }
 
@@ -471,7 +490,7 @@ impl GridMode {
                 self.stack.pop();
                 self.path.pop();
                 self.terminal = false;
-                self.session.restart();
+                self.finished = false;
                 return self.redraw(ctx.palette);
             }
             "space" => {
@@ -484,7 +503,7 @@ impl GridMode {
             _ => {}
         }
 
-        if self.terminal || self.session.finished {
+        if self.terminal || self.finished {
             return CommandBatch::new();
         }
         let Some(key) = key.as_char() else {
@@ -517,6 +536,11 @@ impl Mode for GridMode {
         "Grid".into()
     }
 
+    fn claims_key(&self, key: &Key) -> bool {
+        key.as_char()
+            .is_some_and(|character| self.layout.keys.contains(&character))
+    }
+
     fn indicator_color(&self, palette: &Palette) -> Option<Color> {
         Some(palette.accent)
     }
@@ -524,7 +548,7 @@ impl Mode for GridMode {
     fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
         match event {
             ModeEvent::Activated { previous } => {
-                self.session.activate(previous.as_ref());
+                self.return_mode = previous.clone().unwrap_or_else(ModeId::idle);
                 self.reset(ctx.active_bounds());
                 self.redraw(ctx.palette)
             }
@@ -532,14 +556,19 @@ impl Mode for GridMode {
                 self.reset(ctx.active_bounds());
                 self.redraw(ctx.palette)
             }
-            ModeEvent::FinishRequested { .. } if self.session.finished => CommandBatch::new(),
+            ModeEvent::FinishRequested { .. } if self.finished => CommandBatch::new(),
             ModeEvent::FinishRequested { .. } => {
-                self.session.finish();
+                self.finished = true;
                 let mut commands = self.redraw(ctx.palette);
-                commands.extend(self.session.commands(&self.lifecycle.after_finish));
+                commands.extend(super::targeting::lifecycle_commands(
+                    &self.lifecycle.after_finish,
+                    &self.return_mode,
+                ));
                 commands
             }
-            ModeEvent::Clicked { .. } => self.session.commands(&self.lifecycle.after_click),
+            ModeEvent::Clicked { .. } => {
+                super::targeting::lifecycle_commands(&self.lifecycle.after_click, &self.return_mode)
+            }
             ModeEvent::ScreensChanged(_) => {
                 self.reset(ctx.active_bounds());
                 self.redraw(ctx.palette)
@@ -556,15 +585,8 @@ impl Mode for GridMode {
                 self.stack.clear();
                 self.path.clear();
                 self.terminal = false;
-                self.session.restart();
+                self.finished = false;
                 CommandBatch::new()
-            }
-            ModeEvent::SettingsChanged => {
-                let session = self.session.clone();
-                *self = Self::new(ctx.settings);
-                self.session = session;
-                self.reset(ctx.active_bounds());
-                self.redraw(ctx.palette)
             }
             ModeEvent::Binding {
                 binding,
@@ -587,6 +609,7 @@ impl Mode for GridMode {
 mod tests {
     use super::*;
     use crate::api::geometry::{Point, Screen};
+    use crate::config::Config;
 
     struct Env {
         screens: Vec<Screen>,
@@ -621,7 +644,6 @@ mod tests {
                 cursor: self.cursor,
                 focused_app: None,
                 palette: &self.palette,
-                settings: &self.config,
             }
         }
     }
@@ -671,7 +693,7 @@ mod tests {
     #[test]
     fn activation_layers_large_prefixes_over_small_suffix_grids() {
         let env = Env::new();
-        let mut mode = GridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::grid(&env.config);
         let out = activate(&mut mode, &env);
         let scene = scene_of(&out);
 
@@ -715,7 +737,7 @@ mod tests {
     #[test]
     fn scene_uses_one_fill_unique_rulings_and_text_only_labels() {
         let env = Env::new();
-        let mut mode = GridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::grid(&env.config);
         let out = activate(&mut mode, &env);
         let scene = scene_of(&out);
 
@@ -748,7 +770,7 @@ mod tests {
     #[test]
     fn selecting_the_first_key_restores_the_existing_single_layer_view() {
         let env = Env::new();
-        let mut mode = GridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::grid(&env.config);
         activate(&mut mode, &env);
 
         let out = press(&mut mode, &env, "1");
@@ -779,7 +801,7 @@ mod tests {
         let mut config = Config::default();
         config.grid.ui.label.border_width = 0;
         let env = Env::with(config);
-        let mut mode = GridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::grid(&env.config);
         let out = activate(&mut mode, &env);
 
         assert!(
@@ -793,7 +815,7 @@ mod tests {
     #[test]
     fn each_selection_narrows_the_grid_and_moves_to_its_centre_by_default() {
         let env = Env::new();
-        let mut mode = GridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::grid(&env.config);
         activate(&mut mode, &env);
 
         let first = mode.cells()[0].rect;
@@ -835,7 +857,7 @@ mod tests {
             scale: 2.0,
             name: None,
         });
-        let mut mode = GridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::grid(&env.config);
         activate(&mut mode, &env);
         press(&mut mode, &env, "1");
         assert_eq!(mode.depth(), 1);
@@ -853,7 +875,7 @@ mod tests {
         let mut config = Config::default();
         config.grid.ui.label.font_size = 20;
         let env = Env::with(config);
-        let mut mode = GridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::grid(&env.config);
         let initial = activate(&mut mode, &env);
         let initial_font = scene_of(&initial).labels[0].style.font_size;
 
@@ -878,7 +900,7 @@ mod tests {
     #[test]
     fn follow_binding_disables_live_cursor_following_for_the_session() {
         let env = Env::new();
-        let mut mode = GridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::grid(&env.config);
         activate(&mut mode, &env);
 
         toggle_follow(&mut mode, &env);
@@ -893,7 +915,7 @@ mod tests {
     #[test]
     fn enabling_follow_immediately_warps_to_the_current_grid_centre() {
         let env = Env::new();
-        let mut mode = GridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::grid(&env.config);
         activate(&mut mode, &env);
         toggle_follow(&mut mode, &env);
         press(&mut mode, &env, "1");
@@ -918,7 +940,7 @@ mod tests {
     #[test]
     fn enter_moves_to_the_selected_centre_without_clicking() {
         let env = Env::new();
-        let mut mode = GridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::grid(&env.config);
         activate(&mut mode, &env);
         toggle_follow(&mut mode, &env);
         press(&mut mode, &env, "1");
@@ -939,7 +961,7 @@ mod tests {
     #[test]
     fn screen_retarget_replays_or_resets_the_grid_path() {
         let env = Env::new();
-        let mut mode = GridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::grid(&env.config);
         activate(&mut mode, &env);
         press(&mut mode, &env, "q");
         press(&mut mode, &env, "w");
@@ -980,7 +1002,7 @@ mod tests {
     #[test]
     fn backspace_widens_and_space_resets_the_selection() {
         let env = Env::new();
-        let mut mode = GridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::grid(&env.config);
         activate(&mut mode, &env);
         press(&mut mode, &env, "q");
         press(&mut mode, &env, "q");
@@ -999,7 +1021,7 @@ mod tests {
         let mut config = Config::default();
         config.grid.lifecycle.after_finish = crate::config::LifecycleAction::Keep;
         let env = Env::with(config);
-        let mut mode = GridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::grid(&env.config);
         activate(&mut mode, &env);
         press(&mut mode, &env, "1");
         let selected = mode.current();
@@ -1010,7 +1032,7 @@ mod tests {
             },
             &env.ctx(),
         );
-        assert!(mode.session.finished);
+        assert!(mode.finished);
         assert_eq!(mode.current(), selected);
         let scene = scene_of(&finished);
         assert_eq!(scene.labels.len(), mode.layout.rows * mode.layout.cols);
@@ -1037,14 +1059,14 @@ mod tests {
         );
 
         press(&mut mode, &env, "backspace");
-        assert!(!mode.session.finished);
+        assert!(!mode.finished);
         assert_eq!(mode.depth(), 0);
     }
 
     #[test]
     fn default_finish_returns_grid_to_normal() {
         let env = Env::new();
-        let mut mode = GridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::grid(&env.config);
         mode.handle(
             &ModeEvent::Activated {
                 previous: Some(ModeId::normal()),

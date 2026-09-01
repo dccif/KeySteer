@@ -97,7 +97,7 @@ pub enum KeyDisposition {
 }
 
 /// A native backend. Implementations live in `src/platform/<os>.rs` and are
-/// selected by `cfg(target_os)` in `src/platform.rs`.
+/// selected by `cfg(target_os)` in `src/platform/mod.rs`.
 pub trait Backend {
     /// Block for up to `timeout` for the next event.
     ///
@@ -271,130 +271,8 @@ pub trait Backend {
     }
 }
 
-/// Event-loop capability view of an aggregate [`Backend`].
-pub trait EventPump {
-    fn poll_event(&mut self, timeout: std::time::Duration) -> Result<Option<BackendEvent>, String>;
-    fn dispose_event(&mut self, disposition: KeyDisposition) -> Result<(), String>;
-}
-
-impl<T: Backend + ?Sized> EventPump for T {
-    fn poll_event(&mut self, timeout: std::time::Duration) -> Result<Option<BackendEvent>, String> {
-        Backend::poll(self, timeout)
-    }
-
-    fn dispose_event(&mut self, disposition: KeyDisposition) -> Result<(), String> {
-        Backend::dispose_key(self, disposition)
-    }
-}
-
-/// Native pointer, mouse, keyboard, and display-query capability.
-pub trait Input {
-    fn input_screens(&self) -> Result<Vec<Screen>, String>;
-    fn input_pointer(&self) -> Result<Point, String>;
-    fn input_warp_pointer(&self, to: Point) -> Result<(), String>;
-    fn input_mouse_button(&self, button: MouseButton, action: ButtonAction) -> Result<(), String>;
-    fn input_send_key(&self, key: &Key, state: super::input::KeyState) -> Result<(), String>;
-}
-
-impl<T: Backend + ?Sized> Input for T {
-    fn input_screens(&self) -> Result<Vec<Screen>, String> {
-        Backend::screens(self)
-    }
-
-    fn input_pointer(&self) -> Result<Point, String> {
-        Backend::pointer(self)
-    }
-
-    fn input_warp_pointer(&self, to: Point) -> Result<(), String> {
-        Backend::warp_pointer(self, to)
-    }
-
-    fn input_mouse_button(&self, button: MouseButton, action: ButtonAction) -> Result<(), String> {
-        Backend::mouse_button(self, button, action)
-    }
-
-    fn input_send_key(&self, key: &Key, state: super::input::KeyState) -> Result<(), String> {
-        Backend::send_key(self, key, state)
-    }
-}
-
-/// Overlay presentation and frame-clock capability.
-pub trait Overlay {
-    fn overlay_present(&mut self, scene: Arc<OverlayScene>) -> Result<(), String>;
-    fn overlay_dismiss(&mut self) -> Result<(), String>;
-    fn overlay_set_frame_clock(&mut self, active: bool) -> Result<(), String>;
-}
-
-impl<T: Backend + ?Sized> Overlay for T {
-    fn overlay_present(&mut self, scene: Arc<OverlayScene>) -> Result<(), String> {
-        Backend::present(self, scene)
-    }
-
-    fn overlay_dismiss(&mut self) -> Result<(), String> {
-        Backend::dismiss(self)
-    }
-
-    fn overlay_set_frame_clock(&mut self, active: bool) -> Result<(), String> {
-        Backend::set_frame_clock(self, active)
-    }
-}
-
-/// Asynchronous accessibility/UI scanning capability.
-pub trait UiScan {
-    fn ui_scan_request(&mut self, request: UiScanRequest) -> Result<(), String>;
-    fn ui_scan_cancel(&mut self, id: u64) -> Result<(), String>;
-}
-
-impl<T: Backend + ?Sized> UiScan for T {
-    fn ui_scan_request(&mut self, request: UiScanRequest) -> Result<(), String> {
-        Backend::request_ui_scan(self, request)
-    }
-
-    fn ui_scan_cancel(&mut self, id: u64) -> Result<(), String> {
-        Backend::cancel_ui_scan(self, id)
-    }
-}
-
-/// Status UI, URL launching, updates, and lifecycle capability.
-pub trait Shell {
-    fn shell_name(&self) -> &'static str;
-    fn shell_open_url(&mut self, url: &str) -> Result<(), String>;
-    fn shell_set_enabled(&mut self, enabled: bool) -> Result<(), String>;
-    fn shell_shutdown(&mut self) -> Result<(), String>;
-}
-
-impl<T: Backend + ?Sized> Shell for T {
-    fn shell_name(&self) -> &'static str {
-        Backend::name(self)
-    }
-
-    fn shell_open_url(&mut self, url: &str) -> Result<(), String> {
-        Backend::open_url(self, url)
-    }
-
-    fn shell_set_enabled(&mut self, enabled: bool) -> Result<(), String> {
-        Backend::set_enabled(self, enabled)
-    }
-
-    fn shell_shutdown(&mut self) -> Result<(), String> {
-        Backend::shutdown(self)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Appearance {
     Light,
     Dark,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn requires_all_capabilities<T: EventPump + Input + Overlay + UiScan + Shell + ?Sized>() {}
-
-    #[test]
-    fn aggregate_backend_has_every_capability_view() {
-        requires_all_capabilities::<dyn Backend>();
-    }
 }

@@ -1,37 +1,74 @@
-name: Build and publish
+name: Build, check and publish
 
 on:
   workflow_dispatch:
     inputs:
       platform:
-        description: Packages to build (publishing always builds all platforms)
+        description: Packages to build, or checks only
         required: true
         default: all
         type: choice
         options:
+          - all
           - windows
           - macos
-          - all
-      publish:
-        description: Publish the packages as a GitHub Release
-        required: true
-        default: true
-        type: boolean
-      release_type:
-        description: Release type (used only when publishing)
-        required: true
-        default: release
-        type: choice
-        options:
-          - release
-          - pre-release
+          - checks
 
 permissions:
   contents: read
 
 jobs:
+  check-release-notes:
+    if: ${{ inputs.platform == 'checks' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Validate current version release notes
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version = "\([^" ]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test -n "$version"
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          bash tools/compose-release-notes.sh "$version" "$output"
+          test -s "$output"
+
+  check-windows:
+    if: ${{ inputs.platform == 'checks' }}
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup toolchain install 1.98 --profile minimal --component rustfmt,clippy
+      - run: rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc
+      - name: Sync package version in Cargo.lock
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version = "\([^" ]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test -n "$version"
+          cargo update --package keysteer --precise "$version"
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo clippy --locked --target aarch64-pc-windows-msvc --all-targets --all-features -- -D warnings
+
+  check-macos:
+    if: ${{ inputs.platform == 'checks' }}
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup toolchain install 1.98 --profile minimal --component clippy
+      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Sync package version in Cargo.lock
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version = "\([^" ]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test -n "$version"
+          cargo update --package keysteer --precise "$version"
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-features startup_repair
+      - run: cargo clippy --locked --target x86_64-apple-darwin --all-targets --all-features -- -D warnings
+
   windows:
-    if: ${{ inputs.publish || inputs.platform == 'windows' || inputs.platform == 'all' }}
+    if: ${{ inputs.platform == 'all' || inputs.platform == 'windows' }}
     runs-on: windows-2025
     steps:
       - name: Checkout
@@ -39,6 +76,9 @@ jobs:
 
       - name: Install required Rust toolchain
         run: rustup toolchain install 1.98 --profile minimal
+
+      - name: Verify Rust toolchain
+        run: rustc --version
 
       - name: Install Rust targets
         run: rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc
@@ -75,7 +115,7 @@ jobs:
           retention-days: 30
 
   macos:
-    if: ${{ inputs.publish || inputs.platform == 'macos' || inputs.platform == 'all' }}
+    if: ${{ inputs.platform == 'all' || inputs.platform == 'macos' }}
     runs-on: macos-14
     steps:
       - name: Checkout
@@ -83,6 +123,9 @@ jobs:
 
       - name: Install required Rust toolchain
         run: rustup toolchain install 1.98 --profile minimal
+
+      - name: Verify Rust toolchain
+        run: rustc --version
 
       - name: Install Rust targets
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
@@ -119,7 +162,9 @@ jobs:
           retention-days: 30
 
   release:
-    if: ${{ inputs.publish }}
+    # A public release must contain every supported platform. Partial manual
+    # builds still retain their downloadable workflow artifacts.
+    if: ${{ inputs.platform == 'all' }}
     needs: [windows, macos]
     runs-on: ubuntu-latest
     permissions:
@@ -161,27 +206,17 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TYPE: ${{ inputs.release_type }}
           VERSION: ${{ steps.version.outputs.value }}
         shell: bash
         run: |
-          prerelease_flag=()
-          if [[ "$RELEASE_TYPE" == "pre-release" ]]; then
-            tag="v$VERSION-pre.$GITHUB_RUN_NUMBER"
-            title="KeySteer v$VERSION pre-release #$GITHUB_RUN_NUMBER"
-            prerelease_flag=(--prerelease)
-          else
-            tag="v$VERSION"
-            title="KeySteer v$VERSION"
-          fi
+          tag="v$VERSION"
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "release already exists: $tag" >&2
             exit 1
           fi
           gh release create "$tag" \
             --target "$GITHUB_SHA" \
-            --title "$title" \
-            "${prerelease_flag[@]}" \
+            --title "KeySteer v$VERSION" \
             --generate-notes \
             --notes "$(cat release-body.md)" \
             release-assets/*.zip

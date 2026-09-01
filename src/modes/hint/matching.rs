@@ -34,7 +34,6 @@ pub fn match_input<T: Clone>(hints: &[Hint<T>], input: &str) -> Match<T> {
 mod tests {
     use super::*;
     use crate::api::Rect;
-    use crate::modes::hint::labeling::Hint;
 
     fn hint(label: &str, value: usize) -> Hint<usize> {
         Hint {

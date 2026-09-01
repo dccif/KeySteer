@@ -583,9 +583,12 @@ fn present_about() {
         .stack_size(NATIVE_DIALOG_THREAD_STACK_BYTES)
         .spawn(move || {
             let _guard = guard;
-            if let Err(error) =
-                show_message("About KeySteer", &crate::about::details(), false, false)
-            {
+            if let Err(error) = show_message(
+                "About KeySteer",
+                &crate::platform::common::app_info::details(),
+                false,
+                false,
+            ) {
                 crate::support::logging::report_error("windows-about", error);
             }
         })

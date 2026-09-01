@@ -5,7 +5,7 @@
 ```text
 keysteer/
 ├─ src/                 Rust 库、程序入口、核心运行时和原生后端
-├─ tests/               跨模块/发布配置集成测试
+├─ tests/               不导入实现的架构、日志和源码预算护栏
 ├─ assets/              品牌图、运行时图标和平台图标
 ├─ packaging/           Windows portable 与 macOS .app 打包脚本
 ├─ tools/               与主程序解耦的开发/性能测量工具
@@ -22,27 +22,26 @@ keysteer/
 
 | 路径 | 职责 | 常见入口 |
 | --- | --- | --- |
-| `src/api/` | 跨平台公共协议：按键、动作、命令、事件、几何、场景、插件、后端 trait | `api.rs`, `command.rs`, `backend.rs` |
-| `src/app/` | 程序启动、CLI、路径、配置仓储与网页配置交接 | `bootstrap.rs`, `config_repository.rs`, `config_simulator.rs` |
-| `src/config/` | 纯 TOML 模型、解析、校验和 comment-preserving store | `config.rs`, `store.rs`, `style.rs` |
-| `src/runtime.rs`, `src/runtime/` | Engine、输入路由、命令执行和 overlay 协调 | `runtime/input_router.rs`, `runtime/command_executor.rs` |
-| `src/support/` | 日志、错误聚合、worker join 与性能探针 | `logging.rs`, `errors.rs`, `worker.rs` |
-| `src/modes/hint/` | UI Hint 私有标签分配、匹配和视觉分层算法 | `labeling.rs`, `matching.rs`, `view.rs` |
-| `src/modes/` | 五个内置 Mode 状态机 | `normal.rs`, `grid.rs`, `recursive_grid.rs`, `hint.rs` |
+| `src/api/` | 跨平台公共协议：按键、动作、命令、事件、几何、场景、插件、后端 trait | `api/mod.rs`, `command.rs`, `backend.rs` |
+| `src/app/` | 唯一应用聚合根：启动、CLI、配置编译、Mode catalog 和 runtime | `bootstrap.rs`, `configuration.rs`, `mode_catalog.rs`, `runtime/` |
+| `src/config/` | TOML 文档、Mode section DTO、校验、主题与 comment-preserving store | `mod.rs`, `modes.rs`, `theme.rs`, `store.rs` |
+| `src/app/runtime/` | 应用私有 Engine、运行计划、命令执行及少量有状态协作者 | `mod.rs`, `plan.rs`, `command_executor.rs`, `overlay_coordinator.rs` |
+| `src/modes/` | 五个内置 Mode 状态机；UI Hint 私有算法位于 `hint/` | `normal.rs`, `grid.rs`, `recursive_grid.rs`, `hint.rs`, `hint/` |
 | `src/plugins/` | 使用公共 API 实现的内置插件示例 | `builtin/screen_selector.rs` |
-| `src/update.rs` | 用户主动触发的 GitHub Release 查询和 SemVer 比较 | `check_async` |
-| `src/platform/common/` | 两端共享的 mailbox、partial batcher 与 spatial index | `scan_mailbox.rs`, `partial_batcher.rs` |
-| `src/platform/windows/` | Win32/COM/UIA/GDI/DWM 后端 | `platform/windows.rs` 组合所有子模块 |
-| `src/platform/macos/` | AppKit/CGEventTap/AX/Vision/Core Graphics 后端 | `platform/macos.rs` 组合所有子模块 |
+| `src/platform/common/` | 两端共享的 updater、app info、mailbox、batcher 和 spatial index | `mod.rs` |
+| `src/support/` | 日志、worker、错误聚合和性能探针 | `mod.rs` |
+| `src/platform/windows/` | Win32/COM/UIA/GDI/DWM 后端 | `mod.rs` 组合所有子模块 |
+| `src/platform/macos/` | AppKit/CGEventTap/AX/Vision/Core Graphics 后端 | `mod.rs` 组合所有子模块 |
 | `src/platform/unsupported.rs` | 非 Windows/macOS 的可编译占位后端 | 用于检查公共层可移植性 |
 
 ## 程序入口
 
 - `src/main.rs`：Windows 使用 GUI subsystem；只调用 `app::prepare_console_for_cli()` 和
   `app::run_cli()`。
-- `src/lib.rs`：只公开规范化模块路径，不保留 `engine`、`hints` 根级兼容别名。
+- `src/lib.rs`：单 crate 模块入口；KeySteer 的兼容目标是二进制行为而非 Rust 库 ABI/API。
+- `src/tests/`：crate 内部的跨模块集成测试与 feature-gated 性能预算。
 - `src/app/bootstrap.rs`：加载配置、创建 backend/engine、注册内置模式和插件、进入事件循环。
-- `src/platform.rs`：唯一的目标平台选择点。
+- `src/platform/mod.rs`：唯一的目标平台选择点。
 - `src/platform/common/partial_batcher.rs` / `scan_mailbox.rs`：两端共用的纯计数流式批次与
   generation-aware latest-only 扫描邮箱。
 - `src/platform/macos/latest_point_mailbox.rs`：macOS EventTap 使用的无锁 latest-point
@@ -56,10 +55,11 @@ keysteer/
 | `binding.rs` | TOML 右侧动作的 `Binding` 枚举、解析、canonical 输出、序列 |
 | `command.rs` | `Command`、`ModeEvent`、`Mode`、扫描请求/结果、`HostContext` |
 | `input.rs` | `Key`、`KeyChord`、`InputEvent`、`ModeId`、平台中立别名 |
-| `settings.rs` | `HostContext` 使用的显式不可变 `RuntimeSettings` 边界 |
 | `geometry.rs` | `Point`、`Rect`、`Screen`、`UiTarget` |
 | `overlay.rs` | RGBA `Color`、标签/形状、光标标记、模式徽章、`OverlayScene` |
 | `plugin.rs` | 插件 `Manifest` 和 `Plugin: Mode` |
+| `lifecycle.rs` | targeting 生命周期动作 |
+| `style.rs` | Mode/overlay 共用的运行期 UI style 与 indicator 设置 |
 | `autostart.rs` | 跨平台开机启动 trait |
 | `theme.rs` | 已解析的运行时 `Palette` |
 

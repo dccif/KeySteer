@@ -65,7 +65,7 @@ owner 的 quarantine，本进程后续禁用视觉扫描，不能阻塞 Engine �
 
 1. 启动 scan 时清空上一轮目标、标签、搜索和完成态。
 2. 每个 Partial 立即 append，按矩形/名称/role 空间 key 去重。
-3. 使用 `modes/hint/labeling` 给当前候选重新分配标签并 redraw。
+3. 使用 `modes::hint::labeling` 给当前候选重新分配标签并 redraw。
 4. 搜索模式只过滤已扫描目标，不重新遍历平台树。
 5. 完整标签选中后保存 target、warp pointer、建立 finished 状态。
 6. 只有 `Success`/`TimedOut` 且没有出现标签时才按 `scan_retry_count`/delay 重试；每次预算递增，单次最多 30s。`ContextChanged`、焦点变化和显示器变化清空旧 Hint 并立即创建新 generation，不消耗失败重试次数。

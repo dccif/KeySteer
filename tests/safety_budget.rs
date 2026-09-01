@@ -23,7 +23,7 @@ const PER_FILE_BUDGET: &[(&str, usize)] = &[
     ("src/platform/windows/overlay.rs", 9),
     ("src/platform/windows/screens.rs", 5),
     ("src/platform/windows/status_item.rs", 14),
-    ("src/platform/windows/native.rs", 78),
+    ("src/platform/windows/native/mod.rs", 78),
 ];
 
 fn rust_files(directory: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
@@ -134,9 +134,7 @@ fn unsafe_surface_does_not_regress() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn portable_layers_are_safe_rust() -> Result<(), Box<dyn std::error::Error>> {
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    for relative in [
-        "api", "app", "config", "modes", "plugins", "runtime", "support",
-    ] {
+    for relative in ["api", "app", "config", "modes", "plugins", "support"] {
         let mut files = Vec::new();
         rust_files(&source_root.join(relative), &mut files)?;
         for path in files {

@@ -15,7 +15,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const LOG_FILE: &str = "keysteer.log";
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 const RETAINED_LOGS: usize = 3;
 
@@ -185,12 +184,12 @@ impl Logger {
 ///
 /// Startup treats failure as non-fatal: a read-only program directory should
 /// disable logging, not prevent the tray application from running.
-pub fn init(preferred_path: Option<PathBuf>) -> Result<&'static Path, String> {
+pub fn init(candidate_paths: impl IntoIterator<Item = PathBuf>) -> Result<&'static Path, String> {
     if let Some(logger) = LOGGER.get() {
         return Ok(&logger.path);
     }
     let mut failures = Vec::new();
-    for path in candidate_paths(preferred_path) {
+    for path in candidate_paths {
         match Logger::open(path.clone()) {
             Ok(logger) => {
                 if LOGGER.set(logger).is_ok() {
@@ -440,15 +439,6 @@ fn log_args(level: Level, target: &str, message: fmt::Arguments<'_>) {
     }
 }
 
-fn candidate_paths(preferred_path: Option<PathBuf>) -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = preferred_path.into_iter().collect();
-    let fallback = std::env::temp_dir().join("KeySteer").join(LOG_FILE);
-    if !paths.contains(&fallback) {
-        paths.push(fallback);
-    }
-    paths
-}
-
 fn open_append(path: &Path) -> io::Result<File> {
     OpenOptions::new().create(true).append(true).open(path)
 }
@@ -558,17 +548,6 @@ mod tests {
         assert_eq!(
             rotated_path(path, 2),
             PathBuf::from("diagnostics/keysteer.log.2")
-        );
-    }
-
-    #[test]
-    fn application_data_directory_is_preferred_over_the_emergency_fallback() {
-        let expected = PathBuf::from("application-data").join(LOG_FILE);
-        let paths = candidate_paths(Some(expected.clone()));
-        assert_eq!(paths.first(), Some(&expected));
-        assert_eq!(
-            paths.last(),
-            Some(&std::env::temp_dir().join("KeySteer").join(LOG_FILE))
         );
     }
 

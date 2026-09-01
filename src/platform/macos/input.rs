@@ -18,7 +18,7 @@ use objc2_core_graphics::{
 use crate::api::command::{ButtonAction, MouseButton};
 use crate::api::geometry::Point;
 use crate::api::input::{Key, KeyState};
-use crate::platform::macos::multi_click::ClickTracker;
+use crate::platform::multi_click::ClickTracker;
 
 /// Tags our synthetic events so the tap can ignore them. Any value works as
 /// long as it is unlikely to collide with another tool's.

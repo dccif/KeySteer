@@ -1,4 +1,3 @@
-use std::alloc::System;
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,13 +9,10 @@ use keysteer::api::{
 use keysteer::api::{Key, ModeEvent, Point};
 use keysteer::config::Config;
 use keysteer::modes::hint::labeling::assign_into;
-use keysteer::modes::normal::NormalMode;
-use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
-
-#[global_allocator]
-static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
+use stats_alloc::Region;
 
 #[test]
+#[ignore = "run alone with --test-threads=1 so other tests cannot pollute allocator counts"]
 fn steady_normal_frames_do_not_allocate() {
     let config = Config::default();
     let palette = config.palette(Appearance::Dark);
@@ -25,9 +21,8 @@ fn steady_normal_frames_do_not_allocate() {
         cursor: Point::default(),
         focused_app: None,
         palette: &palette,
-        settings: &config,
     };
-    let mut mode = NormalMode::new(&config);
+    let mut mode = keysteer::app::mode_catalog::normal(&config);
     let key = Key::new("l").unwrap();
     let _ = mode.handle(
         &ModeEvent::Binding {
@@ -47,7 +42,7 @@ fn steady_normal_frames_do_not_allocate() {
         &context,
     );
 
-    let region = Region::new(GLOBAL);
+    let region = Region::new(keysteer::TEST_ALLOCATOR);
     for _ in 0..10_000 {
         black_box(mode.handle(
             &ModeEvent::Frame {
@@ -68,7 +63,7 @@ fn steady_normal_frames_do_not_allocate() {
 }
 
 fn inline_command_batches_do_not_allocate() {
-    let region = Region::new(GLOBAL);
+    let region = Region::new(keysteer::TEST_ALLOCATOR);
     for _ in 0..10_000 {
         let mut batch = CommandBatch::new();
         batch.push(Command::HideOverlay);
@@ -107,7 +102,7 @@ fn warmed_hint_assignment_reuses_two_thousand_labels() {
         "valid hint alphabet must assign"
     );
 
-    let region = Region::new(GLOBAL);
+    let region = Region::new(keysteer::TEST_ALLOCATOR);
     for _ in 0..100 {
         assert!(
             assign_into(

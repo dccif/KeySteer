@@ -10,8 +10,8 @@ use keysteer::api::{
     Appearance, Binding, Command, Direction, HostContext, KeyChord, Mode, ModeEvent, ModeId, Point,
     Rect, Screen, UiScanStrategy,
 };
+use keysteer::app::runtime::Engine;
 use keysteer::config::{Config, LifecycleAction, TargetingLifecycle};
-use keysteer::{modes, plugins, runtime::Engine};
 
 fn screens() -> Vec<Screen> {
     vec![Screen {
@@ -24,12 +24,12 @@ fn screens() -> Vec<Screen> {
 }
 
 fn shipped() -> Config {
-    Config::parse(include_str!("../keysteer.default.toml"))
+    Config::parse(include_str!("../../keysteer.default.toml"))
         .expect("keysteer.default.toml should parse")
 }
 
 fn shipped_document() -> toml::Value {
-    toml::from_str(include_str!("../keysteer.default.toml"))
+    toml::from_str(include_str!("../../keysteer.default.toml"))
         .expect("keysteer.default.toml should be valid TOML")
 }
 
@@ -79,7 +79,7 @@ fn the_shipped_targeting_lifecycles_are_explicit() {
 
 #[test]
 fn the_macos_bridge_does_not_require_clang_availability_runtime() {
-    let bridge = include_str!("../src/platform/macos/vision_bridge.m");
+    let bridge = include_str!("../../src/platform/macos/vision_bridge.m");
     assert!(
         !bridge.contains("if (@available"),
         "@available introduces __isPlatformVersionAtLeast, which Rust's -nodefaultlibs link omits"
@@ -88,8 +88,8 @@ fn the_macos_bridge_does_not_require_clang_availability_runtime() {
 
 #[test]
 fn macos_autostart_registers_the_keysteer_bundle_instead_of_open() {
-    let bridge = include_str!("../src/platform/macos/autostart_bridge.m");
-    let rust = include_str!("../src/platform/macos/autostart.rs");
+    let bridge = include_str!("../../src/platform/macos/autostart_bridge.m");
+    let rust = include_str!("../../src/platform/macos/autostart.rs");
     assert!(bridge.contains("SMAppService.mainAppService"));
     assert!(bridge.contains("registerAndReturnError"));
     assert!(!rust.contains("<string>/usr/bin/open</string>"));
@@ -99,12 +99,12 @@ fn macos_autostart_registers_the_keysteer_bundle_instead_of_open() {
 
 #[test]
 fn macos_top_status_item_stays_inside_the_backend() {
-    let status_item = include_str!("../src/platform/macos/status_item.rs");
-    let backend = include_str!("../src/platform/macos.rs");
-    let bootstrap = include_str!("../src/app/bootstrap.rs");
-    let runtime = include_str!("../src/runtime.rs");
-    let workspace = include_str!("../src/platform/macos/workspace.rs");
-    let build = include_str!("../build.rs");
+    let status_item = include_str!("../../src/platform/macos/status_item.rs");
+    let backend = include_str!("../../src/platform/macos/mod.rs");
+    let bootstrap = include_str!("../../src/app/bootstrap.rs");
+    let runtime = include_str!("../../src/app/runtime/mod.rs");
+    let workspace = include_str!("../../src/platform/macos/workspace.rs");
+    let build = include_str!("../../build.rs");
 
     assert!(bootstrap.contains("platform::backend_for_ui_scan"));
     assert!(bootstrap.contains("engine.run(backend.as_mut())"));
@@ -172,7 +172,7 @@ fn macos_top_status_item_stays_inside_the_backend() {
 
 #[test]
 fn macos_shutdown_releases_input_before_waiting_for_workers() {
-    let backend = include_str!("../src/platform/macos.rs");
+    let backend = include_str!("../../src/platform/macos/mod.rs");
     let shutdown = backend
         .split_once("fn shutdown_resources(&mut self)")
         .map(|(_, body)| body)
@@ -196,7 +196,7 @@ fn macos_shutdown_releases_input_before_waiting_for_workers() {
 
 #[test]
 fn macos_tcc_fail_open_adds_no_per_event_stop_poll() {
-    let hook = include_str!("../src/platform/macos/hook.rs");
+    let hook = include_str!("../../src/platform/macos/hook.rs");
     let callback = hook
         .split_once("fn handle_event(")
         .map(|(_, tail)| tail)
@@ -313,7 +313,7 @@ fn the_shipped_targeting_modes_bind_primary_q_to_normal() {
 #[test]
 fn the_shipped_config_uses_no_action_prefix() {
     // The whole point of the binding vocabulary: verbs stand alone.
-    let text = include_str!("../keysteer.default.toml");
+    let text = include_str!("../../keysteer.default.toml");
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with('#') {
@@ -328,13 +328,16 @@ fn the_shipped_config_uses_no_action_prefix() {
 
 #[test]
 fn defaults_and_shipped_config_agree_on_mode_availability() {
-    let ids: Vec<ModeId> = modes::built_in(&shipped()).iter().map(|m| m.id()).collect();
+    let ids: Vec<ModeId> = keysteer::app::mode_catalog::built_in(&shipped())
+        .iter()
+        .map(|m| m.id())
+        .collect();
     assert_eq!(ids.len(), 5, "expected all five modes: {ids:?}");
 }
 
 #[test]
 fn idle_and_default_normal_let_unbound_keys_reach_the_focused_app() {
-    for mode in modes::built_in(&Config::default()) {
+    for mode in keysteer::app::mode_catalog::built_in(&Config::default()) {
         let expected = !matches!(mode.id().as_str(), "idle" | "normal");
         assert_eq!(
             mode.captures_keyboard(),
@@ -349,10 +352,10 @@ fn idle_and_default_normal_let_unbound_keys_reach_the_focused_app() {
 fn plugins_register_through_the_same_path_as_built_ins() {
     let config = Config::default();
     let mut engine = Engine::new(config.clone(), Appearance::Dark);
-    for mode in modes::built_in(&config) {
+    for mode in keysteer::app::mode_catalog::built_in(&config) {
         engine.register(mode);
     }
-    for plugin in plugins::bundled(&config).unwrap() {
+    for plugin in keysteer::app::mode_catalog::bundled_plugins(&config).unwrap() {
         engine.register_plugin_dyn(plugin).unwrap();
     }
 
@@ -370,10 +373,10 @@ fn a_plugin_chord_is_bound_in_normal_like_any_other_mode() {
     // A plugin's suggested chord must land in the table the user works in.
     let config = Config::default();
     let mut engine = Engine::new(config.clone(), Appearance::Dark);
-    for mode in modes::built_in(&config) {
+    for mode in keysteer::app::mode_catalog::built_in(&config) {
         engine.register(mode);
     }
-    for plugin in plugins::bundled(&config).unwrap() {
+    for plugin in keysteer::app::mode_catalog::bundled_plugins(&config).unwrap() {
         engine.register_plugin_dyn(plugin).unwrap();
     }
 
@@ -400,10 +403,10 @@ fn a_users_binding_beats_a_plugins_suggestion() {
         .insert("alt+s".into(), Binding::parse("move_left").unwrap());
 
     let mut engine = Engine::new(config.clone(), Appearance::Dark);
-    for mode in modes::built_in(&config) {
+    for mode in keysteer::app::mode_catalog::built_in(&config) {
         engine.register(mode);
     }
-    for plugin in plugins::bundled(&config).unwrap() {
+    for plugin in keysteer::app::mode_catalog::bundled_plugins(&config).unwrap() {
         engine.register_plugin_dyn(plugin).unwrap();
     }
 
@@ -422,7 +425,7 @@ fn every_targeting_mode_returns_to_idle_on_escape() {
     let screens = screens();
     let palette = config.palette(Appearance::Dark);
 
-    for mut mode in modes::built_in(&config) {
+    for mut mode in keysteer::app::mode_catalog::built_in(&config) {
         // idle has nowhere to go; normal's escape is the engine's job.
         if mode.id() == ModeId::idle() || mode.id() == ModeId::normal() {
             continue;
@@ -432,7 +435,6 @@ fn every_targeting_mode_returns_to_idle_on_escape() {
             cursor: Point::new(960.0, 540.0),
             focused_app: None,
             palette: &palette,
-            settings: &config,
         };
 
         mode.handle(&ModeEvent::Activated { previous: None }, &ctx);
@@ -462,10 +464,9 @@ fn a_grid_overlay_covers_the_active_screen_at_any_scale() {
         cursor: Point::new(960.0, 540.0),
         focused_app: None,
         palette: &palette,
-        settings: &config,
     };
 
-    let mut grid = modes::GridMode::new(&config);
+    let mut grid = keysteer::app::mode_catalog::grid(&config);
     let out = grid.handle(&ModeEvent::Activated { previous: None }, &ctx);
 
     let scene = out
@@ -523,9 +524,9 @@ fn every_mode_has_a_binding_table_including_plugins() {
 
 #[test]
 fn windows_visual_capture_keeps_one_barrier_and_an_unscaled_copy_path() {
-    let gpu = include_str!("../src/platform/windows/gpu_overlay.rs");
-    let worker = include_str!("../src/platform/windows/overlay_worker.rs");
-    let native = include_str!("../src/platform/windows/native.rs");
+    let gpu = include_str!("../../src/platform/windows/gpu_overlay.rs");
+    let worker = include_str!("../../src/platform/windows/overlay_worker.rs");
+    let native = include_str!("../../src/platform/windows/native/mod.rs");
 
     assert!(
         !gpu.contains("WaitForCommitCompletion"),

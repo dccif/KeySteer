@@ -13,11 +13,50 @@ use crate::api::binding::Binding;
 use crate::api::command::{Command, CommandBatch, FinishCause, HostContext, Mode, ModeEvent};
 use crate::api::geometry::{Point, Rect};
 use crate::api::input::{Key, KeyState, ModeId};
+use crate::api::lifecycle::TargetingLifecycle;
 use crate::api::overlay::{Color, LabelStyle, OverlayLabel, OverlayScene, OverlayShape};
-use crate::config::{Config, GridLayer, Palette, RecursiveGridUi, TargetingLifecycle};
+use crate::api::style::LabelUi;
+use crate::api::theme::{Palette, ThemedColor};
 use smallvec::SmallVec;
 
-use super::targeting::TargetingSession;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerSettings {
+    pub depth: u32,
+    pub grid_cols: Option<u32>,
+    pub grid_rows: Option<u32>,
+    pub keys: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VisualSettings {
+    pub label: LabelUi,
+    pub line_width: i32,
+    pub line_color: Option<ThemedColor>,
+    pub highlight_color: Option<ThemedColor>,
+    pub label_background: bool,
+    pub label_background_color: Option<ThemedColor>,
+    pub label_char: String,
+    pub label_min_font_size: i32,
+    pub label_autohide_multiplier: f64,
+    pub sub_key_preview: bool,
+    pub sub_key_preview_font_size: i32,
+    pub sub_key_preview_text_color: Option<ThemedColor>,
+    pub sub_key_preview_autohide_multiplier: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Settings {
+    pub grid_cols: u32,
+    pub grid_rows: u32,
+    pub keys: String,
+    pub min_size_width: u32,
+    pub min_size_height: u32,
+    pub max_depth: u32,
+    pub cursor_follow_selection: bool,
+    pub lifecycle: TargetingLifecycle,
+    pub layers: Vec<LayerSettings>,
+    pub ui: VisualSettings,
+}
 
 /// Grid shape at one depth.
 #[derive(Debug, Clone, PartialEq)]
@@ -35,7 +74,7 @@ pub struct RecursiveGridMode {
     max_depth: u32,
     default_cursor_follow_selection: bool,
     cursor_follow_selection: bool,
-    ui: RecursiveGridUi,
+    ui: VisualSettings,
 
     /// Areas from the root down to the current one; `stack[0]` is the root.
     stack: SmallVec<[Rect; 12]>,
@@ -43,31 +82,35 @@ pub struct RecursiveGridMode {
     path: SmallVec<[usize; 12]>,
     /// A leaf has been selected and the session is ready to finish.
     terminal: bool,
-    session: TargetingSession,
+    finished: bool,
     lifecycle: TargetingLifecycle,
+    return_mode: ModeId,
 }
 
 impl RecursiveGridMode {
-    pub fn new(config: &Config) -> Self {
-        let rg = &config.recursive_grid;
-        let max_depth = rg.max_depth.max(1);
+    pub fn new(settings: Settings) -> Self {
+        let max_depth = settings.max_depth.max(1);
         let base = Layout {
-            rows: rg.grid_rows.max(1) as usize,
-            cols: rg.grid_cols.max(1) as usize,
-            keys: rg.keys.chars().collect(),
+            rows: settings.grid_rows.max(1) as usize,
+            cols: settings.grid_cols.max(1) as usize,
+            keys: settings.keys.chars().collect(),
         };
         Self {
-            layouts: compile_layouts(&base, &rg.layers, max_depth),
-            min_size: (rg.min_size_width as f64, rg.min_size_height as f64),
+            layouts: compile_layouts(&base, &settings.layers, max_depth),
+            min_size: (
+                settings.min_size_width as f64,
+                settings.min_size_height as f64,
+            ),
             max_depth,
-            default_cursor_follow_selection: rg.cursor_follow_selection,
-            cursor_follow_selection: rg.cursor_follow_selection,
-            ui: rg.ui.clone(),
+            default_cursor_follow_selection: settings.cursor_follow_selection,
+            cursor_follow_selection: settings.cursor_follow_selection,
+            ui: settings.ui,
             stack: SmallVec::new(),
             path: SmallVec::new(),
             terminal: false,
-            session: TargetingSession::default(),
-            lifecycle: rg.lifecycle.clone(),
+            finished: false,
+            lifecycle: settings.lifecycle,
+            return_mode: ModeId::idle(),
         }
     }
 
@@ -144,7 +187,7 @@ impl RecursiveGridMode {
             return OverlayScene::new();
         };
         let appearance = palette.appearance;
-        let resolve = crate::config::style::resolve;
+        let resolve = crate::api::style::resolve;
 
         let line_color = resolve(self.ui.line_color.as_ref(), appearance, palette.accent);
         let highlight = resolve(
@@ -345,7 +388,7 @@ impl RecursiveGridMode {
     fn cancel(&self) -> CommandBatch {
         CommandBatch::two(
             Command::HideOverlay,
-            Command::SwitchMode(self.session.return_mode.clone()),
+            Command::SwitchMode(self.return_mode.clone()),
         )
     }
 
@@ -366,7 +409,7 @@ impl RecursiveGridMode {
         self.stack.push(bounds);
         self.path.clear();
         self.terminal = false;
-        self.session.restart();
+        self.finished = false;
         self.cursor_follow_selection = self.default_cursor_follow_selection;
     }
 
@@ -376,7 +419,7 @@ impl RecursiveGridMode {
         } else {
             SmallVec::new()
         };
-        let was_finished = preserve && self.session.finished;
+        let was_finished = preserve && self.finished;
         let follow = self.cursor_follow_selection;
         self.reset(bounds);
         if preserve {
@@ -393,7 +436,7 @@ impl RecursiveGridMode {
                 self.path.push(index);
             }
             self.terminal = self.depth() >= self.max_depth || !self.can_descend();
-            self.session.finished = was_finished;
+            self.finished = was_finished;
         }
         let mut commands =
             CommandBatch::one(Command::warp_to(self.current().unwrap_or(bounds).center()));
@@ -437,7 +480,7 @@ impl RecursiveGridMode {
                 self.stack.pop();
                 self.path.pop();
                 self.terminal = false;
-                self.session.restart();
+                self.finished = false;
                 return self.redraw(ctx.palette);
             }
             "space" => {
@@ -447,7 +490,7 @@ impl RecursiveGridMode {
             _ => {}
         }
 
-        if self.terminal || self.session.finished {
+        if self.terminal || self.finished {
             return CommandBatch::new();
         }
         let Some(ch) = key.as_char() else {
@@ -467,7 +510,7 @@ impl RecursiveGridMode {
     }
 }
 
-fn compile_layouts(base: &Layout, layers: &[GridLayer], max_depth: u32) -> Vec<Layout> {
+fn compile_layouts(base: &Layout, layers: &[LayerSettings], max_depth: u32) -> Vec<Layout> {
     (0..=max_depth)
         .map(|depth| {
             let mut layout = base.clone();
@@ -487,7 +530,7 @@ fn compile_layouts(base: &Layout, layers: &[GridLayer], max_depth: u32) -> Vec<L
         .collect()
 }
 
-impl RecursiveGridUi {
+impl VisualSettings {
     fn sub_key_preview_label_char(&self) -> &str {
         &self.label_char
     }
@@ -502,6 +545,14 @@ impl Mode for RecursiveGridMode {
         "Recursive Grid".into()
     }
 
+    fn claims_key(&self, key: &Key) -> bool {
+        key.as_char().is_some_and(|character| {
+            self.layouts
+                .iter()
+                .any(|layout| layout.keys.contains(&character))
+        })
+    }
+
     fn indicator_color(&self, palette: &Palette) -> Option<Color> {
         Some(palette.accent_alt)
     }
@@ -509,7 +560,7 @@ impl Mode for RecursiveGridMode {
     fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
         match event {
             ModeEvent::Activated { previous } => {
-                self.session.activate(previous.as_ref());
+                self.return_mode = previous.clone().unwrap_or_else(ModeId::idle);
                 self.reset(ctx.active_bounds());
                 self.redraw(ctx.palette)
             }
@@ -517,19 +568,24 @@ impl Mode for RecursiveGridMode {
                 self.reset(ctx.active_bounds());
                 self.redraw(ctx.palette)
             }
-            ModeEvent::FinishRequested { .. } if self.session.finished => CommandBatch::new(),
+            ModeEvent::FinishRequested { .. } if self.finished => CommandBatch::new(),
             ModeEvent::FinishRequested { .. } => {
-                self.session.finish();
+                self.finished = true;
                 let mut commands = self.redraw(ctx.palette);
-                commands.extend(self.session.commands(&self.lifecycle.after_finish));
+                commands.extend(super::targeting::lifecycle_commands(
+                    &self.lifecycle.after_finish,
+                    &self.return_mode,
+                ));
                 commands
             }
-            ModeEvent::Clicked { .. } => self.session.commands(&self.lifecycle.after_click),
+            ModeEvent::Clicked { .. } => {
+                super::targeting::lifecycle_commands(&self.lifecycle.after_click, &self.return_mode)
+            }
             ModeEvent::Deactivated => {
                 self.stack.clear();
                 self.path.clear();
                 self.terminal = false;
-                self.session.restart();
+                self.finished = false;
                 CommandBatch::new()
             }
             ModeEvent::ScreensChanged(_) => {
@@ -546,13 +602,6 @@ impl Mode for RecursiveGridMode {
                 self.redraw(ctx.palette)
             }
             ModeEvent::Resumed => self.redraw(ctx.palette),
-            ModeEvent::SettingsChanged => {
-                let session = self.session.clone();
-                *self = Self::new(ctx.settings);
-                self.session = session;
-                self.reset(ctx.active_bounds());
-                self.redraw(ctx.palette)
-            }
             ModeEvent::Binding {
                 binding,
                 state: KeyState::Down,
@@ -574,6 +623,7 @@ impl Mode for RecursiveGridMode {
 mod tests {
     use super::*;
     use crate::api::geometry::Screen;
+    use crate::config::{Config, GridLayer};
 
     struct Env {
         screens: Vec<Screen>,
@@ -615,7 +665,6 @@ mod tests {
                 cursor: self.cursor,
                 focused_app: None,
                 palette: &self.palette,
-                settings: &self.config,
             }
         }
     }
@@ -665,7 +714,7 @@ mod tests {
     #[test]
     fn product_defaults_keep_the_three_by_three_recursive_grid_with_follow_enabled() {
         let env = Env::with(Config::default());
-        let mut mode = RecursiveGridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::recursive_grid(&env.config);
         let out = activate(&mut mode, &env);
         assert_eq!(scene_of(&out).labels.len(), 9);
         assert!(mode.cursor_follow_selection);
@@ -682,7 +731,7 @@ mod tests {
     #[test]
     fn enabling_follow_immediately_warps_to_the_current_recursive_cell_centre() {
         let env = Env::new();
-        let mut mode = RecursiveGridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::recursive_grid(&env.config);
         activate(&mut mode, &env);
         toggle_follow(&mut mode, &env);
         press(&mut mode, &env, "g");
@@ -707,7 +756,7 @@ mod tests {
     #[test]
     fn activation_starts_at_the_full_screen() {
         let env = Env::new();
-        let mut mode = RecursiveGridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::recursive_grid(&env.config);
         activate(&mut mode, &env);
         assert_eq!(mode.current(), Some(env.screens[0].bounds));
         assert_eq!(mode.depth(), 0);
@@ -716,7 +765,7 @@ mod tests {
     #[test]
     fn default_grid_is_three_by_three_with_nine_keys() {
         let env = Env::new();
-        let mut mode = RecursiveGridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::recursive_grid(&env.config);
         activate(&mut mode, &env);
         assert_eq!(mode.cells().len(), 9);
     }
@@ -724,7 +773,7 @@ mod tests {
     #[test]
     fn selecting_a_cell_narrows_the_area() {
         let env = Env::new();
-        let mut mode = RecursiveGridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::recursive_grid(&env.config);
         activate(&mut mode, &env);
 
         // "rtyfghvbn": 'g' is index 4, the centre cell of a 3x3 grid.
@@ -738,7 +787,7 @@ mod tests {
     #[test]
     fn each_level_multiplies_precision() {
         let env = Env::new();
-        let mut mode = RecursiveGridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::recursive_grid(&env.config);
         activate(&mut mode, &env);
         press(&mut mode, &env, "r"); // top-left
         assert_eq!(mode.current(), Some(Rect::new(0.0, 0.0, 300.0, 300.0)));
@@ -750,7 +799,7 @@ mod tests {
     #[test]
     fn screen_retarget_replays_or_resets_each_recursive_layer() {
         let env = Env::new();
-        let mut mode = RecursiveGridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::recursive_grid(&env.config);
         activate(&mut mode, &env);
         press(&mut mode, &env, "t");
         press(&mut mode, &env, "g");
@@ -790,7 +839,7 @@ mod tests {
     #[test]
     fn backspace_widens_and_then_dismisses_at_the_root() {
         let env = Env::new();
-        let mut mode = RecursiveGridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::recursive_grid(&env.config);
         activate(&mut mode, &env);
         press(&mut mode, &env, "g");
         assert_eq!(mode.depth(), 1);
@@ -805,7 +854,7 @@ mod tests {
     #[test]
     fn space_resets_to_the_root() {
         let env = Env::new();
-        let mut mode = RecursiveGridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::recursive_grid(&env.config);
         activate(&mut mode, &env);
         press(&mut mode, &env, "g");
         press(&mut mode, &env, "g");
@@ -819,7 +868,7 @@ mod tests {
     #[test]
     fn enter_moves_to_the_centre_without_clicking() {
         let env = Env::new();
-        let mut mode = RecursiveGridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::recursive_grid(&env.config);
         activate(&mut mode, &env);
         press(&mut mode, &env, "g");
 
@@ -844,7 +893,7 @@ mod tests {
         let mut config = legacy_config();
         config.recursive_grid.max_depth = 1;
         let env = Env::with(config);
-        let mut mode = RecursiveGridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::recursive_grid(&env.config);
         activate(&mut mode, &env);
 
         let out = press(&mut mode, &env, "g");
@@ -859,7 +908,7 @@ mod tests {
         config.recursive_grid.min_size_width = 200;
         config.recursive_grid.min_size_height = 200;
         let env = Env::with(config);
-        let mut mode = RecursiveGridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::recursive_grid(&env.config);
         activate(&mut mode, &env);
 
         // The selected 300×300 cell cannot produce another 3×3 layer whose
@@ -880,7 +929,7 @@ mod tests {
             keys: Some("crtn".into()),
         }];
         let env = Env::with(config);
-        let mut mode = RecursiveGridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::recursive_grid(&env.config);
         activate(&mut mode, &env);
 
         assert_eq!(mode.cells().len(), 4);
@@ -893,7 +942,7 @@ mod tests {
     #[test]
     fn unknown_keys_are_ignored() {
         let env = Env::new();
-        let mut mode = RecursiveGridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::recursive_grid(&env.config);
         activate(&mut mode, &env);
         let out = press(&mut mode, &env, "z");
         assert!(out.is_empty(), "{out:?}");
@@ -905,7 +954,7 @@ mod tests {
         let mut config = legacy_config();
         config.recursive_grid.ui.label_char = "\u{B7}".into();
         let env = Env::with(config);
-        let mut mode = RecursiveGridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::recursive_grid(&env.config);
         let out = activate(&mut mode, &env);
 
         let scene = scene_of(&out);
@@ -918,7 +967,7 @@ mod tests {
         let mut config = legacy_config();
         config.recursive_grid.ui.sub_key_preview = true;
         let env = Env::with(config);
-        let mut mode = RecursiveGridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::recursive_grid(&env.config);
         let out = activate(&mut mode, &env);
 
         let scene = scene_of(&out);
@@ -937,7 +986,7 @@ mod tests {
             scale: 2.0,
             name: None,
         });
-        let mut mode = RecursiveGridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::recursive_grid(&env.config);
         activate(&mut mode, &env);
         press(&mut mode, &env, "g");
         assert_eq!(mode.depth(), 1);
@@ -956,7 +1005,7 @@ mod tests {
         config.recursive_grid.ui.label.font_size = 20;
         config.recursive_grid.ui.label_min_font_size = 6;
         let env = Env::with(config);
-        let mut mode = RecursiveGridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::recursive_grid(&env.config);
         let initial = activate(&mut mode, &env);
         let initial_font = scene_of(&initial).labels[0].style.font_size;
 
@@ -973,7 +1022,7 @@ mod tests {
     #[test]
     fn labels_autohide_once_fitting_would_make_them_too_small() {
         let env = Env::new();
-        let mut mode = RecursiveGridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::recursive_grid(&env.config);
         activate(&mut mode, &env);
         press(&mut mode, &env, "g");
         press(&mut mode, &env, "g");
@@ -987,7 +1036,7 @@ mod tests {
     #[test]
     fn scene_draws_interior_rulings() {
         let env = Env::new();
-        let mut mode = RecursiveGridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::recursive_grid(&env.config);
         let out = activate(&mut mode, &env);
         let lines = scene_of(&out)
             .shapes
@@ -1001,7 +1050,7 @@ mod tests {
     #[test]
     fn click_keeps_the_recursive_grid_live_for_further_subdivision() {
         let env = Env::new();
-        let mut mode = RecursiveGridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::recursive_grid(&env.config);
         activate(&mut mode, &env);
         press(&mut mode, &env, "g");
         let selected = mode.current();
@@ -1014,11 +1063,11 @@ mod tests {
             &env.ctx(),
         );
         assert!(clicked.is_empty());
-        assert!(!mode.session.finished);
+        assert!(!mode.finished);
         assert_eq!(mode.current(), selected);
 
         let continued = press(&mut mode, &env, "g");
-        assert!(!mode.session.finished);
+        assert!(!mode.finished);
         assert_eq!(mode.depth(), 2);
         assert!(
             continued
@@ -1030,7 +1079,7 @@ mod tests {
     #[test]
     fn restart_resets_the_session_but_preserves_its_return_mode() {
         let env = Env::new();
-        let mut mode = RecursiveGridMode::new(&env.config);
+        let mut mode = crate::app::mode_catalog::recursive_grid(&env.config);
         mode.handle(
             &ModeEvent::Activated {
                 previous: Some(ModeId::normal()),
@@ -1041,7 +1090,7 @@ mod tests {
         mode.handle(&ModeEvent::Restarted, &env.ctx());
 
         assert_eq!(mode.depth(), 0);
-        assert!(!mode.session.finished);
-        assert_eq!(mode.session.return_mode, ModeId::normal());
+        assert!(!mode.finished);
+        assert_eq!(mode.return_mode, ModeId::normal());
     }
 }

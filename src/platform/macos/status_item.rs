@@ -74,7 +74,7 @@ define_class!(
                 self.mtm(),
                 self,
                 "About KeySteer",
-                &crate::about::details(),
+                &crate::platform::common::app_info::details(),
                 None,
             ) {
                 crate::support::logging::report_error("macos-about", error);

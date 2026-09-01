@@ -2,7 +2,7 @@
 
 ## 配置模型
 
-根类型是 `src/config.rs::Config`。所有主要 section 都有默认值，因此空配置或没有
+根类型是 `src/config/mod.rs::ConfigFile`（`Config` 暂为内部迁移别名）。所有主要 section 都有默认值，因此空配置或没有
 配置合法。根类型和大多数结构使用 `deny_unknown_fields`，拼错字段应在加载时明确失败，
 不能静默忽略。
 
@@ -38,7 +38,7 @@ Mode 的 cursor override 可单独覆盖这些值。普通反馈由物理按键�
 
 ## 加载与发现
 
-`app::config_repository::discover()` 在应用数据目录中优先查找按名称排序的非 default
+`Config::discover()` 在应用数据目录中优先查找按名称排序的非 default
 `keysteer.<任意名称>.toml`；`keysteer.default.toml`（大小写不敏感）只在没有用户 profile
 时作为文件 fallback。显式 `--config` 不参与该排序，仍要求这个文件名格式，但可以接受完整路径：
 
@@ -49,7 +49,7 @@ Mode 的 cursor override 可单独覆盖这些值。普通反馈由物理按键�
 显式加载的路径也会原样交给 `ConfigStore`，因此运行时配置变更会写回同一个文件。
 
 启动时没有使用 `--config` 时，runtime 会保留应用数据目录，并在每次 Reload 时重新执行
-`config_repository::discover_in()`；因此新增、删除、重命名或排序更靠前的配置都能切换当前来源。使用
+`Config::discover_in()`；因此新增、删除、重命名或排序更靠前的配置都能切换当前来源。使用
 `--config` 时来源固定，Reload 只重读该路径。重新发现失败或文件无效时必须保留最后一份
 有效配置；目录中没有配置时则恢复内置默认值，并继续把 `keysteer.user.toml` 作为写入路径。
 
@@ -70,8 +70,6 @@ Mode 的 cursor override 可单独覆盖这些值。普通反馈由物理按键�
 - `primary` 在 macOS 解析为 Command，在 Windows/Linux 解析为 Ctrl。
 - 泛型 modifier 可匹配左右两侧，`left_`/`right_` 只匹配指定侧。
 - `[key_aliases]` 先应用，再由 `[key_aliases.windows|macos|linux]` 覆盖当前平台。
-- alias 编译为显式、不可变的 `KeyNameResolver`；配置解析、运行时 keymap 和 bundled plugin
-  都显式接收它，不使用 thread-local 状态。
 - `"v b" = "fast"` 是多个单键共享动作，加载时展开成 `v` 和 `b` 两条普通绑定；它不是
   按键序列。Chord 内部继续使用 `+`。
 
@@ -141,9 +139,11 @@ after_click = "..."
 `src/config/store.rs::ConfigStore` 使用 `toml_edit` 保留注释：
 
 - 在 clone 文档上应用 dotted-path 修改。
-- 重新 parse + validate 成功后才替换当前文档。
-- 使用同目录临时文件、flush/sync 和原子 replace/rename 写入。
+- 重新 parse + validate，且 `app::configuration` 编译候选计划成功后才提交当前文档。
+- 使用同目录临时文件和由组合根注入的平台原子 replace 写入；`config` 不依赖平台模块。
 - 无效修改不会破坏最后一个有效配置。
 
-Engine 的 `ReloadConfig` 重新读取、校验、更新 palette/keymap，并向 Mode 广播
-`SettingsChanged`。新增可缓存配置时，Mode 必须在这个事件中刷新自己的副本。
+`app::runtime::ConfigurationRepository` 是 Engine 唯一认识的配置端口，具体的 TOML/store/discovery
+适配器在 `app::configuration`。它把完整候选编译成 `RuntimePlan` 后才交给 Engine。无效候选完全无副作用；
+有效候选替换全部 Mode/Plugin 实例、释放合成输入并进入 Idle。Mode 只持有自己的强类型
+Settings，不存在 `ConfigReloaded` 广播。

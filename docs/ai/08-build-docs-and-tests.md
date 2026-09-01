@@ -7,7 +7,7 @@
 - `perf-probe` 是 opt-in feature；正式通用发布默认不启用。启用时热路径只向固定有界队列
   非阻塞写入，文件 I/O 由测试线程执行。mimalloc 在 Windows x64 A/B 中未通过启动 p99
   门禁，未保留依赖或 feature。
-- `.github/workflows/build.yml` 仅手动触发，分别选择构建平台、是否发布以及预发布/正式发布；不运行 fmt、clippy 或测试检查。
+- `.github/workflows/build.yml` 统一承载 CI 与发布且仅手动触发：可选择 Windows/macOS 打包发布或仅运行检查。
 - PGO 不在缺少代表性整进程训练语料时启用；必须先由对应架构原生 runner 产出稳定训练集，并通过同一 p99/内存门禁。
 
 性能变更使用独立 target/worktree A/B：关键 p99 回退不得超过 2%；目标延迟改善至少 3%或内存下降至少 5%才保留。`tools/benchmark-windows-dist.ps1` 记录启动与 working set/private bytes/handles/threads；真实 ready 延迟要求被测二进制启用 `perf-probe`，并通过 `KEYSTEER_PERF_PROBE` 输出生命周期 JSONL marker。普通发行包的 `--check` 结果只标记为 config-check，不冒充 ready 延迟。
@@ -88,27 +88,31 @@ sampling directly from an isolated A/B target directory before packaging.
 
 ## GitHub Actions
 
-根目录 `.github/workflows/build.yml` 的手动表单将构建和发布拆分为三个输入：`platform`
-选择 Windows、macOS 或全平台，`publish` 复选框控制是否创建 GitHub Release（默认勾选），
-`release_type` 选择 `release`（默认）或 `pre-release`。取消发布时只打包所选平台并保留
-workflow artifact，不运行 fmt、clippy 或测试。勾选发布时无论 `platform` 的选择都会构建并
-等待四个平台 ZIP 成功，然后只上传四个 ZIP；预发布使用唯一的
-`v<version>-pre.<run-number>` 标签并标记为 GitHub pre-release，正式发布使用 `v<version>`。
-macOS 证书和 notarization 通过 secrets 注入。创建 Release 时把
-`.github/release-notes.md` 的固定安装提示置于 GitHub 自动生成的变更说明之前；该文件必须
-保留未 notarize macOS 下载包所需的 `sudo xattr -cr /Applications/KeySteer.app` 指引和
-来源安全提示。
+根目录 `.github/workflows/build.yml` 选择 `checks` 时运行检查任务：
+
+- 4 target 打包矩阵：macOS arm64/x64、Windows x64/arm64。
+- 可执行 target 跑 tests，所有 target 跑 clippy。
+- macOS host cross-check Windows backend。
+- Linux job 跑 fmt 和 shipped-config integration test。
+- docs job 使用 Node 24 + pnpm 10，跑 test/typecheck/build。
+
+同一 workflow 手动运行时会构建所选平台；选择 `checks` 时仅运行上述检查，选择 `all` 时，待四个平台的
+ZIP 都成功后，以 Cargo 版本创建 `v<version>` GitHub Release，并且只上传四个 ZIP。
+只构建单个平台时保留 workflow artifact，但不创建不完整的 Release。macOS 证书和
+notarization 通过 secrets 注入。创建 Release 时把 `.github/release-notes.md` 的固定安装
+提示置于 GitHub 自动生成的变更说明之前；该文件必须保留未 notarize macOS 下载包所需的
+`sudo xattr -cr /Applications/KeySteer.app` 指引和来源安全提示。
 
 每个 target 的 workflow artifact 也独立上传：Windows x64/ARM64、macOS Apple
 Silicon/Intel 各一份；不会把不同架构放入同一个 ZIP 或 artifact。
 
 `.github/workflows/pages.yml` 仅由 `workflow_dispatch` 手动触发；push 不会自动部署
-GitHub Pages。需要更新线上文档时，在 Actions 页面运行 `Deploy documentation`。该流程只安装依赖、
-构建并部署站点，不额外运行文档模型测试。
+GitHub Pages。需要更新线上文档时，在 Actions 页面运行 `Deploy documentation`。
 
-`.github/ISSUE_TEMPLATE/` 提供错误报告、功能建议和配置/按键问题三种精简 Issue Form；
-每种模板只要求填写一项核心描述，版本、环境、配置、日志和截图均为可选。空白 Issue 仍允许创建。
-不要在模板中预设 labels，因为 GitHub 只会添加仓库中已经存在的 labels。
+`.github/ISSUE_TEMPLATE/` 提供错误报告、功能建议和配置/按键问题三种 Issue Form；错误
+报告收集平台、架构、版本、受影响功能、复现步骤和脱敏 TOML，避免把不完整的环境信息留给
+维护者猜测。空白 Issue 仍允许创建。不要在模板中预设 labels，因为 GitHub 只会添加仓库中
+已经存在的 labels。
 
 ## VitePress 文档与模拟器
 
@@ -147,7 +151,9 @@ GitHub Pages。API 暂时不可用、限流或某个平台资产缺失时，下�
 ## 测试层次
 
 - 源文件 `#[cfg(test)]`：API parse/canonical、geometry、Mode 状态、runtime 路由、平台纯逻辑。
-- `tests/integration.rs`：发布配置可解析、默认快捷键跨平台、CLI/项目不变量。
+- `src/tests/integration.rs`：crate 内部的发布配置、默认快捷键、Mode/catalog 与跨平台项目不变量。
+- `src/tests/performance.rs`：feature-gated 内部性能预算；只通过 crate 私有实现运行。
+- `tests/architecture_dependencies.rs`、`tests/logging_policy.rs`：不导入库实现的源码边界护栏。
 - 文档站 Node tests：轻量模拟模型，不替代 Rust tests。
 - 平台原生窗口/权限/Hook 仍需要对应 OS 的实机验证。
 - `tools/benchmark-windows-dist.ps1` 是 Windows 黑盒整进程采样入口；它不属于主 crate 的
@@ -159,6 +165,7 @@ GitHub Pages。API 暂时不可用、限流或某个平台资产缺失时，下�
 cargo fmt --check
 cargo test --all-features
 cargo clippy --all-targets --all-features -- -D warnings
+cargo test --features perf-probe tests::performance::steady_normal_frames_do_not_allocate -- --ignored --exact --test-threads=1
 pnpm docs:test
 pnpm docs:check
 pnpm docs:build
