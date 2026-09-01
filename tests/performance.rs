@@ -7,7 +7,7 @@ use keysteer::api::{
     Appearance, Binding, Command, CommandBatch, Direction, HostContext, KeyState, LabelDirection,
     Mode, Rect,
 };
-use keysteer::domain::hints::assign_into;
+use keysteer::modes::hint::labeling::assign_into;
 use keysteer::modes::normal::NormalMode;
 use keysteer::{Config, Key, ModeEvent, Point};
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};

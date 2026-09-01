@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
-use crate::app::worker::WorkerJoin;
+use crate::support::worker::WorkerJoin;
 
 use super::{WAKE_MESSAGE, native};
 
@@ -109,7 +109,7 @@ impl DisplayFrameClock {
         self.running.store(false, Ordering::Release);
         let compositor_token = self.compositor_token.load(Ordering::Acquire);
         if compositor_token != 0 && !native::interrupt_compositor_clock(compositor_token) {
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "windows-frame-clock",
                 "cannot interrupt compositor frame wait",
             );
@@ -152,7 +152,7 @@ impl Drop for DisplayFrameClock {
             return;
         }
         if let Err(error) = self.stop() {
-            crate::app::logging::report_error("windows-frame-clock", &error);
+            crate::support::logging::report_error("windows-frame-clock", &error);
         }
     }
 }
@@ -204,7 +204,7 @@ fn run_clock(
                 native::CompositorWait::Frame => Ok(()),
                 native::CompositorWait::Interrupted => break,
                 native::CompositorWait::Failed => {
-                    crate::app::logging::report_error(
+                    crate::support::logging::report_error(
                         "windows-frame-clock",
                         "compositor clock failed; falling back to output VBlank",
                     );
@@ -224,7 +224,7 @@ fn run_clock(
                     match native::display_output_for_monitor(requested_monitor) {
                         Ok(output) => output,
                         Err(error) => {
-                            crate::app::logging::report_error("windows-frame-clock", error);
+                            crate::support::logging::report_error("windows-frame-clock", error);
                             None
                         }
                     }
@@ -239,13 +239,13 @@ fn run_clock(
         };
         if let Err(error) = waited {
             if selected_output.take().is_some() {
-                crate::app::logging::report_error(
+                crate::support::logging::report_error(
                     "windows-frame-clock",
                     format!("output VBlank wait failed; falling back to DWM: {error}"),
                 );
                 continue;
             }
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "windows-frame-clock",
                 format!("DwmFlush failed; frame delivery stopped: {error}"),
             );
@@ -258,7 +258,7 @@ fn run_clock(
         match deliver_elapsed(&sender, &mut last_delivered, now) {
             Ok(true) => {
                 if let Err(error) = native::post_thread_wake(owner_thread, WAKE_MESSAGE) {
-                    crate::app::logging::report_error(
+                    crate::support::logging::report_error(
                         "windows-frame-clock",
                         format!("cannot wake engine for display frame: {error}"),
                     );

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::api::geometry::{Point, Rect};
 use crate::api::overlay::OverlayScene;
-use crate::app::worker::WorkerJoin;
+use crate::support::worker::WorkerJoin;
 
 use super::{EventSender, gpu_overlay::GpuOverlay, native, overlay};
 
@@ -333,7 +333,7 @@ impl OverlayWorker {
             return Err("Windows overlay renderer is not running".into());
         }
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        crate::app::perf_probe::mark("capture_gate_started");
+        crate::support::perf_probe::mark("capture_gate_started");
         let should_wake = {
             let mut state = self
                 .shared
@@ -458,7 +458,7 @@ impl Drop for OverlayWorker {
             return;
         }
         if let Err(error) = self.shutdown() {
-            crate::app::logging::report_error("windows-overlay", error);
+            crate::support::logging::report_error("windows-overlay", error);
         }
     }
 }
@@ -470,7 +470,7 @@ fn render_loop(shared: &Shared, events: &EventSender, ready: SyncSender<u32>) {
         return;
     }
     let (mut renderer, startup_notice) = AdaptiveRenderer::new();
-    crate::app::perf_probe::mark("renderer_ready");
+    crate::support::perf_probe::mark("renderer_ready");
     let mut dpi_cache = overlay::DpiSceneCache::default();
     if let Some(notice) = startup_notice {
         warn(events, notice);
@@ -478,7 +478,7 @@ fn render_loop(shared: &Shared, events: &EventSender, ready: SyncSender<u32>) {
     let mut scale = 1.0;
     loop {
         if overlay::take_deferred_callback_error() {
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "windows-overlay",
                 "ValidateRect failed for an overlay window",
             );
@@ -558,10 +558,10 @@ fn render_loop(shared: &Shared, events: &EventSender, ready: SyncSender<u32>) {
             };
             match renderer.present(scene, frame.area) {
                 Ok(Some(notice)) => {
-                    crate::app::perf_probe::mark("native_presented");
+                    crate::support::perf_probe::mark("native_presented");
                     warn(events, notice);
                 }
-                Ok(None) => crate::app::perf_probe::mark("native_presented"),
+                Ok(None) => crate::support::perf_probe::mark("native_presented"),
                 Err(error) => crate::report_error!(
                     "windows-overlay",
                     "Windows overlay render failed; the next frame will retry: {error}"
@@ -578,10 +578,10 @@ fn render_loop(shared: &Shared, events: &EventSender, ready: SyncSender<u32>) {
             }
             match renderer.update_positions(positions.cursor, positions.indicator) {
                 Ok(Some(notice)) => {
-                    crate::app::perf_probe::mark("native_presented");
+                    crate::support::perf_probe::mark("native_presented");
                     warn(events, notice);
                 }
-                Ok(None) => crate::app::perf_probe::mark("native_presented"),
+                Ok(None) => crate::support::perf_probe::mark("native_presented"),
                 Err(error) => {
                     let first_failure = {
                         let mut state = shared
@@ -790,10 +790,10 @@ impl AdaptiveRenderer {
         // synchronously, then uses the same barrier for a common ACK contract.
         self.dismiss()?;
         if !self.capture_state.needs_barrier() {
-            crate::app::perf_probe::mark("capture_barrier_skipped");
+            crate::support::perf_probe::mark("capture_barrier_skipped");
             return Ok(());
         }
-        crate::app::perf_probe::mark("capture_barrier_started");
+        crate::support::perf_probe::mark("capture_barrier_started");
         native::wait_for_dwm_frame()
             .map_err(|error| format!("DWM did not confirm the hidden overlay frame: {error}"))?;
         self.capture_state.confirm_hidden();

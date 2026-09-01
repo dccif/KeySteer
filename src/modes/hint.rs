@@ -24,7 +24,13 @@ use crate::api::overlay::{
 };
 use crate::config::style::AUTO;
 use crate::config::{Config, Palette, UiHint as HintsConfig};
-use crate::hints::{self, CompactHint, Match, VisualLayerPlan, build_visual_layer_plan};
+pub mod labeling;
+mod matching;
+mod view;
+
+use labeling::{self as hints, CompactHint};
+use matching::Match;
+use view::{VisualLayerPlan, build_visual_layer_plan};
 
 const SCAN_RETRY_TIMER_ID: &str = "ui_hint.scan_retry";
 const NO_WINDOW_UNDER_POINTER: &str =
@@ -453,7 +459,7 @@ impl HintMode {
         ) {
             self.hints.clear();
             self.status = Some("Cannot assign Hint labels — check hint_characters".into());
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "ui-hint",
                 format!("cannot assign labels for scan {}: {error}", self.scan_id),
             );

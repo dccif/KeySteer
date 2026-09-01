@@ -17,7 +17,7 @@ fn rust_files(directory: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()>
 #[test]
 fn application_diagnostics_use_the_unified_logger() -> Result<(), Box<dyn std::error::Error>> {
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let logging = source_root.join("app/logging.rs");
+    let logging = source_root.join("support/logging.rs");
     let mut files = Vec::new();
     rust_files(&source_root, &mut files)?;
 
@@ -47,7 +47,7 @@ fn application_diagnostics_use_the_unified_logger() -> Result<(), Box<dyn std::e
             ] {
                 assert!(
                     !source.contains(forbidden),
-                    "diagnostics must go through app::logging ({forbidden}): {}",
+                    "diagnostics must go through support::logging ({forbidden}): {}",
                     path.display()
                 );
             }
@@ -89,7 +89,7 @@ fn native_sources_and_dependencies_cannot_bypass_logging() -> Result<(), Box<dyn
             ] {
                 assert!(
                     !source.contains(forbidden),
-                    "native diagnostics must be returned to app::logging ({forbidden}): {}",
+                    "native diagnostics must be returned to support::logging ({forbidden}): {}",
                     path.display()
                 );
             }
@@ -104,7 +104,7 @@ fn native_sources_and_dependencies_cannot_bypass_logging() -> Result<(), Box<dyn
             !manifest
                 .lines()
                 .any(|line| line.trim_start().starts_with(&prefix)),
-            "diagnostics dependency {dependency} bypasses src/app/logging.rs"
+            "diagnostics dependency {dependency} bypasses src/support/logging.rs"
         );
     }
     Ok(())

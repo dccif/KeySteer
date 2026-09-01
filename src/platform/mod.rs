@@ -13,23 +13,19 @@
 #[cfg(target_os = "macos")]
 pub mod macos;
 
-#[cfg(any(target_os = "macos", test))]
-mod multi_click;
-
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-mod disposition_mailbox;
-
-#[cfg(any(target_os = "macos", test))]
-mod latest_point_mailbox;
-
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
-mod partial_batcher;
+pub(crate) mod common;
 
-#[cfg(any(target_os = "macos", target_os = "windows", test))]
-mod scan_mailbox;
+#[cfg(target_os = "macos")]
+pub(crate) use macos::{latest_point_mailbox, multi_click};
 
-#[cfg(any(target_os = "macos", target_os = "windows", test))]
-mod spatial_index;
+// Keep portable unit coverage for macOS-only state machines on non-macOS CI.
+#[cfg(all(test, not(target_os = "macos")))]
+#[path = "macos/latest_point_mailbox.rs"]
+mod latest_point_mailbox_tests;
+#[cfg(all(test, not(target_os = "macos")))]
+#[path = "macos/multi_click.rs"]
+mod multi_click_tests;
 
 #[cfg(target_os = "windows")]
 pub mod windows;

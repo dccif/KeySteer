@@ -209,7 +209,7 @@ impl Engine {
                     if let Err(error) = backend.send_key(&key, state) {
                         return Err(self.recoverable_input_error("keyboard input", error));
                     }
-                    crate::app::perf_probe::mark("injection_executed");
+                    crate::support::perf_probe::mark("injection_executed");
                     self.recoverable_input_succeeded();
                 }
                 Command::SendChord { keys } => {
@@ -217,7 +217,7 @@ impl Engine {
                         self.latched.extend(keys.into_iter().map(InputTarget::Key));
                         return Err(self.recoverable_input_error("keyboard chord", error));
                     }
-                    crate::app::perf_probe::mark("injection_executed");
+                    crate::support::perf_probe::mark("injection_executed");
                     self.recoverable_input_succeeded();
                 }
 
@@ -237,7 +237,7 @@ impl Engine {
                         ..request
                     };
                     let request_id = request.id;
-                    crate::app::perf_probe::mark_value(
+                    crate::support::perf_probe::mark_value(
                         "scan_requested",
                         isize::try_from(request_id).unwrap_or(isize::MAX),
                     );
@@ -342,7 +342,7 @@ impl Engine {
                 self.recoverable_input_error(&format!("mouse button {button:?} {action:?}"), error)
             );
         }
-        crate::app::perf_probe::mark("injection_executed");
+        crate::support::perf_probe::mark("injection_executed");
         self.recoverable_input_succeeded();
         Ok(())
     }

@@ -139,7 +139,7 @@ impl KeyboardInjector {
         let source = self.source()?;
         for (pressed, key) in keys.iter().enumerate() {
             if let Err(error) = post_key_event(source, key, KeyState::Down) {
-                let mut errors = crate::app::errors::ErrorBundle::default();
+                let mut errors = crate::support::errors::ErrorBundle::default();
                 errors.push(format!("press {key}"), error);
                 for pressed_key in keys[..pressed].iter().rev() {
                     errors.record(
@@ -154,7 +154,7 @@ impl KeyboardInjector {
             if let Err(error) = post_key_event(source, key, KeyState::Up) {
                 // Key-up is idempotent. Releasing the complete chord is safer
                 // than trying to infer which native posts reached the session.
-                let mut errors = crate::app::errors::ErrorBundle::default();
+                let mut errors = crate::support::errors::ErrorBundle::default();
                 errors.push(format!("release {key}"), error);
                 for pressed_key in keys.iter().rev() {
                     errors.record(

@@ -73,7 +73,7 @@ fn responsible_app() -> Option<&'static str> {
 ///
 /// Emitting escapes into a pipe or a log file would corrupt it.
 fn bold(text: &str) -> String {
-    let is_tty = crate::app::logging::emergency_stderr_is_terminal();
+    let is_tty = crate::support::logging::emergency_stderr_is_terminal();
     if is_tty {
         format!("\x1b[1m{text}\x1b[0m")
     } else {

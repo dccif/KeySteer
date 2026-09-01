@@ -25,15 +25,14 @@
 pub mod api;
 pub mod app;
 pub mod config;
-pub mod domain;
 pub mod modes;
 pub mod platform;
 pub mod plugins;
+pub mod runtime;
+pub(crate) mod support;
 
-// Compatibility module aliases keep existing library callers working while the
-// implementation lives behind explicit application and domain boundaries.
-pub use app::runtime as engine;
-pub use domain::hints;
+// Compatibility alias retained while callers migrate to `runtime::Engine`.
+pub use runtime as engine;
 
 pub use api::{
     Action, ActionPhase, ActionSequence, Backend, BackendEvent, Color, Command, CommandBatch,

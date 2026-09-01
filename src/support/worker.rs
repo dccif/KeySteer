@@ -152,7 +152,7 @@ impl Drop for WorkerJoin {
     fn drop(&mut self) {
         if let Some(join) = self.join.take() {
             if !self.join_failure_returned {
-                crate::app::logging::report_error(
+                crate::support::logging::report_error(
                     "worker",
                     format!("{} was dropped without a completed join", self.name),
                 );
@@ -187,7 +187,7 @@ pub(crate) fn reap_quarantined() {
         }
         let worker = workers.swap_remove(index);
         if worker.join.join().is_err() {
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "worker",
                 format!("{} quarantined worker panicked", worker.name),
             );

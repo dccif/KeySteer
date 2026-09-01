@@ -356,21 +356,21 @@ pub(crate) fn report_warning_args(target: &str, message: fmt::Arguments<'_>) {
 #[macro_export]
 macro_rules! log_info {
     ($target:expr, $($arg:tt)*) => {
-        $crate::app::logging::info_args($target, format_args!($($arg)*))
+        $crate::support::logging::info_args($target, format_args!($($arg)*))
     };
 }
 
 #[macro_export]
 macro_rules! report_warning {
     ($target:expr, $($arg:tt)*) => {
-        $crate::app::logging::report_warning_args($target, format_args!($($arg)*))
+        $crate::support::logging::report_warning_args($target, format_args!($($arg)*))
     };
 }
 
 #[macro_export]
 macro_rules! report_error {
     ($target:expr, $($arg:tt)*) => {
-        $crate::app::logging::report_error_args($target, format_args!($($arg)*))
+        $crate::support::logging::report_error_args($target, format_args!($($arg)*))
     };
 }
 
@@ -441,7 +441,7 @@ fn log_args(level: Level, target: &str, message: fmt::Arguments<'_>) {
 }
 
 fn candidate_paths() -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = super::paths::data_file(LOG_FILE).into_iter().collect();
+    let mut paths: Vec<PathBuf> = crate::app::paths::data_file(LOG_FILE).into_iter().collect();
     let fallback = std::env::temp_dir().join("KeySteer").join(LOG_FILE);
     if !paths.contains(&fallback) {
         paths.push(fallback);
@@ -563,7 +563,7 @@ mod tests {
 
     #[test]
     fn application_data_directory_is_preferred_over_the_emergency_fallback() {
-        let expected = super::super::paths::data_file(LOG_FILE).unwrap();
+        let expected = crate::app::paths::data_file(LOG_FILE).unwrap();
         let paths = candidate_paths();
         assert_eq!(paths.first(), Some(&expected));
         assert_eq!(

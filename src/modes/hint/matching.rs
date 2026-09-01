@@ -1,4 +1,4 @@
-use super::Hint;
+use super::labeling::Hint;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Match<T> {

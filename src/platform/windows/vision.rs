@@ -15,7 +15,7 @@ use smallvec::SmallVec;
 
 use crate::api::command::UiScanStatus;
 use crate::api::geometry::{Rect, UiTarget};
-use crate::app::worker::WorkerJoin;
+use crate::support::worker::WorkerJoin;
 
 use super::accessibility::WindowsScanPlan;
 use super::overlay_worker::CaptureLease;
@@ -262,7 +262,7 @@ impl OcrDiscovery {
             move || discover_ocr(worker_shared),
         )
         .map_err(|error| {
-            crate::app::logging::report_error("windows-vision", &error);
+            crate::support::logging::report_error("windows-vision", &error);
             let mut state = self
                 .shared
                 .state
@@ -514,7 +514,7 @@ impl ProviderThreads {
 impl Drop for ProviderThreads {
     fn drop(&mut self) {
         if let Err(error) = self.join_all(Instant::now() + PROVIDER_STOP_TIMEOUT) {
-            crate::app::logging::report_error("windows-vision", error);
+            crate::support::logging::report_error("windows-vision", error);
         }
     }
 }
@@ -642,7 +642,7 @@ impl VisionWorker {
 
     pub(super) fn reap_finished(&mut self) {
         if let Err(error) = self.discovery.reap_finished() {
-            crate::app::logging::report_error("windows-vision", error);
+            crate::support::logging::report_error("windows-vision", error);
         }
         let mut index = 0;
         while index < self.workers.len() {
@@ -652,7 +652,7 @@ impl VisionWorker {
                 }
                 Ok(false) => index += 1,
                 Err(error) => {
-                    crate::app::logging::report_error("windows-vision", error);
+                    crate::support::logging::report_error("windows-vision", error);
                     drop(self.workers.swap_remove(index));
                 }
             }
@@ -675,7 +675,7 @@ impl VisionWorker {
                     }
                     Ok(false) => index += 1,
                     Err(error) => {
-                        crate::app::logging::report_error("windows-vision", error);
+                        crate::support::logging::report_error("windows-vision", error);
                         drop(quarantine.swap_remove(index));
                     }
                 }
@@ -714,7 +714,7 @@ impl VisionWorker {
         if let Some(job) = pending {
             finish_cancelled_job(job);
         }
-        let mut errors = crate::app::errors::ErrorBundle::default();
+        let mut errors = crate::support::errors::ErrorBundle::default();
         errors.record(
             "OCR discovery shutdown",
             self.discovery.stop_until(deadline),
@@ -771,7 +771,7 @@ impl Drop for VisionWorker {
             return;
         }
         if let Err(error) = self.stop() {
-            crate::app::logging::report_error("windows-vision", error);
+            crate::support::logging::report_error("windows-vision", error);
         }
     }
 }
@@ -840,7 +840,7 @@ fn cancellation_clears_generation(
 struct WechatFullFrame {
     geometry: CaptureGeometry,
     bitmap: Option<windows::Graphics::Imaging::SoftwareBitmap>,
-    _ledger: crate::app::perf_probe::ResourceGuard,
+    _ledger: crate::support::perf_probe::ResourceGuard,
 }
 
 enum WechatInput {
@@ -862,7 +862,7 @@ impl Drop for WechatFullFrame {
         if let Some(bitmap) = self.bitmap.take()
             && let Err(error) = bitmap.Close()
         {
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "windows-vision",
                 format!("cannot close unused WeChat OCR bitmap: {error}"),
             );
@@ -936,7 +936,7 @@ impl SystemOcrCompletion {
 
 struct SharedSoftwareBitmap {
     bitmap: Option<windows::Graphics::Imaging::SoftwareBitmap>,
-    _ledger: crate::app::perf_probe::ResourceGuard,
+    _ledger: crate::support::perf_probe::ResourceGuard,
 }
 
 impl SharedSoftwareBitmap {
@@ -959,14 +959,14 @@ impl SharedSoftwareBitmap {
 impl Drop for SharedSoftwareBitmap {
     fn drop(&mut self) {
         if let Err(error) = self.close() {
-            crate::app::logging::report_error("windows-vision", error);
+            crate::support::logging::report_error("windows-vision", error);
         }
     }
 }
 
 fn run_scan(mut job: ScanJob, shared: &Arc<SharedQueue>, discovery: &DiscoveryHandle) {
     let status = run_scan_inner(&mut job, shared, discovery);
-    crate::app::perf_probe::mark("vision_terminal_cleanup");
+    crate::support::perf_probe::mark("vision_terminal_cleanup");
     job.source.finish(status);
 }
 
@@ -975,8 +975,8 @@ fn run_scan_inner(
     shared: &Arc<SharedQueue>,
     discovery: &DiscoveryHandle,
 ) -> UiScanStatus {
-    let _coordinator_ledger = crate::app::perf_probe::ResourceGuard::new(
-        crate::app::perf_probe::ResourceKind::Coordinator,
+    let _coordinator_ledger = crate::support::perf_probe::ResourceGuard::new(
+        crate::support::perf_probe::ResourceKind::Coordinator,
     );
     let deadline = Instant::now()
         + Duration::from_millis(
@@ -990,7 +990,7 @@ fn run_scan_inner(
     let geometry = match capture_geometry(bounds) {
         Ok(geometry) => geometry,
         Err(error) => {
-            let mut errors = crate::app::errors::ErrorBundle::default();
+            let mut errors = crate::support::errors::ErrorBundle::default();
             errors.push("capture geometry", error);
             if let Some(capture) = job.capture.take() {
                 errors.record("capture gate release", capture.release());
@@ -1050,10 +1050,10 @@ fn run_scan_inner(
         let result_mailbox = Arc::clone(&provider_mailbox);
         let provider_cancellation = cancellation.clone();
         if providers.spawn("keysteer-system-ocr", move || {
-            let _provider_ledger = crate::app::perf_probe::ResourceGuard::new(
-                crate::app::perf_probe::ResourceKind::Provider,
+            let _provider_ledger = crate::support::perf_probe::ResourceGuard::new(
+                crate::support::perf_probe::ResourceKind::Provider,
             );
-            crate::app::perf_probe::mark("system_ocr_started");
+            crate::support::perf_probe::mark("system_ocr_started");
             let started = Instant::now();
             let result = recognize_system_provider(
                 descriptor,
@@ -1070,7 +1070,7 @@ fn run_scan_inner(
                 elapsed: started.elapsed(),
                 result,
             });
-            crate::app::perf_probe::mark("system_ocr_finished");
+            crate::support::perf_probe::mark("system_ocr_finished");
         }) {
             system_input = Some(SystemOcrSubmission {
                 sender: image_tx,
@@ -1088,10 +1088,10 @@ fn run_scan_inner(
         let provider_cancellation = cancellation.clone();
         let minimum_confidence = job.request.vision.minimum_confidence;
         if providers.spawn("keysteer-wechat-ocr", move || {
-            let _provider_ledger = crate::app::perf_probe::ResourceGuard::new(
-                crate::app::perf_probe::ResourceKind::Provider,
+            let _provider_ledger = crate::support::perf_probe::ResourceGuard::new(
+                crate::support::perf_probe::ResourceKind::Provider,
             );
-            crate::app::perf_probe::mark("wechat_ocr_started");
+            crate::support::perf_probe::mark("wechat_ocr_started");
             let started = Instant::now();
             let result = recognize_wechat_provider(
                 descriptor,
@@ -1107,7 +1107,7 @@ fn run_scan_inner(
                 elapsed: started.elapsed(),
                 result,
             });
-            crate::app::perf_probe::mark("wechat_ocr_finished");
+            crate::support::perf_probe::mark("wechat_ocr_finished");
         }) {
             wechat_input = Some(image_tx);
             pending_ocr += 1;
@@ -1127,7 +1127,7 @@ fn run_scan_inner(
         match super::native::PreparedCapture::new(geometry.width, geometry.height) {
             Ok(capture) => capture,
             Err(error) => {
-                let mut errors = crate::app::errors::ErrorBundle::default();
+                let mut errors = crate::support::errors::ErrorBundle::default();
                 errors.push("capture DIB preparation", error);
                 errors.record("capture gate release", capture_lease.release());
                 return UiScanStatus::Failed(
@@ -1138,10 +1138,10 @@ fn run_scan_inner(
                 );
             }
         };
-    let gdi_ledger = crate::app::perf_probe::ResourceGuard::new(
-        crate::app::perf_probe::ResourceKind::GdiSurface,
+    let gdi_ledger = crate::support::perf_probe::ResourceGuard::new(
+        crate::support::perf_probe::ResourceKind::GdiSurface,
     );
-    crate::app::perf_probe::mark("capture_dib_prepared");
+    crate::support::perf_probe::mark("capture_dib_prepared");
     let mut bitmap_factory_error = None;
     let bitmap_apartment = if system_input.is_none() && wechat_input.is_none() {
         None
@@ -1168,7 +1168,7 @@ fn run_scan_inner(
     {
         let current = context_is_current(shared, job.generation, &job.request);
         if let Err(release_error) = capture_lease.release() {
-            crate::app::logging::report_error("windows-overlay", release_error);
+            crate::support::logging::report_error("windows-overlay", release_error);
         }
         if !current {
             return UiScanStatus::ContextChanged;
@@ -1180,11 +1180,11 @@ fn run_scan_inner(
     }
     if !context_is_current(shared, job.generation, &job.request) {
         if let Err(error) = capture_lease.release() {
-            crate::app::logging::report_error("windows-overlay", error);
+            crate::support::logging::report_error("windows-overlay", error);
         }
         return UiScanStatus::ContextChanged;
     }
-    crate::app::perf_probe::mark("capture_hidden_ack");
+    crate::support::perf_probe::mark("capture_hidden_ack");
     let mut capture_lease = Some(capture_lease);
     let mut context_changed_during_capture = false;
     let captured = prepared_capture.capture_with(
@@ -1193,7 +1193,7 @@ fn run_scan_inner(
         bounds.width.ceil() as i32,
         bounds.height.ceil() as i32,
         |pixels, width, height| {
-            crate::app::perf_probe::mark("capture_gdi_ready");
+            crate::support::perf_probe::mark("capture_gdi_ready");
             if width != geometry.width || height != geometry.height {
                 return Err("native capture dimensions changed unexpectedly".into());
             }
@@ -1292,7 +1292,7 @@ fn run_scan_inner(
     if let Some(lease) = capture_lease.take()
         && let Err(error) = lease.release()
     {
-        crate::app::logging::report_error("windows-overlay", error);
+        crate::support::logging::report_error("windows-overlay", error);
     }
     let fallback_input = match captured {
         Ok(artifact) => artifact,
@@ -1312,16 +1312,16 @@ fn run_scan_inner(
         let provider_cancellation = cancellation.clone();
         let fallback_cancelled = Arc::clone(&fallback_cancelled);
         providers.spawn("keysteer-vision-fallback", move || {
-            let _provider_ledger = crate::app::perf_probe::ResourceGuard::new(
-                crate::app::perf_probe::ResourceKind::Provider,
+            let _provider_ledger = crate::support::perf_probe::ResourceGuard::new(
+                crate::support::perf_probe::ResourceKind::Provider,
             );
-            crate::app::perf_probe::mark("vision_fallback_started");
+            crate::support::perf_probe::mark("vision_fallback_started");
             let mut scratch = FallbackScratch::default();
             let targets = detect_regions(&fallback_input, &options, &mut scratch, || {
                 provider_cancellation.is_cancelled() || fallback_cancelled.load(Ordering::Acquire)
             });
             let _ = send_fallback_batches(&result_mailbox, targets);
-            crate::app::perf_probe::mark("vision_fallback_finished");
+            crate::support::perf_probe::mark("vision_fallback_finished");
         })
     } else {
         false
@@ -1330,7 +1330,7 @@ fn run_scan_inner(
     let mut fallback_done = !fallback_pending;
     let mut timed_out = false;
     let mut context_changed = false;
-    let mut cleanup_errors = crate::app::errors::ErrorBundle::default();
+    let mut cleanup_errors = crate::support::errors::ErrorBundle::default();
     while pending_ocr != 0 || !fallback_done {
         if !generation_is_current(shared, job.generation) {
             cancellation.cancel();
@@ -1391,7 +1391,7 @@ fn run_scan_inner(
             }
             let accepted = job.source.push(targets);
             if accepted != 0 {
-                crate::app::perf_probe::mark("vision_targets_accepted");
+                crate::support::perf_probe::mark("vision_targets_accepted");
             }
             crate::log_info!(
                 "windows-vision",
@@ -1451,12 +1451,12 @@ fn run_scan_inner(
     let cleanup_result = cleanup_errors.into_result();
     if context_changed || !context_is_current(shared, job.generation, &job.request) {
         if let Err(error) = cleanup_result {
-            crate::app::logging::report_error("windows-vision", error);
+            crate::support::logging::report_error("windows-vision", error);
         }
         UiScanStatus::ContextChanged
     } else if timed_out {
         if let Err(error) = cleanup_result {
-            crate::app::logging::report_error("windows-vision", error);
+            crate::support::logging::report_error("windows-vision", error);
         }
         UiScanStatus::TimedOut
     } else if let Err(error) = cleanup_result {
@@ -1866,7 +1866,7 @@ fn wait_system_ocr_cancellation_event(
 #[cold]
 #[inline(never)]
 fn retain_nonterminal_system_ocr_owner(reason: &str) -> ! {
-    crate::app::logging::report_error(
+    crate::support::logging::report_error(
         "windows-vision",
         format!("{reason}; retaining its complete provider owner in quarantine"),
     );
@@ -2301,7 +2301,7 @@ fn drain_early_ocr_events(
         }
         let accepted = source.push(targets);
         if accepted != 0 {
-            crate::app::perf_probe::mark("vision_targets_accepted");
+            crate::support::perf_probe::mark("vision_targets_accepted");
         }
         crate::log_info!(
             "windows-vision",
@@ -2490,12 +2490,12 @@ fn wechat_full_frame_from_bgra(
     factory: &super::native::SoftwareBitmapFactory,
 ) -> Result<WechatFullFrame, String> {
     let bitmap = factory.bgra(pixels, geometry.width, geometry.height)?;
-    crate::app::perf_probe::mark("ocr_bitmap_ready");
+    crate::support::perf_probe::mark("ocr_bitmap_ready");
     Ok(WechatFullFrame {
         geometry,
         bitmap: Some(bitmap),
-        _ledger: crate::app::perf_probe::ResourceGuard::new(
-            crate::app::perf_probe::ResourceKind::Bitmap,
+        _ledger: crate::support::perf_probe::ResourceGuard::new(
+            crate::support::perf_probe::ResourceKind::Bitmap,
         ),
     })
 }
@@ -2573,8 +2573,8 @@ fn system_ocr_tile_from_bgra(
         ),
         bitmap: SharedSoftwareBitmap {
             bitmap: Some(bitmap),
-            _ledger: crate::app::perf_probe::ResourceGuard::new(
-                crate::app::perf_probe::ResourceKind::Bitmap,
+            _ledger: crate::support::perf_probe::ResourceGuard::new(
+                crate::support::perf_probe::ResourceKind::Bitmap,
             ),
         },
     })
@@ -2778,7 +2778,7 @@ fn discover_ocr(shared: Arc<DiscoveryShared>) {
     };
     shared.completed.store(true, Ordering::Release);
     shared.ready.notify_all();
-    crate::app::perf_probe::mark("ocr_ready");
+    crate::support::perf_probe::mark("ocr_ready");
 }
 
 fn probe_ocr(cancelled: impl Fn() -> bool + Copy) -> Option<OcrDiscoverySnapshot> {
@@ -3073,7 +3073,7 @@ impl Drop for OcrOperationGuard {
             }
         }
         for error in failures {
-            crate::app::logging::report_error("windows-vision", error);
+            crate::support::logging::report_error("windows-vision", error);
         }
     }
 }

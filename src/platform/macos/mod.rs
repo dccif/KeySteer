@@ -9,6 +9,8 @@ mod autostart;
 mod display_link;
 mod hook;
 mod input;
+pub(crate) mod latest_point_mailbox;
+pub(crate) mod multi_click;
 mod native;
 mod overlay;
 mod permissions;
@@ -35,7 +37,7 @@ use crate::api::command::{ButtonAction, FocusedApp, MouseButton};
 use crate::api::geometry::{Point, Screen};
 use crate::api::input::{Key, KeyState};
 use crate::api::overlay::OverlayScene;
-use crate::platform::scan_mailbox::ScanMailbox;
+use crate::platform::common::scan_mailbox::ScanMailbox;
 
 use self::hook::{HookStartup, HookThread};
 use self::overlay::Overlay;
@@ -97,7 +99,7 @@ pub struct MacOsBackend {
     frame_clock: display_link::DisplayFrameClock,
     workspace: workspace::Workspace,
     status_item: Option<status_item::StatusItem>,
-    update_worker: Option<crate::app::update::UpdateWorker>,
+    update_worker: Option<crate::platform::common::update::UpdateWorker>,
     held_buttons: Cell<u8>,
     click_tracker: Arc<Mutex<ClickTracker>>,
     warned_about_permissions: bool,
@@ -137,7 +139,7 @@ impl MacOsBackend {
         let hook_start = HookStartup::spawn(Arc::clone(&click_tracker));
         let frame_clock = display_link::DisplayFrameClock::new(mtm);
         let initial_screens = screens::list_screens().unwrap_or_else(|error| {
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "macos-screen",
                 format!("initial display enumeration failed: {error}"),
             );
@@ -152,7 +154,7 @@ impl MacOsBackend {
             Ok(hook) => Some(hook),
             Err(error) => {
                 if trusted {
-                    crate::app::logging::report_error("macos-hook", error);
+                    crate::support::logging::report_error("macos-hook", error);
                 }
                 None
             }
@@ -222,7 +224,7 @@ impl MacOsBackend {
     }
 
     fn release_held_buttons(&self) -> Result<(), String> {
-        let mut errors = crate::app::errors::ErrorBundle::default();
+        let mut errors = crate::support::errors::ErrorBundle::default();
         for button in [
             MouseButton::Left,
             MouseButton::Right,
@@ -246,7 +248,7 @@ impl MacOsBackend {
         if self
             .update_worker
             .as_mut()
-            .is_some_and(crate::app::update::UpdateWorker::reap_finished)
+            .is_some_and(crate::platform::common::update::UpdateWorker::reap_finished)
         {
             self.update_worker.take();
         }
@@ -263,7 +265,7 @@ impl MacOsBackend {
         // before joining any worker; otherwise physical input arriving while
         // Vision is stopping would wait for an Engine disposition that can no
         // longer be sent.
-        let mut errors = crate::app::errors::ErrorBundle::default();
+        let mut errors = crate::support::errors::ErrorBundle::default();
         if let Some(hook) = self.hook.as_mut() {
             hook.request_stop();
         }
@@ -316,7 +318,7 @@ impl Drop for MacOsBackend {
             return;
         }
         if let Err(error) = self.shutdown_resources() {
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "macos-shutdown",
                 format!("cannot completely release macOS backend resources: {error}"),
             );
@@ -332,7 +334,7 @@ impl Backend for MacOsBackend {
             if let Some(event) = self.try_event() {
                 return Ok(Some(event));
             }
-            crate::app::worker::reap_quarantined();
+            crate::support::worker::reap_quarantined();
             self.refresh_native_events();
             if let Some(event) = self.try_event() {
                 return Ok(Some(event));
@@ -440,7 +442,7 @@ impl Backend for MacOsBackend {
 
     fn present(&mut self, scene: Arc<OverlayScene>) -> Result<(), String> {
         self.overlay.present(scene)?;
-        crate::app::perf_probe::mark("native_presented");
+        crate::support::perf_probe::mark("native_presented");
         Ok(())
     }
 
@@ -451,7 +453,7 @@ impl Backend for MacOsBackend {
     ) -> Result<bool, String> {
         let updated = self.overlay.update_positions(cursor, indicator)?;
         if updated {
-            crate::app::perf_probe::mark("native_presented");
+            crate::support::perf_probe::mark("native_presented");
         }
         Ok(updated)
     }
@@ -504,7 +506,7 @@ impl Backend for MacOsBackend {
         }
         let progress_sender = self.event_tx.clone();
         let complete_sender = self.event_tx.clone();
-        self.update_worker = crate::app::update::check_async(
+        self.update_worker = crate::platform::common::update::check_async(
             move |progress| {
                 let _ = progress_sender.send(BackendEvent::UpdateProgress(progress));
             },

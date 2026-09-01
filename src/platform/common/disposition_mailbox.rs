@@ -21,7 +21,7 @@ struct Slot {
 }
 
 #[derive(Default)]
-pub(super) struct DispositionMailbox {
+pub(crate) struct DispositionMailbox {
     slot: Mutex<Slot>,
     ready: Condvar,
 }
@@ -29,7 +29,7 @@ pub(super) struct DispositionMailbox {
 impl DispositionMailbox {
     /// Reserve the reusable slot for one native callback.
     #[cfg(any(not(target_os = "macos"), test))]
-    pub(super) fn begin(&self) -> u64 {
+    pub(crate) fn begin(&self) -> u64 {
         let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
         slot.generation = slot.generation.wrapping_add(1);
         slot.disposition = None;
@@ -40,7 +40,7 @@ impl DispositionMailbox {
     /// its terminal state. The check shares the existing slot lock, so it adds
     /// no atomic, allocation, or second synchronization step to the callback.
     #[cfg(any(target_os = "macos", test))]
-    pub(super) fn try_begin(&self) -> Option<u64> {
+    pub(crate) fn try_begin(&self) -> Option<u64> {
         let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
         if slot.closed {
             return None;
@@ -52,7 +52,7 @@ impl DispositionMailbox {
 
     /// Complete `generation`; returns false when that callback already timed
     /// out and a newer event owns the slot.
-    pub(super) fn complete(&self, generation: u64, disposition: KeyDisposition) -> bool {
+    pub(crate) fn complete(&self, generation: u64, disposition: KeyDisposition) -> bool {
         let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
         if slot.generation != generation || slot.disposition.is_some() {
             return false;
@@ -62,7 +62,7 @@ impl DispositionMailbox {
         true
     }
 
-    pub(super) fn wait(&self, generation: u64, timeout: Duration) -> Option<KeyDisposition> {
+    pub(crate) fn wait(&self, generation: u64, timeout: Duration) -> Option<KeyDisposition> {
         let slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
         if slot.generation != generation {
             return None;
@@ -82,7 +82,7 @@ impl DispositionMailbox {
     /// shutdown either reserves its generation before this lock and is woken,
     /// or observes `closed` and returns without waiting.
     #[cfg(any(target_os = "macos", test))]
-    pub(super) fn close(&self) {
+    pub(crate) fn close(&self) {
         let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
         slot.closed = true;
         slot.generation = slot.generation.wrapping_add(1);

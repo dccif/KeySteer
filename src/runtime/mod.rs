@@ -653,7 +653,7 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(config: Config, appearance: Appearance) -> Self {
-        crate::app::logging::set_non_error_enabled(config.debug.enabled);
+        crate::support::logging::set_non_error_enabled(config.debug.enabled);
         let palette = config.palette(appearance);
         Self {
             config,
@@ -825,7 +825,7 @@ impl Engine {
             .iter()
             .filter_map(|(&id, candidate)| (candidate == owner).then_some(id))
             .collect::<SmallVec<[u64; 1]>>();
-        let mut errors = crate::app::errors::ErrorBundle::default();
+        let mut errors = crate::support::errors::ErrorBundle::default();
         for id in ids {
             self.scan_owners.remove(&id);
             if let Err(error) = backend.cancel_ui_scan(id) {
@@ -842,7 +842,7 @@ impl Engine {
             .copied()
             .collect::<SmallVec<[u64; 2]>>();
         self.scan_owners.clear();
-        let mut errors = crate::app::errors::ErrorBundle::default();
+        let mut errors = crate::support::errors::ErrorBundle::default();
         for id in ids {
             if let Err(error) = backend.cancel_ui_scan(id) {
                 errors.push(format!("cancel UI scan {id}"), error);
@@ -870,7 +870,7 @@ impl Engine {
         backend: &mut dyn Backend,
     ) {
         if !self.input_failure_active {
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "input",
                 if capture_lost {
                     format!(
@@ -894,7 +894,7 @@ impl Engine {
         let previous = self.active.clone();
         self.pending_sequences.clear();
         if let Err(cancel_error) = self.cancel_transient_clicks(backend) {
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "input",
                 format!("cannot cancel pending mouse presses during recovery: {cancel_error}"),
             );
@@ -905,7 +905,7 @@ impl Engine {
         self.modal_stack.clear();
         self.timers.clear();
         if let Err(cancel_error) = self.cancel_all_scans(backend) {
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "ui-scan",
                 format!("cannot cancel scans during input recovery: {cancel_error}"),
             );
@@ -918,7 +918,7 @@ impl Engine {
         }
 
         if let Err(release_error) = self.release_latched(backend) {
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "input",
                 format!("cannot release every held input during recovery: {release_error}"),
             );
@@ -956,7 +956,7 @@ impl Engine {
         }
 
         if let Err(dismiss_error) = backend.dismiss() {
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "overlay",
                 format!("cannot dismiss overlay during input recovery: {dismiss_error}"),
             );
@@ -974,7 +974,7 @@ impl Engine {
 
     fn report_action_error(&mut self, error: String, backend: &mut dyn Backend) {
         if !self.recover_from_input_error(&error, backend) {
-            crate::app::logging::report_error("action", format!("action failed: {error}"));
+            crate::support::logging::report_error("action", format!("action failed: {error}"));
         }
     }
 
@@ -1132,7 +1132,7 @@ impl Engine {
                 self.started_at.elapsed().as_secs_f64() * 1000.0,
                 message.as_ref()
             );
-            crate::app::logging::debug_args(category, format_args!("{message}"));
+            crate::support::logging::debug_args(category, format_args!("{message}"));
         }
     }
 
@@ -1175,18 +1175,18 @@ impl Engine {
     fn start_runtime(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
         if let Err(error) = backend.start() {
             if let Err(shutdown_error) = backend.shutdown() {
-                crate::app::logging::report_error(
+                crate::support::logging::report_error(
                     "backend",
                     format!("shutdown after startup failure also failed: {shutdown_error}"),
                 );
             }
             return Err(RuntimeError::Platform(error).into_message());
         }
-        crate::app::logging::info_args(
+        crate::support::logging::info_args(
             "backend",
             format_args!("{} backend started", backend.name()),
         );
-        crate::app::perf_probe::mark("backend_started");
+        crate::support::perf_probe::mark("backend_started");
         self.trace_lazy(self.config.debug.backend, "backend", || {
             format!("started {} backend", backend.name())
         });
@@ -1198,21 +1198,27 @@ impl Engine {
             let reason = backend
                 .keyboard_unavailable_reason()
                 .unwrap_or_else(|| "the keyboard cannot be observed".to_string());
-            crate::app::logging::report_error("keyboard", reason);
+            crate::support::logging::report_error("keyboard", reason);
         }
 
         self.appearance = backend.appearance();
         self.palette = self.config.palette(self.appearance);
         self.screens = backend.screens().unwrap_or_else(|error| {
-            crate::app::logging::report_error("backend", format!("cannot read screens: {error}"));
+            crate::support::logging::report_error(
+                "backend",
+                format!("cannot read screens: {error}"),
+            );
             Vec::new()
         });
         self.cursor = backend.pointer().unwrap_or_else(|error| {
-            crate::app::logging::report_error("backend", format!("cannot read pointer: {error}"));
+            crate::support::logging::report_error(
+                "backend",
+                format!("cannot read pointer: {error}"),
+            );
             Point::default()
         });
         self.focused_app = backend.focused_app().unwrap_or_else(|error| {
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "backend",
                 format!("cannot read focused application: {error}"),
             );
@@ -1220,7 +1226,7 @@ impl Engine {
         });
         self.focused_app_excluded =
             Self::excluded_app_matches(&self.config, self.focused_app.as_ref());
-        crate::app::logging::info_args(
+        crate::support::logging::info_args(
             "backend",
             format_args!(
                 "initial state screens={} appearance={:?} keyboard_available={}",
@@ -1232,7 +1238,7 @@ impl Engine {
         // Bootstrap defers registration compilation until the backend can
         // provide its initial app profile. This is the only startup build.
         self.rebuild_tables();
-        crate::app::perf_probe::mark("engine_ready");
+        crate::support::perf_probe::mark("engine_ready");
         self.trace_lazy(self.config.debug.backend, "backend", || {
             format!(
                 "screens={} cursor=({:.1},{:.1}) focused_app={:?}",
@@ -1248,7 +1254,7 @@ impl Engine {
         // succeeded, even this early error must pass through native shutdown.
         if let Err(error) = self.activate(ModeId::idle(), None, backend) {
             if let Err(shutdown_error) = backend.shutdown() {
-                crate::app::logging::report_error(
+                crate::support::logging::report_error(
                     "backend",
                     format!("shutdown after activation failure also failed: {shutdown_error}"),
                 );
@@ -1305,7 +1311,7 @@ impl Engine {
         backend: &mut dyn Backend,
         result: Result<(), String>,
     ) -> Result<(), String> {
-        let mut errors = crate::app::errors::ErrorBundle::default();
+        let mut errors = crate::support::errors::ErrorBundle::default();
         errors.record("runtime", result);
         self.pending_sequences.clear();
         errors.record(
@@ -1320,8 +1326,8 @@ impl Engine {
         let shutdown_succeeded = shutdown.is_ok();
         errors.record("backend shutdown", shutdown);
         if shutdown_succeeded {
-            crate::app::perf_probe::mark("shutdown_complete");
-            crate::app::logging::info_args(
+            crate::support::perf_probe::mark("shutdown_complete");
+            crate::support::logging::info_args(
                 "backend",
                 format_args!("{} backend stopped", backend.name()),
             );
@@ -1544,7 +1550,7 @@ impl Engine {
             if let Err(error) =
                 self.continue_sequence(sequence.actions, sequence.owner, sequence.input, backend)
             {
-                crate::app::logging::report_error(
+                crate::support::logging::report_error(
                     "action",
                     format!("delayed action sequence stopped: {error}"),
                 );
@@ -1603,7 +1609,7 @@ impl Engine {
     ) -> Result<(), String> {
         match event {
             BackendEvent::Input(input) => {
-                crate::app::perf_probe::mark("input_received");
+                crate::support::perf_probe::mark("input_received");
                 self.handle_key(input, backend)?;
             }
             BackendEvent::InputInjectionFailed(message) => {
@@ -1681,7 +1687,7 @@ impl Engine {
                 self.refresh_overlay(backend)?;
             }
             BackendEvent::UiScanned(result) => {
-                crate::app::perf_probe::mark_value(
+                crate::support::perf_probe::mark_value(
                     if result.status == UiScanStatus::Partial {
                         "ui_scan_partial"
                     } else {
@@ -1690,17 +1696,17 @@ impl Engine {
                     isize::try_from(result.id).unwrap_or(isize::MAX),
                 );
                 match &result.status {
-                    UiScanStatus::Failed(error) => crate::app::logging::report_error(
+                    UiScanStatus::Failed(error) => crate::support::logging::report_error(
                         "ui-scan",
                         format!("scan {} failed: {error}", result.id),
                     ),
                     UiScanStatus::PermissionDenied(error) | UiScanStatus::Unsupported(error) => {
-                        crate::app::logging::report_warning_args(
+                        crate::support::logging::report_warning_args(
                             "ui-scan",
                             format_args!("scan {} unavailable: {error}", result.id),
                         );
                     }
-                    UiScanStatus::TimedOut => crate::app::logging::report_warning_args(
+                    UiScanStatus::TimedOut => crate::support::logging::report_warning_args(
                         "ui-scan",
                         format_args!("scan {} timed out", result.id),
                     ),
@@ -1719,7 +1725,7 @@ impl Engine {
             }
             BackendEvent::ReloadConfig => {
                 if let Err(error) = self.reload_config(backend) {
-                    crate::app::logging::report_error("config", error);
+                    crate::support::logging::report_error("config", error);
                 }
             }
             BackendEvent::OpenConfigSimulator => {
@@ -1736,7 +1742,7 @@ impl Engine {
                 };
                 let url = crate::app::config_simulator::url_for_config(&source);
                 if let Err(error) = backend.open_url(&url) {
-                    crate::app::logging::report_error("config-simulator", error);
+                    crate::support::logging::report_error("config-simulator", error);
                 } else {
                     self.last_config_simulator_open = Some(now);
                 }
@@ -1760,21 +1766,21 @@ impl Engine {
                     "login-time startup {}",
                     if enabled { "enabled" } else { "disabled" }
                 ),
-                Err(error) => crate::app::logging::report_error("autostart", error),
+                Err(error) => crate::support::logging::report_error("autostart", error),
             },
             BackendEvent::CheckForUpdates => {
                 if let Err(error) = backend.check_for_updates() {
-                    crate::app::logging::report_error("update-check", error);
+                    crate::support::logging::report_error("update-check", error);
                 }
             }
             BackendEvent::UpdateProgress(progress) => {
                 if let Err(error) = backend.present_update_progress(&progress) {
-                    crate::app::logging::report_error("update-check", error);
+                    crate::support::logging::report_error("update-check", error);
                 }
             }
             BackendEvent::UpdateChecked(result) => {
                 if let Err(error) = backend.present_update_result(&result) {
-                    crate::app::logging::report_error("update-check", error);
+                    crate::support::logging::report_error("update-check", error);
                 }
             }
             BackendEvent::Quit => self.should_quit = true,
@@ -1863,7 +1869,7 @@ impl Engine {
     /// Swap in a new configuration at runtime.
     pub fn apply_config(&mut self, config: Config) -> Result<(), String> {
         config.validate().map_err(|e| e.to_string())?;
-        crate::app::logging::set_non_error_enabled(config.debug.enabled);
+        crate::support::logging::set_non_error_enabled(config.debug.enabled);
         self.drag_auto_release.clear();
         self.config = config;
         self.focused_app_excluded =
@@ -2706,7 +2712,7 @@ impl Engine {
     /// The caller can use the returned dirty bit to rebuild the overlay once.
     fn cancel_transient_clicks(&mut self, backend: &mut dyn Backend) -> Result<bool, String> {
         let pending = std::mem::take(&mut self.pending_long_press_toggles);
-        let mut errors = crate::app::errors::ErrorBundle::default();
+        let mut errors = crate::support::errors::ErrorBundle::default();
         let mut feedback_changed = false;
         for pending in pending {
             match self.cancel_pending_long_press(pending, backend) {
@@ -3298,7 +3304,7 @@ impl Engine {
                         Ok(()) => {
                             self.latched.remove(rollback);
                         }
-                        Err(rollback_error) => crate::app::logging::report_error(
+                        Err(rollback_error) => crate::support::logging::report_error(
                             "action",
                             format!("cannot roll back held input: {rollback_error}"),
                         ),
@@ -3318,7 +3324,7 @@ impl Engine {
         force: bool,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
-        let mut errors = crate::app::errors::ErrorBundle::default();
+        let mut errors = crate::support::errors::ErrorBundle::default();
         for target in targets.iter().rev() {
             let matched = self.matching_latched_target(target);
             if !force && matched.is_none() {
@@ -3357,7 +3363,7 @@ impl Engine {
             };
             if let Err(error) = result {
                 if let Err(rollback_error) = self.restore_latched(&original, backend) {
-                    crate::app::logging::report_error(
+                    crate::support::logging::report_error(
                         "action",
                         format!("cannot roll back toggle action: {rollback_error}"),
                     );
@@ -3505,8 +3511,8 @@ impl Engine {
             return Ok(());
         };
         let commands = mode.handle(&event, &context);
-        crate::app::perf_probe::mark("mode_handled");
-        crate::app::perf_probe::mark("commands_ready");
+        crate::support::perf_probe::mark("mode_handled");
+        crate::support::perf_probe::mark("commands_ready");
         self.execute_for(owner, commands, backend)
     }
 
@@ -3533,8 +3539,8 @@ impl Engine {
             return Ok(());
         };
         let commands = mode.handle_owned(event, &context);
-        crate::app::perf_probe::mark("mode_handled");
-        crate::app::perf_probe::mark("commands_ready");
+        crate::support::perf_probe::mark("mode_handled");
+        crate::support::perf_probe::mark("commands_ready");
         self.execute_for(owner, commands, backend)
     }
 

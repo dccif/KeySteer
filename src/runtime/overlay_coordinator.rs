@@ -201,10 +201,10 @@ impl Engine {
             return Ok(());
         }
         let scene = Arc::new(scene);
-        crate::app::perf_probe::mark("overlay_submitted");
-        crate::app::perf_probe::mark("native_submitted");
+        crate::support::perf_probe::mark("overlay_submitted");
+        crate::support::perf_probe::mark("native_submitted");
         backend.present(Arc::clone(&scene))?;
-        crate::app::perf_probe::mark("overlay_presented");
+        crate::support::perf_probe::mark("overlay_presented");
         self.trace(trace_overlay, "overlay", "backend present: ok");
         self.last_scene = Some(scene);
         self.overlay_visible = true;
@@ -237,7 +237,7 @@ impl Engine {
         self.overlay_dynamic = DynamicOverlayState::default();
         self.overlay_positions = None;
         self.overlay_position_fast_path_disabled = false;
-        crate::app::perf_probe::mark("overlay_hidden");
+        crate::support::perf_probe::mark("overlay_hidden");
         Ok(())
     }
 
@@ -299,7 +299,7 @@ impl Engine {
             return Ok(());
         }
 
-        crate::app::perf_probe::mark("native_submitted");
+        crate::support::perf_probe::mark("native_submitted");
         match backend.update_overlay_positions(positions.cursor, positions.indicator) {
             Ok(true) => {
                 self.overlay_positions = Some(positions);
@@ -311,7 +311,7 @@ impl Engine {
             }
             Err(error) => {
                 self.overlay_position_fast_path_disabled = true;
-                crate::app::logging::report_error(
+                crate::support::logging::report_error(
                     "overlay",
                     format!(
                         "position-only overlay update failed; using complete frames until the overlay is dismissed: {error}"

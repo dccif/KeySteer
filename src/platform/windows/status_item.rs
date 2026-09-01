@@ -26,7 +26,7 @@ use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::api::Autostart;
 use crate::api::backend::{BackendEvent, UpdateCheckResult, UpdateProgress};
-use crate::app::worker::WorkerJoin;
+use crate::support::worker::WorkerJoin;
 
 use super::EventSender;
 
@@ -210,7 +210,7 @@ impl Drop for StatusItem {
             return;
         }
         if let Err(error) = self.stop() {
-            crate::app::logging::report_error("windows-tray", &error);
+            crate::support::logging::report_error("windows-tray", &error);
         }
     }
 }
@@ -246,7 +246,7 @@ fn tray_thread(ready: std::sync::mpsc::SyncSender<Result<(u32, isize), String>>)
             // SAFETY: GetLastError has no arguments and is read immediately
             // after the failed message retrieval.
             let last_error = unsafe { windows::Win32::Foundation::GetLastError() };
-            crate::app::logging::report_error(
+            crate::support::logging::report_error(
                 "windows-tray",
                 format!("GetMessageW failed: {last_error:?}"),
             );
@@ -412,7 +412,7 @@ fn show_menu(hwnd: HWND) {
     let autostart_checked = match super::autostart::WindowsAutostart::new().is_enabled() {
         Ok(enabled) => enabled,
         Err(error) => {
-            crate::app::logging::report_error("windows-autostart", error);
+            crate::support::logging::report_error("windows-autostart", error);
             false
         }
     };
@@ -469,13 +469,13 @@ fn show_menu(hwnd: HWND) {
             .and_then(|_| AppendMenuW(menu, MF_STRING, CMD_QUIT as usize, w!("Quit KeySteer")))
     };
     if let Err(error) = menu_result {
-        crate::app::logging::report_error(
+        crate::support::logging::report_error(
             "windows-tray",
             format!("cannot build tray menu: {error}"),
         );
     }
     let point = super::input::cursor_position().unwrap_or_else(|error| {
-        crate::app::logging::report_error("windows-tray", error);
+        crate::support::logging::report_error("windows-tray", error);
         crate::api::geometry::Point::new(0.0, 0.0)
     });
     // SAFETY: `menu` and `hwnd` belong to this tray thread and remain live
@@ -567,7 +567,7 @@ pub(super) fn present_update_result(result: &UpdateCheckResult) -> Result<(), St
                 }
             };
             if let Err(error) = presentation {
-                crate::app::logging::report_error("windows-update", error);
+                crate::support::logging::report_error("windows-update", error);
             }
         })
         .map(|_| ())
@@ -585,15 +585,15 @@ fn present_about() {
             let _guard = guard;
             if let Err(error) = show_message(
                 "About KeySteer",
-                &crate::app::about::details(),
+                &crate::platform::common::app_info::details(),
                 false,
                 false,
             ) {
-                crate::app::logging::report_error("windows-about", error);
+                crate::support::logging::report_error("windows-about", error);
             }
         })
     {
-        crate::app::logging::report_error(
+        crate::support::logging::report_error(
             "windows-about",
             format!("cannot start Windows About UI: {error}"),
         );

@@ -16,8 +16,8 @@ use crate::api::backend::{BackendEvent, KeyDisposition};
 use crate::api::command::MouseButton;
 use crate::api::geometry::Point;
 use crate::api::input::{InputEvent, Key, KeyState};
-use crate::app::worker::WorkerJoin;
 use crate::platform::multi_click::ClickTracker;
+use crate::support::worker::WorkerJoin;
 
 use super::input;
 
@@ -154,7 +154,7 @@ impl HookSignals {
 
 struct TapCaptureLifecycle {
     signals: SharedHookSignals,
-    mailbox: Arc<crate::platform::disposition_mailbox::DispositionMailbox>,
+    mailbox: Arc<crate::platform::common::disposition_mailbox::DispositionMailbox>,
     stop: Arc<AtomicBool>,
     active: Arc<AtomicBool>,
     run_loop: SharedRunLoop,
@@ -175,7 +175,7 @@ struct RegisteredEventTap {
 
 struct CallbackContext {
     sender: SyncSender<Envelope>,
-    mailbox: Arc<crate::platform::disposition_mailbox::DispositionMailbox>,
+    mailbox: Arc<crate::platform::common::disposition_mailbox::DispositionMailbox>,
     state: SharedState,
     latest_pointer: SharedPointer,
     click_tracker: SharedClickTracker,
@@ -186,7 +186,7 @@ struct CallbackContext {
 pub struct HookThread {
     sender: SyncSender<Envelope>,
     receiver: Receiver<Envelope>,
-    mailbox: Arc<crate::platform::disposition_mailbox::DispositionMailbox>,
+    mailbox: Arc<crate::platform::common::disposition_mailbox::DispositionMailbox>,
     pending: Option<u64>,
     latest_pointer: SharedPointer,
     stop: Arc<AtomicBool>,
@@ -201,7 +201,7 @@ pub struct HookThread {
 pub struct HookStartup {
     sender: SyncSender<Envelope>,
     receiver: Option<Receiver<Envelope>>,
-    mailbox: Arc<crate::platform::disposition_mailbox::DispositionMailbox>,
+    mailbox: Arc<crate::platform::common::disposition_mailbox::DispositionMailbox>,
     latest_pointer: SharedPointer,
     stop: Arc<AtomicBool>,
     active: Arc<AtomicBool>,
@@ -221,7 +221,7 @@ struct HookHandshake {
 
 struct HookThreadContext {
     sender: SyncSender<Envelope>,
-    mailbox: Arc<crate::platform::disposition_mailbox::DispositionMailbox>,
+    mailbox: Arc<crate::platform::common::disposition_mailbox::DispositionMailbox>,
     stop: Arc<AtomicBool>,
     active: Arc<AtomicBool>,
     signals: SharedHookSignals,
@@ -233,7 +233,8 @@ struct HookThreadContext {
 impl HookStartup {
     pub fn spawn(click_tracker: SharedClickTracker) -> Result<Self, String> {
         let (event_tx, event_rx) = mpsc::sync_channel(64);
-        let mailbox = Arc::new(crate::platform::disposition_mailbox::DispositionMailbox::default());
+        let mailbox =
+            Arc::new(crate::platform::common::disposition_mailbox::DispositionMailbox::default());
         let thread_mailbox = Arc::clone(&mailbox);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (activate_tx, activate_rx) = mpsc::sync_channel(1);
@@ -345,7 +346,7 @@ impl Drop for HookStartup {
         if let Some(mut worker) = self.worker.take()
             && let Err(error) = worker.join_timeout(STOP_TIMEOUT)
         {
-            crate::app::logging::report_error("macos-hook", &error);
+            crate::support::logging::report_error("macos-hook", &error);
         }
     }
 }
@@ -448,7 +449,7 @@ impl HookThread {
 
     fn reap_finished(&mut self) {
         if let Err(error) = self.worker.reap_finished() {
-            crate::app::logging::report_error("macos-hook", &error);
+            crate::support::logging::report_error("macos-hook", &error);
         }
     }
 
@@ -619,7 +620,7 @@ impl Drop for HookThread {
             return;
         }
         if let Err(error) = self.stop() {
-            crate::app::logging::report_error("macos-hook", &error);
+            crate::support::logging::report_error("macos-hook", &error);
         }
     }
 }
@@ -712,7 +713,7 @@ fn event_tap_thread(handshake: HookHandshake, context: HookThreadContext) {
         detach_event_tap_source(&run_loop, &source, &shared_run_loop);
         return;
     }
-    crate::app::perf_probe::mark("hook_ready");
+    crate::support::perf_probe::mark("hook_ready");
 
     let mut timeout_retried = false;
     loop {
@@ -983,13 +984,13 @@ fn modifier_transition(state: &SharedState, code: i64, flags: u64) -> Option<(Ke
 
 fn disposition_for(
     sender: &SyncSender<Envelope>,
-    mailbox: &crate::platform::disposition_mailbox::DispositionMailbox,
+    mailbox: &crate::platform::common::disposition_mailbox::DispositionMailbox,
     event: BackendEvent,
 ) -> CallbackResult {
-    let correlation_id = crate::app::perf_probe::next_correlation_id();
-    crate::app::perf_probe::mark_correlated("hook_received", correlation_id);
+    let correlation_id = crate::support::perf_probe::next_correlation_id();
+    crate::support::perf_probe::mark_correlated("hook_received", correlation_id);
     let Some(generation) = mailbox.try_begin() else {
-        crate::app::perf_probe::mark_correlated("disposition_returned", correlation_id);
+        crate::support::perf_probe::mark_correlated("disposition_returned", correlation_id);
         return CallbackResult::Keep;
     };
     if sender
@@ -999,7 +1000,7 @@ fn disposition_for(
         })
         .is_err()
     {
-        crate::app::perf_probe::mark_correlated("disposition_returned", correlation_id);
+        crate::support::perf_probe::mark_correlated("disposition_returned", correlation_id);
         return CallbackResult::Keep;
     }
     super::workspace::wake_main_run_loop();
@@ -1015,7 +1016,7 @@ fn disposition_for(
             CallbackResult::Keep
         }
     };
-    crate::app::perf_probe::mark_correlated("disposition_returned", correlation_id);
+    crate::support::perf_probe::mark_correlated("disposition_returned", correlation_id);
     result
 }
 
@@ -1061,7 +1062,8 @@ mod tests {
     #[test]
     fn disposition_is_delivered_to_the_exact_waiting_event() {
         let (event_tx, event_rx) = mpsc::sync_channel(64);
-        let mailbox = Arc::new(crate::platform::disposition_mailbox::DispositionMailbox::default());
+        let mailbox =
+            Arc::new(crate::platform::common::disposition_mailbox::DispositionMailbox::default());
         let generation = mailbox.begin();
         let mut hook = HookThread {
             sender: event_tx,
@@ -1089,7 +1091,8 @@ mod tests {
     #[test]
     fn timed_out_response_channel_is_nonfatal() {
         let (event_tx, event_rx) = mpsc::sync_channel(64);
-        let mailbox = Arc::new(crate::platform::disposition_mailbox::DispositionMailbox::default());
+        let mailbox =
+            Arc::new(crate::platform::common::disposition_mailbox::DispositionMailbox::default());
         let generation = mailbox.begin();
         let _newer = mailbox.begin();
         let mut hook = HookThread {
@@ -1121,7 +1124,7 @@ mod tests {
                 generation: None,
             })
             .unwrap();
-        let mailbox = crate::platform::disposition_mailbox::DispositionMailbox::default();
+        let mailbox = crate::platform::common::disposition_mailbox::DispositionMailbox::default();
 
         assert!(matches!(
             disposition_for(
@@ -1161,7 +1164,8 @@ mod tests {
             ),
             tap_capture_state: AtomicU8::new(TAP_CAPTURE_ARMED),
         });
-        let mailbox = Arc::new(crate::platform::disposition_mailbox::DispositionMailbox::default());
+        let mailbox =
+            Arc::new(crate::platform::common::disposition_mailbox::DispositionMailbox::default());
         let generation = mailbox.begin();
         let stop = Arc::new(AtomicBool::new(false));
         let active = Arc::new(AtomicBool::new(true));
@@ -1245,7 +1249,9 @@ mod tests {
         let mut hook = HookThread {
             sender: event_tx.clone(),
             receiver: event_rx,
-            mailbox: Arc::new(crate::platform::disposition_mailbox::DispositionMailbox::default()),
+            mailbox: Arc::new(
+                crate::platform::common::disposition_mailbox::DispositionMailbox::default(),
+            ),
             pending: None,
             latest_pointer: Arc::clone(&latest_pointer),
             stop: Arc::new(AtomicBool::new(false)),
@@ -1278,7 +1284,9 @@ mod tests {
         let mut hook = HookThread {
             sender: event_tx,
             receiver: event_rx,
-            mailbox: Arc::new(crate::platform::disposition_mailbox::DispositionMailbox::default()),
+            mailbox: Arc::new(
+                crate::platform::common::disposition_mailbox::DispositionMailbox::default(),
+            ),
             pending: None,
             latest_pointer: Arc::new(
                 crate::platform::latest_point_mailbox::LatestPointMailbox::default(),
