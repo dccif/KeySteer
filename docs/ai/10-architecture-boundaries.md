@@ -15,8 +15,8 @@ KeySteer 保持单 crate，并采用混合模块布局：聚合目录使用 `mod
 
 Engine 只持有 `app::runtime::ConfigurationRepository` trait object；TOML、配置发现、comment-preserving
 store 和平台原子替换由 `app::configuration::ConfigRepository` 适配。库的常规公开面只保留
-二进制启动入口；内部跨模块测试位于 `src/tests/`，独立 benchmark 只能通过 `perf-probe`
-下的 doc-hidden hook 访问实现。
+二进制启动入口；内部跨模块测试位于 `src/tests/`。独立 benchmark 通过 `benchmark-hooks`
+只提升既有生产构造器的可见性，不启用诊断用 `perf-probe`、替代算法或运行参数。
 
 ## Runtime 所有权
 

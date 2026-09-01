@@ -89,7 +89,8 @@ try {
     $ordered = @($cold | Sort-Object)
     $result = [ordered]@{
         target = $Target
-        startup_metric = $(if ($UsePerfProbe) { "backend_started_ms" } else { "config_check_process_ms" })
+        startup_metric = $(if ($UsePerfProbe) { "instrumented_backend_started_ms" } else { "config_check_process_ms" })
+        release_equivalent = -not $UsePerfProbe
         startup_ms = [ordered]@{
             p50 = $ordered[[math]::Floor(($ordered.Count - 1) * 0.50)]
             p95 = $ordered[[math]::Floor(($ordered.Count - 1) * 0.95)]

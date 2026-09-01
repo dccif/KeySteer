@@ -35,8 +35,8 @@ pub(crate) mod platform;
 pub(crate) mod plugins;
 pub(crate) mod support;
 
-/// Feature-gated access for the repository's standalone performance harness.
-#[cfg(feature = "perf-probe")]
+/// Doc-hidden access for the repository's standalone release-profile benchmark.
+#[cfg(feature = "benchmark-hooks")]
 #[doc(hidden)]
 pub mod benchmark {
     pub use crate::api::{

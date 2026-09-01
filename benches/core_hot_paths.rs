@@ -1,4 +1,3 @@
-use std::alloc::System;
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -7,11 +6,6 @@ use keysteer::benchmark::{
     Appearance, Binding, Config, Direction, HostContext, Key, KeyState, Mode, ModeEvent, Point,
     Rect, Screen, UiScanResult, UiScanStatus, UiTarget,
 };
-use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
-
-#[global_allocator]
-static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
-
 const SAMPLES: usize = 20_000;
 const CALLS_PER_SAMPLE: usize = 1_000;
 
@@ -38,98 +32,35 @@ fn benchmark_hint_owned_delivery() -> Result<(), String> {
     };
 
     for targets in [24, 64, 100, 128, 500, 2_000] {
-        let samples = if targets <= 128 { 5_000 } else { 500 };
-        let mut owned = Vec::with_capacity(samples);
-        let mut borrowed = Vec::with_capacity(samples);
-        for sample in 0..samples {
-            if sample % 2 == 0 {
-                owned.push(measure_hint_delivery(&config, &context, targets, true));
-                borrowed.push(measure_hint_delivery(&config, &context, targets, false));
-            } else {
-                borrowed.push(measure_hint_delivery(&config, &context, targets, false));
-                owned.push(measure_hint_delivery(&config, &context, targets, true));
-            }
+        let mut samples = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            samples.push(measure_hint_owned_delivery(&config, &context, targets));
         }
-        owned.sort_unstable();
-        borrowed.sort_unstable();
+        samples.sort_unstable();
         let p = |values: &[u128], percentile: usize| values[(values.len() - 1) * percentile / 100];
         println!(
-            "hint_delivery targets={targets} samples={samples} owned_p50={}ns owned_p95={}ns owned_p99={}ns borrowed_p50={}ns borrowed_p95={}ns borrowed_p99={}ns",
-            p(&owned, 50),
-            p(&owned, 95),
-            p(&owned, 99),
-            p(&borrowed, 50),
-            p(&borrowed, 95),
-            p(&borrowed, 99),
-        );
-        let (owned_allocations, owned_bytes) =
-            measure_hint_delivery_allocations(&config, &context, targets, true);
-        let (borrowed_allocations, borrowed_bytes) =
-            measure_hint_delivery_allocations(&config, &context, targets, false);
-        println!(
-            "hint_delivery_alloc targets={targets} owned_allocations={owned_allocations} owned_bytes={owned_bytes} borrowed_allocations={borrowed_allocations} borrowed_bytes={borrowed_bytes}"
+            "hint_owned_delivery targets={targets} samples={SAMPLES} p50={}ns p95={}ns p99={}ns",
+            p(&samples, 50),
+            p(&samples, 95),
+            p(&samples, 99),
         );
     }
     Ok(())
 }
-fn measure_hint_delivery_allocations(
-    config: &Config,
-    context: &HostContext<'_>,
-    count: usize,
-    owned: bool,
-) -> (usize, usize) {
-    let values = hint_targets(count);
-    let mut mode = keysteer::benchmark::hint(config);
-    black_box(mode.handle(&ModeEvent::Activated { previous: None }, context));
-    let region = Region::new(GLOBAL);
-    if owned {
-        black_box(mode.handle_owned(
-            ModeEvent::UiScanned(UiScanResult {
-                id: 1,
-                targets: values,
-                status: UiScanStatus::Partial,
-            }),
-            context,
-        ));
-    } else {
-        let event = ModeEvent::UiScanned(UiScanResult {
-            id: 1,
-            targets: values,
-            status: UiScanStatus::Partial,
-        });
-        black_box(mode.handle(&event, context));
-    }
-    let change = region.change();
-    (change.allocations, change.bytes_allocated)
-}
 
-fn measure_hint_delivery(
-    config: &Config,
-    context: &HostContext<'_>,
-    count: usize,
-    owned: bool,
-) -> u128 {
+fn measure_hint_owned_delivery(config: &Config, context: &HostContext<'_>, count: usize) -> u128 {
     let values = hint_targets(count);
     let mut mode = keysteer::benchmark::hint(config);
     black_box(mode.handle(&ModeEvent::Activated { previous: None }, context));
     let started = Instant::now();
-    if owned {
-        black_box(mode.handle_owned(
-            ModeEvent::UiScanned(UiScanResult {
-                id: 1,
-                targets: values,
-                status: UiScanStatus::Partial,
-            }),
-            context,
-        ));
-    } else {
-        let event = ModeEvent::UiScanned(UiScanResult {
+    black_box(mode.handle_owned(
+        ModeEvent::UiScanned(UiScanResult {
             id: 1,
             targets: values,
             status: UiScanStatus::Partial,
-        });
-        black_box(mode.handle(&event, context));
-    }
+        }),
+        context,
+    ));
     started.elapsed().as_nanos()
 }
 

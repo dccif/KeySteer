@@ -7,7 +7,8 @@ separate worktrees/target directories; keep only changes meeting the p99 and
 memory gates documented in `docs/ai/08-build-docs-and-tests.md`.
 
 Pass `-UsePerfProbe` only for a binary built with the `perf-probe` feature; this
-records the internal `backend_started` marker. Without that switch, the startup
+records the instrumented internal `backend_started` marker for causal diagnosis,
+not a release performance gate. Without that switch, the startup
 metric is intentionally named `config_check_process_ms`.
 
 The runner deliberately keeps samples in memory until the process exits so

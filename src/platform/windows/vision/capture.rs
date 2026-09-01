@@ -48,26 +48,7 @@ impl SystemOcrLayout {
             .unwrap_or(MAX_SYSTEM_OCR_IN_FLIGHT);
         let grid = system_ocr_grid_for_parallelism(geometry.width, geometry.height, parallelism);
         let tile_count = (grid as usize).saturating_mul(grid as usize);
-        let max_in_flight = {
-            let default = system_ocr_concurrency_for(tile_count, parallelism);
-            #[cfg(feature = "perf-probe")]
-            {
-                let mut selected = default;
-                if let Some(value) = std::env::var_os("KEYSTEER_OCR_IN_FLIGHT") {
-                    let value = value.to_string_lossy();
-                    if value.eq_ignore_ascii_case("unbounded") {
-                        selected = tile_count.max(1);
-                    } else if let Ok(limit) = value.parse::<usize>() {
-                        selected = tile_count.min(limit.max(1)).max(1);
-                    }
-                }
-                selected
-            }
-            #[cfg(not(feature = "perf-probe"))]
-            {
-                default
-            }
-        };
+        let max_in_flight = system_ocr_concurrency_for(tile_count, parallelism);
         Self {
             grid,
             tile_count,

@@ -39,7 +39,7 @@ keysteer/
 - `src/main.rs`：Windows 使用 GUI subsystem；只调用 `app::prepare_console_for_cli()` 和
   `app::run_cli()`。
 - `src/lib.rs`：单 crate 模块入口；KeySteer 的兼容目标是二进制行为而非 Rust 库 ABI/API。
-- `src/tests/`：crate 内部的跨模块集成测试与 feature-gated 性能预算。
+- `src/tests/`：crate 内部的跨模块集成测试与默认忽略、需单线程运行的分配预算。
 - `src/app/bootstrap.rs`：加载配置、创建 backend/engine、注册内置模式和插件、进入事件循环。
 - `src/platform/mod.rs`：唯一的目标平台选择点。
 - `src/platform/common/partial_batcher.rs` / `scan_mailbox.rs`：两端共用的纯计数流式批次与
@@ -97,5 +97,5 @@ macOS：
 ## 独立工具
 
 - `tools/benchmark-windows-dist.ps1`：Windows 整进程启动与资源采样入口；启用
-  `perf-probe` 时读取真实 `backend_started` marker，否则只将 `--check` 计为配置检查耗时。
+  `perf-probe` 时读取插桩后的 `backend_started` marker 供因果诊断，否则只将 `--check` 计为配置检查耗时；两者均不会冒充未插桩 ready 延迟。
   采样期间先保存在内存中，结束后才写 JSON，避免磁盘 I/O 污染测量区间。

@@ -4,13 +4,13 @@
 
 - 通用发布保留目标默认 CPU baseline；workflow 先按 `Cargo.toml` 定向同步 Cargo.lock 中的 `keysteer` 根包版本，不更新第三方依赖，后续测试与打包始终使用 `--locked`。打包从 commit 生成 `SOURCE_DATE_EPOCH`，Windows 发布入口同时传递 `/Brepro`。
 - `tools/build-native.ps1` / `tools/build-native.sh` 仅构建 host architecture，使用独立 `target-native/` 和 `-C target-cpu=native`。
-- `perf-probe` 是 opt-in feature；正式通用发布默认不启用。启用时热路径只向固定有界队列
-  非阻塞写入，文件 I/O 由测试线程执行。mimalloc 在 Windows x64 A/B 中未通过启动 p99
+- `perf-probe` 是 opt-in 诊断 feature；正式通用发布和性能验收均不启用。启用时热路径只向固定有界队列
+  非阻塞写入，文件 I/O 由诊断线程执行。它用于关联生命周期事件，不代表未插桩 release 延迟。mimalloc 在 Windows x64 A/B 中未通过启动 p99
   门禁，未保留依赖或 feature。
 - `.github/workflows/build.yml` 统一承载 CI 与发布且仅手动触发：可选择 Windows/macOS 打包发布或仅运行检查。
 - PGO 不在缺少代表性整进程训练语料时启用；必须先由对应架构原生 runner 产出稳定训练集，并通过同一 p99/内存门禁。
 
-性能变更使用独立 target/worktree A/B：关键 p99 回退不得超过 2%；目标延迟改善至少 3%或内存下降至少 5%才保留。`tools/benchmark-windows-dist.ps1` 记录启动与 working set/private bytes/handles/threads；真实 ready 延迟要求被测二进制启用 `perf-probe`，并通过 `KEYSTEER_PERF_PROBE` 输出生命周期 JSONL marker。普通发行包的 `--check` 结果只标记为 config-check，不冒充 ready 延迟。
+性能变更使用独立 target/worktree A/B：关键 p99 回退不得超过 2%；目标延迟改善至少 3%或内存下降至少 5%才保留。`cargo bench --features benchmark-hooks --bench core_hot_paths` 使用 release profile 和系统分配器；`benchmark-hooks` 只改变内部构造器的可见性，不启用探针、替代算法或运行参数。Normal 与每个 Hint 规模固定使用 20k 样本，精准候选验收还需进行多轮交替 A/B。`tools/benchmark-windows-dist.ps1` 记录进程与资源样本；`-UsePerfProbe` 产生的生命周期 JSONL 仅用于诊断 ready 顺序，并明确标记为 instrumented。普通发行包的 `--check` 结果只标记为 config-check，两者都不能冒充未插桩的真实 ready 延迟。
 
 更新检查保留系统 `native-tls`：Windows x64 同一 release profile 的 A/B 中，Rustls+WebPKI
 使 EXE 从 2,652,672 B 增至 3,573,248 B（+34.7%），同内容 ZIP 从 1,283,773 B 增至
@@ -65,8 +65,8 @@ GitHub 自动生成的 commit/PR notes 之前；版本条目缺失、重复或�
 `tools/benchmark-windows-dist.ps1 [target]` starts the unpacked
 `dist/<target>/KeySteer/KeySteer.exe` and writes in-memory startup/resource
 samples to JSON after the measured interval. With `-UsePerfProbe`, the binary
-must be built with `--features perf-probe` and startup samples are the emitted
-`backend_started` elapsed time. Without it, samples are explicitly named
+must be built with `--features perf-probe` and diagnostic samples are the emitted
+instrumented `backend_started` elapsed time; they are not release performance gates. Without it, samples are explicitly named
 `config_check_process_ms`. The script stops its launched process unless
 `-KeepRunning` is selected. `-Executable` and `-ConfigPath` allow equivalent
 sampling directly from an isolated A/B target directory before packaging.
@@ -152,7 +152,7 @@ GitHub Pages。API 暂时不可用、限流或某个平台资产缺失时，下�
 
 - 源文件 `#[cfg(test)]`：API parse/canonical、geometry、Mode 状态、runtime 路由、平台纯逻辑。
 - `src/tests/integration.rs`：crate 内部的发布配置、默认快捷键、Mode/catalog 与跨平台项目不变量。
-- `src/tests/performance.rs`：feature-gated 内部性能预算；只通过 crate 私有实现运行。
+- `src/tests/performance.rs`：默认编译但 `#[ignore]` 的内部性能预算；只通过 crate 私有生产实现运行。
 - `tests/architecture_dependencies.rs`、`tests/logging_policy.rs`：不导入库实现的源码边界护栏。
 - 文档站 Node tests：轻量模拟模型，不替代 Rust tests。
 - 平台原生窗口/权限/Hook 仍需要对应 OS 的实机验证。
@@ -165,7 +165,8 @@ GitHub Pages。API 暂时不可用、限流或某个平台资产缺失时，下�
 cargo fmt --check
 cargo test --all-features
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --features perf-probe tests::performance::steady_normal_frames_do_not_allocate -- --ignored --exact --test-threads=1
+cargo test tests::performance::steady_normal_frames_do_not_allocate -- --ignored --exact --test-threads=1
+cargo bench --features benchmark-hooks --bench core_hot_paths
 pnpm docs:test
 pnpm docs:check
 pnpm docs:build
@@ -174,13 +175,14 @@ pnpm docs:build
 只改文档 Markdown 时不必运行所有原生 target，但应检查链接/路径和 `git diff --check`。
 # Latency benchmark gates
 
-Build with `--features perf-probe` and use
+For causal startup diagnosis only, build with `--features perf-probe` and use
 `tools/benchmark-windows-hint-cold-start.ps1` for startup offsets
 `0/10/50/100/500 ms`. The offsets and input scheduling live only in the
 external harness; production startup remains event-driven parallel prewarming.
 Samples with `probe_dropped > 0` are invalid. The primary metric is the causal
 physical `hook_received` marker through the first subsequent
-`native_presented`, not `backend_started`.
+`native_presented`, not `backend_started`. Because this binary is instrumented,
+these samples locate latency stages but do not pass or fail release performance gates.
 
 Global `stats_alloc` regions are process-wide. Allocation assertions that need
 exact counts are ignored in ordinary parallel CI and must run alone with

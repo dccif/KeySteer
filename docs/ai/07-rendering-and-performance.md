@@ -39,9 +39,10 @@ Normal 的活动方向使用四位 mask，而不是每个显示帧收集一个 `
 Mode 热路径返回 `CommandBatch`：0/1/2 个命令不分配，第三个命令才 spill 到 `Vec`。
 64 位布局测试限制 `Command <= 64 B`、`CommandBatch <= 128 B`、`ModeEvent <= 112 B`；
 crate 内部的 `src/tests/performance.rs` 用 instrumented allocator 锁定预热后的 Normal frame
-为零分配；用 `cargo test --features perf-probe tests::performance::steady_normal_frames_do_not_allocate -- --ignored --exact --test-threads=1` 单独运行，
-避免并行测试污染全局 allocator 计数。`cargo bench --features perf-probe --bench core_hot_paths`
-通过 doc-hidden benchmark hook 报告 p50/p95/p99。temporary-mode chord 与 keymap 一起
+为零分配，并锁定生产 UI Hint owned delivery 的分配预算；用 `cargo test tests::performance::steady_normal_frames_do_not_allocate -- --ignored --exact --test-threads=1` 单独运行，
+避免并行测试污染全局 allocator 计数。`cargo bench --features benchmark-hooks --bench core_hot_paths`
+使用 release profile 和系统分配器；`benchmark-hooks` 只暴露既有生产构造器，不启用探针、替代算法或运行参数。基准通过该 doc-hidden hook 报告 p50/p95/p99。
+Normal 与每个 Hint 规模固定使用 20k 样本；精准候选验收还需进行多轮交替 A/B。temporary-mode chord 与 keymap 一起
 预编译，物理修饰键查通用别名时使用借用查表，不在按键路径构造临时 `Key`。
 Engine 的稳定 `ModeSlot` 缓存活动模式、pointer interest 和已编译路由；优化只减少分派与
 临时所有权开销，不改变 `CompiledKeymap` 的查找语义。UIHint 点击状态的 inline 2 指同时
@@ -194,10 +195,12 @@ Engine 随后执行已有的一次稳定 z 排序，保证 CPU/GPU 都不会重�
 下降至少 5%，且其他关键 p99 回退不超过 2%时才能进入组合测试；例如 UIA control-type
 位集在常见内置 role 上慢于小常量线性表，已经撤销，不能因理论复杂度更低而保留。
 
-`perf-probe` 启用且设置输出路径时使用固定 4096 项的有界队列；Engine/Hook/renderer 只做
+`perf-probe` 启用且设置输出路径时使用固定有界队列；Engine/Hook/renderer 只做
 非阻塞时间戳入队，JSONL 写入与 flush 在专用探针线程执行。队列满时丢探针记录而不是反压
 输入，shutdown 在非热路径等待写出完成；marker 覆盖 `input_received`、`mode_handled`、
 `commands_ready`、`native_submitted` 和原生 `native_presented`；普通 release 不编译该模块。
+它是因果顺序诊断工具，插桩数据不能作为未插桩 release 的延迟验收结果。性能 A/B 必须使用
+默认 feature 的 release 二进制，或双方都只启用 `benchmark-hooks` 的 `core_hot_paths`，且两侧采用相同构建配置。
 
 macOS 原生探针使用固定 AppKit fixture 子进程，运行：
 `bash tools/benchmark-macos-native.sh 709815c 5`。脚本在临时 detached worktree 构建同一探针，

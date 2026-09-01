@@ -51,8 +51,8 @@ flowchart TB
 | `src/platform/windows/` | Win32 Hook、SendInput、UIA、覆盖层、帧时钟和托盘 | `mod.rs` |
 | `src/platform/macos/` | CGEventTap、Core Graphics、AX、Vision、AppKit 和顶部状态项 | `mod.rs` |
 
-`src/lib.rs` 的常规公开面只保留 `app` 启动入口；其余模块为单 crate 内部边界。`perf-probe`
-feature 下额外提供 doc-hidden benchmark hook。`src/main.rs` 只负责进入 CLI 和启动流程。平台后端由 `cfg(target_os)` 在编译期选择。
+`src/lib.rs` 的常规公开面只保留 `app` 启动入口；其余模块为单 crate 内部边界。独立 benchmark
+通过 `benchmark-hooks` 下的 doc-hidden hook 访问同一生产实现；该 feature 只提升可见性，不启用诊断用 `perf-probe` 或改变运行策略。`src/main.rs` 只负责进入 CLI 和启动流程。平台后端由 `cfg(target_os)` 在编译期选择。
 
 ## 启动流程
 

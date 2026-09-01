@@ -115,6 +115,6 @@ $summary = @($results | Group-Object offset_ms | ForEach-Object {
         p99_ms = if ($values.Count) { $values[[math]::Floor(($values.Count - 1) * 0.99)] } else { $null }
     }
 })
-[ordered]@{ metric = "physical_hook_to_first_native_present"; samples = $results; summary = $summary } |
+[ordered]@{ metric = "instrumented_physical_hook_to_first_native_present"; release_equivalent = $false; samples = $results; summary = $summary } |
     ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $OutputPath -Encoding utf8
 Write-Output $OutputPath

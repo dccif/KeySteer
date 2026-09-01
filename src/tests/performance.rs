@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use keysteer::api::{
     Appearance, Binding, Command, CommandBatch, Direction, HostContext, KeyState, LabelDirection,
-    Mode, Rect,
+    Mode, Rect, Screen, UiScanResult, UiScanStatus, UiTarget,
 };
 use keysteer::api::{Key, ModeEvent, Point};
 use keysteer::config::Config;
@@ -60,6 +60,7 @@ fn steady_normal_frames_do_not_allocate() {
     );
     inline_command_batches_do_not_allocate();
     warmed_compact_hint_assignment_reuses_two_thousand_labels();
+    owned_hint_delivery_stays_within_allocation_budget();
 }
 
 fn inline_command_batches_do_not_allocate() {
@@ -121,5 +122,62 @@ fn warmed_compact_hint_assignment_reuses_two_thousand_labels() {
     assert_eq!(
         change.bytes_allocated, 0,
         "hint relabel allocated bytes: {change:?}"
+    );
+}
+
+fn owned_hint_delivery_stays_within_allocation_budget() {
+    const TARGETS: usize = 2_000;
+    const MAX_ALLOCATIONS: usize = 16;
+    const MAX_BYTES: usize = 840_920;
+
+    let config = Config::default();
+    let palette = config.palette(Appearance::Dark);
+    let screens = [Screen {
+        bounds: Rect::new(0.0, 0.0, 4_000.0, 4_000.0),
+        work_area: Rect::new(0.0, 0.0, 4_000.0, 4_000.0),
+        is_primary: true,
+        scale: 1.0,
+        name: None,
+    }];
+    let context = HostContext {
+        screens: &screens,
+        cursor: Point::default(),
+        focused_app: None,
+        palette: &palette,
+    };
+    let targets = (0..TARGETS)
+        .map(|index| UiTarget {
+            rect: Rect::new(
+                (index % 50) as f64 * 70.0,
+                (index / 50) as f64 * 30.0,
+                64.0,
+                24.0,
+            ),
+            name: format!("Control {index} 设置"),
+            role: "button".into(),
+            native_role: Some("native button".into()),
+        })
+        .collect();
+    let mut mode = keysteer::app::mode_catalog::hint(&config);
+    black_box(mode.handle(&ModeEvent::Activated { previous: None }, &context));
+
+    let region = Region::new(keysteer::TEST_ALLOCATOR);
+    let commands = mode.handle_owned(
+        ModeEvent::UiScanned(UiScanResult {
+            id: 1,
+            targets,
+            status: UiScanStatus::Partial,
+        }),
+        &context,
+    );
+    black_box(&commands);
+    let change = region.change();
+    assert!(
+        change.allocations <= MAX_ALLOCATIONS,
+        "owned Hint delivery exceeded {MAX_ALLOCATIONS} allocations: {change:?}"
+    );
+    assert!(
+        change.bytes_allocated <= MAX_BYTES,
+        "owned Hint delivery exceeded {MAX_BYTES} allocated bytes: {change:?}"
     );
 }

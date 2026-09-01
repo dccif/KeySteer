@@ -1,4 +1,7 @@
-//! Opt-in process markers for end-to-end benchmark runners.
+//! Opt-in process markers for causal diagnostics.
+//!
+//! Enabling this module instruments hot paths. Its timestamps identify where
+//! latency occurs, but they are not release-equivalent performance results.
 
 #[cfg(feature = "perf-probe")]
 mod enabled {

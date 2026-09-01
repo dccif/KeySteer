@@ -49,6 +49,11 @@ toml_edit = "0.25"
 ureq = { version = "3.3", default-features = false, features = ["json", "native-tls"] }
 [features]
 default = []
+# Exposes existing production constructors to the standalone benchmark. It
+# must not enable probes, alternate algorithms, or runtime tuning.
+benchmark-hooks = []
+# Instrumented lifecycle diagnostics only. Release performance benchmarks must
+# not enable this feature.
 perf-probe = []
 
 # ---------------------------------------------------------------------------
@@ -185,7 +190,7 @@ stats_alloc = "0.1.10"
 [[bench]]
 name = "core_hot_paths"
 harness = false
-required-features = ["perf-probe"]
+required-features = ["benchmark-hooks"]
 
 [profile.release]
 opt-level = 3
