@@ -171,9 +171,11 @@ GitHub 不可用时从 jsDelivr 版本元数据选择最高稳定 SemVer。回�
 drop request-scoped Agent 及原生 TLS 连接。Windows 提示在线程内使用同线程临时 owner，
 关闭后销毁 owner 并结束线程；macOS 提示保持非 modal，OK action 关闭窗口并释放唯一 retained
 Alert。不得累积更新 worker、弹窗或连接。它不是启动任务，也没有定时轮询。
-Windows 使用更新器专用的已签名原始 EXE，macOS 继续使用 ZIP；公共下载器按目标平台检查
-`MZ`/ZIP 文件头、GitHub 提供的大小和 SHA-256。Windows 用户确认安装后，平台私有
-`update_installer` 校验大小、PE 架构、Windows 版本资源和 Authenticode 文件摘要，并要求
+Windows 和 macOS 都下载各自架构的发布 ZIP；公共下载器检查 ZIP 文件头、GitHub 提供的大小
+和 SHA-256。Windows 用户确认安装后，平台私有 `update_installer` 只从中央目录声明的固定
+`KeySteer/KeySteer.exe` 路径提取候选，兼容打包工具产生的 `/` 与 `\` 分隔符，并严格校验 ZIP
+边界、重复项、加密/压缩方法、长度和 CRC-32。解压输出受大小上限约束，不允许目录遍历或
+ZIP bomb。之后校验 PE 架构、Windows 版本资源和 Authenticode 文件摘要，并要求
 候选与当前进程的叶代码签名证书 SHA-256 指纹一致。完整系统信任链成功时直接接受；自签证书
 仅允许 `CERT_E_UNTRUSTEDROOT` 这一种失败，并且仍须与当前 EXE 指纹相同，其他摘要、过期、
 撤销或链错误全部拒绝。下载文件验证通过后以受限大小复制到安装目录同卷临时文件，并对暂存

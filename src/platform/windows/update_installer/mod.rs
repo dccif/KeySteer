@@ -35,6 +35,7 @@ const READY_WAIT: Duration = Duration::from_secs(15);
 const ARM_WAIT: Duration = Duration::from_secs(5);
 const TEMP_DIRECTORY: &str = "KeySteer";
 const HELPER_PREFIX: &str = "update-helper-";
+const CANDIDATE_PREFIX: &str = "update-candidate-";
 static NONCE: AtomicU64 = AtomicU64::new(0);
 
 struct OwnedHandle(HANDLE);
@@ -64,8 +65,9 @@ pub(super) fn prepare_and_launch(download_path: &Path, latest: &str) -> Result<(
             temp_dir.display()
         )
     })?;
-    cleanup_old_helpers(&temp_dir);
+    cleanup_old_update_files(&temp_dir);
     let helper = temp_dir.join(format!("{HELPER_PREFIX}{nonce}.exe"));
+    let extracted = temp_dir.join(format!("{CANDIDATE_PREFIX}{nonce}.exe"));
 
     let result = (|| {
         let current_signer = signature::verified_signer(&target).map_err(|error| {
@@ -73,15 +75,16 @@ pub(super) fn prepare_and_launch(download_path: &Path, latest: &str) -> Result<(
                 "Automatic installation requires the running KeySteer executable to have a valid code signature. {error}"
             )
         })?;
-        candidate::validate_machine(download_path)?;
-        candidate::validate_version(download_path, &latest)?;
-        let downloaded_signer = signature::verified_signer(download_path)?;
+        candidate::extract_archive_executable(download_path, &extracted)?;
+        candidate::validate_machine(&extracted)?;
+        candidate::validate_version(&extracted, &latest)?;
+        let downloaded_signer = signature::verified_signer(&extracted)?;
         if downloaded_signer != current_signer {
             return Err(
                 "the downloaded update is signed by a different publisher certificate".into(),
             );
         }
-        candidate::stage(download_path, &staged)?;
+        candidate::stage(&extracted, &staged)?;
         candidate::validate_machine(&staged)?;
         candidate::validate_version(&staged, &latest)?;
         let candidate_signer = signature::verified_signer(&staged)?;
@@ -98,6 +101,7 @@ pub(super) fn prepare_and_launch(download_path: &Path, latest: &str) -> Result<(
         })?;
         launch_helper(&helper, &target, &staged, &backup, download_path, &latest)
     })();
+    let _ = fs::remove_file(&extracted);
     if result.is_err() {
         let _ = fs::remove_file(&staged);
         let _ = fs::remove_file(&helper);
@@ -364,7 +368,7 @@ fn replace_file(target: &Path, replacement: &Path, backup: &Path) -> Result<(), 
     .map_err(|error| error.to_string())
 }
 
-fn cleanup_old_helpers(directory: &Path) {
+fn cleanup_old_update_files(directory: &Path) {
     let Ok(entries) = fs::read_dir(directory) else {
         return;
     };
@@ -376,7 +380,10 @@ fn cleanup_old_helpers(directory: &Path) {
         if !path
             .file_name()
             .and_then(OsStr::to_str)
-            .is_some_and(|name| name.starts_with(HELPER_PREFIX) && name.ends_with(".exe"))
+            .is_some_and(|name| {
+                (name.starts_with(HELPER_PREFIX) || name.starts_with(CANDIDATE_PREFIX))
+                    && name.ends_with(".exe")
+            })
         {
             continue;
         }
@@ -437,7 +444,7 @@ mod tests {
             OsString::from("C:\\KeySteer.exe"),
             OsString::from("C:\\staged.exe"),
             OsString::from("C:\\backup.exe"),
-            OsString::from("C:\\update.exe"),
+            OsString::from("C:\\update.zip"),
             OsString::from("0.9.13"),
             OsString::from("--"),
             OsString::from("--config"),

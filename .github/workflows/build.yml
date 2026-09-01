@@ -103,9 +103,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
-          path: |
-            dist/${{ matrix.target }}/*.zip
-            dist/${{ matrix.target }}/*.exe
+          path: dist/${{ matrix.target }}/*.zip
           if-no-files-found: error
           retention-days: 30
 
@@ -205,7 +203,6 @@ jobs:
         shell: bash
         run: |
           test "$(find release-assets -maxdepth 1 -name '*.zip' | wc -l)" -eq 4
-          test "$(find release-assets -maxdepth 1 -name '*.exe' | wc -l)" -eq 2
           test "$(find release-assets -maxdepth 1 -name '*.sha256' | wc -l)" -eq 0
           find release-assets -maxdepth 1 -type f -printf '%f\n' | sort
 
@@ -235,5 +232,4 @@ jobs:
             "${prerelease_flag[@]}" \
             --generate-notes \
             --notes "$(cat release-body.md)" \
-            release-assets/*.zip \
-            release-assets/*.exe
+            release-assets/*.zip

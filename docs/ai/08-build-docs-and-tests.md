@@ -62,9 +62,9 @@ Release 汇总 job 会运行同一提取器，确保版本条目缺失时不发�
    候选程序的叶证书指纹，因此最终用户也不需要安装 CER。
 3. 复制图标已嵌入、GUI-subsystem 的 `KeySteer.exe` 与
    `keysteer.default.toml` 到 `dist/<target>/KeySteer/`。
-4. 生成包含该目录的 `dist/<target>/KeySteer-v<version>-<target>.zip`，并把相同的已签名 EXE
-   复制为 `KeySteer-v<version>-<target>.exe`，仅供自动更新器直接下载和验证。
-5. 不生成独立 checksum 附件；Windows 每个架构发布便携 ZIP 和更新器 EXE。
+4. 生成包含该目录的 `dist/<target>/KeySteer-v<version>-<target>.zip`；自动更新器下载同一个
+   便携 ZIP，严格提取其中已签名的 `KeySteer.exe` 后再验证和安装。
+5. 不生成独立 EXE 或 checksum 附件；Windows 每个架构只发布一个 ZIP。
 
 支持 `x86_64-pc-windows-msvc`、`aarch64-pc-windows-msvc`。
 GitHub Windows packaging job 从 `WINDOWS_SIGNING_PFX_BASE64` 与
@@ -84,7 +84,7 @@ EKU 的可导出自签名 X.509 证书，并输出被 gitignore 的 PFX/CER。PF
 测试证书和随机密码 PFX，不加入用户信任库；它通过与 GitHub Secret 相同的 PFX 路径验证打包，
 再签名两个临时 EXE 并运行 Rust `WinVerifyTrust`
 同证书测试，并确认被篡改的已签 EXE 会拒绝。传入 `-VerifyPackaging` 时由 package script 仅在
-工作区 `tmp/` 的隔离输出根完成构建、签名及 x64 ZIP/更新器 EXE 验证，不污染可发布的
+工作区 `tmp/` 的隔离输出根完成构建、签名及 x64 ZIP 内更新候选 EXE 验证，不污染可发布的
 `dist/`；`finally` 总会删除测试证书和所有临时文件。
 
 `tools/benchmark-windows-dist.ps1 [target]` starts the unpacked
@@ -117,7 +117,7 @@ sampling directly from an isolated A/B target directory before packaging.
 根包 lockfile 版本、安装目标、调用平台 package script 并上传各目标 artifact。它不再提供 `checks` 入口，也不在 runner 上运行
 fmt、test、Clippy、性能或文档构建；这些检查必须在推送前本地完成。`publish=false` 时按
 `platform` 构建 Windows、macOS 或全部目标并只保留 artifact；`publish=true` 时忽略平台筛选、
-强制生成四个平台 ZIP 和两个 Windows 更新器 EXE，防止不完整发布。`release_type=release`
+强制生成四个平台 ZIP，防止不完整发布。`release_type=release`
 创建 `v<version>`，`pre-release` 创建带 run number 的独立 tag 并标记为 GitHub pre-release。
 Windows x64/ARM64 与 macOS Apple Silicon/Intel 分别作为四个 matrix runner 并行编译；不同目标
 仍生成独立机器码和包，但不在同一平台 job 内串行等待。matrix 会略增固定 setup 和总计费分钟，
@@ -125,7 +125,8 @@ Windows x64/ARM64 与 macOS Apple Silicon/Intel 分别作为四个 matrix runner
 版本和 Cargo.lock 缓存 Cargo registry 与 release 构建产物；首次冷构建不受益，后续发布复用
 依赖。package step 有 30 分钟硬上限，Windows 签名流程在签名、证书读取和 SignTool 验证边界
 分别输出进度，信任组件异常时可定位且不会无限占用 runner。
-原始 EXE 避免运行时引入 ZIP/DEFLATE 解析依赖；便携 ZIP 仍供用户手动下载。macOS 证书和
+Windows 自动更新复用便携 ZIP；运行时复用已有 `miniz_oxide` 做有界 DEFLATE 解压，不新增 ZIP
+依赖。macOS 证书和
 notarization 通过 secrets 注入。创建 Release 时把 `.github/release-notes.md` 的固定安装
 提示置于 GitHub 自动生成的变更说明之前；该文件必须保留未 notarize macOS 下载包所需的
 `sudo xattr -cr /Applications/KeySteer.app` 指引和来源安全提示。

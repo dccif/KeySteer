@@ -153,7 +153,7 @@ else {
 $dist = Join-Path $resolvedOutputRoot $Target
 $payload = Join-Path $dist "KeySteer"
 $archive = Join-Path $dist "KeySteer-v$version-$Target.zip"
-$updateExecutable = Join-Path $dist "KeySteer-v$version-$Target.exe"
+$staleUpdateExecutable = Join-Path $dist "KeySteer-v$version-$Target.exe"
 $legacyArchive = Join-Path $dist "KeySteer-$Target.zip"
 $staleChecksums = @("$archive.sha256", "$legacyArchive.sha256")
 
@@ -161,7 +161,7 @@ New-Item -ItemType Directory -Force -Path $dist | Out-Null
 if (Test-Path -LiteralPath $payload) {
     Remove-Item -LiteralPath $payload -Recurse -Force
 }
-foreach ($path in @($archive, $updateExecutable, $legacyArchive) + $staleChecksums) {
+foreach ($path in @($archive, $staleUpdateExecutable, $legacyArchive) + $staleChecksums) {
     if (Test-Path -LiteralPath $path) {
         Remove-Item -LiteralPath $path -Force
     }
@@ -169,10 +169,8 @@ foreach ($path in @($archive, $updateExecutable, $legacyArchive) + $staleChecksu
 
 New-Item -ItemType Directory -Path $payload | Out-Null
 Copy-Item -LiteralPath $binary -Destination (Join-Path $payload "KeySteer.exe")
-Copy-Item -LiteralPath $binary -Destination $updateExecutable
 Copy-Item -LiteralPath $defaultConfig -Destination (Join-Path $payload "keysteer.default.toml")
 Compress-Archive -LiteralPath $payload `
     -DestinationPath $archive -CompressionLevel Optimal
 
 Write-Output $archive
-Write-Output $updateExecutable

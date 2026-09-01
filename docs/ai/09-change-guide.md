@@ -18,7 +18,7 @@
 | 修改托盘/顶部状态图标或开机启动 | 两端 `status_item.rs`/`autostart.rs` | `BackendEvent`、打包应用身份、平台 backend 生命周期 |
 | 修改 Windows 自动更新/签名 | `platform/windows/update_installer/`, `packaging/windows/` | 有序 Quit、同签名者、同卷 ReplaceFile、ready/rollback、CI secrets |
 | 修改配置路径 | `app/paths.rs`, `config::discover` | packaged app 与 portable tests、README |
-| 修改打包 | `packaging/<os>/`、`build.rs` | CI + release matrix、图标/签名、平台 ZIP + Windows 更新器 EXE |
+| 修改打包 | `packaging/<os>/`、`build.rs` | CI + release matrix、图标/签名、每个平台架构一个 ZIP |
 | 修改网页模拟器 | `docs/.vitepress/components/ConfigStudio.tsx` | style controls、Node tests、typecheck/build |
 
 ## 跨层改动顺序
