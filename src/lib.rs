@@ -44,7 +44,6 @@ pub mod benchmark {
         LabelDirection, Mode, ModeEvent, Point, Rect, Screen, UiScanResult, UiScanStatus, UiTarget,
     };
     pub use crate::config::Config;
-    pub use crate::modes::hint::labeling::{Hint, assign_into};
 
     pub fn hint(config: &Config) -> crate::modes::HintMode {
         crate::app::mode_catalog::hint(config)

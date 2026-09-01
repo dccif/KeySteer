@@ -1577,7 +1577,7 @@ mod tests {
             &env.ctx(),
         );
         let label = mode.session.hints[0].label.clone();
-        let out = press(&mut mode, &env, &label);
+        let out = press(&mut mode, &env, label.as_str());
         assert!(
             out.iter()
                 .any(|command| matches!(command, Command::WarpPointer { .. }))
@@ -1622,10 +1622,14 @@ mod tests {
                 mode.session
                     .hints
                     .iter()
-                    .filter(|hint| hint.label.starts_with(&prefix))
+                    .filter(|hint| hint.label.as_str().starts_with(&prefix))
                     .count()
                     > 1
-                    && mode.session.hints.iter().all(|hint| hint.label != prefix)
+                    && mode
+                        .session
+                        .hints
+                        .iter()
+                        .all(|hint| hint.label.as_str() != prefix)
             })
             .expect("test data should produce a partial prefix");
 
@@ -1664,10 +1668,14 @@ mod tests {
                 mode.session
                     .hints
                     .iter()
-                    .filter(|hint| hint.label.starts_with(&prefix))
+                    .filter(|hint| hint.label.as_str().starts_with(&prefix))
                     .count()
                     > 1
-                    && mode.session.hints.iter().all(|hint| hint.label != prefix)
+                    && mode
+                        .session
+                        .hints
+                        .iter()
+                        .all(|hint| hint.label.as_str() != prefix)
             })
             .expect("test data should produce a partial prefix");
 
@@ -2303,10 +2311,14 @@ mod tests {
                 mode.session
                     .hints
                     .iter()
-                    .filter(|hint| hint.label.starts_with(&prefix))
+                    .filter(|hint| hint.label.as_str().starts_with(&prefix))
                     .count()
                     > 1
-                    && mode.session.hints.iter().all(|hint| hint.label != prefix)
+                    && mode
+                        .session
+                        .hints
+                        .iter()
+                        .all(|hint| hint.label.as_str() != prefix)
             })
             .expect("test data should provide a partial label prefix");
         press(&mut mode, &env, &prefix.to_string());
@@ -2445,7 +2457,7 @@ mod tests {
         let label = mode.session.hints[1].label.clone();
         let expected = mode.session.scanned[1].rect.center();
         let mut out = Vec::new();
-        for ch in label.chars() {
+        for ch in label.as_str().chars() {
             out = press(&mut mode, &env, &ch.to_string());
         }
         assert!(
@@ -2908,7 +2920,7 @@ mod tests {
             .collect();
         deliver(&mut mode, &env, targets);
 
-        let first = mode.session.hints[0].label.chars().next().unwrap();
+        let first = mode.session.hints[0].label.as_str().chars().next().unwrap();
         press(&mut mode, &env, &first.to_string());
         let before = mode.input.text().to_string();
 
@@ -2921,7 +2933,7 @@ mod tests {
                     .session
                     .hints
                     .iter()
-                    .any(|h| h.label.starts_with(&format!("{before}{c}")))
+                    .any(|h| h.label.as_str().starts_with(&format!("{before}{c}")))
             })
             .copied();
 
@@ -3031,7 +3043,7 @@ mod tests {
         activate(&mut mode, &env);
         deliver(&mut mode, &env, vec![target("Save", 100.0)]);
         let label = mode.session.hints[0].label.clone();
-        let selected = press(&mut mode, &env, &label);
+        let selected = press(&mut mode, &env, label.as_str());
         assert!(selected.iter().any(|command| matches!(
             command,
             Command::FinishMode {

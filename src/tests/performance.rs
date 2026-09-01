@@ -8,7 +8,7 @@ use keysteer::api::{
 };
 use keysteer::api::{Key, ModeEvent, Point};
 use keysteer::config::Config;
-use keysteer::modes::hint::labeling::assign_into;
+use keysteer::modes::hint::labeling::assign_compact_into;
 use stats_alloc::Region;
 
 #[test]
@@ -59,7 +59,7 @@ fn steady_normal_frames_do_not_allocate() {
         "steady frames allocated bytes: {change:?}"
     );
     inline_command_batches_do_not_allocate();
-    warmed_hint_assignment_reuses_two_thousand_labels();
+    warmed_compact_hint_assignment_reuses_two_thousand_labels();
 }
 
 fn inline_command_batches_do_not_allocate() {
@@ -81,7 +81,7 @@ fn inline_command_batches_do_not_allocate() {
     );
 }
 
-fn warmed_hint_assignment_reuses_two_thousand_labels() {
+fn warmed_compact_hint_assignment_reuses_two_thousand_labels() {
     const TARGETS: usize = 2_000;
     let alphabet: Vec<char> = "arstneioqwfpjluy".chars().collect();
     let targets = (0..TARGETS).map(|index| {
@@ -92,7 +92,7 @@ fn warmed_hint_assignment_reuses_two_thousand_labels() {
     });
     let mut output = Vec::new();
     assert!(
-        assign_into(
+        assign_compact_into(
             &mut output,
             targets.clone(),
             &alphabet,
@@ -105,7 +105,7 @@ fn warmed_hint_assignment_reuses_two_thousand_labels() {
     let region = Region::new(keysteer::TEST_ALLOCATOR);
     for _ in 0..100 {
         assert!(
-            assign_into(
+            assign_compact_into(
                 &mut output,
                 targets.clone(),
                 &alphabet,
