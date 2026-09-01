@@ -8,11 +8,11 @@ KeySteer 保持单 crate，并采用混合模块布局：聚合目录使用 `mod
 ## 配置编译
 
 `config::ConfigFile` 只代表 TOML 文档、默认值和校验。`app::configuration::compile` 是唯一编译
-边界，产出与 TOML 无关的 `runtime::RuntimePlan`：Engine settings、明暗 palette、路由、应用
+边界，产出与 TOML 无关的 `app::runtime::RuntimePlan`：Engine settings、明暗 palette、路由、应用
 override，以及已经实例化的 Mode/Plugin。`app::mode_catalog` 是唯一内置 Mode 注册点，每个
 构造函数只接收自己的强类型 `Settings`。
 
-Engine 只持有 `runtime::ConfigurationRepository` trait object；TOML、配置发现、comment-preserving
+Engine 只持有 `app::runtime::ConfigurationRepository` trait object；TOML、配置发现、comment-preserving
 store 和平台原子替换由 `app::configuration::ConfigRepository` 适配。库的常规公开面只保留
 二进制启动入口；内部跨模块测试位于 `src/tests/`，独立 benchmark 只能通过 `perf-probe`
 下的 doc-hidden hook 访问实现。

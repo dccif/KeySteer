@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use crate::api::{Appearance, Binding, Mode, ModeId, ModeIndicator, Palette, Plugin};
 
@@ -68,6 +69,26 @@ pub struct RuntimePlan {
     pub routes: BTreeMap<ModeId, ModeRoute>,
     pub modes: Vec<Box<dyn Mode>>,
     pub plugins: Vec<Box<dyn Plugin>>,
+}
+
+/// A compiled candidate and the repository state that produced it. The engine
+/// installs both only after accepting the plan.
+pub struct ConfigurationCandidate {
+    pub plan: RuntimePlan,
+    pub repository: Box<dyn ConfigurationRepository>,
+    pub source_path: Option<PathBuf>,
+}
+
+/// Runtime-owned port for configuration persistence. Implementations live at
+/// the application boundary, so the engine knows neither TOML nor ConfigFile.
+pub trait ConfigurationRepository: Send {
+    fn source_text(&self) -> Result<String, String>;
+
+    fn source_path(&self) -> Option<PathBuf>;
+
+    fn reload_candidate(&self) -> Result<ConfigurationCandidate, String>;
+
+    fn set_candidate(&self, path: &str, value: &str) -> Result<ConfigurationCandidate, String>;
 }
 
 impl RuntimePlan {

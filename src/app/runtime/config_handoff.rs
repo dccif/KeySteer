@@ -52,7 +52,7 @@ mod tests {
 
     #[test]
     fn shipped_configuration_fits_the_browser_handoff() {
-        let source = include_str!("../../keysteer.default.toml");
+        let source = include_str!("../../../keysteer.default.toml");
         let url = url_for_config(source);
         assert!(url.starts_with(&format!("{SIMULATOR_URL}#ks-config=v1.")));
         assert!(url.len() <= SIMULATOR_URL.len() + 1 + MAX_FRAGMENT_BYTES);

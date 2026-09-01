@@ -143,7 +143,7 @@ after_click = "..."
 - 使用同目录临时文件和由组合根注入的平台原子 replace 写入；`config` 不依赖平台模块。
 - 无效修改不会破坏最后一个有效配置。
 
-`runtime::ConfigurationRepository` 是 Engine 唯一认识的配置端口，具体的 TOML/store/discovery
+`app::runtime::ConfigurationRepository` 是 Engine 唯一认识的配置端口，具体的 TOML/store/discovery
 适配器在 `app::configuration`。它把完整候选编译成 `RuntimePlan` 后才交给 Engine。无效候选完全无副作用；
 有效候选替换全部 Mode/Plugin 实例、释放合成输入并进入 Idle。Mode 只持有自己的强类型
 Settings，不存在 `ConfigReloaded` 广播。

@@ -67,7 +67,7 @@ Engine 的 Frame、指针、按键等通用热路径直接调用借用式 `Mode:
 
 ## Engine 拥有什么
 
-`src/runtime/mod.rs::Engine` 的状态分为几组：
+`src/app/runtime/mod.rs::Engine` 的状态分为几组：
 
 - 计划/主题：`EngineSettings`、`PaletteSet`、路由和当前 `Appearance`；Mode 不读取 TOML。
 - 模式：稳定的连续 `ModeRegistry`/`ModeSlot`、缓存的活动 slot、modal stack、插件默认绑定

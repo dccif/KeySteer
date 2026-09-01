@@ -3,14 +3,14 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crate::api::{Appearance, ModeId};
-use crate::config::{AppOverride, Bindings, ConfigFile, ConfigStore, UiHintAppOverride};
 #[cfg(test)]
-use crate::runtime::Engine;
-use crate::runtime::{
+use super::runtime::Engine;
+use super::runtime::{
     AppRouteOverride, ConfigurationCandidate, ConfigurationRepository, DebugSettings,
     EngineSettings, ModeRoute, PaletteSet, RuntimePlan,
 };
+use crate::api::{Appearance, ModeId};
+use crate::config::{AppOverride, Bindings, ConfigFile, ConfigStore, UiHintAppOverride};
 
 #[derive(Clone)]
 pub(crate) struct ConfigRepository {

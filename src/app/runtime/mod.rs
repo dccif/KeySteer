@@ -13,14 +13,13 @@
 
 mod command_executor;
 mod config_handoff;
-mod configuration;
 mod input_router;
 mod overlay_coordinator;
 mod plan;
 
-pub use configuration::{ConfigurationCandidate, ConfigurationRepository};
 pub use plan::{
-    AppRouteOverride, DebugSettings, EngineSettings, ModeRoute, PaletteSet, RuntimePlan,
+    AppRouteOverride, ConfigurationCandidate, ConfigurationRepository, DebugSettings,
+    EngineSettings, ModeRoute, PaletteSet, RuntimePlan,
 };
 
 #[cfg(test)]

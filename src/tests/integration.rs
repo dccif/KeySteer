@@ -10,8 +10,8 @@ use keysteer::api::{
     Appearance, Binding, Command, Direction, HostContext, KeyChord, Mode, ModeEvent, ModeId, Point,
     Rect, Screen, UiScanStrategy,
 };
+use keysteer::app::runtime::Engine;
 use keysteer::config::{Config, LifecycleAction, TargetingLifecycle};
-use keysteer::runtime::Engine;
 
 fn screens() -> Vec<Screen> {
     vec![Screen {
@@ -102,7 +102,7 @@ fn macos_top_status_item_stays_inside_the_backend() {
     let status_item = include_str!("../../src/platform/macos/status_item.rs");
     let backend = include_str!("../../src/platform/macos/mod.rs");
     let bootstrap = include_str!("../../src/app/bootstrap.rs");
-    let runtime = include_str!("../../src/runtime/mod.rs");
+    let runtime = include_str!("../../src/app/runtime/mod.rs");
     let workspace = include_str!("../../src/platform/macos/workspace.rs");
     let build = include_str!("../../build.rs");
 

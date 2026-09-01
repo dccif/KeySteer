@@ -134,7 +134,7 @@ fn unsafe_surface_does_not_regress() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn portable_layers_are_safe_rust() -> Result<(), Box<dyn std::error::Error>> {
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    for relative in ["api", "app", "config", "domain", "modes", "plugins"] {
+    for relative in ["api", "app", "config", "modes", "plugins", "support"] {
         let mut files = Vec::new();
         rust_files(&source_root.join(relative), &mut files)?;
         for path in files {

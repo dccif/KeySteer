@@ -43,8 +43,8 @@ flowchart TB
 | --- | --- | --- |
 | `src/api/` | 跨平台公共协议：按键、绑定、命令、事件、覆盖层、插件和后端 trait | `api/mod.rs`、`api/binding.rs`、`api/command.rs` |
 | `src/config/` | TOML 反序列化、默认值、校验、主题、继承和可提交 store | `config/mod.rs`、`config/store.rs` |
-| `src/app/` | CLI、路径、配置编译、Mode catalog 和启动组装 | `app/bootstrap.rs`、`app/configuration.rs` |
-| `src/runtime/` | Engine、RuntimePlan、输入/调度/覆盖层协作者 | `runtime/mod.rs`、`runtime/plan.rs` |
+| `src/app/` | CLI、路径、配置编译、Mode catalog、runtime 和启动组装 | `app/bootstrap.rs`、`app/configuration.rs` |
+| `src/app/runtime/` | 应用私有 Engine、RuntimePlan 与输入/调度/覆盖层协作者 | `app/runtime/mod.rs`、`app/runtime/plan.rs` |
 | `src/modes/` | `idle`、`normal`、`grid`、`recursive_grid`、`ui_hint` 状态机 | 对应的 `.rs` 文件 |
 | `src/modes/hint/` | UI Hint 私有标签分配、匹配和视觉分层算法 | `labeling.rs`、`matching.rs`、`view.rs` |
 | `src/plugins/` | 内置插件；也是插件的参考实现 | `builtin/screen_selector.rs` |

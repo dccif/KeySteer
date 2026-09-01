@@ -83,7 +83,7 @@ ModeEvent + HostContext → Plugin 状态机 → Vec<Command>
 
 1. **解析**：在 `src/api/binding.rs` 添加语法、参数数量和错误信息。
 2. **公共命令**：在 `src/api/command.rs` 添加平台无关的 `Command` 变体。
-3. **执行**：在 `src/runtime/command_executor.rs` 的运行时命令执行路径处理该命令；涉及原生能力时调用 `Backend`。
+3. **执行**：在 `src/app/runtime/command_executor.rs` 的运行时命令执行路径处理该命令；涉及原生能力时调用 `Backend`。
 4. **验证和文档**：增加单元/集成测试，更新 `keysteer.default.toml`、[模式与动作](/reference/modes-and-actions)、模拟器动作列表和 AI 手册。
 
 绑定解析有意在加载阶段拒绝拼写错误。不要把未知输入静默当成“什么都不做”，否则用户只能在运行时猜原因。

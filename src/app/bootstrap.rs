@@ -3,9 +3,9 @@
 use crate::api::Key;
 use crate::config::{Config, ConfigStore};
 use crate::platform;
-use crate::runtime::Engine;
 
 use super::cli::CliOptions;
+use super::runtime::Engine;
 
 pub(crate) fn run(args: CliOptions) -> Result<(), String> {
     crate::support::perf_probe::mark("bootstrap_started");

@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | 新增/修改动作 verb | `src/api/binding.rs` | `command_executor.rs`、default TOML、配置文档、模拟器分类 |
 | 修改按键匹配/别名 | `src/api/input.rs`, `src/config/mod.rs` | `input_router.rs`、integration tests、网页 `bindings.ts` |
-| 修改模式切换 | `src/runtime/mod.rs` | `command_executor.rs`、所有 Mode 的 Activated/Deactivated |
+| 修改模式切换 | `src/app/runtime/mod.rs` | `command_executor.rs`、所有 Mode 的 Activated/Deactivated |
 | 修改 Finish/click 语义 | `src/modes/targeting.rs` + targeting Mode | 生命周期验证、Engine semantic Clicked tests |
 | 修改 Normal 移动 | `src/modes/normal.rs` | 两端 frame clock、pointer config、实机手感 |
 | 修改 Grid 绘制 | `src/modes/grid.rs` | overlay API、两端 overlay、default style |

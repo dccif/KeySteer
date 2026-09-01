@@ -33,8 +33,6 @@ pub(crate) mod modes;
 pub(crate) mod platform;
 #[allow(dead_code, unused_imports)]
 pub(crate) mod plugins;
-#[allow(dead_code, unused_imports)]
-pub(crate) mod runtime;
 pub(crate) mod support;
 
 /// Feature-gated access for the repository's standalone performance harness.

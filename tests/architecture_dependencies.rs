@@ -68,7 +68,7 @@ fn config_owns_documents_without_reaching_outward() -> std::io::Result<()> {
 #[test]
 fn runtime_consumes_only_api_and_support() -> std::io::Result<()> {
     assert_forbidden(
-        "src/runtime",
+        "src/app/runtime",
         &["app", "config", "modes", "platform", "plugins"],
     )
 }
