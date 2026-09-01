@@ -6,12 +6,12 @@
 | --- | --- | --- |
 | 新增/修改动作 verb | `src/api/binding.rs` | `command_executor.rs`、default TOML、配置文档、模拟器分类 |
 | 修改按键匹配/别名 | `src/api/input.rs`, `src/config/mod.rs` | `input_router.rs`、integration tests、网页 `bindings.ts` |
-| 修改模式切换 | `runtime/mod.rs` | `command_executor.rs`、所有 Mode 的 Activated/Deactivated |
-| 修改 Finish/click 语义 | `src/modes/mod.rs` + targeting Mode | 生命周期验证、Engine semantic Clicked tests |
+| 修改模式切换 | `src/runtime/mod.rs` | `command_executor.rs`、所有 Mode 的 Activated/Deactivated |
+| 修改 Finish/click 语义 | `src/modes/targeting.rs` + targeting Mode | 生命周期验证、Engine semantic Clicked tests |
 | 修改 Normal 移动 | `src/modes/normal.rs` | 两端 frame clock、pointer config、实机手感 |
 | 修改 Grid 绘制 | `src/modes/grid.rs` | overlay API、两端 overlay、default style |
 | 修改 Recursive Grid | `recursive_grid.rs` | layers/min-size/Backspace/keep tests、网页预览 |
-| 修改 UI Hint 标签逻辑 | `modes/hint.rs`, `domain/hints/` | 两端扫描终态/Partial、retry tests |
+| 修改 UI Hint 标签逻辑 | `modes/hint.rs`, `modes/hint/` | 两端扫描终态/Partial、retry tests |
 | 修改 Windows 扫描 | `platform/windows/accessibility.rs` | COM thread、popup/Z-order、timeout、实机 UIA |
 | 修改 macOS 扫描 | `platform/macos/ui_scan.rs` + AX/Vision | 权限、单 worker、Objective-C bridge、macOS 14 |
 | 修改覆盖层性能 | 两端 `overlay.rs` | `OverlayScene` equality、dismiss 内存、DPI/Retina |
@@ -71,6 +71,7 @@
 - `deny_unknown_fields` 保持 typo 可见。
 - 一个 TOML 可跨平台解析；平台字段不能在另一目标意外生效。
 - macOS `.app` 不写 bundle；portable 不写用户全局目录。
+- 新 Mode 只新增强类型 Settings、可选 TOML section 和 `app::mode_catalog` 项；Engine 不增加 Mode-id match。
 - 正式 artifacts 必须来自 packaging script，保持图标、应用身份和签名链。
 
 ## 验证强度

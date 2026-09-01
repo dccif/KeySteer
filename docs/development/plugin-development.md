@@ -16,6 +16,8 @@ pub trait Mode: Send {
     fn display_name(&self) -> String { /* 默认: id 中的下划线替换为空格 */ }
     fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch;
     fn captures_keyboard(&self) -> bool { true }              // 是否独占键盘
+    fn claims_key(&self, _key: &Key) -> bool { false }        // 自己消费的原始字符
+    fn wants_pointer_events(&self) -> bool { true }            // 是否接收高频指针事件
     fn indicator_color(&self, _palette: &Palette) -> Option<Color> { None }
 }
 ```
@@ -29,7 +31,6 @@ pub struct Manifest {
     pub id: String,            // reverse-DNS 风格唯一 id，如 "com.example.zoom"
     pub name: String,          // 人类可读名称
     pub description: String,   // 一句话说明
-    pub api_version: u32,      // 必须等于 API_VERSION（当前 8）
     pub default_chords: Vec<KeyChord>,     // 直接激活插件模式的遗留组合键
     pub verbs: Vec<String>,                // 插件导出的带参动词
     pub default_bindings: Vec<(KeyChord, Binding)>, // 建议绑定（见下）
@@ -40,16 +41,6 @@ Manifest 提供链式构造方法：`Manifest::new(id, name).with_description(..
 
 **校验规则**（`Manifest::validate`，注册时宿主会校验）：
 
-- `api_version` 必须等于 `API_VERSION`（当前 `8`），否则整个插件被拒绝
-
-### API v8 overlay migration
-
-`OverlayLabel.text` is now `OverlayText` and `style` is `SharedLabelStyle`.
-Their serialized shapes remain a TOML/JSON string and a style object. Existing
-`OverlayLabel::new(text, rect, LabelStyle)` calls still compile; struct literals
-must use `.into()`, and direct style mutation becomes
-`label.style_mut().font_size = ...`. Short text stays inline and cloned labels
-share style through copy-on-write semantics.
 - `id` 只能包含 ASCII 字母、数字以及 `.`、`_`、`-`，不能为空
 - `verbs` 只能包含小写 ASCII 字母、数字和 `_`，不能为空
 
@@ -103,7 +94,6 @@ share style through copy-on-write semantics.
 | `FocusChanged` / `ScreensChanged` / `ScreenRetargeted` | 应用 / 显示器拓扑变化 |
 | `UiScanned(UiScanResult)` | 一次 UI 扫描的结果 |
 | `Timer { id, elapsed }` | 自定义定时器到点 |
-| `ConfigReloaded` | 配置重载，需要刷新缓存的字段 |
 
 ### HostContext：只读的运行现场
 
@@ -138,21 +128,18 @@ temporary_mode_keys = ["primary"]
 插件在程序内部编译并注册（当前没有外部动态加载）：
 
 ```rust
-// src/plugins/mod.rs —— 内置插件统一在这里实例化。
-// 别名解析失败会作为启动错误返回。
-pub fn bundled(config: &Config) -> Result<Vec<Box<dyn Plugin>>, String> {
-    Ok(vec![Box::new(ScreenSelector::with_key_aliases(
-        config.resolved_key_aliases(),
-    )?)])
-}
-
-// src/app/bootstrap.rs —— 启动时取得并注册每个 bundled plugin。
-for plugin in plugins::bundled(&config)? {
-    engine.register_plugin_dyn(plugin)?;
+// src/app/mode_catalog.rs —— 唯一组合点把 DTO 转成插件自己的 Settings。
+pub fn bundled_plugins(config: &ConfigFile) -> Result<Vec<Box<dyn Plugin>>, String> {
+    plugins::bundled(BundledSettings {
+        key_aliases: config.resolved_key_aliases().clone(),
+        screen_selector_preserve: config
+            .plugin_setting_bool("plugin:screen-selector", "preserve")
+            .unwrap_or(true),
+    })
 }
 ```
 
-`Engine::register_plugin_dyn(Box<dyn Plugin>)` 会校验 Manifest、注册动词和 Mode，并合并默认绑定：**插件的 `default_chords` 与 `default_bindings` 都只填补 `normal` 中仍为空的位置，绝不覆盖用户已经配置的键位**。注册失败不是可静默忽略的配置问题：它会中止启动，使版本或 Manifest 错误能被立刻发现。
+catalog 编译 `RuntimePlan` 时会校验 Manifest、注册动词和 Mode，并合并默认绑定：**插件的 `default_chords` 与 `default_bindings` 都只填补 `normal` 中仍为空的位置，绝不覆盖用户已经配置的键位**。注册失败不是可静默忽略的配置问题：它会中止启动，使 Manifest 错误能被立刻发现。当前插件随仓库编译，不承诺外部动态加载 API 版本兼容。
 
 ## 内置示例：Screen Selector
 
@@ -192,7 +179,7 @@ fn preserve(ctx: &HostContext<'_>) -> bool {
 ## 规范与建议
 
 - **只依赖公共 API**：插件不要向下依赖 `Engine` 或平台模块。需要新能力时，优先扩充公共 API，而不是给插件开后门——这样内置模式与第三方插件始终保持互换性
-- **`api_version` 是硬约束**：宿主与插件版本不匹配会直接拒绝加载
+- bundled plugin 与主程序同仓编译；Rust 插件 ABI/API 不承诺跨版本兼容。
 - **共享词汇**：优先复用内置动词（`move_left`、`left_click`、`finish` 等），不要发明重复的词汇；`ModeEvent::Binding` 已经替插件查好了绑定表
 - **默认绑定保持克制**：`default_chords` 和 `default_bindings` 都只是“建议”，用户配置永远优先
 - **配置结构是公开边界的一部分**：新增插件配置字段时先扩展 `PluginModeConfig`；不要在 TOML 中记录运行时自己处理但配置类型并不存在的 section

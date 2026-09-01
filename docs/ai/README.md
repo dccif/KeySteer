@@ -26,13 +26,16 @@
 | 修改覆盖层、帧时钟或性能 | [覆盖层、帧同步与性能](07-rendering-and-performance.md) |
 | 修改构建、打包、文档或测试 | [构建、打包、文档站与测试](08-build-docs-and-tests.md) |
 | 准备实施跨层改动 | [改动导航与不变量](09-change-guide.md) |
+| 检查模块依赖和配置编译边界 | [架构边界与运行计划](10-architecture-boundaries.md) |
 
 ## 一句话架构
 
 ```text
-TOML -> Config -> Engine -> ModeEvent -> Mode/Plugin -> CommandBatch<Command> -> Backend -> OS
-                    ^                                                    |
-                    +-------------------- BackendEvent <-----------------+
+TOML -> ConfigFile -> app::configuration -> RuntimePlan -> Engine
+                                                     -> ModeEvent -> Mode/Plugin
+                                                     <- CommandBatch<Command>
+                                                           |
+                                                        Backend -> OS
 ```
 
 - `api` 是跨层共享的唯一词汇。

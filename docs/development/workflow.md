@@ -15,6 +15,7 @@ cargo check
 cargo test
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
+cargo test --features perf-probe tests::performance::steady_normal_frames_do_not_allocate -- --ignored --exact --test-threads=1
 ```
 
 直接运行开发版本：
@@ -80,13 +81,13 @@ pnpm docs:build
 1. 在 `src/api/binding.rs` 修改解析、规范化和序列化。
 2. 为合法输入、错误输入和数组顺序增加测试。
 3. 更新 `keysteer.default.toml`、[模式与动作](/reference/modes-and-actions) 和配置模拟器需要展示的动作分类。
-4. 检查 `src/app/runtime/mod.rs` 中的命令执行分支、配置校验和集成测试。
+4. 检查 `src/runtime/command_executor.rs` 中的命令执行分支、配置编译和集成测试。
 
 ### 改 Mode
 
 1. 先确认 ModeEvent、Command 和生命周期语义。
 2. 在 Mode 内保存状态，使用 `Command` 请求宿主能力。
-3. 验证 `Activated`、`Deactivated`、`Restarted`、`FinishRequested` 和 `ConfigReloaded`。
+3. 验证 `Activated`、`Deactivated`、`Restarted`、`FinishRequested`，以及完整计划重载后的新实例/Idle 语义。
 4. 检查 overlay、输入释放和模式切换后的 owner。
 
 ### 改平台后端
@@ -101,7 +102,8 @@ pnpm docs:build
 | 层级 | 覆盖内容 |
 | --- | --- |
 | Rust 单元测试 | Binding 解析、配置校验、Mode 状态、几何算法和 runtime 路由 |
-| `tests/` 集成测试 | 发布默认配置、CLI 行为和跨平台不变量 |
+| `src/tests/` crate 内部集成测试 | 发布默认配置、Mode/catalog、CLI 行为和跨平台不变量 |
+| `tests/` 源码护栏 | 依赖方向、日志策略和安全预算，不导入内部模块 |
 | 文档 Node 测试 | 绑定继承、配置副本、模拟器状态 |
 | 目标系统实测 | Hook、权限、UIA/AX/Vision、覆盖层、托盘和打包 |
 

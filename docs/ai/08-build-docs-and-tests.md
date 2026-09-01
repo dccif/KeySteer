@@ -151,7 +151,9 @@ GitHub Pages。API 暂时不可用、限流或某个平台资产缺失时，下�
 ## 测试层次
 
 - 源文件 `#[cfg(test)]`：API parse/canonical、geometry、Mode 状态、runtime 路由、平台纯逻辑。
-- `tests/integration.rs`：发布配置可解析、默认快捷键跨平台、CLI/项目不变量。
+- `src/tests/integration.rs`：crate 内部的发布配置、默认快捷键、Mode/catalog 与跨平台项目不变量。
+- `src/tests/performance.rs`：feature-gated 内部性能预算；只通过 crate 私有实现运行。
+- `tests/architecture_dependencies.rs`、`tests/logging_policy.rs`：不导入库实现的源码边界护栏。
 - 文档站 Node tests：轻量模拟模型，不替代 Rust tests。
 - 平台原生窗口/权限/Hook 仍需要对应 OS 的实机验证。
 - `tools/benchmark-windows-dist.ps1` 是 Windows 黑盒整进程采样入口；它不属于主 crate 的
@@ -163,6 +165,7 @@ GitHub Pages。API 暂时不可用、限流或某个平台资产缺失时，下�
 cargo fmt --check
 cargo test --all-features
 cargo clippy --all-targets --all-features -- -D warnings
+cargo test --features perf-probe tests::performance::steady_normal_frames_do_not_allocate -- --ignored --exact --test-threads=1
 pnpm docs:test
 pnpm docs:check
 pnpm docs:build

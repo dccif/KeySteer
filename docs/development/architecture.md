@@ -11,9 +11,9 @@ flowchart TB
     subgraph configuration["配置层"]
         direction LR
         toml["TOML 配置"]
-        config["Config<br/>反序列化 · 校验 · 默认值"]
-        keymap["编译后的 Keymap<br/>继承 · 应用覆盖 · 快捷键"]
-        toml --> config --> keymap
+        config["ConfigFile<br/>反序列化 · 校验 · 默认值"]
+        plan["RuntimePlan<br/>Settings · 路由 · palette · Mode catalog"]
+        toml --> config --> plan
     end
 
     subgraph core["平台无关核心"]
@@ -31,7 +31,7 @@ flowchart TB
         backend <--> os
     end
 
-    configuration -->|"Keymap"| core
+    configuration -->|"RuntimePlan"| core
     core <-->|"BackendEvent / 原生调用"| native
 ```
 
@@ -42,15 +42,17 @@ flowchart TB
 | 目录 | 负责什么 | 从哪里开始读 |
 | --- | --- | --- |
 | `src/api/` | 跨平台公共协议：按键、绑定、命令、事件、覆盖层、插件和后端 trait | `api/mod.rs`、`api/binding.rs`、`api/command.rs` |
-| `src/config/` | TOML 反序列化、默认值、校验、主题、继承和原子写入 | `config/mod.rs`、`config/store.rs` |
-| `src/app/` | CLI、路径、日志、启动组装和运行时编排 | `app/bootstrap.rs`、`app/runtime/mod.rs` |
+| `src/config/` | TOML 反序列化、默认值、校验、主题、继承和可提交 store | `config/mod.rs`、`config/store.rs` |
+| `src/app/` | CLI、路径、配置编译、Mode catalog 和启动组装 | `app/bootstrap.rs`、`app/configuration.rs` |
+| `src/runtime/` | Engine、RuntimePlan、输入/调度/覆盖层协作者 | `runtime/mod.rs`、`runtime/plan.rs` |
 | `src/modes/` | `idle`、`normal`、`grid`、`recursive_grid`、`ui_hint` 状态机 | 对应的 `.rs` 文件 |
-| `src/domain/hints/` | UI 标签分配、匹配和网格算法 | `labels.rs`、`matcher.rs` |
+| `src/modes/hint/` | UI Hint 私有标签分配、匹配和视觉分层算法 | `labeling.rs`、`matching.rs`、`view.rs` |
 | `src/plugins/` | 内置插件；也是插件的参考实现 | `builtin/screen_selector.rs` |
 | `src/platform/windows/` | Win32 Hook、SendInput、UIA、覆盖层、帧时钟和托盘 | `mod.rs` |
 | `src/platform/macos/` | CGEventTap、Core Graphics、AX、Vision、AppKit 和顶部状态项 | `mod.rs` |
 
-`src/lib.rs` 暴露公共 API；`src/main.rs` 只负责进入 CLI 和启动流程。平台后端由 `cfg(target_os)` 在编译期选择。
+`src/lib.rs` 的常规公开面只保留 `app` 启动入口；其余模块为单 crate 内部边界。`perf-probe`
+feature 下额外提供 doc-hidden benchmark hook。`src/main.rs` 只负责进入 CLI 和启动流程。平台后端由 `cfg(target_os)` 在编译期选择。
 
 ## 启动流程
 
@@ -58,9 +60,9 @@ flowchart TB
 
 1. 初始化日志和 panic hook。
 2. 解析 `--config`、`--check`、`--doctor` 等参数。
-3. 显式 `--config` 时加载该文件；否则在当前目录按文件名选择第一个 `keysteer.<名称>.toml` 用户配置。没有用户配置时使用该默认文件；仍不存在时使用 `Config::default()`。
-4. 创建目标平台的 `Backend` 和 `Engine`。
-5. 注册内置 Mode 与 bundled plugin。
+3. 显式 `--config` 时加载该文件；否则在应用数据目录按文件名选择第一个 `keysteer.<名称>.toml` 用户配置。没有用户配置时使用内建默认值。
+4. 把已验证的 `ConfigFile` 编译成 `RuntimePlan`。
+5. 创建目标平台的 `Backend`，并以完整计划创建 `Engine`。
 6. 启动事件循环，默认激活 `idle`。
 
 ## Engine 是调度中心
@@ -69,23 +71,23 @@ flowchart TB
 
 - 当前 Mode、临时 Mode 和 modal 操作栈。
 - 每个 Mode 编译后的按键表及应用覆盖。
-- 按键消费/延后决定/透传决定、长按状态。
-- 非阻塞动作序列。
+- `InputState` 中的按键 disposition、held gesture、长按与合成输入。
+- `Scheduler` 中的非阻塞动作序列、timer 和 frame-clock owner。
 - 屏幕、光标、前台应用、主题和覆盖层 scene。
 
 它把 Mode 返回的 `Command` 翻译成 Backend 调用，或再发回一个 ModeEvent。Mode 不需要知道窗口句柄、线程、权限或原生 API。
 
 ## Mode 与 Plugin 的统一契约
 
-Mode 是一个平台无关状态机：收到 `ModeEvent` 和只读的 `HostContext`，返回 `Vec<Command>`。
+Mode 是一个平台无关状态机：收到 `ModeEvent` 和只读的 `HostContext`，返回 `CommandBatch`。
 
 ```rust
 impl Mode for MyMode {
     fn id(&self) -> ModeId { ModeId::new("my_mode").unwrap() }
 
-    fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> Vec<Command> {
+    fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
         // 更新状态，返回宿主可以执行的 Command
-        Vec::new()
+        CommandBatch::new()
     }
 }
 ```
@@ -111,6 +113,6 @@ flowchart LR
 - 不要让 Mode 依赖某个平台的具体类型。
 - 修改 `Backend` 时同时检查 Windows、macOS 和 `unsupported` 实现。
 - 改动绑定语法时同步更新 `keysteer.default.toml`、配置文档和测试。
-- 改动 Finish、点击或 held input 时，重点检查失败清理和 key-up 路由。配置重载失败、模式切换、禁用和退出必须清除长按候选、普通点击视觉状态、计时器、帧时钟、scan owner、覆盖层与所有 latched 输入。
+- 改动 Finish、点击或 held input 时，重点检查失败清理和 key-up 路由。无效配置重载必须零副作用；有效重载执行完整 runtime restart，同时保留物理 Down/Up disposition 配对。
 
 下一步可阅读 [扩展指南](/development/extension-guide)、[开发流程与测试](/development/workflow) 或 [插件开发](/development/plugin-development)。

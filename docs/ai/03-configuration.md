@@ -2,7 +2,7 @@
 
 ## 配置模型
 
-根类型是 `src/config/mod.rs::Config`。所有主要 section 都有默认值，因此空配置或没有
+根类型是 `src/config/mod.rs::ConfigFile`（`Config` 暂为内部迁移别名）。所有主要 section 都有默认值，因此空配置或没有
 配置合法。根类型和大多数结构使用 `deny_unknown_fields`，拼错字段应在加载时明确失败，
 不能静默忽略。
 
@@ -139,9 +139,11 @@ after_click = "..."
 `src/config/store.rs::ConfigStore` 使用 `toml_edit` 保留注释：
 
 - 在 clone 文档上应用 dotted-path 修改。
-- 重新 parse + validate 成功后才替换当前文档。
-- 使用同目录临时文件、flush/sync 和原子 replace/rename 写入。
+- 重新 parse + validate，且 `app::configuration` 编译候选计划成功后才提交当前文档。
+- 使用同目录临时文件和由组合根注入的平台原子 replace 写入；`config` 不依赖平台模块。
 - 无效修改不会破坏最后一个有效配置。
 
-Engine 的 `ReloadConfig` 重新读取、校验、更新 palette/keymap，并向 Mode 广播
-`ConfigReloaded`。新增可缓存配置时，Mode 必须在这个事件中刷新自己的副本。
+`runtime::ConfigurationRepository` 是 Engine 唯一认识的配置端口，具体的 TOML/store/discovery
+适配器在 `app::configuration`。它把完整候选编译成 `RuntimePlan` 后才交给 Engine。无效候选完全无副作用；
+有效候选替换全部 Mode/Plugin 实例、释放合成输入并进入 Idle。Mode 只持有自己的强类型
+Settings，不存在 `ConfigReloaded` 广播。

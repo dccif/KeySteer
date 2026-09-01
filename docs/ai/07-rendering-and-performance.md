@@ -38,8 +38,10 @@ Normal 的活动方向使用四位 mask，而不是每个显示帧收集一个 `
 
 Mode 热路径返回 `CommandBatch`：0/1/2 个命令不分配，第三个命令才 spill 到 `Vec`。
 64 位布局测试限制 `Command <= 64 B`、`CommandBatch <= 128 B`、`ModeEvent <= 112 B`；
-`tests/performance.rs` 用 instrumented allocator 锁定预热后的 Normal frame 为零分配，
-`cargo bench --bench core_hot_paths` 报告其 p50/p95/p99。temporary-mode chord 与 keymap 一起
+crate 内部的 `src/tests/performance.rs` 用 instrumented allocator 锁定预热后的 Normal frame
+为零分配；用 `cargo test --features perf-probe tests::performance::steady_normal_frames_do_not_allocate -- --ignored --exact --test-threads=1` 单独运行，
+避免并行测试污染全局 allocator 计数。`cargo bench --features perf-probe --bench core_hot_paths`
+通过 doc-hidden benchmark hook 报告 p50/p95/p99。temporary-mode chord 与 keymap 一起
 预编译，物理修饰键查通用别名时使用借用查表，不在按键路径构造临时 `Key`。
 Engine 的稳定 `ModeSlot` 缓存活动模式、pointer interest 和已编译路由；优化只减少分派与
 临时所有权开销，不改变 `CompiledKeymap` 的查找语义。UIHint 点击状态的 inline 2 指同时

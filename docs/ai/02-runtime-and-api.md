@@ -9,11 +9,10 @@ main.rs
      -> logging::init + panic hook
      -> cli::parse_args
      -> bootstrap::run
-        -> Config::discover/load 或 Config::default
+        -> ConfigFile::discover/load 或 ConfigFile::default
+        -> app::configuration::compile -> RuntimePlan
         -> platform::backend
-        -> Engine::new
-        -> modes::built_in 注册
-        -> plugins::bundled 注册
+        -> Engine::from_plan
         -> Engine::run
 ```
 
@@ -68,18 +67,18 @@ Engine 的 Frame、指针、按键等通用热路径直接调用借用式 `Mode:
 
 ## Engine 拥有什么
 
-`src/app/runtime/mod.rs::Engine` 的状态分为几组：
+`src/runtime/mod.rs::Engine` 的状态分为几组：
 
-- 配置/主题：`Config`、`Palette`、当前 `Appearance`。
+- 计划/主题：`EngineSettings`、`PaletteSet`、路由和当前 `Appearance`；Mode 不读取 TOML。
 - 模式：稳定的连续 `ModeRegistry`/`ModeSlot`、缓存的活动 slot、modal stack、插件默认绑定
   和 verb 所有者。slot 同时拥有该 Mode 的 binding table、temporary chords 和 pointer
   interest；Frame/Pointer 的常见分派不再重复走树查找。
-- 输入：当前物理按键、每键 consume/forward disposition、held gesture、合成输入 latch。
+- 输入：`InputState` 持有物理按键、每键 consume/forward disposition、held gesture、合成输入 latch。
 - 路由：每个 ModeSlot 的 `CompiledKeymap`、预解析的 temporary-mode chord 和当前应用对应的
   override profile key。`CompiledKeymap` 内部仍保持已经验证过的结构，不使用曾回退的排序 Vec。
-- 异步：动作序列、Mode timer、UI scan id -> owner、frame clock owner。
+- 异步：`Scheduler` 持有动作序列、Mode timer 和 frame clock owner；scan id 仍映射 owner。
 - 环境：屏幕、权威光标坐标、当前应用。
-- 绘制：Mode 原始 scene、加装饰后的最后 scene、可见状态。
+- 绘制：`OverlayCoordinator` 持有 Mode 原始 scene、最后 scene、去重和位置快路状态。
 - 控制：启用/暂停、退出、配置存储、输入失败抑制。
 
 绑定表只在配置、模式注册或实际生效的 per-app override profile 变化时重建。仅窗口标题
@@ -112,10 +111,8 @@ Backend 的幂等完整关闭流程；普通发布包返回主函数后不得保
 时钟，也不进入三类到期扫描。重复 `KeyState::Down` 只在首次进入 `PressedKeys` 时 clone key；
 display mode 只在实际改变 temporary chord 成员的物理边沿上重算。
 
-Engine 始终更新权威 cursor 和动态 overlay 坐标；注册表仅对内置 Normal/Idle 标记“不派发
-物理 Pointer 事件”，因此高采样率鼠标不会让它们重复执行空 handler。Grid、Recursive、
-UIHint 和第三方 Mode 继续接收；该属性不进入公开 Mode vtable，避免改变插件接口或扰动所有
-Mode 的热分派布局。
+Engine 始终更新权威 cursor 和动态 overlay 坐标；每个 Mode 通过带默认实现的
+`wants_pointer_events` 声明是否接收高频指针事件，并通过 `claims_key` 声明自己的原始字符表。
 
 `Backend::poll` 最多阻塞 50ms 或到下一个 timer/sequence/长按截止时间。延迟序列和长按项
 按截止时间倒序保存，最近项位于 `Vec` 尾部；等待只读取尾项，到期只 `pop`，不得在每次
@@ -176,8 +173,8 @@ join；超时会作为关闭失败传播并令进程退出，不能在仍运行 
 下载分别有 3 秒、60 秒的整体硬超时。
 macOS 更新事件在 Hook 有界队列忙时转入 fallback channel，后台线程不会被状态事件阻塞。
 
-状态栏的 `OpenConfigSimulator` 同样先进入 Engine。Engine 从 `ConfigStore` 取得当前有效
-源文本，只在点击时以 zlib + Base64URL 生成 URL fragment，再由 `Backend::open_url` 交给
+状态栏的 `OpenConfigSimulator` 同样先进入 Engine。Engine 从 runtime 定义的
+`ConfigurationRepository` 端口取得当前有效源文本，只在点击时以 zlib + Base64URL 生成 URL fragment，再由 `Backend::open_url` 交给
 系统浏览器。配置 fragment 不得放进 query、不得启动本地 HTTP 服务，也不得在启动时预计算。
 生成的 source/compressed/encoded/url 均为单次局部值且不缓存；Engine 对成功打开后的快速
 重复菜单事件做 2 秒防抖，避免重复压缩和连续打开浏览器标签页。
