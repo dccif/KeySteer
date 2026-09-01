@@ -188,6 +188,10 @@ Vision：`src/platform/macos/vision.rs` + `vision_bridge.m`。
 - `128` remains the zero-allocation inline Hint layer boundary. Active sessions
   lazily retain a reusable dynamic workspace for `129..=256`; deactivation
   releases it, and larger scans retain a safe dynamic fallback.
+- The wide path runs the same exact X sweep before allocating its conflict
+  bitset. A generation with no visual conflicts finishes with an empty layer
+  plan; the first real conflict enters the unchanged exact graph coloring path.
+  This is an allocation fast path, not an approximate overlap test.
 - Wide conflict construction uses an exact X sweep and the original overlap
   predicate; invalid/non-finite rectangles use the quadratic reference path.
 - Windows system OCR constructs a tile only after acquiring a credit. The

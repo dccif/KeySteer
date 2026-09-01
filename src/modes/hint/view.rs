@@ -95,6 +95,13 @@ impl VisualLayerPlan {
         )
     }
 
+    #[cfg(test)]
+    fn retained_graph_words(&self) -> usize {
+        self.wide
+            .as_ref()
+            .map_or(0, |wide| wide.graph_rows.capacity())
+    }
+
     pub(crate) fn release_retained(&mut self) {
         self.layers = LayerStorage::default();
         self.wide = None;
@@ -444,6 +451,20 @@ fn build_wide_plan(
     wide: &mut WideVisualLayerWorkspace,
 ) {
     let len = placements.len();
+    let valid_sweep = prepare_wide_sweep(placements, &mut wide.sweep_order);
+    if valid_sweep
+        && !wide_sweep_has_edge(
+            placements,
+            visually_stacked,
+            &wide.sweep_order,
+            &mut wide.sweep_active,
+        )
+    {
+        wide.packed.resize(len, WIDE_UNSTACKED);
+        wide.packed.fill(WIDE_UNSTACKED);
+        plan.finish(placements, hint_count, &wide.packed, 0);
+        return;
+    }
     let mut graph = ConflictGraph::new_wide(
         len,
         std::mem::take(&mut wide.graph_rows),
@@ -453,8 +474,9 @@ fn build_wide_plan(
         placements,
         visually_stacked,
         &mut graph,
-        &mut wide.sweep_order,
+        &wide.sweep_order,
         &mut wide.sweep_active,
+        valid_sweep,
     );
     wide.visited.resize(len, false);
     wide.visited.fill(false);
@@ -505,18 +527,11 @@ fn build_wide_edges(
     placements: &[(usize, Rect)],
     visually_stacked: &impl Fn(Rect, Rect) -> bool,
     graph: &mut ConflictGraph,
-    order: &mut Vec<usize>,
+    order: &[usize],
     active: &mut Vec<usize>,
+    prepared_sweep: bool,
 ) {
-    let valid = placements.iter().all(|(_, rect)| {
-        rect.x.is_finite()
-            && rect.y.is_finite()
-            && rect.width.is_finite()
-            && rect.height.is_finite()
-            && rect.width >= 0.0
-            && rect.height >= 0.0
-    });
-    if !valid {
+    if !prepared_sweep {
         for right in 1..placements.len() {
             for left in 0..right {
                 if visually_stacked(placements[left].1, placements[right].1) {
@@ -526,15 +541,6 @@ fn build_wide_edges(
         }
         return;
     }
-    order.clear();
-    order.extend(0..placements.len());
-    order.sort_unstable_by(|left, right| {
-        placements[*left]
-            .1
-            .x
-            .total_cmp(&placements[*right].1.x)
-            .then_with(|| left.cmp(right))
-    });
     active.clear();
     for &right in order.iter() {
         let right_rect = placements[right].1;
@@ -548,6 +554,52 @@ fn build_wide_edges(
         }
         active.push(right);
     }
+}
+
+fn prepare_wide_sweep(placements: &[(usize, Rect)], order: &mut Vec<usize>) -> bool {
+    let valid = placements.iter().all(|(_, rect)| {
+        rect.x.is_finite()
+            && rect.y.is_finite()
+            && rect.width.is_finite()
+            && rect.height.is_finite()
+            && rect.width >= 0.0
+            && rect.height >= 0.0
+    });
+    if !valid {
+        return false;
+    }
+    order.clear();
+    order.extend(0..placements.len());
+    order.sort_unstable_by(|left, right| {
+        placements[*left]
+            .1
+            .x
+            .total_cmp(&placements[*right].1.x)
+            .then_with(|| left.cmp(right))
+    });
+    true
+}
+
+fn wide_sweep_has_edge(
+    placements: &[(usize, Rect)],
+    visually_stacked: &impl Fn(Rect, Rect) -> bool,
+    order: &[usize],
+    active: &mut Vec<usize>,
+) -> bool {
+    active.clear();
+    for &right in order.iter() {
+        let right_rect = placements[right].1;
+        active.retain(|left| placements[*left].1.right() >= right_rect.x);
+        for &left in active.iter() {
+            let left_rect = placements[left].1;
+            if left_rect.intersect(&right_rect).is_some() && visually_stacked(left_rect, right_rect)
+            {
+                return true;
+            }
+        }
+        active.push(right);
+    }
+    false
 }
 
 fn color_component_wide(
@@ -880,6 +932,30 @@ mod tests {
         plan.finish(placements, placements.len(), &packed, global);
     }
 
+    fn assert_matches_quadratic_reference(placements: &[(usize, Rect)]) {
+        let mut optimized = VisualLayerPlan::default();
+        build_visual_layer_plan(placements, placements.len(), overlap, &mut optimized);
+        let mut reference = VisualLayerPlan::default();
+        quadratic_reference(placements, &mut reference);
+
+        assert_eq!(optimized.layer_count(), reference.layer_count());
+        assert_eq!(optimized.len(), reference.len());
+        for hint_index in 0..placements.len() {
+            assert_eq!(
+                optimized.layer_info(hint_index),
+                reference.layer_info(hint_index),
+                "hint {hint_index}"
+            );
+            for selected_layer in 0..=optimized.layer_count().saturating_add(1) {
+                assert_eq!(
+                    optimized.draw_rank(hint_index, selected_layer),
+                    reference.draw_rank(hint_index, selected_layer),
+                    "hint {hint_index}, selected layer {selected_layer}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn path_counterexample_uses_two_layers_in_every_draw_order() {
         let source = [
@@ -1037,8 +1113,40 @@ mod tests {
         let dynamic = (0..2_000)
             .map(|index| (index, Rect::new(index as f64 * 100.0, 0.0, 20.0, 20.0)))
             .collect::<Vec<_>>();
-        build_visual_layer_plan(&dynamic, dynamic.len(), overlap, &mut plan);
-        assert_eq!(plan.layer_count(), 0);
+        let mut sparse_plan = VisualLayerPlan::default();
+        build_visual_layer_plan(&dynamic, dynamic.len(), overlap, &mut sparse_plan);
+        assert_eq!(sparse_plan.layer_count(), 0);
+        assert_eq!(sparse_plan.retained_graph_words(), 0);
+    }
+
+    #[test]
+    fn wide_fast_path_preserves_overlap_and_shift_layer_semantics() {
+        let sparse = (0..2_000)
+            .map(|index| (index, Rect::new(index as f64 * 100.0, 0.0, 20.0, 20.0)))
+            .collect::<Vec<_>>();
+        assert_matches_quadratic_reference(&sparse);
+
+        let pairs = (0..250)
+            .flat_map(|pair| {
+                let rect = Rect::new(pair as f64 * 100.0, 0.0, 20.0, 20.0);
+                [(pair * 2, rect), (pair * 2 + 1, rect)]
+            })
+            .collect::<Vec<_>>();
+        assert_matches_quadratic_reference(&pairs);
+
+        let chain = (0..256)
+            .map(|index| (index, Rect::new(index as f64 * 15.0, 0.0, 20.0, 20.0)))
+            .collect::<Vec<_>>();
+        assert_matches_quadratic_reference(&chain);
+
+        let dense = (0..129)
+            .map(|index| (index, Rect::new(0.0, 0.0, 20.0, 20.0)))
+            .collect::<Vec<_>>();
+        assert_matches_quadratic_reference(&dense);
+
+        let mut invalid = sparse[..129].to_vec();
+        invalid[64].1.x = f64::NAN;
+        assert_matches_quadratic_reference(&invalid);
     }
 
     #[test]

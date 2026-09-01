@@ -46,6 +46,41 @@ trait LabelBuffer {
     fn push(&mut self, value: char);
 }
 
+#[derive(Clone, Copy)]
+enum LabelPlan {
+    Direct,
+    NormalPairs { singles: usize },
+    FixedForward { width: usize, divisor: usize },
+    FixedReverse { width: usize },
+}
+
+impl LabelPlan {
+    fn new(count: usize, alphabet_len: usize, direction: LabelDirection) -> Self {
+        match direction {
+            LabelDirection::Normal => {
+                let mut reserved = 0usize;
+                while alphabet_len - reserved + reserved * alphabet_len < count {
+                    reserved += 1;
+                    if reserved == alphabet_len {
+                        let width = fixed_width_for(count, alphabet_len);
+                        return Self::FixedForward {
+                            width,
+                            divisor: alphabet_len.saturating_pow(width.saturating_sub(1) as u32),
+                        };
+                    }
+                }
+                Self::NormalPairs {
+                    singles: alphabet_len - reserved,
+                }
+            }
+            LabelDirection::Reverse if count <= alphabet_len => Self::Direct,
+            LabelDirection::Reverse => Self::FixedReverse {
+                width: fixed_width_for(count, alphabet_len),
+            },
+        }
+    }
+}
+
 impl LabelBuffer for String {
     fn clear(&mut self) {
         String::clear(self);
@@ -80,17 +115,19 @@ pub fn assign<T>(
     if alphabet.len() < 2 {
         return Err("hint alphabet needs at least 2 characters".into());
     }
-    let labels = match direction {
-        LabelDirection::Normal => labels_normal(targets.len(), alphabet),
-        LabelDirection::Reverse => labels_reverse(targets.len(), alphabet),
-    };
+    let count = targets.len();
+    let plan = LabelPlan::new(count, alphabet.len(), direction);
     Ok(targets
         .into_iter()
-        .zip(labels)
-        .map(|((bounds, value), label)| Hint {
-            label,
-            bounds,
-            value,
+        .enumerate()
+        .map(|(index, (bounds, value))| {
+            let mut label = String::new();
+            write_label(&mut label, index, alphabet, plan);
+            Hint {
+                label,
+                bounds,
+                value,
+            }
         })
         .collect())
 }
@@ -105,20 +142,25 @@ pub fn assign_into<T, I>(
 where
     I: Iterator<Item = (Rect, T)> + Clone,
 {
-    let count = targets.clone().count();
-    if count != 0 && alphabet.len() < 2 {
+    let count = iterator_count(&targets);
+    if count == 0 {
+        output.clear();
+        return Ok(());
+    }
+    if alphabet.len() < 2 {
         return Err("hint alphabet needs at least 2 characters".into());
     }
+    let plan = LabelPlan::new(count, alphabet.len(), direction);
     output.truncate(count);
     output.reserve(count.saturating_sub(output.len()));
     for (index, (bounds, value)) in targets.enumerate() {
         if let Some(hint) = output.get_mut(index) {
-            write_label(&mut hint.label, index, count, alphabet, direction);
+            write_label(&mut hint.label, index, alphabet, plan);
             hint.bounds = bounds;
             hint.value = value;
         } else {
             let mut label = String::new();
-            write_label(&mut label, index, count, alphabet, direction);
+            write_label(&mut label, index, alphabet, plan);
             output.push(Hint {
                 label,
                 bounds,
@@ -138,20 +180,25 @@ pub(crate) fn assign_compact_into<T, I>(
 where
     I: Iterator<Item = (Rect, T)> + Clone,
 {
-    let count = targets.clone().count();
-    if count != 0 && alphabet.len() < 2 {
+    let count = iterator_count(&targets);
+    if count == 0 {
+        output.clear();
+        return Ok(());
+    }
+    if alphabet.len() < 2 {
         return Err("hint alphabet needs at least 2 characters".into());
     }
+    let plan = LabelPlan::new(count, alphabet.len(), direction);
     output.truncate(count);
     output.reserve(count.saturating_sub(output.len()));
     for (index, (bounds, value)) in targets.enumerate() {
         if let Some(hint) = output.get_mut(index) {
-            write_label(&mut hint.label, index, count, alphabet, direction);
+            write_label(&mut hint.label, index, alphabet, plan);
             hint.bounds = bounds;
             hint.value = value;
         } else {
             let mut label = HintCode::default();
-            write_label(&mut label, index, count, alphabet, direction);
+            write_label(&mut label, index, alphabet, plan);
             output.push(CompactHint {
                 label,
                 bounds,
@@ -162,27 +209,21 @@ where
     Ok(())
 }
 
-fn write_label<L: LabelBuffer>(
-    label: &mut L,
-    index: usize,
-    count: usize,
-    alphabet: &[char],
-    direction: LabelDirection,
-) {
+fn iterator_count<I: Iterator + Clone>(iterator: &I) -> usize {
+    let (minimum, maximum) = iterator.size_hint();
+    if maximum == Some(minimum) {
+        minimum
+    } else {
+        iterator.clone().count()
+    }
+}
+
+fn write_label<L: LabelBuffer>(label: &mut L, index: usize, alphabet: &[char], plan: LabelPlan) {
     label.clear();
     let radix = alphabet.len();
-    match direction {
-        LabelDirection::Normal => {
-            let mut reserved = 0usize;
-            while radix - reserved + reserved * radix < count {
-                reserved += 1;
-                if reserved == radix {
-                    let width = fixed_width_for(count, radix);
-                    write_fixed_width(label, index, alphabet, width, false);
-                    return;
-                }
-            }
-            let singles = radix - reserved;
+    match plan {
+        LabelPlan::Direct => label.push(alphabet[index]),
+        LabelPlan::NormalPairs { singles } => {
             if index < singles {
                 label.push(alphabet[index]);
             } else {
@@ -191,10 +232,11 @@ fn write_label<L: LabelBuffer>(
                 label.push(alphabet[pair % radix]);
             }
         }
-        LabelDirection::Reverse if count <= radix => label.push(alphabet[index]),
-        LabelDirection::Reverse => {
-            let width = fixed_width_for(count, radix);
-            write_fixed_width(label, index, alphabet, width, true);
+        LabelPlan::FixedForward { width, divisor } => {
+            write_fixed_width(label, index, alphabet, width, Some(divisor));
+        }
+        LabelPlan::FixedReverse { width } => {
+            write_fixed_width(label, index, alphabet, width, None);
         }
     }
 }
@@ -204,74 +246,21 @@ fn write_fixed_width<L: LabelBuffer>(
     mut index: usize,
     alphabet: &[char],
     width: usize,
-    little_endian: bool,
+    mut divisor: Option<usize>,
 ) {
     let radix = alphabet.len();
-    if little_endian {
+    if divisor.is_none() {
         for _ in 0..width {
             label.push(alphabet[index % radix]);
             index /= radix;
         }
         return;
     }
-    let mut divisor = radix.saturating_pow(width.saturating_sub(1) as u32);
+    let mut divisor = divisor.take().unwrap_or(1);
     for _ in 0..width {
         label.push(alphabet[(index / divisor) % radix]);
         divisor = (divisor / radix).max(1);
     }
-}
-
-fn labels_normal(count: usize, alphabet: &[char]) -> Vec<String> {
-    let n = alphabet.len();
-    let mut reserved = 0usize;
-    while n - reserved + reserved * n < count {
-        reserved += 1;
-        if reserved == n {
-            return labels_normal_deep(count, alphabet);
-        }
-    }
-
-    let mut labels = Vec::with_capacity(count);
-    for &character in &alphabet[..n - reserved] {
-        labels.push(character.to_string());
-        if labels.len() == count {
-            return labels;
-        }
-    }
-    for &prefix in &alphabet[n - reserved..] {
-        for &suffix in alphabet {
-            labels.push(format!("{prefix}{suffix}"));
-            if labels.len() == count {
-                return labels;
-            }
-        }
-    }
-    labels
-}
-
-fn labels_normal_deep(count: usize, alphabet: &[char]) -> Vec<String> {
-    let width = fixed_width_for(count, alphabet.len());
-    (0..count)
-        .map(|index| fixed_width_label(index, alphabet, width))
-        .collect()
-}
-
-fn labels_reverse(count: usize, alphabet: &[char]) -> Vec<String> {
-    let radix = alphabet.len();
-    if count <= radix {
-        return alphabet[..count].iter().map(char::to_string).collect();
-    }
-    let width = fixed_width_for(count, radix);
-    (0..count)
-        .map(|mut index| {
-            let mut label = String::with_capacity(width);
-            for _ in 0..width {
-                label.push(alphabet[index % radix]);
-                index /= radix;
-            }
-            label
-        })
-        .collect()
 }
 
 fn fixed_width_for(count: usize, radix: usize) -> usize {
@@ -282,16 +271,6 @@ fn fixed_width_for(count: usize, radix: usize) -> usize {
         capacity = capacity.saturating_mul(radix);
     }
     width
-}
-
-fn fixed_width_label(mut index: usize, alphabet: &[char], width: usize) -> String {
-    let radix = alphabet.len();
-    let mut characters = vec![alphabet[0]; width];
-    for slot in characters.iter_mut().rev() {
-        *slot = alphabet[index % radix];
-        index /= radix;
-    }
-    characters.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -381,5 +360,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             capacities
         );
+    }
+
+    #[test]
+    fn precomputed_plans_preserve_labels_across_capacity_boundaries() {
+        let alphabet = chars("arstneioqwfpjluy");
+        for direction in [LabelDirection::Normal, LabelDirection::Reverse] {
+            for count in [1, 16, 17, 128, 129, 256, 257, 500, 2_000] {
+                let source = targets(count);
+                let expected = assign(source.iter().copied(), &alphabet, direction).unwrap();
+                let mut reused = Vec::new();
+                assign_into(&mut reused, source.iter().copied(), &alphabet, direction).unwrap();
+                assert_eq!(reused, expected, "count={count}, direction={direction:?}");
+            }
+        }
     }
 }

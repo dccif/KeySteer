@@ -345,24 +345,33 @@ impl HintMode {
             self.session.ensure_search_names();
         }
 
-        let candidates = self
-            .session
-            .scanned
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| {
-                query.is_none_or(|query| self.session.scanned_names_lower[*index].contains(query))
-            })
-            .map(|(index, target)| (target.rect, index));
+        let result = if let Some(query) = query {
+            let scanned = &self.session.scanned;
+            let names = &self.session.scanned_names_lower;
+            hints::assign_compact_into(
+                &mut self.session.hints,
+                scanned
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| names[*index].contains(query))
+                    .map(|(index, target)| (target.rect, index)),
+                &self.alphabet,
+                self.config.label_direction,
+            )
+        } else {
+            hints::assign_compact_into(
+                &mut self.session.hints,
+                self.session
+                    .scanned
+                    .iter()
+                    .enumerate()
+                    .map(|(index, target)| (target.rect, index)),
+                &self.alphabet,
+                self.config.label_direction,
+            )
+        };
 
-        if hints::assign_compact_into(
-            &mut self.session.hints,
-            candidates,
-            &self.alphabet,
-            self.config.label_direction,
-        )
-        .is_err()
-        {
+        if result.is_err() {
             self.session.hints.clear();
             self.session.status = Some("Cannot assign Hint labels — check hint_characters".into());
         }
