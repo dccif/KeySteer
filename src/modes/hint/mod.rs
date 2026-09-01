@@ -25,7 +25,7 @@ use crate::api::overlay::{
 };
 use crate::api::style::{AUTO, BoundaryHighlight, HintPlacement, LabelUi, SearchInputUi};
 use crate::api::theme::Palette;
-pub mod labeling;
+pub(crate) mod labeling;
 mod session;
 mod view;
 

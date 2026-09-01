@@ -2,7 +2,8 @@ use crate::api::geometry::Rect;
 use crate::api::hint::LabelDirection;
 use smallvec::SmallVec;
 
-/// A target with its assigned, prefix-free label.
+/// Reusable String-backed output used only by the feature-gated benchmark.
+#[cfg(feature = "perf-probe")]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hint<T> {
     pub label: String,
@@ -81,6 +82,7 @@ impl LabelPlan {
     }
 }
 
+#[cfg(feature = "perf-probe")]
 impl LabelBuffer for String {
     fn clear(&mut self) {
         String::clear(self);
@@ -103,36 +105,8 @@ impl LabelBuffer for HintCode {
     }
 }
 
-pub fn assign<T>(
-    targets: impl IntoIterator<Item = (Rect, T)>,
-    alphabet: &[char],
-    direction: LabelDirection,
-) -> Result<Vec<Hint<T>>, String> {
-    let targets: Vec<(Rect, T)> = targets.into_iter().collect();
-    if targets.is_empty() {
-        return Ok(Vec::new());
-    }
-    if alphabet.len() < 2 {
-        return Err("hint alphabet needs at least 2 characters".into());
-    }
-    let count = targets.len();
-    let plan = LabelPlan::new(count, alphabet.len(), direction);
-    Ok(targets
-        .into_iter()
-        .enumerate()
-        .map(|(index, (bounds, value))| {
-            let mut label = String::new();
-            write_label(&mut label, index, alphabet, plan);
-            Hint {
-                label,
-                bounds,
-                value,
-            }
-        })
-        .collect())
-}
-
-/// Assign into a reusable buffer, retaining every label String allocation.
+/// Assign into a reusable String-backed benchmark buffer.
+#[cfg(feature = "perf-probe")]
 pub fn assign_into<T, I>(
     output: &mut Vec<Hint<T>>,
     targets: I,
@@ -287,14 +261,72 @@ mod tests {
             .collect()
     }
 
-    fn labels_of<T>(hints: &[Hint<T>]) -> Vec<&str> {
+    fn assign_labels(
+        count: usize,
+        alphabet: &[char],
+        direction: LabelDirection,
+    ) -> Result<Vec<CompactHint<usize>>, String> {
+        let mut hints = Vec::new();
+        assign_compact_into(&mut hints, targets(count).into_iter(), alphabet, direction)?;
+        Ok(hints)
+    }
+
+    fn labels_of<T>(hints: &[CompactHint<T>]) -> Vec<&str> {
         hints.iter().map(|hint| hint.label.as_str()).collect()
+    }
+
+    fn reference_label(
+        mut index: usize,
+        count: usize,
+        alphabet: &[char],
+        direction: LabelDirection,
+    ) -> String {
+        let radix = alphabet.len();
+        match direction {
+            LabelDirection::Normal => {
+                let mut reserved = 0usize;
+                while radix - reserved + reserved * radix < count {
+                    reserved += 1;
+                    if reserved == radix {
+                        let width = fixed_width_for(count, radix);
+                        let mut divisor = radix.saturating_pow(width.saturating_sub(1) as u32);
+                        let mut label = String::new();
+                        for _ in 0..width {
+                            label.push(alphabet[(index / divisor) % radix]);
+                            divisor = (divisor / radix).max(1);
+                        }
+                        return label;
+                    }
+                }
+                let singles = radix - reserved;
+                if index < singles {
+                    alphabet[index].to_string()
+                } else {
+                    let pair = index - singles;
+                    format!(
+                        "{}{}",
+                        alphabet[singles + pair / radix],
+                        alphabet[pair % radix]
+                    )
+                }
+            }
+            LabelDirection::Reverse if count <= radix => alphabet[index].to_string(),
+            LabelDirection::Reverse => {
+                let width = fixed_width_for(count, radix);
+                let mut label = String::new();
+                for _ in 0..width {
+                    label.push(alphabet[index % radix]);
+                    index /= radix;
+                }
+                label
+            }
+        }
     }
 
     #[test]
     fn directions_match_documented_sequences() {
-        let normal = assign(targets(5), &chars("asdf"), LabelDirection::Normal).unwrap();
-        let reverse = assign(targets(5), &chars("asdf"), LabelDirection::Reverse).unwrap();
+        let normal = assign_labels(5, &chars("asdf"), LabelDirection::Normal).unwrap();
+        let reverse = assign_labels(5, &chars("asdf"), LabelDirection::Reverse).unwrap();
         assert_eq!(labels_of(&normal), ["a", "s", "d", "fa", "fs"]);
         assert_eq!(labels_of(&reverse), ["aa", "sa", "da", "fa", "as"]);
     }
@@ -303,7 +335,7 @@ mod tests {
     fn labels_are_unique_and_prefix_free() {
         for direction in [LabelDirection::Normal, LabelDirection::Reverse] {
             for count in [1, 2, 9, 40, 200, 900] {
-                let hints = assign(targets(count), &chars("asdfghjkl"), direction).unwrap();
+                let hints = assign_labels(count, &chars("asdfghjkl"), direction).unwrap();
                 let labels = labels_of(&hints);
                 let unique: std::collections::BTreeSet<_> = labels.iter().collect();
                 assert_eq!(unique.len(), count);
@@ -318,35 +350,33 @@ mod tests {
 
     #[test]
     fn validates_degenerate_inputs() {
-        assert!(assign(targets(3), &chars("a"), LabelDirection::Normal).is_err());
+        assert!(assign_labels(3, &chars("a"), LabelDirection::Normal).is_err());
         assert!(
-            assign(
-                Vec::<(Rect, usize)>::new(),
-                &chars("asdf"),
-                LabelDirection::Normal
-            )
-            .unwrap()
-            .is_empty()
+            assign_labels(0, &chars("asdf"), LabelDirection::Normal)
+                .unwrap()
+                .is_empty()
         );
     }
 
     #[test]
-    fn assign_into_reuses_label_capacity_and_preserves_sequences() {
+    fn compact_assignment_reuses_label_capacity_and_preserves_sequences() {
         let alphabet = chars("asdfghjkl");
         let source = targets(25);
         let mut output = Vec::new();
-        assign_into(
+        assign_compact_into(
             &mut output,
             source.iter().copied(),
             &alphabet,
             LabelDirection::Normal,
         )
         .unwrap();
-        let capacities: Vec<_> = output.iter().map(|hint| hint.label.capacity()).collect();
-        let expected = assign(source.iter().copied(), &alphabet, LabelDirection::Normal).unwrap();
-        assert_eq!(output, expected);
+        let capacities: Vec<_> = output.iter().map(|hint| hint.label.0.capacity()).collect();
+        let expected = labels_of(&output)
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
 
-        assign_into(
+        assign_compact_into(
             &mut output,
             source.iter().copied(),
             &alphabet,
@@ -356,10 +386,11 @@ mod tests {
         assert_eq!(
             output
                 .iter()
-                .map(|hint| hint.label.capacity())
+                .map(|hint| hint.label.0.capacity())
                 .collect::<Vec<_>>(),
             capacities
         );
+        assert_eq!(labels_of(&output), expected);
     }
 
     #[test]
@@ -367,11 +398,16 @@ mod tests {
         let alphabet = chars("arstneioqwfpjluy");
         for direction in [LabelDirection::Normal, LabelDirection::Reverse] {
             for count in [1, 16, 17, 128, 129, 256, 257, 500, 2_000] {
-                let source = targets(count);
-                let expected = assign(source.iter().copied(), &alphabet, direction).unwrap();
-                let mut reused = Vec::new();
-                assign_into(&mut reused, source.iter().copied(), &alphabet, direction).unwrap();
-                assert_eq!(reused, expected, "count={count}, direction={direction:?}");
+                let assigned = assign_labels(count, &alphabet, direction).unwrap();
+                for (index, hint) in assigned.iter().enumerate() {
+                    assert_eq!(
+                        hint.label.as_str(),
+                        reference_label(index, count, &alphabet, direction),
+                        "count={count}, index={index}, direction={direction:?}"
+                    );
+                    assert_eq!(hint.value, index);
+                    assert_eq!(hint.bounds, Rect::new(index as f64, 0.0, 1.0, 1.0));
+                }
             }
         }
     }
