@@ -2,12 +2,12 @@
 
 ## 优化构建档位（2026-08）
 
-- 通用发布保留目标默认 CPU baseline；workflow 先按 `Cargo.toml` 定向同步 Cargo.lock 中的 `keysteer` 根包版本，不更新第三方依赖，后续测试与打包始终使用 `--locked`。打包从 commit 生成 `SOURCE_DATE_EPOCH`，Windows 发布入口同时传递 `/Brepro`。
+- 通用发布保留目标默认 CPU baseline；版本变更应在提交前同步 Cargo.lock 中的 `keysteer` 根包版本。为避免只修改 Cargo.toml 导致正式打包失败，workflow 在每个原生 matrix runner 上先读取 manifest 版本，并用 `cargo update --package keysteer --precise <version>` 定向同步根包条目，不主动升级第三方依赖；后续打包仍使用 `--locked`。打包从 commit 生成 `SOURCE_DATE_EPOCH`，Windows 发布入口同时传递 `/Brepro`。
 - `tools/build-native.ps1` / `tools/build-native.sh` 仅构建 host architecture，使用独立 `target-native/` 和 `-C target-cpu=native`。
 - `perf-probe` 是 opt-in 诊断 feature；正式通用发布和性能验收均不启用。启用时热路径只向固定有界队列
   非阻塞写入，文件 I/O 由诊断线程执行。它用于关联生命周期事件，不代表未插桩 release 延迟。mimalloc 在 Windows x64 A/B 中未通过启动 p99
   门禁，未保留依赖或 feature。
-- `.github/workflows/build.yml` 统一承载 CI 与发布且仅手动触发：可选择 Windows/macOS 打包发布或仅运行检查。
+- `.github/workflows/build.yml` 只承载手动打包和发布，可选择 Windows、macOS 或全部平台，并可选择只保留 artifact、正式发布或预发布；格式化、测试、Clippy 和性能验收在提交前本地运行，不消耗发布 Actions 时长。开启发布时无论平台下拉值为何都构建全部目标，防止产生不完整 Release。
 - PGO 不在缺少代表性整进程训练语料时启用；必须先由对应架构原生 runner 产出稳定训练集，并通过同一 p99/内存门禁。
 
 性能变更使用独立 target/worktree A/B：关键 p99 回退不得超过 2%；目标延迟改善至少 3%或内存下降至少 5%才保留。`cargo bench --features benchmark-hooks --bench core_hot_paths` 使用 release profile 和系统分配器；`benchmark-hooks` 只改变内部构造器的可见性，不启用探针、替代算法或运行参数。Normal 与每个 Hint 规模固定使用 20k 样本，精准候选验收还需进行多轮交替 A/B。`tools/benchmark-windows-dist.ps1` 记录进程与资源样本；`-UsePerfProbe` 产生的生命周期 JSONL 仅用于诊断 ready 顺序，并明确标记为 instrumented。普通发行包的 `--check` 结果只标记为 config-check，两者都不能冒充未插桩的真实 ready 延迟。
@@ -48,7 +48,7 @@ release profile：`opt-level=3`、fat LTO、`codegen-units=1`、abort panic、st
 `tools/compose-release-notes.sh` 精确提取 `docs/releases/index.md` 中同名的
 `## <version>` 条目。该双语内容和 `.github/release-notes.md` 的固定安装提示会置于
 GitHub 自动生成的 commit/PR notes 之前；版本条目缺失、重复或为空时禁止创建 Release。
-普通 CI 也会运行同一提取器，确保版本更新与文档条目在合并前保持同步。
+Release 汇总 job 会运行同一提取器，确保版本条目缺失时不发布。
 
 ### Windows
 
@@ -81,8 +81,9 @@ EKU 的可导出自签名 X.509 证书，并输出被 gitignore 的 PFX/CER。PF
 自签名证书不会让其他用户看到公开受信任的“已验证的发布者”；若需要该 Windows UI 身份，正式发布必须使用受信任 CA
 颁发的代码签名证书并保护、轮换私钥。由于自动更新固定比较当前叶证书指纹，换证前必须规划
 一次带过渡信任策略的版本，不能直接用新证书覆盖发布。
-`packaging/windows/test-authenticode-update.ps1` 使用系统 Windows PowerShell 临时创建一天有效、
-不可导出的测试证书，不加入用户信任库；它签名两个临时 EXE，运行 Rust `WinVerifyTrust`
+`packaging/windows/test-authenticode-update.ps1` 使用系统 Windows PowerShell 临时创建一天有效的
+测试证书和随机密码 PFX，不加入用户信任库；它通过与 GitHub Secret 相同的 PFX 路径验证打包，
+再签名两个临时 EXE 并运行 Rust `WinVerifyTrust`
 同证书测试，并确认被篡改的已签 EXE 会拒绝。传入 `-VerifyPackaging` 时由 package script 仅在
 `signtool verify` 期间临时加入当前用户 Root，并在工作区 `tmp/` 的隔离输出根完成构建、签名及
 x64 ZIP/更新器 EXE 验证，不污染可发布的 `dist/`；`finally` 总会删除测试证书、Root 条目和
@@ -114,18 +115,19 @@ sampling directly from an isolated A/B target directory before packaging.
 
 ## GitHub Actions
 
-根目录 `.github/workflows/build.yml` 选择 `checks` 时运行检查任务：
-
-- 4 target 打包矩阵：macOS arm64/x64、Windows x64/arm64。
-- 可执行 target 跑 tests，所有 target 跑 clippy。
-- macOS host cross-check Windows backend。
-- Linux job 跑 fmt 和 shipped-config integration test。
-- docs job 使用 Node 24 + pnpm 10，跑 test/typecheck/build。
-
-同一 workflow 手动运行时会构建所选平台；选择 `checks` 时仅运行上述检查，选择 `all` 时，待四个平台的
-四个平台 ZIP 和两个 Windows 更新器 EXE 都成功后，以 Cargo 版本创建 `v<version>` GitHub
-Release。原始 EXE 避免运行时引入 ZIP/DEFLATE 解析依赖；便携 ZIP 仍供用户手动下载。
-只构建单个平台时保留 workflow artifact，但不创建不完整的 Release。macOS 证书和
+根目录 `.github/workflows/build.yml` 仅手动运行并只做发布所需工作：安装固定 Rust 工具链、同步
+根包 lockfile 版本、安装目标、调用平台 package script 并上传各目标 artifact。它不再提供 `checks` 入口，也不在 runner 上运行
+fmt、test、Clippy、性能或文档构建；这些检查必须在推送前本地完成。`publish=false` 时按
+`platform` 构建 Windows、macOS 或全部目标并只保留 artifact；`publish=true` 时忽略平台筛选、
+强制生成四个平台 ZIP 和两个 Windows 更新器 EXE，防止不完整发布。`release_type=release`
+创建 `v<version>`，`pre-release` 创建带 run number 的独立 tag 并标记为 GitHub pre-release。
+Windows x64/ARM64 与 macOS Apple Silicon/Intel 分别作为四个 matrix runner 并行编译；不同目标
+仍生成独立机器码和包，但不在同一平台 job 内串行等待。matrix 会略增固定 setup 和总计费分钟，
+主要优化的是发布墙钟时间。每个目标用 GitHub 官方 `actions/cache` 按 OS、target、固定 Rust
+版本和 Cargo.lock 缓存 Cargo registry 与 release 构建产物；首次冷构建不受益，后续发布复用
+依赖。package step 有 30 分钟硬上限，Windows 签名流程在签名、证书读取和 SignTool 验证边界
+分别输出进度，信任组件异常时可定位且不会无限占用 runner。
+原始 EXE 避免运行时引入 ZIP/DEFLATE 解析依赖；便携 ZIP 仍供用户手动下载。macOS 证书和
 notarization 通过 secrets 注入。创建 Release 时把 `.github/release-notes.md` 的固定安装
 提示置于 GitHub 自动生成的变更说明之前；该文件必须保留未 notarize macOS 下载包所需的
 `sudo xattr -cr /Applications/KeySteer.app` 指引和来源安全提示。
@@ -137,8 +139,8 @@ Silicon/Intel 各一份；不会把不同架构放入同一个 ZIP 或 artifact�
 GitHub Pages。需要更新线上文档时，在 Actions 页面运行 `Deploy documentation`。
 
 `.github/ISSUE_TEMPLATE/` 提供错误报告、功能建议和配置/按键问题三种 Issue Form；错误
-报告收集平台、架构、版本、受影响功能、复现步骤和脱敏 TOML，避免把不完整的环境信息留给
-维护者猜测。空白 Issue 仍允许创建。不要在模板中预设 labels，因为 GitHub 只会添加仓库中
+报告以一个必填描述收集实际行为、预期行为和复现方式，并提供可选的版本环境、脱敏 TOML 与
+诊断信息，降低提交负担。空白 Issue 仍允许创建。不要在模板中预设 labels，因为 GitHub 只会添加仓库中
 已经存在的 labels。
 
 ## VitePress 文档与模拟器

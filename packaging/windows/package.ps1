@@ -132,6 +132,7 @@ if ($signingRequested) {
     if ($LASTEXITCODE -ne 0) {
         throw "Authenticode signing failed with exit code $LASTEXITCODE"
     }
+    Write-Host "Authenticode signing completed; preparing local verification"
     $temporaryRootAdded = $false
     $temporaryCertificate = $null
     try {
@@ -139,6 +140,7 @@ if ($signingRequested) {
             Import-Module Microsoft.PowerShell.Security
             Import-Module PKI
             if (-not [string]::IsNullOrWhiteSpace($SigningPfx)) {
+                Write-Host "Reading the signer certificate directly from the PFX"
                 if ([string]::IsNullOrWhiteSpace($SigningPassword)) {
                     $pfxData = Get-PfxData -FilePath $resolvedPfx
                 }
@@ -156,6 +158,7 @@ if ($signingRequested) {
                 $signer = $endCertificates[0]
             }
             else {
+                Write-Host "Reading the signer certificate from CurrentUser\\My"
                 $signerPath = "Cert:\CurrentUser\My\$normalizedThumbprint"
                 $signer = Get-Item -LiteralPath $signerPath -ErrorAction Stop
             }
@@ -174,10 +177,12 @@ if ($signingRequested) {
                 }
             }
         }
+        Write-Host "Verifying the embedded Authenticode signature with SignTool"
         & $signTool verify /pa /all $binary
         if ($LASTEXITCODE -ne 0) {
             throw "Authenticode verification failed with exit code $LASTEXITCODE"
         }
+        Write-Host "Authenticode verification completed"
     }
     finally {
         if ($temporaryRootAdded) {

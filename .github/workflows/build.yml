@@ -1,94 +1,80 @@
-name: Build, check and publish
+name: Package and publish
 
 on:
   workflow_dispatch:
     inputs:
       platform:
-        description: Packages to build, or checks only
+        description: Packages to build
         required: true
         default: all
         type: choice
         options:
-          - all
           - windows
           - macos
-          - checks
+          - all
+      publish:
+        description: Publish the packages as a GitHub Release
+        required: true
+        default: true
+        type: boolean
+      release_type:
+        description: Release type
+        required: true
+        default: release
+        type: choice
+        options:
+          - release
+          - pre-release
 
 permissions:
   contents: read
 
 jobs:
-  check-release-notes:
-    if: ${{ inputs.platform == 'checks' }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - name: Validate current version release notes
-        shell: bash
-        run: |
-          version="$(sed -n 's/^version = "\([^" ]*\)"/\1/p' Cargo.toml | head -n 1)"
-          test -n "$version"
-          output="$(mktemp)"
-          trap 'rm -f "$output"' EXIT
-          bash tools/compose-release-notes.sh "$version" "$output"
-          test -s "$output"
-
-  check-windows:
-    if: ${{ inputs.platform == 'checks' }}
-    runs-on: windows-2025
-    steps:
-      - uses: actions/checkout@v6
-      - run: rustup toolchain install 1.98 --profile minimal --component rustfmt,clippy
-      - run: rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc
-      - name: Sync package version in Cargo.lock
-        shell: bash
-        run: |
-          version="$(sed -n 's/^version = "\([^" ]*\)"/\1/p' Cargo.toml | head -n 1)"
-          test -n "$version"
-          cargo update --package keysteer --precise "$version"
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - run: cargo clippy --locked --target aarch64-pc-windows-msvc --all-targets --all-features -- -D warnings
-
-  check-macos:
-    if: ${{ inputs.platform == 'checks' }}
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v6
-      - run: rustup toolchain install 1.98 --profile minimal --component clippy
-      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
-      - name: Sync package version in Cargo.lock
-        shell: bash
-        run: |
-          version="$(sed -n 's/^version = "\([^" ]*\)"/\1/p' Cargo.toml | head -n 1)"
-          test -n "$version"
-          cargo update --package keysteer --precise "$version"
-      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - run: cargo test --locked --all-features startup_repair
-      - run: cargo clippy --locked --target x86_64-apple-darwin --all-targets --all-features -- -D warnings
-
   windows:
-    if: ${{ inputs.platform == 'all' || inputs.platform == 'windows' }}
+    name: Package Windows ${{ matrix.arch }}
+    if: ${{ inputs.publish || inputs.platform == 'windows' || inputs.platform == 'all' }}
     runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+            artifact: KeySteer-Windows-x64
+            package_args: ""
+          - arch: ARM64
+            target: aarch64-pc-windows-msvc
+            artifact: KeySteer-Windows-ARM64
+            package_args: -SkipConfigCheck
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install required Rust toolchain
         run: rustup toolchain install 1.98 --profile minimal
 
-      - name: Verify Rust toolchain
-        run: rustc --version
-
-      - name: Install Rust targets
-        run: rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc
-
       - name: Sync package version in Cargo.lock
         shell: bash
         run: |
           version="$(sed -n 's/^version = "\([^" ]*\)"/\1/p' Cargo.toml | head -n 1)"
           test -n "$version"
           cargo update --package keysteer --precise "$version"
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Restore Rust release cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/${{ matrix.target }}/release/build
+            target/${{ matrix.target }}/release/deps
+            target/${{ matrix.target }}/release/.fingerprint
+          key: ${{ runner.os }}-${{ matrix.target }}-rust-1.98-release-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-rust-1.98-release-
 
       - name: Prepare Windows code-signing certificate
         shell: pwsh
@@ -105,55 +91,44 @@ jobs:
           )
           "KEYSTEER_SIGNING_PFX=$pfx" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Package Windows x64
+      - name: Package Windows ${{ matrix.arch }}
         shell: pwsh
+        timeout-minutes: 30
         env:
           KEYSTEER_SIGNING_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}
           KEYSTEER_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
-        run: ./packaging/windows/package.ps1 -Target x86_64-pc-windows-msvc -RequireSigning -TrustSelfSignedForBuild
+        run: ./packaging/windows/package.ps1 -Target ${{ matrix.target }} -RequireSigning -TrustSelfSignedForBuild ${{ matrix.package_args }}
 
-      - name: Package Windows ARM64
-        shell: pwsh
-        env:
-          KEYSTEER_SIGNING_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}
-          KEYSTEER_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
-        run: ./packaging/windows/package.ps1 -Target aarch64-pc-windows-msvc -SkipConfigCheck -RequireSigning -TrustSelfSignedForBuild
-
-      - name: Upload Windows x64 package
+      - name: Upload Windows ${{ matrix.arch }} package
         uses: actions/upload-artifact@v7
         with:
-          name: KeySteer-Windows-x64
+          name: ${{ matrix.artifact }}
           path: |
-            dist/x86_64-pc-windows-msvc/*.zip
-            dist/x86_64-pc-windows-msvc/*.exe
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Upload Windows ARM64 package
-        uses: actions/upload-artifact@v7
-        with:
-          name: KeySteer-Windows-ARM64
-          path: |
-            dist/aarch64-pc-windows-msvc/*.zip
-            dist/aarch64-pc-windows-msvc/*.exe
+            dist/${{ matrix.target }}/*.zip
+            dist/${{ matrix.target }}/*.exe
           if-no-files-found: error
           retention-days: 30
 
   macos:
-    if: ${{ inputs.platform == 'all' || inputs.platform == 'macos' }}
+    name: Package macOS ${{ matrix.arch }}
+    if: ${{ inputs.publish || inputs.platform == 'macos' || inputs.platform == 'all' }}
     runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: Apple Silicon
+            target: aarch64-apple-darwin
+            artifact: KeySteer-macOS-Apple-Silicon
+          - arch: Intel
+            target: x86_64-apple-darwin
+            artifact: KeySteer-macOS-Intel
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install required Rust toolchain
         run: rustup toolchain install 1.98 --profile minimal
-
-      - name: Verify Rust toolchain
-        run: rustc --version
-
-      - name: Install Rust targets
-        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - name: Sync package version in Cargo.lock
         shell: bash
@@ -162,41 +137,46 @@ jobs:
           test -n "$version"
           cargo update --package keysteer --precise "$version"
 
-      - name: Package macOS Apple Silicon
-        shell: bash
-        run: bash packaging/macos/package.sh aarch64-apple-darwin
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
 
-      - name: Package macOS Intel
-        shell: bash
-        run: bash packaging/macos/package.sh x86_64-apple-darwin
+      - name: Restore Rust release cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/${{ matrix.target }}/release/build
+            target/${{ matrix.target }}/release/deps
+            target/${{ matrix.target }}/release/.fingerprint
+          key: ${{ runner.os }}-${{ matrix.target }}-rust-1.98-release-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-rust-1.98-release-
 
-      - name: Upload macOS Apple Silicon package
+      - name: Package macOS ${{ matrix.arch }}
+        shell: bash
+        timeout-minutes: 30
+        run: bash packaging/macos/package.sh ${{ matrix.target }}
+
+      - name: Upload macOS ${{ matrix.arch }} package
         uses: actions/upload-artifact@v7
         with:
-          name: KeySteer-macOS-Apple-Silicon
-          path: dist/aarch64-apple-darwin/*.zip
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Upload macOS Intel package
-        uses: actions/upload-artifact@v7
-        with:
-          name: KeySteer-macOS-Intel
-          path: dist/x86_64-apple-darwin/*.zip
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.target }}/*.zip
           if-no-files-found: error
           retention-days: 30
 
   release:
     # A public release must contain every supported platform. Partial manual
     # builds still retain their downloadable workflow artifacts.
-    if: ${{ inputs.platform == 'all' }}
+    if: ${{ inputs.publish }}
     needs: [windows, macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Read package version
         id: version
@@ -232,17 +212,27 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TYPE: ${{ inputs.release_type }}
           VERSION: ${{ steps.version.outputs.value }}
         shell: bash
         run: |
-          tag="v$VERSION"
+          prerelease_flag=()
+          if [[ "$RELEASE_TYPE" == "pre-release" ]]; then
+            tag="v$VERSION-pre.$GITHUB_RUN_NUMBER"
+            title="KeySteer v$VERSION pre-release #$GITHUB_RUN_NUMBER"
+            prerelease_flag=(--prerelease)
+          else
+            tag="v$VERSION"
+            title="KeySteer v$VERSION"
+          fi
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "release already exists: $tag" >&2
             exit 1
           fi
           gh release create "$tag" \
             --target "$GITHUB_SHA" \
-            --title "KeySteer v$VERSION" \
+            --title "$title" \
+            "${prerelease_flag[@]}" \
             --generate-notes \
             --notes "$(cat release-body.md)" \
             release-assets/*.zip \
