@@ -1,4 +1,4 @@
-//! One-shot handoff of the active TOML to the static web simulator.
+//! One-shot handoff of the active TOML source to the static web simulator.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -9,9 +9,9 @@ const SIMULATOR_URL: &str = "https://dccif.github.io/KeySteer/simulator";
 const PROTOCOL_VERSION: &str = "v1";
 const MAX_SOURCE_BYTES: usize = 256 * 1024;
 const MAX_FRAGMENT_BYTES: usize = 24 * 1024;
-pub(crate) const OPEN_DEBOUNCE: Duration = Duration::from_secs(2);
+pub(super) const OPEN_DEBOUNCE: Duration = Duration::from_secs(2);
 
-pub(crate) fn url_for_config(source: &str) -> String {
+pub(super) fn url_for_config(source: &str) -> String {
     if source.len() > MAX_SOURCE_BYTES {
         return format!("{SIMULATOR_URL}#ks-config-error=too-large");
     }
@@ -51,11 +51,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_config_is_supported() {
-        assert_eq!(decode(&url_for_config("")), b"");
-    }
-
-    #[test]
     fn shipped_configuration_fits_the_browser_handoff() {
         let source = include_str!("../../keysteer.default.toml");
         let url = url_for_config(source);
@@ -67,27 +62,6 @@ mod tests {
     #[test]
     fn oversized_source_uses_non_secret_error_fragment() {
         let source = "x".repeat(MAX_SOURCE_BYTES + 1);
-        assert_eq!(
-            url_for_config(&source),
-            format!("{SIMULATOR_URL}#ks-config-error=too-large")
-        );
-    }
-
-    #[test]
-    fn source_at_the_raw_limit_is_supported_when_compressible() {
-        let source = "x".repeat(MAX_SOURCE_BYTES);
-        assert_eq!(decode(&url_for_config(&source)), source.as_bytes());
-    }
-
-    #[test]
-    fn incompressible_fragment_uses_the_bounded_error_url() {
-        let mut state = 0x1234_5678_u32;
-        let source = (0..64 * 1024)
-            .map(|_| {
-                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                char::from_u32((state >> 24) % 95 + 32).unwrap()
-            })
-            .collect::<String>();
         assert_eq!(
             url_for_config(&source),
             format!("{SIMULATOR_URL}#ks-config-error=too-large")

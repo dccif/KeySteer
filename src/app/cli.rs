@@ -29,7 +29,7 @@ pub fn run_cli() -> ExitCode {
     if let Some(exit) = run_internal_wechat_helper() {
         return exit;
     }
-    let log_path = match crate::support::logging::init() {
+    let log_path = match crate::support::logging::init(log_candidates()) {
         Ok(path) => Some(path.to_path_buf()),
         Err(error) => {
             crate::report_error!("logging", "{error}");
@@ -55,6 +55,17 @@ pub fn run_cli() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn log_candidates() -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = super::paths::data_file("keysteer.log")
+        .into_iter()
+        .collect();
+    let fallback = std::env::temp_dir().join("KeySteer").join("keysteer.log");
+    if !paths.contains(&fallback) {
+        paths.push(fallback);
+    }
+    paths
 }
 
 fn parse_args() -> Result<Option<CliOptions>, String> {
@@ -188,6 +199,22 @@ CONFIGURATION:
         println!(
             "\nDIAGNOSTICS:\n    Always-on runtime log: {}",
             path.display()
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn application_log_precedes_the_emergency_fallback() {
+        let expected = super::super::paths::data_file("keysteer.log").unwrap();
+        let paths = log_candidates();
+        assert_eq!(paths.first(), Some(&expected));
+        assert_eq!(
+            paths.last(),
+            Some(&std::env::temp_dir().join("KeySteer").join("keysteer.log"))
         );
     }
 }

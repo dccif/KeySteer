@@ -50,6 +50,30 @@ fn api_is_the_dependency_floor() -> std::io::Result<()> {
 }
 
 #[test]
+fn support_is_business_agnostic() -> std::io::Result<()> {
+    assert_forbidden(
+        "src/support",
+        &["app", "config", "modes", "platform", "plugins", "runtime"],
+    )
+}
+
+#[test]
+fn config_owns_documents_without_reaching_outward() -> std::io::Result<()> {
+    assert_forbidden(
+        "src/config",
+        &["app", "modes", "platform", "plugins", "runtime", "support"],
+    )
+}
+
+#[test]
+fn runtime_consumes_only_api_and_support() -> std::io::Result<()> {
+    assert_forbidden(
+        "src/runtime",
+        &["app", "config", "modes", "platform", "plugins"],
+    )
+}
+
+#[test]
 fn modes_and_compiled_plugins_only_consume_the_api() -> std::io::Result<()> {
     let forbidden = ["app", "config", "platform", "runtime", "support"];
     assert_forbidden("src/modes", &forbidden)?;

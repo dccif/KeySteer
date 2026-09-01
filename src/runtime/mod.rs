@@ -12,10 +12,13 @@
 //! [`ModeEvent::Binding`].
 
 mod command_executor;
+mod config_handoff;
+mod configuration;
 mod input_router;
 mod overlay_coordinator;
 mod plan;
 
+pub use configuration::{ConfigurationCandidate, ConfigurationRepository};
 pub use plan::{
     AppRouteOverride, DebugSettings, EngineSettings, ModeRoute, PaletteSet, RuntimePlan,
 };
@@ -23,13 +26,13 @@ pub use plan::{
 #[cfg(test)]
 use std::collections::BTreeSet;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use smallvec::SmallVec;
 
+use crate::api::Palette;
 use crate::api::backend::{Appearance, Backend, BackendEvent, KeyDisposition};
 use crate::api::binding::{Binding, Button, DEFAULT_WAIT_MS, InputTarget};
 use crate::api::command::{
@@ -39,8 +42,8 @@ use crate::api::command::{
 use crate::api::geometry::{Point, Screen};
 use crate::api::input::{Key, KeyChord, KeyState, ModeId};
 use crate::api::overlay::{CursorMarker, Indicator, OverlayScene};
-use crate::config::{Bindings, Config, ConfigStore, Palette};
 use input_router::CompiledKeymap;
+use plan::Bindings;
 
 /// Internal classification for failures crossing the Engine loop. Public APIs
 /// keep their string errors, while recovery decisions never parse display text.
@@ -599,7 +602,6 @@ fn app_pattern_matches(pattern: &str, app: &FocusedApp) -> bool {
 }
 
 pub struct Engine {
-    config: Config,
     settings: EngineSettings,
     palettes: PaletteSet,
     routes: BTreeMap<ModeId, ModeRoute>,
@@ -670,32 +672,24 @@ pub struct Engine {
     input_failure_active: bool,
     pending_runtime_error: Option<RuntimeError>,
     should_quit: bool,
-    config_store: Option<ConfigStore>,
-    /// Automatic startup keeps discovering this directory on every reload.
-    /// An explicit `--config` leaves this unset and remains pinned to its path.
-    config_discovery_directory: Option<PathBuf>,
+    configuration: Option<Box<dyn ConfigurationRepository>>,
     /// Prevent rapid status-menu clicks from opening duplicate browser tabs.
     last_config_simulator_open: Option<Instant>,
     started_at: Instant,
 }
 
 impl Engine {
-    pub fn new(config: Config, appearance: Appearance) -> Self {
-        let plan = match crate::app::configuration::compile(&config) {
-            Ok(plan) => plan,
-            Err(error) => panic!("Engine::new requires a validated configuration: {error}"),
-        };
+    fn empty(plan: RuntimePlan, appearance: Appearance) -> Result<Self, String> {
         let RuntimePlan {
             settings,
             palettes,
             routes,
-            modes: _,
-            plugins: _,
+            modes,
+            plugins,
         } = plan;
         crate::support::logging::set_non_error_enabled(settings.debug.enabled);
         let palette = palettes.for_appearance(appearance);
-        Self {
-            config,
+        let mut engine = Self {
             settings,
             palettes,
             routes,
@@ -723,30 +717,10 @@ impl Engine {
             input_failure_active: false,
             pending_runtime_error: None,
             should_quit: false,
-            config_store: None,
-            config_discovery_directory: None,
+            configuration: None,
             last_config_simulator_open: None,
             started_at: Instant::now(),
-        }
-    }
-
-    pub(crate) fn from_plan(
-        config: Config,
-        plan: RuntimePlan,
-        appearance: Appearance,
-    ) -> Result<Self, String> {
-        let mut engine = Self::new(config, appearance);
-        let RuntimePlan {
-            settings,
-            palettes,
-            routes,
-            modes,
-            plugins,
-        } = plan;
-        engine.settings = settings;
-        engine.palettes = palettes;
-        engine.routes = routes;
-        engine.palette = engine.palettes.for_appearance(appearance);
+        };
         for mode in modes {
             engine.register_deferred(mode);
         }
@@ -754,6 +728,10 @@ impl Engine {
             engine.register_plugin_dyn_deferred(plugin)?;
         }
         Ok(engine)
+    }
+
+    pub fn from_plan(plan: RuntimePlan, appearance: Appearance) -> Result<Self, String> {
+        Self::empty(plan, appearance)
     }
 
     /// Register a mode. Later registrations replace earlier ones with the same
@@ -833,22 +811,14 @@ impl Engine {
         Ok(())
     }
 
-    pub fn config(&self) -> &Config {
-        &self.config
+    pub fn attach_configuration(&mut self, repository: Box<dyn ConfigurationRepository>) {
+        self.configuration = Some(repository);
     }
 
-    pub fn attach_config_store(&mut self, store: ConfigStore) {
-        self.config_store = Some(store);
-        self.config_discovery_directory = None;
-    }
-
-    pub(crate) fn attach_discovered_config_store(
-        &mut self,
-        store: ConfigStore,
-        directory: PathBuf,
-    ) {
-        self.config_store = Some(store);
-        self.config_discovery_directory = Some(directory);
+    pub fn configuration_source_path(&self) -> Option<std::path::PathBuf> {
+        self.configuration
+            .as_ref()
+            .and_then(|repository| repository.source_path())
     }
 
     fn recoverable_input_error(&mut self, action: &str, error: String) -> String {
@@ -1805,16 +1775,16 @@ impl Engine {
             BackendEvent::OpenConfigSimulator => {
                 let now = Instant::now();
                 if self.last_config_simulator_open.is_some_and(|previous| {
-                    now.saturating_duration_since(previous)
-                        < crate::app::config_simulator::OPEN_DEBOUNCE
+                    now.saturating_duration_since(previous) < config_handoff::OPEN_DEBOUNCE
                 }) {
                     return Ok(());
                 }
-                let source = match self.config_store.as_ref() {
-                    Some(store) => store.source_text(),
-                    None => self.config.to_toml().map_err(|error| error.to_string())?,
-                };
-                let url = crate::app::config_simulator::url_for_config(&source);
+                let source = self
+                    .configuration
+                    .as_ref()
+                    .ok_or_else(|| "no configuration source is attached".to_string())?
+                    .source_text()?;
+                let url = config_handoff::url_for_config(&source);
                 if let Err(error) = backend.open_url(&url) {
                     crate::support::logging::report_error("config-simulator", error);
                 } else {
@@ -1866,53 +1836,26 @@ impl Engine {
     }
 
     fn reload_config(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
-        let discovered_path = if let Some(directory) = self.config_discovery_directory.clone() {
-            let (config, store, path) = match Config::discover_in(&directory) {
-                Ok(Some(path)) => {
-                    let loaded = Config::load_with_source(&path).map_err(|error| {
-                        format!(
-                            "configuration reload rejected; keeping the last valid configuration: {error}"
-                        )
-                    })?;
-                    let store =
-                        ConfigStore::from_validated_text(loaded.path.clone(), loaded.raw_text);
-                    (loaded.config, store, Some(loaded.path))
-                }
-                Ok(None) => {
-                    let config = Config::default();
-                    let path = directory.join("keysteer.user.toml");
-                    let store = ConfigStore::from_validated_text(
-                        path,
-                        config.to_toml().map_err(|error| error.to_string())?,
-                    );
-                    (config, store, None)
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "configuration reload rejected; discovery failed: {error}"
-                    ));
-                }
-            };
-            self.apply_config_and_restart(config, backend)?;
-            self.config_store = Some(store);
-            path
-        } else if let Some(current) = self.config_store.as_ref() {
-            // Reload into a detached candidate. A malformed file must not
-            // replace the active source or cancel an in-flight short click.
-            let mut candidate = current.clone();
-            let config = candidate.reload().map_err(|error| {
+        // The adapter parses, validates and compiles into a detached candidate.
+        // Nothing owned by the active runtime is touched on failure.
+        let candidate = self
+            .configuration
+            .as_ref()
+            .ok_or_else(|| "no configuration source is attached".to_string())?
+            .reload_candidate()
+            .map_err(|error| {
                 format!(
                     "configuration reload rejected; keeping the last valid configuration: {error}"
                 )
             })?;
-            let path = candidate.path().to_path_buf();
-            self.apply_config_and_restart(config, backend)?;
-            self.config_store = Some(candidate);
-            Some(path)
-        } else {
-            self.apply_config_and_restart(self.config.clone(), backend)?;
-            None
-        };
+        let ConfigurationCandidate {
+            plan,
+            repository,
+            source_path,
+        } = candidate;
+        self.apply_runtime_plan(plan, backend)?;
+        self.configuration = Some(repository);
+        let discovered_path = source_path;
         if let Some(path) = discovered_path {
             crate::log_info!(
                 "config",
@@ -1928,9 +1871,10 @@ impl Engine {
         Ok(())
     }
 
-    /// Swap in a new configuration at runtime.
-    pub fn apply_config(&mut self, config: Config) -> Result<(), String> {
-        let plan = crate::app::configuration::compile(&config)?;
+    /// Swap in a precompiled plan without restarting runtime-owned tasks.
+    /// This is intended for deterministic tests and initial assembly only;
+    /// interactive reloads always use the controlled restart path.
+    pub fn apply_plan(&mut self, plan: RuntimePlan) -> Result<(), String> {
         let RuntimePlan {
             settings,
             palettes,
@@ -1940,7 +1884,6 @@ impl Engine {
         } = plan;
         crate::support::logging::set_non_error_enabled(settings.debug.enabled);
         self.input.drag_auto_release.clear();
-        self.config = config;
         self.settings = settings;
         self.palettes = palettes;
         self.routes = routes;
@@ -1948,19 +1891,6 @@ impl Engine {
         self.palette = self.palettes.for_appearance(self.appearance);
         self.rebuild_tables();
         self.trace_binding_tables();
-        Ok(())
-    }
-
-    fn apply_config_and_restart(
-        &mut self,
-        config: Config,
-        backend: &mut dyn Backend,
-    ) -> Result<(), String> {
-        // Compilation is deliberately first. A bad candidate cannot cancel a
-        // timer, release input, replace a mode, or alter the current palette.
-        let plan = crate::app::configuration::compile(&config)?;
-        self.apply_runtime_plan(plan, backend)?;
-        self.config = config;
         Ok(())
     }
 
@@ -3852,16 +3782,41 @@ fn drag_modifier_bit(key: &Key) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TEST_ALLOCATOR;
     use crate::api::CommandBatch;
     use crate::api::binding::Direction;
     use crate::api::geometry::Rect;
     use crate::api::input::InputEvent;
-    use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
-    use std::alloc::System;
+    use crate::config::{Config, ConfigStore};
+    use stats_alloc::Region;
     use std::sync::{Arc, Mutex};
 
-    #[global_allocator]
-    static TEST_ALLOCATOR: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
+    fn attach_test_repository(
+        engine: &mut Engine,
+        config: Config,
+        store: Option<ConfigStore>,
+        discovery_directory: Option<std::path::PathBuf>,
+        source: String,
+    ) {
+        engine.attach_configuration(Box::new(crate::app::configuration::ConfigRepository::new(
+            config,
+            source,
+            store,
+            discovery_directory,
+        )));
+    }
+
+    fn active_config(engine: &Engine) -> Config {
+        Config::parse(
+            &engine
+                .configuration
+                .as_ref()
+                .expect("test engine has a configuration repository")
+                .source_text()
+                .unwrap(),
+        )
+        .unwrap()
+    }
 
     /// Records what the engine asked of the platform.
     #[derive(Default)]
@@ -4051,24 +4006,31 @@ mod tests {
     fn simulator_menu_uses_the_active_config_source() {
         let source = "# current profile\n[normal]\nlong_press_toggle_ms = 777\n";
         let mut engine = Engine::new(Config::parse(source).unwrap(), Appearance::Dark);
-        engine.attach_config_store(ConfigStore::from_validated_text(
-            "keysteer.profile.toml",
+        attach_test_repository(
+            &mut engine,
+            Config::parse(source).unwrap(),
+            Some(ConfigStore::from_validated_text(
+                "keysteer.profile.toml",
+                source.to_string(),
+                crate::platform::atomic_replace,
+            )),
+            None,
             source.to_string(),
-        ));
+        );
         let (mut backend, log) = FakeBackend::new(vec![BackendEvent::OpenConfigSimulator]);
 
         engine.run(&mut backend).unwrap();
 
         assert_eq!(
             log.lock().unwrap().opened_urls,
-            [crate::app::config_simulator::url_for_config(source)]
+            [config_handoff::url_for_config(source)]
         );
     }
 
     #[test]
     fn simulator_menu_serializes_config_without_a_store() {
         let config = Config::default();
-        let expected = crate::app::config_simulator::url_for_config(&config.to_toml().unwrap());
+        let expected = config_handoff::url_for_config(&config.to_toml().unwrap());
         let mut engine = Engine::new(config, Appearance::Dark);
         let (mut backend, log) = FakeBackend::new(vec![BackendEvent::OpenConfigSimulator]);
 
@@ -5071,7 +5033,6 @@ mod tests {
         });
         assert_eq!(builds.get(), 0);
 
-        engine.config.debug.enabled = true;
         engine.settings.debug.enabled = true;
         engine.trace_lazy(false, "test", || {
             builds.set(builds.get() + 1);
@@ -5117,9 +5078,8 @@ mod tests {
 
         let mut reloaded = initial;
         reloaded.grid.max_depth = 3;
-        engine
-            .apply_config_and_restart(reloaded, &mut backend)
-            .unwrap();
+        let plan = crate::app::configuration::compile(&reloaded).unwrap();
+        engine.apply_runtime_plan(plan, &mut backend).unwrap();
         engine
             .activate(ModeId::grid(), Some(ModeId::normal()), &mut backend)
             .unwrap();
@@ -5923,8 +5883,9 @@ mod tests {
             ("double_click", Button::Left, ButtonAction::DoubleClick),
         ] {
             let mut engine = engine_with_normal_binding("x", binding);
-            engine.config.normal.long_press_toggle_ms = 0;
-            engine.apply_config(engine.config.clone()).unwrap();
+            let mut config = active_config(&engine);
+            config.normal.long_press_toggle_ms = 0;
+            engine.apply_config(config).unwrap();
             engine.active = ModeId::normal();
             let (mut backend, log) = FakeBackend::new(Vec::new());
 
@@ -6375,8 +6336,9 @@ mod tests {
     fn excluded_focus_clears_pending_and_latched_click_feedback() {
         for long_pressed in [false, true] {
             let mut engine = drag_auto_release_engine();
-            engine.config.general.excluded_apps = vec!["com.example.excluded".into()];
-            engine.apply_config(engine.config.clone()).unwrap();
+            let mut config = active_config(&engine);
+            config.general.excluded_apps = vec!["com.example.excluded".into()];
+            engine.apply_config(config).unwrap();
             let (mut backend, log) = FakeBackend::new(Vec::new());
             if long_pressed {
                 latch_drag_button(&mut engine, ";", &mut backend);
@@ -6433,9 +6395,10 @@ mod tests {
     #[test]
     fn excluded_focus_clears_immediate_click_feedback_without_a_pending_toggle() {
         let mut engine = drag_auto_release_engine();
-        engine.config.normal.long_press_toggle_ms = 0;
-        engine.config.general.excluded_apps = vec!["com.example.excluded".into()];
-        engine.apply_config(engine.config.clone()).unwrap();
+        let mut config = active_config(&engine);
+        config.normal.long_press_toggle_ms = 0;
+        config.general.excluded_apps = vec!["com.example.excluded".into()];
+        engine.apply_config(config).unwrap();
         let (mut backend, log) = FakeBackend::new(Vec::new());
 
         engine
@@ -6520,12 +6483,12 @@ mod tests {
     #[test]
     fn drag_auto_release_keeps_specific_modifier_chords_ahead_of_move_fallback() {
         let mut engine = drag_auto_release_engine();
-        engine
-            .config
+        let mut config = active_config(&engine);
+        config
             .normal
             .bindings
             .insert("ctrl+shift+h".into(), Binding::parse("send home").unwrap());
-        engine.apply_config(engine.config.clone()).unwrap();
+        engine.apply_config(config).unwrap();
         let (mut backend, log) = FakeBackend::new(Vec::new());
         latch_drag_button(&mut engine, ";", &mut backend);
 
@@ -6551,12 +6514,12 @@ mod tests {
     #[test]
     fn drag_auto_release_respects_an_exact_disabled_chord() {
         let mut engine = drag_auto_release_engine();
-        engine
-            .config
+        let mut config = active_config(&engine);
+        config
             .normal
             .bindings
             .insert("ctrl+h".into(), Binding::Disabled);
-        engine.apply_config(engine.config.clone()).unwrap();
+        engine.apply_config(config).unwrap();
         let (mut backend, log) = FakeBackend::new(Vec::new());
         latch_drag_button(&mut engine, ";", &mut backend);
 
@@ -6579,11 +6542,9 @@ mod tests {
     #[test]
     fn drag_auto_release_respects_a_disabled_chord_from_normal_inheritance() {
         let mut engine = drag_auto_release_engine();
-        engine
-            .config
-            .hotkeys
-            .insert("ctrl+h".into(), Binding::Disabled);
-        engine.apply_config(engine.config.clone()).unwrap();
+        let mut config = active_config(&engine);
+        config.hotkeys.insert("ctrl+h".into(), Binding::Disabled);
+        engine.apply_config(config).unwrap();
         let (mut backend, log) = FakeBackend::new(Vec::new());
         latch_drag_button(&mut engine, ";", &mut backend);
 
@@ -6704,12 +6665,12 @@ mod tests {
     #[test]
     fn explicit_press_takes_over_an_existing_auto_drag_button() {
         let mut engine = drag_auto_release_engine();
-        engine
-            .config
+        let mut config = active_config(&engine);
+        config
             .normal
             .bindings
             .insert("ctrl+x".into(), Binding::parse("press mouse_left").unwrap());
-        engine.apply_config(engine.config.clone()).unwrap();
+        engine.apply_config(config).unwrap();
         let (mut backend, log) = FakeBackend::new(Vec::new());
         latch_drag_button(&mut engine, ";", &mut backend);
         latch_drag_button(&mut engine, "'", &mut backend);
@@ -6826,7 +6787,7 @@ mod tests {
             .unwrap();
         assert_ne!(engine.input.drag_auto_release.buttons, 0);
 
-        let mut replacement = engine.config.clone();
+        let mut replacement = active_config(&engine);
         replacement.normal.auto_release_ms = 50;
         engine.apply_config(replacement).unwrap();
 
@@ -7090,8 +7051,9 @@ mod tests {
             ]
         );
 
-        engine.config.normal.long_press_toggle_ms = 0;
-        engine.apply_config(engine.config.clone()).unwrap();
+        let mut config = active_config(&engine);
+        config.normal.long_press_toggle_ms = 0;
+        engine.apply_config(config).unwrap();
         engine
             .handle_backend_event(key_down("x"), &mut backend)
             .unwrap();
@@ -7344,7 +7306,7 @@ mod tests {
         engine
             .handle_backend_event(key_down("x"), &mut backend)
             .unwrap();
-        engine.apply_config(engine.config.clone()).unwrap();
+        engine.apply_config(active_config(&engine)).unwrap();
         engine
             .handle_backend_event(key_up("x"), &mut backend)
             .unwrap();
@@ -8699,8 +8661,9 @@ mod tests {
             vec![("n".into(), KeyState::Down), ("n".into(), KeyState::Up),]
         );
 
-        engine.config.normal.long_press_toggle_ms = 0;
-        engine.apply_config(engine.config.clone()).unwrap();
+        let mut config = active_config(&engine);
+        config.normal.long_press_toggle_ms = 0;
+        engine.apply_config(config).unwrap();
         engine
             .handle_backend_event(key_down("n"), &mut backend)
             .unwrap();
@@ -10267,29 +10230,56 @@ mod tests {
 
         let defaults = Config::default();
         let default_write_path = directory.join("keysteer.user.toml");
-        let store = ConfigStore::open(&default_write_path, &defaults).unwrap();
-        let mut engine = Engine::new(defaults, Appearance::Dark);
-        engine.attach_discovered_config_store(store, directory.clone());
+        let store = ConfigStore::open(
+            &default_write_path,
+            &defaults,
+            crate::platform::atomic_replace,
+        )
+        .unwrap();
+        let source = defaults.to_toml().unwrap();
+        let mut engine = Engine::new(defaults.clone(), Appearance::Dark);
+        attach_test_repository(
+            &mut engine,
+            defaults,
+            Some(store),
+            Some(directory.clone()),
+            source,
+        );
 
         let discovered_path = directory.join("keysteer.created-later.toml");
         std::fs::write(&discovered_path, "[pointer]\ninitial_speed = 321\n").unwrap();
         let (mut backend, _) = FakeBackend::new(vec![]);
         engine.reload_config(&mut backend).unwrap();
 
-        assert_eq!(engine.config.pointer.initial_speed, 321.0);
-        assert_eq!(
-            engine.config_store.as_ref().unwrap().path(),
-            discovered_path
-        );
+        let active = Config::parse(
+            &engine
+                .configuration
+                .as_ref()
+                .unwrap()
+                .source_text()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(active.pointer.initial_speed, 321.0);
+        assert_eq!(engine.configuration_source_path().unwrap(), discovered_path);
 
         std::fs::remove_file(&discovered_path).unwrap();
         engine.reload_config(&mut backend).unwrap();
+        let active = Config::parse(
+            &engine
+                .configuration
+                .as_ref()
+                .unwrap()
+                .source_text()
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
-            engine.config.pointer.initial_speed,
+            active.pointer.initial_speed,
             Config::default().pointer.initial_speed
         );
         assert_eq!(
-            engine.config_store.as_ref().unwrap().path(),
+            engine.configuration_source_path().unwrap(),
             default_write_path
         );
 
@@ -10311,9 +10301,11 @@ mod tests {
         let explicit_path = directory.join("keysteer.explicit.toml");
         std::fs::write(&explicit_path, "[pointer]\ninitial_speed = 200\n").unwrap();
         let config = Config::load(&explicit_path).unwrap();
-        let store = ConfigStore::open(&explicit_path, &config).unwrap();
-        let mut engine = Engine::new(config, Appearance::Dark);
-        engine.attach_config_store(store);
+        let store =
+            ConfigStore::open(&explicit_path, &config, crate::platform::atomic_replace).unwrap();
+        let source = config.to_toml().unwrap();
+        let mut engine = Engine::new(config.clone(), Appearance::Dark);
+        attach_test_repository(&mut engine, config, Some(store), None, source);
 
         std::fs::write(
             directory.join("keysteer.aaa.toml"),
@@ -10324,8 +10316,17 @@ mod tests {
         let (mut backend, _) = FakeBackend::new(vec![]);
         engine.reload_config(&mut backend).unwrap();
 
-        assert_eq!(engine.config.pointer.initial_speed, 456.0);
-        assert_eq!(engine.config_store.as_ref().unwrap().path(), explicit_path);
+        let active = Config::parse(
+            &engine
+                .configuration
+                .as_ref()
+                .unwrap()
+                .source_text()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(active.pointer.initial_speed, 456.0);
+        assert_eq!(engine.configuration_source_path().unwrap(), explicit_path);
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -10344,10 +10345,11 @@ mod tests {
 
         let path = directory.join("keysteer.user.toml");
         let mut engine = engine_with_normal_action("x", Binding::Click(Button::Left));
-        let mut config = engine.config.clone();
+        let mut config = active_config(&engine);
         std::fs::write(&path, config.to_toml().unwrap()).unwrap();
-        let store = ConfigStore::open(&path, &config).unwrap();
-        engine.attach_config_store(store);
+        let store = ConfigStore::open(&path, &config, crate::platform::atomic_replace).unwrap();
+        let source = config.to_toml().unwrap();
+        attach_test_repository(&mut engine, config.clone(), Some(store), None, source);
         engine.active = ModeId::normal();
         let (mut backend, log) = FakeBackend::new(Vec::new());
 
@@ -10367,7 +10369,16 @@ mod tests {
         engine.reload_config(&mut backend).unwrap();
         assert!(engine.input.pending_long_press_toggles.is_empty());
         assert!(engine.input.latched.is_empty());
-        assert_eq!(engine.config.pointer.initial_speed, 456.0);
+        let active = Config::parse(
+            &engine
+                .configuration
+                .as_ref()
+                .unwrap()
+                .source_text()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(active.pointer.initial_speed, 456.0);
         assert_eq!(
             log.lock().unwrap().buttons,
             [

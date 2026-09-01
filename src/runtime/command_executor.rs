@@ -301,13 +301,19 @@ impl Engine {
 
                 Command::SetConfigValue { path, value } => {
                     let update = self
-                        .config_store
-                        .as_mut()
+                        .configuration
+                        .as_ref()
                         .ok_or_else(|| "no writable configuration source is attached".to_string())
-                        .and_then(|store| store.set(&path, &value).map_err(|e| e.to_string()));
+                        .and_then(|repository| repository.set_candidate(&path, &value));
                     match update {
-                        Ok(config) => {
-                            self.apply_config_and_restart(config, backend)?;
+                        Ok(candidate) => {
+                            let super::ConfigurationCandidate {
+                                plan,
+                                repository,
+                                source_path: _,
+                            } = candidate;
+                            self.apply_runtime_plan(plan, backend)?;
+                            self.configuration = Some(repository);
                         }
                         Err(error) => {
                             return Err(format!(

@@ -6,12 +6,12 @@
 //! configuration stays valid, that the five modes fit together, and that a
 //! plugin is treated exactly like a built-in mode.
 
-use keysteer::Engine;
 use keysteer::api::{
     Appearance, Binding, Command, Direction, HostContext, KeyChord, Mode, ModeEvent, ModeId, Point,
     Rect, Screen, UiScanStrategy,
 };
 use keysteer::config::{Config, LifecycleAction, TargetingLifecycle};
+use keysteer::runtime::Engine;
 
 fn screens() -> Vec<Screen> {
     vec![Screen {
@@ -24,12 +24,12 @@ fn screens() -> Vec<Screen> {
 }
 
 fn shipped() -> Config {
-    Config::parse(include_str!("../keysteer.default.toml"))
+    Config::parse(include_str!("../../keysteer.default.toml"))
         .expect("keysteer.default.toml should parse")
 }
 
 fn shipped_document() -> toml::Value {
-    toml::from_str(include_str!("../keysteer.default.toml"))
+    toml::from_str(include_str!("../../keysteer.default.toml"))
         .expect("keysteer.default.toml should be valid TOML")
 }
 
@@ -79,7 +79,7 @@ fn the_shipped_targeting_lifecycles_are_explicit() {
 
 #[test]
 fn the_macos_bridge_does_not_require_clang_availability_runtime() {
-    let bridge = include_str!("../src/platform/macos/vision_bridge.m");
+    let bridge = include_str!("../../src/platform/macos/vision_bridge.m");
     assert!(
         !bridge.contains("if (@available"),
         "@available introduces __isPlatformVersionAtLeast, which Rust's -nodefaultlibs link omits"
@@ -88,8 +88,8 @@ fn the_macos_bridge_does_not_require_clang_availability_runtime() {
 
 #[test]
 fn macos_autostart_registers_the_keysteer_bundle_instead_of_open() {
-    let bridge = include_str!("../src/platform/macos/autostart_bridge.m");
-    let rust = include_str!("../src/platform/macos/autostart.rs");
+    let bridge = include_str!("../../src/platform/macos/autostart_bridge.m");
+    let rust = include_str!("../../src/platform/macos/autostart.rs");
     assert!(bridge.contains("SMAppService.mainAppService"));
     assert!(bridge.contains("registerAndReturnError"));
     assert!(!rust.contains("<string>/usr/bin/open</string>"));
@@ -99,12 +99,12 @@ fn macos_autostart_registers_the_keysteer_bundle_instead_of_open() {
 
 #[test]
 fn macos_top_status_item_stays_inside_the_backend() {
-    let status_item = include_str!("../src/platform/macos/status_item.rs");
-    let backend = include_str!("../src/platform/macos/mod.rs");
-    let bootstrap = include_str!("../src/app/bootstrap.rs");
-    let runtime = include_str!("../src/runtime/mod.rs");
-    let workspace = include_str!("../src/platform/macos/workspace.rs");
-    let build = include_str!("../build.rs");
+    let status_item = include_str!("../../src/platform/macos/status_item.rs");
+    let backend = include_str!("../../src/platform/macos/mod.rs");
+    let bootstrap = include_str!("../../src/app/bootstrap.rs");
+    let runtime = include_str!("../../src/runtime/mod.rs");
+    let workspace = include_str!("../../src/platform/macos/workspace.rs");
+    let build = include_str!("../../build.rs");
 
     assert!(bootstrap.contains("platform::backend_for_ui_scan"));
     assert!(bootstrap.contains("engine.run(backend.as_mut())"));
@@ -172,7 +172,7 @@ fn macos_top_status_item_stays_inside_the_backend() {
 
 #[test]
 fn macos_shutdown_releases_input_before_waiting_for_workers() {
-    let backend = include_str!("../src/platform/macos/mod.rs");
+    let backend = include_str!("../../src/platform/macos/mod.rs");
     let shutdown = backend
         .split_once("fn shutdown_resources(&mut self)")
         .map(|(_, body)| body)
@@ -196,7 +196,7 @@ fn macos_shutdown_releases_input_before_waiting_for_workers() {
 
 #[test]
 fn macos_tcc_fail_open_adds_no_per_event_stop_poll() {
-    let hook = include_str!("../src/platform/macos/hook.rs");
+    let hook = include_str!("../../src/platform/macos/hook.rs");
     let callback = hook
         .split_once("fn handle_event(")
         .map(|(_, tail)| tail)
@@ -313,7 +313,7 @@ fn the_shipped_targeting_modes_bind_primary_q_to_normal() {
 #[test]
 fn the_shipped_config_uses_no_action_prefix() {
     // The whole point of the binding vocabulary: verbs stand alone.
-    let text = include_str!("../keysteer.default.toml");
+    let text = include_str!("../../keysteer.default.toml");
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with('#') {
@@ -524,9 +524,9 @@ fn every_mode_has_a_binding_table_including_plugins() {
 
 #[test]
 fn windows_visual_capture_keeps_one_barrier_and_an_unscaled_copy_path() {
-    let gpu = include_str!("../src/platform/windows/gpu_overlay.rs");
-    let worker = include_str!("../src/platform/windows/overlay_worker.rs");
-    let native = include_str!("../src/platform/windows/native/mod.rs");
+    let gpu = include_str!("../../src/platform/windows/gpu_overlay.rs");
+    let worker = include_str!("../../src/platform/windows/overlay_worker.rs");
+    let native = include_str!("../../src/platform/windows/native/mod.rs");
 
     assert!(
         !gpu.contains("WaitForCommitCompletion"),

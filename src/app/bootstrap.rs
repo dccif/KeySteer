@@ -2,7 +2,8 @@
 
 use crate::api::Key;
 use crate::config::{Config, ConfigStore};
-use crate::{Engine, platform};
+use crate::platform;
+use crate::runtime::Engine;
 
 use super::cli::CliOptions;
 
@@ -59,7 +60,7 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
         },
     };
     crate::support::logging::set_non_error_enabled(config.debug.enabled);
-    crate::support::logging::start_session();
+    crate::support::logging::start_session(platform::backend_name());
     if loaded_from_file {
         let path = config_path.as_deref().ok_or_else(|| {
             "configuration loader reported a file without retaining its path".to_string()
@@ -107,9 +108,13 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
     let plan = super::configuration::compile(&config)?;
     let store = if let Some(config_path) = config_path {
         Some(
-            match config_source {
-                Some(source) => Ok(ConfigStore::from_validated_text(config_path, source)),
-                None => ConfigStore::open(config_path, &config),
+            match config_source.as_ref() {
+                Some(source) => Ok(ConfigStore::from_validated_text(
+                    config_path,
+                    source.clone(),
+                    crate::platform::atomic_replace,
+                )),
+                None => ConfigStore::open(config_path, &config, crate::platform::atomic_replace),
             }
             .map_err(|e| e.to_string())?,
         )
@@ -119,18 +124,17 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
 
     let mut backend = platform::backend_for_ui_scan(config.ui_hint.strategy)?;
     crate::support::perf_probe::mark("backend_created");
-    let mut engine = Engine::from_plan(config, plan, backend.appearance())?;
-    if let Some(store) = store {
-        if rediscover_config_on_reload {
-            if let Some(directory) = crate::app::paths::data_dir() {
-                engine.attach_discovered_config_store(store, directory);
-            } else {
-                engine.attach_config_store(store);
-            }
-        } else {
-            engine.attach_config_store(store);
-        }
-    }
+    let source = match config_source {
+        Some(source) => source,
+        None => config.to_toml().map_err(|error| error.to_string())?,
+    };
+    let discovery_directory = rediscover_config_on_reload
+        .then(crate::app::paths::data_dir)
+        .flatten();
+    let repository =
+        super::configuration::ConfigRepository::new(config, source, store, discovery_directory);
+    let mut engine = Engine::from_plan(plan, backend.appearance())?;
+    engine.attach_configuration(Box::new(repository));
 
     engine.run(backend.as_mut())
 }

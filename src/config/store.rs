@@ -6,10 +6,13 @@ use toml_edit::{DocumentMut, Item, Table};
 
 use super::{Config, ConfigError};
 
+pub type ReplaceFile = fn(&Path, &Path) -> std::io::Result<()>;
+
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
     path: PathBuf,
     source: StoreSource,
+    replace_file: ReplaceFile,
 }
 
 #[derive(Debug, Clone)]
@@ -28,7 +31,11 @@ impl StoreSource {
 }
 
 impl ConfigStore {
-    pub fn open(path: impl Into<PathBuf>, fallback: &Config) -> Result<Self, ConfigError> {
+    pub fn open(
+        path: impl Into<PathBuf>,
+        fallback: &Config,
+        replace_file: ReplaceFile,
+    ) -> Result<Self, ConfigError> {
         let path = path.into();
         let text = if path.is_file() {
             std::fs::read_to_string(&path)
@@ -37,15 +44,20 @@ impl ConfigStore {
             fallback.to_toml()?
         };
         Config::parse(&text)?;
-        Ok(Self::from_validated_text(path, text))
+        Ok(Self::from_validated_text(path, text, replace_file))
     }
 
-    pub(crate) fn from_validated_text(path: impl Into<PathBuf>, text: String) -> Self {
+    pub(crate) fn from_validated_text(
+        path: impl Into<PathBuf>,
+        text: String,
+        replace_file: ReplaceFile,
+    ) -> Self {
         // The caller already parsed and validated this exact source. Keep the
         // compact text and defer the comment-preserving AST until the first edit.
         Self {
             path: path.into(),
             source: StoreSource::Raw(text),
+            replace_file,
         }
     }
 
@@ -72,6 +84,14 @@ impl ConfigStore {
     }
 
     pub fn set(&mut self, path: &str, raw_value: &str) -> Result<Config, ConfigError> {
+        let (candidate, config) = self.prepare_set(path, raw_value)?;
+        candidate.persist()?;
+        *self = candidate;
+        Ok(config)
+    }
+
+    /// Build an edited, validated store without touching the active file.
+    pub fn prepare_set(&self, path: &str, raw_value: &str) -> Result<(Self, Config), ConfigError> {
         let segments: Vec<&str> = path.split('.').filter(|part| !part.is_empty()).collect();
         if segments.is_empty() {
             return Err(ConfigError::Invalid("config path must not be empty".into()));
@@ -96,9 +116,13 @@ impl ConfigStore {
         let text = candidate.to_string();
         let config = Config::parse(&text)?;
         config.validate()?;
-        atomic_write(&self.path, text.as_bytes())?;
-        self.source = StoreSource::Parsed(candidate);
-        Ok(config)
+        let mut store = self.clone();
+        store.source = StoreSource::Parsed(candidate);
+        Ok((store, config))
+    }
+
+    pub fn persist(&self) -> Result<(), ConfigError> {
+        atomic_write(&self.path, self.source.text().as_bytes(), self.replace_file)
     }
 }
 
@@ -120,7 +144,7 @@ fn set_item(table: &mut Table, path: &[&str], value: Item) -> Result<(), ConfigE
     set_item(child, tail, value)
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
+fn atomic_write(path: &Path, bytes: &[u8], replace_file: ReplaceFile) -> Result<(), ConfigError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent).map_err(|e| {
         ConfigError::Io(format!(
@@ -132,7 +156,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
     std::fs::write(&temp, bytes)
         .map_err(|e| ConfigError::Io(format!("cannot write {}: {e}", temp.display())))?;
 
-    crate::platform::atomic_replace(&temp, path)
+    replace_file(&temp, path)
         .map_err(|e| ConfigError::Io(format!("cannot replace {}: {e}", path.display())))?;
 
     Ok(())
@@ -141,6 +165,13 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+        if destination.exists() {
+            std::fs::remove_file(destination)?;
+        }
+        std::fs::rename(source, destination)
+    }
 
     fn test_file_name(prefix: &str) -> String {
         let current_thread = std::thread::current();
@@ -161,7 +192,7 @@ mod tests {
     #[test]
     fn creates_nested_platform_setting_tables() {
         let path = std::env::temp_dir().join(test_file_name("keysteer-platform-store"));
-        let mut store = ConfigStore::open(&path, &Config::default()).unwrap();
+        let mut store = ConfigStore::open(&path, &Config::default(), replace_file).unwrap();
         let config = store
             .set("platform.macos.scroll.invert_vertical", "false")
             .unwrap();
@@ -172,7 +203,7 @@ mod tests {
     #[test]
     fn invalid_update_keeps_the_last_valid_document() {
         let path = std::env::temp_dir().join(test_file_name("keysteer-store"));
-        let mut store = ConfigStore::open(&path, &Config::default()).unwrap();
+        let mut store = ConfigStore::open(&path, &Config::default(), replace_file).unwrap();
         let before = store.source.text();
         assert!(store.set("pointer.initial_speed", "0").is_err());
         assert_eq!(store.source.text(), before);
@@ -180,10 +211,26 @@ mod tests {
     }
 
     #[test]
+    fn prepared_update_does_not_touch_disk_until_committed() {
+        let path = std::env::temp_dir().join(test_file_name("keysteer-prepared-store"));
+        let original = Config::default().to_toml().unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let store = ConfigStore::open(&path, &Config::default(), replace_file).unwrap();
+
+        let (candidate, config) = store.prepare_set("pointer.initial_speed", "17").unwrap();
+        assert_eq!(config.pointer.initial_speed, 17.0);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        candidate.persist().unwrap();
+        assert_ne!(std::fs::read_to_string(&path).unwrap(), original);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn updates_platform_specific_key_aliases() {
         let path =
             std::env::temp_dir().join(format!("keysteer-alias-store-{}.toml", std::process::id()));
-        let mut store = ConfigStore::open(&path, &Config::default()).unwrap();
+        let mut store = ConfigStore::open(&path, &Config::default(), replace_file).unwrap();
         let config = store
             .set("key_aliases.windows.Primary", "\"left_alt\"")
             .unwrap();
@@ -195,7 +242,7 @@ mod tests {
     fn document_ast_is_lazy_and_reload_returns_to_raw_source() {
         let path = std::env::temp_dir().join(test_file_name("keysteer-lazy-store"));
         std::fs::write(&path, Config::default().to_toml().unwrap()).unwrap();
-        let mut store = ConfigStore::open(&path, &Config::default()).unwrap();
+        let mut store = ConfigStore::open(&path, &Config::default(), replace_file).unwrap();
         assert!(matches!(store.source, StoreSource::Raw(_)));
         store.set("pointer.initial_speed", "11").unwrap();
         assert!(matches!(store.source, StoreSource::Parsed(_)));

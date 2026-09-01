@@ -22,22 +22,48 @@
 //! Backends implement [`api::Backend`] and are chosen by `cfg(target_os)` in
 //! [`platform`], so cross-compiling needs no feature flags or config edits.
 
-pub mod api;
+#[allow(dead_code, unused_imports)]
+pub(crate) mod api;
 pub mod app;
-pub mod config;
-pub mod modes;
-pub mod platform;
-pub mod plugins;
-pub mod runtime;
+#[allow(dead_code, unused_imports)]
+pub(crate) mod config;
+#[allow(dead_code, unused_imports)]
+pub(crate) mod modes;
+#[allow(dead_code, unused_imports)]
+pub(crate) mod platform;
+#[allow(dead_code, unused_imports)]
+pub(crate) mod plugins;
+#[allow(dead_code, unused_imports)]
+pub(crate) mod runtime;
 pub(crate) mod support;
 
-// Compatibility alias retained while callers migrate to `runtime::Engine`.
-pub use runtime as engine;
+/// Feature-gated access for the repository's standalone performance harness.
+#[cfg(feature = "perf-probe")]
+#[doc(hidden)]
+pub mod benchmark {
+    pub use crate::api::{
+        Appearance, Binding, Command, CommandBatch, Direction, HostContext, Key, KeyState,
+        LabelDirection, Mode, ModeEvent, Point, Rect, Screen, UiScanResult, UiScanStatus, UiTarget,
+    };
+    pub use crate::config::Config;
+    pub use crate::modes::hint::labeling::{Hint, assign_into};
 
-pub use api::{
-    Action, ActionPhase, ActionSequence, Backend, BackendEvent, Color, Command, CommandBatch,
-    FinishCause, HostContext, Key, KeyChord, Mode, ModeEvent, ModeId, OverlayScene, Point, Rect,
-    Screen,
-};
-pub use config::{Config, ConfigError, ConfigFile, Palette, Theme};
-pub use engine::Engine;
+    pub fn hint(config: &Config) -> crate::modes::HintMode {
+        crate::app::mode_catalog::hint(config)
+    }
+
+    pub fn normal(config: &Config) -> crate::modes::NormalMode {
+        crate::app::mode_catalog::normal(config)
+    }
+}
+
+#[cfg(test)]
+extern crate self as keysteer;
+
+#[cfg(test)]
+#[global_allocator]
+pub(crate) static TEST_ALLOCATOR: &stats_alloc::StatsAlloc<std::alloc::System> =
+    &stats_alloc::INSTRUMENTED_SYSTEM;
+
+#[cfg(test)]
+mod tests;

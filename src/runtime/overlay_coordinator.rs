@@ -99,7 +99,7 @@ impl Engine {
             ..DynamicOverlayState::default()
         };
         if let Some(cursor) = self
-            .config
+            .settings
             .mode_indicator
             .cursor_for_mode_ref(display_mode.as_str())
         {
@@ -349,7 +349,7 @@ impl Engine {
     fn build_indicator(&self, display_mode: &ModeId) -> Option<(Indicator, IndicatorGeometry)> {
         let mode = self.modes.get(display_mode)?;
         let (text, ui) = self
-            .config
+            .settings
             .mode_indicator
             .for_mode_with(display_mode.as_str(), || mode.display_name())?;
 

@@ -33,7 +33,7 @@ pub use crate::api::lifecycle::{LifecycleAction, TargetingLifecycle};
 pub use modes::{
     Grid, GridLayer, GridUi, Normal, Pointer, RecursiveGrid, RecursiveGridUi, Scroll, UiHint,
 };
-pub use store::ConfigStore;
+pub use store::{ConfigStore, ReplaceFile};
 pub use style::{
     Anchor, BoundaryHighlight, CursorIndicatorOverride, CursorIndicatorUi, HintPlacement,
     IndicatorUi, IndicatorUiOverride, LabelUi, ModeIndicator, ModeIndicatorEntry, SearchInputUi,
@@ -692,18 +692,6 @@ fn normalize_key_if_aliased(
 }
 
 impl ConfigFile {
-    /// Locate the first config in the active application data directory.
-    ///
-    /// Portable configs are named `keysteer.<name>.toml`. User profiles sort
-    /// by name; the annotated `keysteer.default.toml` example is considered
-    /// only when no user profile exists.
-    pub fn discover() -> Result<Option<PathBuf>, ConfigError> {
-        let Some(directory) = crate::app::paths::data_dir() else {
-            return Ok(None);
-        };
-        Self::discover_in(&directory)
-    }
-
     pub(crate) fn discover_in(directory: &Path) -> Result<Option<PathBuf>, ConfigError> {
         let entries = match std::fs::read_dir(directory) {
             Ok(entries) => entries,
@@ -756,10 +744,6 @@ impl ConfigFile {
         name.strip_prefix("keysteer.")
             .and_then(|rest| rest.strip_suffix(".toml"))
             .is_some_and(|profile| !profile.is_empty())
-    }
-
-    pub fn default_write_path() -> Option<PathBuf> {
-        crate::app::paths::data_file("keysteer.user.toml")
     }
 
     pub fn load(path: &Path) -> Result<Self, ConfigError> {

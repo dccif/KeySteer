@@ -185,6 +185,7 @@ stats_alloc = "0.1.10"
 [[bench]]
 name = "core_hot_paths"
 harness = false
+required-features = ["perf-probe"]
 
 [profile.release]
 opt-level = 3

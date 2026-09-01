@@ -15,7 +15,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const LOG_FILE: &str = "keysteer.log";
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 const RETAINED_LOGS: usize = 3;
 
@@ -185,12 +184,12 @@ impl Logger {
 ///
 /// Startup treats failure as non-fatal: a read-only program directory should
 /// disable logging, not prevent the tray application from running.
-pub fn init() -> Result<&'static Path, String> {
+pub fn init(candidate_paths: impl IntoIterator<Item = PathBuf>) -> Result<&'static Path, String> {
     if let Some(logger) = LOGGER.get() {
         return Ok(&logger.path);
     }
     let mut failures = Vec::new();
-    for path in candidate_paths() {
+    for path in candidate_paths {
         match Logger::open(path.clone()) {
             Ok(logger) => {
                 if LOGGER.set(logger).is_ok() {
@@ -237,7 +236,7 @@ pub fn set_non_error_enabled(enabled: bool) {
 }
 
 /// Start a diagnostic session after configuration has enabled non-error logs.
-pub(crate) fn start_session() {
+pub(crate) fn start_session(backend_name: &str) {
     if !level_enabled(Level::Info)
         || LOGGER.get().is_none()
         || SESSION_STARTED.swap(true, Ordering::AcqRel)
@@ -260,7 +259,7 @@ pub(crate) fn start_session() {
             } else {
                 "release"
             },
-            crate::platform::backend_name(),
+            backend_name,
             std::env::current_exe()
                 .map(|value| value.display().to_string())
                 .unwrap_or_else(|error| format!("<unavailable: {error}>")),
@@ -440,15 +439,6 @@ fn log_args(level: Level, target: &str, message: fmt::Arguments<'_>) {
     }
 }
 
-fn candidate_paths() -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = crate::app::paths::data_file(LOG_FILE).into_iter().collect();
-    let fallback = std::env::temp_dir().join("KeySteer").join(LOG_FILE);
-    if !paths.contains(&fallback) {
-        paths.push(fallback);
-    }
-    paths
-}
-
 fn open_append(path: &Path) -> io::Result<File> {
     OpenOptions::new().create(true).append(true).open(path)
 }
@@ -558,17 +548,6 @@ mod tests {
         assert_eq!(
             rotated_path(path, 2),
             PathBuf::from("diagnostics/keysteer.log.2")
-        );
-    }
-
-    #[test]
-    fn application_data_directory_is_preferred_over_the_emergency_fallback() {
-        let expected = crate::app::paths::data_file(LOG_FILE).unwrap();
-        let paths = candidate_paths();
-        assert_eq!(paths.first(), Some(&expected));
-        assert_eq!(
-            paths.last(),
-            Some(&std::env::temp_dir().join("KeySteer").join(LOG_FILE))
         );
     }
 

@@ -3,12 +3,10 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use keysteer::api::{
-    Appearance, Binding, Direction, HostContext, KeyState, LabelDirection, Mode, Rect, Screen,
-    UiScanResult, UiScanStatus, UiTarget,
+use keysteer::benchmark::{
+    Appearance, Binding, Config, Direction, HostContext, Key, KeyState, LabelDirection, Mode,
+    ModeEvent, Point, Rect, Screen, UiScanResult, UiScanStatus, UiTarget, assign_into,
 };
-use keysteer::modes::hint::labeling::assign_into;
-use keysteer::{Config, Key, ModeEvent, Point};
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 
 #[global_allocator]
@@ -84,7 +82,7 @@ fn measure_hint_delivery_allocations(
     owned: bool,
 ) -> (usize, usize) {
     let values = hint_targets(count);
-    let mut mode = keysteer::app::mode_catalog::hint(config);
+    let mut mode = keysteer::benchmark::hint(config);
     black_box(mode.handle(&ModeEvent::Activated { previous: None }, context));
     let region = Region::new(GLOBAL);
     if owned {
@@ -115,7 +113,7 @@ fn measure_hint_delivery(
     owned: bool,
 ) -> u128 {
     let values = hint_targets(count);
-    let mut mode = keysteer::app::mode_catalog::hint(config);
+    let mut mode = keysteer::benchmark::hint(config);
     black_box(mode.handle(&ModeEvent::Activated { previous: None }, context));
     let started = Instant::now();
     if owned {
@@ -163,7 +161,7 @@ fn benchmark_normal_frame() -> Result<(), String> {
         focused_app: None,
         palette: &palette,
     };
-    let mut mode = keysteer::app::mode_catalog::normal(&config);
+    let mut mode = keysteer::benchmark::normal(&config);
     let _ = mode.handle(
         &ModeEvent::Binding {
             binding: Arc::new(Binding::Move(Direction::Right)),
