@@ -198,6 +198,7 @@ mod enabled {
         submit(event, Some(correlation_id), None);
     }
 
+    #[cfg(target_os = "windows")]
     pub(super) fn mark_correlated_value(event: &'static str, correlation_id: u64, value: isize) {
         submit(event, Some(correlation_id), Some(value));
     }
@@ -315,6 +316,7 @@ pub(crate) fn mark_correlated(event: &'static str, correlation_id: u64) {
 }
 
 #[inline]
+#[cfg(target_os = "windows")]
 pub(crate) fn mark_correlated_value(event: &'static str, correlation_id: u64, value: isize) {
     #[cfg(feature = "perf-probe")]
     enabled::mark_correlated_value(event, correlation_id, value);

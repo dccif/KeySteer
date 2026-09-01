@@ -115,6 +115,4 @@ fn compile_macos_bridge() {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn compile_macos_bridge() {
-    println!("cargo:warning=skipping macOS Objective-C bridge on a non-macOS host");
-}
+fn compile_macos_bridge() {}
