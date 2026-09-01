@@ -24,9 +24,9 @@ keysteer/
 | --- | --- | --- |
 | `src/api/` | 跨平台公共协议：按键、动作、命令、事件、几何、场景、插件、后端 trait | `api/mod.rs`, `command.rs`, `backend.rs` |
 | `src/app/` | 唯一应用聚合根：启动、CLI、配置编译、Mode catalog 和 runtime | `bootstrap.rs`, `configuration.rs`, `mode_catalog.rs`, `runtime/` |
-| `src/config/` | TOML 文档、Mode section DTO、校验、主题与 comment-preserving store | `mod.rs`, `modes.rs`, `theme.rs`, `store.rs` |
-| `src/app/runtime/` | 应用私有 Engine、运行计划、命令执行及少量有状态协作者 | `mod.rs`, `plan.rs`, `command_executor.rs`, `overlay_coordinator.rs` |
-| `src/modes/` | 五个内置 Mode 状态机；UI Hint 私有算法位于 `hint/` | `normal.rs`, `grid.rs`, `recursive_grid.rs`, `hint.rs`, `hint/` |
+| `src/config/` | TOML 文档、Mode section DTO、别名规范化、校验、主题与 comment-preserving store | `mod.rs`, `modes.rs`, `aliases.rs`, `validation.rs`, `store.rs` |
+| `src/app/runtime/` | 应用私有 Engine、原子运行计划、命令执行及有状态协作者 | `mod.rs`, `plan.rs`, `mode_registry.rs`, `input_state.rs`, `scheduler.rs`, `overlay_coordinator.rs` |
+| `src/modes/` | 五个内置 Mode 状态机；UI Hint 私有状态和算法位于 `hint/` | `normal.rs`, `grid.rs`, `recursive_grid.rs`, `hint/mod.rs`, `hint/session.rs` |
 | `src/plugins/` | 使用公共 API 实现的内置插件示例 | `builtin/screen_selector.rs` |
 | `src/platform/common/` | 两端共享的 updater、app info、mailbox、batcher 和 spatial index | `mod.rs` |
 | `src/support/` | 日志、worker、错误聚合和性能探针 | `mod.rs` |
@@ -70,7 +70,7 @@ Windows：
 - `hook.rs` 键盘 Hook 与同步 consume/forward 握手。
 - `input.rs` 鼠标、滚轮、键盘注入。
 - `overlay.rs` click-through layered window 与软件栅格化。
-- `accessibility.rs` UIA 流式扫描、popup HWND、遮挡过滤；`ui_scan.rs` 统一 UIA/视觉流式发布与空间去重；`vision.rs` 负责 GDI 截图、系统 OCR 和纯 Rust 区域检测；`wechat_ocr.rs` 负责微信组件发现与隔离 helper。
+- `accessibility.rs` UIA 流式扫描、popup HWND、遮挡过滤；`ui_scan.rs` 统一 UIA/视觉流式发布与空间去重；`vision/` 按 worker façade、generation providers、discovery、mailbox、system OCR、capture 和 fallback 分层；`wechat_ocr.rs` 负责微信组件发现与隔离 helper。
 - `frame_clock.rs` DWM 合成帧时钟。
 - `status_item.rs` 托盘菜单、更新提示与浏览器打开；`autostart.rs` 登录启动；`system_events.rs` 前台/显示事件。
 

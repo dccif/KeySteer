@@ -61,7 +61,7 @@ owner 的 quarantine，本进程后续禁用视觉扫描，不能阻塞 Engine �
 
 ## HintMode 端
 
-`src/modes/hint.rs` 的职责：
+`src/modes/hint/mod.rs` 与 `session.rs` 的职责：
 
 1. 启动 scan 时清空上一轮目标、标签、搜索和完成态。
 2. 每个 Partial 立即 append，按矩形/名称/role 空间 key 去重。
@@ -127,7 +127,7 @@ owner 的 quarantine，本进程后续禁用视觉扫描，不能阻塞 Engine �
   重复项替换。Windows 发布器继续统一 24/48/96…累计边界和 2000 项上限。
 - Hybrid 中任一 provider 报告 `ContextChanged` 都会立即发布本代 terminal，不等待另一 provider；HintMode 随即提交新 generation，Engine 的 owner 取消路径使另一 provider 释放 capture/OCR/plan。旧坐标不会作为 terminal tail 再发布。
 - Backend ready 后的首次事件轮询只异步执行一次 OCR discovery：系统探测在临时 MTA 中创建并立即销毁 `OcrEngine`，微信探测只缓存已验证的绝对路径与文件标识。系统 OCR/WIC 通过本代拥有的 activation factory 调用，禁止使用会跨临时 MTA 残留悬空指针的投影静态 factory cache。这样 ready 热路径不承担探测线程创建；成功和失败结果都缓存到进程退出，不保留 OCR、helper、COM 或 vision worker。首次扫描若探测尚未完成，只由视觉协调线程等待同一个 single-flight 结果。
-- `src/platform/windows/vision.rs` 在有视觉请求时懒启动 generation-scoped coordinator。每个 generation 只取得一张 GDI top-down DIB 截图；等待 OCR 时只检查原子 generation，不轮询 HWND。目标 HWND/PID/边界只在捕获、每批发布和 terminal 前复核；视觉候选使用 scan plan 的共享遮挡矩形过滤，不创建全屏 mask。当前与 latest pending 请求完成后 coordinator 自行退出。
+- `src/platform/windows/vision/mod.rs` 是 `VisionWorker` façade、队列和 generation 调度；`providers.rs` 拥有本代系统/微信 OCR 执行与清理，`discovery.rs` 缓存 provider descriptor，`provider_mailbox.rs` 管理有界发布/终态/取消，`system_ocr.rs` 持有 WinRT operation，`capture.rs` 负责坐标和 BGRA 输入，`fallback.rs` 保存纯 Rust detector 与 scratch。每个 generation 只取得一张 GDI top-down DIB 截图；等待 OCR 时只检查原子 generation，不轮询 HWND。目标 HWND/PID/边界只在捕获、每批发布和 terminal 前复核；视觉候选使用 scan plan 的共享遮挡矩形过滤，不创建全屏 mask。当前与 latest pending 请求完成后 coordinator 自行退出。
 - 截图前由 `overlay_worker.rs` 建立 generation capture gate：渲染线程清空 GPU/CPU overlay。若 overlay 从未显示，或上次隐藏已经由 DWM 确认，则直接 ACK；仅在存在尚未确认消失的可见像素时执行一次 `DwmFlush`。ACK 前 UIA/OCR 提交只覆盖 latest deferred frame；截图复制完成立即释放 gate，只显示最新帧。旧 lease、取消和 shutdown 不能释放新 generation。
 - `detect_text=true` 时先从进程内 discovery 快照生成 `None`、`SystemOnly`、`WechatOnly` 或 `Dual` 执行计划。`SystemOnly` 只创建系统 tile，绝不进入微信专用完整位图、WIC、PNG、helper、job、pipe 或 reader 路径；只有 `WechatOnly`/`Dual` 才构造 `WechatFullFrame`。系统 OCR 按可用逻辑线程的下一个平方数选择 `N×N` 网格，并由图片尺寸限制核心块的宽、高都至少为 64px；没有固定 `7×7` 上限。各块向相邻核心区重叠 64px，bitmap 就绪后立即提交独立 `RecognizeAsync`；tile 输入与 completion 共用有界事件通道，provider 在继续接收 tile 时立即消费已完成结果。它先计算文字行的联合矩形和核心区归属，丢弃接缝副本后才取得文字并直接组成最多 24 项的批次，避免为最终丢弃的重叠行分配字符串。块内坐标映射回桌面，目标中心只归属于一个半开核心矩形，因此接缝文字不会漏掉或重复发布。`Dual` 在首个系统 tile 后才提交微信专用完整帧，随后继续排空两路结果；微信结果先发布、再清理 helper 与 PNG。terminal 严格等待全部块和 helper 清理完成，两路最终发布空间并集。
 - `detect_rectangles=true` 时并行计算灰度、局部对比/梯度、形态闭合和八邻域连通区域。分析图限制为 2,073,600 像素、最长边 2560，候选最小边为 6px；scratch 只属于本次 generation，连通区域使用逐行 run-length 和活跃组件，不保留最坏覆盖全图的像素队列。形态位图复用且候选维持有界 top-K。任一 OCR 产生有效目标就立即取消这项 CPU-heavy 工作；只有全部 OCR 没有有效目标时才发布缓存。
