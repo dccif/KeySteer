@@ -9,6 +9,10 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::UI::Controls::{
+    TASKDIALOG_BUTTON, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TD_INFORMATION_ICON, TDCBF_OK_BUTTON,
+    TDF_SIZE_TO_CONTENT, TDF_USE_COMMAND_LINKS, TaskDialogIndirect,
+};
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
     ShellExecuteW,
@@ -40,6 +44,7 @@ const CMD_AUTOSTART: i32 = 4;
 const CMD_CHECK_UPDATES: i32 = 5;
 const CMD_ABOUT: i32 = 6;
 const CMD_QUIT: i32 = 7;
+const ABOUT_REPOSITORY_BUTTON: i32 = 1001;
 
 static SENDER: OnceLock<Mutex<Option<EventSender>>> = OnceLock::new();
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -70,6 +75,13 @@ enum UpdateMenuState {
 }
 
 struct NativeDialogGuard;
+
+#[derive(Clone, Copy)]
+enum DialogButtons {
+    Ok,
+    YesNo,
+    Repository,
+}
 
 impl NativeDialogGuard {
     fn acquire() -> Option<Self> {
@@ -540,7 +552,7 @@ pub(super) fn present_update_result(result: &UpdateCheckResult) -> Result<(), St
                             path.display()
                         ),
                         false,
-                        true,
+                        DialogButtons::YesNo,
                     )
                     .and_then(|install| {
                         if !install {
@@ -557,7 +569,7 @@ pub(super) fn present_update_result(result: &UpdateCheckResult) -> Result<(), St
                                     "Automatic installation was not started, and the current KeySteer was not changed.\n\n{error}\n\nOpen the download folder for manual installation?"
                                 ),
                                 true,
-                                true,
+                                DialogButtons::YesNo,
                             )
                             .and_then(|open| {
                                 if open {
@@ -572,7 +584,7 @@ pub(super) fn present_update_result(result: &UpdateCheckResult) -> Result<(), St
                         "KeySteer Update",
                         &format!("KeySteer {current} is already the latest version."),
                         false,
-                        false,
+                        DialogButtons::Ok,
                     )
                 .map(|_| ()),
                 UpdateCheckResult::Failed(error) => {
@@ -580,7 +592,7 @@ pub(super) fn present_update_result(result: &UpdateCheckResult) -> Result<(), St
                         "KeySteer Update",
                         &format!("Could not check for updates.\n\n{error}"),
                         true,
-                        false,
+                        DialogButtons::Ok,
                     )
                     .map(|_| ())
                 }
@@ -602,13 +614,23 @@ fn present_about() {
         .stack_size(NATIVE_DIALOG_THREAD_STACK_BYTES)
         .spawn(move || {
             let _guard = guard;
-            if let Err(error) = show_message(
+            match show_message(
                 "About KeySteer",
                 &crate::platform::common::app_info::details(),
                 false,
-                false,
+                DialogButtons::Repository,
             ) {
-                crate::support::logging::report_error("windows-about", error);
+                Ok(true) => {
+                    if let Err(error) =
+                        open_https_url(crate::platform::common::app_info::REPOSITORY_URL)
+                    {
+                        crate::support::logging::report_error("windows-about", error);
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    crate::support::logging::report_error("windows-about", error);
+                }
             }
         })
     {
@@ -665,13 +687,14 @@ fn show_message(
     title: &str,
     message: &str,
     is_error: bool,
-    offer_open: bool,
+    buttons: DialogButtons,
 ) -> Result<bool, String> {
-    // A detached MessageBox without an owner can remain inactive. This hidden
-    // same-thread owner gives the dialog a complete native modal lifetime while
-    // keeping the engine and tray threads unblocked.
+    // A detached native dialog without an owner can remain inactive. This
+    // hidden same-thread owner gives both MessageBox and Task Dialog a complete
+    // modal lifetime while keeping the engine and tray threads unblocked.
     // SAFETY: the temporary owner and all UTF-16 buffers remain live through
-    // the modal call; the same thread destroys the owner exactly once.
+    // the synchronous call; TaskDialog retains none of the supplied pointers,
+    // and the same thread destroys the owner exactly once.
     let (response, destroy) = unsafe {
         let owner = CreateWindowExW(
             WS_EX_TOOLWINDOW,
@@ -690,28 +713,67 @@ fn show_message(
         .map_err(|error| format!("cannot create Windows dialog owner: {error}"))?;
         let title = wide(title);
         let message = wide(message);
-        let flags = (if offer_open { MB_YESNO } else { MB_OK })
-            | MB_SETFOREGROUND
-            | if is_error {
-                MB_ICONERROR
-            } else {
-                MB_ICONINFORMATION
-            };
-        let response = MessageBoxW(
-            Some(owner),
-            PCWSTR(message.as_ptr()),
-            PCWSTR(title.as_ptr()),
-            flags,
-        );
+        let response = match buttons {
+            DialogButtons::Repository => {
+                let repository_title = wide("KeySteer");
+                let custom_buttons = [TASKDIALOG_BUTTON {
+                    nButtonID: ABOUT_REPOSITORY_BUTTON,
+                    pszButtonText: PCWSTR(repository_title.as_ptr()),
+                }];
+                let config = TASKDIALOGCONFIG {
+                    cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
+                    hwndParent: owner,
+                    dwFlags: TDF_USE_COMMAND_LINKS | TDF_SIZE_TO_CONTENT,
+                    dwCommonButtons: TDCBF_OK_BUTTON,
+                    pszWindowTitle: PCWSTR(title.as_ptr()),
+                    Anonymous1: TASKDIALOGCONFIG_0 {
+                        pszMainIcon: TD_INFORMATION_ICON,
+                    },
+                    pszMainInstruction: PCWSTR(title.as_ptr()),
+                    pszContent: PCWSTR(message.as_ptr()),
+                    cButtons: custom_buttons.len() as u32,
+                    pButtons: custom_buttons.as_ptr(),
+                    nDefaultButton: 1,
+                    ..Default::default()
+                };
+                let mut selected = 0;
+                TaskDialogIndirect(&config, Some(&mut selected), None, None)
+                    .map(|()| selected)
+                    .map_err(|error| format!("cannot present Windows About dialog: {error}"))
+            }
+            DialogButtons::Ok | DialogButtons::YesNo => {
+                let flags = (if matches!(buttons, DialogButtons::YesNo) {
+                    MB_YESNO
+                } else {
+                    MB_OK
+                }) | MB_SETFOREGROUND
+                    | if is_error {
+                        MB_ICONERROR
+                    } else {
+                        MB_ICONINFORMATION
+                    };
+                let selected = MessageBoxW(
+                    Some(owner),
+                    PCWSTR(message.as_ptr()),
+                    PCWSTR(title.as_ptr()),
+                    flags,
+                );
+                (selected.0 != 0)
+                    .then_some(selected.0)
+                    .ok_or_else(|| "MessageBoxW could not present the dialog".to_string())
+            }
+        };
         let destroy = DestroyWindow(owner)
             .map_err(|error| format!("cannot destroy Windows update dialog owner: {error}"));
         (response, destroy)
     };
-    if response.0 == 0 {
-        return Err("MessageBoxW could not present the dialog".into());
-    }
+    let response = response?;
     destroy?;
-    Ok(offer_open && response == IDYES)
+    Ok(match buttons {
+        DialogButtons::Ok => false,
+        DialogButtons::YesNo => response == IDYES.0,
+        DialogButtons::Repository => response == ABOUT_REPOSITORY_BUTTON,
+    })
 }
 
 fn open_download_folder(download: &Path) -> Result<(), String> {

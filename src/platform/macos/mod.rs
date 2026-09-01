@@ -28,8 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use objc2::MainThreadMarker;
-use objc2_app_kit::{NSEvent, NSWorkspace};
-use objc2_foundation::{NSString, NSURL};
+use objc2_app_kit::NSEvent;
 
 use crate::api::Autostart;
 use crate::api::backend::{Appearance, Backend, BackendEvent, KeyDisposition};
@@ -539,14 +538,7 @@ impl Backend for MacOsBackend {
     }
 
     fn open_url(&mut self, url: &str) -> Result<(), String> {
-        let text = NSString::from_str(url);
-        let url = NSURL::URLWithString(&text)
-            .ok_or_else(|| "macOS could not parse the simulator URL".to_string())?;
-        if NSWorkspace::sharedWorkspace().openURL(&url) {
-            Ok(())
-        } else {
-            Err("macOS could not open the default browser".into())
-        }
+        status_item::open_https_url(url)
     }
 
     fn name(&self) -> &'static str {

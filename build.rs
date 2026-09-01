@@ -1,6 +1,7 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=assets/icons/keysteer.ico");
+    println!("cargo:rerun-if-changed=assets/windows/keysteer.manifest");
     println!("cargo:rerun-if-changed=src/platform/windows/compositor_clock.c");
     println!("cargo:rerun-if-changed=src/platform/macos/vision_bridge.m");
     println!("cargo:rerun-if-changed=src/platform/macos/autostart_bridge.m");
@@ -64,6 +65,7 @@ fn compile_windows_resources() -> Result<(), Box<dyn std::error::Error>> {
     let mut resource = winresource::WindowsResource::new();
     resource
         .set_icon("assets/icons/keysteer.ico")
+        .set_manifest_file("assets/windows/keysteer.manifest")
         .set("ProductName", "KeySteer")
         // Explorer and Task Manager's Startup Apps surface this field. Keep
         // it compact; the longer product description belongs in documentation

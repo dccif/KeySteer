@@ -16,7 +16,7 @@ use objc2_app_kit::{
     NSImageView, NSMenu, NSMenuItem, NSPanel, NSSquareStatusItemLength, NSStatusBar, NSStatusItem,
     NSTextField, NSView, NSWindowStyleMask, NSWorkspace,
 };
-use objc2_foundation::{NSData, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSData, NSPoint, NSRect, NSSize, NSString, NSURL};
 
 use crate::api::Autostart;
 use crate::api::backend::{BackendEvent, UpdateCheckResult, UpdateProgress};
@@ -75,8 +75,15 @@ define_class!(
                 self,
                 "About KeySteer",
                 &crate::platform::common::app_info::details(),
-                None,
+                PanelAction::OpenRepository,
             ) {
+                crate::support::logging::report_error("macos-about", error);
+            }
+        }
+
+        #[unsafe(method(openRepository:))]
+        fn open_repository(&self, _sender: Option<&AnyObject>) {
+            if let Err(error) = open_https_url(crate::platform::common::app_info::REPOSITORY_URL) {
                 crate::support::logging::report_error("macos-about", error);
             }
         }
@@ -340,8 +347,18 @@ impl StatusItem {
         let mtm = MainThreadMarker::new().ok_or_else(|| {
             "update result must be presented on the macOS main thread".to_string()
         })?;
-        show_panel(mtm, &self._target, title, details, downloaded_update)
+        let action = downloaded_update
+            .map(PanelAction::RevealInFinder)
+            .unwrap_or(PanelAction::None);
+        show_panel(mtm, &self._target, title, details, action)
     }
+}
+
+#[derive(Clone, Copy)]
+enum PanelAction<'a> {
+    None,
+    OpenRepository,
+    RevealInFinder(&'a Path),
 }
 
 fn show_panel(
@@ -349,7 +366,7 @@ fn show_panel(
     target: &StatusTarget,
     title: &str,
     details: &str,
-    downloaded_update: Option<&Path>,
+    action: PanelAction<'_>,
 ) -> Result<(), String> {
     autoreleasepool(|_| {
         const WIDTH: f64 = 520.0;
@@ -401,22 +418,29 @@ fn show_panel(
 
         // SAFETY: both selectors are implemented by the retained target with
         // matching Objective-C signatures; AppKit retains no Rust borrow.
-        let (button, reveal_button) = unsafe {
+        let (button, secondary_button) = unsafe {
             let button = NSButton::buttonWithTitle_target_action(
                 &NSString::from_str("OK"),
                 Some(target),
                 Some(sel!(dismissUpdateAlert:)),
                 mtm,
             );
-            let reveal_button = downloaded_update.is_some().then(|| {
-                NSButton::buttonWithTitle_target_action(
+            let secondary_button = match action {
+                PanelAction::None => None,
+                PanelAction::OpenRepository => Some(NSButton::buttonWithTitle_target_action(
+                    &NSString::from_str("KeySteer"),
+                    Some(target),
+                    Some(sel!(openRepository:)),
+                    mtm,
+                )),
+                PanelAction::RevealInFinder(_) => Some(NSButton::buttonWithTitle_target_action(
                     &NSString::from_str("Show in Finder"),
                     Some(target),
                     Some(sel!(showDownloadedUpdate:)),
                     mtm,
-                )
-            });
-            (button, reveal_button)
+                )),
+            };
+            (button, secondary_button)
         };
         button.setFrame(NSRect::new(
             NSPoint::new(412.0, 16.0),
@@ -425,18 +449,36 @@ fn show_panel(
         button.setKeyEquivalent(&NSString::from_str("\r"));
         content.addSubview(&button);
 
-        if let Some(reveal_button) = reveal_button {
-            reveal_button.setFrame(NSRect::new(
+        if let Some(secondary_button) = secondary_button {
+            secondary_button.setFrame(NSRect::new(
                 NSPoint::new(276.0, 16.0),
                 NSSize::new(124.0, 32.0),
             ));
-            content.addSubview(&reveal_button);
+            content.addSubview(&secondary_button);
         }
 
         panel.setContentView(Some(&content));
-        target.show_update_alert(panel, downloaded_update.map(Path::to_path_buf));
+        let downloaded_update = match action {
+            PanelAction::RevealInFinder(path) => Some(path.to_path_buf()),
+            PanelAction::None | PanelAction::OpenRepository => None,
+        };
+        target.show_update_alert(panel, downloaded_update);
         Ok(())
     })
+}
+
+pub(super) fn open_https_url(url: &str) -> Result<(), String> {
+    if !url.starts_with("https://") || url.contains('\0') {
+        return Err("macOS refused an invalid HTTPS URL".into());
+    }
+    let text = NSString::from_str(url);
+    let url = NSURL::URLWithString(&text)
+        .ok_or_else(|| "macOS could not parse the HTTPS URL".to_string())?;
+    if NSWorkspace::sharedWorkspace().openURL(&url) {
+        Ok(())
+    } else {
+        Err("macOS could not open the default browser".into())
+    }
 }
 
 fn create_native_item(

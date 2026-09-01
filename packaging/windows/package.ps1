@@ -15,7 +15,6 @@ param(
     [string] $TimestampUrl = $env:KEYSTEER_TIMESTAMP_URL,
     [switch] $RequireSigning,
     [switch] $SkipTimestamp,
-    [switch] $TrustSelfSignedForBuild,
     [string] $OutputRoot
 )
 
@@ -132,69 +131,7 @@ if ($signingRequested) {
     if ($LASTEXITCODE -ne 0) {
         throw "Authenticode signing failed with exit code $LASTEXITCODE"
     }
-    Write-Host "Authenticode signing completed; preparing local verification"
-    $temporaryRootAdded = $false
-    $temporaryCertificate = $null
-    try {
-        if ($TrustSelfSignedForBuild) {
-            Import-Module Microsoft.PowerShell.Security
-            Import-Module PKI
-            if (-not [string]::IsNullOrWhiteSpace($SigningPfx)) {
-                Write-Host "Reading the signer certificate directly from the PFX"
-                if ([string]::IsNullOrWhiteSpace($SigningPassword)) {
-                    $pfxData = Get-PfxData -FilePath $resolvedPfx
-                }
-                else {
-                    $securePassword = ConvertTo-SecureString `
-                        -String $SigningPassword `
-                        -AsPlainText `
-                        -Force
-                    $pfxData = Get-PfxData -FilePath $resolvedPfx -Password $securePassword
-                }
-                $endCertificates = @($pfxData.EndEntityCertificates)
-                if ($endCertificates.Count -ne 1) {
-                    throw "the signing PFX must contain exactly one end-entity certificate"
-                }
-                $signer = $endCertificates[0]
-            }
-            else {
-                Write-Host "Reading the signer certificate from CurrentUser\\My"
-                $signerPath = "Cert:\CurrentUser\My\$normalizedThumbprint"
-                $signer = Get-Item -LiteralPath $signerPath -ErrorAction Stop
-            }
-            if ($signer.Subject -eq $signer.Issuer) {
-                $rootPath = "Cert:\CurrentUser\Root\$($signer.Thumbprint)"
-                if (-not (Test-Path -LiteralPath $rootPath)) {
-                    $temporaryCertificate = [IO.Path]::GetTempFileName()
-                    [IO.File]::WriteAllBytes(
-                        $temporaryCertificate,
-                        $signer.Export([Security.Cryptography.X509Certificates.X509ContentType]::Cert)
-                    )
-                    Import-Certificate `
-                        -FilePath $temporaryCertificate `
-                        -CertStoreLocation "Cert:\CurrentUser\Root" | Out-Null
-                    $temporaryRootAdded = $true
-                }
-            }
-        }
-        Write-Host "Verifying the embedded Authenticode signature with SignTool"
-        & $signTool verify /pa /all $binary
-        if ($LASTEXITCODE -ne 0) {
-            throw "Authenticode verification failed with exit code $LASTEXITCODE"
-        }
-        Write-Host "Authenticode verification completed"
-    }
-    finally {
-        if ($temporaryRootAdded) {
-            $rootPath = "Cert:\CurrentUser\Root\$($signer.Thumbprint)"
-            if (Test-Path -LiteralPath $rootPath) {
-                Remove-Item -LiteralPath $rootPath -Force
-            }
-        }
-        if ($temporaryCertificate -and (Test-Path -LiteralPath $temporaryCertificate)) {
-            Remove-Item -LiteralPath $temporaryCertificate -Force
-        }
-    }
+    Write-Host "Authenticode signing completed"
 }
 else {
     Write-Warning "Building unsigned artifacts; one-click automatic installation will be disabled"

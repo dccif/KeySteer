@@ -97,7 +97,7 @@ jobs:
         env:
           KEYSTEER_SIGNING_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}
           KEYSTEER_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
-        run: ./packaging/windows/package.ps1 -Target ${{ matrix.target }} -RequireSigning -TrustSelfSignedForBuild ${{ matrix.package_args }}
+        run: ./packaging/windows/package.ps1 -Target ${{ matrix.target }} -RequireSigning ${{ matrix.package_args }}
 
       - name: Upload Windows ${{ matrix.arch }} package
         uses: actions/upload-artifact@v7

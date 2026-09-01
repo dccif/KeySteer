@@ -4,6 +4,7 @@ pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const AUTHORS: &str = env!("CARGO_PKG_AUTHORS");
 pub(crate) const BUILD_DATE: &str = env!("KEYSTEER_BUILD_DATE");
 pub(crate) const LICENSE: &str = env!("CARGO_PKG_LICENSE");
+pub(crate) const REPOSITORY_URL: &str = "https://github.com/dccif/KeySteer";
 
 pub(crate) fn details() -> String {
     format!(
@@ -22,5 +23,6 @@ mod tests {
         assert!(details.contains("Author: dccif"));
         assert!(details.contains("Build date: "));
         assert!(details.contains("License: GPL-3.0-or-later"));
+        assert_eq!(REPOSITORY_URL, "https://github.com/dccif/KeySteer");
     }
 }

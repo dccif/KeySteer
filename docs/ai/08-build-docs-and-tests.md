@@ -56,10 +56,10 @@ Release 汇总 job 会运行同一提取器，确保版本条目缺失时不发�
 
 1. `cargo build --locked --release --target`。
 2. 使用 `KEYSTEER_SIGNING_PFX` + `KEYSTEER_SIGNING_PASSWORD` 或
-   `KEYSTEER_SIGNING_THUMBPRINT` 对 EXE 做 SHA-256 Authenticode 签名和 RFC 3161 时间戳，再由
-   `signtool verify /pa /all` 验证；`-RequireSigning` 禁止产生不可自动安装的正式包。
-   `-TrustSelfSignedForBuild` 只在 verify 期间把自签证书临时加入构建用户 Root，并在 finally
-   中移除，不会把 CER 放进发布包，也不要求最终用户安装证书。
+   `KEYSTEER_SIGNING_THUMBPRINT` 对 EXE 做 SHA-256 Authenticode 签名和 RFC 3161 时间戳；
+   SignTool 返回失败会立即终止，`-RequireSigning` 禁止产生不可自动安装的正式包。打包阶段不把
+   自签证书加入 runner 的 Root；安装更新时由 KeySteer 校验 Authenticode 摘要并比较当前程序与
+   候选程序的叶证书指纹，因此最终用户也不需要安装 CER。
 3. 复制图标已嵌入、GUI-subsystem 的 `KeySteer.exe` 与
    `keysteer.default.toml` 到 `dist/<target>/KeySteer/`。
 4. 生成包含该目录的 `dist/<target>/KeySteer-v<version>-<target>.zip`，并把相同的已签名 EXE
@@ -70,8 +70,7 @@ Release 汇总 job 会运行同一提取器，确保版本条目缺失时不发�
 GitHub Windows packaging job 从 `WINDOWS_SIGNING_PFX_BASE64` 与
 `WINDOWS_SIGNING_PASSWORD` secrets 恢复短生命周期 PFX 文件并强制签名；可用
 `WINDOWS_TIMESTAMP_URL` repository variable 覆盖默认时间戳服务。两种架构必须使用同一证书，
-否则跨架构包身份会分裂。workflow 允许自签 PFX，并只在 runner 的 `signtool verify` 期间建立
-临时当前用户信任；公开受信任 CA 的证书不需要这一步。
+否则跨架构包身份会分裂。workflow 允许自签 PFX，不修改 runner 的证书信任库。
 
 `packaging/windows/new-development-certificate.ps1` 在 `CurrentUser\\My` 创建带 Code Signing
 EKU 的可导出自签名 X.509 证书，并输出被 gitignore 的 PFX/CER。PFX 可导入 Kleopatra 做备份和
@@ -85,9 +84,8 @@ EKU 的可导出自签名 X.509 证书，并输出被 gitignore 的 PFX/CER。PF
 测试证书和随机密码 PFX，不加入用户信任库；它通过与 GitHub Secret 相同的 PFX 路径验证打包，
 再签名两个临时 EXE 并运行 Rust `WinVerifyTrust`
 同证书测试，并确认被篡改的已签 EXE 会拒绝。传入 `-VerifyPackaging` 时由 package script 仅在
-`signtool verify` 期间临时加入当前用户 Root，并在工作区 `tmp/` 的隔离输出根完成构建、签名及
-x64 ZIP/更新器 EXE 验证，不污染可发布的 `dist/`；`finally` 总会删除测试证书、Root 条目和
-所有临时文件。
+工作区 `tmp/` 的隔离输出根完成构建、签名及 x64 ZIP/更新器 EXE 验证，不污染可发布的
+`dist/`；`finally` 总会删除测试证书和所有临时文件。
 
 `tools/benchmark-windows-dist.ps1 [target]` starts the unpacked
 `dist/<target>/KeySteer/KeySteer.exe` and writes in-memory startup/resource
