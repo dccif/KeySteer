@@ -52,6 +52,8 @@ pub enum FinishCause {
 /// including drawing its own grid or full-screen overlay.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
+    /// Move the window and physical pointer together, preserving relative position.
+    MoveWindowToScreen(WindowScreenTarget),
     /// Dispatch high-level actions through the same path used by config.
     DispatchActions(ActionSequence),
     /// Move the pointer by a relative delta, in pixels.
@@ -147,6 +149,15 @@ pub enum Command {
 
     /// Shut the application down.
     Quit,
+}
+
+/// Display destination for moving the native window under the pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowScreenTarget {
+    Previous,
+    Next,
+    /// Zero-based index in the backend's display list.
+    Index(usize),
 }
 
 impl Command {

@@ -3,17 +3,26 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::api::{Binding, Key, KeyChord};
+use crate::api::{Binding, Key, KeyChord, ModeId};
+
+#[derive(Debug, Clone)]
+pub(super) struct ChordContinuation {
+    pub chord: Arc<KeyChord>,
+    pub binding: Arc<Binding>,
+    pub owner: ModeId,
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct CompiledBinding {
-    pub chord: KeyChord,
+    pub chord: Arc<KeyChord>,
     pub binding: Arc<Binding>,
+    pub continuations: Arc<[ChordContinuation]>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct CompiledKeymap {
     by_activation: BTreeMap<Key, Vec<CompiledBinding>>,
+    has_prefixes: bool,
 }
 
 impl CompiledKeymap {
@@ -37,10 +46,64 @@ impl CompiledKeymap {
             return;
         }
         entries.push(CompiledBinding {
-            chord,
+            chord: Arc::new(chord),
             binding: Arc::new(binding),
+            continuations: Arc::from([]),
         });
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.chord.keys().len()));
+    }
+
+    pub fn continuation_candidates(
+        &self,
+        owner: &ModeId,
+    ) -> impl Iterator<Item = ChordContinuation> + '_ {
+        let owner = owner.clone();
+        self.by_activation
+            .values()
+            .flatten()
+            .filter(|entry| !matches!(entry.binding.as_ref(), Binding::Disabled))
+            .map(move |entry| ChordContinuation {
+                chord: entry.chord.clone(),
+                binding: entry.binding.clone(),
+                owner: owner.clone(),
+            })
+    }
+
+    /// Compile topology once after overrides and plugin defaults have merged.
+    /// A continuation must end with a new completion key. Adding modifiers
+    /// after the activation key is not an ordered chord continuation.
+    pub fn compile_prefixes(&mut self, candidates: &[ChordContinuation]) {
+        self.has_prefixes = false;
+        for entry in self.by_activation.values_mut().flatten() {
+            let short = &entry.chord;
+            entry.continuations = candidates
+                .iter()
+                .filter(|long| {
+                    !short.activation_key().is_modifier()
+                        && long.chord.keys().len() > short.keys().len()
+                        && !short.keys().iter().any(|key| {
+                            modifier_matches(key, long.chord.activation_key())
+                                || modifier_matches(long.chord.activation_key(), key)
+                        })
+                        && short.keys().iter().all(|key| {
+                            long.chord.keys().iter().any(|other| {
+                                modifier_matches(key, other) || modifier_matches(other, key)
+                            })
+                        })
+                })
+                .cloned()
+                .collect();
+            self.has_prefixes |= !entry.continuations.is_empty();
+        }
+    }
+
+    pub fn prefix_entry(&self, key: &Key, binding: &Arc<Binding>) -> Option<&CompiledBinding> {
+        if !self.has_prefixes {
+            return None;
+        }
+        self.find_entry(key, |entry| {
+            Arc::ptr_eq(&entry.binding, binding) && !entry.continuations.is_empty()
+        })
     }
 
     pub fn contains_chord(&self, chord: &KeyChord) -> bool {

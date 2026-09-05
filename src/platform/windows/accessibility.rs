@@ -748,6 +748,8 @@ fn native_point_in_rect(point: POINT, rect: Rect) -> bool {
 struct PointWindowCollector {
     point: POINT,
     target: Option<(HWND, u32, Rect)>,
+    reject_shell: bool,
+    blocked_by_shell: bool,
 }
 
 extern "system" fn collect_window_at_point(hwnd: HWND, _data: LPARAM) -> BOOL {
@@ -756,18 +758,45 @@ extern "system" fn collect_window_at_point(hwnd: HWND, _data: LPARAM) -> BOOL {
             return BOOL(0);
         };
         if collector.target.is_none()
+            && !collector.blocked_by_shell
             && window_bounds(hwnd)
                 .is_some_and(|bounds| native_point_in_rect(collector.point, bounds))
-            && let Some(target) = scannable_target(hwnd)
         {
-            collector.target = Some(target);
+            if collector.reject_shell
+                && class_name_is_shell_surface(hwnd)
+                && super::native::is_window_visible(hwnd)
+            {
+                collector.blocked_by_shell = true;
+            } else if let Some(target) = scannable_target(hwnd) {
+                collector.target = Some(target);
+            }
         }
         BOOL(1)
     })
 }
 
+pub(super) fn movable_window_under_pointer(
+    cursor: crate::api::geometry::Point,
+) -> Result<Option<(HWND, u32, Rect)>, String> {
+    let hit = normalize_root_owner(super::native::window_from_point(POINT {
+        x: cursor.x.round() as i32,
+        y: cursor.y.round() as i32,
+    }));
+    // Do not fall through taskbars or the desktop to an application behind them.
+    if class_name_is_shell_surface(hit) || hit == super::native::desktop_window() {
+        return Ok(None);
+    }
+    window_under_pointer_with_shell_filter(true, cursor)
+}
+
 fn window_under_pointer() -> Result<Option<(HWND, u32, Rect)>, String> {
-    let cursor = super::input::cursor_position()?;
+    window_under_pointer_with_shell_filter(false, super::input::cursor_position()?)
+}
+
+fn window_under_pointer_with_shell_filter(
+    reject_shell: bool,
+    cursor: crate::api::geometry::Point,
+) -> Result<Option<(HWND, u32, Rect)>, String> {
     let point = POINT {
         x: cursor.x.round() as i32,
         y: cursor.y.round() as i32,
@@ -780,6 +809,8 @@ fn window_under_pointer() -> Result<Option<(HWND, u32, Rect)>, String> {
         *slot = Some(PointWindowCollector {
             point,
             target: None,
+            reject_shell,
+            blocked_by_shell: false,
         })
     });
     let enumeration = super::native::enum_windows(Some(collect_window_at_point), LPARAM(0))

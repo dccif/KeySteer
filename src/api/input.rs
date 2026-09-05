@@ -346,7 +346,9 @@ impl KeyChord {
         let (mut modifiers, mut keys): (Vec<_>, Vec<_>) =
             self.keys.iter().partition(|key| key.is_modifier());
         modifiers.sort_by(|a, b| modifier_rank(a).cmp(&modifier_rank(b)).then(a.cmp(b)));
-        keys.sort_unstable();
+        // Preserve the completion key across canonicalize -> parse. Sorting
+        // every letter would turn `alt+s+a` into a chord completed by S.
+        keys.sort_by_key(|key| (*key == &self.activation, *key));
         modifiers
             .into_iter()
             .chain(keys)
@@ -526,6 +528,20 @@ mod tests {
         let chord = KeyChord::parse("LeftAlt + H").unwrap();
         assert_eq!(chord.canonical(), "left_alt+h");
         assert_eq!(chord.activation_key().as_str(), "h");
+    }
+
+    #[test]
+    fn multi_letter_chords_preserve_the_completion_key_when_serialized() {
+        for value in ["alt+s+a", "ctrl+x+c", "ctrl+x+c+v"] {
+            let original = KeyChord::parse(value).unwrap();
+            let reloaded = KeyChord::parse(&original.canonical()).unwrap();
+            assert_eq!(original.activation_key(), reloaded.activation_key());
+            assert_eq!(original.canonical(), reloaded.canonical());
+        }
+        assert_ne!(
+            KeyChord::parse("alt+s+a").unwrap().canonical(),
+            KeyChord::parse("alt+a+s").unwrap().canonical()
+        );
     }
 
     #[test]

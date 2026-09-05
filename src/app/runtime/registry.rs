@@ -283,6 +283,7 @@ impl Engine {
     }
 
     pub(super) fn set_active(&mut self, active: ModeId) {
+        self.input.pending_chords.clear();
         self.registry.active_slot = self.registry.index_of(&active);
         self.registry.active = active;
     }
@@ -367,6 +368,18 @@ impl Engine {
         // A plugin's suggested chord applies in `normal`, which is where the
         // user works, and only if that chord is still free.
         self.registry.merge_plugin_bindings_into_normal();
+
+        let continuations: Vec<_> = self
+            .registry
+            .tables()
+            .flat_map(|(owner, table)| table.continuation_candidates(owner))
+            .collect();
+        for id in self.binding_mode_ids() {
+            if let Some(table) = self.registry.table_mut_or_default(&id) {
+                table.compile_prefixes(&continuations);
+            }
+        }
+        self.input.pending_chords.clear();
 
         self.ui_hint_overlap_chord = ui_hint_overlap_chord;
         self.registry.binding_profile_key = binding_profile_key;

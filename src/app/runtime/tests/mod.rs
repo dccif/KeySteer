@@ -42,6 +42,7 @@ fn active_config(engine: &Engine) -> Config {
 /// Records what the engine asked of the platform.
 #[derive(Default)]
 struct Recorder {
+    window_moves: Vec<crate::api::command::WindowScreenTarget>,
     presents: usize,
     dismissals: usize,
     warps: Vec<Point>,
@@ -68,6 +69,8 @@ struct Recorder {
 }
 
 struct FakeBackend {
+    window_move_pointer: Option<Point>,
+    fail_window_move: bool,
     events: Vec<BackendEvent>,
     log: Arc<Mutex<Recorder>>,
     fail_start: bool,
@@ -82,6 +85,8 @@ impl FakeBackend {
         let log = Arc::new(Mutex::new(Recorder::default()));
         (
             Self {
+                window_move_pointer: None,
+                fail_window_move: false,
                 events,
                 log: log.clone(),
                 fail_start: false,
@@ -129,6 +134,16 @@ impl Backend for FakeBackend {
     }
     fn pointer(&self) -> Result<Point, String> {
         Ok(Point::new(10.0, 10.0))
+    }
+    fn move_window_to_screen(
+        &self,
+        target: crate::api::command::WindowScreenTarget,
+    ) -> Result<Option<Point>, String> {
+        self.log.lock().unwrap().window_moves.push(target);
+        if self.fail_window_move {
+            return Err("injected window movement failure".into());
+        }
+        Ok(self.window_move_pointer)
     }
     fn focused_app(&self) -> Result<Option<FocusedApp>, String> {
         Ok(None)
@@ -475,3 +490,4 @@ include!("toggle.rs");
 include!("lifecycle.rs");
 include!("overlay.rs");
 include!("reload_scheduler.rs");
+include!("window_mover.rs");

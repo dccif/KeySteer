@@ -7,10 +7,30 @@
 - Vision result 由 Rust RAII owner 释放，读取 slice 前验证 count<=2000 和非空指针。
 - COM apartment 显式 `!Send/!Sync`，确保 `CoUninitialize` 回到初始化线程。
 - 两个平台入口不放行 undocumented unsafe；每个最小块记录 `SAFETY` 契约。机械门禁当前为
-  不高于 220 个 unsafe expression/17 个文件，并同时禁止 `transmute`/`transmute_copy`；`domain` 与其余 portable 层使用编译期
+  预算以 `tests/safety_budget.rs` 为准；Window Mover 增加四个 Win32 调用和五个 AX 操作，并同时禁止 `transmute`/`transmute_copy`；`domain` 与其余 portable 层使用编译期
   `forbid(unsafe_code)`/测试门禁保持零 unsafe。
 
 ## 共同契约
+
+跨屏窗口移动复用 `common/window_placement.rs`：以窗口与屏幕的最大交集选择源屏，按显示器
+编号循环 previous/next。相同屏幕尺寸精确平移（不受两屏任务栏差异影响），不同尺寸按工作区剩余可移动空间的比例映射，
+保留窗口大小；超出目标工作区的大窗口至少把左上角放入工作区。
+动作开始时只读取一次物理鼠标位置，用于命中和跟随计算。`following_pointer` 保持鼠标在
+普通窗口内的偏移；最大化窗口尺寸变化时保留比例，并将结果限制在目标显示器内。
+后端提交成功后返回该位置，由 Engine 统一 warp 和同步状态；无目标或请求失败不移动鼠标。
+
+Windows `window_mover.rs` 复用 UIA 的纯 HWND 命中/过滤，不提交扫描。桌面、任务栏、自身及
+透明覆盖层不作为目标，也不穿透系统桌面/任务栏移动背后的应用。普通窗口使用异步
+`SetWindowPos` 并保留焦点/Z-order；最大化窗口通过异步 `SetWindowPlacement` 同时移动还原
+位置、保留最大化状态，显式转换 workspace/screen 坐标。成功表示操作已提交，应用仍可能
+限制大小、DPI 行为或拒绝移动；禁止同步等待外部 UI 线程。
+
+macOS `accessibility::move_window_to_screen` 通过 AX 命中鼠标下元素及 `AXWindow`，设置
+`AXPosition`；CF 引用由 `OwnedCf` 释放，使用有限 messaging timeout。原生全屏 Space 需要先
+退出全屏；不激活应用，也不发送系统快捷键模拟移动。
+
+坐标契约参考 [Microsoft WINDOWPLACEMENT](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-windowplacement)
+和 [Apple AX hit testing](https://developer.apple.com/documentation/applicationservices/1462077-axuielementcopyelementatposition)。
 
 两端都实现 `api::Backend`：poll、按键 disposition、屏幕/光标/前台应用、输入注入、
 frame clock、overlay、UI scan、appearance、系统浏览器、状态栏开关和 autostart。目标后端由

@@ -137,3 +137,12 @@ double-click 成功后生成。普通 click 仍在物理键按下沿原子执行
 - 默认建议 `primary+s -> screen next`，但用户已占用时不覆盖。
 
 新增插件能力应优先扩充公共 API，而不是让插件向下依赖 `Engine` 或平台模块。
+
+## Window Mover 插件
+
+`src/plugins/builtin/window_mover.rs` 导出 `move_window previous/next/<编号>`，返回
+`Command::MoveWindowToScreen(WindowScreenTarget)`。Engine 委托 `Backend::move_window_to_screen`，
+鼠标跟随窗口并保持窗口内的相对位置，不切换 Mode、不发 `Clicked`。默认建议
+`primary+s+d -> move_window next`，与 `primary+s -> screen next` 由通用前缀仲裁处理；
+插件不判断物理按键，也不拥有等待状态。
+默认绑定遵循 key aliases，用户绑定和 `none` 优先，可在任意 Mode 中配置插件 verb。

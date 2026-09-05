@@ -100,7 +100,7 @@ flowchart LR
 | `n` | 切换左键持续按下，用于拖拽 |
 | `t` / `y` / `i` / `u` | 发送 `Home` / `End` / `Page Up` / `Page Down` |
 | `g` / `f` / `Primary+F` | `Grid` / `Recursive Grid` / `UI Hint` |
-| `Primary+S` | 切换到下一块显示器 |
+| `Primary+S` / `Primary+S+D` | 切换鼠标到下一块显示器／将鼠标下窗口移到下一块显示器，鼠标保持在窗口内的相对位置 |
 | `q` 或 `Esc` | 返回`Idle`待机 |
 
 </details>

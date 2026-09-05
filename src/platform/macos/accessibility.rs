@@ -92,6 +92,19 @@ impl AxAttributes {
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
+    fn AXUIElementCreateSystemWide() -> AXUIElementRef;
+    fn AXUIElementCopyElementAtPosition(
+        element: AXUIElementRef,
+        x: c_float,
+        y: c_float,
+        result: *mut AXUIElementRef,
+    ) -> c_int;
+    fn AXUIElementSetAttributeValue(
+        element: AXUIElementRef,
+        attribute: CFStringRef,
+        value: CFTypeRef,
+    ) -> c_int;
+    fn AXValueCreate(value_type: c_int, value: *const c_void) -> AXValueRef;
     fn AXUIElementCreateApplication(pid: libc::pid_t) -> AXUIElementRef;
     fn AXUIElementCopyAttributeValue(
         element: AXUIElementRef,
@@ -104,6 +117,95 @@ unsafe extern "C" {
     fn AXValueGetTypeID() -> usize;
     fn AXValueGetType(value: AXValueRef) -> c_int;
     fn AXValueGetValue(value: AXValueRef, value_type: c_int, output: *mut c_void) -> bool;
+}
+
+/// Resolve the window from the physical pointer, never the focused window.
+pub(super) fn move_window_to_screen(
+    cursor: crate::api::geometry::Point,
+    screens: &[crate::api::geometry::Screen],
+    target: crate::api::command::WindowScreenTarget,
+) -> Result<Option<crate::api::geometry::Point>, String> {
+    use crate::platform::common::window_placement::{
+        destination, following_pointer, map_between_screens,
+    };
+    // SAFETY: AX Create returns a +1 object, transferred once to OwnedCf.
+    let system = unsafe { OwnedCf::from_create_rule(AXUIElementCreateSystemWide()) }
+        .ok_or_else(|| "cannot create AX system element".to_string())?;
+    // SAFETY: the AX reference is live and the timeout is finite.
+    let timeout = unsafe { AXUIElementSetMessagingTimeout(system.as_ptr(), NODE_TIMEOUT_SECONDS) };
+    if timeout != AX_OK {
+        return Err(format!(
+            "cannot set window lookup timeout: AXError {timeout}"
+        ));
+    }
+    let mut hit = ptr::null();
+    // SAFETY: hit is a writable output and the returned +1 object is adopted
+    // even if AX reports a failure, so every returned reference is released.
+    let (error, hit) = unsafe {
+        let error = AXUIElementCopyElementAtPosition(
+            system.as_ptr(),
+            cursor.x as c_float,
+            cursor.y as c_float,
+            &mut hit,
+        );
+        (error, OwnedCf::from_create_rule(hit))
+    };
+    if error != AX_OK {
+        return Err(format!("cannot find window under pointer: AXError {error}"));
+    }
+    let Some(hit) = hit else {
+        return Ok(None);
+    };
+    let window = if copy_string_attribute(hit.as_ptr(), &CFString::new("AXRole")).as_deref()
+        == Some("AXWindow")
+    {
+        hit
+    } else {
+        let Some(window) = copy_attribute(hit.as_ptr(), &CFString::new("AXWindow")) else {
+            return Ok(None);
+        };
+        window
+    };
+    if !is_ax_element(window.as_ptr()) {
+        return Ok(None);
+    }
+    if copy_bool_attribute(window.as_ptr(), &CFString::new("AXFullScreen")) == Some(true) {
+        return Err("leave native macOS full screen before moving the window".into());
+    }
+    let attributes = AxAttributes::new();
+    let bounds = element_rect(window.as_ptr(), &attributes)
+        .ok_or_else(|| "cannot read the window's AX position and size".to_string())?;
+    let Some((source, target)) = destination(screens, bounds, target) else {
+        return Ok(None);
+    };
+    let mapped = map_between_screens(bounds, &screens[source], &screens[target]);
+    let point = CGPoint::new(mapped.x, mapped.y);
+    // SAFETY: the type tag describes exactly the CGPoint at this pointer.
+    // AXValueCreate copies its contents; OwnedCf owns the resulting +1 object.
+    let value = unsafe {
+        OwnedCf::from_create_rule(AXValueCreate(
+            AX_VALUE_CGPOINT,
+            (&point as *const CGPoint).cast(),
+        ))
+    }
+    .ok_or_else(|| "cannot create AX window position".to_string())?;
+    // SAFETY: window, attribute and value stay alive through the bounded AX call.
+    let error = unsafe {
+        AXUIElementSetAttributeValue(
+            window.as_ptr(),
+            attributes.position.as_concrete_TypeRef(),
+            value.as_ptr(),
+        )
+    };
+    if error != AX_OK {
+        return Err(format!("cannot move window: AXError {error}"));
+    }
+    Ok(Some(following_pointer(
+        cursor,
+        bounds,
+        mapped,
+        screens[target].bounds,
+    )))
 }
 
 pub fn ax_roles_for(semantic_roles: &[String]) -> Vec<String> {

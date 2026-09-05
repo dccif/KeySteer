@@ -379,6 +379,13 @@ impl Backend for MacOsBackend {
         input::cursor_position()
     }
 
+    fn move_window_to_screen(
+        &self,
+        target: crate::api::command::WindowScreenTarget,
+    ) -> Result<Option<Point>, String> {
+        accessibility::move_window_to_screen(self.pointer()?, &self.screens()?, target)
+    }
+
     fn focused_app(&self) -> Result<Option<FocusedApp>, String> {
         Ok(self.workspace.focused_app())
     }

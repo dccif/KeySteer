@@ -79,6 +79,7 @@ fn default_normal_bindings() -> Bindings {
         ("f", "recursive_grid"),
         ("primary+f", "ui_hint"),
         ("primary+s", "screen next"),
+        ("primary+s+d", "move_window next"),
         // Navigation keys sent to the focused application.
         ("u", "page_down"),
         ("i", "page_up"),

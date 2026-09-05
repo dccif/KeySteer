@@ -20,6 +20,7 @@
 | 找模块和入口 | [项目地图](01-project-map.md) |
 | 修改启动、事件路由或动作执行 | [核心运行时与公共 API](02-runtime-and-api.md) |
 | 修改 TOML、按键、继承或持久化 | [配置、按键和持久化](03-configuration.md) |
+| 修改组合键前缀仲裁、跨屏窗口移动或鼠标跟随 | [配置与按键](03-configuration.md)、[核心运行时与公共 API](02-runtime-and-api.md)、[模式与插件](04-modes-and-lifecycle.md)、[原生后端](06-platform-backends.md) |
 | 修改 Mode、插件或 Finish | [内置模式、插件与 Finish](04-modes-and-lifecycle.md) |
 | 修改 UIA、AX、OCR、Vision 或扫描超时 | [UI Hint 扫描链路](05-ui-scanning.md) |
 | 修改原生平台能力、登录项或状态栏生命周期 | [Windows 与 macOS 后端](06-platform-backends.md) |

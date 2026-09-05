@@ -296,6 +296,7 @@ impl<T> IntoIterator for KeyMap<T> {
 
 #[derive(Debug, Default)]
 pub(super) struct InputState {
+    pub(super) pending_chords: SmallVec<[super::prefix_chords::PendingChord; 2]>,
     pub(super) pressed: PressedKeys,
     pub(super) key_dispositions: KeyMap<KeyDisposition>,
     pub(super) active_gestures: KeyMap<ActiveGesture>,
@@ -310,6 +311,7 @@ impl InputState {
     /// Clear plan-owned transient state while preserving physical key edges and
     /// their disposition until the corresponding real KeyUp arrives.
     pub(super) fn reset_for_plan_swap(&mut self) {
+        self.pending_chords.clear();
         self.active_gestures.clear();
         self.active_click_indicators.clear();
         self.active_default_toggles.clear();
@@ -318,6 +320,7 @@ impl InputState {
 
     /// Capture loss means the matching physical KeyUp can no longer arrive.
     pub(super) fn forget_physical_capture(&mut self) {
+        self.pending_chords.clear();
         self.pressed.clear();
         self.key_dispositions.clear();
     }
@@ -550,6 +553,7 @@ impl Engine {
             && display_before.is_some_and(|display_before| display_before != self.display_mode());
 
         if !self.enabled || self.is_excluded_app() {
+            self.input.pending_chords.clear();
             if let Some(pending) = completed_long_press
                 && let Err(error) = self.cancel_pending_long_press(pending, backend)
             {
@@ -563,6 +567,49 @@ impl Engine {
                 backend,
             )?;
             return Ok(());
+        }
+
+        // Prefix keys were consumed on Down. Resolve only after publishing Up,
+        // and still release any independent gesture owned by this same key.
+        if input.state == KeyState::Up && self.has_released_prefix() {
+            let outcome = self.complete_key_disposition(&input, KeyOutcome::Consumed);
+            self.dispose_input(&input, outcome, trace_key, backend)?;
+            if let Some(gesture) = self.input.active_gestures.remove(&input.key) {
+                let resolved = ResolvedBinding {
+                    binding: gesture.binding,
+                    owner: gesture.owner,
+                };
+                if let Err(error) = self.apply_binding(resolved, &input, backend) {
+                    self.report_action_error(error, backend);
+                }
+            }
+            if let Some(pending) = completed_long_press
+                && let Err(error) = self.complete_pending_mouse_click(pending, backend)
+            {
+                self.report_action_error(error, backend);
+            }
+            if let Err(error) = self.finish_default_toggle(completed_default_toggle, backend) {
+                self.report_action_error(error, backend);
+            }
+            if let Err(error) = self.commit_released_prefixes(backend) {
+                self.report_action_error(error, backend);
+            }
+            self.reassert_latched_key_after_forwarded_release(
+                &input,
+                released_forwarded_key,
+                backend,
+            )?;
+            if display_changed || click_indicator_released {
+                self.refresh_overlay(backend)?;
+            }
+            return Ok(());
+        }
+        if input.state == KeyState::Down
+            && !pressed_changed
+            && self.is_pending_chord_key(&input.key)
+        {
+            let outcome = self.complete_key_disposition(&input, KeyOutcome::Consumed);
+            return self.dispose_input(&input, outcome, trace_key, backend);
         }
 
         if let Some(pending) = completed_long_press {
@@ -655,6 +702,17 @@ impl Engine {
         }
 
         if let Some(resolved) = bound {
+            if input.state == KeyState::Down && !input.repeat {
+                self.cancel_completed_prefixes(&resolved);
+                if self.defer_prefix_chord(&resolved, &input.key) {
+                    let outcome = self.complete_key_disposition(&input, KeyOutcome::Consumed);
+                    self.dispose_input(&input, outcome, trace_key, backend)?;
+                    if display_changed {
+                        self.refresh_overlay(backend)?;
+                    }
+                    return Ok(());
+                }
+            }
             // Remember both the binding and its recipient so a release stops a
             // normal gesture even while grid, recursive_grid or ui_hint remains
             // the active mode.
@@ -1350,11 +1408,15 @@ impl Engine {
 
 impl Engine {
     pub(super) fn temporary_mode_is_active(&self, mode: &ModeId) -> bool {
+        self.temporary_mode_is_active_for_pressed(mode, &self.input.pressed)
+    }
+
+    fn temporary_mode_is_active_for_pressed(&self, mode: &ModeId, pressed: &[Key]) -> bool {
         self.registry.temporary_chords(mode).is_some_and(|chords| {
             chords.iter().any(|entry| {
                 let reserved_for_overlap = self.registry.active == ModeId::ui_hint()
                     && entry.conflicts_with_ui_hint_overlap;
-                !reserved_for_overlap && entry.chord.matches_pressed(&self.input.pressed)
+                !reserved_for_overlap && entry.chord.matches_pressed(pressed)
             })
         })
     }
@@ -1403,7 +1465,12 @@ impl Engine {
 
     /// Find the binding for `key` using the compiled mode precedence rules.
     pub(super) fn lookup(&self, key: &Key) -> Option<ResolvedBinding> {
-        let active_match = self.lookup_with_specificity_in(&self.registry.active, key);
+        self.lookup_for_pressed(key, &self.input.pressed)
+    }
+
+    pub(super) fn lookup_for_pressed(&self, key: &Key, pressed: &[Key]) -> Option<ResolvedBinding> {
+        let active_match =
+            self.lookup_with_specificity_for_pressed(&self.registry.active, key, pressed);
         if self.registry.active == ModeId::idle() {
             return active_match.map(|(binding, _)| ResolvedBinding {
                 binding,
@@ -1421,13 +1488,14 @@ impl Engine {
                 owner: self.registry.active.clone(),
             });
         };
-        let temporary_active = self.temporary_mode_is_active(&self.registry.active);
+        let temporary_active =
+            self.temporary_mode_is_active_for_pressed(&self.registry.active, pressed);
         let temporary_match = temporary_active
             .then_some(route.temporary_mode.as_ref())
             .flatten()
             .cloned()
             .and_then(|owner| {
-                self.lookup_with_specificity_in(&owner, key)
+                self.lookup_with_specificity_for_pressed(&owner, key, pressed)
                     .map(|(binding, specificity)| (binding, owner, specificity))
             });
 
@@ -1450,7 +1518,7 @@ impl Engine {
                 if *owner == self.registry.active {
                     return None;
                 }
-                self.lookup_inherited(owner, key, &mut SmallVec::new())
+                self.lookup_inherited(owner, key, pressed, &mut SmallVec::new())
             }),
         }
     }
@@ -1459,13 +1527,14 @@ impl Engine {
         &self,
         owner: &ModeId,
         key: &Key,
+        pressed: &[Key],
         visited: &mut SmallVec<[ModeId; 8]>,
     ) -> Option<ResolvedBinding> {
         if visited.contains(owner) {
             return None;
         }
         visited.push(owner.clone());
-        if let Some(binding) = self.lookup_in(owner, key) {
+        if let Some((binding, _)) = self.lookup_with_specificity_for_pressed(owner, key, pressed) {
             return (binding.as_ref() != &Binding::Disabled).then(|| ResolvedBinding {
                 binding,
                 owner: owner.clone(),
@@ -1474,7 +1543,7 @@ impl Engine {
         let sources = &self.registry.routes.get(owner)?.inherits;
         sources
             .iter()
-            .find_map(|source| self.lookup_inherited(source, key, visited))
+            .find_map(|source| self.lookup_inherited(source, key, pressed, visited))
     }
 
     pub(super) fn active_claims_raw_key(&self, key: &Key) -> bool {
@@ -1493,16 +1562,25 @@ impl Engine {
         mode: &ModeId,
         key: &Key,
     ) -> Option<(Arc<Binding>, usize)> {
+        self.lookup_with_specificity_for_pressed(mode, key, &self.input.pressed)
+    }
+
+    fn lookup_with_specificity_for_pressed(
+        &self,
+        mode: &ModeId,
+        key: &Key,
+        pressed: &[Key],
+    ) -> Option<(Arc<Binding>, usize)> {
         let table = self.registry.table(mode)?;
         if self.strict_modifier_matching_enabled() {
-            table.lookup_with_specificity_strict(key, &self.input.pressed, |modifier| {
+            table.lookup_with_specificity_strict(key, pressed, |modifier| {
                 matches!(
                     self.input.key_dispositions.get(modifier),
                     Some(KeyDisposition::Consume)
                 )
             })
         } else {
-            table.lookup_with_specificity(key, &self.input.pressed)
+            table.lookup_with_specificity(key, pressed)
         }
     }
 

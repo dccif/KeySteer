@@ -360,7 +360,13 @@ fn plugins_register_through_the_same_path_as_built_ins() {
     }
 
     let ids: Vec<String> = engine.registered_modes().map(|i| i.to_string()).collect();
-    for expected in ["idle", "normal", "grid", "plugin:screen-selector"] {
+    for expected in [
+        "idle",
+        "normal",
+        "grid",
+        "plugin:screen-selector",
+        "plugin:window-mover",
+    ] {
         assert!(
             ids.contains(&expected.to_string()),
             "{expected} missing from {ids:?}"

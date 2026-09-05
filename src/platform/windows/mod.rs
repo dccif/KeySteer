@@ -25,6 +25,7 @@ mod ui_scan;
 mod update_installer;
 mod vision;
 mod wechat_ocr;
+mod window_mover;
 
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -601,6 +602,13 @@ impl Backend for WindowsBackend {
 
     fn pointer(&self) -> Result<Point, String> {
         input::cursor_position()
+    }
+
+    fn move_window_to_screen(
+        &self,
+        target: crate::api::command::WindowScreenTarget,
+    ) -> Result<Option<Point>, String> {
+        window_mover::move_to_screen(target)
     }
 
     fn focused_app(&self) -> Result<Option<FocusedApp>, String> {

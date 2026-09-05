@@ -80,6 +80,21 @@ Mode 的 cursor override 可单独覆盖这些值。普通反馈由物理按键�
 平台风险（macOS Option+字母、系统保留键、终端快捷键、Apple 不存在的 F21-F24）是
 warning，不是解析错误。
 
+## 组合键前缀
+
+`KeyChord` 的最后一个非修饰键是完成键；canonical 输出必须保留它，避免 `ctrl+x+c`
+保存后变成由 X 完成的组合。空格分组仍不是按键序列。
+
+`registry::rebuild_tables` 在应用覆盖、插件默认绑定合并后编译严格超集的 continuation 关系。
+只有增加了新完成键的长组合才构成前缀冲突；单独修饰键保持原来的即时语义。Engine 用同一个
+resolver 检查候选在当前继承、temporary mode、`none` 和修饰键侧别下是否有效。
+匹配短组合后消费输入并保存 Arc 候选；长组合完成时取消短组合，任一短组合成员释放时才执行
+仍挂起的短动作。嵌套前缀使用同一规则，不使用固定延迟、timer 或全表逐键扫描。
+
+冲突的短 click 不启动长按 MouseDown，held 动作在释放时按完整 Down/Up 处理。连续移动、速度
+或 toggle 最好使用没有长组合的键。模式切换、有效配置/应用覆盖重编译、禁用和输入恢复取消
+pending；无效 Reload 保留最后有效计划及 pending。Down/Up 仍使用既有 disposition 配对。
+
 ## Binding 语法
 
 `src/api/binding.rs::Binding` 同时是配置动作、内部动作和插件动作。解析顺序大致为：

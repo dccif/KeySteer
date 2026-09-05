@@ -50,8 +50,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Install required Rust toolchain
-        run: rustup toolchain install 1.98 --profile minimal
+      - name: Install stable Rust toolchain
+        run: rustup toolchain install stable --profile minimal
 
       - name: Sync package version in Cargo.lock
         shell: bash
@@ -72,9 +72,9 @@ jobs:
             target/${{ matrix.target }}/release/build
             target/${{ matrix.target }}/release/deps
             target/${{ matrix.target }}/release/.fingerprint
-          key: ${{ runner.os }}-${{ matrix.target }}-rust-1.98-release-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}
+          key: ${{ runner.os }}-${{ matrix.target }}-rust-stable-release-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-rust-1.98-release-
+            ${{ runner.os }}-${{ matrix.target }}-rust-stable-release-
 
       - name: Prepare Windows code-signing certificate
         shell: pwsh
@@ -125,8 +125,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Install required Rust toolchain
-        run: rustup toolchain install 1.98 --profile minimal
+      - name: Install stable Rust toolchain
+        run: rustup toolchain install stable --profile minimal
 
       - name: Sync package version in Cargo.lock
         shell: bash
@@ -147,9 +147,9 @@ jobs:
             target/${{ matrix.target }}/release/build
             target/${{ matrix.target }}/release/deps
             target/${{ matrix.target }}/release/.fingerprint
-          key: ${{ runner.os }}-${{ matrix.target }}-rust-1.98-release-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}
+          key: ${{ runner.os }}-${{ matrix.target }}-rust-stable-release-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-rust-1.98-release-
+            ${{ runner.os }}-${{ matrix.target }}-rust-stable-release-
 
       - name: Package macOS ${{ matrix.arch }}
         shell: bash

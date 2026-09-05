@@ -27,7 +27,7 @@ keysteer/
 | `src/config/` | TOML 文档、Mode section DTO、别名规范化、校验、主题与 comment-preserving store | `mod.rs`, `settings.rs`, `aliases.rs`, `validation.rs`, `store.rs` |
 | `src/app/runtime/` | 应用私有 Engine、原子运行计划、命令执行及有状态协作者 | `mod.rs`, `plan.rs`, `registry.rs`, `input_state.rs`, `scheduler.rs`, `overlay_coordinator.rs` |
 | `src/modes/` | 五个内置 Mode 状态机；UI Hint 私有状态和算法位于 `hint/` | `normal.rs`, `grid.rs`, `recursive_grid.rs`, `hint/mod.rs`, `hint/session.rs` |
-| `src/plugins/` | 使用公共 API 实现的内置插件示例 | `builtin/screen_selector.rs` |
+| `src/plugins/` | 使用公共 API 实现的内置插件 | `builtin/screen_selector.rs`, `builtin/window_mover.rs` |
 | `src/platform/common/` | 两端共享的 updater、app info、mailbox、batcher 和 spatial index | `mod.rs` |
 | `src/support/` | 日志、worker、错误聚合和性能探针 | `mod.rs` |
 | `src/platform/windows/` | Win32/COM/UIA/GDI/DWM 后端 | `mod.rs` 组合所有子模块 |
@@ -42,6 +42,8 @@ keysteer/
 - `src/tests/`：crate 内部的跨模块集成测试与默认忽略、需单线程运行的分配预算。
 - `src/app/bootstrap.rs`：加载配置、创建 backend/engine、注册内置模式和插件、进入事件循环。
 - `src/platform/mod.rs`：唯一的目标平台选择点。
+- `src/app/runtime/prefix_chords.rs`：消费已匹配短组合、等待释放或长组合完成；候选关系由 `input_router.rs` 在路由重建时编译。
+- `src/platform/common/window_placement.rs`：跨屏窗口位置的纯几何计算；Windows `window_mover.rs` 与 macOS `accessibility.rs` 负责原生操作。
 - `src/platform/common/partial_batcher.rs` / `scan_mailbox.rs`：两端共用的纯计数流式批次与
   generation-aware latest-only 扫描邮箱。
 - `src/platform/macos/latest_point_mailbox.rs`：macOS EventTap 使用的无锁 latest-point

@@ -98,7 +98,7 @@ Press `Esc` in a targeting mode to return to Normal; press it again to return to
 | `n` | Toggle a held left button for dragging |
 | `t` / `y` / `i` / `u` | Send `Home` / `End` / `Page Up` / `Page Down` |
 | `g` / `f` / `Primary+F` | `Grid` / `Recursive Grid` / `UI Hint` |
-| `Primary+S` | Switch to the next display |
+| `Primary+S` / `Primary+S+D` | Switch the pointer display / move the window under the pointer to the next display, keeping the pointer's relative position within it |
 | `q` or `Esc` | Return to Idle |
 
 </details>

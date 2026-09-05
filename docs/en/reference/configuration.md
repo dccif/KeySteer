@@ -58,6 +58,21 @@ Fields you do not specify retain their defaults. Starting with the shipped defau
 
 ## Keys and aliases
 
+### Chords with a shared prefix
+
+The engine compiles chord relationships when configuration is loaded. Built-in actions and plugins share this rule. The default can switch the pointer display or move a window:
+
+```toml
+[normal.bindings]
+"primary+s" = "screen next"
+"primary+s+d" = "move_window next"
+```
+
+Release `Primary+S` to switch the pointer display; keep it held and press D to move the window. Use `move_window previous` or `move_window 2` for another destination, and bind any of them to another chord. The final non-modifier key completes the chord. No timeout or plugin changes are needed. Inheritance, per-app overrides, `none`, and modifier sides are respected.
+
+Mode changes and successful configuration reloads cancel pending actions. Standalone modifiers remain immediate.
+A continuous action used as an ambiguous prefix receives one Down/Up tap on release; use independent keys for movement, long-press clicks, and toggle gestures.
+
 ### Key syntax
 
 The left side of a binding accepts a single key, a chord, or multiple independent keys sharing one action:

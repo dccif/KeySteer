@@ -4,10 +4,11 @@ use std::path::{Path, PathBuf};
 
 // Keep the current audited native surface from growing. Portable layers are
 // checked separately below and remain entirely safe Rust.
-const MAX_UNSAFE_EXPRESSIONS: usize = 243;
-const MAX_UNSAFE_FILES: usize = 20;
+// Window Mover adds four Win32 placement calls and five bounded AX operations.
+const MAX_UNSAFE_EXPRESSIONS: usize = 252;
+const MAX_UNSAFE_FILES: usize = 21;
 const PER_FILE_BUDGET: &[(&str, usize)] = &[
-    ("src/platform/macos/accessibility.rs", 12),
+    ("src/platform/macos/accessibility.rs", 17),
     ("src/platform/macos/autostart.rs", 5),
     ("src/platform/macos/display_link.rs", 4),
     ("src/platform/macos/native.rs", 6),
@@ -22,6 +23,7 @@ const PER_FILE_BUDGET: &[(&str, usize)] = &[
     ("src/platform/windows/input.rs", 4),
     ("src/platform/windows/overlay.rs", 9),
     ("src/platform/windows/screens.rs", 5),
+    ("src/platform/windows/window_mover.rs", 4),
     ("src/platform/windows/status_item.rs", 14),
     ("src/platform/windows/update_installer/candidate.rs", 4),
     ("src/platform/windows/update_installer/mod.rs", 11),

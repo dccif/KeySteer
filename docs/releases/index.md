@@ -1,5 +1,11 @@
 # 更新日志 / Release Notes
 
+## 0.9.15
+
+新增 Window Mover 插件：将鼠标放在应用窗口上，按 `Primary+S+D` 即可把窗口和鼠标一起移到下一块显示器，并保持窗口内的相对位置。单独按 `Primary+S` 仍只切换鼠标所在显示器；可使用 `move_window previous` 或 `move_window <显示器编号>` 自定义其他目标。
+
+Added the Window Mover plugin: point at an application window and press `Primary+S+D` to move both the window and pointer to the next display while preserving the pointer's relative position. `Primary+S` alone still switches the pointer display. Configure `move_window previous` or `move_window <display number>` for other destinations.
+
 ## 0.9.13
 
 重整内部配置、模式与运行时边界并优化大批量 UI Hint 标签生成，在保持原有匹配、遮挡和显示层切换语义的同时减少分配；Windows 正式签名版现在支持下载后验证同一发布者、自动替换和重启，启动失败会恢复旧版本。

@@ -210,10 +210,12 @@ n = "toggle"
 g = "grid"
 f = "recursive_grid"
 "primary+f" = "ui_hint"
-# Screen Selector plugin: `screen next`, `screen previous`, `screen 2`, or
-# `call screen` to show numbered displays. The manifest also supplies this
-# default when the chord is not claimed here.
+# Move the pointer to the next display, or keep Primary+S held and press D to
+# move the application window under the pointer there. The pointer follows the
+# window and keeps its position inside it. Use `move_window previous` or
+# `move_window 2` for custom bindings.
 "primary+s" = "screen next"
+"primary+s+d" = "move_window next"
 
 # Optional Vim-style arrow keys sent to the focused application. Bare hjkl
 # continue to move the pointer; the more specific Primary chords send arrows.

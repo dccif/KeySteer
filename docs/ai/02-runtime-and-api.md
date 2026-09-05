@@ -41,6 +41,14 @@ emergency stderr 使用不 panic 的 `Write` 路径，且不创建后台日志�
 
 ## API 边界
 
+跨屏窗口移动通过 `Command::MoveWindowToScreen(WindowScreenTarget)` 到
+`Backend::move_window_to_screen`。窗口命中与位置查询按动作执行时的物理鼠标完成，不使用
+前台应用代替鼠标下窗口。后端返回 `Option<Point>`：提交移动后返回对应的鼠标目标位置，
+Engine 复用 `WarpPointer` 同步物理鼠标、权威 cursor、拖动状态和覆盖层；无目标返回 `None`，
+移动请求失败不触发 warp。未实现此可选能力的 Backend 返回明确的不支持错误。
+组合键前缀在 `registry` 重编译时构建；`prefix_chords` 只持有尚未执行的动作及共享候选，
+不拥有系统资源、timer 或按键重放。它复用正常绑定执行路径并先完成原生 disposition 握手。
+
 `src/api/` 是唯一允许跨层传递的词汇：
 
 - 原生层向上只产生 `BackendEvent`。

@@ -16,6 +16,7 @@ mod input_router;
 mod input_state;
 mod overlay_coordinator;
 mod plan;
+mod prefix_chords;
 mod registry;
 mod scheduler;
 
@@ -1388,6 +1389,13 @@ impl Engine {
                 }
 
                 Command::Quit => self.should_quit = true,
+                Command::MoveWindowToScreen(target) => {
+                    if let Some(pointer) = backend.move_window_to_screen(target)? {
+                        // Reuse the normal warp path so the authoritative
+                        // cursor, overlay and drag state move together.
+                        self.execute_for(owner, [Command::warp_to(pointer)], backend)?;
+                    }
+                }
             }
         }
         Ok(())

@@ -117,6 +117,16 @@ pub trait Backend {
     fn pointer(&self) -> Result<Point, String>;
     fn focused_app(&self) -> Result<Option<FocusedApp>, String>;
 
+    /// Move the window under the pointer without changing focus. Return its
+    /// corresponding pointer position for the engine to warp and synchronize;
+    /// None means no window moved. Errors must not trigger a pointer warp.
+    fn move_window_to_screen(
+        &self,
+        _target: super::command::WindowScreenTarget,
+    ) -> Result<Option<Point>, String> {
+        Err("moving windows between displays is not supported by this backend".into())
+    }
+
     fn warp_pointer(&self, to: Point) -> Result<(), String>;
     /// Move from the engine's authoritative position by a relative delta.
     /// Supplying `from` lets native backends avoid querying the cursor again.
