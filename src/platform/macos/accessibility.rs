@@ -17,8 +17,10 @@ use crate::api::command::UiScanRequest;
 use crate::api::geometry::{Rect, UiTarget};
 
 use super::native::OwnedCf;
+use super::window_move::WriteError;
 
 const AX_OK: i32 = 0;
+const AX_CANNOT_COMPLETE: i32 = -25204;
 const AX_VALUE_CGPOINT: i32 = 1;
 const AX_VALUE_CGSIZE: i32 = 2;
 const SCAN_BUDGET: Duration = Duration::from_millis(500);
@@ -185,7 +187,7 @@ pub(super) struct MovableWindow {
 }
 
 impl MovableWindow {
-    fn set_attribute(&self, attribute: &CFString, value: CFTypeRef) -> Result<(), String> {
+    fn set_attribute(&self, attribute: &CFString, value: CFTypeRef) -> Result<(), WriteError> {
         // SAFETY: the window, attribute and caller-owned value are live for the
         // bounded call. All callers supply an AXValue or CFBoolean CF object.
         let error = unsafe {
@@ -197,8 +199,14 @@ impl MovableWindow {
         };
         if error == AX_OK {
             Ok(())
+        } else if error == AX_CANNOT_COMPLETE {
+            Err(WriteError::Unconfirmed(format!(
+                "cannot confirm window {attribute}: AXError {error}"
+            )))
         } else {
-            Err(format!("cannot set window {attribute}: AXError {error}"))
+            Err(WriteError::Rejected(format!(
+                "cannot set window {attribute}: AXError {error}"
+            )))
         }
     }
 }
@@ -213,7 +221,7 @@ impl super::window_move::WindowAccess for MovableWindow {
         })
     }
 
-    fn set_fullscreen(&self, enabled: bool) -> Result<(), String> {
+    fn set_fullscreen(&self, enabled: bool) -> Result<(), WriteError> {
         let value = if enabled {
             CFBoolean::true_value()
         } else {
@@ -222,7 +230,7 @@ impl super::window_move::WindowAccess for MovableWindow {
         self.set_attribute(&self.fullscreen, value.as_CFTypeRef())
     }
 
-    fn set_position(&self, point: crate::api::geometry::Point) -> Result<(), String> {
+    fn set_position(&self, point: crate::api::geometry::Point) -> Result<(), WriteError> {
         let point = CGPoint::new(point.x, point.y);
         // SAFETY: the type tag describes exactly the CGPoint at this pointer.
         // AXValueCreate copies its contents; OwnedCf owns the resulting +1 object.
@@ -232,7 +240,7 @@ impl super::window_move::WindowAccess for MovableWindow {
                 (&point as *const CGPoint).cast(),
             ))
         }
-        .ok_or_else(|| "cannot create AX window position".to_string())?;
+        .ok_or_else(|| WriteError::Rejected("cannot create AX window position".to_string()))?;
         self.set_attribute(&self.attributes.position, value.as_ptr())
     }
 }

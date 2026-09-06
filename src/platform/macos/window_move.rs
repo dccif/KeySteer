@@ -18,8 +18,33 @@ pub(super) struct Snapshot {
 
 pub(super) trait WindowAccess {
     fn snapshot(&self) -> Result<Snapshot, String>;
-    fn set_position(&self, point: Point) -> Result<(), String>;
-    fn set_fullscreen(&self, enabled: bool) -> Result<(), String>;
+    fn set_position(&self, point: Point) -> Result<(), WriteError>;
+    fn set_fullscreen(&self, enabled: bool) -> Result<(), WriteError>;
+}
+
+#[derive(Debug)]
+pub(super) enum WriteError {
+    /// Messaging failed; the application may already have applied the write.
+    Unconfirmed(String),
+    Rejected(String),
+}
+
+impl WriteError {
+    pub(super) fn message(self) -> String {
+        match self {
+            Self::Unconfirmed(message) | Self::Rejected(message) => message,
+        }
+    }
+}
+
+/// A missing acknowledgement must not cause a replay or a compensating write
+/// while the application is still transitioning. Observe the requested state.
+fn submitted(result: Result<(), WriteError>) -> Result<Option<String>, String> {
+    match result {
+        Ok(()) => Ok(None),
+        Err(WriteError::Unconfirmed(message)) => Ok(Some(message)),
+        Err(WriteError::Rejected(message)) => Err(message),
+    }
 }
 
 #[derive(Debug)]
@@ -59,7 +84,9 @@ impl<W: WindowAccess> WindowMove<W> {
         };
         if snapshot.fullscreen != Some(true) {
             let mapped = map_between_screens(snapshot.bounds, &screens[source], &screens[target]);
-            window.set_position(Point::new(mapped.x, mapped.y))?;
+            window
+                .set_position(Point::new(mapped.x, mapped.y))
+                .map_err(WriteError::message)?;
             return Ok((
                 None,
                 Some(following_pointer(
@@ -70,11 +97,7 @@ impl<W: WindowAccess> WindowMove<W> {
                 )),
             ));
         }
-        if let Err(error) = window.set_fullscreen(false) {
-            // AX can report a timeout after accepting a write. Restore best effort.
-            let recovery = window.set_fullscreen(true).err();
-            return Err(with_recovery(error, recovery));
-        }
+        let last_error = submitted(window.set_fullscreen(false))?;
         Ok((
             Some(Self {
                 window,
@@ -87,14 +110,16 @@ impl<W: WindowAccess> WindowMove<W> {
                 next_poll: now + POLL_INTERVAL,
                 deadline: now + STAGE_TIMEOUT,
                 previous: None,
-                last_error: None,
+                last_error,
             }),
             None,
         ))
     }
 
     pub(super) fn cancel(&self) -> Result<(), String> {
-        self.window.set_fullscreen(true)
+        self.window
+            .set_fullscreen(true)
+            .map_err(WriteError::message)
     }
 
     fn advance(&mut self, stage: Stage, now: Instant) {
@@ -153,14 +178,17 @@ impl<W: WindowAccess> WindowMove<W> {
                     &screens[self.source],
                     &screens[self.target],
                 );
-                self.window
-                    .set_position(Point::new(mapped.x, mapped.y))
-                    .map(|()| self.advance(Stage::Moving, now))
+                submitted(self.window.set_position(Point::new(mapped.x, mapped.y))).map(|error| {
+                    self.advance(Stage::Moving, now);
+                    self.last_error = error;
+                })
             }
-            Stage::Moving if snapshot.fullscreen == Some(false) && on_target => self
-                .window
-                .set_fullscreen(true)
-                .map(|()| self.advance(Stage::Entering, now)),
+            Stage::Moving if snapshot.fullscreen == Some(false) && on_target => {
+                submitted(self.window.set_fullscreen(true)).map(|error| {
+                    self.advance(Stage::Entering, now);
+                    self.last_error = error;
+                })
+            }
             Stage::Entering
                 if snapshot.fullscreen == Some(true)
                     && on_target
@@ -217,6 +245,8 @@ mod tests {
         snapshot: Option<Snapshot>,
         writes: Vec<String>,
         fail_position: bool,
+        unconfirmed_writes: bool,
+        reject_fullscreen: bool,
     }
     #[derive(Clone)]
     struct Window(Rc<RefCell<State>>);
@@ -227,21 +257,31 @@ mod tests {
                 .snapshot
                 .ok_or("window temporarily unavailable".into())
         }
-        fn set_position(&self, point: Point) -> Result<(), String> {
+        fn set_position(&self, point: Point) -> Result<(), WriteError> {
             let mut state = self.0.borrow_mut();
             state.writes.push(format!("move {},{}", point.x, point.y));
             if state.fail_position {
-                Err("move rejected".into())
+                Err(WriteError::Rejected("move rejected".into()))
+            } else if state.unconfirmed_writes {
+                Err(WriteError::Unconfirmed("AXPosition: AXError -25204".into()))
             } else {
                 Ok(())
             }
         }
-        fn set_fullscreen(&self, enabled: bool) -> Result<(), String> {
+        fn set_fullscreen(&self, enabled: bool) -> Result<(), WriteError> {
             self.0
                 .borrow_mut()
                 .writes
                 .push(format!("fullscreen {enabled}"));
-            Ok(())
+            if self.0.borrow().reject_fullscreen {
+                Err(WriteError::Rejected("fullscreen unsupported".into()))
+            } else if self.0.borrow().unconfirmed_writes {
+                Err(WriteError::Unconfirmed(
+                    "AXFullScreen: AXError -25204".into(),
+                ))
+            } else {
+                Ok(())
+            }
         }
     }
     fn screens() -> Vec<Screen> {
@@ -298,9 +338,19 @@ mod tests {
 
     #[test]
     fn fullscreen_move_waits_for_restored_frame_and_warps_only_after_target_fullscreen() {
+        complete_fullscreen_move(false);
+    }
+
+    #[test]
+    fn all_writes_can_time_out_after_application_without_aborting_or_replaying() {
+        complete_fullscreen_move(true);
+    }
+
+    fn complete_fullscreen_move(unconfirmed_writes: bool) {
         let screens = screens();
         let now = Instant::now();
         let window = window(screens[0].bounds, true);
+        window.0.borrow_mut().unconfirmed_writes = unconfirmed_writes;
         let mut movement = start(&window, &screens, now);
         assert_eq!(window.0.borrow().writes, ["fullscreen false"]);
         // While the full-screen animation runs, do not submit a position.
@@ -358,6 +408,47 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(pointer, Point::new(-1125.0, 500.0));
+        assert_eq!(
+            window.0.borrow().writes,
+            ["fullscreen false", "move -1275,150", "fullscreen true"]
+        );
+    }
+
+    #[test]
+    fn unconfirmed_exit_that_never_happens_expires_without_moving_or_replaying() {
+        let screens = screens();
+        let now = Instant::now();
+        let window = window(screens[0].bounds, true);
+        window.0.borrow_mut().unconfirmed_writes = true;
+        let mut movement = start(&window, &screens, now);
+        assert!(movement.poll(&screens, now + POLL_INTERVAL).is_none());
+        assert!(movement.poll(&screens, now + POLL_INTERVAL * 2).is_none());
+        assert_eq!(window.0.borrow().writes, ["fullscreen false"]);
+        let error = movement
+            .poll(&screens, now + STAGE_TIMEOUT)
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("Exiting") && error.contains("-25204"));
+        assert_eq!(
+            window.0.borrow().writes,
+            ["fullscreen false", "fullscreen true"]
+        );
+    }
+
+    #[test]
+    fn unsupported_fullscreen_is_rejected_without_starting_or_restoring() {
+        let screens = screens();
+        let window = window(screens[0].bounds, true);
+        window.0.borrow_mut().reject_fullscreen = true;
+        let result = WindowMove::start(
+            window.clone(),
+            Point::default(),
+            &screens,
+            WindowScreenTarget::Next,
+            Instant::now(),
+        );
+        assert!(matches!(result, Err(error) if error.contains("unsupported")));
+        assert_eq!(window.0.borrow().writes, ["fullscreen false"]);
     }
 
     #[test]

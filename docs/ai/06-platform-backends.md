@@ -34,6 +34,9 @@ macOS `accessibility::window_under_pointer` 通过 AX 命中鼠标下元素及 `
 稳定后推进，不 sleep 等动画，不发送模拟快捷键，也不创建后台 AX 线程。确认目标屏幕全屏后
 通过 `WindowMoveCompleted` 让 Engine 同步鼠标。每阶段 5 秒截止；显示器变化、失败或 shutdown
 尝试恢复全屏，记录恢复失败并释放引用，不保证系统接受恢复。进行中重复请求不重复启动。
+全屏过渡中的 AX 写入返回 `kAXErrorCannotComplete (-25204)` 时，只表示回执未确认，应用可能
+已经执行：保留事务进入对应观察阶段，不立即回滚，也不重复发送退出、位移或恢复请求。以窗口
+实际状态确认后继续；超过阶段截止才报告失败并尝试恢复。其他明确拒绝仍按失败处理。
 
 坐标契约参考 [Microsoft WINDOWPLACEMENT](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-windowplacement)
 和 [Apple AX hit testing](https://developer.apple.com/documentation/applicationservices/1462077-axuielementcopyelementatposition)。
