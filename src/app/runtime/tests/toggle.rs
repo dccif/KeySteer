@@ -526,6 +526,46 @@ fn parameterless_toggle_consumes_a_bound_partner_without_running_its_action() {
 }
 
 #[test]
+fn parameterless_toggle_treats_speed_keys_as_physical_partners_in_both_orders() {
+    for order in [["n", "left_shift"], ["left_shift", "n"]] {
+        let mut config = Config::default();
+        config.normal.bindings.clear();
+        config
+            .normal
+            .bindings
+            .insert("n".into(), Binding::Toggle(Vec::new()));
+        config.normal.bindings.insert(
+            "left_shift".into(),
+            Binding::SpeedToggle(crate::api::Speed::Slow),
+        );
+
+        let mut engine = Engine::new(config.clone(), Appearance::Dark);
+        for mode in crate::app::mode_catalog::built_in(&config) {
+            engine.register(mode);
+        }
+        engine.registry.active = ModeId::normal();
+        let (mut backend, _log) = FakeBackend::new(Vec::new());
+
+        for key in order {
+            engine.handle_backend_event(key_down(key), &mut backend).unwrap();
+        }
+        for key in order.iter().rev() {
+            engine.handle_backend_event(key_up(key), &mut backend).unwrap();
+        }
+
+        assert!(engine
+            .input
+            .latched
+            .contains(&InputTarget::Key(Key::new("left_shift").unwrap())), "order={order:?}");
+        assert_eq!(
+            engine.overlay.speed_toggle,
+            (order[0] == "left_shift").then_some(crate::api::Speed::Slow),
+            "toggle capture must not execute the speed binding: order={order:?}"
+        );
+    }
+}
+
+#[test]
 fn configurable_parameterless_toggle_self_latches_only_after_the_threshold() {
     for activation in ["t", "f8", "caps_lock"] {
         let mut engine = engine_with_normal_binding(activation, "toggle");

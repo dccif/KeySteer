@@ -31,6 +31,9 @@ settings；不能注入输入、创建窗口或直接扫描 UI。
   KeySteer 自身绑定消费。这样外部 `Alt+H` 不会命中裸 `h`，但 `left_shift=slow` 后的
   `Shift+H` 仍成立。
 - 持有方向、滚动和速度手势状态。
+- `precision`/`slow`/`fast` 是按住型速度手势；对应的 `*_toggle` 绑定在 Normal 内锁存速度，
+  并通过 Engine-owned indicator 第二行反馈当前锁存值。
+- 参数化 `toggle` 捕获速度键时只锁存其物理键目标，不重新执行速度动作，避免速度状态影响 toggle。
 - 连续移动优先由原生 frame clock 驱动；第一下有 `tap_distance`，避免极短按键无移动。
 - 使用真实 elapsed time、可配置的 smootherstep/线性加速度和 sub-pixel remainder；曲线按
   解析积分计算，对角线归一化。

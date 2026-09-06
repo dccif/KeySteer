@@ -7,8 +7,11 @@ struct HeldTargetsText {
     character_count: usize,
 }
 
-fn held_targets_text(targets: &LatchedTargets) -> Option<HeldTargetsText> {
-    if targets.is_empty() {
+fn held_targets_text(
+    targets: &LatchedTargets,
+    speed: Option<crate::api::binding::Speed>,
+) -> Option<HeldTargetsText> {
+    if targets.is_empty() && speed.is_none() {
         return None;
     }
 
@@ -27,12 +30,25 @@ fn held_targets_text(targets: &LatchedTargets) -> Option<HeldTargetsText> {
             },
         );
     let target_count = targets.iter().len();
+    let speed_name = speed.map(|speed| match speed {
+        crate::api::binding::Speed::Precision => "PRECISION",
+        crate::api::binding::Speed::Slow => "SLOW",
+        crate::api::binding::Speed::Fast => "FAST",
+    });
+    let speed_characters = speed_name.map_or(0, |name| name.chars().count());
+    let speed_separator = usize::from(speed_name.is_some() && target_count > 0);
     let mut text = String::with_capacity(
-        PREFIX.len() + names_len + SEPARATOR.len() * target_count.saturating_sub(1),
+        PREFIX.len()
+            + names_len
+            + speed_name.map_or(0, str::len)
+            + SEPARATOR.len() * (target_count + speed_separator).saturating_sub(1),
     );
     text.push_str(PREFIX);
+    if let Some(speed_name) = speed_name {
+        text.push_str(speed_name);
+    }
     for (index, target) in targets.iter().enumerate() {
-        if index != 0 {
+        if index != 0 || speed.is_some() {
             text.push_str(SEPARATOR);
         }
         for character in target.canonical_str().chars() {
@@ -47,7 +63,8 @@ fn held_targets_text(targets: &LatchedTargets) -> Option<HeldTargetsText> {
         value: text,
         character_count: PREFIX.chars().count()
             + names_characters
-            + SEPARATOR.chars().count() * target_count.saturating_sub(1),
+            + speed_characters
+            + SEPARATOR.chars().count() * (target_count + speed_separator).saturating_sub(1),
     })
 }
 
@@ -109,6 +126,7 @@ pub(super) struct OverlayCoordinator {
     pub(super) position_fast_path_disabled: bool,
     pub(super) command_batch_depth: usize,
     pub(super) pending: Option<PendingOverlay>,
+    pub(super) speed_toggle: Option<crate::api::binding::Speed>,
 }
 
 impl OverlayCoordinator {
@@ -121,6 +139,7 @@ impl OverlayCoordinator {
         self.position_fast_path_disabled = false;
         self.command_batch_depth = 0;
         self.pending = None;
+        self.speed_toggle = None;
     }
 }
 impl Engine {
@@ -434,7 +453,7 @@ impl Engine {
             self.palette.readable_on(background),
             self.palette.accent,
         );
-        let held_text = held_targets_text(&self.input.latched);
+        let held_text = held_targets_text(&self.input.latched, self.overlay.speed_toggle);
         let text_width = |character_count: usize| {
             (character_count as f64 * style.font_size * 0.75 + style.padding_x * 2.0)
                 .max(style.font_size * 2.0)
@@ -480,7 +499,7 @@ mod tests {
         targets.insert(InputTarget::Mouse(Button::Right));
         targets.insert(InputTarget::Mouse(Button::Left));
 
-        let held = held_targets_text(&targets).expect("held targets");
+        let held = held_targets_text(&targets, None).expect("held targets");
         assert_eq!(
             held.value,
             "● LEFT SHIFT · MOUSE LEFT · MOUSE RIGHT · MOUSE MIDDLE"
@@ -493,8 +512,17 @@ mod tests {
         let mut targets = LatchedTargets::default();
         targets.insert(InputTarget::Key(Key::new("é").unwrap()));
 
-        let held = held_targets_text(&targets).expect("held target");
+        let held = held_targets_text(&targets, None).expect("held target");
         assert_eq!(held.value, "● é");
         assert_eq!(held.character_count, 3);
+    }
+
+    #[test]
+    fn speed_toggle_uses_the_same_second_indicator_line() {
+        let targets = LatchedTargets::default();
+        let held = held_targets_text(&targets, Some(crate::api::binding::Speed::Fast))
+            .expect("speed indicator");
+        assert_eq!(held.value, "● FAST");
+        assert_eq!(held.character_count, 6);
     }
 }

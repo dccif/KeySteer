@@ -1265,6 +1265,11 @@ impl Engine {
                     }
                 }
 
+                Command::SetSpeedToggle { speed, active } => {
+                    self.overlay.speed_toggle = active.then_some(speed);
+                    self.refresh_overlay(backend)?;
+                }
+
                 Command::ShowOverlay(scene) => self.show_overlay(scene, backend)?,
                 Command::HideOverlay => self.hide_overlay(backend)?,
 
@@ -1559,6 +1564,7 @@ impl Engine {
             Binding::Move(_)
                 | Binding::Scroll(..)
                 | Binding::Speed(_)
+                | Binding::SpeedToggle(_)
                 | Binding::ToggleCursorFollowSelection
                 | Binding::RescanUi
         ) {
@@ -1802,6 +1808,7 @@ impl Engine {
             Binding::Move(_)
             | Binding::Scroll(..)
             | Binding::Speed(_)
+            | Binding::SpeedToggle(_)
             | Binding::ToggleCursorFollowSelection
             | Binding::RescanUi => {
                 Err("stateful binding reached the stateless runtime dispatch boundary".into())

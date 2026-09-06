@@ -1,5 +1,9 @@
 # Release notes
 
+## 0.9.17
+
+Added tap-to-toggle speed actions: `precision_toggle`, `slow_toggle`, and `fast_toggle` latch a speed on the first press and clear it on the next press. The active speed appears below the mode indicator. Parameterless `toggle` is decoupled from speed state, so both `n+Shift` and `Shift+n` preserve the existing combination-key behavior without re-running or clearing the speed action.
+
 ## 0.9.16
 
 Improved Window Mover: maximized windows now move directly to another display while staying maximized, without a restore/maximize flicker.

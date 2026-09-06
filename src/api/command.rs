@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::binding::{ActionSequence, Binding};
+use super::binding::{ActionSequence, Binding, Speed};
 use super::geometry::{Point, Rect, Screen, UiTarget};
 use super::input::{Key, KeyState, ModeId};
 use super::overlay::{Color, OverlayScene};
@@ -86,6 +86,12 @@ pub enum Command {
     /// Start or stop display-synchronised frame events for continuous motion.
     /// This is driven by the native display link, not a periodic timer.
     SetFrameClock(bool),
+
+    /// Update the engine-owned speed toggle indicator.
+    SetSpeedToggle {
+        speed: Speed,
+        active: bool,
+    },
 
     /// Present a frame. Replaces whatever was on screen.
     ShowOverlay(Arc<OverlayScene>),

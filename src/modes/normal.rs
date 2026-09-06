@@ -285,6 +285,8 @@ pub struct NormalMode {
     scrolling: SmallKeyMap<(Direction, ScrollAmount)>,
     /// Speed modifiers currently held.
     speeds: SmallKeyMap<Speed>,
+    /// The optional speed modifier selected by a point-and-toggle binding.
+    toggled_speed: Option<Speed>,
 
     /// Derived held-input state. It changes only on physical key edges, so
     /// display frames need neither scan the small maps nor resolve precedence.
@@ -308,6 +310,7 @@ impl NormalMode {
             moving: SmallKeyMap::default(),
             scrolling: SmallKeyMap::default(),
             speeds: SmallKeyMap::default(),
+            toggled_speed: None,
             directions: DirectionMask::default(),
             speed_multiplier: 1.0,
             motion: Motion::default(),
@@ -328,6 +331,12 @@ impl NormalMode {
             self.profile.fast_multiplier
         } else if self.speeds.values().any(|s| *s == Speed::Slow) {
             self.profile.slow_multiplier
+        } else if let Some(speed) = self.toggled_speed {
+            match speed {
+                Speed::Precision => self.profile.precision_multiplier,
+                Speed::Slow => self.profile.slow_multiplier,
+                Speed::Fast => self.profile.fast_multiplier,
+            }
         } else {
             1.0
         };
@@ -404,6 +413,17 @@ impl NormalMode {
                 self.refresh_multiplier();
             }
 
+            Binding::SpeedToggle(speed) => {
+                if pressed {
+                    self.toggled_speed = (self.toggled_speed != Some(*speed)).then_some(*speed);
+                    self.refresh_multiplier();
+                    out.push(Command::SetSpeedToggle {
+                        speed: *speed,
+                        active: self.toggled_speed == Some(*speed),
+                    });
+                }
+            }
+
             // The engine handles every other verb before it reaches a mode.
             _ => {}
         }
@@ -424,6 +444,7 @@ impl NormalMode {
         self.moving.clear();
         self.scrolling.clear();
         self.speeds.clear();
+        self.toggled_speed = None;
         self.directions = DirectionMask::default();
         self.speed_multiplier = 1.0;
         self.motion.reset();
@@ -477,11 +498,21 @@ impl Mode for NormalMode {
             ModeEvent::Activated { .. } => {
                 self.release_all();
                 // Draw an empty scene so the engine can attach the indicator.
-                Command::show_overlay(crate::api::overlay::OverlayScene::new()).into()
+                CommandBatch::Two(
+                    Command::SetSpeedToggle {
+                        speed: Speed::Fast,
+                        active: false,
+                    },
+                    Command::show_overlay(crate::api::overlay::OverlayScene::new()),
+                )
             }
             ModeEvent::Deactivated => {
                 self.release_all();
-                CommandBatch::new()
+                Command::SetSpeedToggle {
+                    speed: Speed::Fast,
+                    active: false,
+                }
+                .into()
             }
             ModeEvent::Binding {
                 binding,
@@ -935,6 +966,31 @@ mod tests {
             "slow ({slow}) should trail normal ({normal})"
         );
         assert!(fast > normal, "fast ({fast}) should lead normal ({normal})");
+    }
+
+    #[test]
+    fn speed_toggle_changes_speed_until_pressed_again() {
+        let env = Env::new();
+        let mut mode = crate::app::mode_catalog::normal(&env.config);
+        let fast = Binding::SpeedToggle(Speed::Fast);
+        let first = down(&mut mode, &env, fast.clone(), "v");
+        assert!(first.iter().any(|command| matches!(
+            command,
+            Command::SetSpeedToggle {
+                speed: Speed::Fast,
+                active: true
+            }
+        )));
+        assert_eq!(mode.toggled_speed, Some(Speed::Fast));
+        let second = down(&mut mode, &env, fast, "v");
+        assert!(second.iter().any(|command| matches!(
+            command,
+            Command::SetSpeedToggle {
+                speed: Speed::Fast,
+                active: false
+            }
+        )));
+        assert_eq!(mode.toggled_speed, None);
     }
 
     #[test]

@@ -50,6 +50,10 @@ passthrough_unbound_keys = true # 设为 false 可恢复键盘独占
 
 ## 移动速度
 
+默认的 `precision`、`slow` 和 `fast` 需要按住。若希望点按切换，可在
+`[normal.bindings]` 中使用 `precision_toggle`、`slow_toggle` 或 `fast_toggle`；
+再次按同一绑定关闭，当前锁存速度会显示在模式指示器下方。
+
 移动速度以像素/秒和加速度计算， 默认的平滑加速会在起步和接近最高速度时放缓速度变化
 
 将 `smooth_acceleration` 设为 `false` 可恢复线性加速。

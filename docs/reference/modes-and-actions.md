@@ -48,6 +48,7 @@ f = "recursive_grid"
 | `scroll_half_*` | 按 `scroll_step_half` 滚动。 |
 | `scroll_full_*` | 按 `scroll_step_full` 滚动。 |
 | `precision`、`slow`、`fast` | 按住时改变移动速度。 |
+| `precision_toggle`、`slow_toggle`、`fast_toggle` | 按一下锁存速度，再按同一键关闭；状态显示在模式指示器下方。 |
 | `follow` | 切换 Grid/Recursive Grid 的鼠标跟随。 |
 
 `wheel_*` 是 `scroll_*` 的兼容别名。速度动作通常和方向键一起使用：

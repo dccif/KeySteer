@@ -150,6 +150,8 @@ pub enum Binding {
     Wait { min_ms: u64, max_ms: u64 },
     /// Scale pointer speed while held.
     Speed(Speed),
+    /// Toggle a pointer speed modifier on each key press.
+    SpeedToggle(Speed),
     /// Toggle live cursor tracking while selecting a grid cell.
     ToggleCursorFollowSelection,
     /// Send a synthetic keystroke to the focused application.
@@ -375,6 +377,9 @@ impl Binding {
             "precision" => B::Speed(Speed::Precision),
             "slow" => B::Speed(Speed::Slow),
             "fast" => B::Speed(Speed::Fast),
+            "precision_toggle" | "toggle_precision" => B::SpeedToggle(Speed::Precision),
+            "slow_toggle" | "toggle_slow" => B::SpeedToggle(Speed::Slow),
+            "fast_toggle" | "toggle_fast" => B::SpeedToggle(Speed::Fast),
             "follow" => B::ToggleCursorFollowSelection,
             "finish" | "finish_mode" => B::FinishMode,
             "restart_mode" => B::RestartMode,
@@ -448,6 +453,9 @@ impl Binding {
             B::Speed(Speed::Precision) => "precision".into(),
             B::Speed(Speed::Slow) => "slow".into(),
             B::Speed(Speed::Fast) => "fast".into(),
+            B::SpeedToggle(Speed::Precision) => "precision_toggle".into(),
+            B::SpeedToggle(Speed::Slow) => "slow_toggle".into(),
+            B::SpeedToggle(Speed::Fast) => "fast_toggle".into(),
             B::ToggleCursorFollowSelection => "follow".into(),
             B::Send(chord) => format!("send {}", chord.canonical()),
             B::Exec { program, args } if args.is_empty() => format!("exec {program}"),
@@ -740,6 +748,15 @@ mod tests {
     }
 
     #[test]
+    fn speed_toggle_bindings_are_taps() {
+        assert_eq!(
+            Binding::parse("fast_toggle").unwrap(),
+            Binding::SpeedToggle(Speed::Fast)
+        );
+        assert!(!Binding::SpeedToggle(Speed::Fast).is_held());
+    }
+
+    #[test]
     fn every_binding_round_trips_through_its_canonical_form() {
         let all = [
             Binding::Mode(ModeId::normal()),
@@ -765,6 +782,7 @@ mod tests {
                 max_ms: 50,
             },
             Binding::Speed(Speed::Fast),
+            Binding::SpeedToggle(Speed::Fast),
             Binding::ToggleCursorFollowSelection,
             Binding::Send(KeyChord::parse("ctrl+alt+delete").unwrap()),
             Binding::Exec {

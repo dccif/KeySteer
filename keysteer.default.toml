@@ -192,6 +192,13 @@ j = "move_down"
 k = "move_up"
 l = "move_right"
 # Hold shift to slow the pointer; either v or b makes it fast.
+# For point-and-toggle speed modes, bind a key to `precision_toggle`,
+# `slow_toggle`, or `fast_toggle`; press once to enable and again to clear.
+# The active toggle is shown in the second line of the mode indicator.
+# Example point-and-toggle setup:
+# v = "fast_toggle"
+# left_shift = "slow_toggle"
+# caps_lock = "precision_toggle"
 caps_lock = "precision"
 left_shift = "slow"
 "v b" = "fast"

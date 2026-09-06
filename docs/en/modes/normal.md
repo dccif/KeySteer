@@ -46,6 +46,11 @@ passthrough_unbound_keys = true # Set false to restore keyboard exclusivity.
 
 ## Pointer speed
 
+The default `precision`, `slow`, and `fast` bindings are held modifiers. To use
+point-and-toggle behaviour, bind a key to `precision_toggle`, `slow_toggle`, or
+`fast_toggle`; press the same binding again to clear it. The active speed is
+shown below the mode indicator.
+
 Speed uses pixels per second and acceleration. Smooth acceleration softens changes both when beginning and approaching top speed. Set `smooth_acceleration` to `false` for linear acceleration.
 
 ```toml

@@ -109,7 +109,9 @@ pending；无效 Reload 保留最后有效计划及 pending。Down/Up 仍使用�
 
 TOML 右值可以是字符串，也可以是字符串数组；数组解析为有序 `Binding::Sequence`。
 canonical 输出必须能重新 parse。`press/release/toggle` 是合成输入状态管理；
-`precision/slow/fast` 才是移动速度修饰符。
+`precision/slow/fast` 是按住型移动速度修饰符；`precision_toggle`、`slow_toggle`、
+`fast_toggle` 是点按切换型修饰符，再次点按同一动作会关闭。锁存的速度显示在模式指示器的第二行，
+与 `press`/`toggle` 的按下提示共用同一位置。
 
 无参数 `toggle` 对所有键使用相同规则。伙伴键在激活键之前或之后按下都可立即被锁定；推断伙伴
 目标时使用 Normal 的最终语义表和 `physical pressed ∪ latched keyboard targets`，但不执行伙伴
@@ -121,6 +123,8 @@ canonical 输出必须能重新 parse。`press/release/toggle` 是合成输入�
 激活键已经按下时，后到伙伴的 Down/Up 必须在查找和执行伙伴自身 binding 之前被消费；更具体的
 完整 chord 仍优先于裸 `toggle`。运行时 Reload 只在新配置完成解析和验证后取消旧配置的 pending
 长按；无效配置必须保留现有输入状态。
+速度状态（`precision`/`slow`/`fast` 及其 `*_toggle` 变体）与参数化 `toggle` 解耦：
+速度键作为 toggle 伙伴时按普通物理键目标处理，但不会再次执行或改变速度状态。
 
 ## 继承和优先级
 

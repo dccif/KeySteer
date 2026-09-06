@@ -48,6 +48,7 @@ f = "recursive_grid"
 | `scroll_half_*` | Scroll by `scroll_step_half`. |
 | `scroll_full_*` | Scroll by `scroll_step_full`. |
 | `precision`, `slow`, `fast` | Change pointer speed while held. |
+| `precision_toggle`, `slow_toggle`, `fast_toggle` | Toggle a speed with a tap; tap the same binding again to clear it. The active speed appears below the mode indicator. |
 | `follow` | Toggle pointer following in Grid or Recursive Grid. |
 
 `wheel_*` remains a compatibility alias for `scroll_*`. Speed actions are usually paired with a movement key:

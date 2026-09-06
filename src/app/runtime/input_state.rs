@@ -1171,6 +1171,9 @@ impl Engine {
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
         let targets = self.normal_toggle_partner_targets(key);
+        if targets.is_empty() {
+            return Ok(());
+        }
         for used in self.input.active_default_toggles.values_mut() {
             *used = true;
         }

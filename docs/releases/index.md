@@ -1,5 +1,11 @@
 # 更新日志 / Release Notes
 
+## 0.9.17
+
+新增 `precision_toggle`、`slow_toggle` 和 `fast_toggle` 速度模式切换功能，按下即可进入速度模式，无需持续按住。
+
+Added `precision_toggle`, `slow_toggle`, and `fast_toggle` speed-mode toggles. Press once to enter a speed mode without holding the key down.
+
 ## 0.9.16
 
 改进 Window Mover：最大化窗口现在可直接移到另一块显示器。
