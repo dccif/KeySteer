@@ -1,5 +1,11 @@
 # 更新日志 / Release Notes
 
+## 0.9.16
+
+改进 Window Mover：最大化窗口现在可直接移到另一块显示器。
+
+Improved Window Mover: maximized windows now move directly to another display while staying maximized。
+
 ## 0.9.15
 
 新增 Window Mover 插件：将鼠标放在应用窗口上，按 `Primary+S+D` 即可把窗口和鼠标一起移到下一块显示器，并保持窗口内的相对位置。单独按 `Primary+S` 仍只切换鼠标所在显示器；可使用 `move_window previous` 或 `move_window <显示器编号>` 自定义其他目标。

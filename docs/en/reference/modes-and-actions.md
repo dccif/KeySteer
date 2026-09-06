@@ -148,7 +148,7 @@ It targets the application window under the physical pointer when invoked. The p
 Display numbers follow the `screen` plugin. One display or no movable window is a no-op.
 
 Equal display dimensions preserve the offset and window size, even with different taskbar layouts. Different dimensions map the fraction of available travel within work areas and keep the window accessible where possible.
-Windows maximized windows retain their state and receive a migrated restore position. macOS uses Accessibility for ordinary windows; leave native full screen first.
+Windows maximized windows move directly while retaining their state, without a restore/maximize cycle, and receive a migrated restore position. macOS uses Accessibility for ordinary windows; leave native full screen first.
 Applications can impose their own position or DPI size constraints. The default binding is `Primary+S+D → move_window next`; releasing `Primary+S` still only switches the pointer display. Both bindings are configurable in any binding table.
 
 ## Other actions

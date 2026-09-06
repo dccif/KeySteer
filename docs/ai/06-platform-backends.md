@@ -21,8 +21,10 @@
 
 Windows `window_mover.rs` 复用 UIA 的纯 HWND 命中/过滤，不提交扫描。桌面、任务栏、自身及
 透明覆盖层不作为目标，也不穿透系统桌面/任务栏移动背后的应用。普通窗口使用异步
-`SetWindowPos` 并保留焦点/Z-order；最大化窗口通过异步 `SetWindowPlacement` 同时移动还原
-位置、保留最大化状态，显式转换 workspace/screen 坐标。成功表示操作已提交，应用仍可能
+`SetWindowPos` 并保留焦点/Z-order；最大化窗口同样先通过 `SetWindowPos` 移动实际边框，
+按目标工作区和 DPI 保留不可见边框，再用异步 `SetWindowPlacement` 更新还原位置。
+整个过程保留最大化状态，不使用还原再最大化的中间状态；只更新还原位置不能保证可见窗口跨屏。
+还原位置显式转换 workspace/screen 坐标。成功表示操作已提交，应用仍可能
 限制大小、DPI 行为或拒绝移动；禁止同步等待外部 UI 线程。
 
 macOS `accessibility::move_window_to_screen` 通过 AX 命中鼠标下元素及 `AXWindow`，设置

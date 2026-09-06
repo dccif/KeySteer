@@ -1,5 +1,9 @@
 # Release notes
 
+## 0.9.16
+
+Improved Window Mover: maximized windows now move directly to another display while staying maximized, without a restore/maximize flicker.
+
 ## 0.9.15
 
 Added the Window Mover plugin: point at an application window and press `Primary+S+D` to move both the window and pointer to the next display while preserving the pointer's relative position. `Primary+S` alone still switches the pointer display. Configure `move_window previous` or `move_window <display number>` for other destinations.
