@@ -9,6 +9,11 @@ use crate::platform::common::window_placement::{
 
 pub(super) const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STAGE_TIMEOUT: Duration = Duration::from_secs(5);
+// AX can expose the final frame before the compositor finishes its fullscreen
+// transition. This conservative quiet period is a timing guard, not an OS
+// animation-completion notification. Keep polling rather than sleeping.
+const FULLSCREEN_SETTLE: Duration = Duration::from_millis(750);
+const POSITION_SETTLE: Duration = Duration::from_millis(150);
 
 #[derive(Clone, Copy, PartialEq)]
 pub(super) struct Snapshot {
@@ -47,6 +52,19 @@ fn submitted(result: Result<(), WriteError>) -> Result<Option<String>, String> {
     }
 }
 
+/// The same move operation serves ordinary windows and restored fullscreen
+/// windows. Only the caller decides whether to wait and restore fullscreen.
+fn move_window_frame(
+    window: &impl WindowAccess,
+    bounds: Rect,
+    source: &Screen,
+    target: &Screen,
+) -> Result<Rect, WriteError> {
+    let mapped = map_between_screens(bounds, source, target);
+    window.set_position(Point::new(mapped.x, mapped.y))?;
+    Ok(mapped)
+}
+
 #[derive(Debug)]
 enum Stage {
     Exiting,
@@ -64,7 +82,7 @@ pub(super) struct WindowMove<W> {
     stage: Stage,
     next_poll: Instant,
     deadline: Instant,
-    previous: Option<Snapshot>,
+    previous: Option<(Snapshot, Instant)>,
     last_error: Option<String>,
 }
 
@@ -83,10 +101,9 @@ impl<W: WindowAccess> WindowMove<W> {
             return Ok((None, None));
         };
         if snapshot.fullscreen != Some(true) {
-            let mapped = map_between_screens(snapshot.bounds, &screens[source], &screens[target]);
-            window
-                .set_position(Point::new(mapped.x, mapped.y))
-                .map_err(WriteError::message)?;
+            let mapped =
+                move_window_frame(&window, snapshot.bounds, &screens[source], &screens[target])
+                    .map_err(WriteError::message)?;
             return Ok((
                 None,
                 Some(following_pointer(
@@ -129,8 +146,8 @@ impl<W: WindowAccess> WindowMove<W> {
         self.last_error = None;
     }
 
-    /// Caller removes the transaction after any Some result. A pair of stable
-    /// observations avoids acting on AX flags that change before window bounds.
+    /// Caller removes the transaction after any Some result. Require sustained
+    /// stability: two identical AX frames can still be inside a system animation.
     pub(super) fn poll(
         &mut self,
         screens: &[Screen],
@@ -164,21 +181,31 @@ impl<W: WindowAccess> WindowMove<W> {
                 return None;
             }
         };
-        let stable = self.previous == Some(snapshot);
-        self.previous = Some(snapshot);
-        if !stable {
+        let stable_since = match self.previous {
+            Some((previous, since)) if previous == snapshot => since,
+            _ => {
+                self.previous = Some((snapshot, now));
+                return None;
+            }
+        };
+        let settle = match self.stage {
+            Stage::Exiting | Stage::Entering => FULLSCREEN_SETTLE,
+            Stage::Moving => POSITION_SETTLE,
+        };
+        if now.saturating_duration_since(stable_since) < settle {
             return None;
         }
         let on_target = self.on_target(snapshot.bounds);
         let result = match self.stage {
             Stage::Exiting if snapshot.fullscreen == Some(false) => {
                 // Use the restored frame, not the old fullscreen frame.
-                let mapped = map_between_screens(
+                let result = move_window_frame(
+                    &self.window,
                     snapshot.bounds,
                     &screens[self.source],
                     &screens[self.target],
                 );
-                submitted(self.window.set_position(Point::new(mapped.x, mapped.y))).map(|error| {
+                submitted(result.map(|_| ())).map(|error| {
                     self.advance(Stage::Moving, now);
                     self.last_error = error;
                 })
@@ -333,7 +360,7 @@ mod tests {
             fullscreen: Some(fullscreen),
         });
         assert!(movement.poll(screens, now).is_none());
-        movement.poll(screens, now + POLL_INTERVAL)
+        movement.poll(screens, now + FULLSCREEN_SETTLE)
     }
 
     #[test]
@@ -364,7 +391,7 @@ mod tests {
                 &screens,
                 restored,
                 false,
-                now + POLL_INTERVAL * 3
+                now + Duration::from_secs(1)
             )
             .is_none()
         );
@@ -380,7 +407,7 @@ mod tests {
                 &screens,
                 moved,
                 false,
-                now + POLL_INTERVAL * 5
+                now + Duration::from_secs(2)
             )
             .is_none()
         );
@@ -393,7 +420,7 @@ mod tests {
                 &screens,
                 moved,
                 true,
-                now + POLL_INTERVAL * 7
+                now + Duration::from_secs(3)
             )
             .is_none()
         );
@@ -403,7 +430,7 @@ mod tests {
             &screens,
             screens[1].bounds,
             true,
-            now + POLL_INTERVAL * 9,
+            now + Duration::from_secs(4),
         )
         .unwrap()
         .unwrap();
@@ -466,6 +493,81 @@ mod tests {
             window.0.borrow().writes,
             ["fullscreen false", "fullscreen true"]
         );
+    }
+
+    #[test]
+    fn early_restored_frame_does_not_move_and_later_changes_restart_quiet_period() {
+        let screens = screens();
+        let now = Instant::now();
+        let window = window(screens[0].bounds, true);
+        let mut movement = start(&window, &screens, now);
+        let restored = Rect::new(100.0, 100.0, 600.0, 400.0);
+        window.0.borrow_mut().snapshot = Some(Snapshot {
+            bounds: restored,
+            fullscreen: Some(false),
+        });
+        for ms in [50, 100, 200, 400] {
+            assert!(
+                movement
+                    .poll(&screens, now + Duration::from_millis(ms))
+                    .is_none()
+            );
+            assert_eq!(window.0.borrow().writes, ["fullscreen false"]);
+        }
+        // A late geometry change must restart the entire quiet period.
+        window.0.borrow_mut().snapshot.as_mut().unwrap().bounds.x = 120.0;
+        for ms in [450, 800, 1150] {
+            assert!(
+                movement
+                    .poll(&screens, now + Duration::from_millis(ms))
+                    .is_none()
+            );
+            assert_eq!(window.0.borrow().writes, ["fullscreen false"]);
+        }
+        assert!(
+            movement
+                .poll(&screens, now + Duration::from_millis(1200))
+                .is_none()
+        );
+        assert_eq!(
+            window.0.borrow().writes,
+            ["fullscreen false", "move -1230,150"]
+        );
+    }
+
+    #[test]
+    fn transient_read_failure_restarts_fullscreen_quiet_period() {
+        let screens = screens();
+        let now = Instant::now();
+        let window = window(screens[0].bounds, true);
+        let mut movement = start(&window, &screens, now);
+        let restored = Snapshot {
+            bounds: Rect::new(100.0, 100.0, 600.0, 400.0),
+            fullscreen: Some(false),
+        };
+        window.0.borrow_mut().snapshot = Some(restored);
+        assert!(movement.poll(&screens, now + POLL_INTERVAL).is_none());
+        window.0.borrow_mut().snapshot = None;
+        assert!(
+            movement
+                .poll(&screens, now + Duration::from_millis(500))
+                .is_none()
+        );
+        window.0.borrow_mut().snapshot = Some(restored);
+        for ms in [550, 800, 1250] {
+            assert!(
+                movement
+                    .poll(&screens, now + Duration::from_millis(ms))
+                    .is_none()
+            );
+            assert_eq!(window.0.borrow().writes, ["fullscreen false"]);
+        }
+        assert!(
+            movement
+                .poll(&screens, now + Duration::from_millis(1300))
+                .is_none()
+        );
+        assert_eq!(window.0.borrow().writes.len(), 2);
     }
 
     #[test]

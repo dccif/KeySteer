@@ -30,8 +30,11 @@ Windows `window_mover.rs` 复用 UIA 的纯 HWND 命中/过滤，不提交扫描
 macOS `accessibility::window_under_pointer` 通过 AX 命中鼠标下元素及 `AXWindow`，普通窗口直接设置
 `AXPosition`。CF 引用由 `OwnedCf` 释放，系统与保留窗口均使用有限 messaging timeout。
 `window_move.rs` 保留同一个 AX 窗口，在后端 poll 中自动退出原生全屏、按还原后的窗口尺寸跨屏、
-恢复全屏；使用系统过渡动画，系统可能随全屏切换焦点。每 50ms 至多推进一次，两次状态与位置
-稳定后推进，不 sleep 等动画，不发送模拟快捷键，也不创建后台 AX 线程。确认目标屏幕全屏后
+恢复全屏。实际位置映射与 AXPosition 写入复用普通窗口的 `move_window_frame`；全屏流程仅包裹前后的状态切换及观察。
+使用系统过渡动画，系统可能随全屏切换焦点。每 50ms 至多推进一次，全屏退出/进入要求
+AX 状态与位置持续稳定 750ms，普通位移阶段要求 150ms；变化或读取失败重置稳定计时。
+这是防止过早跨屏的保守时序保护，并非系统动画完成通知，异常缓慢的动画仍需实机验证。
+不 sleep 等动画，不发送模拟快捷键，也不创建后台 AX 线程。确认目标屏幕全屏后
 通过 `WindowMoveCompleted` 让 Engine 同步鼠标。每阶段 5 秒截止；显示器变化、失败或 shutdown
 尝试恢复全屏，记录恢复失败并释放引用，不保证系统接受恢复。进行中重复请求不重复启动。
 全屏过渡中的 AX 写入返回 `kAXErrorCannotComplete (-25204)` 时，只表示回执未确认，应用可能
