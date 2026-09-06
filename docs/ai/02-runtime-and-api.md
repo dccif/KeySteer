@@ -46,6 +46,9 @@ emergency stderr 使用不 panic 的 `Write` 路径，且不创建后台日志�
 前台应用代替鼠标下窗口。后端返回 `Option<Point>`：提交移动后返回对应的鼠标目标位置，
 Engine 复用 `WarpPointer` 同步物理鼠标、权威 cursor、拖动状态和覆盖层；无目标返回 `None`，
 移动请求失败不触发 warp。未实现此可选能力的 Backend 返回明确的不支持错误。
+macOS 原生全屏移动启动后也返回 `None`；后端保留窗口，按 poll 推进退出全屏、跨屏、恢复全屏，
+最终发送 `BackendEvent::WindowMoveCompleted(Result<Point, String>)`。Engine 只在成功时复用
+`WarpPointer`，失败只记录错误；后台窗口移动错误不作为输入注入失败清空键盘状态。
 组合键前缀在 `registry` 重编译时构建；`prefix_chords` 只持有尚未执行的动作及共享候选，
 不拥有系统资源、timer 或按键重放。它复用正常绑定执行路径并先完成原生 disposition 握手。
 

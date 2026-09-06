@@ -120,14 +120,9 @@ unsafe extern "C" {
 }
 
 /// Resolve the window from the physical pointer, never the focused window.
-pub(super) fn move_window_to_screen(
+pub(super) fn window_under_pointer(
     cursor: crate::api::geometry::Point,
-    screens: &[crate::api::geometry::Screen],
-    target: crate::api::command::WindowScreenTarget,
-) -> Result<Option<crate::api::geometry::Point>, String> {
-    use crate::platform::common::window_placement::{
-        destination, following_pointer, map_between_screens,
-    };
+) -> Result<Option<MovableWindow>, String> {
     // SAFETY: AX Create returns a +1 object, transferred once to OwnedCf.
     let system = unsafe { OwnedCf::from_create_rule(AXUIElementCreateSystemWide()) }
         .ok_or_else(|| "cannot create AX system element".to_string())?;
@@ -169,43 +164,77 @@ pub(super) fn move_window_to_screen(
     if !is_ax_element(window.as_ptr()) {
         return Ok(None);
     }
-    if copy_bool_attribute(window.as_ptr(), &CFString::new("AXFullScreen")) == Some(true) {
-        return Err("leave native macOS full screen before moving the window".into());
-    }
-    let attributes = AxAttributes::new();
-    let bounds = element_rect(window.as_ptr(), &attributes)
-        .ok_or_else(|| "cannot read the window's AX position and size".to_string())?;
-    let Some((source, target)) = destination(screens, bounds, target) else {
-        return Ok(None);
-    };
-    let mapped = map_between_screens(bounds, &screens[source], &screens[target]);
-    let point = CGPoint::new(mapped.x, mapped.y);
-    // SAFETY: the type tag describes exactly the CGPoint at this pointer.
-    // AXValueCreate copies its contents; OwnedCf owns the resulting +1 object.
-    let value = unsafe {
-        OwnedCf::from_create_rule(AXValueCreate(
-            AX_VALUE_CGPOINT,
-            (&point as *const CGPoint).cast(),
-        ))
-    }
-    .ok_or_else(|| "cannot create AX window position".to_string())?;
-    // SAFETY: window, attribute and value stay alive through the bounded AX call.
-    let error = unsafe {
-        AXUIElementSetAttributeValue(
-            window.as_ptr(),
-            attributes.position.as_concrete_TypeRef(),
-            value.as_ptr(),
-        )
-    };
+    // SAFETY: the retained AX window is live; every later message is bounded.
+    let error = unsafe { AXUIElementSetMessagingTimeout(window.as_ptr(), NODE_TIMEOUT_SECONDS) };
     if error != AX_OK {
-        return Err(format!("cannot move window: AXError {error}"));
+        return Err(format!(
+            "cannot set window messaging timeout: AXError {error}"
+        ));
     }
-    Ok(Some(following_pointer(
-        cursor,
-        bounds,
-        mapped,
-        screens[target].bounds,
-    )))
+    Ok(Some(MovableWindow {
+        window,
+        attributes: AxAttributes::new(),
+        fullscreen: CFString::new("AXFullScreen"),
+    }))
+}
+
+pub(super) struct MovableWindow {
+    window: OwnedCf,
+    attributes: AxAttributes,
+    fullscreen: CFString,
+}
+
+impl MovableWindow {
+    fn set_attribute(&self, attribute: &CFString, value: CFTypeRef) -> Result<(), String> {
+        // SAFETY: the window, attribute and caller-owned value are live for the
+        // bounded call. All callers supply an AXValue or CFBoolean CF object.
+        let error = unsafe {
+            AXUIElementSetAttributeValue(
+                self.window.as_ptr(),
+                attribute.as_concrete_TypeRef(),
+                value,
+            )
+        };
+        if error == AX_OK {
+            Ok(())
+        } else {
+            Err(format!("cannot set window {attribute}: AXError {error}"))
+        }
+    }
+}
+
+impl super::window_move::WindowAccess for MovableWindow {
+    fn snapshot(&self) -> Result<super::window_move::Snapshot, String> {
+        let bounds = element_rect(self.window.as_ptr(), &self.attributes)
+            .ok_or_else(|| "cannot read the window's AX position and size".to_string())?;
+        Ok(super::window_move::Snapshot {
+            bounds,
+            fullscreen: copy_bool_attribute(self.window.as_ptr(), &self.fullscreen),
+        })
+    }
+
+    fn set_fullscreen(&self, enabled: bool) -> Result<(), String> {
+        let value = if enabled {
+            CFBoolean::true_value()
+        } else {
+            CFBoolean::false_value()
+        };
+        self.set_attribute(&self.fullscreen, value.as_CFTypeRef())
+    }
+
+    fn set_position(&self, point: crate::api::geometry::Point) -> Result<(), String> {
+        let point = CGPoint::new(point.x, point.y);
+        // SAFETY: the type tag describes exactly the CGPoint at this pointer.
+        // AXValueCreate copies its contents; OwnedCf owns the resulting +1 object.
+        let value = unsafe {
+            OwnedCf::from_create_rule(AXValueCreate(
+                AX_VALUE_CGPOINT,
+                (&point as *const CGPoint).cast(),
+            ))
+        }
+        .ok_or_else(|| "cannot create AX window position".to_string())?;
+        self.set_attribute(&self.attributes.position, value.as_ptr())
+    }
 }
 
 pub fn ax_roles_for(semantic_roles: &[String]) -> Vec<String> {

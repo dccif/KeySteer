@@ -7,7 +7,7 @@
 - Vision result 由 Rust RAII owner 释放，读取 slice 前验证 count<=2000 和非空指针。
 - COM apartment 显式 `!Send/!Sync`，确保 `CoUninitialize` 回到初始化线程。
 - 两个平台入口不放行 undocumented unsafe；每个最小块记录 `SAFETY` 契约。机械门禁当前为
-  预算以 `tests/safety_budget.rs` 为准；Window Mover 增加四个 Win32 调用和五个 AX 操作，并同时禁止 `transmute`/`transmute_copy`；`domain` 与其余 portable 层使用编译期
+  预算以 `tests/safety_budget.rs` 为准；Window Mover 增加四个 Win32 调用和六个 AX 操作（含保留窗口的 messaging timeout），并同时禁止 `transmute`/`transmute_copy`；`domain` 与其余 portable 层使用编译期
   `forbid(unsafe_code)`/测试门禁保持零 unsafe。
 
 ## 共同契约
@@ -27,9 +27,13 @@ Windows `window_mover.rs` 复用 UIA 的纯 HWND 命中/过滤，不提交扫描
 还原位置显式转换 workspace/screen 坐标。成功表示操作已提交，应用仍可能
 限制大小、DPI 行为或拒绝移动；禁止同步等待外部 UI 线程。
 
-macOS `accessibility::move_window_to_screen` 通过 AX 命中鼠标下元素及 `AXWindow`，设置
-`AXPosition`；CF 引用由 `OwnedCf` 释放，使用有限 messaging timeout。原生全屏 Space 需要先
-退出全屏；不激活应用，也不发送系统快捷键模拟移动。
+macOS `accessibility::window_under_pointer` 通过 AX 命中鼠标下元素及 `AXWindow`，普通窗口直接设置
+`AXPosition`。CF 引用由 `OwnedCf` 释放，系统与保留窗口均使用有限 messaging timeout。
+`window_move.rs` 保留同一个 AX 窗口，在后端 poll 中自动退出原生全屏、按还原后的窗口尺寸跨屏、
+恢复全屏；使用系统过渡动画，系统可能随全屏切换焦点。每 50ms 至多推进一次，两次状态与位置
+稳定后推进，不 sleep 等动画，不发送模拟快捷键，也不创建后台 AX 线程。确认目标屏幕全屏后
+通过 `WindowMoveCompleted` 让 Engine 同步鼠标。每阶段 5 秒截止；显示器变化、失败或 shutdown
+尝试恢复全屏，记录恢复失败并释放引用，不保证系统接受恢复。进行中重复请求不重复启动。
 
 坐标契约参考 [Microsoft WINDOWPLACEMENT](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-windowplacement)
 和 [Apple AX hit testing](https://developer.apple.com/documentation/applicationservices/1462077-axuielementcopyelementatposition)。

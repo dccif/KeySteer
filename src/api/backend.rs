@@ -30,6 +30,8 @@ pub enum BackendEvent {
     InputCaptureLost(String),
     /// The pointer moved.
     PointerMoved(Point),
+    /// An asynchronous window move finished. Only success requests a pointer warp.
+    WindowMoveCompleted(Result<Point, String>),
     /// The display is ready for another animation frame.
     ///
     /// This is sourced from the native display link rather than a fixed-rate
@@ -119,7 +121,8 @@ pub trait Backend {
 
     /// Move the window under the pointer without changing focus. Return its
     /// corresponding pointer position for the engine to warp and synchronize;
-    /// None means no window moved. Errors must not trigger a pointer warp.
+    /// None means no move, or a pending move delivered via WindowMoveCompleted.
+    /// Errors must not trigger a pointer warp. Native fullscreen may change focus.
     fn move_window_to_screen(
         &self,
         _target: super::command::WindowScreenTarget,

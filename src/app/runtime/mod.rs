@@ -609,6 +609,13 @@ impl Engine {
             BackendEvent::InputCaptureLost(message) => {
                 self.reset_runtime_input_state(&message, true, backend);
             }
+            BackendEvent::WindowMoveCompleted(result) => match result {
+                Ok(point) => {
+                    let owner = self.registry.active.clone();
+                    self.execute_for(&owner, [Command::warp_to(point)], backend)?;
+                }
+                Err(message) => crate::support::logging::report_error("window-move", message),
+            },
             BackendEvent::PointerMoved(reported) => {
                 let p = self
                     .constrain_absolute_pointer(reported)

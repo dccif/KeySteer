@@ -31,7 +31,7 @@ keysteer/
 | `src/platform/common/` | 两端共享的 updater、app info、mailbox、batcher 和 spatial index | `mod.rs` |
 | `src/support/` | 日志、worker、错误聚合和性能探针 | `mod.rs` |
 | `src/platform/windows/` | Win32/COM/UIA/GDI/DWM 后端 | `mod.rs` 组合所有子模块 |
-| `src/platform/macos/` | AppKit/CGEventTap/AX/Vision/Core Graphics 后端 | `mod.rs` 组合所有子模块 |
+| `src/platform/macos/` | AppKit/CGEventTap/AX/Vision/Core Graphics 后端 | `mod.rs` 组合所有子模块；`window_move.rs` 管理原生全屏跨屏过渡，AX 引用由 `accessibility.rs` 持有 |
 | `src/platform/unsupported.rs` | 非 Windows/macOS 的可编译占位后端 | 用于检查公共层可移植性 |
 
 ## 程序入口

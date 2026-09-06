@@ -26,6 +26,9 @@ mod latest_point_mailbox_tests;
 #[cfg(all(test, not(target_os = "macos")))]
 #[path = "macos/multi_click.rs"]
 mod multi_click_tests;
+#[cfg(all(test, not(target_os = "macos")))]
+#[path = "macos/window_move.rs"]
+mod window_move_tests;
 
 #[cfg(target_os = "windows")]
 pub mod windows;

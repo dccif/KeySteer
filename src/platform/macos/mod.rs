@@ -18,9 +18,10 @@ mod screens;
 mod status_item;
 mod ui_scan;
 mod vision;
+mod window_move;
 mod workspace;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -94,6 +95,7 @@ pub struct MacOsBackend {
     pending: VecDeque<BackendEvent>,
     overlay: Overlay,
     screens: Vec<Screen>,
+    window_move: RefCell<Option<window_move::WindowMove<accessibility::MovableWindow>>>,
     display_watcher: Option<screens::DisplayWatcher>,
     frame_clock: display_link::DisplayFrameClock,
     workspace: workspace::Workspace,
@@ -167,6 +169,7 @@ impl MacOsBackend {
             pending: VecDeque::new(),
             overlay: Overlay::new(),
             screens: initial_screens,
+            window_move: RefCell::new(None),
             display_watcher: Some(display_watcher),
             frame_clock,
             workspace,
@@ -269,6 +272,11 @@ impl MacOsBackend {
             hook.request_stop();
         }
         self.status_item.take();
+        if let Some(movement) = self.window_move.get_mut().take()
+            && let Err(error) = movement.cancel()
+        {
+            errors.push("restore moving fullscreen window", error);
+        }
         self.frame_clock.stop();
         self.scan_worker.request_stop();
         if let Some(worker) = self.update_worker.as_ref() {
@@ -335,12 +343,25 @@ impl Backend for MacOsBackend {
             }
             crate::support::worker::reap_quarantined();
             self.refresh_native_events();
+            if let Some(result) = self
+                .window_move
+                .get_mut()
+                .as_mut()
+                .and_then(|movement| movement.poll(&self.screens, Instant::now()))
+            {
+                self.window_move.get_mut().take();
+                self.pending
+                    .push_back(BackendEvent::WindowMoveCompleted(result));
+            }
             if let Some(event) = self.try_event() {
                 return Ok(Some(event));
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let mut remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Ok(None);
+            }
+            if self.window_move.get_mut().is_some() {
+                remaining = remaining.min(window_move::POLL_INTERVAL);
             }
             if self.frame_clock.is_running() {
                 if let Some(elapsed) = self.frame_clock.next(remaining) {
@@ -383,7 +404,23 @@ impl Backend for MacOsBackend {
         &self,
         target: crate::api::command::WindowScreenTarget,
     ) -> Result<Option<Point>, String> {
-        accessibility::move_window_to_screen(self.pointer()?, &self.screens()?, target)
+        let mut pending = self.window_move.borrow_mut();
+        if pending.is_some() {
+            return Ok(None);
+        }
+        let cursor = self.pointer()?;
+        let Some(window) = accessibility::window_under_pointer(cursor)? else {
+            return Ok(None);
+        };
+        let (movement, pointer) = window_move::WindowMove::start(
+            window,
+            cursor,
+            &self.screens()?,
+            target,
+            Instant::now(),
+        )?;
+        *pending = movement;
+        Ok(pointer)
     }
 
     fn focused_app(&self) -> Result<Option<FocusedApp>, String> {

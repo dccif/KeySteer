@@ -203,3 +203,20 @@ fn window_noop_failure_or_failed_warp_does_not_update_cursor() {
         assert_eq!(engine.cursor, Point::new(10.0, 10.0));
     }
 }
+
+#[test]
+fn asynchronous_window_move_warps_and_synchronizes_only_on_success() {
+    for fail in [false, true] {
+        let mut engine = chord_test_engine(&Config::default());
+        let (mut backend, log) = FakeBackend::new(vec![]);
+        engine.screens = backend.screens().unwrap();
+        engine.cursor = Point::new(10.0, 10.0);
+        let result = if fail { Err("fullscreen transition failed".into()) } else { Ok(Point::new(250.0, 200.0)) };
+        engine.handle_backend_event(BackendEvent::WindowMoveCompleted(result), &mut backend).unwrap();
+        let expected = if fail { Point::new(10.0, 10.0) } else { Point::new(250.0, 200.0) };
+        assert_eq!(engine.cursor, expected);
+        assert_eq!(log.lock().unwrap().warps.len(), usize::from(!fail));
+        engine.execute_for(&ModeId::normal(), [Command::MovePointer { dx: 5.0, dy: 0.0 }], &mut backend).unwrap();
+        assert_eq!(engine.cursor, Point::new(expected.x + 5.0, expected.y));
+    }
+}
