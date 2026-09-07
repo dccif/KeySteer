@@ -149,6 +149,11 @@ Engine 为每个物理键保存 disposition，确保 key-up 与 key-down 使用�
 不能造成 down 被吞、up 被放行。held binding 还保存其 owner，松开时不会重新查找一个
 已经不匹配的 chord。
 
+原生回调超时必须立即使 mailbox generation 失效；迟到的 `dispose_key` 返回错误，即使
+尚无下一次按键。Engine 将其作为可恢复输入错误，中止对应绑定动作并回到 Idle，不退出进程。
+Windows Hook 另用固定 bitset 保存实际原生 disposition；重复和松键沿用首次按下的决定，
+因此超时兜底不会泄漏已消费的重复键，也不会吞掉已透传按下对应的松键。
+
 `KeyDisposition::Defer` 仅保留公开 API 兼容性，Engine 不再产生它，内置后端按
 `Forward` 处理。Windows 不再延迟或重放 Alt。
 

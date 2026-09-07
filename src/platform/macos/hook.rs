@@ -458,10 +458,11 @@ impl HookThread {
             .pending
             .take()
             .ok_or_else(|| "no macOS keyboard event is awaiting a disposition".to_string())?;
-        // A callback may already have timed out and failed open. Generation
-        // matching makes its late response harmless.
-        let _ = self.mailbox.complete(generation, disposition);
-        Ok(())
+        if self.mailbox.complete(generation, disposition) {
+            Ok(())
+        } else {
+            Err("keyboard disposition deadline expired".into())
+        }
     }
 
     pub fn stop(&mut self) -> Result<(), String> {
@@ -1089,12 +1090,12 @@ mod tests {
     }
 
     #[test]
-    fn timed_out_response_channel_is_nonfatal() {
+    fn timed_out_response_rejects_late_acknowledgement() {
         let (event_tx, event_rx) = mpsc::sync_channel(64);
         let mailbox =
             Arc::new(crate::platform::common::disposition_mailbox::DispositionMailbox::default());
         let generation = mailbox.begin();
-        let _newer = mailbox.begin();
+        assert_eq!(mailbox.wait(generation, Duration::ZERO), None);
         let mut hook = HookThread {
             sender: event_tx,
             receiver: event_rx,
@@ -1111,7 +1112,7 @@ mod tests {
             stop_failure_returned: false,
             deferred: VecDeque::new(),
         };
-        hook.set_disposition(KeyDisposition::Forward).unwrap();
+        assert!(hook.set_disposition(KeyDisposition::Forward).is_err());
         assert!(hook.pending.is_none());
     }
 

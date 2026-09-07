@@ -1,8 +1,13 @@
 # Release notes
 
+## 0.9.19
+
+- Window Mover now defaults to `Primary+D`. Bindings remain configurable, and `Primary+S` independently switches the pointer display.
+- The web configuration simulator now supports importing, editing, and exporting window-movement actions and `precision_toggle`, `slow_toggle`, and `fast_toggle`.
+
 ## 0.9.18
 
-Fixed lost key routes after Reload Configuration, so saved settings take effect without quitting. 
+Fixed lost key routes after Reload Configuration, so saved settings take effect without quitting.
 
 ## 0.9.17
 

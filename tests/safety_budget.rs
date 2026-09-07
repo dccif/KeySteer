@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 // checked separately below and remain entirely safe Rust.
 // Window Mover adds four Win32 placement calls and five bounded AX operations.
 // Fullscreen transitions add one bounded timeout call for the retained AX window.
-const MAX_UNSAFE_EXPRESSIONS: usize = 253;
+// Input recovery adds owned SetTimer/KillTimer and WTS registration pairs.
+const MAX_UNSAFE_EXPRESSIONS: usize = 257;
 const MAX_UNSAFE_FILES: usize = 21;
 const PER_FILE_BUDGET: &[(&str, usize)] = &[
     ("src/platform/macos/accessibility.rs", 18),
@@ -29,7 +30,7 @@ const PER_FILE_BUDGET: &[(&str, usize)] = &[
     ("src/platform/windows/update_installer/candidate.rs", 4),
     ("src/platform/windows/update_installer/mod.rs", 11),
     ("src/platform/windows/update_installer/signature.rs", 9),
-    ("src/platform/windows/native/mod.rs", 78),
+    ("src/platform/windows/native/mod.rs", 82),
 ];
 
 fn rust_files(directory: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {

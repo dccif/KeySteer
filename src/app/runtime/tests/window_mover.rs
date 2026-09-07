@@ -7,6 +7,137 @@ fn display_primary() -> String {
 }
 
 #[test]
+fn expired_window_move_disposition_aborts_action_and_recovers_engine() {
+    let config = Config::parse(r#"
+        [key_aliases]
+        primary = "left_alt"
+        [normal.bindings]
+        "primary+d" = "move_window next"
+    "#).unwrap();
+    let mut engine = chord_test_engine(&config);
+    engine.rebuild_tables();
+    let (mut backend, log) = FakeBackend::new(vec![key_down("d")]);
+    engine.activate(ModeId::normal(), None, &mut backend).unwrap();
+    engine.handle_backend_event(key_down("left_alt"), &mut backend).unwrap();
+    backend.fail_next_disposition = true;
+    engine.run_runtime_turn(&mut backend, Duration::ZERO).unwrap();
+    assert_eq!(engine.active_mode(), &ModeId::idle());
+    assert!(engine.input.active_gestures.is_empty());
+    assert!(log.lock().unwrap().window_moves.is_empty());
+    // Recovery must leave the process usable for the next activation.
+    for event in [key_up("d"), key_up("left_alt")] {
+        engine.handle_backend_event(event, &mut backend).unwrap();
+    }
+    engine.activate(ModeId::normal(), None, &mut backend).unwrap();
+    for event in [key_down("left_alt"), key_down("d"), key_up("d"), key_up("left_alt")] {
+        engine.handle_backend_event(event, &mut backend).unwrap();
+    }
+    assert_eq!(log.lock().unwrap().window_moves, [crate::api::command::WindowScreenTarget::Next]);
+}
+
+#[test]
+fn normal_alt_d_invokes_window_mover_with_wasd_bindings() {
+    let config = Config::parse(r#"
+        [key_aliases]
+        primary = "left_alt"
+        [hotkeys]
+        "primary+e" = "normal"
+        [normal.bindings]
+        w = "move_up"
+        a = "move_left"
+        s = "move_down"
+        d = "move_right"
+        "primary+s" = "screen next"
+        "primary+d" = "move_window next"
+    "#).unwrap();
+    for fail in [false, true] {
+        let mut engine = chord_test_engine(&config);
+        let (mut backend, log) = FakeBackend::new(vec![
+            key_down("left_alt"), key_down("e"), key_up("e"), key_up("left_alt"),
+            key_down("left_alt"), key_down("d"), key_up("d"), key_up("left_alt"),
+        ]);
+        backend.fail_window_move = fail;
+        engine.run(&mut backend).unwrap();
+        let log = log.lock().unwrap();
+        assert_eq!(log.window_moves, [crate::api::command::WindowScreenTarget::Next]);
+        assert_eq!(&log.dispositions[5..7], &[KeyDisposition::Consume, KeyDisposition::Consume]);
+        assert!(log.moves.is_empty());
+        assert!(log.warps.is_empty());
+        assert!(log.sent.is_empty(), "no fallback to application shortcuts after a failed or no-op window move");
+    }
+}
+
+#[test]
+fn temporary_activation_keys_do_not_shadow_wasd_or_defer_movement() {
+    for target in [ModeId::grid(), ModeId::recursive_grid(), ModeId::ui_hint()] {
+        for window_chord in ["primary+d", "primary+s+d"] {
+            let config = Config::parse(&format!(r#"
+                [key_aliases]
+                primary = "left_alt"
+                [normal.bindings]
+                w = "move_up"
+                a = "move_left"
+                s = "move_down"
+                d = "move_right"
+                "primary+s" = "screen next"
+                "{window_chord}" = "move_window next"
+            "#)).unwrap();
+            for key in ["w", "a", "s", "d"] {
+                let mut engine = chord_test_engine(&config);
+                engine.rebuild_tables();
+                let (mut backend, log) = FakeBackend::new(Vec::new());
+                engine.screens = backend.screens().unwrap();
+                engine.cursor = Point::new(500.0, 400.0);
+                engine.activate(target.clone(), Some(ModeId::normal()), &mut backend).unwrap();
+                log.lock().unwrap().warps.clear();
+                for event in [key_down("left_alt"), key_down(key), BackendEvent::Frame(Duration::from_millis(20))] {
+                    engine.handle_backend_event(event, &mut backend).unwrap();
+                }
+                assert!(engine.input.pending_chords.is_empty(), "{target} {window_chord} {key}");
+                let move_count = log.lock().unwrap().moves.len();
+                assert!(move_count >= 2, "{target} {window_chord} {key} must move immediately and on frames");
+                for event in [key_up("left_alt"), key_up(key), BackendEvent::Frame(Duration::from_millis(20))] {
+                    engine.handle_backend_event(event, &mut backend).unwrap();
+                }
+                assert_eq!(engine.active_mode(), &target);
+                let log = log.lock().unwrap();
+                assert_eq!(log.moves.len(), move_count, "release must stop the held movement");
+                assert!(log.window_moves.is_empty());
+                assert!(log.warps.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn temporary_layer_preserves_local_bindings_other_modifiers_and_normal_shortcuts() {
+    let config = Config::parse(r#"
+        [key_aliases]
+        primary = "left_alt"
+        [normal.bindings]
+        s = "move_down"
+        "primary+s" = "screen next"
+        "shift+s" = "move_up"
+        [grid.bindings]
+        "primary+q" = "normal"
+        "primary+s" = "none"
+    "#).unwrap();
+    let mut engine = chord_test_engine(&config);
+    engine.rebuild_tables();
+    let s = Key::new("s").unwrap();
+    let alt_s = [Key::new("left_alt").unwrap(), s.clone()];
+    engine.set_active(ModeId::normal());
+    assert_eq!(engine.lookup_for_pressed(&s, &alt_s).unwrap().binding.as_ref(), &config.normal.bindings["left_alt+s"]);
+    engine.set_active(ModeId::grid());
+    assert!(engine.lookup_for_pressed(&s, &alt_s).is_none());
+    let q = Key::new("q").unwrap();
+    assert_eq!(engine.lookup_for_pressed(&q, &[alt_s[0].clone(), q.clone()]).unwrap().owner, ModeId::grid());
+    engine.set_active(ModeId::recursive_grid());
+    assert_eq!(engine.lookup_for_pressed(&s, &alt_s).unwrap().binding.as_ref(), &Binding::Move(Direction::Down));
+    assert_eq!(engine.lookup_for_pressed(&s, &[alt_s[0].clone(), Key::new("left_shift").unwrap(), s.clone()]).unwrap().binding.as_ref(), &Binding::Move(Direction::Up));
+}
+
+#[test]
 fn wasd_movement_does_not_wait_for_an_unpressed_chord_modifier() {
     // The relevant bindings and pointer settings from keysteer.usert.toml.
     let config = Config::parse(r#"

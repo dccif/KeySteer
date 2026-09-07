@@ -72,15 +72,15 @@ Tap to select precision, slow, or fast speed. Press the same key again to return
 
 ### Chords with a shared prefix
 
-The engine compiles chord relationships when configuration is loaded. Built-in actions and plugins share this rule. The default can switch the pointer display or move a window:
+The engine compiles chord relationships when configuration is loaded. Built-in actions and plugins share this rule. Window movement defaults to `primary+d` (Alt+D on Windows, Command+D on macOS), independently of `primary+s` for switching the pointer display. You can also configure a shared prefix:
 
 ```toml
 [normal.bindings]
 "primary+s" = "screen next"
-"primary+d" = "move_window next"
+"primary+s+d" = "move_window next"
 ```
 
-`Primary+S` switches the pointer display; `Primary+D` moves the window. If you remap window movement to `primary+s+d`, hold `Primary+S` and press D to move the window, or release the short chord to switch the pointer display. Use `move_window previous` or `move_window 2` for another destination. The final non-modifier key completes the chord. No timeout or plugin changes are needed. Inheritance, per-app overrides, `none`, and modifier sides are respected.
+In this custom configuration, hold `Primary+S` and press D to move the window, or release the short chord to switch the pointer display. Use `move_window previous` or `move_window 2` for another destination. The final non-modifier key completes the chord. No timeout or plugin changes are needed. Inheritance, per-app overrides, `none`, and modifier sides are respected.
 
 Mode changes and successful configuration reloads cancel pending actions. Standalone modifiers remain immediate.
 A continuous action used as an ambiguous prefix receives one Down/Up tap on release; use independent keys for movement, long-press clicks, and toggle gestures.

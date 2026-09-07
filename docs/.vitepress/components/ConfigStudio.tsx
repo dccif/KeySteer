@@ -61,6 +61,13 @@ const actionGroups: ActionGroup[] = [
       ['move_left', '向左移动'], ['move_down', '向下移动'],
       ['move_up', '向上移动'], ['move_right', '向右移动'],
       ['precision', '精确速度'], ['slow', '慢速'], ['fast', '快速'],
+      ['precision_toggle', '切换精确速度'], ['slow_toggle', '切换慢速'], ['fast_toggle', '切换快速'],
+    ].map(([value, label]) => ({ value, label })),
+  },
+  {
+    name: '窗口移动',
+    actions: [
+      ['move_window previous', '窗口移到上一屏'], ['move_window next', '窗口移到下一屏'],
     ].map(([value, label]) => ({ value, label })),
   },
   {
@@ -157,6 +164,9 @@ export default defineComponent({
     const modifiers = reactive<Record<Modifier, boolean>>({ primary: false, shift: false, alt: false })
     const selectedChord = ref('')
     const customAction = ref('')
+    const windowScreen = ref('1')
+    const validWindowScreen = computed(() => /^\d+$/.test(windowScreen.value)
+      && Number.isSafeInteger(Number(windowScreen.value)) && Number(windowScreen.value) >= 1)
     const message = ref('正在载入默认配置…')
     const importInput = ref<HTMLInputElement | null>(null)
     const simulator = reactive(createSimulatorState())
@@ -243,6 +253,8 @@ export default defineComponent({
       if (!parts.includes(spec.key)) parts.push(spec.key)
       selectedChord.value = parts.join('+')
       customAction.value = selectedAction.value
+      const target = /^move_window\s+(\d+)$/.exec(selectedAction.value)
+      if (target) windowScreen.value = target[1]
     }
 
     function setAction(action: string): void {
@@ -481,6 +493,12 @@ export default defineComponent({
                   </div>
                 ))}
               </div>
+              <div class="ks-custom-action">
+                <label for="ks-window-screen">窗口目标屏幕（从 1 开始）</label>
+                <input id="ks-window-screen" type="number" min="1" step="1" value={windowScreen.value} onInput={(event) => { windowScreen.value = (event.target as HTMLInputElement).value }} />
+                <button disabled={!selectedChord.value || !validWindowScreen.value} onClick={() => setAction(`move_window ${Number(windowScreen.value)}`)}>窗口移到指定屏幕</button>
+              </div>
+              <p>速度切换动作按一次启用，再按一次取消。窗口移动作用于鼠标所在的窗口；网页预览暂不模拟这两类动作。</p>
               <div class="ks-custom-action">
                 <input value={customAction.value} placeholder="自定义动作，例如 press shift" onInput={(event) => { customAction.value = (event.target as HTMLInputElement).value }} onKeydown={(event) => { if (event.key === 'Enter') setAction(customAction.value.trim()) }} />
                 <button disabled={!selectedChord.value || !customAction.value.trim()} onClick={() => setAction(customAction.value.trim())}>应用</button>
@@ -949,8 +967,9 @@ function autoSetting(value: unknown, fallback: number): number {
 }
 
 function actionTone(action: string): string {
+  if (action.startsWith('move_window ')) return 'utility'
   if (action.startsWith('move_')) return 'move'
-  if (['precision', 'slow', 'fast'].includes(action)) return 'speed'
+  if (['precision', 'slow', 'fast', 'precision_toggle', 'slow_toggle', 'fast_toggle'].includes(action)) return 'speed'
   if (action.includes('click')) return 'click'
   if (action === 'toggle' || action.startsWith('press') || action.startsWith('release')) return 'state'
   if (action.includes('scroll') || action.includes('wheel')) return 'scroll'
@@ -965,7 +984,11 @@ function shortAction(action: string): string {
     left_click: '左键', right_click: '右键', middle_click: '中键', double_click: '双击',
     grid: 'Grid', recursive_grid: '递归 Grid', ui_hint: 'UI Hint', normal: 'Normal', idle: 'Idle',
     precision: '精确', slow: '慢速', fast: '快速', finish: '完成', restart_mode: '重启', escape: '返回',
+    precision_toggle: '切换精确', slow_toggle: '切换慢速', fast_toggle: '切换快速',
+    'move_window previous': '窗口上一屏', 'move_window prev': '窗口上一屏', 'move_window next': '窗口下一屏',
   }
+  const windowTarget = /^move_window\s+(\d+)$/.exec(action)
+  if (windowTarget) return `窗口→屏幕 ${windowTarget[1]}`
   return names[action] ?? action.replace(/_/g, ' ')
 }
 

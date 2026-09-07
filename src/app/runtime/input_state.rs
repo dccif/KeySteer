@@ -836,7 +836,7 @@ impl Engine {
     }
 
     pub(super) fn dispose_input(
-        &self,
+        &mut self,
         input: &crate::api::input::InputEvent,
         outcome: KeyOutcome,
         trace_key: bool,
@@ -846,7 +846,9 @@ impl Engine {
             KeyOutcome::Consumed => KeyDisposition::Consume,
             KeyOutcome::Forwarded => KeyDisposition::Forward,
         };
-        backend.dispose_key(disposition)?;
+        backend
+            .dispose_key(disposition)
+            .map_err(|error| self.recoverable_input_error("keyboard disposition", error))?;
         self.trace_lazy(trace_key, "key", || {
             format!(
                 "received key={} state={:?} repeat={} injected={} mode={} disposition={disposition:?}",
@@ -1493,21 +1495,39 @@ impl Engine {
         };
         let temporary_active =
             self.temporary_mode_is_active_for_pressed(&self.registry.active, pressed);
-        let temporary_match = temporary_active
-            .then_some(route.temporary_mode.as_ref())
-            .flatten()
-            .cloned()
-            .and_then(|owner| {
-                self.lookup_with_specificity_for_pressed(&owner, key, pressed)
-                    .map(|(binding, specificity)| (binding, owner, specificity))
-            });
-
-        if let Some((binding, owner, temporary_specificity)) = temporary_match
-            && active_match
-                .as_ref()
-                .is_none_or(|(_, active_specificity)| *active_specificity <= temporary_specificity)
-        {
-            return Some(ResolvedBinding { binding, owner });
+        if temporary_active && let Some(owner) = route.temporary_mode.as_ref() {
+            // Explicit bindings of the targeting mode retain their physical
+            // chord, including `none`. The temporary layer consumes its
+            // activation keys before looking up the target and its parents.
+            if let Some((binding, _)) = active_match {
+                return (binding.as_ref() != &Binding::Disabled).then(|| ResolvedBinding {
+                    binding,
+                    owner: self.registry.active.clone(),
+                });
+            }
+            let chords = self.registry.temporary_chords(&self.registry.active)?;
+            let remaining: SmallVec<[Key; 8]> = pressed
+                .iter()
+                .filter(|physical| {
+                    !chords.iter().any(|entry| {
+                        !(self.registry.active == ModeId::ui_hint()
+                            && entry.conflicts_with_ui_hint_overlap)
+                            && entry.chord.matches_pressed(pressed)
+                            && entry
+                                .chord
+                                .keys()
+                                .iter()
+                                .any(|configured| Self::keys_match(configured, physical))
+                    })
+                })
+                .cloned()
+                .collect();
+            if !remaining.contains(key) {
+                return None;
+            }
+            // Do not fall back to the original pressed set: that would
+            // resurrect shortcuts containing the consumed activation keys.
+            return self.lookup_inherited(owner, key, &remaining, &mut SmallVec::new());
         }
 
         match active_match {

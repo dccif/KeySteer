@@ -50,6 +50,8 @@ Idle 是启动时的默认状态，只监听 `[hotkeys]` 中的入口，不会�
 
 Grid、Recursive Grid 和 UI Hint 默认继承 Normal，并把 `Primary` 作为临时修饰键。按住它时，移动、滚动和点击按键临时交给 Normal，方便定位时也能自由移动；松开后回到当前定位会话。
 
+临时激活键不会参与 Normal 的快捷键匹配。例如把 Primary 设置为 Alt 后，临时状态下的 Alt+S 使用 Normal 的 `s` 绑定，而普通 Normal 中的 Alt+S 仍使用 `primary+s`。当前定位模式显式配置的快捷键（如 `primary+q`）以及 `none` 屏蔽优先保留，其他修饰键照常参与匹配。
+
 ```toml
 [grid]
 inherits = ["hotkeys", "normal"]

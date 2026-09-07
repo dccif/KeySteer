@@ -1,10 +1,17 @@
 # 更新日志 / Release Notes
 
+## 0.9.19
+
+- Window Mover 默认快捷键改为 `Primary+D`，可在配置中自定义；`Primary+S` 独立切换鼠标所在显示器。
+- 网页配置模拟器新增窗口移动和 `precision_toggle`、`slow_toggle`、`fast_toggle` 动作配置，支持导入、编辑和导出。
+
+Window Mover now defaults to `Primary+D`, with configurable bindings and independent `Primary+S` pointer-display switching. The web configuration simulator now supports importing, editing, and exporting window-movement and speed-toggle actions.
+
 ## 0.9.18
 
 修复状态栏 Reload Configuration 后新配置的按键路由丢失，保存并重载后无需退出程序。
 
-Fixed lost key routes after Reload Configuration, so saved settings take effect without quitting. 
+Fixed lost key routes after Reload Configuration, so saved settings take effect without quitting.
 
 ## 0.9.17
 

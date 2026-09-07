@@ -51,7 +51,7 @@ impl DispositionMailbox {
     }
 
     /// Complete `generation`; returns false when that callback already timed
-    /// out and a newer event owns the slot.
+    /// out, or a newer event owns the slot.
     pub(crate) fn complete(&self, generation: u64, disposition: KeyDisposition) -> bool {
         let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
         if slot.generation != generation || slot.disposition.is_some() {
@@ -67,15 +67,22 @@ impl DispositionMailbox {
         if slot.generation != generation {
             return None;
         }
-        let (slot, _) = self
+        let (mut slot, _) = self
             .ready
             .wait_timeout_while(slot, timeout, |slot| {
                 slot.generation == generation && slot.disposition.is_none()
             })
             .unwrap_or_else(|error| error.into_inner());
-        (slot.generation == generation)
-            .then_some(slot.disposition)
-            .flatten()
+        if slot.generation != generation {
+            return None;
+        }
+        let disposition = slot.disposition;
+        if disposition.is_none() {
+            // Retire under the same lock as complete: even before another
+            // key arrives, a late engine response must report failure.
+            slot.generation = slot.generation.wrapping_add(1);
+        }
+        disposition
     }
 
     /// Permanently fail open this mailbox. A native callback racing with
@@ -114,6 +121,7 @@ mod tests {
         let mailbox = DispositionMailbox::default();
         let first = mailbox.begin();
         assert_eq!(mailbox.wait(first, Duration::ZERO), None);
+        assert!(!mailbox.complete(first, KeyDisposition::Consume));
 
         let second = mailbox.begin();
         assert!(mailbox.complete(second, KeyDisposition::Consume));

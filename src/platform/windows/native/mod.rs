@@ -1456,6 +1456,75 @@ pub(crate) fn get_window_message(
     unsafe { GetMessageW(message, None, 0, 0) }.0
 }
 
+/// A message-only timer owned and destroyed on its creating thread.
+pub(crate) struct ThreadTimer {
+    id: usize,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl ThreadTimer {
+    pub(crate) fn new(interval_ms: u32) -> Result<Self, String> {
+        // SAFETY: no HWND or callback is retained. Windows allocates the id;
+        // this thread-bound guard receives WM_TIMER on the creating thread.
+        let id = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::SetTimer(None, 0, interval_ms, None)
+        };
+        if id == 0 {
+            return Err("cannot create Windows input recovery timer".into());
+        }
+        Ok(Self {
+            id,
+            _thread: std::marker::PhantomData,
+        })
+    }
+
+    pub(crate) fn matches(&self, message: &windows::Win32::UI::WindowsAndMessaging::MSG) -> bool {
+        message.message == windows::Win32::UI::WindowsAndMessaging::WM_TIMER
+            && message.hwnd.is_invalid()
+            && message.wParam.0 == self.id
+    }
+}
+
+impl Drop for ThreadTimer {
+    fn drop(&mut self) {
+        // SAFETY: this guard owns the timer id and cannot leave its thread.
+        let result = unsafe { windows::Win32::UI::WindowsAndMessaging::KillTimer(None, self.id) };
+        if let Err(error) = result {
+            crate::report_error!("windows-hook", "cannot stop recovery timer: {error}");
+        }
+    }
+}
+
+/// Borrows a tray HWND until notifications have been unregistered.
+pub(crate) struct SessionNotifications<'a>(&'a OwnedWindow);
+
+impl<'a> SessionNotifications<'a> {
+    pub(crate) fn new(window: &'a OwnedWindow) -> Result<Self, String> {
+        use windows::Win32::System::RemoteDesktop::{
+            NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification,
+        };
+        // SAFETY: the borrowed HWND remains live until this guard unregisters.
+        unsafe { WTSRegisterSessionNotification(window.raw(), NOTIFY_FOR_THIS_SESSION) }
+            .map_err(|error| format!("cannot subscribe to session changes: {error}"))?;
+        Ok(Self(window))
+    }
+}
+
+impl Drop for SessionNotifications<'_> {
+    fn drop(&mut self) {
+        // SAFETY: registration belongs to this guard and its borrowed HWND
+        // cannot be destroyed before the matching unregistration.
+        if let Err(error) = unsafe {
+            windows::Win32::System::RemoteDesktop::WTSUnRegisterSessionNotification(self.0.raw())
+        } {
+            crate::report_error!(
+                "windows-events",
+                "cannot unsubscribe from session changes: {error}"
+            );
+        }
+    }
+}
+
 #[inline(always)]
 pub(crate) fn window_long(
     hwnd: HWND,

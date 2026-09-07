@@ -113,6 +113,9 @@ pub trait Backend {
     /// `WH_KEYBOARD_LL`, macOS `CGEventTap`) must block their callback until
     /// this is called, otherwise the keystroke reaches the app before the
     /// engine has decided.
+    /// If the callback's deadline expired, return an error rather than
+    /// acknowledging a decision that can no longer be applied. The engine
+    /// aborts the action and recovers its input state without exiting.
     fn dispose_key(&mut self, disposition: KeyDisposition) -> Result<(), String>;
 
     fn screens(&self) -> Result<Vec<Screen>, String>;

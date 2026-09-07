@@ -3,7 +3,7 @@
 ## Native safety boundary（2026-08）
 
 - Windows DIB/GPU/window 尺寸先通过 `NativeDimensions`；i32 narrowing、BGRA 长度和 `isize::MAX` 约束均在 FFI 前完成。
-- 低级 Hook callback 使用 `try_send`，队列忙时 fail-open；timeout warning 以原子单槽合并。
+- 低级 Hook callback 使用 `try_send`，队列忙时新按键 fail-open；Windows 已按住的键仍遵循原生 down/up 配对；timeout warning 以原子单槽合并。
 - Vision result 由 Rust RAII owner 释放，读取 slice 前验证 count<=2000 和非空指针。
 - COM apartment 显式 `!Send/!Sync`，确保 `CoUninitialize` 回到初始化线程。
 - 两个平台入口不放行 undocumented unsafe；每个最小块记录 `SAFETY` 契约。机械门禁当前为
@@ -68,6 +68,18 @@ may open File Explorer instead of preserving the complete URL for the default br
 组合入口：`src/platform/windows/mod.rs`。
 
 ### 线程和事件
+
+Windows Hook 用固定 bitset 记录真正返回给系统的按键消费决定。重复和松键沿用首次按下
+的结果，包括队列满或 100ms 握手超时；首次按下没有决定时仍透传。常规 Hook 更新保留
+这些状态，会话恢复时清空。两端共享的 disposition mailbox 在超时的同一把锁内作废
+generation，迟到确认向 Engine 返回可恢复错误，不再继续执行已经失去消费确认的动作。
+
+Windows 低级 Hook 可能被系统静默移除，而所属线程仍存活。Hook 线程持有 30 秒的原生消息
+timer，在回调之间安装新句柄并释放旧句柄；安装失败保留原句柄，下次重试。常规更新保留
+按键状态和活动模式。disposition 超时也投递更新请求，不在回调内安装 Hook。
+托盘窗口接收系统恢复、解锁和会话重新连接通知，投递更新请求并通过 `InputCaptureLost`
+使 Hook 与 Engine 清理失效的输入状态。后台事件通道断开时先 join 原线程，再重建；失败
+按 30 秒退避重试，不能把断开当成普通空队列。timer 和会话通知均由原生 RAII owner 清理。
 
 - 创建 Backend 的线程也是 Win32 message loop、tray、overlay window 的 owner。
 - overlay worker 在 tray 和屏幕枚举之前启动；消息队列就绪后，GPU device tree 在渲染线程

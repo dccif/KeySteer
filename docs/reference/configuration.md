@@ -76,15 +76,15 @@ space = "idle"
 
 ### 共享前缀的组合键
 
-程序在加载配置时预编译组合键关系，内置动作和插件使用同一规则。默认配置既可切换鼠标所在显示器，也可移动窗口：
+程序在加载配置时预编译组合键关系，内置动作和插件使用同一规则。默认窗口移动为 `primary+d`（Windows 为 Alt+D，macOS 为 Command+D），与切换鼠标显示器的 `primary+s` 独立触发。也可自定义共享前缀：
 
 ```toml
 [normal.bindings]
 "primary+s" = "screen next"
-"primary+d" = "move_window next"
+"primary+s+d" = "move_window next"
 ```
 
-`Primary+S` 切换鼠标所在显示器，`Primary+D` 移动窗口。若自行将窗口移动改绑为 `primary+s+d`，则保持 `Primary+S` 并按 D 移动窗口，只松开短组合才切换鼠标显示器。可改成
+上述自定义配置中，保持 `Primary+S` 并按 D 移动窗口，只松开短组合则切换鼠标显示器。动作也可改成
 `move_window previous` 或 `move_window 2`，也可使用任意其他组合键。最后一个非修饰键是完成键，
 运行时会自动仲裁，不需要配置等待时间，也无需修改插件；`none`、按应用覆盖、继承及左右修饰键限制均参与判断。
 

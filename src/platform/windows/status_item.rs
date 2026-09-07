@@ -26,6 +26,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TrackPopupMenu, TranslateMessage, WM_APP, WM_CANCELMODE, WM_DISPLAYCHANGE, WM_LBUTTONUP,
     WM_NULL, WM_QUIT, WM_RBUTTONUP, WM_SETTINGCHANGE, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
+use windows::Win32::UI::WindowsAndMessaging::{
+    PBT_APMRESUMEAUTOMATIC, WM_POWERBROADCAST, WM_WTSSESSION_CHANGE, WTS_CONSOLE_CONNECT,
+    WTS_REMOTE_CONNECT, WTS_SESSION_UNLOCK,
+};
 use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::api::Autostart;
@@ -248,6 +252,14 @@ fn tray_thread(ready: std::sync::mpsc::SyncSender<Result<(u32, isize), String>>)
         return;
     }
 
+    let session_notifications = match super::native::SessionNotifications::new(&window) {
+        Ok(notifications) => Some(notifications),
+        Err(error) => {
+            crate::report_error!("windows-events", "{error}");
+            None
+        }
+    };
+
     let mut message = MSG::default();
     loop {
         let status = super::native::get_window_message(&mut message);
@@ -271,6 +283,7 @@ fn tray_thread(ready: std::sync::mpsc::SyncSender<Result<(u32, isize), String>>)
             DispatchMessageW(&message);
         }
     }
+    drop(session_notifications);
     destroy_window(window);
 }
 
@@ -805,6 +818,12 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if resumes_input_capture(message, wparam.0 as u32) {
+        if let Err(error) = super::hook::request_renewal(true) {
+            crate::report_error!("windows-hook", "{error}");
+        }
+        return LRESULT(isize::from(message == WM_POWERBROADCAST));
+    }
     let taskbar_created = TASKBAR_CREATED.load(Ordering::Acquire);
     if taskbar_created != 0 && message == taskbar_created {
         if !add_icon(hwnd) {
@@ -837,9 +856,38 @@ extern "system" fn window_proc(
     }
 }
 
+fn resumes_input_capture(message: u32, event: u32) -> bool {
+    (message == WM_POWERBROADCAST && event == PBT_APMRESUMEAUTOMATIC)
+        || (message == WM_WTSSESSION_CHANGE
+            && matches!(
+                event,
+                WTS_SESSION_UNLOCK | WTS_CONSOLE_CONNECT | WTS_REMOTE_CONNECT
+            ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_resume_unlock_and_reconnect_request_input_recovery() {
+        assert!(resumes_input_capture(
+            WM_POWERBROADCAST,
+            PBT_APMRESUMEAUTOMATIC
+        ));
+        for event in [WTS_SESSION_UNLOCK, WTS_CONSOLE_CONNECT, WTS_REMOTE_CONNECT] {
+            assert!(resumes_input_capture(WM_WTSSESSION_CHANGE, event));
+        }
+        assert!(!resumes_input_capture(WM_DISPLAYCHANGE, WTS_SESSION_UNLOCK));
+        assert!(!resumes_input_capture(
+            WM_WTSSESSION_CHANGE,
+            windows::Win32::UI::WindowsAndMessaging::WTS_SESSION_LOCK
+        ));
+        assert!(!resumes_input_capture(
+            WM_POWERBROADCAST,
+            windows::Win32::UI::WindowsAndMessaging::PBT_APMPOWERSTATUSCHANGE
+        ));
+    }
 
     #[test]
     fn menu_actions_use_the_backend_event_channel() {

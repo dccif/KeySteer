@@ -69,6 +69,7 @@ struct Recorder {
 }
 
 struct FakeBackend {
+    fail_next_disposition: bool,
     window_move_pointer: Option<Point>,
     fail_window_move: bool,
     events: Vec<BackendEvent>,
@@ -85,6 +86,7 @@ impl FakeBackend {
         let log = Arc::new(Mutex::new(Recorder::default()));
         (
             Self {
+                fail_next_disposition: false,
                 window_move_pointer: None,
                 fail_window_move: false,
                 events,
@@ -118,6 +120,9 @@ impl Backend for FakeBackend {
         }))
     }
     fn dispose_key(&mut self, d: KeyDisposition) -> Result<(), String> {
+        if std::mem::take(&mut self.fail_next_disposition) {
+            return Err("keyboard disposition deadline expired".into());
+        }
         let mut log = self.log.lock().unwrap();
         log.dispositions.push(d);
         log.timeline.push("dispose");

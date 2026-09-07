@@ -26,7 +26,7 @@ use super::input;
 use crate::platform::common::disposition_mailbox::DispositionMailbox;
 
 pub const TIMEOUT_WARNING: &str =
-    "keyboard disposition timed out; the key was forwarded and the hook remained active";
+    "keyboard disposition timed out; using native key pairing fallback";
 
 struct Envelope {
     event: BackendEvent,
@@ -36,6 +36,53 @@ struct Envelope {
 struct EventSink {
     sender: SyncSender<Envelope>,
     mailbox: Arc<DispositionMailbox>,
+}
+
+/// Actual native decisions survive a slow engine turn. In particular, timeout
+/// must not forward a repeat or release after Windows never saw the press.
+#[derive(Clone, Copy, Default)]
+struct NativeKeyDecisions {
+    held: [u64; 4],
+    consumed: [u64; 4],
+}
+
+impl NativeKeyDecisions {
+    fn resolve(
+        &mut self,
+        virtual_key: u32,
+        state: KeyState,
+        proposed: Option<KeyDisposition>,
+    ) -> KeyDisposition {
+        let word = virtual_key as usize / 64;
+        if word >= self.held.len() {
+            return proposed.unwrap_or(KeyDisposition::Forward);
+        }
+        let mask = 1u64 << (virtual_key as usize % 64);
+        let disposition = if self.held[word] & mask != 0 {
+            if self.consumed[word] & mask != 0 {
+                KeyDisposition::Consume
+            } else {
+                KeyDisposition::Forward
+            }
+        } else {
+            proposed.unwrap_or(KeyDisposition::Forward)
+        };
+        match state {
+            KeyState::Down => {
+                self.held[word] |= mask;
+                if disposition == KeyDisposition::Consume {
+                    self.consumed[word] |= mask;
+                } else {
+                    self.consumed[word] &= !mask;
+                }
+            }
+            KeyState::Up => {
+                self.held[word] &= !mask;
+                self.consumed[word] &= !mask;
+            }
+        }
+        disposition
+    }
 }
 
 thread_local! {
@@ -54,7 +101,15 @@ const WAKE_MESSAGE: u32 = WM_APP + 0x4D;
 const RESET_PRESSED_MESSAGE: u32 = WM_APP + 0x4F;
 const INJECTION_MESSAGE: u32 = WM_APP + 0x50;
 const MENU_MASK_MESSAGE: u32 = WM_APP + 0x51;
+const RENEW_HOOK_MESSAGE: u32 = WM_APP + 0x52;
+const HOOK_RENEW_INTERVAL_MS: u32 = 30_000;
 const HOOK_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const TEST_RETIRE_HOOKS_MESSAGE: u32 = WM_APP + 0x53;
+#[cfg(test)]
+static TEST_RENEWALS: AtomicU32 = AtomicU32::new(0);
+#[cfg(test)]
+static TEST_HOOKS_RETIRED: AtomicBool = AtomicBool::new(false);
 
 /// Native input work executed only from the hook thread's message loop. A
 /// posted request cannot run until the physical-key callback ahead of it has
@@ -299,6 +354,9 @@ thread_local! {
     /// Virtual keys are one byte. A fixed bitset avoids allocating a tree node
     /// for every held key inside the latency-sensitive hook callback.
     static PRESSED: Cell<[u64; 4]> = const { Cell::new([0; 4]) };
+    static NATIVE_DECISIONS: Cell<NativeKeyDecisions> = const { Cell::new(NativeKeyDecisions {
+        held: [0; 4], consumed: [0; 4],
+    }) };
     /// Physical Alt state that has already reached the rest of Windows.
     static FORWARDED_ALT: Cell<ForwardedAlt> = const { Cell::new(ForwardedAlt(0)) };
 }
@@ -310,6 +368,7 @@ pub struct HookThread {
     pending: Option<u64>,
     thread_id: u32,
     worker: Option<WorkerJoin>,
+    retry_after: Option<Instant>,
 }
 
 struct OwnedHook {
@@ -332,7 +391,15 @@ impl Drop for OwnedHook {
         // this non-Send guard remains on the installing thread, and Drop is
         // the only unhook path.
         if let Err(error) = unsafe { UnhookWindowsHookEx(self.raw) } {
-            crate::report_error!("windows-hook", "cannot remove hook: {error}");
+            // Windows can silently retire a timed-out low-level hook. Its
+            // already-invalid handle is an expected cleanup result on renewal.
+            if error.code()
+                != windows::core::HRESULT::from_win32(
+                    windows::Win32::Foundation::ERROR_INVALID_HOOK_HANDLE.0,
+                )
+            {
+                crate::report_error!("windows-hook", "cannot remove hook: {error}");
+            }
         }
     }
 }
@@ -345,6 +412,8 @@ impl HookThread {
         // A backend can be recreated in the same process by tests or recovery.
         // Physical pointer movement stays silent until an overlay is presented.
         set_pointer_wake_enabled(false);
+        TIMEOUT_WARNING_PENDING.store(false, Ordering::Release);
+        WAKE_FAILED.store(false, Ordering::Release);
         // Ensure the engine thread has a message queue before hook callbacks
         // try to wake it with PostThreadMessageW.
         let owner_thread = super::native::prepare_thread_message_queue();
@@ -398,6 +467,7 @@ impl HookThread {
             pending: None,
             thread_id,
             worker: Some(worker),
+            retry_after: None,
         })
     }
 
@@ -407,7 +477,11 @@ impl HookThread {
                 "PostThreadMessageW could not wake the engine for hooked input".into(),
             ));
         }
-        if let Ok(envelope) = self.receiver.try_recv() {
+        let received = self.receiver.try_recv();
+        if matches!(received, Err(mpsc::TryRecvError::Disconnected)) {
+            return self.recover_stopped_thread();
+        }
+        if let Ok(envelope) = received {
             if matches!(
                 &envelope.event,
                 BackendEvent::Warning(message) if message == TIMEOUT_WARNING
@@ -420,15 +494,37 @@ impl HookThread {
         take_latest_pointer().map(BackendEvent::PointerMoved)
     }
 
+    #[cold]
+    fn recover_stopped_thread(&mut self) -> Option<BackendEvent> {
+        let now = Instant::now();
+        if self.retry_after.is_some_and(|deadline| now < deadline) {
+            return None;
+        }
+        self.retry_after = Some(now + Duration::from_secs(30));
+        // Never replace an owner until its previous native thread has joined.
+        match self.stop().and_then(|()| Self::start()) {
+            Ok(replacement) => {
+                *self = replacement;
+                Some(BackendEvent::InputCaptureLost(
+                    "Windows input hook stopped and was restarted".into(),
+                ))
+            }
+            Err(error) => Some(BackendEvent::InputCaptureLost(format!(
+                "Windows input hook stopped; restart failed: {error}; retrying in 30 seconds"
+            ))),
+        }
+    }
+
     pub fn set_disposition(&mut self, disposition: KeyDisposition) -> Result<(), String> {
         let generation = self
             .pending
             .take()
             .ok_or_else(|| "no keyboard event is awaiting a disposition".to_string())?;
-        // A timed-out callback has already failed open. Generation matching
-        // makes its late response harmless if a newer event owns the slot.
-        let _ = self.mailbox.complete(generation, disposition);
-        Ok(())
+        if self.mailbox.complete(generation, disposition) {
+            Ok(())
+        } else {
+            Err("keyboard disposition deadline expired".into())
+        }
     }
 
     /// Queue SendInput work without waiting on the hook thread. A synchronous
@@ -518,6 +614,31 @@ impl Drop for HookThread {
     }
 }
 
+fn install_hooks() -> Result<(OwnedHook, OwnedHook), String> {
+    // SAFETY: the callback has the required ABI, is process-lifetime code, and
+    // the resulting handle is immediately placed in its thread-bound guard.
+    let keyboard_hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), None, 0) }
+        .map(OwnedHook::new)
+        .map_err(|error| format!("SetWindowsHookExW failed: {error}"))?;
+    // SAFETY: the callback has the required ABI, is process-lifetime code, and
+    // the resulting handle is immediately placed in its thread-bound guard.
+    let mouse_hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0) }
+        .map(OwnedHook::new)
+        .map_err(|error| format!("SetWindowsHookExW(mouse) failed: {error}"))?;
+    Ok((keyboard_hook, mouse_hook))
+}
+
+/// Run between callbacks on their installing thread; never inject a probe key.
+pub(super) fn request_renewal(capture_lost: bool) -> Result<(), String> {
+    let thread = HOOK_THREAD.load(Ordering::Acquire);
+    if thread == 0 {
+        // A stopped worker is recovered through its disconnected event queue.
+        return Ok(());
+    }
+    super::native::post_thread_message(thread, RENEW_HOOK_MESSAGE, usize::from(capture_lost))
+        .map_err(|error| format!("cannot request Windows hook renewal: {error}"))
+}
+
 fn hook_thread(
     sender: SyncSender<Envelope>,
     mailbox: Arc<DispositionMailbox>,
@@ -525,27 +646,26 @@ fn hook_thread(
     ready: SyncSender<Result<u32, String>>,
     wake_thread: u32,
 ) {
-    // SAFETY: the callback has the required ABI, is process-lifetime code, and
-    // the resulting handle is immediately placed in its thread-bound guard.
-    let keyboard_hook = match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), None, 0) }
-    {
-        Ok(hook) => OwnedHook::new(hook),
+    let mut hooks = match install_hooks() {
+        Ok(hooks) => Some(hooks),
         Err(error) => {
-            let _ = ready.send(Err(format!("SetWindowsHookExW failed: {error}")));
-            return;
-        }
-    };
-    // SAFETY: the callback has the required ABI, is process-lifetime code, and
-    // the resulting handle is immediately placed in its thread-bound guard.
-    let mouse_hook = match unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0) }
-    {
-        Ok(hook) => OwnedHook::new(hook),
-        Err(error) => {
-            let _ = ready.send(Err(format!("SetWindowsHookExW(mouse) failed: {error}")));
+            let _ = ready.send(Err(error));
             return;
         }
     };
     let thread_id = super::native::prepare_thread_message_queue();
+    #[cfg(test)]
+    {
+        TEST_RENEWALS.store(0, Ordering::Release);
+        TEST_HOOKS_RETIRED.store(false, Ordering::Release);
+    }
+    let renewal_timer = match super::native::ThreadTimer::new(HOOK_RENEW_INTERVAL_MS) {
+        Ok(timer) => timer,
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
     HOOK_THREAD.store(thread_id, Ordering::Release);
     EVENT_SINK.with(|current| *current.borrow_mut() = Some(EventSink { sender, mailbox }));
     WAKE_THREAD.store(wake_thread, Ordering::Release);
@@ -568,8 +688,47 @@ fn hook_thread(
             WAKE_FAILED.store(true, Ordering::Release);
             break;
         }
+        #[cfg(test)]
+        if message.message == TEST_RETIRE_HOOKS_MESSAGE {
+            hooks.take();
+            TEST_HOOKS_RETIRED.store(true, Ordering::Release);
+            continue;
+        }
+        if renewal_timer.matches(&message) || message.message == RENEW_HOOK_MESSAGE {
+            // Install the replacement first: a failed attempt cannot discard
+            // working hooks. Routine renewal preserves active keys and modes.
+            match install_hooks() {
+                Ok(replacement) => {
+                    hooks = Some(replacement);
+                    #[cfg(test)]
+                    TEST_RENEWALS.fetch_add(1, Ordering::Release);
+                }
+                Err(error) => {
+                    crate::report_error!("windows-hook", "cannot renew input hooks: {error}")
+                }
+            }
+            if message.message == RENEW_HOOK_MESSAGE && message.wParam.0 != 0 {
+                PRESSED.with(|pressed| pressed.set([0; 4]));
+                NATIVE_DECISIONS.with(|decisions| decisions.set(NativeKeyDecisions::default()));
+                FORWARDED_ALT.with(|alt| alt.set(ForwardedAlt::default()));
+                if !send_envelope(Envelope {
+                    event: BackendEvent::InputCaptureLost(
+                        "Windows resumed or unlocked; input state requires resynchronization"
+                            .into(),
+                    ),
+                    generation: None,
+                }) {
+                    crate::report_error!(
+                        "windows-hook",
+                        "cannot publish input reset after session recovery"
+                    );
+                }
+            }
+            continue;
+        }
         if message.message == RESET_PRESSED_MESSAGE {
             PRESSED.with(|pressed| pressed.set([0; 4]));
+            NATIVE_DECISIONS.with(|decisions| decisions.set(NativeKeyDecisions::default()));
             FORWARDED_ALT.with(|alt| alt.set(ForwardedAlt::default()));
             continue;
         }
@@ -609,8 +768,8 @@ fn hook_thread(
             DispatchMessageW(&message);
         }
     }
-    drop(mouse_hook);
-    drop(keyboard_hook);
+    drop(renewal_timer);
+    drop(hooks);
     let abandoned = injection.abandon_pending();
     if abandoned != 0 {
         let _ = send_envelope(Envelope {
@@ -671,6 +830,13 @@ fn queue_timeout_warning() {
         .is_err()
     {
         return;
+    }
+    if let Err(error) = request_renewal(false) {
+        // The low-frequency timer remains a fallback if this wake fails.
+        let _ = send_envelope(Envelope {
+            event: BackendEvent::Warning(error),
+            generation: None,
+        });
     }
     if !send_envelope(Envelope {
         event: BackendEvent::Warning(TIMEOUT_WARNING.into()),
@@ -839,15 +1005,21 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     );
     let disposition = if let Some((mailbox, generation)) = begin_disposition(event) {
         match mailbox.wait(generation, Duration::from_millis(100)) {
-            Some(disposition) => disposition,
+            Some(disposition) => Some(disposition),
             None => {
                 queue_timeout_warning();
-                KeyDisposition::Forward
+                None
             }
         }
     } else {
-        KeyDisposition::Forward
+        None
     };
+    let disposition = NATIVE_DECISIONS.with(|decisions| {
+        let mut current = decisions.get();
+        let disposition = current.resolve(info.vkCode, state, disposition);
+        decisions.set(current);
+        disposition
+    });
     crate::support::perf_probe::mark_correlated("disposition_returned", correlation_id);
     let virtual_key = info.vkCode as u16;
     let mask_menu = FORWARDED_ALT.with(|alt| {
@@ -889,6 +1061,142 @@ mod tests {
     use super::*;
     use std::hint::black_box;
     use std::time::Instant;
+
+    #[test]
+    fn native_timeout_preserves_consumed_repeat_and_release() {
+        let mut decisions = NativeKeyDecisions::default();
+        let d = 0x44;
+        assert_eq!(
+            decisions.resolve(d, KeyState::Down, Some(KeyDisposition::Consume)),
+            KeyDisposition::Consume
+        );
+        assert_eq!(
+            decisions.resolve(d, KeyState::Down, None),
+            KeyDisposition::Consume
+        );
+        assert_eq!(
+            decisions.resolve(d, KeyState::Up, None),
+            KeyDisposition::Consume
+        );
+        // A new press has no cached decision and still fails open.
+        assert_eq!(
+            decisions.resolve(d, KeyState::Down, None),
+            KeyDisposition::Forward
+        );
+        // The engine may still remember Consume after its first response was
+        // late; native pairing follows the press actually delivered to Windows.
+        assert_eq!(
+            decisions.resolve(d, KeyState::Down, Some(KeyDisposition::Consume)),
+            KeyDisposition::Forward
+        );
+        assert_eq!(
+            decisions.resolve(d, KeyState::Up, Some(KeyDisposition::Consume)),
+            KeyDisposition::Forward
+        );
+    }
+
+    #[test]
+    fn native_timeout_does_not_swallow_forwarded_or_unrelated_keys() {
+        let mut decisions = NativeKeyDecisions::default();
+        assert_eq!(
+            decisions.resolve(0x44, KeyState::Down, Some(KeyDisposition::Consume)),
+            KeyDisposition::Consume
+        );
+        assert_eq!(
+            decisions.resolve(0x41, KeyState::Down, Some(KeyDisposition::Forward)),
+            KeyDisposition::Forward
+        );
+        assert_eq!(
+            decisions.resolve(0x41, KeyState::Down, None),
+            KeyDisposition::Forward
+        );
+        assert_eq!(
+            decisions.resolve(0x41, KeyState::Up, None),
+            KeyDisposition::Forward
+        );
+        assert_eq!(
+            decisions.resolve(0x44, KeyState::Up, None),
+            KeyDisposition::Consume
+        );
+    }
+
+    #[test]
+    fn a_disconnected_hook_backs_off_failed_recovery() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(sender);
+        let mut hook = HookThread {
+            receiver,
+            mailbox: Arc::new(DispositionMailbox::default()),
+            injection: Arc::new(InjectionQueue::default()),
+            pending: None,
+            thread_id: 0,
+            worker: None,
+            retry_after: Some(Instant::now() + Duration::from_secs(30)),
+        };
+        assert!(hook.next_event().is_none());
+        assert!(
+            hook.worker.is_none(),
+            "backoff must not spawn a native thread"
+        );
+    }
+
+    #[test]
+    #[ignore = "native hook lifecycle; run alone, waits for the 30-second recovery timer"]
+    fn native_hook_recovers_removed_handles_and_session_state() {
+        let mut hook = HookThread::start().unwrap();
+        let thread_id = hook.thread_id;
+        super::super::native::post_thread_message(thread_id, TEST_RETIRE_HOOKS_MESSAGE, 0).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(35);
+        while !TEST_HOOKS_RETIRED.load(Ordering::Acquire)
+            || TEST_RENEWALS.load(Ordering::Acquire) == 0
+        {
+            assert!(
+                Instant::now() < deadline,
+                "periodic renewal did not replace removed hooks"
+            );
+            if matches!(hook.next_event(), Some(BackendEvent::Input(_))) {
+                hook.set_disposition(KeyDisposition::Forward).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            hook.thread_id, thread_id,
+            "renewal must reuse the owner thread"
+        );
+        request_renewal(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "session recovery did not reset input state"
+            );
+            match hook.next_event() {
+                Some(BackendEvent::InputCaptureLost(_)) => break,
+                Some(BackendEvent::Input(_)) => {
+                    hook.set_disposition(KeyDisposition::Forward).unwrap()
+                }
+                _ => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        // Exercise the distinct stopped-worker path, not just handle renewal.
+        hook.stop().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "disconnected hook was not restarted"
+            );
+            match hook.next_event() {
+                Some(BackendEvent::InputCaptureLost(_)) => break,
+                Some(BackendEvent::Input(_)) => {
+                    hook.set_disposition(KeyDisposition::Forward).unwrap()
+                }
+                _ => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        assert_ne!(hook.thread_id, 0);
+        hook.stop().unwrap();
+    }
 
     fn percentiles(mut samples: Vec<u128>) -> (u128, u128, u128) {
         samples.sort_unstable();
@@ -996,6 +1304,7 @@ mod tests {
             pending: Some(generation),
             thread_id: 0,
             worker: None,
+            retry_after: None,
         };
 
         hook.set_disposition(KeyDisposition::Consume).unwrap();
@@ -1007,11 +1316,11 @@ mod tests {
     }
 
     #[test]
-    fn a_timed_out_disposition_is_nonfatal() {
+    fn a_timed_out_disposition_rejects_late_acknowledgement() {
         let (_event_tx, event_rx) = mpsc::channel();
         let mailbox = Arc::new(DispositionMailbox::default());
         let generation = mailbox.begin();
-        let _newer = mailbox.begin();
+        assert_eq!(mailbox.wait(generation, Duration::ZERO), None);
         let mut hook = HookThread {
             receiver: event_rx,
             mailbox,
@@ -1019,9 +1328,10 @@ mod tests {
             pending: Some(generation),
             thread_id: 0,
             worker: None,
+            retry_after: None,
         };
 
-        hook.set_disposition(KeyDisposition::Forward).unwrap();
+        assert!(hook.set_disposition(KeyDisposition::Forward).is_err());
         assert!(hook.pending.is_none());
     }
 
