@@ -57,13 +57,12 @@ impl ScanSession {
     pub(super) fn append_targets(&mut self, targets: Vec<UiTarget>) -> bool {
         let before = self.scanned.len();
 
-        // Take the first small platform batch by ownership. A retained session
-        // buffer is already cheaper to refill by move.
+        // Take the first platform batch by ownership. Large buffers are still
+        // released on exit; retained small buffers are cheaper to refill.
         if self.scanned.is_empty()
             && self.scanned.capacity() == 0
             && self.seen_targets.is_empty()
             && !self.search_names_initialized
-            && targets.len() <= MAX_IDLE_RETAINED_TARGETS
         {
             self.scanned = targets;
             self.scanned.retain(|target| {
@@ -72,23 +71,29 @@ impl ScanSession {
             });
             self.seen_targets.reserve(self.scanned.len());
 
-            let mut index = 0;
-            while index < self.scanned.len() {
+            let mut retained = 0;
+            for index in 0..self.scanned.len() {
                 let key = target_key(&self.scanned[index]);
-                let duplicate = self.seen_targets.get(&key).is_some_and(|indices| {
+                let indices = self.seen_targets.entry(key).or_default();
+                let duplicate = {
                     indices.iter().any(|&existing_index| {
                         let existing = &self.scanned[existing_index];
                         let candidate = &self.scanned[index];
                         existing.name == candidate.name && existing.role == candidate.role
                     })
-                });
-                if duplicate {
-                    self.scanned.remove(index);
-                } else {
-                    self.seen_targets.entry(key).or_default().push(index);
-                    index += 1;
+                };
+                if !duplicate {
+                    // Compact in source order without shifting the remaining
+                    // batch for each duplicate. Indices always refer to the
+                    // retained prefix, so later duplicates see canonical data.
+                    if retained != index {
+                        self.scanned.swap(retained, index);
+                    }
+                    indices.push(retained);
+                    retained += 1;
                 }
             }
+            self.scanned.truncate(retained);
             return !self.scanned.is_empty();
         }
 
@@ -122,12 +127,13 @@ impl ScanSession {
             return false;
         }
         let key = target_key(&target);
-        let duplicate = self.seen_targets.get(&key).is_some_and(|indices| {
+        let indices = self.seen_targets.entry(key).or_default();
+        let duplicate = {
             indices.iter().any(|&index| {
                 let existing = &self.scanned[index];
                 existing.name == target.name && existing.role == target.role
             })
-        });
+        };
         if duplicate {
             return false;
         }
@@ -136,7 +142,7 @@ impl ScanSession {
             self.scanned_names_lower.push(target.name.to_lowercase());
         }
         self.scanned.push(target);
-        self.seen_targets.entry(key).or_default().push(index);
+        indices.push(index);
         true
     }
 }
@@ -149,4 +155,48 @@ fn target_key(target: &UiTarget) -> (i64, i64, i64, i64) {
         (rect.width * 4.0).round() as i64,
         (rect.height * 4.0).round() as i64,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owned_batches_preserve_first_occurrence_order_and_collision_indices() {
+        for count in [24, 128, 129, 500, 2_000] {
+            let mut targets = Vec::new();
+            let mut expected = Vec::new();
+            for index in 0..count {
+                let target = UiTarget {
+                    rect: Rect::new((index % 10) as f64, 0.0, 1.0, 1.0),
+                    name: format!("Target {index}"),
+                    role: "button".into(),
+                    native_role: None,
+                };
+                expected.push(target.clone());
+                targets.push(target.clone());
+                let mut duplicate = target;
+                duplicate.native_role = Some("same semantic target".into());
+                targets.push(duplicate);
+            }
+            let original_storage = targets.as_ptr();
+            let mut session = ScanSession::default();
+            assert!(session.append_targets(targets));
+            assert_eq!(session.scanned.as_ptr(), original_storage);
+            assert_eq!(session.scanned, expected);
+            for indices in session.seen_targets.values() {
+                for &index in indices {
+                    assert_eq!(session.scanned[index], expected[index]);
+                }
+            }
+            session.ensure_search_names();
+            // Later partials use the append path and the same canonical index.
+            assert!(!session.append_targets(expected.clone()));
+            assert_eq!(session.scanned, expected);
+            assert_eq!(session.scanned_names_lower.len(), count);
+            session.clear_results(true);
+            assert!(session.scanned.is_empty());
+            assert!(session.scanned.capacity() <= MAX_IDLE_RETAINED_TARGETS);
+        }
+    }
 }

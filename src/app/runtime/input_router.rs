@@ -14,6 +14,12 @@ pub(super) struct ChordContinuation {
 
 #[derive(Debug, Clone)]
 pub(super) struct CompiledBinding {
+    pub chord: KeyChord,
+    pub binding: Arc<Binding>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct CompiledPrefix {
     pub chord: Arc<KeyChord>,
     pub binding: Arc<Binding>,
     pub continuations: Arc<[ChordContinuation]>,
@@ -22,7 +28,7 @@ pub(super) struct CompiledBinding {
 #[derive(Debug, Clone, Default)]
 pub(super) struct CompiledKeymap {
     by_activation: BTreeMap<Key, Vec<CompiledBinding>>,
-    has_prefixes: bool,
+    prefixes: BTreeMap<Key, Vec<CompiledPrefix>>,
 }
 
 impl CompiledKeymap {
@@ -46,9 +52,8 @@ impl CompiledKeymap {
             return;
         }
         entries.push(CompiledBinding {
-            chord: Arc::new(chord),
+            chord,
             binding: Arc::new(binding),
-            continuations: Arc::from([]),
         });
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.chord.keys().len()));
     }
@@ -62,8 +67,18 @@ impl CompiledKeymap {
             .values()
             .flatten()
             .filter(|entry| !matches!(entry.binding.as_ref(), Binding::Disabled))
+            .filter(|entry| {
+                entry
+                    .chord
+                    .keys()
+                    .iter()
+                    .filter(|key| !key.is_modifier())
+                    .take(2)
+                    .count()
+                    == 2
+            })
             .map(move |entry| ChordContinuation {
-                chord: entry.chord.clone(),
+                chord: Arc::new(entry.chord.clone()),
                 binding: entry.binding.clone(),
                 owner: owner.clone(),
             })
@@ -73,10 +88,10 @@ impl CompiledKeymap {
     /// A continuation must end with a new completion key. Adding modifiers
     /// after the activation key is not an ordered chord continuation.
     pub fn compile_prefixes(&mut self, candidates: &[ChordContinuation]) {
-        self.has_prefixes = false;
-        for entry in self.by_activation.values_mut().flatten() {
+        self.prefixes.clear();
+        for entry in self.by_activation.values().flatten() {
             let short = &entry.chord;
-            entry.continuations = candidates
+            let mut continuations = candidates
                 .iter()
                 .filter(|long| {
                     !short.activation_key().is_modifier()
@@ -92,18 +107,27 @@ impl CompiledKeymap {
                         })
                 })
                 .cloned()
-                .collect();
-            self.has_prefixes |= !entry.continuations.is_empty();
+                .peekable();
+            if continuations.peek().is_some() {
+                self.prefixes
+                    .entry(short.activation_key().clone())
+                    .or_default()
+                    .push(CompiledPrefix {
+                        chord: Arc::new(short.clone()),
+                        binding: entry.binding.clone(),
+                        continuations: continuations.collect(),
+                    });
+            }
         }
     }
 
-    pub fn prefix_entry(&self, key: &Key, binding: &Arc<Binding>) -> Option<&CompiledBinding> {
-        if !self.has_prefixes {
-            return None;
-        }
-        self.find_entry(key, |entry| {
-            Arc::ptr_eq(&entry.binding, binding) && !entry.continuations.is_empty()
-        })
+    pub fn prefix_entry(&self, key: &Key, binding: &Arc<Binding>) -> Option<&CompiledPrefix> {
+        // Only non-modifier activation keys can prefix a longer chord.
+        // Unrelated keys never search the full keymap.
+        self.prefixes
+            .get(key)?
+            .iter()
+            .find(|entry| Arc::ptr_eq(&entry.binding, binding))
     }
 
     pub fn contains_chord(&self, chord: &KeyChord) -> bool {

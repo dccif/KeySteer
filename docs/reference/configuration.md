@@ -42,7 +42,19 @@ keysteer --check --config keysteer.user.toml
 space = "idle"
 ```
 
-所有未写的字段都会保留默认值。建议在默认配置的基础上进行修改。
+未写的字段保留默认值，但显式提供 `[normal.bindings]` 等绑定表会整体替换对应默认表；删除或改绑的插件快捷键不会被内部默认值补回。建议复制完整默认配置再修改。用户 profile 优先于 default 文件，二者不逐项合并。
+
+保存后点击状态栏菜单的 Reload Configuration 即可生效，程序回到 Idle，再使用启动键进入 Normal。`left_shift = "slow"` 表示按住减速；改为 `shift = "slow_toggle"` 可用任一 Shift 点按切换减速。若保留 `right_shift = "middle_click"`，右 Shift 的专用绑定仍优先。
+
+也可在已有的 `[normal.bindings]` 中加入数字速度档位：
+
+```toml
+"1" = "precision_toggle"
+"2" = "slow_toggle"
+"3" = "fast_toggle"
+```
+
+点按选择精确、慢速或快速档；再按同一个键恢复正常速度，按另一个键直接换档。倍率由 `[pointer]` 的 `precision_multiplier`、`slow_multiplier`、`fast_multiplier` 控制。Grid 等标签模式仍优先把数字作为标签输入。
 
 ## 配置结构
 
@@ -69,10 +81,10 @@ space = "idle"
 ```toml
 [normal.bindings]
 "primary+s" = "screen next"
-"primary+s+d" = "move_window next"
+"primary+d" = "move_window next"
 ```
 
-松开 `Primary+S` 只切换鼠标所在显示器；保持它并按 D 才移动窗口。可改成
+`Primary+S` 切换鼠标所在显示器，`Primary+D` 移动窗口。若自行将窗口移动改绑为 `primary+s+d`，则保持 `Primary+S` 并按 D 移动窗口，只松开短组合才切换鼠标显示器。可改成
 `move_window previous` 或 `move_window 2`，也可使用任意其他组合键。最后一个非修饰键是完成键，
 运行时会自动仲裁，不需要配置等待时间，也无需修改插件；`none`、按应用覆盖、继承及左右修饰键限制均参与判断。
 

@@ -413,15 +413,13 @@ impl NormalMode {
                 self.refresh_multiplier();
             }
 
-            Binding::SpeedToggle(speed) => {
-                if pressed {
-                    self.toggled_speed = (self.toggled_speed != Some(*speed)).then_some(*speed);
-                    self.refresh_multiplier();
-                    out.push(Command::SetSpeedToggle {
-                        speed: *speed,
-                        active: self.toggled_speed == Some(*speed),
-                    });
-                }
+            Binding::SpeedToggle(speed) if pressed => {
+                self.toggled_speed = (self.toggled_speed != Some(*speed)).then_some(*speed);
+                self.refresh_multiplier();
+                out.push(Command::SetSpeedToggle {
+                    speed: *speed,
+                    active: self.toggled_speed == Some(*speed),
+                });
             }
 
             // The engine handles every other verb before it reaches a mode.
@@ -496,23 +494,33 @@ impl Mode for NormalMode {
     fn handle(&mut self, event: &ModeEvent, _ctx: &HostContext<'_>) -> CommandBatch {
         match event {
             ModeEvent::Activated { .. } => {
+                let selected = self.toggled_speed;
                 self.release_all();
                 // Draw an empty scene so the engine can attach the indicator.
-                CommandBatch::Two(
-                    Command::SetSpeedToggle {
-                        speed: Speed::Fast,
+                let mut out = CommandBatch::new();
+                if let Some(speed) = selected {
+                    out.push(Command::SetSpeedToggle {
+                        speed,
                         active: false,
-                    },
-                    Command::show_overlay(crate::api::overlay::OverlayScene::new()),
-                )
+                    });
+                }
+                out.push(Command::show_overlay(
+                    crate::api::overlay::OverlayScene::new(),
+                ));
+                out
             }
             ModeEvent::Deactivated => {
+                let selected = self.toggled_speed;
                 self.release_all();
-                Command::SetSpeedToggle {
-                    speed: Speed::Fast,
-                    active: false,
+                if let Some(speed) = selected {
+                    Command::SetSpeedToggle {
+                        speed,
+                        active: false,
+                    }
+                    .into()
+                } else {
+                    CommandBatch::new()
                 }
-                .into()
             }
             ModeEvent::Binding {
                 binding,
@@ -991,6 +999,35 @@ mod tests {
             }
         )));
         assert_eq!(mode.toggled_speed, None);
+    }
+
+    #[test]
+    fn default_activation_does_not_emit_speed_toggle_commands() {
+        let env = Env::new();
+        let mut mode = crate::app::mode_catalog::normal(&env.config);
+        let out = mode.handle(&ModeEvent::Activated { previous: None }, &env.ctx());
+        assert_eq!(out.iter().count(), 1);
+        assert!(
+            out.iter()
+                .all(|command| matches!(command, Command::ShowOverlay(_)))
+        );
+    }
+
+    #[test]
+    fn deactivation_clears_selected_speed_only_once() {
+        let env = Env::new();
+        let mut mode = crate::app::mode_catalog::normal(&env.config);
+        down(&mut mode, &env, Binding::SpeedToggle(Speed::Slow), "shift");
+        let out = mode.handle(&ModeEvent::Deactivated, &env.ctx());
+        assert!(out.iter().any(|command| matches!(
+            command,
+            Command::SetSpeedToggle {
+                speed: Speed::Slow,
+                active: false
+            }
+        )));
+        assert_eq!(mode.multiplier(), 1.0);
+        assert!(mode.handle(&ModeEvent::Deactivated, &env.ctx()).is_empty());
     }
 
     #[test]

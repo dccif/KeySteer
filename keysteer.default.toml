@@ -222,7 +222,7 @@ f = "recursive_grid"
 # window and keeps its position inside it. Use `move_window previous` or
 # `move_window 2` for custom bindings.
 "primary+s" = "screen next"
-"primary+s+d" = "move_window next"
+"primary+d" = "move_window next"
 
 # Optional Vim-style arrow keys sent to the focused application. Bare hjkl
 # continue to move the pointer; the more specific Primary chords send arrows.

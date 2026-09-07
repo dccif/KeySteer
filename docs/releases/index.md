@@ -1,5 +1,11 @@
 # 更新日志 / Release Notes
 
+## 0.9.18
+
+修复状态栏 Reload Configuration 后新配置的按键路由丢失，保存并重载后无需退出程序。
+
+Fixed lost key routes after Reload Configuration, so saved settings take effect without quitting. 
+
 ## 0.9.17
 
 新增 `precision_toggle`、`slow_toggle` 和 `fast_toggle` 速度模式切换功能，按下即可进入速度模式，无需持续按住。

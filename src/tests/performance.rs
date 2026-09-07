@@ -127,8 +127,9 @@ fn warmed_compact_hint_assignment_reuses_two_thousand_labels() {
 
 fn owned_hint_delivery_stays_within_allocation_budget() {
     const TARGETS: usize = 2_000;
-    const MAX_ALLOCATIONS: usize = 16;
-    const MAX_BYTES: usize = 840_920;
+    const MAX_ALLOCATIONS: usize = 15;
+    // The first owned batch no longer allocates a second target array.
+    const MAX_BYTES: usize = 840_920 - TARGETS * std::mem::size_of::<UiTarget>();
 
     let config = Config::default();
     let palette = config.palette(Appearance::Dark);

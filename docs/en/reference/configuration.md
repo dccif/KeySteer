@@ -40,7 +40,19 @@ keysteer --check --config keysteer.user.toml
 space = "idle"
 ```
 
-Fields you do not specify retain their defaults. Starting with the shipped default configuration is recommended.
+Omitted fields retain their defaults, but an explicit bindings table such as `[normal.bindings]` replaces the corresponding default table. Removed or remapped plugin shortcuts are not restored from internal defaults. Start by copying the full default configuration. A user profile takes precedence over the default file; the two files are not merged.
+
+After saving, select Reload Configuration in the status menu. The program returns to Idle; use your launcher to enter Normal again. `left_shift = "slow"` slows movement while held. Use `shift = "slow_toggle"` to toggle slow movement with either Shift; a retained `right_shift = "middle_click"` binding still takes precedence for right Shift.
+
+You can also add number keys to your existing `[normal.bindings]` table:
+
+```toml
+"1" = "precision_toggle"
+"2" = "slow_toggle"
+"3" = "fast_toggle"
+```
+
+Tap to select precision, slow, or fast speed. Press the same key again to return to normal speed, or another key to switch levels. Configure the ratios with `precision_multiplier`, `slow_multiplier`, and `fast_multiplier` in `[pointer]`. Label modes such as Grid still give label input priority over these number bindings.
 
 ## Configuration structure
 
@@ -65,10 +77,10 @@ The engine compiles chord relationships when configuration is loaded. Built-in a
 ```toml
 [normal.bindings]
 "primary+s" = "screen next"
-"primary+s+d" = "move_window next"
+"primary+d" = "move_window next"
 ```
 
-Release `Primary+S` to switch the pointer display; keep it held and press D to move the window. Use `move_window previous` or `move_window 2` for another destination, and bind any of them to another chord. The final non-modifier key completes the chord. No timeout or plugin changes are needed. Inheritance, per-app overrides, `none`, and modifier sides are respected.
+`Primary+S` switches the pointer display; `Primary+D` moves the window. If you remap window movement to `primary+s+d`, hold `Primary+S` and press D to move the window, or release the short chord to switch the pointer display. Use `move_window previous` or `move_window 2` for another destination. The final non-modifier key completes the chord. No timeout or plugin changes are needed. Inheritance, per-app overrides, `none`, and modifier sides are respected.
 
 Mode changes and successful configuration reloads cancel pending actions. Standalone modifiers remain immediate.
 A continuous action used as an ambiguous prefix receives one Down/Up tap on release; use independent keys for movement, long-press clicks, and toggle gestures.

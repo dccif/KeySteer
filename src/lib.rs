@@ -40,10 +40,19 @@ pub(crate) mod support;
 #[doc(hidden)]
 pub mod benchmark {
     pub use crate::api::{
-        Appearance, Binding, Command, CommandBatch, Direction, HostContext, Key, KeyState,
-        LabelDirection, Mode, ModeEvent, Point, Rect, Screen, UiScanResult, UiScanStatus, UiTarget,
+        Appearance, Backend, BackendEvent, Binding, ButtonAction, Command, CommandBatch, Direction,
+        FocusedApp, HostContext, InputEvent, Key, KeyDisposition, KeyState, LabelDirection, Mode,
+        ModeEvent, MouseButton, OverlayScene, Point, Rect, Screen, UiScanRequest, UiScanResult,
+        UiScanStatus, UiTarget,
     };
     pub use crate::config::Config;
+
+    pub fn engine(config: &Config) -> Result<crate::app::runtime::Engine, String> {
+        crate::app::runtime::Engine::from_plan(
+            crate::app::configuration::compile(config)?,
+            Appearance::Dark,
+        )
+    }
 
     pub fn hint(config: &Config) -> crate::modes::HintMode {
         crate::app::mode_catalog::hint(config)

@@ -9,7 +9,13 @@ use keysteer::benchmark::{
 const SAMPLES: usize = 20_000;
 const CALLS_PER_SAMPLE: usize = 1_000;
 
+#[path = "support/runtime.rs"]
+mod runtime;
+
 fn main() -> Result<(), String> {
+    if std::env::args().any(|arg| arg == "--runtime") {
+        return runtime::run();
+    }
     benchmark_normal_frame()?;
     benchmark_hint_owned_delivery()?;
     Ok(())
@@ -31,7 +37,11 @@ fn benchmark_hint_owned_delivery() -> Result<(), String> {
         palette: &palette,
     };
 
-    for targets in [24, 64, 100, 128, 500, 2_000] {
+    let small_only = std::env::args().any(|arg| arg == "--hint-small");
+    for targets in [24, 64, 100, 128, 500, 2_000]
+        .into_iter()
+        .filter(|targets| !small_only || *targets <= 64)
+    {
         let mut samples = Vec::with_capacity(SAMPLES);
         for _ in 0..SAMPLES {
             samples.push(measure_hint_owned_delivery(&config, &context, targets));

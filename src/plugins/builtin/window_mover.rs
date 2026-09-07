@@ -24,7 +24,7 @@ impl WindowMover {
             .with_description("Move the window under the pointer to another display")
             .with_verb(VERB)
             .with_default_binding(
-                KeyChord::parse_with_aliases("primary+s+d", aliases)?,
+                KeyChord::parse_with_aliases("primary+d", aliases)?,
                 Binding::Invoke {
                     verb: VERB.into(),
                     args: vec!["next".into()],

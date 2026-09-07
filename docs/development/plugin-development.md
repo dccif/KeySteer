@@ -139,7 +139,7 @@ pub fn bundled_plugins(config: &ConfigFile) -> Result<Vec<Box<dyn Plugin>>, Stri
 }
 ```
 
-catalog 编译 `RuntimePlan` 时会校验 Manifest、注册动词和 Mode，并合并默认绑定：**插件的 `default_chords` 与 `default_bindings` 都只填补 `normal` 中仍为空的位置，绝不覆盖用户已经配置的键位**。注册失败不是可静默忽略的配置问题：它会中止启动，使 Manifest 错误能被立刻发现。当前插件随仓库编译，不承诺外部动态加载 API 版本兼容。
+catalog 编译 `RuntimePlan` 时会校验 Manifest、注册动词和 Mode。运行计划以配置绑定为准，不注入 Manifest 建议，避免恢复用户删除或改绑的快捷键；随程序发布的默认键位必须同时写入配置默认值和 `keysteer.default.toml`。单独调用动态注册 API 时，`default_chords` 与 `default_bindings` 仅填补 `normal` 中仍为空的位置。注册失败会中止启动，使 Manifest 错误能被立刻发现。当前插件随仓库编译，不承诺外部动态加载 API 版本兼容。
 
 ## 内置示例：Screen Selector
 

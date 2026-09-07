@@ -31,6 +31,7 @@ pub(super) struct ModeRegistry {
     pub(super) active: ModeId,
     pub(super) active_slot: Option<usize>,
     pub(super) binding_profile_key: Vec<Bindings>,
+    pub(super) prefixes_require_modifier: bool,
     #[cfg(test)]
     pub(super) table_rebuild_count: usize,
     pub(super) plugin_bindings: Vec<(KeyChord, Binding)>,
@@ -47,6 +48,7 @@ impl Default for ModeRegistry {
             active: ModeId::idle(),
             active_slot: None,
             binding_profile_key: Vec::new(),
+            prefixes_require_modifier: true,
             #[cfg(test)]
             table_rebuild_count: 0,
             plugin_bindings: Vec::new(),
@@ -237,32 +239,38 @@ impl Engine {
         &mut self,
         plugin: Box<dyn crate::api::plugin::Plugin>,
     ) -> Result<(), String> {
-        self.register_plugin_dyn_inner(plugin, true)
+        self.register_plugin_dyn_inner(plugin, true, true)
     }
 
     pub(crate) fn register_plugin_dyn_deferred(
         &mut self,
         plugin: Box<dyn crate::api::plugin::Plugin>,
     ) -> Result<(), String> {
-        self.register_plugin_dyn_inner(plugin, false)
+        // A compiled plan already contains the complete configured keymap.
+        // Reintroducing manifest suggestions here would resurrect keys that
+        // the user removed or remapped in their bindings table.
+        self.register_plugin_dyn_inner(plugin, false, false)
     }
 
     fn register_plugin_dyn_inner(
         &mut self,
         plugin: Box<dyn crate::api::plugin::Plugin>,
         rebuild: bool,
+        include_suggestions: bool,
     ) -> Result<(), String> {
         plugin.manifest().validate()?;
         let id = plugin.id();
 
-        for chord in plugin.manifest().default_chords.clone() {
+        if include_suggestions {
+            for chord in plugin.manifest().default_chords.clone() {
+                self.registry
+                    .plugin_bindings
+                    .push((chord, Binding::Mode(id.clone())));
+            }
             self.registry
                 .plugin_bindings
-                .push((chord, Binding::Mode(id.clone())));
+                .extend(plugin.manifest().default_bindings.clone());
         }
-        self.registry
-            .plugin_bindings
-            .extend(plugin.manifest().default_bindings.clone());
         for verb in plugin.manifest().verbs.clone() {
             if let Some(existing) = self.registry.plugin_verbs.insert(verb.clone(), id.clone()) {
                 return Err(RuntimeError::Fatal(format!(
@@ -374,6 +382,13 @@ impl Engine {
             .tables()
             .flat_map(|(owner, table)| table.continuation_candidates(owner))
             .collect();
+        self.registry.prefixes_require_modifier = continuations.iter().all(|candidate| {
+            candidate
+                .chord
+                .keys()
+                .iter()
+                .any(crate::api::Key::is_modifier)
+        });
         for id in self.binding_mode_ids() {
             if let Some(table) = self.registry.table_mut_or_default(&id) {
                 table.compile_prefixes(&continuations);

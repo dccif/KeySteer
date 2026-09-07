@@ -466,9 +466,9 @@ fn explicit_config_reload_remains_pinned_to_its_path() {
         "[pointer]\ninitial_speed = 999\n",
     )
     .unwrap();
-    std::fs::write(&explicit_path, "[pointer]\ninitial_speed = 456\n").unwrap();
+    std::fs::write(&explicit_path, "[pointer]\ninitial_speed = 456\n[hotkeys]\nf8 = \"normal\"\n").unwrap();
     let (mut backend, _) = FakeBackend::new(vec![]);
-    engine.reload_config(&mut backend).unwrap();
+    engine.handle_backend_event(BackendEvent::ReloadConfig, &mut backend).unwrap();
 
     let active = Config::parse(
         &engine
@@ -481,6 +481,32 @@ fn explicit_config_reload_remains_pinned_to_its_path() {
     .unwrap();
     assert_eq!(active.pointer.initial_speed, 456.0);
     assert_eq!(engine.configuration_source_path().unwrap(), explicit_path);
+    assert!(engine.registry.routes.contains_key(&ModeId::idle()));
+    assert!(engine.registry.routes.contains_key(&ModeId::normal()));
+    for event in [key_down("f8"), key_up("f8")] {
+        engine.handle_backend_event(event, &mut backend).unwrap();
+    }
+    assert_eq!(engine.active_mode(), &ModeId::normal());
+
+    // Repeated status-menu reloads replace both mode bindings and plugin verbs.
+    for speed in ["slow_toggle", "fast_toggle"] {
+        std::fs::write(&explicit_path, format!(
+            "[hotkeys]\nf8 = \"normal\"\n[normal.bindings]\nshift = \"{speed}\"\n\"primary+x\" = \"move_window next\"\n"
+        )).unwrap();
+        engine.handle_backend_event(BackendEvent::ReloadConfig, &mut backend).unwrap();
+        assert_eq!(engine.active_mode(), &ModeId::idle());
+        assert_eq!(engine.overlay.speed_toggle, None);
+        assert_eq!(engine.bindings_in(&ModeId::normal()).len(), 2);
+        for event in [key_down("f8"), key_up("f8"), key_down("left_shift"), key_up("left_shift")] {
+            engine.handle_backend_event(event, &mut backend).unwrap();
+        }
+        let expected = if speed == "slow_toggle" { crate::api::binding::Speed::Slow } else { crate::api::binding::Speed::Fast };
+        assert_eq!(engine.overlay.speed_toggle, Some(expected));
+        for event in [key_down("left_shift"), key_up("left_shift")] {
+            engine.handle_backend_event(event, &mut backend).unwrap();
+        }
+        assert_eq!(engine.overlay.speed_toggle, None);
+    }
 
     std::fs::remove_dir_all(directory).unwrap();
 }

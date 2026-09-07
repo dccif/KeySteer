@@ -1,5 +1,9 @@
 # Release notes
 
+## 0.9.18
+
+Fixed lost key routes after Reload Configuration, so saved settings take effect without quitting. 
+
 ## 0.9.17
 
 Added tap-to-toggle speed actions: `precision_toggle`, `slow_toggle`, and `fast_toggle` latch a speed on the first press and clear it on the next press. The active speed appears below the mode indicator. Parameterless `toggle` is decoupled from speed state, so both `n+Shift` and `Shift+n` preserve the existing combination-key behavior without re-running or clearing the speed action.

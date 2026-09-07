@@ -889,13 +889,10 @@ impl Engine {
 
         self.settings = settings;
         self.palettes = palettes;
-        self.registry.routes = routes;
         self.palette = self.palettes.for_appearance(self.appearance);
         self.focused_app_excluded = self.excluded_app_matches(self.focused_app.as_ref());
-        self.registry = ModeRegistry::default();
-        self.registry.plugin_bindings.clear();
-        self.registry.plugin_verbs.clear();
-        self.registry.active_slot = None;
+        self.registry = ModeRegistry::with_routes(routes);
+        crate::support::logging::set_non_error_enabled(self.settings.debug.enabled);
         for spec in modes {
             match spec.instance {
                 ModeInstance::BuiltIn(mode) => self.register_deferred(mode),
@@ -1266,8 +1263,11 @@ impl Engine {
                 }
 
                 Command::SetSpeedToggle { speed, active } => {
-                    self.overlay.speed_toggle = active.then_some(speed);
-                    self.refresh_overlay(backend)?;
+                    let selected = active.then_some(speed);
+                    if self.overlay.speed_toggle != selected {
+                        self.overlay.speed_toggle = selected;
+                        self.refresh_overlay(backend)?;
+                    }
                 }
 
                 Command::ShowOverlay(scene) => self.show_overlay(scene, backend)?,

@@ -13,6 +13,17 @@ pub(super) struct PendingChord {
 
 impl Engine {
     fn continuation_is_available(&self, short: &KeyChord, candidate: &ChordContinuation) -> bool {
+        // Reject missing modifiers before cloning any pressed keys.
+        if candidate.chord.keys().iter().any(|key| {
+            key.is_modifier()
+                && !self
+                    .input
+                    .pressed
+                    .iter()
+                    .any(|physical| Self::keys_match(key, physical))
+        }) {
+            return false;
+        }
         // A generic short modifier must not promise a continuation on the
         // opposite physical side (right Alt held, left Alt required).
         if short.keys().iter().any(|key| {
@@ -48,6 +59,11 @@ impl Engine {
     }
 
     pub(super) fn defer_prefix_chord(&mut self, resolved: &ResolvedBinding, key: &Key) -> bool {
+        if self.registry.prefixes_require_modifier
+            && !self.input.pressed.iter().any(Key::is_modifier)
+        {
+            return false;
+        }
         let Some(entry) = self
             .registry
             .table(&resolved.owner)

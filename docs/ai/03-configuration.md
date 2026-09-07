@@ -88,6 +88,8 @@ warning，不是解析错误。
 `registry::rebuild_tables` 在应用覆盖、插件默认绑定合并后编译严格超集的 continuation 关系。
 只有增加了新完成键的长组合才构成前缀冲突；单独修饰键保持原来的即时语义。Engine 用同一个
 resolver 检查候选在当前继承、temporary mode、`none` 和修饰键侧别下是否有效。
+候选要求的修饰键必须已经按下；例如没有按 Primary 时，裸 `s` 不等待 `primary+s+d`，移动立即开始。
+裸键长组合仍使用同一仲裁规则。
 匹配短组合后消费输入并保存 Arc 候选；长组合完成时取消短组合，任一短组合成员释放时才执行
 仍挂起的短动作。嵌套前缀使用同一规则，不使用固定延迟、timer 或全表逐键扫描。
 
@@ -134,7 +136,11 @@ Engine 为每个 Mode 编译有效 keymap：
 2. 按 `inherits` 给出的顺序查找父 Mode。
 3. `none` 显式屏蔽继承项。
 4. 当前应用匹配的 `app_configs` 覆盖合并结果。
-5. 插件建议的默认 chord 只填补 `normal` 中仍为空的位置，不覆盖用户配置。
+5. 编译的运行计划仅使用配置中的绑定，不重新注入插件 Manifest 的建议键位。动态注册插件时，建议 chord 只填补 `normal` 中仍为空的位置。
+
+显式提供 `[normal.bindings]` 等绑定表时，该表整体替换内置表；未提供的字段才使用默认值。
+用户 profile 与 default 文件是选择关系，不逐项叠加。修改或删除插件快捷键后，启动和 Reload
+均不得恢复 Manifest 中的旧键位。随程序编译的插件统一注册，不扫描绑定来推断插件是否被使用。
 
 `temporary_mode`/`temporary_mode_keys` 允许 targeting mode 暂时使用另一个 Mode（默认为
 Normal）的绑定，而不销毁当前选择路径。
