@@ -387,10 +387,14 @@ pub(crate) fn build_visual_layer_plan(
     }
 
     let mut graph = ConflictGraph::new(placements.len());
-    for right in 1..placements.len() {
-        for left in 0..right {
-            if visually_stacked(placements[left].1, placements[right].1) {
-                graph.add_edge(left, right);
+    let swept =
+        placements.len() >= 32 && inline_sweep_edges(placements, &visually_stacked, &mut graph);
+    if !swept {
+        for right in 1..placements.len() {
+            for left in 0..right {
+                if visually_stacked(placements[left].1, placements[right].1) {
+                    graph.add_edge(left, right);
+                }
             }
         }
     }
@@ -441,6 +445,48 @@ pub(crate) fn build_visual_layer_plan(
         &packed_component_layers,
         global_layer_count,
     );
+}
+
+/// Use the same X-axis rejection as the wide plan, with inline byte indices.
+/// Invalid geometry keeps the exhaustive predicate path unchanged.
+fn inline_sweep_edges(
+    placements: &[(usize, Rect)],
+    visually_stacked: &impl Fn(Rect, Rect) -> bool,
+    graph: &mut ConflictGraph,
+) -> bool {
+    if !placements.iter().all(|(_, rect)| {
+        rect.x.is_finite()
+            && rect.y.is_finite()
+            && rect.width.is_finite()
+            && rect.height.is_finite()
+            && rect.width >= 0.0
+            && rect.height >= 0.0
+    }) {
+        return false;
+    }
+    debug_assert!(placements.len() <= INLINE_LABELS);
+    let mut order: SmallVec<[u8; INLINE_LABELS]> = (0..placements.len() as u8).collect();
+    order.sort_unstable_by(|left, right| {
+        placements[usize::from(*left)]
+            .1
+            .x
+            .total_cmp(&placements[usize::from(*right)].1.x)
+            .then_with(|| left.cmp(right))
+    });
+    let mut active: SmallVec<[u8; INLINE_LABELS]> = SmallVec::new();
+    for &right in &order {
+        let right_rect = placements[usize::from(right)].1;
+        active.retain(|left| placements[usize::from(*left)].1.right() >= right_rect.x);
+        for &left in &active {
+            let left_rect = placements[usize::from(left)].1;
+            if left_rect.intersect(&right_rect).is_some() && visually_stacked(left_rect, right_rect)
+            {
+                graph.add_edge(usize::from(left), usize::from(right));
+            }
+        }
+        active.push(right);
+    }
+    true
 }
 
 fn build_wide_plan(
@@ -1147,6 +1193,57 @@ mod tests {
         let mut invalid = sparse[..129].to_vec();
         invalid[64].1.x = f64::NAN;
         assert_matches_quadratic_reference(&invalid);
+    }
+
+    #[test]
+    fn inline_sweep_preserves_layers_for_sparse_dense_and_invalid_geometry() {
+        for count in [31, 32, 64, 100, 128] {
+            for pattern in 0..5 {
+                let placements: Vec<_> = (0..count)
+                    .map(|index| {
+                        let rect = match pattern {
+                            0 => Rect::new(index as f64 * 100.0, 0.0, 20.0, 20.0),
+                            1 => Rect::new((index / 2) as f64 * 100.0, 0.0, 20.0, 20.0),
+                            2 => Rect::new(index as f64 * 15.0, 0.0, 20.0, 20.0),
+                            3 => Rect::new(0.0, 0.0, 20.0, 20.0),
+                            _ => Rect::new(
+                                ((index * 73) % 101) as f64,
+                                ((index * 31) % 79) as f64,
+                                (index % 23) as f64,
+                                (index % 19) as f64,
+                            ),
+                        };
+                        (index, rect)
+                    })
+                    .collect();
+                assert_matches_quadratic_reference(&placements);
+            }
+            for bad in [f64::NAN, f64::INFINITY, -1.0] {
+                let mut placements: Vec<_> = (0..count)
+                    .map(|index| (index, Rect::new(index as f64 * 15.0, 0.0, 20.0, 20.0)))
+                    .collect();
+                placements[count / 2].1.width = bad;
+                assert_matches_quadratic_reference(&placements);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "allocation probe; run alone with --test-threads=1"]
+    fn inline_sweep_does_not_allocate() {
+        let placements: Vec<_> = (0..128)
+            .map(|index| (index, Rect::new(index as f64 * 15.0, 0.0, 20.0, 20.0)))
+            .collect();
+        let mut plan = VisualLayerPlan::default();
+        build_visual_layer_plan(&placements, placements.len(), overlap, &mut plan);
+        let region = stats_alloc::Region::new(crate::TEST_ALLOCATOR);
+        for _ in 0..1_000 {
+            build_visual_layer_plan(&placements, placements.len(), overlap, &mut plan);
+            std::hint::black_box(&plan);
+        }
+        let change = region.change();
+        assert_eq!(change.allocations, 0, "{change:?}");
+        assert_eq!(change.reallocations, 0, "{change:?}");
     }
 
     #[test]
