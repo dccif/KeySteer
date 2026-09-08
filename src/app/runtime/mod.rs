@@ -1042,6 +1042,8 @@ fn map_button(button: crate::api::binding::Button) -> MouseButton {
         crate::api::binding::Button::Left => MouseButton::Left,
         crate::api::binding::Button::Right => MouseButton::Right,
         crate::api::binding::Button::Middle => MouseButton::Middle,
+        crate::api::binding::Button::X1 => MouseButton::X1,
+        crate::api::binding::Button::X2 => MouseButton::X2,
     }
 }
 
@@ -1050,6 +1052,8 @@ const fn drag_button_bit(button: Button) -> u8 {
         Button::Left => 1 << 0,
         Button::Right => 1 << 1,
         Button::Middle => 1 << 2,
+        Button::X1 => 1 << 3,
+        Button::X2 => 1 << 4,
     }
 }
 

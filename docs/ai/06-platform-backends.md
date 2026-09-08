@@ -307,6 +307,9 @@ macOS 的 CGEvent 已携带系统转换好的 Unicode 文本：无需求时完�
 ## 鼠标侧键绑定
 
 `mouse_x1` / `mouse_x2` 是物理触发键（别名 `xbutton1`/`mouse4`、`xbutton2`/`mouse5`）。
+同名右值动作通过 `Binding::Click` 映射到 `MouseButton::X1/X2`；Windows 发送带
+`XBUTTON1/2` 的原生 XDOWN/XUP，macOS 发送按钮编号 3/4 的 OtherMouseDown/Up。
+成功合成点击沿用一次 `Clicked` 通知；显式 press/release/toggle 不产生该通知。
 Windows Hook 将 XBUTTON1/2 的 down/up、macOS Hook 将 OtherMouse 的按钮 3/4 边沿转换成
 普通 `BackendEvent::Input`，character 为空，复用现有绑定、继承、held gesture 和 disposition
 握手。平台缓存 canonical Key；忽略自身注入，原生侧保存实际消费决定，超时/跨模式松开

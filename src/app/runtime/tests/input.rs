@@ -772,7 +772,7 @@ fn a_semantic_click_notifies_the_active_mode() {
 
 #[test]
 fn every_semantic_click_notifies_once_but_press_release_and_toggle_do_not() {
-    for binding in ["left_click", "right_click", "middle_click", "double_click"] {
+    for binding in ["left_click", "right_click", "middle_click", "double_click", "mouse_x1", "mouse_x2"] {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let mut engine = engine_with_normal_probes(&seen, "x", binding);
         run_in_normal(&mut engine, vec![key_down("x"), key_up("x")]);
@@ -789,6 +789,12 @@ fn every_semantic_click_notifies_once_but_press_release_and_toggle_do_not() {
         "press mouse_left",
         "release mouse_left",
         "toggle mouse_left",
+        "press mouse_x1",
+        "release mouse_x1",
+        "toggle mouse_x1",
+        "press mouse_x2",
+        "release mouse_x2",
+        "toggle mouse_x2",
     ] {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let mut engine = engine_with_normal_probes(&seen, "x", binding);
@@ -874,6 +880,8 @@ fn every_mouse_click_binding_short_press_runs_on_key_up() {
         ("left_click", Button::Left, ButtonAction::Click),
         ("middle_click", Button::Middle, ButtonAction::Click),
         ("right_click", Button::Right, ButtonAction::Click),
+        ("mouse_x1", Button::X1, ButtonAction::Click),
+        ("mouse_x2", Button::X2, ButtonAction::Click),
         ("double_click", Button::Left, ButtonAction::DoubleClick),
     ] {
         let mut engine = engine_with_normal_binding("x", binding);
@@ -916,6 +924,8 @@ fn disabling_long_press_keeps_every_mouse_click_on_key_down() {
         ("left_click", Button::Left, ButtonAction::Click),
         ("middle_click", Button::Middle, ButtonAction::Click),
         ("right_click", Button::Right, ButtonAction::Click),
+        ("mouse_x1", Button::X1, ButtonAction::Click),
+        ("mouse_x2", Button::X2, ButtonAction::Click),
         ("double_click", Button::Left, ButtonAction::DoubleClick),
     ] {
         let mut engine = engine_with_normal_binding("x", binding);
@@ -967,6 +977,8 @@ fn every_mouse_click_binding_long_press_only_toggles_its_button() {
         ("left_click", Button::Left),
         ("middle_click", Button::Middle),
         ("right_click", Button::Right),
+        ("mouse_x1", Button::X1),
+        ("mouse_x2", Button::X2),
         ("double_click", Button::Left),
     ] {
         let mut engine = engine_with_normal_binding("x", binding);
@@ -1008,3 +1020,34 @@ fn every_mouse_click_binding_long_press_only_toggles_its_button() {
     }
 }
 
+
+#[test]
+fn side_click_release_failure_recovers_without_clicked_notification() {
+    for (binding, button) in [("mouse_x1", MouseButton::X1), ("mouse_x2", MouseButton::X2)] {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = engine_with_normal_probes(&seen, "x", binding);
+        engine.registry.active = ModeId::normal();
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+        engine.handle_backend_event(key_down("x"), &mut backend).unwrap();
+        log.lock().unwrap().fail_next_mouse_release = true;
+        engine.handle_backend_event(key_up("x"), &mut backend).unwrap();
+        assert!(engine.input.latched.is_empty());
+        assert!(engine.input.pending_long_press_toggles.is_empty());
+        assert_eq!(log.lock().unwrap().buttons, [(button, ButtonAction::Press), (button, ButtonAction::Release)]);
+        assert!(log.lock().unwrap().sent.is_empty());
+        assert!(!seen.lock().unwrap().iter().any(|event| event.ends_with(":clicked")));
+    }
+}
+
+#[test]
+fn side_button_latches_are_released_at_shutdown() {
+    for (target, button) in [("mouse_x1", MouseButton::X1), ("mouse_x2", MouseButton::X2)] {
+        for verb in ["press", "toggle"] {
+            let mut engine = engine_with_normal_binding("x", &format!("{verb} {target}"));
+            let log = run_in_normal(&mut engine, vec![key_down("x"), key_up("x")]);
+            assert!(engine.input.latched.is_empty());
+            assert_eq!(log.lock().unwrap().buttons, [(button, ButtonAction::Press), (button, ButtonAction::Release)]);
+            assert!(log.lock().unwrap().sent.is_empty());
+        }
+    }
+}

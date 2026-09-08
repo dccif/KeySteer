@@ -212,7 +212,9 @@ impl Engine {
                 Some(crate::api::binding::Button::Left) => cursor.left_pressed_color,
                 Some(crate::api::binding::Button::Middle) => cursor.middle_pressed_color,
                 Some(crate::api::binding::Button::Right) => cursor.right_pressed_color,
-                None => None,
+                Some(crate::api::binding::Button::X1 | crate::api::binding::Button::X2) | None => {
+                    None
+                }
             }
             .and_then(|color| color.resolve(self.palette.appearance));
             let fill = pressed_color.map_or_else(

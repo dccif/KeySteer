@@ -437,11 +437,17 @@ impl Engine {
     pub(super) fn take_drag_release_targets(&mut self) -> TargetBuffer {
         let buttons = self.input.drag_auto_release.buttons;
         self.input.drag_auto_release.clear();
-        [Button::Left, Button::Right, Button::Middle]
-            .into_iter()
-            .filter(|button| buttons & drag_button_bit(*button) != 0)
-            .map(InputTarget::Mouse)
-            .collect()
+        [
+            Button::Left,
+            Button::Right,
+            Button::Middle,
+            Button::X1,
+            Button::X2,
+        ]
+        .into_iter()
+        .filter(|button| buttons & drag_button_bit(*button) != 0)
+        .map(InputTarget::Mouse)
+        .collect()
     }
 
     pub(super) fn forget_drag_button(&mut self, button: Button) {

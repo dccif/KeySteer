@@ -1,5 +1,16 @@
 # Release notes
 
+## 0.9.21
+
+Added keyboard-triggered mouse side-button clicks on Windows and macOS. Add these bindings to your existing `[normal.bindings]`, reload the configuration, then tap `T` / `Y` in Normal mode:
+
+```toml
+t = "mouse_x1"
+y = "mouse_x2"
+```
+
+Side buttons usually navigate Back / Forward, depending on the application. Use actions such as `press mouse_x1`, `release mouse_x1`, and `toggle mouse_x2` to press, release, or latch a side button.
+
 ## 0.9.20
 
 - Added a live key-help panel showing available keys and actions, with customizable styling.

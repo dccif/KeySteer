@@ -65,7 +65,7 @@ h = "move_left"
 
 | Action | Description |
 | --- | --- |
-| `left_click`, `right_click`, `middle_click` | With long-press detection enabled, send MouseDown immediately and MouseUp on a short release; at the threshold, only latch the existing press. With it disabled, inject an atomic click on key-down. |
+| `left_click`, `right_click`, `middle_click`, `mouse_x1`, `mouse_x2` | With long-press detection enabled, send MouseDown immediately and MouseUp on a short release; at the threshold, only latch the existing press. With it disabled, inject an atomic click on key-down. |
 | `double_click` | Immediately starts the first left-button press, completes the double-click on a short release, or latches the left button on a long press. |
 | `left_press`, `right_press` | Hold a pointer button. |
 | `left_release`, `right_release` | Release a held pointer button. |
@@ -75,7 +75,7 @@ h = "move_left"
 | `release <target...>` | Release targets that were previously held. |
 | `toggle <target...>` | Toggle the state of targets. |
 
-Targets are key names or `mouse_left`, `mouse_right`, and `mouse_middle`:
+Targets are key names or `mouse_left`, `mouse_right`, and `mouse_middle`, `mouse_x1`, `mouse_x2`:
 
 ```toml
 [normal.bindings]

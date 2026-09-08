@@ -194,6 +194,7 @@ Settings，不存在 `ConfigReloaded` 广播。
 ## 鼠标侧键绑定
 
 绑定左值接受 `mouse_x1` / `mouse_x2`，内置别名为 `xbutton1`/`mouse4` 与
-`xbutton2`/`mouse5`；支持常规组合键、继承和应用覆盖。它们是触发键，不是新增的
-键盘 `send` 目标。默认配置只提供注释示例，不占用用户的前进/后退键。未绑定或 `none`
+`xbutton2`/`mouse5`；支持常规组合键、继承和应用覆盖。右值 `mouse_x1` / `mouse_x2`
+解析为 `Binding::Click(Button::X1/X2)`，也支持 `press` / `release` / `toggle` 的鼠标目标；
+它们不属于键盘 `send` 目标。点击复用普通点击的长按锁定与清理流程。默认配置只提供注释示例，不占用用户的前进/后退键。未绑定或 `none`
 时侧键保持透传。示例见 [配置参考](/reference/configuration#鼠标侧键)。

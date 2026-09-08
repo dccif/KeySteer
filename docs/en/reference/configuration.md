@@ -370,5 +370,15 @@ Chords, inheritance, app overrides and held actions work as usual. For example,
 `mouse_x2 = "scroll_down"` scrolls while held and stops on release. Unbound or
 `none` side buttons pass through even in keyboard-capturing modes. A matched
 binding consumes both edges. Physical side buttons do not emit `Clicked`.
-These names are binding triggers; if mouse software remaps a side button to a
-keyboard shortcut, bind the shortcut that the driver actually emits.
+These names also work as actions that inject native mouse side-button clicks:
+
+```toml
+[normal.bindings]
+t = "mouse_x1"
+y = "mouse_x2"
+```
+
+`press mouse_x1`, `release mouse_x1`, and `toggle mouse_x2` are supported too.
+Clicks follow the usual long-press latch behavior. The receiving application decides
+whether they navigate Back or Forward. If mouse software remaps a physical side
+button to a keyboard shortcut, bind the shortcut that the driver actually emits.

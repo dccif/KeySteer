@@ -1,5 +1,18 @@
 # 更新日志 / Release Notes
 
+## 0.9.21
+
+新增键盘模拟鼠标侧键点击，支持 Windows 和 macOS。在现有 `[normal.bindings]` 中加入以下配置，重载后进入 Normal 模式，点按 `T` / `Y` 即可模拟两个侧键：
+
+```toml
+t = "mouse_x1"
+y = "mouse_x2"
+```
+
+侧键通常用于后退 / 前进，具体行为由应用决定；也支持 `press mouse_x1`、`release mouse_x1` 和 `toggle mouse_x2` 等按下、释放及锁定操作。
+
+Added keyboard-triggered mouse side-button clicks on Windows and macOS. Add the bindings above to your existing `[normal.bindings]`, reload the configuration, then tap `T` / `Y` in Normal mode. Side buttons usually navigate Back / Forward, depending on the application. Explicit `press`, `release`, and `toggle` actions also support these buttons.
+
 ## 0.9.20
 
 - 新增实时按键提示面板，可查看当前模式可用的按键与动作，并自定义面板样式。

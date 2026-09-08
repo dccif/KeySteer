@@ -65,7 +65,7 @@ h = "move_left"
 
 | 动作 | 说明 |
 | --- | --- |
-| `left_click`、`right_click`、`middle_click` | 启用长按判定时按下沿立即 MouseDown、松开沿立即 MouseUp；达到阈值只锁定现有按压。设为 0 时在按下沿注入原子点击。 |
+| `left_click`、`right_click`、`middle_click`, `mouse_x1`, `mouse_x2` | 启用长按判定时按下沿立即 MouseDown、松开沿立即 MouseUp；达到阈值只锁定现有按压。设为 0 时在按下沿注入原子点击。 |
 | `double_click` | 同样立即开始第一次左键按压；短按松开时完成双击，长按只锁定左键。 |
 | `left_press`、`right_press` | 按住鼠标按钮。 |
 | `left_release`、`right_release` | 松开鼠标按钮。 |
@@ -75,7 +75,7 @@ h = "move_left"
 | `release <目标...>` | 释放之前按住的目标。 |
 | `toggle <目标...>` | 切换目标状态。 |
 
-目标可以是键名或 `mouse_left`、`mouse_right`、`mouse_middle`：
+目标可以是键名或 `mouse_left`、`mouse_right`、`mouse_middle`, `mouse_x1`, `mouse_x2`：
 
 ```toml
 [normal.bindings]

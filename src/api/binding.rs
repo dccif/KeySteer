@@ -67,6 +67,8 @@ pub enum Button {
     Left,
     Right,
     Middle,
+    X1,
+    X2,
 }
 
 /// A keyboard key or mouse button that can be latched by an input action.
@@ -83,6 +85,8 @@ impl InputTarget {
             "mouse_left" => Some(Button::Left),
             "mouse_right" => Some(Button::Right),
             "mouse_middle" => Some(Button::Middle),
+            "mouse_x1" | "xbutton1" | "mouse4" => Some(Button::X1),
+            "mouse_x2" | "xbutton2" | "mouse5" => Some(Button::X2),
             _ => None,
         };
         if let Some(button) = button {
@@ -100,6 +104,8 @@ impl InputTarget {
             Self::Mouse(Button::Left) => "mouse_left",
             Self::Mouse(Button::Right) => "mouse_right",
             Self::Mouse(Button::Middle) => "mouse_middle",
+            Self::Mouse(Button::X1) => "mouse_x1",
+            Self::Mouse(Button::X2) => "mouse_x2",
         }
     }
 
@@ -341,7 +347,7 @@ impl Binding {
 
     fn verb(word: &str) -> Option<Self> {
         use Binding as B;
-        use Button::{Left, Middle, Right};
+        use Button::{Left, Middle, Right, X1, X2};
         use Direction::{Down, Up};
         use ScrollAmount::{Full, Half, Step};
 
@@ -363,6 +369,10 @@ impl Binding {
             "left_click" => B::Click(Left),
             "right_click" => B::Click(Right),
             "middle_click" => B::Click(Middle),
+            "mouse_x1" | "xbutton1" | "mouse4" | "x1_click" => B::Click(X1),
+            "mouse_x2" | "xbutton2" | "mouse5" | "x2_click" => B::Click(X2),
+            "x1_double_click" => B::DoubleClick(X1),
+            "x2_double_click" => B::DoubleClick(X2),
             "double_click" => B::DoubleClick(Left),
             "left_press" => B::Press(vec![InputTarget::Mouse(Left)]),
             "left_release" => B::Release(vec![InputTarget::Mouse(Left)]),
@@ -420,6 +430,8 @@ impl Binding {
             Button::Left => "left",
             Button::Right => "right",
             Button::Middle => "middle",
+            Button::X1 => "x1",
+            Button::X2 => "x2",
         };
         let direction = |d: &Direction| match d {
             Direction::Left => "left",
@@ -441,6 +453,8 @@ impl Binding {
             B::Scroll(d, ScrollAmount::Step) => format!("wheel_{}", direction(d)),
             B::Scroll(d, ScrollAmount::Half) => format!("wheel_half_{}", direction(d)),
             B::Scroll(d, ScrollAmount::Full) => format!("wheel_full_{}", direction(d)),
+            B::Click(Button::X1) => "mouse_x1".into(),
+            B::Click(Button::X2) => "mouse_x2".into(),
             B::Click(b) => format!("{}_click", button(b)),
             B::DoubleClick(Button::Left) => "double_click".into(),
             B::DoubleClick(b) => format!("{}_double_click", button(b)),
@@ -777,6 +791,16 @@ mod tests {
             Binding::Scroll(Direction::Up, ScrollAmount::Half),
             Binding::Scroll(Direction::Down, ScrollAmount::Full),
             Binding::Click(Button::Middle),
+            Binding::Click(Button::X1),
+            Binding::Click(Button::X2),
+            Binding::DoubleClick(Button::X1),
+            Binding::DoubleClick(Button::X2),
+            Binding::Press(vec![InputTarget::Mouse(Button::X1)]),
+            Binding::Release(vec![InputTarget::Mouse(Button::X2)]),
+            Binding::Toggle(vec![
+                InputTarget::Mouse(Button::X1),
+                InputTarget::Mouse(Button::X2),
+            ]),
             Binding::DoubleClick(Button::Left),
             Binding::Press(vec![InputTarget::Mouse(Button::Left)]),
             Binding::Release(vec![InputTarget::Mouse(Button::Left)]),

@@ -81,6 +81,7 @@ const actionGroups: ActionGroup[] = [
     actions: [
       ['left_click', '左键点击'], ['right_click', '右键点击'],
       ['middle_click', '中键点击'], ['double_click', '双击'],
+      ['mouse_x1', '侧键 1 点击'], ['mouse_x2', '侧键 2 点击'],
     ].map(([value, label]) => ({ value, label })),
   },
   {
@@ -352,6 +353,11 @@ export default defineComponent({
       }
       if (action === 'toggle') {
         toggleButton(simulator, 'left')
+        return
+      }
+      if (['mouse_x1', 'xbutton1', 'mouse4', 'x1_click', 'mouse_x2', 'xbutton2', 'mouse5', 'x2_click', 'x1_double_click', 'x2_double_click'].includes(action)) {
+        clickPulse.value += 1
+        simulator.lastEvent = action
         return
       }
       if (action.includes('wheel') || action.startsWith('scroll_')) {
@@ -1035,6 +1041,7 @@ function shortAction(action: string): string {
     move_left: '← 移动', move_down: '↓ 移动', move_up: '↑ 移动', move_right: '→ 移动',
     wheel_up: '↑ 滚动', wheel_down: '↓ 滚动', scroll_left: '← 滚动', scroll_right: '→ 滚动',
     left_click: '左键', right_click: '右键', middle_click: '中键', double_click: '双击',
+    mouse_x1: '侧键 1', mouse_x2: '侧键 2',
     grid: 'Grid', recursive_grid: '递归 Grid', ui_hint: 'UI Hint', normal: 'Normal', idle: 'Idle',
     precision: '精确', slow: '慢速', fast: '快速', finish: '完成', restart_mode: '重启', escape: '返回',
     precision_toggle: '切换精确', slow_toggle: '切换慢速', fast_toggle: '切换快速',

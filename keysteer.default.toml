@@ -33,7 +33,7 @@
 #   move_left move_down move_up move_right
 #   scroll_left scroll_down scroll_up scroll_right
 #   scroll_half_down scroll_half_up scroll_full_down scroll_full_up
-#   left_click right_click middle_click double_click
+#   left_click right_click middle_click double_click mouse_x1 mouse_x2
 #   press <keys/buttons...>            hold inputs, e.g. `press shift mouse_left`
 #   release <keys/buttons...>          release inputs held by press/toggle
 #   toggle [keys/buttons...]           toggle each input; no args makes its
@@ -44,7 +44,7 @@
 #   slow fast                         held alongside a direction
 #   escape quit
 #
-# Mouse target names are mouse_left, mouse_right, and mouse_middle. Keyboard
+# Mouse target names are mouse_left, mouse_right, mouse_middle, mouse_x1, mouse_x2. Keyboard
 # targets accept every key name and alias listed below. For example:
 #   n = "toggle"                      N+key toggles that action's input target;
 #                                      bare N releases all latched inputs
@@ -188,6 +188,9 @@ auto_release_ms = 0
 # ---------------------------------------------------------------------------
 
 [normal.bindings]
+# Optional synthetic side clicks (the receiving app decides their behavior):
+# t = "mouse_x1"
+# y = "mouse_x2"
 # Optional side buttons: mouse_x1 (Back), mouse_x2 (Forward).
 # mouse_x1 = "key_help"
 # mouse_x2 = "grid"
