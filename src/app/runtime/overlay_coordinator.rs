@@ -118,6 +118,8 @@ pub(super) struct DynamicOverlayState {
 
 #[derive(Default)]
 pub(super) struct OverlayCoordinator {
+    pub(super) key_help_visible: bool,
+    pub(super) key_help_cache: Option<Box<super::key_help::KeyHelpCache>>,
     pub(super) last_scene: Option<Arc<OverlayScene>>,
     pub(super) content: Option<Arc<OverlayScene>>,
     pub(super) visible: bool,
@@ -140,6 +142,8 @@ impl OverlayCoordinator {
         self.command_batch_depth = 0;
         self.pending = None;
         self.speed_toggle = None;
+        self.key_help_visible = false;
+        self.key_help_cache = None;
     }
 }
 impl Engine {
@@ -148,6 +152,7 @@ impl Engine {
         mut scene: Arc<OverlayScene>,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
+        self.overlay.key_help_cache = None;
         if self.overlay.command_batch_depth > 0 {
             self.overlay.pending = Some(PendingOverlay::Show(scene));
             return Ok(());
@@ -253,6 +258,7 @@ impl Engine {
             scene.clip =
                 Screen::containing(&self.screens, &self.cursor).map(|screen| screen.bounds);
         }
+        self.decorate_key_help(&mut scene);
         let trace_overlay = if cursor_only {
             self.settings.debug.motion
         } else {
@@ -360,6 +366,14 @@ impl Engine {
         if self.registry.active == ModeId::idle() || !self.overlay.visible {
             return Ok(());
         }
+        if self.overlay.key_help_visible
+            && self.overlay.key_help_cache.as_ref().is_none_or(|cache| {
+                Screen::containing(&self.screens, &self.cursor)
+                    .is_none_or(|screen| !cache.matches_screen(screen))
+            })
+        {
+            return self.refresh_overlay(backend);
+        }
         if self.overlay.dynamic.follows_cursor_screen {
             let current_clip =
                 Screen::containing(&self.screens, &self.cursor).map(|screen| screen.bounds);
@@ -437,7 +451,10 @@ impl Engine {
         }
     }
 
-    fn build_indicator(&self, display_mode: &ModeId) -> Option<(Indicator, IndicatorGeometry)> {
+    pub(super) fn build_indicator(
+        &self,
+        display_mode: &ModeId,
+    ) -> Option<(Indicator, IndicatorGeometry)> {
         let mode = self.registry.get(display_mode)?;
         let (text, ui) = self
             .settings

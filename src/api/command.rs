@@ -705,6 +705,14 @@ pub trait Mode: Send {
         false
     }
 
+    /// Currently available raw inputs for the optional live help overlay.
+    /// Bindings are supplied separately by the host's effective keymap.
+    /// If these change during Frame/PointerMoved, return ShowOverlay to
+    /// invalidate the host's help cache, just as for other visual changes.
+    fn available_keys(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
     /// Whether pointer motion should be delivered to this mode.
     fn wants_pointer_events(&self) -> bool {
         true

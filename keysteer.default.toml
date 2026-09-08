@@ -150,6 +150,8 @@ text = "#17327AFF"
 # ---------------------------------------------------------------------------
 
 [hotkeys]
+# Optional mouse-side-button launcher (Windows/macOS):
+# mouse_x1 = "normal"
 "primary+e" = "normal"
 
 [normal]
@@ -186,6 +188,12 @@ auto_release_ms = 0
 # ---------------------------------------------------------------------------
 
 [normal.bindings]
+# Optional side buttons: mouse_x1 (Back), mouse_x2 (Forward).
+# mouse_x1 = "key_help"
+# mouse_x2 = "grid"
+# "ctrl+mouse_x2" = "ui_hint"
+# 实时按键提示：取消注释启用；省略或注释即禁用，可自行换键。
+# "?" = "key_help"
 # Movement, vim style.
 h = "move_left"
 j = "move_down"
@@ -593,3 +601,20 @@ preserve = true
 # motion = false
 # overlay = true
 # timers = true
+
+# ── 实时按键提示面板 ──────────────────────────────────────────────────────────
+# 在普通绑定表中写入 "?" = "key_help" 切换显示；省略或注释即禁用。
+# enabled=false 全局禁止显示。字号用于按键与说明，标题与布局自动适配。
+# 空字体及未指定的背景/文字色继承模式指示器与主题；尺寸为逻辑像素。
+# 颜色支持 "#RRGGBBAA" 或 { light = "#RRGGBBAA", dark = "#RRGGBBAA" }。
+[key_help]
+enabled = true
+font_family = ""
+font_size = 12.0
+# background_color = "#465FBCFF"
+# text_color = "#FFFFFFFF"
+# border_color = "#00000000"
+border_width = 0.0
+border_radius = 10.0
+padding_x = 24.0
+padding_y = 8.0

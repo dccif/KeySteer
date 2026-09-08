@@ -7,13 +7,17 @@ use std::path::{Path, PathBuf};
 // Window Mover adds four Win32 placement calls and five bounded AX operations.
 // Fullscreen transitions add one bounded timeout call for the retained AX window.
 // Input recovery adds owned SetTimer/KillTimer and WTS registration pairs.
-const MAX_UNSAFE_EXPRESSIONS: usize = 257;
+// Literal-character input adds one bounded read-only FFI block per platform:
+// CGEvent Unicode extraction and Win32 ToUnicodeEx with no-state-change flags.
+// Candidate filtering adds a foreground HKL read, cold translation enumeration,
+// and an explicitly requested read-only loaded-layout test probe on Windows.
+const MAX_UNSAFE_EXPRESSIONS: usize = 262;
 const MAX_UNSAFE_FILES: usize = 21;
 const PER_FILE_BUDGET: &[(&str, usize)] = &[
     ("src/platform/macos/accessibility.rs", 18),
     ("src/platform/macos/autostart.rs", 5),
     ("src/platform/macos/display_link.rs", 4),
-    ("src/platform/macos/native.rs", 6),
+    ("src/platform/macos/native.rs", 7),
     ("src/platform/macos/overlay.rs", 6),
     ("src/platform/macos/permissions.rs", 5),
     ("src/platform/macos/status_item.rs", 4),
@@ -22,7 +26,7 @@ const PER_FILE_BUDGET: &[(&str, usize)] = &[
     ("src/platform/windows/autostart.rs", 4),
     ("src/platform/windows/gpu_overlay.rs", 28),
     ("src/platform/windows/hook.rs", 8),
-    ("src/platform/windows/input.rs", 4),
+    ("src/platform/windows/input.rs", 8),
     ("src/platform/windows/overlay.rs", 9),
     ("src/platform/windows/screens.rs", 5),
     ("src/platform/windows/window_mover.rs", 4),

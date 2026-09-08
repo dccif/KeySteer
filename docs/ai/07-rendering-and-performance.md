@@ -224,3 +224,39 @@ macOS 原生探针使用固定 AppKit fixture 子进程，运行：
 - A rejected position-only backend update disables that fast path until the
   overlay is dismissed. Operational failures are reported once through the
   unified logger instead of being swallowed or retried on every pointer event.
+
+## 实时按键提示
+
+`Binding::KeyHelp` 通过普通按键 resolver 和 apply_binding 切换面板；通过 `"?" = "key_help"` 显式启用，省略或注释该绑定即禁用，没有独立输入拦截。OverlayCoordinator 保存显示开关及缓存，沿用离散动作的 repeat 与 Up 配对消费。Idle 不显示面板，进入 Idle 关闭。关闭提示从当前有效 key_help 绑定生成。
+
+面板从编译后绑定枚举候选，复用 Engine 的 active/inherited/temporary resolver 检查实际动作；组合键前缀按住期间筛选对应候选。`Mode::available_keys` 提供默认空实现，内置 Grid、UI Hint 和屏幕选择器按实例当前状态报告原始输入，UI Hint 只报告剩余标签下一字符。该 API 不调用原生能力、不改变模式状态。键盘事件后刷新，流式扫描或模式重绘时同步更新。
+
+提示使用现有 OverlayLabel、主题和原生静态层，在当前屏幕底部居中显示单个圆角面板，复用 mode/toggle indicator 配色和字体；等价动作合并按键，面板内部以透明文字分列排布。面板底色作为最高文字层下的一张空文字标签绘制，以遮住底层 Hint 标签而无需改动原生渲染边界；模式原始 scene 不包含帮助标签，关闭时恢复原 scene。鼠标位置更新沿用已有快路径，不增加定时器、线程或全屏 CPU buffer。
+
+帮助面板的按键以浅底深字圆角键帽展示，同一列键帽右边缘对齐，功能说明使用原生左对齐。`LabelStyle::text_alignment` 默认 Center 保持既有 Grid/Hint/indicator 行为，帮助说明设为 Left；Windows DirectWrite format 缓存包含 alignment，GDI DrawText 与 matched-prefix 起点按同一 alignment 计算；macOS 设置 CATextLayer 对齐并同步前缀裁剪起点。对齐不依赖字符数估算的居中偏移。
+
+帮助面板按每列最长键帽和功能说明估算内容宽度，不固定撑满屏幕；`[key_help]` 配置字体、颜色、边框、圆角与内边距；默认水平内边距 24、垂直内边距 8。行高和标题区随字号计算，列间距 6、键帽与说明间距 8 保持内部布局常量。超长自定义绑定受工作区宽度限制，仍复用现有文字适配。
+
+等价动作的按键保持为一个完整组，不按字符长度拆分。Grid、Recursive Grid 不在帮助面板重复列出网格上已有的选择字符，仅报告返回、确认、重启等控制键。
+
+键帽沿用模式提示字体和 5 像素逻辑左右内边距。
+
+帮助列表的键帽与功能说明统一使用 key_help.font_size（默认 12）；列宽按同一字号计算。工作区不足时只允许整张列表统一缩放，不按单条文本长度分别缩小；标题和关闭提示按正文字号的 1.25 倍自动计算。
+
+帮助正文按实际列总宽度在面板中居中，包括最小面板宽度产生的剩余空间；功能说明使用较紧凑的独立文字框，避免右侧保留键帽宽度估算带来的额外空白。
+
+## 帮助面板缓存与寿命
+
+居中没有固定横坐标：外层 `area.x + (area.width - width) / 2`，正文 `panel.x + (panel.width - body_width) / 2`。工作区、DPI、当前按键集合及各列文字宽度估算共同决定布局；边距与间距是样式尺寸，不是中心偏移补偿。
+
+`OverlayCoordinator::key_help_cache` 只保存一个可见会话的缓存。源标签和最终装饰标签使用 `OverlayItems` 的 Arc 共享，不额外复制已提交的标签数组；相同输入场景、模式、主题和屏幕几何直接借用整组最终标签，跳过候选解析、String 拼装、样式分配、COW 和排序。普通位置更新仍走原有快路径，非空 Grid/Hint 场景跨屏也检查帮助面板的屏幕几何，触发必要的重新居中。
+
+物理输入边沿、非运动 ModeEvent、新 ShowOverlay、扫描结果和路由重编译使缓存失效；主题、显示模式、工作区及 DPI 还在命中判断中检查。Frame/PointerMoved 不直接使缓存失效；若自定义 Mode 在这两类事件中改变其 `available_keys`，应像视觉内容改变一样发出 ShowOverlay。未注入的重复输入不再单独追加一次帮助刷新；Mode 需要重绘时仍可通过 ShowOverlay 刷新。焦点改变后帮助开启时显式刷新最终生效路由。
+
+关闭、Idle、Reload/overlay reset 与 shutdown 释放缓存；没有跨会话历史表、后台任务或定时轮询。构建时的 String/Vec 为临时所有权，显示期间所需文字由场景持有，最后一个 Arc 释放后回收。后端可能还持有最后一帧或字体缓存，这是已有有界渲染资源，不是每次帮助刷新累积的新条目。
+
+性能探针位于 runtime/tests/overlay.rs：release 下单线程运行 `key_help_decoration_probe`、`key_help_cache_close_cycles_release_allocations`、`key_help_cache_position_updates_allocate_nothing`，每项 20k 次；前两项分别验证缓存命中零分配、反复开关分配与释放平衡，第三项验证开启帮助后的鼠标位置路径零分配。功能测试覆盖标签存储共享、键输入/流式结果失效、路由/主题更新和跨屏动态居中。
+
+本机 release 单线程交替 A/B 三轮，每轮 20k 次相同帮助装饰：旧版每轮 7,500,000 次分配（471,520,000 字节），缓存版为 0；p99 中位数 41µs → 0.1µs（计时分辨率约 0.1µs）。20k 次完整开关中缓存版分配/释放均为 7,520,000 次、476,320,000 字节，未残留构建分配。开启帮助后 20k 次位置更新零分配；关闭帮助的既有 overlay_position_performance_probe 交替三轮 p99 中位数保持 position 0.1µs / complete 0.6µs。以上是隔离的 Engine 微基准，不代表原生渲染或端到端输入延迟，也不是双 4K 真机资源验收结论。
+
+帮助面板关闭时，`handle_key` 直接进入既有输入处理，不追加提示刷新收尾。注册表查询复用已有的活动模式槽位缓存，取用前验证槽位中的 ModeId，避免按键路由重复搜索模式索引；切换模式、重载和其他模式查询仍安全回退到索引表。没有字符数据的输入直接走物理键解析；仅有带修饰键的组合前缀时，单个普通键跳过前缀仲裁。上述优化均位于公共运行时。

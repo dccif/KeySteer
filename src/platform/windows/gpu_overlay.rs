@@ -133,6 +133,7 @@ struct FontEntry {
     family: String,
     size_bits: u64,
     bold: bool,
+    alignment: crate::api::overlay::TextAlignment,
     format: IDWriteTextFormat,
 }
 
@@ -875,6 +876,7 @@ impl GpuOverlay {
             entry.family == style.font_family
                 && entry.size_bits == size_bits
                 && entry.bold == style.bold
+                && entry.alignment == style.text_alignment
         }) {
             return Ok(entry.format.clone());
         }
@@ -909,7 +911,15 @@ impl GpuOverlay {
         // SAFETY: the format is newly owned and all enum values are valid.
         unsafe {
             format
-                .SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)
+                .SetTextAlignment(match style.text_alignment {
+                    crate::api::overlay::TextAlignment::Left => {
+                        windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_ALIGNMENT_LEADING
+                    }
+                    crate::api::overlay::TextAlignment::Center => DWRITE_TEXT_ALIGNMENT_CENTER,
+                    crate::api::overlay::TextAlignment::Right => {
+                        windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_ALIGNMENT_TRAILING
+                    }
+                })
                 .and_then(|()| format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER))
                 .and_then(|()| format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP))
         }
@@ -918,6 +928,7 @@ impl GpuOverlay {
             family: style.font_family.clone(),
             size_bits,
             bold: style.bold,
+            alignment: style.text_alignment,
             format: format.clone(),
         });
         Ok(format)

@@ -124,9 +124,31 @@ impl Placement {
     }
 }
 
+/// Horizontal text placement within a label's rectangle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextAlignment {
+    Left,
+    #[default]
+    Center,
+    Right,
+}
+
+impl TextAlignment {
+    pub(crate) fn offset(self, container: f64, text: f64) -> f64 {
+        match self {
+            Self::Left => 0.0,
+            Self::Center => (container - text) / 2.0,
+            Self::Right => container - text,
+        }
+    }
+}
+
 /// Fully-resolved visual style for a text label. No theme lookups remain.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LabelStyle {
+    #[serde(default)]
+    pub text_alignment: TextAlignment,
     pub background: Color,
     pub text_color: Color,
     /// Color of the already-typed prefix, so users see their progress.
@@ -145,6 +167,7 @@ pub struct LabelStyle {
 impl Default for LabelStyle {
     fn default() -> Self {
         Self {
+            text_alignment: TextAlignment::Center,
             background: Color::rgba(0x0A, 0x13, 0x38, 0xF2),
             text_color: Color::rgb(0xE8, 0xEE, 0xFF),
             matched_text_color: Color::rgb(0x8F, 0xA2, 0xF0),
@@ -614,7 +637,6 @@ impl<T> OverlayItems<T> {
         Self(Arc::new(Vec::with_capacity(capacity)))
     }
 
-    #[cfg(any(target_os = "windows", test))]
     pub(crate) fn shares_storage_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }

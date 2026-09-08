@@ -118,6 +118,12 @@ pub trait Backend {
     /// aborts the action and recovers its input state without exiting.
     fn dispose_key(&mut self, disposition: KeyDisposition) -> Result<(), String>;
 
+    /// Single-character bindings present in the compiled routes. Native backends
+    /// may use this cold-path hint to avoid extracting text for physical-only
+    /// configurations. An empty slice disables optional character observation.
+    /// Physical key identity and disposition must remain unchanged.
+    fn set_character_bindings(&mut self, _keys: &[super::input::Key]) {}
+
     fn screens(&self) -> Result<Vec<Screen>, String>;
     fn pointer(&self) -> Result<Point, String>;
     fn focused_app(&self) -> Result<Option<FocusedApp>, String>;

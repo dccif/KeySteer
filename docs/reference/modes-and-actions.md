@@ -195,3 +195,7 @@ Windows 最大化窗口直接跨屏，全程保持最大化，还原位置也一
 6. 内置模式名或命名空间插件模式名。
 
 完整默认示例见 [默认配置文件](/generated/keysteer.default.toml)。
+
+## `key_help`
+
+切换实时按键提示，不重启当前模式或清除筛选状态。在 Normal 绑定表中写入 `"?" = "key_help"` 启用，省略或注释即禁用，targeting 模式可继承。样式由 `[key_help]` 配置。

@@ -529,6 +529,20 @@ impl Mode for RecursiveGridMode {
         })
     }
 
+    fn available_keys(&self) -> Vec<(String, String)> {
+        // Selection characters are already drawn in the grid itself.
+        [
+            ("esc", "cancel"),
+            ("enter", "select"),
+            ("backspace", "back"),
+            ("tab", "back"),
+            ("space", "restart"),
+        ]
+        .into_iter()
+        .map(|(key, action)| (key.into(), action.into()))
+        .collect()
+    }
+
     fn indicator_color(&self, palette: &Palette) -> Option<Color> {
         Some(palette.accent_alt)
     }

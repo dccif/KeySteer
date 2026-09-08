@@ -203,6 +203,7 @@ pub fn compile(config: &ConfigFile) -> Result<RuntimePlan, String> {
             default_scan_roles: config.ui_hint.clickable_roles.clone(),
             ui_hint_overlap_key: config.ui_hint.overlap_cycle_key.clone(),
             mode_indicator: config.mode_indicator.clone(),
+            key_help: config.key_help.clone(),
         },
         palettes: PaletteSet {
             light: config.palette(Appearance::Light),

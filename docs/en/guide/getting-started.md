@@ -37,6 +37,10 @@ Once you have moved the pointer and clicked once, you know KeySteer's most commo
 Grant Accessibility permission first; see [macOS installation and permissions](/en/guide/macos).
 :::
 
+## View available keys at any time
+
+Add `"?" = "key_help"` under `[normal.bindings]`, then press `?` (`Shift+/` on a US keyboard) to show the available keys and actions in a rounded panel centered at the bottom of the current screen. Press it again to close the panel. Omit or comment out this binding to disable it.
+
 ## The operating model at a glance
 
 ```mermaid

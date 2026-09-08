@@ -1,5 +1,11 @@
 # Release notes
 
+## 0.9.20
+
+- Added a live key-help panel showing available keys and actions, with customizable styling.
+- Added mouse side-button bindings with chord and hold support.
+- Added direct symbol bindings such as `?`, `!`, and `+`, plus all shifted symbol keys and a key-help preview in the web configuration simulator.
+
 ## 0.9.19
 
 - Window Mover now defaults to `Primary+D`. Bindings remain configurable, and `Primary+S` independently switches the pointer display.

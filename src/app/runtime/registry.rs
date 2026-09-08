@@ -1,6 +1,6 @@
 //! Runtime mode registry, route compilation, dispatch, and lifecycle.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::api::backend::Backend;
 use crate::api::binding::Binding;
@@ -32,6 +32,7 @@ pub(super) struct ModeRegistry {
     pub(super) active_slot: Option<usize>,
     pub(super) binding_profile_key: Vec<Bindings>,
     pub(super) prefixes_require_modifier: bool,
+    pub(super) character_keys: HashMap<char, crate::api::Key>,
     #[cfg(test)]
     pub(super) table_rebuild_count: usize,
     pub(super) plugin_bindings: Vec<(KeyChord, Binding)>,
@@ -49,6 +50,7 @@ impl Default for ModeRegistry {
             active_slot: None,
             binding_profile_key: Vec::new(),
             prefixes_require_modifier: true,
+            character_keys: HashMap::new(),
             #[cfg(test)]
             table_rebuild_count: 0,
             plugin_bindings: Vec::new(),
@@ -94,6 +96,14 @@ impl ModeRegistry {
     }
 
     pub(super) fn index_of(&self, id: &ModeId) -> Option<usize> {
+        // Input routing repeatedly asks for the active mode's table and
+        // temporary chords. Reuse the dispatch slot, checking its identity so
+        // a mode switch or plan reload cannot expose a stale cached index.
+        if let Some(index) = self.active_slot
+            && self.id_at(index) == Some(id)
+        {
+            return Some(index);
+        }
         self.indices.get(id).copied()
     }
 
@@ -291,6 +301,10 @@ impl Engine {
     }
 
     pub(super) fn set_active(&mut self, active: ModeId) {
+        self.overlay.key_help_cache = None;
+        if active == ModeId::idle() {
+            self.overlay.key_help_visible = false;
+        }
         self.input.pending_chords.clear();
         self.registry.active_slot = self.registry.index_of(&active);
         self.registry.active = active;
@@ -336,6 +350,7 @@ impl Engine {
     /// Per-app overrides for the focused application are folded in, so a
     /// binding can differ per application, and disabled entries are dropped.
     pub(super) fn rebuild_tables(&mut self) {
+        self.overlay.key_help_cache = None;
         let ids = self.binding_mode_ids();
         let binding_profile_key = self.binding_profile_key_for(self.focused_app.as_ref());
 
@@ -377,6 +392,19 @@ impl Engine {
         // user works, and only if that chord is still free.
         self.registry.merge_plugin_bindings_into_normal();
 
+        // A literal character can only select a single-key chord. Keep one
+        // interned Key per character instead of searching every mode per input.
+        self.registry.character_keys = self
+            .registry
+            .tables()
+            .flat_map(|(_, table)| table.iter_entries())
+            .filter(|entry| entry.chord.keys().len() == 1)
+            .filter_map(|entry| {
+                let key = entry.chord.activation_key();
+                Some((key.as_char()?, key.clone()))
+            })
+            .collect();
+
         let continuations: Vec<_> = self
             .registry
             .tables()
@@ -402,6 +430,11 @@ impl Engine {
         {
             self.registry.table_rebuild_count += 1;
         }
+    }
+
+    pub(super) fn sync_character_bindings(&self, backend: &mut dyn Backend) {
+        let keys: Vec<_> = self.registry.character_keys.values().cloned().collect();
+        backend.set_character_bindings(&keys);
     }
 
     /// Apply the focused application's overrides to one mode's table.
@@ -513,6 +546,11 @@ impl Engine {
         event: ModeEvent,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
+        if self.overlay.key_help_visible
+            && !matches!(event, ModeEvent::Frame { .. } | ModeEvent::PointerMoved(_))
+        {
+            self.overlay.key_help_cache = None;
+        }
         let Some(mode_index) = self.mode_index_for_dispatch(owner) else {
             return Ok(());
         };
@@ -540,6 +578,7 @@ impl Engine {
         event: ModeEvent,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
+        self.overlay.key_help_cache = None;
         let Some(mode_index) = self.mode_index_for_dispatch(owner) else {
             return Ok(());
         };

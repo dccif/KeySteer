@@ -61,6 +61,25 @@ impl ConfigFile {
     pub fn validate(&self) -> Result<(), ConfigError> {
         let bad = |m: String| ConfigError::Invalid(m);
 
+        let help = &self.key_help;
+        for (name, value) in [
+            ("font_size", help.font_size),
+            ("border_width", help.border_width),
+            ("border_radius", help.border_radius),
+            ("padding_x", help.padding_x),
+            ("padding_y", help.padding_y),
+        ] {
+            if !value.is_finite() || !(0.0..=4096.0).contains(&value) {
+                return Err(bad(format!("key_help.{name} must be finite and 0..=4096")));
+            }
+        }
+        if help.font_size < 1.0 {
+            return Err(bad("key_help.font_size must be at least 1".into()));
+        }
+        validate_optional_color("key_help.background_color", help.background_color.as_ref())?;
+        validate_optional_color("key_help.text_color", help.text_color.as_ref())?;
+        validate_optional_color("key_help.border_color", help.border_color.as_ref())?;
+
         if self.normal.long_press_toggle_ms > 60_000 {
             return Err(bad("normal.long_press_toggle_ms must be 0..=60000".into()));
         }

@@ -495,7 +495,27 @@ impl Engine {
         Ok(())
     }
 
+    #[inline]
     pub(super) fn handle_key(
+        &mut self,
+        input: crate::api::input::InputEvent,
+        backend: &mut dyn Backend,
+    ) -> Result<(), String> {
+        if !self.overlay.key_help_visible {
+            return self.handle_key_inner(input, backend);
+        }
+        let refresh = !input.injected && !input.repeat;
+        if refresh {
+            self.overlay.key_help_cache = None;
+        }
+        self.handle_key_inner(input, backend)?;
+        if refresh && self.overlay.key_help_visible {
+            self.refresh_overlay(backend)?;
+        }
+        Ok(())
+    }
+
+    fn handle_key_inner(
         &mut self,
         input: crate::api::input::InputEvent,
         backend: &mut dyn Backend,
@@ -646,6 +666,9 @@ impl Engine {
                     binding: gesture.binding,
                     owner: gesture.owner,
                 }),
+            KeyState::Down if input.character.is_some() => self
+                .lookup_character(&input)
+                .or_else(|| self.lookup(&input.key)),
             KeyState::Down => self.lookup(&input.key),
             KeyState::Up => self
                 .input
@@ -704,7 +727,10 @@ impl Engine {
         if let Some(resolved) = bound {
             if input.state == KeyState::Down && !input.repeat {
                 self.cancel_completed_prefixes(&resolved);
-                if self.defer_prefix_chord(&resolved, &input.key) {
+                // A modifier-based prefix needs at least two pressed keys.
+                if (!self.registry.prefixes_require_modifier || self.input.pressed.len() > 1)
+                    && self.defer_prefix_chord(&resolved, &input.key)
+                {
                     let outcome = self.complete_key_disposition(&input, KeyOutcome::Consumed);
                     self.dispose_input(&input, outcome, trace_key, backend)?;
                     if display_changed {
@@ -800,11 +826,12 @@ impl Engine {
             return Ok(());
         }
 
-        let captures = self
-            .registry
-            .get(&self.registry.active)
-            .map(|m| m.captures_keyboard())
-            .unwrap_or(false);
+        let captures = !input.key.is_mouse_side_button()
+            && self
+                .registry
+                .get(&self.registry.active)
+                .map(|m| m.captures_keyboard())
+                .unwrap_or(false);
 
         let outcome = if captures {
             KeyOutcome::Consumed
@@ -820,14 +847,16 @@ impl Engine {
 
         // Raw-mode handling may redraw a large target scene, so it must also
         // happen after the hook has received its disposition.
-        self.dispatch(
-            ModeEvent::Key {
-                key: input.key.clone(),
-                state: input.state,
-                repeat: input.repeat,
-            },
-            backend,
-        )?;
+        if !input.key.is_mouse_side_button() {
+            self.dispatch(
+                ModeEvent::Key {
+                    key: input.key.clone(),
+                    state: input.state,
+                    repeat: input.repeat,
+                },
+                backend,
+            )?;
+        }
         self.reassert_latched_key_after_forwarded_release(&input, released_forwarded_key, backend)?;
         if display_changed || click_indicator_released {
             self.refresh_overlay(backend)?;
@@ -1471,6 +1500,20 @@ impl Engine {
     /// Find the binding for `key` using the compiled mode precedence rules.
     pub(super) fn lookup(&self, key: &Key) -> Option<ResolvedBinding> {
         self.lookup_for_pressed(key, &self.input.pressed)
+    }
+
+    fn lookup_character(&self, input: &crate::api::input::InputEvent) -> Option<ResolvedBinding> {
+        let character = input.character?.to_lowercase().next()?;
+        if input.key.as_char() == Some(character) || character.is_control() {
+            return None;
+        }
+        // Borrow the configured symbol itself. No symbol-to-keyboard map,
+        // per-event String allocation, or synthetic key press is involved.
+        let symbol = self.registry.character_keys.get(&character)?;
+        // A produced character is already the result of the OS layout. Its
+        // producer modifiers are not part of a literal character binding.
+        // Keep the real input.key for disposition and held-action release.
+        self.lookup_for_pressed(symbol, std::slice::from_ref(symbol))
     }
 
     pub(super) fn lookup_for_pressed(&self, key: &Key, pressed: &[Key]) -> Option<ResolvedBinding> {

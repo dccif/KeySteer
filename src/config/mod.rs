@@ -86,6 +86,8 @@ pub struct ConfigFile {
     pub pointer: Pointer,
     #[serde(default)]
     pub mode_indicator: ModeIndicator,
+    #[serde(default)]
+    pub key_help: crate::api::style::KeyHelp,
     /// Binding tables for plugin modes, keyed by mode id.
     ///
     /// A plugin mode is configured exactly like a built-in one; it just lives
@@ -125,6 +127,7 @@ impl Default for ConfigFile {
             scroll: Scroll::default(),
             pointer: Pointer::default(),
             mode_indicator: ModeIndicator::default(),
+            key_help: Default::default(),
             plugin_modes: default_plugin_modes(),
             app_configs: Vec::new(),
             resolved_key_aliases: BTreeMap::new(),

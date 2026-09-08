@@ -42,6 +42,7 @@ fn active_config(engine: &Engine) -> Config {
 /// Records what the engine asked of the platform.
 #[derive(Default)]
 struct Recorder {
+    character_bindings: Vec<Vec<String>>,
     window_moves: Vec<crate::api::command::WindowScreenTarget>,
     presents: usize,
     dismissals: usize,
@@ -103,6 +104,12 @@ impl FakeBackend {
 }
 
 impl Backend for FakeBackend {
+    fn set_character_bindings(&mut self, keys: &[Key]) {
+        let mut keys: Vec<_> = keys.iter().map(|key| key.as_str().to_string()).collect();
+        keys.sort();
+        self.log.lock().unwrap().character_bindings.push(keys);
+    }
+
     fn start(&mut self) -> Result<(), String> {
         if self.fail_start {
             Err("injected startup failure".into())
@@ -366,6 +373,7 @@ fn only_ui_scan_results_use_the_owned_mode_route() {
 
 fn key_event(name: &str, state: KeyState) -> BackendEvent {
     BackendEvent::Input(InputEvent {
+        character: None,
         key: Key::new(name).unwrap(),
         state,
         repeat: false,

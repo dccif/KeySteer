@@ -195,6 +195,27 @@ impl Mode for ScreenSelector {
         "Screen".into()
     }
 
+    fn available_keys(&self) -> Vec<(String, String)> {
+        let mut keys = vec![("esc".into(), "cancel".into())];
+        if !self.input.is_empty() {
+            keys.push(("backspace".into(), "back".into()));
+        }
+        if self.cells.iter().any(|(label, _, _)| label == &self.input) {
+            keys.push(("enter".into(), "select screen".into()));
+        }
+        let next: std::collections::BTreeSet<_> = self
+            .cells
+            .iter()
+            .filter_map(|(label, _, _)| label.strip_prefix(&self.input))
+            .filter_map(|suffix| suffix.chars().next())
+            .collect();
+        keys.extend(
+            next.into_iter()
+                .map(|key| (key.to_string(), "select screen".into())),
+        );
+        keys
+    }
+
     fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
         match event {
             ModeEvent::Invoked { verb, args } if verb == VERB => {

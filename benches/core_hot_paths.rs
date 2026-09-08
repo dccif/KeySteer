@@ -12,7 +12,19 @@ const CALLS_PER_SAMPLE: usize = 1_000;
 #[path = "support/runtime.rs"]
 mod runtime;
 
+#[cfg(target_os = "windows")]
+#[path = "support/character_capture.rs"]
+mod character_capture;
+
+#[cfg(target_os = "macos")]
+#[path = "support/character_capture_macos.rs"]
+mod character_capture;
+
 fn main() -> Result<(), String> {
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    if std::env::args().any(|arg| arg == "--character-capture") {
+        return character_capture::run();
+    }
     if std::env::args().any(|arg| arg == "--runtime") {
         return runtime::run();
     }

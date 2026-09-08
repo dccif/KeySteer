@@ -14,6 +14,7 @@
 mod config_handoff;
 mod input_router;
 mod input_state;
+mod key_help;
 mod overlay_coordinator;
 mod plan;
 mod prefix_chords;
@@ -481,6 +482,7 @@ impl Engine {
         // Bootstrap defers registration compilation until the backend can
         // provide its initial app profile. This is the only startup build.
         self.rebuild_tables();
+        self.sync_character_bindings(backend);
         crate::support::perf_probe::mark("engine_ready");
         self.trace_lazy(self.settings.debug.backend, "backend", || {
             format!(
@@ -565,6 +567,7 @@ impl Engine {
         errors.record("cancel scans", self.cancel_all_scans(backend));
         errors.record("release held inputs", self.release_latched(backend));
         errors.record("dismiss overlay", backend.dismiss());
+        self.overlay.reset();
         let shutdown = backend.shutdown();
         let shutdown_succeeded = shutdown.is_ok();
         errors.record("backend shutdown", shutdown);
@@ -672,9 +675,13 @@ impl Engine {
                 }
                 if profile_changed {
                     self.rebuild_tables();
+                    self.sync_character_bindings(backend);
                     self.trace_binding_tables();
                 }
                 self.dispatch(ModeEvent::FocusChanged(app), backend)?;
+                if self.overlay.key_help_visible {
+                    self.refresh_overlay(backend)?;
+                }
             }
             BackendEvent::ScreensChanged(screens) => {
                 self.screens = screens.clone();
@@ -904,6 +911,7 @@ impl Engine {
         self.rebuild_tables();
         self.trace_binding_tables();
         self.set_active(ModeId::idle());
+        self.sync_character_bindings(backend);
         self.dispatch(
             ModeEvent::Activated {
                 previous: Some(previous),
@@ -1161,6 +1169,7 @@ impl Engine {
             match command {
                 Command::DispatchActions(actions) => {
                     let input = crate::api::input::InputEvent {
+                        character: None,
                         key: Key::new("plugin_action")?,
                         state: KeyState::Down,
                         repeat: false,
@@ -1582,6 +1591,15 @@ impl Engine {
         }
 
         match binding {
+            Binding::KeyHelp => {
+                if self.registry.active != ModeId::idle() {
+                    self.overlay.key_help_visible =
+                        self.settings.key_help.enabled && !self.overlay.key_help_visible;
+                    self.overlay.key_help_cache = None;
+                    self.refresh_overlay(backend)?;
+                }
+                Ok(true)
+            }
             Binding::Sequence(actions) => {
                 let actions = self.flatten_sequence(actions);
                 let has_held = actions.iter().any(Binding::is_held);

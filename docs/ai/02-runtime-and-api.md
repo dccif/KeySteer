@@ -101,6 +101,11 @@ manifest/default binding。`registry.rs` 将 Mode 注册、查找、路由编译
 绑定表只在配置、模式注册或实际生效的 per-app override profile 变化时重建。仅窗口标题
 变化但合并后的绑定不变，不应触发表重编译。
 
+路由编译同时建立 `char -> Key` 索引，仅收录单键字符 chord。字符查找直接借用索引中的 Key，
+不再逐模式寻找字符；真正的绑定仍通过原有模式优先级、继承和 Disabled 规则解析。Engine
+在启动、运行时重载和有效应用覆盖变化时，以 `Backend::set_character_bindings` 同步字符观察
+需求，普通按键处理不遍历配置或重建该索引。
+
 ## 事件循环
 
 `Engine::run`：
@@ -229,3 +234,14 @@ macOS 更新事件在 Hook 有界队列忙时转入 fallback channel，后台线
 - 对连续失败只报告一次，后续成功后解除抑制。
 
 不要把这种失败改成保留当前 targeting 状态，否则用户会停留在没有可用标识的假状态。
+
+## 字符与物理键
+
+`InputEvent.key` 保留物理键身份，`character` 可选地携带平台读取的单个可打印字符。配置中的单字符（包括符号）按字面解析。实际字符不同于物理键时，Engine 先用该字符查询普通绑定继承链，匹配失败才回退物理键/chord；字符已经由 OS 布局生成，不要求它的生产修饰键参与字面匹配。释放、repeat 与 held gesture 始终使用原物理键配对。输入恢复无需新增字符状态；查询借用已编译 Key，避免每次创建字符串。
+
+## 鼠标侧键绑定
+
+`mouse_x1` / `mouse_x2` 通过普通 `BackendEvent::Input` 参与组合键、继承和 held gesture。
+按下、松开仍通过 `dispose_key` 配对。未匹配的侧键总是透传，不受 Mode 的
+`captures_keyboard` 影响，不派发原始 `ModeEvent::Key`，也不产生语义 `Clicked`。
+原生边沿映射和超时配对见 [原生后端](06-platform-backends.md#鼠标侧键绑定)。

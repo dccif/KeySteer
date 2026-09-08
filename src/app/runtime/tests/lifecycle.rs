@@ -1,4 +1,28 @@
 #[test]
+fn registry_lookup_preserves_identity_with_a_stale_dispatch_slot() {
+    let mut registry = ModeRegistry::default();
+    let mut registered = Vec::new();
+    for mode in crate::app::mode_catalog::built_in(&Config::default()) {
+        let id = mode.id();
+        let pointer_events = mode.wants_pointer_events();
+        let index = registry.insert(id.clone(), mode, pointer_events);
+        registered.push((id, index));
+    }
+    for cached in [None, Some(usize::MAX)]
+        .into_iter()
+        .chain(registered.iter().map(|(_, index)| Some(*index)))
+    {
+        registry.active_slot = cached;
+        for (id, index) in &registered {
+            registry.active = id.clone();
+            assert_eq!(registry.index_of(id), Some(*index));
+            assert_eq!(registry.get(id).unwrap().id(), *id);
+        }
+        assert_eq!(registry.index_of(&ModeId::new("missing_mode").unwrap()), None);
+    }
+}
+
+#[test]
 fn toggled_inputs_survive_targeting_but_release_on_normal_or_idle_entry() {
     let mut engine = engine_with_normal_binding("n", "toggle left_shift mouse_left");
     engine.register(Box::new(ProbeMode::new(
@@ -209,6 +233,7 @@ fn injected_keys_are_never_dispatched_to_modes() {
     engine.register(Box::new(ProbeMode::new("idle", seen.clone())));
 
     let (mut backend, _) = FakeBackend::new(vec![BackendEvent::Input(InputEvent {
+        character: None,
         key: Key::new("g").unwrap(),
         state: KeyState::Down,
         repeat: false,

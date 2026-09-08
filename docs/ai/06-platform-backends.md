@@ -272,3 +272,44 @@ TOML 可跨平台复用，但只有对应 Backend 消费它。
   later at the engine or renderer boundary, never inside the OS callback.
 - Readiness markers distinguish `hook_ready`, `uia_ready`, `ocr_ready`, and
   `renderer_ready`; `backend_started` is not interactive readiness.
+
+## 可打印字符输入
+
+物理按键映射保留不变。Engine 在初始路由编译、配置重载和有效应用覆盖配置变化后，通过
+`Backend::set_character_bindings` 交付单字符绑定需求。两端复用原生物理键映射，只有物理键
+路径无法表示的字符才启用额外观察；默认配置、无字符需求的配置和移除最后一个字符绑定后，
+非 repeat Down 只检查关闭标志，不查询布局、不读取 Unicode、不分配字符缓冲区。
+
+两端共用 `common/character_candidates.rs::CharacterDemand`：编译实际需要额外观察的字符、
+管理开关，并用 128-bit ASCII 位图在 UTF-16 解码之前排除未绑定的普通字符。单个 ASCII
+字符只读取一个原子字，命中时直接返回已校验的 ASCII 字符；不需要遍历绑定或解码迭代器。
+非 ASCII、代理对和多字符文本仍走原有
+校验，不把 Unicode 大小写关系简化为 ASCII。Windows 的原生候选快照也放在该模块，
+但布局枚举和原生调用仍在平台目录中。
+
+Windows 在后端线程按当前布局预编译 `virtual key × Shift/Ctrl/Alt` 候选位图，正向枚举锁定
+状态和小键盘等多种产生方式，不把 `VkKeyScanEx` 的单个反查结果当成完整候选集合。Hook
+启用字符观察后仍须读取真实前台布局：`WH_KEYBOARD_LL` 不携带 HKL，不能依赖异步通知缓存
+而漏掉布局切换后的第一键。布局一致、scan code 一致且位图排除的键直接返回；只有候选、
+未知扫描码或失效缓存才构造按键状态并调用 `ToUnicodeEx`。按键状态按已按下 bitset 的置位项
+填充，不再遍历全部 256 个键。遇到新布局先保守观察，并请求后端在没有待交付事件时重建；
+重建不在 Hook 回调中执行。发布以版本号保护，读到更新中的位图不得据此拒绝字符。
+dead-key 布局或无法枚举的字符保留完整观察回退；flag 4 保持系统 dead-key 状态不变。
+
+macOS 的 CGEvent 已携带系统转换好的 Unicode 文本：无需求时完全跳过读取；有需求时
+读取固定栈缓冲区，马上通过共享 ASCII 位图过滤，再对候选执行 UTF-16 校验。它仍需
+读取事件文本来识别实际字符，**没有 Windows 那种物理键/布局候选表**。不在 Hook 中
+调用 TIS 输入源 API，也不增加主线程同步、Carbon 布局枚举或布局通知缓存，避免引入
+主线程约束和布局切换时的漏键风险。两端只在非 repeat、非修饰键 Down
+观察字符，用固定栈缓冲区拒绝控制字符、无效 UTF-16 和多个字符，不把 IME 文本提交当成
+快捷键，也不维护某个符号的 Shift 映射表。`hook_received` 性能标记覆盖字符读取的耗时。
+
+## 鼠标侧键绑定
+
+`mouse_x1` / `mouse_x2` 是物理触发键（别名 `xbutton1`/`mouse4`、`xbutton2`/`mouse5`）。
+Windows Hook 将 XBUTTON1/2 的 down/up、macOS Hook 将 OtherMouse 的按钮 3/4 边沿转换成
+普通 `BackendEvent::Input`，character 为空，复用现有绑定、继承、held gesture 和 disposition
+握手。平台缓存 canonical Key；忽略自身注入，原生侧保存实际消费决定，超时/跨模式松开
+也不能拆散 down/up。Windows 使用 VK_XBUTTON1/2 的独立 bitset 槽，并复用 Alt 菜单抑制。
+未匹配绑定的侧键必须透传，不能受 `captures_keyboard` 影响，也不发送原始 `ModeEvent::Key`；
+物理侧键不产生语义 `Clicked`。左右键、中键和滚轮不接入此次绑定链路。

@@ -264,6 +264,7 @@
 }
 
 .ks-key-row button,
+.ks-dual-key,
 .ks-key-gap {
   width: calc(var(--key-unit) * var(--key-width) + 4px * (var(--key-width) - 1));
   flex: 0 0 auto;
@@ -288,6 +289,8 @@
 }
 
 .ks-numpad button { height: auto; }
+
+.ks-keyboard-hint { margin: -4px 20px 12px; color: var(--vp-c-text-2); font-size: 11px; }
 
 .ks-key-row button > small,
 .ks-numpad button > small {
@@ -314,6 +317,53 @@
 
 .ks-keyboard button:hover { filter: brightness(.97); transform: translateY(-1px); }
 .ks-keyboard button.selected { outline: 2px solid var(--vp-c-brand-1); outline-offset: 1px; box-shadow: 0 0 0 4px var(--vp-c-brand-soft); }
+
+/* Two legends share one physical keycap. Only the glyphs carry binding colors. */
+.ks-dual-key {
+  display: flex;
+  flex-direction: column;
+  height: var(--key-height);
+  padding: 3px 0;
+  border: 1px solid var(--ks-border);
+  border-bottom-width: 3px;
+  border-radius: 7px;
+  background: var(--ks-key);
+}
+.ks-key-row .ks-dual-key button {
+  position: relative;
+  width: 100%;
+  height: 50%;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  align-items: flex-start;
+  justify-content: center;
+  font-size: clamp(9px, 0.85vw, 12px);
+  transform: none;
+  filter: none;
+}
+.ks-key-row .ks-dual-key button:first-child { font-size: clamp(8px, 0.72vw, 10px); }
+.ks-key-row .ks-dual-key button > small { display: none; }
+.ks-key-row .ks-dual-key button.bound::after {
+  content: '';
+  position: absolute;
+  right: 5px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.ks-dual-key:has(button.selected),
+.ks-dual-key:focus-within { outline: 2px solid var(--vp-c-brand-1); outline-offset: 1px; }
+.ks-key-row .ks-dual-key button.selected {
+  outline: none;
+  box-shadow: none;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.ks-key-row .ks-dual-key button:hover { background: var(--vp-c-default-soft); }
+.ks-key-row .ks-dual-key button:focus-visible { outline: 1px dotted currentColor; outline-offset: -2px; }
 
 .ks-key-section.compact .ks-key-row button { font-size: 9px; }
 

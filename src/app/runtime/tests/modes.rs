@@ -130,6 +130,7 @@ fn temporary_modifier_repaints_badge_without_leaving_grid() {
     let primary = Key::new(&config.grid.temporary_mode_keys[0]).unwrap();
     let input = |state| {
         BackendEvent::Input(InputEvent {
+            character: None,
             key: primary.clone(),
             state,
             repeat: false,
@@ -179,6 +180,7 @@ fn primary_q_returns_every_configurable_targeting_mode_to_normal() {
         engine
             .handle_backend_event(
                 BackendEvent::Input(InputEvent {
+                    character: None,
                     key: primary.clone(),
                     state: KeyState::Down,
                     repeat: false,
@@ -407,6 +409,7 @@ fn discrete_bindings_ignore_auto_repeat() {
         vec![
             key_down("f"),
             BackendEvent::Input(InputEvent {
+                character: None,
                 key: Key::new("f").unwrap(),
                 state: KeyState::Down,
                 repeat: true,
@@ -448,6 +451,7 @@ fn held_sequence_repeat_does_not_repeat_discrete_actions() {
         vec![
             key_down("f"),
             BackendEvent::Input(InputEvent {
+                character: None,
                 key: Key::new("f").unwrap(),
                 state: KeyState::Down,
                 repeat: true,
@@ -472,6 +476,7 @@ fn held_sequence_rejects_mode_changes_before_starting() {
         owner: ModeId::normal(),
     };
     let input = InputEvent {
+        character: None,
         key: Key::new("f").unwrap(),
         state: KeyState::Down,
         repeat: false,
@@ -495,6 +500,7 @@ fn follow_binding_is_dispatched_once_to_the_active_mode() {
         vec![
             key_down("`"),
             BackendEvent::Input(InputEvent {
+                character: None,
                 key: Key::new("`").unwrap(),
                 state: KeyState::Down,
                 repeat: true,

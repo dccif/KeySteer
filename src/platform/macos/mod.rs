@@ -21,6 +21,9 @@ mod vision;
 mod window_move;
 mod workspace;
 
+#[cfg(feature = "benchmark-hooks")]
+pub use input::{CharacterCaptureProbe, observe_character_unfiltered};
+
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -386,6 +389,12 @@ impl Backend for MacOsBackend {
             );
         }
         Ok(())
+    }
+
+    fn set_character_bindings(&mut self, keys: &[crate::api::Key]) {
+        if let Some(hook) = self.hook.as_ref() {
+            hook.set_character_bindings(keys);
+        }
     }
 
     fn screens(&self) -> Result<Vec<Screen>, String> {

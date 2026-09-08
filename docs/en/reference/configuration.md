@@ -341,3 +341,34 @@ timers = true
 ```
 
 Enable debug logs only while investigating an issue; they are written to `keysteer.log` in the data directory.
+
+## Key help
+
+The `key_help` verb toggles the available-key panel. Add `"?" = "key_help"` under `[normal.bindings]` to enable it. Omission or commenting out the entry disables it; no `none` entry is needed. `?` matches the character produced by the operating system; configuration parsing does not infer a layout or expand it into a chord. Inherited bindings apply in targeting modes. Idle closes the panel.
+
+`[key_help]` supports `enabled`, `font_family`, `font_size`, `background_color`, `text_color`, `border_color`, `border_width`, `border_radius`, `padding_x`, and `padding_y`. Empty font and omitted background/text colors follow the mode indicator and theme. Colors accept `#RRGGBBAA` or `{ light = "#RRGGBBAA", dark = "#RRGGBBAA" }`. Title sizing, columns and centering adapt automatically.
+
+Use **Edit key help style** in the [simulator](/en/simulator) to preview changes and export TOML.
+
+### Mouse side buttons
+
+Windows and macOS accept `mouse_x1` (usually Back) and `mouse_x2` (usually Forward)
+as binding triggers. Aliases are `xbutton1`/`mouse4` and `xbutton2`/`mouse5`.
+Add the lines to the corresponding existing tables:
+
+```toml
+[hotkeys]
+mouse_x1 = "normal"
+
+[normal.bindings]
+mouse_x1 = "key_help"
+mouse_x2 = "grid"
+"ctrl+mouse_x2" = "ui_hint"
+```
+
+Chords, inheritance, app overrides and held actions work as usual. For example,
+`mouse_x2 = "scroll_down"` scrolls while held and stops on release. Unbound or
+`none` side buttons pass through even in keyboard-capturing modes. A matched
+binding consumes both edges. Physical side buttons do not emit `Clicked`.
+These names are binding triggers; if mouse software remaps a side button to a
+keyboard shortcut, bind the shortcut that the driver actually emits.

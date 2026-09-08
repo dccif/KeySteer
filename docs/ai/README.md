@@ -19,13 +19,15 @@
 | --- | --- |
 | 找模块和入口 | [项目地图](01-project-map.md) |
 | 修改启动、事件路由、输入消费确认或动作执行 | [核心运行时与公共 API](02-runtime-and-api.md) |
-| 修改 TOML、按键、临时模式激活键消费、配置优先级、Reload、继承或持久化 | [配置、按键和持久化](03-configuration.md) |
-| 修改组合键前缀仲裁、跨屏窗口移动（含 macOS 原生全屏异步过渡）或鼠标跟随 | [配置与按键](03-configuration.md)、[核心运行时与公共 API](02-runtime-and-api.md)、[模式与插件](04-modes-and-lifecycle.md)、[原生后端](06-platform-backends.md) |
+| 修改 TOML、按键提示配置、字符/物理按键、临时模式激活键消费、配置优先级、Reload、继承或持久化 | [配置、按键和持久化](03-configuration.md) |
+| 修改鼠标侧键绑定、组合键前缀仲裁、跨屏窗口移动（含 macOS 原生全屏异步过渡）或鼠标跟随 | [配置与按键](03-configuration.md)、[核心运行时与公共 API](02-runtime-and-api.md)、[模式与插件](04-modes-and-lifecycle.md)、[原生后端](06-platform-backends.md) |
 | 修改 Mode、插件或 Finish | [内置模式、插件与 Finish](04-modes-and-lifecycle.md) |
 | 修改 UIA、AX、OCR、Vision 或扫描超时 | [UI Hint 扫描链路](05-ui-scanning.md) |
 | 修改原生平台能力、后台输入恢复、登录项或状态栏生命周期 | [Windows 与 macOS 后端](06-platform-backends.md) |
-| 修改覆盖层、帧时钟或性能 | [覆盖层、帧同步与性能](07-rendering-and-performance.md) |
+| 修改覆盖层、实时按键提示及其缓存、帧时钟或性能 | [覆盖层、帧同步与性能](07-rendering-and-performance.md) |
+| 修改跨平台字符需求/ASCII 过滤、Windows 布局候选过滤或输入延迟 | [核心运行时与公共 API](02-runtime-and-api.md)、[原生后端](06-platform-backends.md)、[构建与性能验收](08-build-docs-and-tests.md) |
 | 修改构建、打包、文档或测试 | [构建、打包、文档站与测试](08-build-docs-and-tests.md) |
+| 对比 0.9.20 与 0.9.13 性能 | [本机性能报告](performance-0.9.20.md) |
 | 准备实施跨层改动 | [改动导航与不变量](09-change-guide.md) |
 | 检查模块依赖和配置编译边界 | [架构边界与运行计划](10-architecture-boundaries.md) |
 

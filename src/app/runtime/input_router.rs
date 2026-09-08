@@ -32,6 +32,10 @@ pub(super) struct CompiledKeymap {
 }
 
 impl CompiledKeymap {
+    pub(super) fn iter_entries(&self) -> impl Iterator<Item = &CompiledBinding> {
+        self.by_activation.values().flatten()
+    }
+
     pub fn compile(bindings: Vec<(String, Binding)>, aliases: &BTreeMap<String, String>) -> Self {
         let mut map = Self::default();
         for (text, binding) in bindings {

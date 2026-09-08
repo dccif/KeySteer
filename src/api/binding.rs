@@ -170,6 +170,8 @@ pub enum Binding {
     SetConfig { path: String, value: String },
     /// Leave the current mode and return to idle.
     Escape,
+    /// Toggle the available-key panel.
+    KeyHelp,
     /// Stop the program.
     Quit,
     /// Explicitly unbound: removes an inherited default.
@@ -381,6 +383,7 @@ impl Binding {
             "slow_toggle" | "toggle_slow" => B::SpeedToggle(Speed::Slow),
             "fast_toggle" | "toggle_fast" => B::SpeedToggle(Speed::Fast),
             "follow" => B::ToggleCursorFollowSelection,
+            "key_help" => B::KeyHelp,
             "finish" | "finish_mode" => B::FinishMode,
             "restart_mode" => B::RestartMode,
 
@@ -461,6 +464,7 @@ impl Binding {
             B::Exec { program, args } if args.is_empty() => format!("exec {program}"),
             B::Exec { program, args } => format!("exec {program} {}", args.join(" ")),
             B::RescanUi => "rescan".into(),
+            B::KeyHelp => "key_help".into(),
             B::FinishMode => "finish".into(),
             B::RestartMode => "restart_mode".into(),
             B::ReloadConfig => "reload_config".into(),

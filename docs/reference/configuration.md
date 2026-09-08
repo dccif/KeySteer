@@ -113,6 +113,32 @@ h = "move_left"
 
 常用键名包括 `a-z`、`0-9`、`space`、`enter`、`esc`、`tab`、`delete`、`backspace`、`up`、`down`、`left`、`right`、`home`、`end`、`page_up`、`page_down`、`f1-f20` 和 `numpad_0-numpad_9`。
 
+### 鼠标侧键
+
+Windows 和 macOS 都支持把两个鼠标侧键作为绑定的左值：
+
+| 按键名 | 含义 | 可用别名 |
+| --- | --- | --- |
+| `mouse_x1` | 第一个侧键，通常是后退键 | `xbutton1`、`mouse4` |
+| `mouse_x2` | 第二个侧键，通常是前进键 | `xbutton2`、`mouse5` |
+
+将需要的行加入已有配置的对应段，不要重复创建同名段：
+
+```toml
+[hotkeys]
+mouse_x1 = "normal"          # 从 Idle 进入工作模式
+
+[normal.bindings]
+mouse_x1 = "key_help"        # 在工作模式中切换按键提示
+mouse_x2 = "grid"            # 进入网格定位
+"ctrl+mouse_x2" = "ui_hint"  # Ctrl + 第二个侧键进入 UI Hint
+```
+
+侧键支持普通组合键、绑定继承、应用覆盖和持续动作，例如 `mouse_x2 = "scroll_down"` 会在
+按住时滚动、松开时停止。未绑定或设为 `none` 时保留原生前进/后退行为，即使当前模式独占
+键盘也不会自动吞掉侧键；匹配绑定后会消费该次侧键的按下与松开。物理侧键不产生语义 `Clicked` 事件。
+这些名称用于触发绑定；鼠标驱动若已把侧键改成键盘快捷键，应绑定驱动实际输出的按键。
+
 ### 自定义别名
 
 ```toml
@@ -368,3 +394,11 @@ timers = true
 ```
 
 建议只在排查问题时开启调试日志；日志会写入数据目录中的 `keysteer.log`。
+
+## 实时按键提示
+
+`key_help` 动词切换按键提示面板。在 `[normal.bindings]` 中写入 `"?" = "key_help"` 即可启用；省略或注释该项即禁用，不需要 `none`。`?` 按字面匹配操作系统产生的问号字符，解析器不推测键盘布局或按法；targeting 模式按原有规则继承。进入 Idle 自动关闭。
+
+`[key_help]` 只提供常用样式项：`enabled`、`font_family`、`font_size`、`background_color`、`text_color`、`border_color`、`border_width`、`border_radius`、`padding_x`、`padding_y`。空字体和未指定的背景/文字色跟随模式指示器与主题。颜色支持 `#RRGGBBAA` 或 `{ light = "#RRGGBBAA", dark = "#RRGGBBAA" }`。标题大小、分列和居中自动适配。
+
+在[模拟器](/simulator)点击“编辑按键提示样式”，即可修改、预览并导出 TOML。

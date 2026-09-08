@@ -7,7 +7,7 @@ import {
   type ConfigDocument,
 } from './document'
 
-type TargetingMode = 'grid' | 'recursive_grid' | 'ui_hint'
+type TargetingMode = 'grid' | 'recursive_grid' | 'ui_hint' | 'key_help'
 type Appearance = 'dark' | 'light'
 type ControlKind = 'color' | 'number' | 'text' | 'boolean' | 'select'
 
@@ -28,6 +28,24 @@ interface ModeFields {
 }
 
 const fields: Record<TargetingMode, ModeFields> = {
+  key_help: {
+    colors: [
+      { path: 'key_help.background_color', label: '背景色', kind: 'color' },
+      { path: 'key_help.text_color', label: '文字色', kind: 'color' },
+      { path: 'key_help.border_color', label: '边框色', kind: 'color' },
+    ],
+    layout: [
+      { path: 'key_help.enabled', label: '启用按键提示', kind: 'boolean' },
+      { path: 'key_help.font_size', label: '字号', kind: 'number', min: 1, max: 72, step: 1 },
+      { path: 'key_help.padding_x', label: '水平内边距', kind: 'number', min: 0, max: 100, step: 1 },
+      { path: 'key_help.padding_y', label: '垂直内边距', kind: 'number', min: 0, max: 100, step: 1 },
+    ],
+    advanced: [
+      { path: 'key_help.font_family', label: '字体（空值继承）', kind: 'text' },
+      { path: 'key_help.border_width', label: '边框宽度', kind: 'number', min: 0, max: 20, step: 1 },
+      { path: 'key_help.border_radius', label: '圆角', kind: 'number', min: 0, max: 100, step: 1 },
+    ],
+  },
   grid: {
     colors: [
       { path: 'grid.ui.background_color', label: '标签底色', kind: 'color' },
@@ -203,7 +221,10 @@ const StyleControl = defineComponent({
   setup(props) {
     return () => {
       const field = props.field
-      const value = props.value ?? fallback(field, props.appearance)
+      const source = props.value ?? fallback(field, props.appearance)
+      const variants = field.kind === 'color' && source && typeof source === 'object' ? source as Record<string, string> : undefined
+      const value = variants?.[props.appearance] ?? source
+      const updateColor = (next: string) => props.onUpdate(variants ? { ...variants, [props.appearance]: next } : next)
       return (
         <label class={{ 'ks-style-control': true, toggle: field.kind === 'boolean' }} title={field.path}>
           <span>{field.label}</span>
@@ -211,8 +232,8 @@ const StyleControl = defineComponent({
             <button type="button" class={{ active: Boolean(value) }} onClick={() => props.onUpdate(!value)}><i />{value ? '开启' : '关闭'}</button>
           ) : field.kind === 'color' ? (
             <div class="ks-style-color">
-              <input type="color" value={normalizeColor(value, props.appearance)} onInput={(event) => props.onUpdate(withAlpha((event.target as HTMLInputElement).value, value))} />
-              <input value={String(value)} onInput={(event) => props.onUpdate((event.target as HTMLInputElement).value)} />
+              <input type="color" value={normalizeColor(value, props.appearance)} onInput={(event) => updateColor(withAlpha((event.target as HTMLInputElement).value, value))} />
+              <input value={String(value)} onInput={(event) => updateColor((event.target as HTMLInputElement).value)} />
             </div>
           ) : field.kind === 'select' ? (
             <select value={String(value)} onChange={(event) => props.onUpdate((event.target as HTMLSelectElement).value)}>
@@ -259,5 +280,5 @@ function withAlpha(next: string, previous: unknown): string {
 }
 
 function modeLabel(mode: TargetingMode): string {
-  return mode === 'grid' ? 'Grid' : mode === 'recursive_grid' ? 'Recursive Grid' : 'UI Hint'
+  return mode === 'key_help' ? '按键提示' : mode === 'grid' ? 'Grid' : mode === 'recursive_grid' ? 'Recursive Grid' : 'UI Hint'
 }

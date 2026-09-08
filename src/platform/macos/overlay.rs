@@ -639,6 +639,13 @@ impl WindowContent {
             LabelSlot::Indicator(index) => &mut self.indicator_labels[index],
         };
         let frame = to_window_rect(spec.rect, area);
+        let alignment = match spec.style.text_alignment {
+            crate::api::overlay::TextAlignment::Left => ns_string!("left"),
+            crate::api::overlay::TextAlignment::Center => ns_string!("center"),
+            crate::api::overlay::TextAlignment::Right => ns_string!("right"),
+        };
+        layer.base.setAlignmentMode(alignment);
+        layer.matched.setAlignmentMode(alignment);
         layer.base.setHidden(false);
         layer.base.setFrame(frame);
         layer.base.setBackgroundColor(
@@ -673,7 +680,11 @@ impl WindowContent {
             }
             layer.metrics = metrics;
         }
-        layer.update_matched_prefix(spec.analysis.matched_utf16_len, frame.size);
+        layer.update_matched_prefix(
+            spec.analysis.matched_utf16_len,
+            frame.size,
+            spec.style.text_alignment,
+        );
         layer.configured = true;
     }
 
@@ -887,7 +898,12 @@ impl LabelLayers {
         }
     }
 
-    fn update_matched_prefix(&self, matched_utf16_len: usize, frame: NSSize) {
+    fn update_matched_prefix(
+        &self,
+        matched_utf16_len: usize,
+        frame: NSSize,
+        alignment: crate::api::overlay::TextAlignment,
+    ) {
         self.matched_clip.setHidden(matched_utf16_len == 0);
         if matched_utf16_len == 0 {
             return;
@@ -898,7 +914,7 @@ impl LabelLayers {
             .iter()
             .find(|offset| usize::try_from(offset.utf16_len) == Ok(matched_utf16_len))
             .map_or(f64::from(self.metrics.width), |offset| f64::from(offset.x));
-        let text_origin = (frame.width - f64::from(self.metrics.width)) / 2.0;
+        let text_origin = alignment.offset(frame.width, f64::from(self.metrics.width));
         let clip_width = (text_origin + prefix_x).clamp(0.0, frame.width);
         self.matched_clip.setFrame(NSRect::new(
             NSPoint::new(0.0, 0.0),

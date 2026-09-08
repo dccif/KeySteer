@@ -10,6 +10,35 @@ use core_graphics::display::{
 };
 use objc2_foundation::{NSDefaultRunLoopMode, NSRunLoopMode};
 
+pub(crate) fn event_character(
+    event: &core_graphics::event::CGEvent,
+    demand: Option<&crate::platform::common::character_candidates::CharacterDemand>,
+) -> Option<char> {
+    let raw: &core_graphics::event::CGEventRef = event.as_ref();
+    let raw =
+        (raw as *const core_graphics::event::CGEventRef).cast::<objc2_core_graphics::CGEvent>();
+    let mut units = [0u16; 8];
+    let mut count = 0;
+    // SAFETY: both crates wrap the same CGEventRef. The borrowed event remains
+    // live during this read; buffers and output length have the required size.
+    unsafe {
+        objc2_core_graphics::CGEvent::keyboard_get_unicode_string(
+            Some(&*raw),
+            units.len() as u64,
+            &mut count,
+            units.as_mut_ptr(),
+        );
+    }
+    if count > units.len() as u64 {
+        return None;
+    }
+    let units = &units[..count as usize];
+    demand.map_or_else(
+        || crate::api::input::single_printable_character(units),
+        |demand| demand.decode(units),
+    )
+}
+
 /// Process-lifetime run-loop modes exported by Core Foundation/Foundation.
 pub(crate) struct RunLoopModes {
     pub(crate) core_foundation: CFRunLoopMode,

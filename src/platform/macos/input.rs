@@ -18,7 +18,32 @@ use objc2_core_graphics::{
 use crate::api::command::{ButtonAction, MouseButton};
 use crate::api::geometry::Point;
 use crate::api::input::{Key, KeyState};
+
 use crate::platform::multi_click::ClickTracker;
+
+#[cfg(feature = "benchmark-hooks")]
+pub struct CharacterCaptureProbe(crate::platform::common::character_candidates::CharacterDemand);
+
+#[cfg(feature = "benchmark-hooks")]
+impl CharacterCaptureProbe {
+    pub fn new(keys: &[Key], _keyboard_type: u32) -> Self {
+        let demand = crate::platform::common::character_candidates::CharacterDemand::new();
+        demand.configure(keys, |key| keycode_for(key).is_some());
+        Self(demand)
+    }
+
+    pub fn observe(&self, event: &CGEvent) -> Option<char> {
+        if !self.0.is_enabled() {
+            return None;
+        }
+        super::native::event_character(event, Some(&self.0))
+    }
+}
+
+#[cfg(feature = "benchmark-hooks")]
+pub fn observe_character_unfiltered(event: &CGEvent) -> Option<char> {
+    super::native::event_character(event, None)
+}
 
 /// Tags our synthetic events so the tap can ignore them. Any value works as
 /// long as it is unlikely to collide with another tool's.

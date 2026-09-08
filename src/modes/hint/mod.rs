@@ -991,6 +991,48 @@ impl Mode for HintMode {
             })
     }
 
+    fn available_keys(&self) -> Vec<(String, String)> {
+        let mut keys = vec![("esc".into(), "cancel".into())];
+        if self.session.finished {
+            keys.push(("backspace".into(), "back".into()));
+            keys.push(("tab".into(), "back".into()));
+            return keys;
+        }
+        if self.session.scanning && self.session.hints.is_empty() {
+            return keys;
+        }
+        keys.push(("backspace".into(), "back".into()));
+        keys.push(("enter".into(), "select first match".into()));
+        match &self.input {
+            Input::Labels(prefix) => {
+                keys.push(("/".into(), "search names".into()));
+                let next: std::collections::BTreeSet<_> = self
+                    .session
+                    .hints
+                    .iter()
+                    .filter_map(|hint| hint.label.as_str().strip_prefix(prefix.as_str()))
+                    .filter_map(|suffix| suffix.chars().next())
+                    .collect();
+                keys.extend(
+                    next.into_iter()
+                        .map(|key| (key.to_string(), "select hint".into())),
+                );
+            }
+            Input::Search(_) => {
+                keys.extend(
+                    ('a'..='z')
+                        .chain('0'..='9')
+                        .map(|key| (key.to_string(), "search names".into())),
+                );
+                keys.push(("space".into(), "search names".into()));
+            }
+        }
+        if let Some(chord) = &self.overlap_cycle_chord {
+            keys.push((chord.canonical(), "cycle overlapping hints".into()));
+        }
+        keys
+    }
+
     fn indicator_color(&self, palette: &Palette) -> Option<Color> {
         Some(palette.accent)
     }
@@ -1634,6 +1676,21 @@ mod tests {
             .expect("test data should produce a partial prefix");
 
         let out = press(&mut mode, &env, &prefix.to_string());
+        let expected_next: std::collections::BTreeSet<_> = mode
+            .session
+            .hints
+            .iter()
+            .filter_map(|hint| hint.label.as_str().strip_prefix(prefix))
+            .filter_map(|suffix| suffix.chars().next())
+            .map(|key| key.to_string())
+            .collect();
+        let help_next: std::collections::BTreeSet<_> = mode
+            .available_keys()
+            .into_iter()
+            .filter(|(_, action)| action == "select hint")
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(help_next, expected_next);
         let scene = scene_of(&out);
         assert!(!scene.labels.is_empty());
         assert!(scene.labels.len() < total);

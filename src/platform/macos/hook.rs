@@ -82,6 +82,7 @@ struct TapState {
     // disabled signal crosses from the callback to the surrounding run loop.
     last_flags: AtomicU64,
     caps_lock_down: AtomicBool,
+    side_button_decisions: AtomicU8,
     disabled: AtomicU8,
 }
 
@@ -90,6 +91,7 @@ impl Default for TapState {
         Self {
             last_flags: AtomicU64::new(0),
             caps_lock_down: AtomicBool::new(false),
+            side_button_decisions: AtomicU8::new(0),
             disabled: AtomicU8::new(0),
         }
     }
@@ -120,6 +122,7 @@ struct HookSignals {
     capture_loss: AtomicU8,
     drag_modifier_flags: AtomicU8,
     tap_capture_state: AtomicU8,
+    character_demand: crate::platform::common::character_candidates::CharacterDemand,
 }
 
 impl HookSignals {
@@ -128,6 +131,7 @@ impl HookSignals {
             capture_loss: AtomicU8::new(CAPTURE_LOSS_NONE),
             drag_modifier_flags: AtomicU8::new(0),
             tap_capture_state: AtomicU8::new(TAP_CAPTURE_ARMED),
+            character_demand: crate::platform::common::character_candidates::CharacterDemand::new(),
         }
     }
 
@@ -352,6 +356,12 @@ impl Drop for HookStartup {
 }
 
 impl HookThread {
+    pub(super) fn set_character_bindings(&self, keys: &[Key]) {
+        self.signals
+            .character_demand
+            .configure(keys, |key| input::keycode_for(key).is_some());
+    }
+
     pub fn is_active(&self) -> bool {
         self.active.load(Ordering::Acquire)
     }
@@ -843,6 +853,61 @@ fn handle_event(
         return CallbackResult::Keep;
     }
 
+    if matches!(
+        event_type,
+        CGEventType::OtherMouseDown | CGEventType::OtherMouseUp
+    ) && let Some((number, key_state, key)) = side_button_input(
+        event_type,
+        event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER),
+    ) {
+        let previous = state.side_button_decisions.load(Ordering::Relaxed);
+        let held = 1 << number;
+        let consumed = held << 2;
+        let proposed = disposition_for(
+            sender,
+            mailbox,
+            BackendEvent::Input(InputEvent {
+                character: None,
+                key,
+                state: key_state,
+                repeat: key_state == KeyState::Down && previous & held != 0,
+                injected: false,
+                timestamp_millis: 0,
+            }),
+        );
+        let consume = if previous & held != 0 {
+            previous & consumed != 0
+        } else {
+            matches!(proposed, CallbackResult::Drop)
+        };
+        let next = match key_state {
+            KeyState::Down => (previous | held) & !consumed | if consume { consumed } else { 0 },
+            KeyState::Up => previous & !(held | consumed),
+        };
+        state.side_button_decisions.store(next, Ordering::Relaxed);
+        if key_state == KeyState::Up && !consume {
+            let point = event.location();
+            let count = event.get_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE);
+            if let Ok(mut tracker) = click_tracker.lock() {
+                tracker.observe_completed(
+                    if number == 0 {
+                        MouseButton::X1
+                    } else {
+                        MouseButton::X2
+                    },
+                    Point::new(point.x, point.y),
+                    count,
+                    Instant::now(),
+                );
+            }
+        }
+        return if consume {
+            CallbackResult::Drop
+        } else {
+            CallbackResult::Keep
+        };
+    }
+
     match event_type {
         CGEventType::KeyDown | CGEventType::KeyUp => {
             let code = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
@@ -854,10 +919,20 @@ fn handle_event(
             } else {
                 KeyState::Up
             };
+            let repeat = event.get_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT) != 0;
             let input = InputEvent {
+                character: if key_state == KeyState::Down
+                    && !repeat
+                    && signals.character_demand.is_enabled()
+                    && !key.is_modifier()
+                {
+                    super::native::event_character(event, Some(&signals.character_demand))
+                } else {
+                    None
+                },
                 key,
                 state: key_state,
-                repeat: event.get_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT) != 0,
+                repeat,
                 injected: false,
                 timestamp_millis: 0,
             };
@@ -879,6 +954,7 @@ fn handle_event(
                 sender,
                 mailbox,
                 BackendEvent::Input(InputEvent {
+                    character: None,
                     key,
                     state: key_state,
                     repeat: false,
@@ -945,6 +1021,20 @@ fn handle_event(
         }
         _ => CallbackResult::Keep,
     }
+}
+
+fn side_button_input(event_type: CGEventType, button: i64) -> Option<(u8, KeyState, Key)> {
+    let number = match button {
+        3 => 1,
+        4 => 2,
+        _ => return None,
+    };
+    let state = match event_type {
+        CGEventType::OtherMouseDown => KeyState::Down,
+        CGEventType::OtherMouseUp => KeyState::Up,
+        _ => return None,
+    };
+    Some((number - 1, state, Key::mouse_side_button(number)?))
 }
 
 fn store_latest_pointer(latest_pointer: &SharedPointer, point: Point) -> bool {
@@ -1023,6 +1113,27 @@ fn disposition_for(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn mouse_side_button_edges_do_not_capture_middle_or_other_buttons() {
+        for (button, name) in [(3, "mouse_x1"), (4, "mouse_x2")] {
+            let (_, down, key) =
+                super::side_button_input(core_graphics::event::CGEventType::OtherMouseDown, button)
+                    .unwrap();
+            let (_, up, _) =
+                super::side_button_input(core_graphics::event::CGEventType::OtherMouseUp, button)
+                    .unwrap();
+            assert_eq!(key.as_str(), name);
+            assert_eq!(down, crate::api::KeyState::Down);
+            assert_eq!(up, crate::api::KeyState::Up);
+        }
+        for button in [0, 1, 2, 5, -1] {
+            assert!(
+                super::side_button_input(core_graphics::event::CGEventType::OtherMouseDown, button)
+                    .is_none()
+            );
+        }
+    }
     use super::*;
 
     #[test]
@@ -1132,6 +1243,7 @@ mod tests {
                 &event_tx,
                 &mailbox,
                 BackendEvent::Input(InputEvent {
+                    character: None,
                     key: Key::new("a").unwrap(),
                     state: KeyState::Down,
                     repeat: false,
@@ -1149,6 +1261,7 @@ mod tests {
         event_tx
             .try_send(Envelope {
                 event: BackendEvent::Input(InputEvent {
+                    character: None,
                     key: Key::new("a").unwrap(),
                     state: KeyState::Down,
                     repeat: false,
@@ -1164,6 +1277,7 @@ mod tests {
                 input::DRAG_MODIFIER_SHIFT | input::DRAG_MODIFIER_COMMAND,
             ),
             tap_capture_state: AtomicU8::new(TAP_CAPTURE_ARMED),
+            character_demand: crate::platform::common::character_candidates::CharacterDemand::new(),
         });
         let mailbox =
             Arc::new(crate::platform::common::disposition_mailbox::DispositionMailbox::default());

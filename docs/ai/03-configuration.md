@@ -66,6 +66,12 @@ Mode 的 cursor override 可单独覆盖这些值。普通反馈由物理按键�
 自动发现到的文件无效时，启动会记录错误并使用内置默认值；显式 `--config` 无效则返回
 错误。CLI `--check`、`--dump-config`、`--doctor` 用于诊断。
 
+工作模式通过普通 verb `key_help` 切换实时按键提示，需在 `normal.bindings` 中显式写入 `"?" = "key_help"`；内置绑定不添加此动作，缺少配置或注释掉该项即禁用，不需要 none。符号按原文解析；平台输入同时保留物理键和 OS 产生的字符，字符绑定直接匹配后者，不在解析器展开组合键；遵循现有继承、覆盖、按键边沿及 repeat 规则，没有保留快捷键。`[key_help]` 只配置 enabled、字体、字号、三种颜色、边框及内边距；标题与布局自动适配。该结构位于 `api::style`，经 configuration 编译进 EngineSettings。Idle、禁用及排除应用不显示面板。
+
+字符观察需求与单字符索引在路由编译时产生，通过 Backend 的可选能力同步；原生物理键路径
+已能表示的按键不要求开启额外字符观察。候选过滤属于原生布局实现，不改写配置中的符号或
+把 `?` 等字符展开成 Shift chord。详见 [原生后端的字符输入](06-platform-backends.md#可打印字符输入)。
+
 ## 按键标准化
 
 `src/api/input.rs` 负责 `Key` 和 `KeyChord`：
@@ -184,3 +190,10 @@ after_click = "..."
 适配器在 `app::configuration`。它把完整候选编译成 `RuntimePlan` 后才交给 Engine。无效候选完全无副作用；
 有效候选替换全部 Mode/Plugin 实例、释放合成输入并进入 Idle。Mode 只持有自己的强类型
 Settings，不存在 `ConfigReloaded` 广播。
+
+## 鼠标侧键绑定
+
+绑定左值接受 `mouse_x1` / `mouse_x2`，内置别名为 `xbutton1`/`mouse4` 与
+`xbutton2`/`mouse5`；支持常规组合键、继承和应用覆盖。它们是触发键，不是新增的
+键盘 `send` 目标。默认配置只提供注释示例，不占用用户的前进/后退键。未绑定或 `none`
+时侧键保持透传。示例见 [配置参考](/reference/configuration#鼠标侧键)。

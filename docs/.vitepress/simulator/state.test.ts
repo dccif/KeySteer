@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   applyModeAction,
+  applyKeyHelpAction,
   createSimulatorState,
   movePointer,
   resetTargetingPath,
@@ -31,4 +32,22 @@ test('button toggles retain pressed state', () => {
   assert.equal(state.pressedButtons.has('left'), true)
   toggleButton(state, 'left')
   assert.equal(state.pressedButtons.has('left'), false)
+})
+
+test('key_help toggles without resetting selection and closes on idle', () => {
+  const state = createSimulatorState()
+  applyModeAction(state, 'grid')
+  state.targeting.grid.path.push('a')
+  assert.equal(applyKeyHelpAction(state, 'key_help'), true)
+  assert.equal(state.keyHelpVisible, true)
+  assert.deepEqual(state.targeting.grid.path, ['a'])
+  applyKeyHelpAction(state, 'key_help')
+  assert.equal(state.keyHelpVisible, false)
+  applyKeyHelpAction(state, 'key_help', false)
+  assert.equal(state.keyHelpVisible, false)
+  applyKeyHelpAction(state, 'key_help')
+  applyModeAction(state, 'idle')
+  assert.equal(state.keyHelpVisible, false)
+  applyKeyHelpAction(state, 'key_help')
+  assert.equal(state.keyHelpVisible, false)
 })

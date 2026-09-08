@@ -1,7 +1,7 @@
 //! Windows keycode mapping and `SendInput` injection.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::POINT;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -16,6 +16,223 @@ use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos, XBUTTO
 use crate::api::command::{ButtonAction, MouseButton};
 use crate::api::geometry::Point;
 use crate::api::input::{Key, KeyState};
+use crate::platform::common::character_candidates::{CharacterCandidates, CharacterDemand};
+
+type KeyboardLayout = windows::Win32::UI::Input::KeyboardAndMouse::HKL;
+
+/// Cold writers publish a layout-specific candidate bitmap. A stale or changing
+/// bitmap always falls back to observation, never rejects a possible character.
+pub struct CharacterCapture {
+    candidates: CharacterCandidates,
+    demand: CharacterDemand,
+    characters: Mutex<Vec<char>>,
+}
+
+impl CharacterCapture {
+    pub const fn new() -> Self {
+        Self {
+            candidates: CharacterCandidates::new(),
+            demand: CharacterDemand::new(),
+            characters: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn configure(&self, keys: &[Key]) {
+        let mut previous = self.characters.lock().unwrap_or_else(|e| e.into_inner());
+        let characters = CharacterDemand::characters(keys, |key| virtual_key_for(key).is_some());
+        if *previous == characters {
+            return;
+        }
+        *previous = characters;
+        self.publish(&previous);
+    }
+
+    pub(super) fn refresh_if_needed(&self) {
+        if self.candidates.take_refresh() {
+            let characters = self.characters.lock().unwrap_or_else(|e| e.into_inner());
+            self.publish(&characters);
+        }
+    }
+
+    fn publish(&self, characters: &[char]) {
+        // The demand mutex serializes publication and native enumeration.
+        self.candidates.begin_update(!characters.is_empty());
+        self.demand.publish(characters);
+        let (layout, masks, scans) = if characters.is_empty() {
+            (0, [u64::MAX; 256], [0; 256])
+        } else {
+            let layout = foreground_keyboard_layout();
+            let (masks, scans) = compile_character_candidates(characters, layout);
+            (layout.0 as usize, masks.map(u64::from), scans)
+        };
+        self.candidates.publish(layout, masks, scans);
+    }
+
+    #[inline]
+    pub fn character_for_key(&self, vk: u32, scan: u32, pressed: [u64; 4]) -> Option<char> {
+        if !self.is_enabled() {
+            return None;
+        }
+        self.observe_candidate(vk, scan, pressed)
+    }
+
+    #[inline]
+    pub(super) fn is_enabled(&self) -> bool {
+        self.demand.is_enabled()
+    }
+
+    pub(super) fn observe_candidate(&self, vk: u32, scan: u32, pressed: [u64; 4]) -> Option<char> {
+        // WH_KEYBOARD_LL carries no HKL. Validate the *current* foreground
+        // layout, even before rejecting a candidate: notification-only caches
+        // can miss the first key after a layout switch or a new foreground app.
+        let layout = foreground_keyboard_layout();
+        if !self.is_candidate(vk, scan, character_modifiers(pressed), layout.0 as usize) {
+            return None;
+        }
+        translate_character(vk, scan, pressed, layout, Some(&self.demand))
+    }
+
+    fn is_candidate(&self, vk: u32, scan: u32, modifiers: u8, layout: usize) -> bool {
+        self.candidates
+            .is_candidate(vk as usize, scan, modifiers, layout)
+    }
+}
+
+impl Default for CharacterCapture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Expose the same production converter without candidate filtering for the
+/// standalone, uninstrumented release benchmark's conservative reference path.
+#[cfg(feature = "benchmark-hooks")]
+pub fn observe_character_unfiltered(vk: u32, scan: u32, pressed: [u64; 4]) -> Option<char> {
+    translate_character(vk, scan, pressed, foreground_keyboard_layout(), None)
+}
+
+pub(super) static CHARACTER_CAPTURE: CharacterCapture = CharacterCapture::new();
+
+fn foreground_keyboard_layout() -> KeyboardLayout {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout;
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    // SAFETY: no pointers escape; all returned handles are borrowed from Windows.
+    unsafe { GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), None)) }
+}
+
+fn character_modifiers(pressed: [u64; 4]) -> u8 {
+    let down = |code: usize| pressed[code / 64] & (1u64 << (code % 64)) != 0;
+    u8::from(down(0x10) || down(0xA0) || down(0xA1))
+        | (u8::from(down(0x11) || down(0xA2) || down(0xA3)) << 1)
+        | (u8::from(down(0x12) || down(0xA4) || down(0xA5)) << 2)
+}
+
+/// Enumerate forward translations, including numpad alternatives and lock
+/// states. Reverse lookup alone only returns one way of producing a character.
+fn compile_character_candidates(
+    characters: &[char],
+    layout: KeyboardLayout,
+) -> ([u8; 256], [u32; 256]) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        MAPVK_VK_TO_VSC, MapVirtualKeyExW, ToUnicodeEx,
+    };
+    let mut candidates = [0u8; 256];
+    let mut scan_codes = [0u32; 256];
+    let mut found = std::collections::BTreeSet::new();
+    // SAFETY: layout is a borrowed HKL; all input and output arrays have the API's
+    // documented sizes. Flag 4 never mutates the system's dead-key state.
+    unsafe {
+        for (vk, _) in VIRTUAL_KEYS {
+            if key_map()[*vk as usize]
+                .as_ref()
+                .is_none_or(Key::is_modifier)
+            {
+                continue;
+            }
+            let scan = MapVirtualKeyExW(u32::from(*vk), MAPVK_VK_TO_VSC, Some(layout));
+            scan_codes[*vk as usize] = scan;
+            for modifiers in 0..8u8 {
+                for locks in 0..8u8 {
+                    let mut state = [0u8; 256];
+                    state[*vk as usize] = 0x80;
+                    for (bit, generic, left) in [(1, 0x10, 0xA0), (2, 0x11, 0xA2), (4, 0x12, 0xA4)]
+                    {
+                        if modifiers & bit != 0 {
+                            state[generic] |= 0x80;
+                            state[left] |= 0x80;
+                        }
+                    }
+                    for (bit, code) in [(1, 0x14), (2, 0x90), (4, 0x15)] {
+                        state[code] |= u8::from(locks & bit != 0);
+                    }
+                    let mut units = [0u16; 8];
+                    let count =
+                        ToUnicodeEx(u32::from(*vk), scan, &state, &mut units, 4, Some(layout));
+                    // Dead-key layouts depend on pending composition state, so
+                    // negative filtering cannot be proved safe for that layout.
+                    if count < 0 {
+                        return ([u8::MAX; 256], scan_codes);
+                    }
+                    if count > 0
+                        && count as usize <= units.len()
+                        && let Some(character) =
+                            crate::api::input::single_printable_character(&units[..count as usize])
+                        && let Some(character) = character.to_lowercase().next()
+                        && characters.binary_search(&character).is_ok()
+                    {
+                        candidates[*vk as usize] |= 1 << modifiers;
+                        found.insert(character);
+                    }
+                }
+            }
+        }
+    }
+    // Unmappable characters / input methods retain the exact observation path.
+    if found.len() != characters.len() {
+        ([u8::MAX; 256], scan_codes)
+    } else {
+        (candidates, scan_codes)
+    }
+}
+
+/// Translate a candidate without altering the foreground's dead-key state.
+fn translate_character(
+    vk: u32,
+    scan: u32,
+    pressed: [u64; 4],
+    layout: KeyboardLayout,
+    demand: Option<&CharacterDemand>,
+) -> Option<char> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, ToUnicodeEx};
+    let mut state = [0u8; 256];
+    for (word, mut bits) in pressed.into_iter().enumerate() {
+        while bits != 0 {
+            state[word * 64 + bits.trailing_zeros() as usize] = 0x80;
+            bits &= bits - 1;
+        }
+    }
+    for (generic, left, right) in [(0x10, 0xA0, 0xA1), (0x11, 0xA2, 0xA3), (0x12, 0xA4, 0xA5)] {
+        state[generic] |= state[left] | state[right];
+    }
+    let mut units = [0u16; 8];
+    // SAFETY: fixed-size buffers satisfy the APIs. The window/thread/layout
+    // handles are borrowed synchronously. Flag 4 requests no keyboard-state
+    // mutation (Windows 10 1607+), preserving the foreground dead-key state.
+    let count = unsafe {
+        for code in [0x14, 0x90, 0x15] {
+            state[code] |= (GetKeyState(code as i32) & 1) as u8;
+        }
+        ToUnicodeEx(vk, scan, &state, &mut units, 4, Some(layout))
+    };
+    if count <= 0 || count as usize > units.len() {
+        return None;
+    }
+    let units = &units[..count as usize];
+    demand.map_or_else(
+        || crate::api::input::single_printable_character(units),
+        |demand| demand.decode(units),
+    )
+}
 
 /// Written to `dwExtraInfo` so the low-level hook can ignore our own input.
 pub const INJECTED_TAG: usize = 0x4E4D_4B31;
@@ -687,6 +904,73 @@ mod tests {
     use super::*;
     use std::hint::black_box;
     use std::time::Instant;
+
+    #[test]
+    fn physical_only_bindings_leave_character_capture_off() {
+        let capture = CharacterCapture::new();
+        let keys = ["h", "j", "k", "l", ";", "'", "1", "/"].map(|name| Key::new(name).unwrap());
+        capture.configure(&keys);
+        assert!(!capture.candidates.is_enabled());
+        assert_eq!(capture.character_for_key(0x48, 0x23, [0; 4]), None);
+    }
+
+    #[test]
+    fn character_capture_configuration_can_be_removed_without_stale_candidates() {
+        let capture = CharacterCapture::new();
+        // Seed an old snapshot without consulting the user's live layout.
+        *capture.characters.lock().unwrap() = vec!['?'];
+        capture.candidates.enabled.store(true, Ordering::Release);
+        capture.configure(&[]);
+        assert!(!capture.candidates.is_enabled());
+        assert!(capture.characters.lock().unwrap().is_empty());
+        assert_eq!(capture.character_for_key(0xBF, 0x35, [0; 4]), None);
+    }
+
+    #[test]
+    #[ignore = "read-only native layout probe; requires the US layout to be loaded"]
+    fn native_character_layout_probe() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayoutList;
+        let mut layouts = [KeyboardLayout::default(); 32];
+        // SAFETY: the fixed slice is writable for the entire synchronous call.
+        // This only reads installed layouts; it never loads or activates one.
+        let count = unsafe { GetKeyboardLayoutList(Some(&mut layouts)) };
+        let layout = layouts[..(count.max(0) as usize).min(layouts.len())]
+            .iter()
+            .copied()
+            .find(|layout| layout.0 as usize & 0xffff_ffff == 0x0409_0409)
+            .expect("load the US keyboard layout before running this explicit native probe");
+        let (masks, scans) = compile_character_candidates(&['!', '+', '?', '~'], layout);
+        assert_eq!(masks[0x48], 0, "H is never a candidate for these symbols");
+        assert_eq!(masks[0xBF] & 1, 0, "plain slash");
+        assert_ne!(masks[0xBF] & (1 << 1), 0, "Shift+slash");
+        assert_ne!(masks[0x31] & (1 << 1), 0, "Shift+1");
+        assert_ne!(masks[0xC0] & (1 << 1), 0, "Shift+backtick");
+        assert_ne!(masks[0xBB] & (1 << 1), 0, "Shift+equals");
+        assert_ne!(masks[0x6B] & 1, 0, "numpad add also produces +");
+        assert_eq!(scans[0x48], 0x23);
+        for (expected, vk, shifted) in [
+            ('?', 0xBFusize, true),
+            ('!', 0x31, true),
+            ('~', 0xC0, true),
+            ('+', 0xBB, true),
+            ('+', 0x6B, false),
+        ] {
+            let mut pressed = [0u64; 4];
+            pressed[vk / 64] |= 1 << (vk % 64);
+            if shifted {
+                pressed[0xA0 / 64] |= 1 << (0xA0 % 64);
+            }
+            assert_eq!(
+                translate_character(vk as u32, scans[vk], pressed, layout, None),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            compile_character_candidates(&['🦀'], layout).0,
+            [u8::MAX; 256],
+            "unmappable characters preserve the observation fallback"
+        );
+    }
 
     fn mouse_data(input: &INPUT) -> MOUSEINPUT {
         // SAFETY: every caller passes an INPUT value built by

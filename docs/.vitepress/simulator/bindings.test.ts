@@ -32,3 +32,11 @@ test('whitespace-separated binding aliases color and resolve each key', () => {
   assert.equal(resolveBinding(document, 'normal', 'b')?.value, 'fast')
   assert.equal(effectiveBindings(document, 'normal').has('v b'), false)
 })
+
+test('symbol bindings are literal and can be omitted', () => {
+  const document = { normal: { bindings: { '?': 'key_help' } } }
+  assert.equal(resolveBinding(document, 'normal', 'shift+/'), undefined)
+  assert.equal(resolveBinding(document, 'normal', '?')?.value, 'key_help')
+  assert.equal(resolveBinding(document, 'normal', '/'), undefined)
+  assert.equal(resolveBinding({ normal: { bindings: {} } }, 'normal', 'shift+/'), undefined)
+})

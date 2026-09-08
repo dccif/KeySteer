@@ -1283,6 +1283,7 @@ fn failed_or_source_less_clicks_do_not_leave_click_indicators() {
     assert!(engine.input.active_click_indicators.is_empty());
 
     let delayed_input = InputEvent {
+        character: None,
         key: Key::new("x").unwrap(),
         state: KeyState::Down,
         repeat: false,

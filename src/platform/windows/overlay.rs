@@ -1049,14 +1049,27 @@ impl TextRasterizer {
                         .get(prefix_utf16_len - 1)
                         .copied()
                         .ok_or("GDI returned no matched-prefix advance")?;
-                    let left = (width as i32 - text_size.cx) / 2;
+                    let left = style
+                        .text_alignment
+                        .offset(width as f64, text_size.cx as f64)
+                        as i32;
                     matched_boundary = Some((left + prefix_width).clamp(0, width as i32) as usize);
                 }
                 DrawTextW(
                     scratch.dc(),
                     &mut self.utf16,
                     &mut draw_rect,
-                    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                    match style.text_alignment {
+                        crate::api::overlay::TextAlignment::Left => {
+                            windows::Win32::Graphics::Gdi::DT_LEFT
+                        }
+                        crate::api::overlay::TextAlignment::Center => DT_CENTER,
+                        crate::api::overlay::TextAlignment::Right => {
+                            windows::Win32::Graphics::Gdi::DT_RIGHT
+                        }
+                    } | DT_VCENTER
+                        | DT_SINGLELINE
+                        | DT_NOPREFIX,
                 );
             }
         }

@@ -4,6 +4,7 @@ import { stringify } from 'smol-toml'
 import {
   MOVEMENT_ACTIONS,
   applyModeAction,
+  applyKeyHelpAction,
   createSimulatorState,
   movePointer,
   toggleButton,
@@ -27,6 +28,8 @@ interface KeySpec {
   key: string
   label: string
   width?: number
+  shifted?: string
+  literal?: boolean
 }
 
 interface GridKeySpec extends KeySpec {
@@ -55,6 +58,9 @@ const modes: Array<{ id: EditorMode; label: string }> = [
 ]
 
 const actionGroups: ActionGroup[] = [
+  { name: '按键提示', actions: [
+    { value: 'key_help', label: '切换按键提示' },
+  ] },
   {
     name: '移动',
     actions: [
@@ -161,6 +167,7 @@ export default defineComponent({
     const sourceStats = ref({ bytes: 0, sections: 0, values: 0 })
     const activeMode = ref<EditorMode>('normal')
     const appearance = ref<Appearance>('light')
+    const editKeyHelp = ref(false)
     const modifiers = reactive<Record<Modifier, boolean>>({ primary: false, shift: false, alt: false })
     const selectedChord = ref('')
     const customAction = ref('')
@@ -249,7 +256,7 @@ export default defineComponent({
 
     function selectKey(spec: KeySpec): void {
       if (!spec.key) return
-      const parts: string[] = (Object.keys(modifiers) as Modifier[]).filter((modifier) => modifiers[modifier])
+      const parts: string[] = spec.literal ? [] : (Object.keys(modifiers) as Modifier[]).filter((modifier) => modifiers[modifier])
       if (!parts.includes(spec.key)) parts.push(spec.key)
       selectedChord.value = parts.join('+')
       customAction.value = selectedAction.value
@@ -280,7 +287,7 @@ export default defineComponent({
     function keyBindingInfo(spec: KeySpec): KeyBindingInfo | undefined {
       if (!effectiveDocument.value || !spec.key) return undefined
       const entries = [...effectiveBindings(effectiveDocument.value, activeMode.value)]
-        .filter(([chord]) => chord === spec.key || chord.split('+').at(-1) === spec.key)
+        .filter(([chord]) => chord === spec.key || (!spec.literal && chord.endsWith(`+${spec.key}`)))
       if (entries.length === 0) return undefined
       const [chord, binding] = entries[0]
       const action = Array.isArray(binding.value) ? String(binding.value[0] ?? '') : String(binding.value)
@@ -327,6 +334,7 @@ export default defineComponent({
     }
 
     function executeAction(action: string, continuous = false): void {
+      if (applyKeyHelpAction(simulator, action, effectiveDocument.value?.key_help?.enabled !== false)) return
       if (MOVEMENT_ACTIONS.has(action)) {
         movePointer(simulator, action, continuous ? 0.45 : 2.5)
         return
@@ -359,7 +367,18 @@ export default defineComponent({
       if (!simulatorArmed.value || event.repeat) return
       if (event.key === 'Escape') {
         simulatorArmed.value = false
-        heldActions.clear()
+        heldActions.clear(); heldCharacterActions.clear()
+        return
+      }
+      const character = event.key.toLowerCase()
+      const characterActions = [...character].length === 1 && character !== browserKeyName(event.key, event.code) ? resolveAction(character) : []
+      if (characterActions.length > 0) {
+        event.preventDefault()
+        characterActions.forEach(action => {
+          if (MOVEMENT_ACTIONS.has(action)) heldActions.add(action)
+          else executeAction(action)
+        })
+        heldCharacterActions.set(event.code, characterActions)
         return
       }
       if (handleTargetingKey(browserKeyName(event.key, event.code))) {
@@ -377,10 +396,13 @@ export default defineComponent({
       })
     }
 
+    const heldCharacterActions = new Map<string, string[]>()
     function onSimulatorKeyUp(event: KeyboardEvent): void {
+      heldCharacterActions.get(event.code)?.forEach(action => heldActions.delete(action))
+      heldCharacterActions.delete(event.code)
       const chord = chordFromEvent(event, isMac.value)
       if (!chord) {
-        heldActions.clear()
+        heldActions.clear(); heldCharacterActions.clear()
         return
       }
       resolveAction(chord).forEach((action) => heldActions.delete(action))
@@ -464,10 +486,11 @@ export default defineComponent({
                   {modifier === 'primary' ? 'Primary' : modifier === 'shift' ? 'Shift' : 'Alt'}
                 </button>
               ))}
-              <code>{selectedChord.value || '点击一个键查看绑定'}</code>
+              <input aria-label="绑定按键或符号" placeholder="点击键盘或输入符号，如 ?" value={selectedChord.value} onInput={(event) => { selectedChord.value = (event.target as HTMLInputElement).value }} />
             </div>
           </div>
           {keyboard()}
+          <p class="ks-keyboard-hint">点击键帽内的上层符号可按字符绑定（如 ?）；下层按键可搭配上方组合键。彩色圆点表示已有绑定，悬停可查看动作。</p>
           <div class="ks-key-legend" aria-label="按键颜色分类">
             <span class="tone-move"><i />方向移动</span>
             <span class="tone-click"><i />鼠标点击</span>
@@ -526,7 +549,7 @@ export default defineComponent({
                 style={targetingVisual.value as any}
                 tabindex="0"
                 onFocus={() => { simulatorArmed.value = true }}
-                onBlur={() => { simulatorArmed.value = false; heldActions.clear() }}
+                onBlur={() => { simulatorArmed.value = false; heldActions.clear(); heldCharacterActions.clear() }}
                 onKeydown={onSimulatorKeyDown}
                 onKeyup={onSimulatorKeyUp}
               >
@@ -541,9 +564,20 @@ export default defineComponent({
                   <span key={clickPulse.value} class={clickPulse.value ? 'pulse' : ''} />
                 </div>
                 {scrollPulse.value && <div class="ks-scroll-pulse">{scrollPulse.value}</div>}
+                {effectiveDocument.value && simulator.keyHelpVisible && simulator.mode !== 'idle' && effectiveDocument.value.key_help?.enabled !== false && (
+                  <KeyHelpPreview document={effectiveDocument.value} mode={simulator.mode} appearance={appearance.value} />
+                )}
                 <div class="ks-event-log">{simulator.lastEvent}</div>
               </div>
-              {document.value && effectiveDocument.value && (simulator.mode === 'grid' || simulator.mode === 'recursive_grid' || simulator.mode === 'ui_hint') && (
+              <div class="ks-toolbar ks-compact-toolbar">
+                <button class="ks-button" onClick={() => executeAction('key_help')}>切换按键提示预览</button>
+                <button class={{ 'ks-button': true, active: editKeyHelp.value }} onClick={() => { editKeyHelp.value = !editKeyHelp.value; if (editKeyHelp.value && !simulator.keyHelpVisible) executeAction('key_help') }}>编辑按键提示样式</button>
+              </div>
+              {document.value && effectiveDocument.value && editKeyHelp.value && (
+                <ModeStyleControls document={document.value} effectiveDocument={effectiveDocument.value} mode="key_help" appearance={appearance.value}
+                  onChange={(next) => { document.value = next }} onAppearanceChange={(next) => { appearance.value = next }} />
+              )}
+              {document.value && effectiveDocument.value && !editKeyHelp.value && (simulator.mode === 'grid' || simulator.mode === 'recursive_grid' || simulator.mode === 'ui_hint') && (
                 <ModeStyleControls
                   document={document.value}
                   effectiveDocument={effectiveDocument.value}
@@ -553,7 +587,7 @@ export default defineComponent({
                   onAppearanceChange={(next) => { appearance.value = next }}
                 />
               )}
-              {(simulator.mode === 'normal' || simulator.mode === 'idle') && <p class="ks-normal-note">Normal 没有网格覆盖层，请选择 Grid、Recursive Grid 或 UI Hint 调整样式。</p>}
+              {(simulator.mode === 'normal' || simulator.mode === 'idle') && <p class="ks-normal-note">可预览按键提示，或选择 Grid、Recursive Grid、UI Hint 调整覆盖层样式。</p>}
             </section>
           </div>
 
@@ -747,20 +781,27 @@ const KeyboardRows = defineComponent({
         {props.rows.map((row) => (
           <div class="ks-key-row">
             {row.map((spec) => spec.key ? (() => {
-              const binding = props.bindingInfo(spec)
-              return <button
-                style={{ '--key-width': String(spec.width ?? 1) }}
-                class={{
-                  selected: props.selected.split('+').at(-1) === spec.key,
-                  bound: Boolean(binding),
-                  [`tone-${binding?.tone ?? 'none'}`]: Boolean(binding),
-                }}
-                title={binding ? `${spec.key}: ${binding.text}` : spec.key}
-                onClick={() => props.onKey(spec)}
-              >
-                <span>{spec.label}</span>
-                {binding && <small>{binding.text}</small>}
-              </button>
+              const renderKey = (layer: KeySpec) => {
+                const binding = props.bindingInfo(layer)
+                return <button
+                  style={{ '--key-width': String(layer.width ?? 1) }}
+                  class={{
+                    selected: props.selected === layer.key || (!layer.literal && props.selected.endsWith(`+${layer.key}`)),
+                    bound: Boolean(binding),
+                    [`tone-${binding?.tone ?? 'none'}`]: Boolean(binding),
+                  }}
+                  aria-label={layer.literal ? `符号 ${layer.label}` : `按键 ${layer.label}`}
+                  title={binding ? `${layer.key}: ${binding.text}` : layer.key}
+                  onClick={() => props.onKey(layer)}
+                >
+                  <span>{layer.label}</span>
+                  {binding && <small>{binding.text}</small>}
+                </button>
+              }
+              return spec.shifted ? <div class="ks-dual-key" style={{ '--key-width': String(spec.width ?? 1) }}>
+                {renderKey({ key: spec.shifted, label: spec.shifted, literal: true })}
+                {renderKey(spec)}
+              </div> : renderKey(spec)
             })() : (
               <span class="ks-key-gap" style={{ '--key-width': String(spec.width ?? 0.5) }} />
             ))}
@@ -808,7 +849,10 @@ const Numpad = defineComponent({
 })
 
 function key(keyName: string, label: string, width = 1): KeySpec {
-  return { key: keyName, label, width }
+  // US keycap legends only; binding parsing and input use literal characters.
+  const base = [...'`1234567890-=[]\\;\u0027,./']
+  const shifted = [...'~!@#$%^&*()_+{}|:\u0022<>?']
+  return { key: keyName, label, width, shifted: shifted[base.indexOf(keyName)] }
 }
 
 function gap(width = 0.55): KeySpec {
@@ -875,6 +919,15 @@ function chordFromEvent(event: KeyboardEvent, isMac: boolean): string {
 }
 
 function browserKeyName(value: string, code: string): string {
+  // Physical key identity is separate from KeyboardEvent.key's actual text.
+  const punctuation: Record<string, string> = {
+    Slash: '/', Semicolon: ';', Quote: "'", Backslash: '\\', BracketLeft: '[', BracketRight: ']',
+    Backquote: '`', Equal: '=', Minus: '-', Comma: ',', Period: '.',
+  }
+  if (punctuation[code]) return punctuation[code]
+  if (/^Key[A-Z]$/.test(code)) return code.slice(3).toLowerCase()
+  if (/^Digit[0-9]$/.test(code)) return code.slice(5)
+
   const aliases: Record<string, string> = {
     ' ': 'space', Escape: 'esc', Enter: 'enter', Backspace: 'backspace', Tab: 'tab',
     Delete: 'delete', Insert: 'insert', ArrowUp: 'up', ArrowDown: 'down',
@@ -1048,4 +1101,133 @@ function formatError(error: unknown): string {
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   return `${(bytes / 1024).toFixed(1)} KiB`
+}
+
+const KeyHelpPreview = defineComponent({
+  props: {
+    document: { type: Object as () => ConfigDocument, required: true },
+    mode: { type: String, required: true },
+    appearance: { type: String as () => 'light' | 'dark', required: true },
+  },
+  setup(props) {
+    const host = ref<HTMLElement>()
+    const size = ref({ width: 800, height: 450 })
+    let observer: ResizeObserver | undefined
+    onMounted(() => {
+      observer = new ResizeObserver(([entry]) => {
+        size.value = { width: entry.contentRect.width, height: entry.contentRect.height }
+      })
+      if (host.value) observer.observe(host.value)
+    })
+    onBeforeUnmount(() => observer?.disconnect())
+    const entries = computed(() => keyHelpEntries(props.document, props.mode))
+    return () => {
+      if (!props.document.key_help) return null
+      const ui = keyHelpStyle(props.document.key_help)
+      const layout = keyHelpLayout(ui, entries.value, size.value.width, size.value.height)
+      const theme = props.document.theme?.[props.appearance] ?? {}
+      const indicator = { ...props.document.mode_indicator?.ui, ...props.document.mode_indicator?.modes?.[props.mode]?.ui }
+      const color = (value: unknown, fallback: string): string => {
+        const raw = typeof value === 'object' && value ? (value as ConfigDocument)[props.appearance] : value
+        return typeof raw === 'string' && /^#[\da-f]{8}$/i.test(raw) ? raw : fallback
+      }
+      const derivedBackground = color(indicator.background_color, theme.accent ?? '#465FBCFF')
+      const background = color(ui.background_color, derivedBackground)
+      const foreground = color(ui.text_color, color(indicator.text_color, readable(derivedBackground, theme.text, theme.on_accent_alt)))
+      const close = entries.value.filter(entry => entry.action === 'key_help').map(entry => entry.keys).join(' / ')
+      const closeText = close ? `${close}  Close` : ''
+      const closeWidth = Math.min(closeText.length * ui.title_font_size * 0.75, layout.width * 0.45)
+      const titleStyle = { fontSize: `${ui.title_font_size}px`, fontWeight: ui.title_bold ? '700' : '400', color: color(ui.title_color, foreground),
+        height: `${layout.headerHeight}px`, display: 'flex', alignItems: 'center', overflow: 'hidden', whiteSpace: 'nowrap' as const }
+      const scale = layout.bodyScale
+      return (
+        <div ref={host} style={{ position: 'absolute', inset: 0, pointerEvents: 'none', zIndex: 20, overflow: 'hidden' }}>
+          <div aria-label="按键提示预览" style={{ position: 'absolute', left: '50%', transform: 'translateX(-50%)', bottom: `${ui.bottom_margin}px`,
+            width: `${layout.width}px`, height: `${layout.height}px`, background, borderRadius: `${ui.border_radius}px`,
+            boxShadow: `inset 0 0 0 ${ui.border_width}px ${color(ui.border_color, '#00000000')}`,
+            fontFamily: ui.font_family || indicator.font_family || 'system-ui, sans-serif', lineHeight: 1.4, color: foreground }}>
+            <div style={{ ...titleStyle, position: 'absolute', left: `${layout.padding}px`, top: `${ui.padding_y}px`, width: `${Math.max(1, layout.width - layout.padding * 2 - closeWidth - ui.key_gap)}px` }}>{props.mode} · Available keys</div>
+            <div style={{ ...titleStyle, position: 'absolute', right: `${layout.padding}px`, top: `${ui.padding_y}px`, width: `${closeWidth}px` }}>{closeText}</div>
+            {entries.value.map((entry, index) => {
+              const column = Math.floor(index / layout.rows)
+              const widths = layout.widths[column]
+              const left = layout.bodyLeft + layout.widths.slice(0, column).reduce((sum, w) => sum + w.key + w.action + ui.key_gap + ui.column_gap, 0)
+              const top = ui.padding_y + layout.headerHeight + index % layout.rows * layout.rowHeight
+              return <div key={entry.keys} style={{ position: 'absolute', left: `${left}px`, top: `${top}px`, display: 'flex', alignItems: 'center',
+                height: `${Math.max(1, layout.rowHeight - ui.row_gap)}px`, gap: `${ui.key_gap}px`, fontSize: `${ui.font_size * scale}px`, whiteSpace: 'nowrap' }}>
+                <span style={{ width: `${widths.key}px`, display: 'flex', justifyContent: 'flex-end' }}>
+                  <span style={{ fontWeight: ui.key_bold ? '700' : '400', color: color(ui.key_text_color, '#1E222BFF'), background: color(ui.key_background_color, '#EBEDF2FF'),
+                    padding: `${ui.key_padding_y * scale}px ${ui.key_padding_x * scale}px`, borderRadius: `${ui.key_border_radius * scale}px`,
+                    boxShadow: `inset 0 0 0 ${ui.key_border_width * scale}px ${color(ui.key_border_color, '#C4C9D3FF')}` }}>{entry.keys}</span>
+                </span>
+                <span style={{ width: `${widths.action}px`, overflow: 'hidden', opacity: ui.text_opacity, fontWeight: ui.text_bold ? '700' : '400' }}>{entry.action}</span>
+              </div>
+            })}
+          </div>
+        </div>
+      )
+    }
+  },
+})
+
+function readable(background: string, text = '#10172DFF', alternate = '#FFFFFFFF'): string {
+  const luminance = (hex: string) => {
+    const channels = [1, 3, 5].map(offset => parseInt(hex.slice(offset, offset + 2), 16) / 255)
+      .map(value => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4)
+    return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722
+  }
+  const bg = luminance(background)
+  const contrast = (color: string) => (Math.max(bg, luminance(color)) + 0.05) / (Math.min(bg, luminance(color)) + 0.05)
+  return contrast(text) >= contrast(alternate) ? text : alternate
+}
+
+interface HelpEntry { keys: string; action: string }
+
+function keyHelpEntries(document: ConfigDocument, mode: string): HelpEntry[] {
+  const groups = new Map<string, string[]>()
+  for (const [chord, binding] of effectiveBindings(document, mode)) {
+    if (binding.value === '__disabled__') continue
+    const action = Array.isArray(binding.value) ? binding.value.join(' → ') : String(binding.value)
+    const keys = groups.get(action) ?? []
+    keys.push(chord.replaceAll('_', ' ').toUpperCase())
+    groups.set(action, keys)
+  }
+  return [...groups].map(([action, keys]) => ({ action, keys: keys.sort().join(' / ') }))
+    .sort((a, b) => a.keys.localeCompare(b.keys))
+}
+
+/** Same logical-pixel sizing as the native help decorator (browser font metrics differ). */
+function keyHelpLayout(ui: ConfigDocument, entries: HelpEntry[], screenWidth: number, screenHeight: number) {
+  ui = keyHelpStyle(ui)
+  const availableWidth = Math.max(1, screenWidth - ui.screen_margin * 2)
+  const padding = Math.min(ui.padding_x, availableWidth / 4)
+  const columns = availableWidth >= ui.column_threshold && entries.length > 8
+    ? Math.max(1, Math.min(ui.max_columns, entries.length)) : 1
+  const rows = Math.max(1, Math.ceil(entries.length / columns))
+  const widths = Array.from({ length: columns }, (_, column) => {
+    const chunk = entries.slice(column * rows, (column + 1) * rows)
+    return {
+      key: Math.max(1, ...chunk.map(entry => [...entry.keys].length)) * ui.font_size * 0.75 + ui.key_padding_x * 2,
+      action: Math.max(1, ...chunk.map(entry => [...entry.action].length)) * ui.font_size * 0.6 + ui.font_size / 3,
+    }
+  })
+  const textWidth = widths.reduce((sum, column) => sum + column.key + column.action, 0)
+  const gaps = (columns - 1) * ui.column_gap + columns * ui.key_gap
+  const width = Math.min(availableWidth, Math.max(ui.min_width, textWidth + gaps + padding * 2))
+  const squeeze = Math.max(0.01, Math.min(1, (width - padding * 2 - gaps) / textWidth))
+  widths.forEach(column => { column.key *= squeeze; column.action *= squeeze })
+  const headerHeight = Math.max(ui.header_height, ui.title_font_size * 1.4)
+  const rowHeight = Math.min(ui.row_height, Math.max(8, (screenHeight * ui.max_height_ratio - headerHeight - ui.padding_y * 2) / rows))
+  const height = headerHeight + rows * rowHeight + ui.padding_y * 2
+  const bodyScale = Math.max(0.01, Math.min(squeeze, (rowHeight - ui.row_gap) / (ui.font_size * 1.4 + ui.key_padding_y * 2)))
+  return { width, height, padding, columns, rows, widths, rowHeight, headerHeight, bodyScale,
+    bodyLeft: (width - textWidth * squeeze - gaps) / 2 }
+}
+
+/** Internal presentation values derived from the compact public style block. */
+function keyHelpStyle(ui: ConfigDocument): ConfigDocument {
+  return { ...ui, title_font_size: ui.font_size * 1.25, title_bold: true, key_bold: true, text_bold: false,
+    text_opacity: 0.85, key_border_width: 1, key_border_radius: 3, key_padding_x: 5, key_padding_y: 1,
+    column_gap: 6, key_gap: 8, row_gap: 2, row_height: ui.font_size * 2, header_height: ui.font_size * 7 / 3,
+    screen_margin: 12, bottom_margin: 12, min_width: 340, max_height_ratio: 0.6, max_columns: 2, column_threshold: 560 }
 }

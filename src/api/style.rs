@@ -224,6 +224,7 @@ impl LabelUi {
         let font_size = self.font_size.max(1) as f64;
         let background = resolve(self.background_color.as_ref(), appearance, background);
         LabelStyle {
+            text_alignment: Default::default(),
             background,
             text_color: resolve(self.text_color.as_ref(), appearance, text),
             matched_text_color: resolve(
@@ -572,5 +573,38 @@ mod tests {
         let area = Rect::new(0.0, 0.0, 1000.0, 800.0);
         let r = Anchor::BottomCenter.place(area, 320.0, 30.0, 0.0, 24.0);
         assert_eq!(r, Rect::new(340.0, 746.0, 320.0, 30.0));
+    }
+}
+
+/// Available-key panel style; typography and layout adapt to this compact block.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KeyHelp {
+    pub enabled: bool,
+    pub font_family: String,
+    pub font_size: f64,
+    pub background_color: Option<ThemedColor>,
+    pub text_color: Option<ThemedColor>,
+    pub border_color: Option<ThemedColor>,
+    pub border_width: f64,
+    pub border_radius: f64,
+    pub padding_x: f64,
+    pub padding_y: f64,
+}
+
+impl Default for KeyHelp {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            font_family: String::new(),
+            font_size: 12.0,
+            background_color: None,
+            text_color: None,
+            border_color: None,
+            border_width: 0.0,
+            border_radius: 10.0,
+            padding_x: 24.0,
+            padding_y: 8.0,
+        }
     }
 }

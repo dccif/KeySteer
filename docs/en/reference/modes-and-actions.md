@@ -191,3 +191,7 @@ The right-hand side is parsed in this order:
 6. A built-in Mode name or namespaced plugin Mode name.
 
 See the [default configuration](/generated/keysteer.default.toml) for the complete shipped example.
+
+## `key_help`
+
+Toggle the available-key panel without restarting the active mode or clearing its selection. Enable with `"?" = "key_help"` in Normal, inherited by targeting modes. Omit or comment out the entry to disable it. Configure its appearance in `[key_help]`.

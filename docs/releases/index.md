@@ -1,5 +1,13 @@
 # 更新日志 / Release Notes
 
+## 0.9.20
+
+- 新增实时按键提示面板，可查看当前模式可用的按键与动作，并自定义面板样式。
+- 新增鼠标侧键绑定，支持组合键及按住执行动作。
+- 支持直接绑定 `?`、`!`、`+` 等符号；网页配置模拟器新增完整符号键位和按键提示预览。
+
+Added a live key-help panel with customizable styling, mouse side-button bindings with chord and hold support, and direct symbol bindings such as `?`, `!`, and `+`. The web configuration simulator now includes all shifted symbol keys and a key-help preview.
+
 ## 0.9.19
 
 - Window Mover 默认快捷键改为 `Primary+D`，可在配置中自定义；`Primary+S` 独立切换鼠标所在显示器。

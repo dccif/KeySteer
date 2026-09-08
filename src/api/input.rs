@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
@@ -59,6 +59,20 @@ impl Borrow<str> for Key {
 }
 
 impl Key {
+    /// Extra mouse buttons enter the ordinary binding pipeline as physical
+    /// keys. Cache canonical names so native edges only clone an Arc.
+    pub(crate) fn mouse_side_button(number: u8) -> Option<Self> {
+        static KEYS: OnceLock<[Key; 2]> = OnceLock::new();
+        let index = usize::from(number.checked_sub(1)?);
+        KEYS.get_or_init(|| [Key("mouse_x1".into()), Key("mouse_x2".into())])
+            .get(index)
+            .cloned()
+    }
+
+    pub(crate) fn is_mouse_side_button(&self) -> bool {
+        matches!(self.as_str(), "mouse_x1" | "mouse_x2")
+    }
+
     pub fn new(value: impl AsRef<str>) -> Result<Self, String> {
         let normalized = normalize_key(value.as_ref());
         if normalized.is_empty() {
@@ -220,6 +234,8 @@ pub(crate) fn normalize_builtin_key(value: &str) -> String {
             "right_win".into()
         }
         "escape" => "esc".into(),
+        "xbutton1" | "mouse4" => "mouse_x1".into(),
+        "xbutton2" | "mouse5" => "mouse_x2".into(),
         "return" => "enter".into(),
         "del" => "delete".into(),
         "up" => "arrow_up".into(),
@@ -281,10 +297,14 @@ pub struct KeyChord {
 
 impl KeyChord {
     pub fn parse(value: &str) -> Result<Self, String> {
-        let keys = value
-            .split('+')
-            .map(Key::new)
-            .collect::<Result<Vec<_>, _>>()?;
+        let keys = if value.trim().chars().count() == 1 {
+            vec![Key::new(value)?]
+        } else {
+            value
+                .split('+')
+                .map(Key::new)
+                .collect::<Result<Vec<_>, _>>()?
+        };
         if keys.is_empty() {
             return Err("chord must contain a key".into());
         }
@@ -396,12 +416,23 @@ pub enum KeyState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputEvent {
     pub key: Key,
+    /// One printable character reported by the OS keyboard layout, when available.
+    /// Physical key identity is retained for chords and paired release.
+    pub character: Option<char>,
     pub state: KeyState,
     /// Auto-repeat from holding the key.
     pub repeat: bool,
     /// Synthesized by this process — must never be re-processed.
     pub injected: bool,
     pub timestamp_millis: u64,
+}
+
+/// Decode one printable scalar without allocating or treating composed text
+/// and dead-key sequences as keyboard shortcuts.
+pub fn single_printable_character(units: &[u16]) -> Option<char> {
+    let mut chars = char::decode_utf16(units.iter().copied());
+    let character = chars.next()?.ok()?;
+    (!character.is_control() && chars.next().is_none()).then_some(character)
 }
 
 /// Identifier of a mode. Built-in and plugin modes share this namespace,
@@ -513,6 +544,26 @@ impl<'de> Deserialize<'de> for ModeId {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn mouse_side_button_names_and_aliases_are_canonical_trigger_keys() {
+        for (number, aliases) in [
+            (1, ["mouse_x1", "xbutton1", "mouse4"]),
+            (2, ["mouse_x2", "xbutton2", "mouse5"]),
+        ] {
+            let key = super::Key::mouse_side_button(number).unwrap();
+            assert!(key.is_mouse_side_button());
+            assert!(key.as_char().is_none());
+            for alias in aliases {
+                assert_eq!(super::Key::new(alias).unwrap(), key);
+                let chord = super::KeyChord::parse(&format!("ctrl+{alias}")).unwrap();
+                assert_eq!(chord.activation_key(), &key);
+            }
+        }
+        assert!(super::Key::mouse_side_button(0).is_none());
+        assert!(super::Key::mouse_side_button(3).is_none());
+        assert!(!super::Key::new("x").unwrap().is_mouse_side_button());
+    }
     use super::*;
 
     #[test]
@@ -541,6 +592,29 @@ mod tests {
         assert_ne!(
             KeyChord::parse("alt+s+a").unwrap().canonical(),
             KeyChord::parse("alt+a+s").unwrap().canonical()
+        );
+    }
+
+    #[test]
+    fn native_character_decoder_rejects_controls_and_multi_character_text() {
+        assert_eq!(single_printable_character(&[0x3f]), Some('?'));
+        assert_eq!(single_printable_character(&[0xd83d, 0xde80]), Some('🚀'));
+        for units in [&[][..], &[0xd800][..], &[0x0d][..], &[0x3f, 0x21][..]] {
+            assert_eq!(single_printable_character(units), None);
+        }
+    }
+
+    #[test]
+    fn printable_symbols_are_literal_chords() {
+        for value in ["?", ":", "@", "!", "+", "€"] {
+            let chord = KeyChord::parse(value).unwrap();
+            assert_eq!(chord.canonical(), value);
+            assert_eq!(chord.keys().len(), 1);
+            assert_eq!(chord.activation_key().as_str(), value);
+        }
+        assert_ne!(
+            KeyChord::parse("?").unwrap(),
+            KeyChord::parse("shift+/").unwrap()
         );
     }
 

@@ -25,10 +25,10 @@ keysteer/
 | `src/api/` | 跨平台公共协议：按键、动作、命令、事件、几何、场景、插件、后端 trait | `api/mod.rs`, `command.rs`, `backend.rs` |
 | `src/app/` | 唯一应用聚合根：启动、CLI、配置编译、Mode catalog 和 runtime | `bootstrap.rs`, `configuration.rs`, `mode_catalog.rs`, `runtime/` |
 | `src/config/` | TOML 文档、Mode section DTO、别名规范化、校验、主题与 comment-preserving store | `mod.rs`, `settings.rs`, `aliases.rs`, `validation.rs`, `store.rs` |
-| `src/app/runtime/` | 应用私有 Engine、原子运行计划、命令执行及有状态协作者 | `mod.rs`, `plan.rs`, `registry.rs`, `input_state.rs`, `scheduler.rs`, `overlay_coordinator.rs` |
+| `src/app/runtime/` | 应用私有 Engine、原子运行计划、命令执行及有状态协作者 | `mod.rs`, `plan.rs`, `registry.rs`, `input_state.rs`, `scheduler.rs`, `overlay_coordinator.rs`, `key_help.rs` |
 | `src/modes/` | 五个内置 Mode 状态机；UI Hint 私有状态和算法位于 `hint/` | `normal.rs`, `grid.rs`, `recursive_grid.rs`, `hint/mod.rs`, `hint/session.rs` |
 | `src/plugins/` | 使用公共 API 实现的内置插件 | `builtin/screen_selector.rs`, `builtin/window_mover.rs` |
-| `src/platform/common/` | 两端共享的 updater、app info、mailbox、batcher 和 spatial index | `mod.rs` |
+| `src/platform/common/` | 两端共享的字符需求/ASCII 过滤、原生候选快照、updater、app info、mailbox、batcher 和 spatial index | `mod.rs`, `character_candidates.rs` |
 | `src/support/` | 日志、worker、错误聚合和性能探针 | `mod.rs` |
 | `src/platform/windows/` | Win32/COM/UIA/GDI/DWM 后端 | `mod.rs` 组合所有子模块 |
 | `src/platform/macos/` | AppKit/CGEventTap/AX/Vision/Core Graphics 后端 | `mod.rs` 组合所有子模块；`window_move.rs` 管理原生全屏跨屏过渡，AX 引用由 `accessibility.rs` 持有 |

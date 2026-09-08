@@ -27,6 +27,9 @@ mod vision;
 mod wechat_ocr;
 mod window_mover;
 
+#[cfg(feature = "benchmark-hooks")]
+pub use input::{CharacterCapture, observe_character_unfiltered};
+
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -549,6 +552,7 @@ impl Backend for WindowsBackend {
         if let Some(event) = self.try_event()? {
             return Ok(Some(event));
         }
+        input::CHARACTER_CAPTURE.refresh_if_needed();
         crate::support::worker::reap_quarantined();
 
         if !self.pump_messages() {
@@ -594,6 +598,10 @@ impl Backend for WindowsBackend {
             .as_mut()
             .ok_or_else(|| "keyboard hook is not running".to_string())?
             .set_disposition(disposition)
+    }
+
+    fn set_character_bindings(&mut self, keys: &[crate::api::Key]) {
+        input::CHARACTER_CAPTURE.configure(keys);
     }
 
     fn screens(&self) -> Result<Vec<Screen>, String> {

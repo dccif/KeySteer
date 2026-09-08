@@ -126,6 +126,7 @@ impl Engine {
         {
             let pending = self.input.pending_chords.remove(index);
             let mut event = crate::api::input::InputEvent {
+                character: None,
                 key: pending.key.clone(),
                 state: KeyState::Down,
                 repeat: false,

@@ -13,7 +13,7 @@ use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, HHOOK, KBDLLHOOKSTRUCT, LLKHF_UP, MSG, MSLLHOOKSTRUCT, SetWindowsHookExW,
     TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_MOUSEMOVE,
-    WM_QUIT,
+    WM_QUIT, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 use crate::api::backend::{BackendEvent, KeyDisposition};
@@ -409,6 +409,7 @@ impl HookThread {
         // Build canonical shared Key values before the first physical key edge
         // reaches the latency-sensitive hook callback.
         input::prewarm_key_map();
+        input::CHARACTER_CAPTURE.configure(&[]);
         // A backend can be recreated in the same process by tests or recovery.
         // Physical pointer movement stays silent until an overlay is presented.
         set_pointer_wake_enabled(false);
@@ -989,20 +990,35 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     } else {
         KeyState::Down
     };
-    let repeat = update_pressed_state(info.vkCode, state);
-    let event = BackendEvent::Input(InputEvent {
-        key,
-        state,
-        repeat,
-        injected: false,
-        timestamp_millis: info.time as u64,
-    });
     let correlation_id = crate::support::perf_probe::next_correlation_id();
     crate::support::perf_probe::mark_correlated_value(
         "hook_received",
         correlation_id,
         info.vkCode as isize,
     );
+    let repeat = update_pressed_state(info.vkCode, state);
+    let event = BackendEvent::Input(InputEvent {
+        character: if state == KeyState::Down
+            && !repeat
+            && !is_modifier
+            && input::CHARACTER_CAPTURE.is_enabled()
+        {
+            PRESSED.with(|pressed| {
+                input::CHARACTER_CAPTURE.observe_candidate(
+                    info.vkCode,
+                    info.scanCode,
+                    pressed.get(),
+                )
+            })
+        } else {
+            None
+        },
+        key,
+        state,
+        repeat,
+        injected: false,
+        timestamp_millis: info.time as u64,
+    });
     let disposition = if let Some((mailbox, generation)) = begin_disposition(event) {
         match mailbox.wait(generation, Duration::from_millis(100)) {
             Some(disposition) => Some(disposition),
@@ -1021,7 +1037,21 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         disposition
     });
     crate::support::perf_probe::mark_correlated("disposition_returned", correlation_id);
-    let virtual_key = info.vkCode as u16;
+    mask_alt_menu(info.vkCode as u16, state, repeat, is_modifier, disposition);
+    match disposition {
+        KeyDisposition::Consume => return LRESULT(1),
+        KeyDisposition::Defer | KeyDisposition::Forward => {}
+    }
+    super::native::call_next_hook(code, wparam, lparam)
+}
+
+fn mask_alt_menu(
+    virtual_key: u16,
+    state: KeyState,
+    repeat: bool,
+    is_modifier: bool,
+    disposition: KeyDisposition,
+) {
     let mask_menu = FORWARDED_ALT.with(|alt| {
         let mut alt_state = alt.get();
         let mask = alt_state.observe(virtual_key, state, repeat, is_modifier, disposition);
@@ -1039,19 +1069,68 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             generation: None,
         });
     }
-    match disposition {
-        KeyDisposition::Consume => return LRESULT(1),
-        KeyDisposition::Defer | KeyDisposition::Forward => {}
-    }
-    super::native::call_next_hook(code, wparam, lparam)
+}
+
+fn side_button_input(message: u32, data: u32, timestamp: u32) -> Option<(u32, InputEvent)> {
+    let state = match message {
+        WM_XBUTTONDOWN => KeyState::Down,
+        WM_XBUTTONUP => KeyState::Up,
+        _ => return None,
+    };
+    let number = match data >> 16 {
+        1 => 1,
+        2 => 2,
+        _ => return None,
+    };
+    // XBUTTON1/2 occupy unused VK_XBUTTON1/2 slots in native pairing state.
+    let key = Key::mouse_side_button(number)?;
+    Some((
+        4 + u32::from(number),
+        InputEvent {
+            character: None,
+            key,
+            state,
+            repeat: false,
+            injected: false,
+            timestamp_millis: u64::from(timestamp),
+        },
+    ))
 }
 
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code >= 0 && wparam.0 as u32 == WM_MOUSEMOVE {
+    let message = wparam.0 as u32;
+    if code >= 0 && matches!(message, WM_MOUSEMOVE | WM_XBUTTONDOWN | WM_XBUTTONUP) {
         // SAFETY: for a non-negative low-level mouse callback Windows supplies
         // `lparam` as a valid MSLLHOOKSTRUCT for this call's duration.
         let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
-        store_latest_pointer(Point::new(info.pt.x as f64, info.pt.y as f64));
+        if message == WM_MOUSEMOVE {
+            store_latest_pointer(Point::new(info.pt.x as f64, info.pt.y as f64));
+        } else if !is_our_input(info.dwExtraInfo)
+            && let Some((native_key, mut input)) =
+                side_button_input(message, info.mouseData, info.time)
+        {
+            let state = input.state;
+            input.repeat = update_pressed_state(native_key, state);
+            let repeat = input.repeat;
+            let proposed =
+                begin_disposition(BackendEvent::Input(input)).and_then(|(mailbox, generation)| {
+                    let result = mailbox.wait(generation, Duration::from_millis(100));
+                    if result.is_none() {
+                        queue_timeout_warning();
+                    }
+                    result
+                });
+            let disposition = NATIVE_DECISIONS.with(|decisions| {
+                let mut current = decisions.get();
+                let disposition = current.resolve(native_key, state, proposed);
+                decisions.set(current);
+                disposition
+            });
+            mask_alt_menu(native_key as u16, state, repeat, false, disposition);
+            if disposition == KeyDisposition::Consume {
+                return LRESULT(1);
+            }
+        }
     }
     super::native::call_next_hook(code, wparam, lparam)
 }
@@ -1061,6 +1140,31 @@ mod tests {
     use super::*;
     use std::hint::black_box;
     use std::time::Instant;
+
+    #[test]
+    fn mouse_side_button_edges_use_distinct_native_pairing_slots() {
+        for (number, name) in [(1, "mouse_x1"), (2, "mouse_x2")] {
+            let (slot, down) = side_button_input(WM_XBUTTONDOWN, number << 16, 123).unwrap();
+            let (_, up) = side_button_input(WM_XBUTTONUP, number << 16, 124).unwrap();
+            assert_eq!(slot, number + 4);
+            assert_eq!(down.key.as_str(), name);
+            assert_eq!(down.character, None);
+            assert_eq!(down.state, KeyState::Down);
+            assert_eq!(up.state, KeyState::Up);
+            let mut decisions = NativeKeyDecisions::default();
+            assert_eq!(
+                decisions.resolve(slot, down.state, Some(KeyDisposition::Consume)),
+                KeyDisposition::Consume
+            );
+            assert_eq!(
+                decisions.resolve(slot, up.state, None),
+                KeyDisposition::Consume
+            );
+        }
+        assert!(side_button_input(WM_MOUSEMOVE, 1 << 16, 0).is_none());
+        assert!(side_button_input(WM_XBUTTONDOWN, 257 << 16, 0).is_none());
+        assert!(is_our_input(input::INJECTED_TAG));
+    }
 
     #[test]
     fn native_timeout_preserves_consumed_repeat_and_release() {

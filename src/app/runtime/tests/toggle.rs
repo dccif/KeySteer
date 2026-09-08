@@ -1084,6 +1084,7 @@ fn wait_pauses_and_resumes_a_sequence_without_blocking() {
     let mut engine = Engine::new(Config::default(), Appearance::Dark);
     let (mut backend, log) = FakeBackend::new(Vec::new());
     let input = InputEvent {
+        character: None,
         key: Key::new("n").unwrap(),
         state: KeyState::Down,
         repeat: false,
@@ -1120,6 +1121,7 @@ fn delayed_sequence_failure_does_not_drop_other_due_sequences() {
     let (mut backend, log) = FakeBackend::new(Vec::new());
     let now = Instant::now();
     let input = InputEvent {
+        character: None,
         key: Key::new("n").unwrap(),
         state: KeyState::Down,
         repeat: false,

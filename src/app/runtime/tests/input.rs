@@ -1,4 +1,62 @@
 #[test]
+fn mouse_side_buttons_launch_modes_and_keep_the_release_consumed() {
+    let config: Config = toml::from_str("[hotkeys]\nmouse4 = 'normal'").unwrap();
+    let mut engine = Engine::from_plan(crate::app::configuration::compile(&config).unwrap(), Appearance::Dark).unwrap();
+    let (mut backend, log) = FakeBackend::new(vec![key_down("mouse_x1"), key_up("mouse_x1")]);
+    engine.run(&mut backend).unwrap();
+    assert_eq!(engine.active_mode(), &ModeId::normal());
+    assert_eq!(log.lock().unwrap().dispositions, [KeyDisposition::Consume; 2]);
+    assert!(engine.input.key_dispositions.is_empty());
+}
+
+#[test]
+fn unbound_mouse_side_buttons_forward_in_capturing_modes() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut engine = engine_with_probes(&seen, &[]);
+    engine.registry.active = ModeId::normal();
+    let (mut backend, log) = FakeBackend::new(Vec::new());
+    for event in [key_down("mouse_x1"), key_up("mouse_x1"), key_down("mouse_x2"), key_up("mouse_x2")] {
+        engine.handle_backend_event(event, &mut backend).unwrap();
+    }
+    assert_eq!(log.lock().unwrap().dispositions, [KeyDisposition::Forward; 4]);
+    assert!(!seen.lock().unwrap().iter().any(|event| event.ends_with(":key") || event.ends_with(":clicked")));
+}
+
+#[test]
+fn mouse_side_button_chord_releases_held_action_after_modifier_release() {
+    let mut engine = engine_with_normal_binding("ctrl+mouse_x2", "move_left");
+    engine.registry.active = ModeId::normal();
+    let (mut backend, log) = FakeBackend::new(Vec::new());
+    for event in [key_down("left_ctrl"), key_down("mouse_x2")] {
+        engine.handle_backend_event(event, &mut backend).unwrap();
+    }
+    assert!(engine.input.active_gestures.get(&Key::new("mouse_x2").unwrap()).is_some());
+    for event in [key_up("left_ctrl"), key_up("mouse_x2")] {
+        engine.handle_backend_event(event, &mut backend).unwrap();
+    }
+    assert!(engine.input.active_gestures.is_empty());
+    let log = log.lock().unwrap();
+    assert_eq!(log.dispositions[1], KeyDisposition::Consume);
+    assert_eq!(log.dispositions[3], KeyDisposition::Consume);
+}
+
+#[test]
+fn disabled_mouse_side_binding_blocks_inheritance_and_preserves_native_behavior() {
+    let mut config = Config::default();
+    config.normal.bindings.insert("mouse_x2".into(), Binding::parse("key_help").unwrap());
+    config.grid.inherits = vec!["normal".into()];
+    config.grid.bindings.insert("mouse_x2".into(), Binding::Disabled);
+    let mut engine = Engine::from_plan(crate::app::configuration::compile(&config).unwrap(), Appearance::Dark).unwrap();
+    engine.registry.active = ModeId::grid();
+    let (mut backend, log) = FakeBackend::new(Vec::new());
+    for event in [key_down("mouse_x2"), key_up("mouse_x2")] {
+        engine.handle_backend_event(event, &mut backend).unwrap();
+    }
+    assert!(!engine.overlay.key_help_visible);
+    assert_eq!(log.lock().unwrap().dispositions, [KeyDisposition::Forward; 2]);
+}
+
+#[test]
 fn trace_lazy_does_not_build_messages_when_debug_is_disabled() {
     let mut engine = Engine::new(Config::default(), Appearance::Dark);
     let builds = std::cell::Cell::new(0);
@@ -279,6 +337,7 @@ fn repeat_and_release_keep_the_first_down_disposition() {
     let mut engine = Engine::new(Config::default(), Appearance::Dark);
     let key = Key::new("f").unwrap();
     let input = |state, repeat| InputEvent {
+        character: None,
         key: key.clone(),
         state,
         repeat,
@@ -331,6 +390,7 @@ fn repeat_does_not_start_a_binding_missing_from_the_first_down() {
     engine
         .handle_backend_event(
             BackendEvent::Input(InputEvent {
+                character: None,
                 key: Key::new("l").unwrap(),
                 state: KeyState::Down,
                 repeat: true,

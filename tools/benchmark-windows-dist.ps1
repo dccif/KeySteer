@@ -6,6 +6,8 @@ param(
     [string] $ConfigPath,
     [int] $ColdStarts = 30,
     [int] $ResidentSeconds = 30,
+    [int] $WarmupSeconds = 3,
+    [string] $OutputPath,
     [switch] $UsePerfProbe,
     [int] $ProbeTimeoutSeconds = 15,
     [switch] $KeepRunning
@@ -75,22 +77,39 @@ for ($index = 0; $index -lt $ColdStarts; $index++) {
 $resident = Start-Process -FilePath $exe -ArgumentList @("--config", $config) -PassThru -WindowStyle Hidden
 try {
     $samples = [System.Collections.Generic.List[object]]::new()
+    Start-Sleep -Seconds $WarmupSeconds
+    $resident.Refresh()
+    if ($resident.HasExited) { throw "resident process exited during warmup" }
+    $previousCpu = $resident.TotalProcessorTime.TotalMilliseconds
+    $sampleWatch = [Diagnostics.Stopwatch]::StartNew()
+    $previousElapsed = 0.0
     for ($second = 1; $second -le $ResidentSeconds; $second++) {
         Start-Sleep -Seconds 1
         $resident.Refresh()
+        if ($resident.HasExited) { throw "resident process exited during sampling" }
+        $cpu = $resident.TotalProcessorTime.TotalMilliseconds
+        $elapsed = $sampleWatch.Elapsed.TotalMilliseconds
         $samples.Add([ordered]@{
             second = $second
             working_set = $resident.WorkingSet64
             private_bytes = $resident.PrivateMemorySize64
             handles = $resident.HandleCount
             threads = $resident.Threads.Count
+            cpu_ms = $cpu - $previousCpu
+            interval_ms = $elapsed - $previousElapsed
         })
+        $previousCpu = $cpu
+        $previousElapsed = $elapsed
     }
     $ordered = @($cold | Sort-Object)
     $result = [ordered]@{
         target = $Target
         startup_metric = $(if ($UsePerfProbe) { "instrumented_backend_started_ms" } else { "config_check_process_ms" })
         release_equivalent = -not $UsePerfProbe
+        executable_sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
+        executable_bytes = (Get-Item -LiteralPath $exe).Length
+        config_sha256 = (Get-FileHash -LiteralPath $config -Algorithm SHA256).Hash
+        warmup_seconds = $WarmupSeconds
         startup_ms = [ordered]@{
             p50 = $ordered[[math]::Floor(($ordered.Count - 1) * 0.50)]
             p95 = $ordered[[math]::Floor(($ordered.Count - 1) * 0.95)]
@@ -99,7 +118,7 @@ try {
         startup_samples_ms = @($cold)
         resident = $samples
     }
-    $output = Join-Path $root "target\benchmarks\windows-$Target.json"
+    $output = if ($OutputPath) { $OutputPath } else { Join-Path $root "target\benchmarks\windows-$Target.json" }
     New-Item -ItemType Directory -Force -Path (Split-Path $output) | Out-Null
     $result | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $output -Encoding utf8
     Write-Output $output

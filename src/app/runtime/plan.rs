@@ -30,6 +30,7 @@ pub struct EngineSettings {
     pub default_scan_roles: Vec<String>,
     pub ui_hint_overlap_key: String,
     pub mode_indicator: ModeIndicator,
+    pub key_help: crate::api::style::KeyHelp,
 }
 
 #[derive(Debug, Clone, PartialEq)]

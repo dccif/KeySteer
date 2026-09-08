@@ -18,6 +18,7 @@ export interface TargetingState {
 
 export interface SimulatorState {
   mode: SimulatorMode
+  keyHelpVisible: boolean
   pointer: Point
   pressedButtons: Set<'left' | 'right' | 'middle'>
   targeting: TargetingState
@@ -34,6 +35,7 @@ export const MOVEMENT_ACTIONS = new Set([
 export function createSimulatorState(): SimulatorState {
   return {
     mode: 'normal',
+    keyHelpVisible: false,
     pointer: { x: 50, y: 50 },
     pressedButtons: new Set(),
     targeting: {
@@ -56,6 +58,7 @@ export function movePointer(state: SimulatorState, action: string, distance: num
 
 export function applyModeAction(state: SimulatorState, action: string): boolean {
   if (!isSimulatorMode(action)) return false
+  if (action === 'idle') state.keyHelpVisible = false
   state.mode = action
   state.lastEvent = `进入 ${action}`
   return true
@@ -81,4 +84,13 @@ function isSimulatorMode(value: string): value is SimulatorMode {
 
 function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(maximum, Math.max(minimum, value))
+}
+
+export function applyKeyHelpAction(state: SimulatorState, action: string, enabled = true): boolean {
+  if (action !== 'key_help') return false
+  if (state.mode !== 'idle') {
+    state.keyHelpVisible = enabled && !state.keyHelpVisible
+  }
+  state.lastEvent = action
+  return true
 }

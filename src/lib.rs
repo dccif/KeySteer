@@ -47,6 +47,12 @@ pub mod benchmark {
     };
     pub use crate::config::Config;
 
+    #[cfg(target_os = "windows")]
+    pub use crate::platform::windows::{CharacterCapture, observe_character_unfiltered};
+
+    #[cfg(target_os = "macos")]
+    pub use crate::platform::macos::{CharacterCaptureProbe, observe_character_unfiltered};
+
     pub fn engine(config: &Config) -> Result<crate::app::runtime::Engine, String> {
         crate::app::runtime::Engine::from_plan(
             crate::app::configuration::compile(config)?,
