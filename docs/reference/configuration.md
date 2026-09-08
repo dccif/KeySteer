@@ -303,6 +303,42 @@ after_click = "normal"
 
 macOS 支持 Accessibility tree、Vision 和 Hybrid。Windows 默认使用 `hybrid`，将 UIA 与完整视觉管线并行执行、流式显示并去重合并；这能补足最小化、最大化、关闭等原生窗口按钮。`vision` 并行使用可用的系统 OCR 与自动发现的微信 OCR，并在 OCR 无结果时回退内置像素区域识别。OCR 不增加配置字段，也不随发行包分发微信组件。`clickable_roles` 是跨平台语义角色，也可以用 `ax:` 或 `uia:` 指定原生角色。
 
+## Window 配置
+
+`[window]` 控制窗口调整，`[window.bindings]` 控制独立的操作键。默认入口位于 `[hotkeys]`：`"alt+w" = "window"`。Window 默认只继承 `hotkeys`，按住 Primary 才临时使用 Normal；因此重绑 Normal 的方向键不会改变 Window 的方向键。
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `enabled` | `true` | 注册 Window 模式。 |
+| `inherits` | `["hotkeys"]` | 未被本地绑定覆盖时按顺序继承。 |
+| `temporary_mode` / `temporary_mode_keys` | `"normal"` / `["primary"]` | 保留目标和子状态的临时模式。 |
+| `double_tap_ms` | `300` | AA 双击间隔，100–2000ms。 |
+| `move_step` / `move_speed` | `20.0` / `600.0` | 短按步长／连续移动速度。 |
+| `resize_step` / `resize_speed` | `20.0` / `500.0` | 中心缩放步长／速度。 |
+| `gap` | `8.0` | 布局间距。 |
+| `number_timeout_ms` | `250` | 仅歧义数字前缀等待，允许 100–2000ms。 |
+| `split_ratios` | `["1/4", "1/3", "1/2", "2/3", "3/4"]` | 树编辑分割线的比例档位。非空数组，可混用分数字符串和小数，例如 `["3/4", 0.3, "1/2", 0.4]`；加载时自动排序、去重，每项须大于 0 且小于 1。 |
+| `layout_keys` | `"123456789qwe"` | 旧配置解析兼容，不再控制新布局交互。 |
+| `border_width` | `3.0` | 目标描边宽度。 |
+| `ui.border_color` | 跟随主题 | 锁定目标的描边颜色；合并操作面板的字体、颜色及圆角使用 `[key_help]`。 |
+
+步长和间距使用逻辑像素，速度使用逻辑像素／秒；Windows 按目标屏幕 DPI 换算。Tab 直接循环切换窗口并居中鼠标，不需要窗口标签或确认配置。
+
+```toml
+[window]
+move_step = 12.0
+resize_step = 10.0
+gap = 12.0
+
+[window.ui]
+border_color = { dark = "#58A6FFFF", light = "#0969DAFF" }
+
+[key_help]
+font_size = 12
+```
+
+配置只写上述参数时保留默认操作键。如果写入 `[window.bindings]`，该绑定表会整体替换默认表；请从完整默认配置复制所需动作再改键，例如把 `z = "window_undo"` 改成 `x = "window_undo"`。应用覆盖支持 `[[window.app_configs]]`。全部动作见 [Window 模式](/reference/modes-and-actions#window-模式)，也可在配置编辑器的 Window 页签编辑并预览。
+
 ## 指针、滚动和主题
 
 ```toml

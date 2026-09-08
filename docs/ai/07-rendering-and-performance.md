@@ -1,5 +1,27 @@
 # 覆盖层、帧同步与性能约束
 
+
+## 统一场景构建
+
+`src/presentation/` 统一负责 Grid、Recursive Grid、UI Hint、Window、屏幕选择器、按键帮助、
+模式徽标和光标标记的布局、样式解析与场景原语构造。该层只依赖 `api`，不读取 Mode 实例、
+TOML、输入路由或原生句柄；Windows/macOS 后端继续负责字体、窗口、surface 和实际栅格化。
+
+Mode 只维护交互状态，通过 `HostContext::present(api::presentation::View)` 提交借用的视图。
+HostContext 注入 `Presenter` 端口，宿主使用无状态 `presentation::Composer`，测试可替换实现。
+视图同步消费，直接借用标签、库存、布局树和样式，不复制整个 Mode，也不在命令中保留借用。
+输出仍是 `Command::ShowOverlay(Arc<OverlayScene>)`，因此命令顺序、Finish、批次合并和后端协议不变。
+
+UI Hint 的重叠几何、冲突图和分层算法位于 `presentation/hint/`。`api::presentation::VisualLayerPlan`
+是由 Mode 会话持有的可复用缓存；Mode 只管理失效、清理及 Shift 轮次，通过 Presenter 重建计划。
+原有 inline 层号、宽路径 workspace 和借用式扫描数据继续复用，不增加逐帧重建。
+
+运行时只收集有效绑定、显示模式、按住按钮、锚点和预览数据，再调用同一 presentation 层装饰场景。
+`OverlayCoordinator` 保留单会话帮助缓存、scene 共享、去重、批次合并和位置快路径。
+新增视觉组件时，在 API 定义借用视图并在 presentation 添加 compositor；复用已有原语即可，
+只有新增原生绘制能力才扩展后端。内置 Mode/Plugin 不直接构造标签、形状或样式，架构测试锁定此边界。
+低层 `ShowOverlay` 仍保留给直接提交场景的兼容调用方。
+
 ## 当前内存策略（2026-08）
 
 Windows DirectComposition 保持设备、字体和紧致 cursor/indicator surface 预热，但 cursor-only Normal 不创建全屏 static surface。只有 backdrop、shape 或 label 存在时才挂载 static visual；回到无静态内容时立即释放 screen-sized surface。
@@ -9,6 +31,8 @@ Windows OCR 不属于预热常驻集。Backend ready 后首次事件轮询派发
 热路径使用 inline storage：`CommandBatch` 的 0/1/2 命令不分配，Normal held-key map inline 4 项，Grid/Recursive stack/path inline 12 项，继承 visited inline 8 项。
 
 ## 提交模型
+
+Window 的中心编号、区域描边只在状态变化时重新提交；500ms 库存结果相同时不重绘。库存结果以所有权交付，未变化条目直接复用；编号前缀索引只在可见成员、屏幕或区域数量改变时重建，数字输入复用缓冲区和 inline 输出。派生方向表仅在配置变化时重建。Window 的操作提示和 A 单个比例预览共用 key_help 的一个圆角背景、字体和键帽。Mode 只提供 `help_anchor` / `help_previews`，Host 根据有效绑定生成文字并约束面板到目标工作区。缓存比较锁定矩形、状态文字和缩略图选择；普通鼠标移动不会带走面板。Window 不再额外绘制浮动模式 badge。
 
 `Backend::present` 接收 `Arc<OverlayScene>`。Windows 使用 latest-frame 单槽队列：Engine 只替换待绘制帧并立即返回，已经过期的帧不会进入原生绘制。frame/position 更新与 empty→ready 判定在同一次锁内完成，并用 outstanding-wake 合并突发提交；渲染线程每次 drain 才清除标志，积压位置更新合并为一次唤醒，并只保留最终位置。同一输入批次中的 Warp、Show、Finish、Click、Hide 会先合并覆盖层意图；输入注入保持立即执行，批次结束只提交一次最终画面。
 
@@ -146,7 +170,7 @@ Shift 恢复每个分量的第 0 层。这样默认层不会成为一次无变�
 bitset 和必要的宽层号。宽路径先执行同一个精确 X sweep；完全没有视觉冲突时不分配或清零
 冲突 bitset，发现第一条边后仍执行原有精确图构建、五种着色和两次压缩。这个快路不改变
 `visually_stacked` 判定、层号或 Shift 映射。计划按完整 Hint 索引保存，筛选压缩不会遗漏标签；每个分量将全部层
-映射到互不相同的稳定 z-index，并把当前 Shift 层映射到统一最高值。Mode 单次线性生成标签，
+映射到互不相同的稳定 z-index，并把当前 Shift 层映射到统一最高值。统一 compositor 单次线性生成标签，
 Engine 随后执行已有的一次稳定 z 排序，保证 CPU/GPU 都不会重新遮住提升层；
 不移动、裁剪或重新分配标签。Hint 前缀、Backspace 或名称查询改变可见集合时重建
 计划；Windows 分层与 `DpiSceneCache` 共享同一个零分配 compact-label 几何 helper，按 scene clip

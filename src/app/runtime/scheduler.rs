@@ -21,6 +21,7 @@ pub(super) struct PendingSequence {
 
 #[derive(Debug, Default)]
 pub(super) struct Scheduler {
+    pub(super) window_sessions: BTreeMap<u64, ModeId>,
     pub(super) sequences: Vec<PendingSequence>,
     pub(super) timers: HashMap<String, Timer>,
     pub(super) frame_clock_owner: Option<ModeId>,
@@ -28,6 +29,7 @@ pub(super) struct Scheduler {
 
 impl Scheduler {
     pub(super) fn reset(&mut self) {
+        self.window_sessions.clear();
         self.sequences.clear();
         self.timers.clear();
         self.frame_clock_owner = None;

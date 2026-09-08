@@ -1,4 +1,4 @@
-import { computed, defineComponent, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, defineComponent, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { withBase } from 'vitepress'
 import { stringify } from 'smol-toml'
 import {
@@ -9,7 +9,11 @@ import {
   movePointer,
   toggleButton,
 } from '../simulator/state'
-import { effectiveBindings, resolveBinding } from '../simulator/bindings'
+import { compileWindowLayoutBindings, effectiveBindings, resolveBinding, resolvePhysicalBinding, resolveWindowLayoutBinding, temporaryPhysicalKeys } from '../simulator/bindings'
+import type { WindowLayoutBinding } from '../simulator/bindings'
+import { applyWindowAction, chooseWindowNumber, enterWindow, finishWindowNumber, setDemoWindowCount, temporaryWindow, windowActionAvailable, windowDetail, windowDoubleTap, windowInputStatus, windowSelectionKey, windowTarget, WINDOW_AREA, WINDOW_MOTION } from '../simulator/window'
+import type { WindowState } from '../simulator/window'
+import { layoutRect, quickCaption, quickRect, treeSlots } from '../simulator/window-layout'
 import { consumeConfigHandoff } from '../simulator/config-handoff'
 import CommonConfigControls from '../config-studio/CommonConfigControls'
 import ModeStyleControls from '../config-studio/ModeStyleControls'
@@ -20,7 +24,7 @@ import {
   type ConfigDocument,
 } from '../config-studio/document'
 
-type EditorMode = 'hotkeys' | 'normal' | 'grid' | 'recursive_grid' | 'ui_hint'
+type EditorMode = 'hotkeys' | 'normal' | 'grid' | 'recursive_grid' | 'ui_hint' | 'window'
 type Modifier = 'primary' | 'shift' | 'alt'
 type Appearance = 'dark' | 'light'
 
@@ -55,9 +59,17 @@ const modes: Array<{ id: EditorMode; label: string }> = [
   { id: 'grid', label: 'Grid' },
   { id: 'recursive_grid', label: 'Recursive Grid' },
   { id: 'ui_hint', label: 'UI Hint' },
+  { id: 'window', label: 'Window' },
 ]
 
 const actionGroups: ActionGroup[] = [
+  { name: 'Window', actions: [
+    ['window_left', '窗口向左'], ['window_down', '窗口向下'], ['window_up', '窗口向上'], ['window_right', '窗口向右'],
+    ['window_size', '移动／缩放'], ['window_layout', '快速布局／AA 平铺'], ['window_edit', '编辑布局树'], ['window_tile', '直接平铺'],
+    ['window_screen_next', '循环切屏'],
+    ['window_maximize', '最大化／还原'], ['window_center', '窗口居中'], ['window_select', '切换下一个窗口'],
+    ['window_undo', '撤销窗口调整'], ['window_cancel', '返回／退出'], ['window_exit', '退出 Window'],
+  ].map(([value, label]) => ({ value, label })) },
   { name: '按键提示', actions: [
     { value: 'key_help', label: '切换按键提示' },
   ] },
@@ -103,7 +115,7 @@ const actionGroups: ActionGroup[] = [
     actions: [
       ['normal', 'Normal'], ['grid', 'Grid'],
       ['recursive_grid', 'Recursive Grid'], ['ui_hint', 'UI Hint'],
-      ['idle', 'Idle'],
+      ['idle', 'Idle'], ['window', 'Window'],
     ].map(([value, label]) => ({ value, label })),
   },
   {
@@ -209,6 +221,13 @@ export default defineComponent({
 
     const targetingVisual = computed(() => targetingAppearance(effectiveDocument.value, simulator.mode, appearance.value))
     const targetingSettings = computed(() => effectiveDocument.value?.[simulator.mode] ?? {})
+    const windowLayoutBindings = computed(() => compileWindowLayoutBindings(effectiveDocument.value ?? {}, isMac.value))
+    let windowNumberTimer: ReturnType<typeof setTimeout> | undefined
+    watch(() => simulator.mode === 'window' && !simulator.window.temporary ? simulator.window.numberDeadline : null, deadline => {
+      clearTimeout(windowNumberTimer)
+      if (deadline !== null) windowNumberTimer = setTimeout(() => finishWindowNumber(simulator, effectiveDocument.value?.window ?? {}), Math.max(0, deadline - Date.now()))
+    })
+    onBeforeUnmount(() => clearTimeout(windowNumberTimer))
     const editorVisual = computed(() => editorAppearance(effectiveDocument.value, appearance.value))
 
     async function loadDefault(): Promise<void> {
@@ -328,13 +347,14 @@ export default defineComponent({
 
     function resolveAction(chord: string): string[] {
       if (!effectiveDocument.value) return []
-      const lookupMode = simulator.mode === 'idle' ? 'hotkeys' : simulator.mode
+      const lookupMode = simulator.mode === 'idle' ? 'hotkeys' : simulator.mode === 'window' && simulator.window.temporary ? 'normal' : simulator.mode
       const binding = resolveBinding(effectiveDocument.value, lookupMode, chord)?.value
       if (Array.isArray(binding)) return binding.map(String)
       return typeof binding === 'string' ? [binding] : []
     }
 
     function executeAction(action: string, continuous = false): void {
+      if (applyWindowAction(simulator, action, effectiveDocument.value?.window ?? {}, Date.now(), continuous ? .016 : undefined)) return
       if (applyKeyHelpAction(simulator, action, effectiveDocument.value?.key_help?.enabled !== false)) return
       if (MOVEMENT_ACTIONS.has(action)) {
         movePointer(simulator, action, continuous ? 0.45 : 2.5)
@@ -371,10 +391,46 @@ export default defineComponent({
 
     function onSimulatorKeyDown(event: KeyboardEvent): void {
       if (!simulatorArmed.value || event.repeat) return
-      if (event.key === 'Escape') {
+      const physical = physicalKey(event)
+      physicalKeys.add(physical)
+      updateTemporaryWindow(event)
+      if (event.key === 'Escape' && simulator.mode !== 'window') {
         simulatorArmed.value = false
         heldActions.clear(); heldCharacterActions.clear()
         return
+      }
+      const document = effectiveDocument.value
+      if (document) {
+        const pressed = currentPhysicalKeys(event)
+        const launcher = resolvePhysicalBinding(document, 'hotkeys', pressed, physical, isMac.value)
+        if (simulator.mode === 'window') {
+          const local = resolvePhysicalBinding(document, 'window', pressed, physical, isMac.value, true)
+          const temporary = temporaryPhysicalKeys(document, 'window', pressed, isMac.value)
+          if (!temporary.length && pressed.length === 1 && windowSelectionKey(simulator, physical, document.window ?? {})) { event.preventDefault(); return }
+          let resolved = local ?? (temporary.length
+            ? resolvePhysicalBinding(document, String(document.window?.temporary_mode ?? 'normal'), pressed.filter(k => !temporary.includes(k)), physical, isMac.value)
+            : resolvePhysicalBinding(document, 'window', pressed, physical, isMac.value))
+          if (!temporary.length && simulator.window.panel !== 'none') {
+            const direction = resolveWindowLayoutBinding(windowLayoutBindings.value, pressed, physical)
+            const reserved = resolved?.value === 'window_edit' || resolved?.value === 'window_layout' && windowDoubleTap(simulator.window, document.window ?? {})
+            if (!reserved && direction && windowActionAvailable(simulator.window, direction)) resolved = { value: direction, source: 'window' }
+          }
+          if (!temporary.length && resolved?.source === 'window' && !windowActionAvailable(simulator.window, String(resolved.value))) resolved = undefined
+          if (resolved) {
+            event.preventDefault()
+            const actions = Array.isArray(resolved.value) ? resolved.value.map(String) : [String(resolved.value)]
+            heldCharacterActions.set(event.code, actions)
+            actions.forEach(action => {
+              if (WINDOW_MOTION.has(action) || MOVEMENT_ACTIONS.has(action)) heldActions.add(action)
+              executeAction(action)
+            })
+            return
+          }
+          if (temporary.includes(physical)) { event.preventDefault(); return }
+          event.preventDefault(); return
+        } else if (launcher?.value === 'window') {
+          event.preventDefault(); heldActions.clear(); executeAction('window'); return
+        }
       }
       const character = event.key.toLowerCase()
       const characterActions = [...character].length === 1 && character !== browserKeyName(event.key, event.code) ? resolveAction(character) : []
@@ -403,9 +459,30 @@ export default defineComponent({
     }
 
     const heldCharacterActions = new Map<string, string[]>()
+    const physicalKeys = new Set<string>()
+    function physicalKey(event: KeyboardEvent): string {
+      const modifiers: Record<string, string> = { AltLeft: 'left_alt', AltRight: 'right_alt', ControlLeft: 'left_ctrl', ControlRight: 'right_ctrl', ShiftLeft: 'left_shift', ShiftRight: 'right_shift', MetaLeft: 'left_cmd', MetaRight: 'right_cmd' }
+      return modifiers[event.code] ?? browserKeyName(event.key, event.code)
+    }
+    function currentPhysicalKeys(event: KeyboardEvent): string[] {
+      const keys = [...physicalKeys]
+      for (const [family, active] of [['alt', event.altKey], ['ctrl', event.ctrlKey], ['shift', event.shiftKey], ['cmd', event.metaKey]] as const) {
+        if (active && !keys.some(k => k.endsWith(`_${family}`))) keys.push(`left_${family}`)
+      }
+      return keys
+    }
+    function updateTemporaryWindow(event: KeyboardEvent): void {
+      if (simulator.mode !== 'window' || !effectiveDocument.value) return
+      const active = temporaryPhysicalKeys(effectiveDocument.value, 'window', currentPhysicalKeys(event), isMac.value).length > 0
+      if (active !== simulator.window.temporary) heldActions.clear()
+      temporaryWindow(simulator.window, active, effectiveDocument.value.window ?? {})
+    }
     function onSimulatorKeyUp(event: KeyboardEvent): void {
+      physicalKeys.delete(physicalKey(event))
+      updateTemporaryWindow(event)
       heldCharacterActions.get(event.code)?.forEach(action => heldActions.delete(action))
       heldCharacterActions.delete(event.code)
+      if (![...heldActions].some(action => WINDOW_MOTION.has(action))) simulator.window.gesture = false
       const chord = chordFromEvent(event, isMac.value)
       if (!chord) {
         heldActions.clear(); heldCharacterActions.clear()
@@ -417,7 +494,10 @@ export default defineComponent({
     function animate(timestamp: number): void {
       const delta = previousFrame ? Math.min(32, timestamp - previousFrame) : 16
       previousFrame = timestamp
-      heldActions.forEach((action) => movePointer(simulator, action, delta * 0.028))
+      heldActions.forEach((action) => {
+        if (WINDOW_MOTION.has(action)) applyWindowAction(simulator, action, effectiveDocument.value?.window ?? {}, Date.now(), delta / 1000)
+        else movePointer(simulator, action, delta * 0.028)
+      })
       animationFrame = requestAnimationFrame(animate)
     }
 
@@ -441,8 +521,10 @@ export default defineComponent({
       return true
     }
 
-    function setPreviewMode(mode: 'normal' | 'grid' | 'recursive_grid' | 'ui_hint'): void {
-      simulator.mode = mode
+    function setPreviewMode(mode: 'normal' | 'grid' | 'recursive_grid' | 'ui_hint' | 'window'): void {
+      heldActions.clear(); physicalKeys.clear()
+      if (mode === 'window') enterWindow(simulator)
+      else simulator.mode = mode
       simulator.lastEvent = `预览 ${mode}`
     }
 
@@ -545,7 +627,7 @@ export default defineComponent({
                 <span class={{ 'ks-status': true, armed: simulatorArmed.value }}>{simulatorArmed.value ? '键盘已捕获' : '点击预览可试按键'}</span>
               </div>
               <div class="ks-simulator-modes" aria-label="预览模式">
-                {(['normal', 'grid', 'recursive_grid', 'ui_hint'] as const).map((mode) => (
+                {(['normal', 'grid', 'recursive_grid', 'ui_hint', 'window'] as const).map((mode) => (
                   <button class={{ active: simulator.mode === mode }} onClick={() => setPreviewMode(mode)}>{mode}</button>
                 ))}
               </div>
@@ -555,13 +637,36 @@ export default defineComponent({
                 style={targetingVisual.value as any}
                 tabindex="0"
                 onFocus={() => { simulatorArmed.value = true }}
-                onBlur={() => { simulatorArmed.value = false; heldActions.clear(); heldCharacterActions.clear() }}
+                onBlur={() => { simulatorArmed.value = false; heldActions.clear(); heldCharacterActions.clear(); physicalKeys.clear(); temporaryWindow(simulator.window, false) }}
                 onKeydown={onSimulatorKeyDown}
                 onKeyup={onSimulatorKeyUp}
               >
                 <div class="ks-screen-grid" />
-                <DesktopBackdrop />
-                <div class="ks-mode-badge">{simulator.mode}</div>
+                {simulator.mode !== 'window' && <DesktopBackdrop />}
+                {(simulator.mode !== 'window' || simulator.window.temporary) && <div class="ks-mode-badge">{simulator.mode === 'window' ? 'normal' : simulator.mode}</div>}
+                {simulator.mode === 'window' && <div class="ks-window-demo">
+                  <div class="ks-window-screen-label">示例屏幕 {simulator.window.screen + 1} / 2</div>
+                  <label class="ks-window-count">示例窗口数 <select aria-label="示例窗口数量" value={simulator.window.windows.filter(w => w.screen === simulator.window.screen).length}
+                    onChange={e => setDemoWindowCount(simulator, Number((e.target as HTMLSelectElement).value))}>
+                    {[1, 3, 9, 20, 23, 30].map(count => <option value={count}>{count}</option>)}
+                  </select></label>
+                  {simulator.window.windows.filter(w => w.screen === simulator.window.screen).map(w => <div
+                    class={{ 'ks-demo-window': true, target: w.id === simulator.window.target && !simulator.window.temporary }}
+                    style={{ left: `${w.x / WINDOW_AREA.width * 100}%`, top: `${w.y / WINDOW_AREA.height * 100}%`, width: `${w.width / WINDOW_AREA.width * 100}%`, height: `${w.height / WINDOW_AREA.height * 100}%`, outlineWidth: `${numberSetting(targetingSettings.value.border_width, 3)}px`, zIndex: w.id === simulator.window.target ? 2 : 1 }}>
+                    <div class="ks-demo-window-title">{w.app} · {w.title}</div>
+                    <div class="ks-demo-window-lines"><i /><i /><i /></div>
+                  </div>)}
+                  {!simulator.window.temporary && windowNumberLabels(simulator.window).map(label => <button class="ks-window-number"
+                    aria-label={`选择窗口 ${label.number}`} style={{ left: `${label.x}%`, top: `${label.y}%` }}
+                    onMousedown={e => e.preventDefault()} onClick={() => chooseWindowNumber(simulator, label.number, targetingSettings.value)}>{label.number}</button>)}
+                  {!simulator.window.temporary && simulator.window.tree && treeSlots(simulator.window.tree).map(slot => {
+                    const rect = layoutRect(slot.rect, WINDOW_AREA, numberSetting(targetingSettings.value.gap, 8))
+                    return <div class={{ 'ks-window-slot': true, selected: simulator.window.tree?.selected === slot.id }}
+                      style={{ left: `${rect.x / WINDOW_AREA.width * 100}%`, top: `${rect.y / WINDOW_AREA.height * 100}%`, width: `${rect.width / WINDOW_AREA.width * 100}%`, height: `${rect.height / WINDOW_AREA.height * 100}%` }}>
+                      <button aria-label={`选择区域 ${slot.id}`} onMousedown={e => e.preventDefault()} onClick={() => chooseWindowNumber(simulator, slot.id, targetingSettings.value, true)}>{'`'}{slot.id}</button>
+                    </div>
+                  })}
+                </div>}
                 {(simulator.mode === 'grid' || simulator.mode === 'recursive_grid') && <div class="ks-target-backdrop" />}
                 {simulator.mode === 'grid' && <TargetGrid mode="grid" settings={targetingSettings.value} path={simulator.targeting.grid.path} />}
                 {simulator.mode === 'recursive_grid' && <TargetGrid mode="recursive_grid" settings={targetingSettings.value} path={simulator.targeting.recursiveGrid.path} />}
@@ -570,10 +675,16 @@ export default defineComponent({
                   <span key={clickPulse.value} class={clickPulse.value ? 'pulse' : ''} />
                 </div>
                 {scrollPulse.value && <div class="ks-scroll-pulse">{scrollPulse.value}</div>}
-                {effectiveDocument.value && simulator.keyHelpVisible && simulator.mode !== 'idle' && effectiveDocument.value.key_help?.enabled !== false && (
-                  <KeyHelpPreview document={effectiveDocument.value} mode={simulator.mode} appearance={appearance.value} />
+                {effectiveDocument.value && simulator.mode === 'window' && !simulator.window.temporary && (
+                  <KeyHelpPreview document={effectiveDocument.value} mode="window" appearance={appearance.value}
+                    anchor={windowTarget(simulator.window)} detail={windowDetail(simulator.window)}
+                    status={windowInputStatus(simulator.window) || (simulator.lastEvent.startsWith('window_') ? '' : simulator.lastEvent)}
+                    windowState={simulator.window} layoutBindings={windowLayoutBindings.value} />
                 )}
-                <div class="ks-event-log">{simulator.lastEvent}</div>
+                {effectiveDocument.value && simulator.keyHelpVisible && simulator.mode !== 'idle' && (simulator.mode !== 'window' || simulator.window.temporary) && effectiveDocument.value.key_help?.enabled !== false && (
+                  <KeyHelpPreview document={effectiveDocument.value} mode={simulator.mode === 'window' ? 'normal' : simulator.mode} appearance={appearance.value} />
+                )}
+                {simulator.mode !== 'window' && <div class="ks-event-log">{simulator.lastEvent}</div>}
               </div>
               <div class="ks-toolbar ks-compact-toolbar">
                 <button class="ks-button" onClick={() => executeAction('key_help')}>切换按键提示预览</button>
@@ -583,7 +694,8 @@ export default defineComponent({
                 <ModeStyleControls document={document.value} effectiveDocument={effectiveDocument.value} mode="key_help" appearance={appearance.value}
                   onChange={(next) => { document.value = next }} onAppearanceChange={(next) => { appearance.value = next }} />
               )}
-              {document.value && effectiveDocument.value && !editKeyHelp.value && (simulator.mode === 'grid' || simulator.mode === 'recursive_grid' || simulator.mode === 'ui_hint') && (
+              {simulator.mode === 'window' && <p class="ks-window-instructions">数字选窗；A 快速布局，使用 Normal 方向键调整比例，AA 平铺。E 编辑布局树：Shift＋方向分区，Ctrl＋方向调分割线。修改即时生效，Esc 返回，Q 退出，Z 撤销；按住 Primary 临时使用 Normal。这里只调整示例窗口。</p>}
+              {document.value && effectiveDocument.value && !editKeyHelp.value && (simulator.mode === 'grid' || simulator.mode === 'recursive_grid' || simulator.mode === 'ui_hint' || simulator.mode === 'window') && (
                 <ModeStyleControls
                   document={document.value}
                   effectiveDocument={effectiveDocument.value}
@@ -1115,6 +1227,11 @@ const KeyHelpPreview = defineComponent({
     document: { type: Object as () => ConfigDocument, required: true },
     mode: { type: String, required: true },
     appearance: { type: String as () => 'light' | 'dark', required: true },
+    anchor: { type: Object as () => { x: number; y: number; width: number; height: number } },
+    detail: { type: String, default: '' },
+    status: { type: String, default: '' },
+    windowState: { type: Object as () => WindowState },
+    layoutBindings: { type: Array as () => WindowLayoutBinding[], default: () => [] },
   },
   setup(props) {
     const host = ref<HTMLElement>()
@@ -1127,11 +1244,15 @@ const KeyHelpPreview = defineComponent({
       if (host.value) observer.observe(host.value)
     })
     onBeforeUnmount(() => observer?.disconnect())
-    const entries = computed(() => keyHelpEntries(props.document, props.mode))
+    const entries = computed(() => keyHelpEntries(props.document, props.mode, props.windowState, props.layoutBindings))
     return () => {
       if (!props.document.key_help) return null
       const ui = keyHelpStyle(props.document.key_help)
-      const layout = keyHelpLayout(ui, entries.value, size.value.width, size.value.height)
+      const isWindow = props.mode === 'window'
+      const preview = props.windowState?.panel === 'quick' ? quickRect(props.windowState.quick) : null
+      const previewHeight = preview ? Math.min(84, size.value.height * .18) : 0
+      const statusHeight = props.status ? ui.font_size * 1.8 : 0
+      const layout = keyHelpLayout(ui, entries.value, isWindow ? Math.min(size.value.width, 784) : size.value.width, size.value.height, previewHeight + statusHeight, isWindow)
       const theme = props.document.theme?.[props.appearance] ?? {}
       const indicator = { ...props.document.mode_indicator?.ui, ...props.document.mode_indicator?.modes?.[props.mode]?.ui }
       const color = (value: unknown, fallback: string): string => {
@@ -1147,19 +1268,28 @@ const KeyHelpPreview = defineComponent({
       const titleStyle = { fontSize: `${ui.title_font_size}px`, fontWeight: ui.title_bold ? '700' : '400', color: color(ui.title_color, foreground),
         height: `${layout.headerHeight}px`, display: 'flex', alignItems: 'center', overflow: 'hidden', whiteSpace: 'nowrap' as const }
       const scale = layout.bodyScale
+      const left = props.anchor ? Math.max(0, Math.min(size.value.width - layout.width,
+        (props.anchor.x + props.anchor.width / 2) / WINDOW_AREA.width * size.value.width - layout.width / 2)) : (size.value.width - layout.width) / 2
+      const top = props.anchor ? Math.max(0, Math.min(size.value.height - layout.height - 8,
+        (props.anchor.y + props.anchor.height) / WINDOW_AREA.height * size.value.height + 10)) : size.value.height - layout.height - ui.bottom_margin
       return (
         <div ref={host} style={{ position: 'absolute', inset: 0, pointerEvents: 'none', zIndex: 20, overflow: 'hidden' }}>
-          <div aria-label="按键提示预览" style={{ position: 'absolute', left: '50%', transform: 'translateX(-50%)', bottom: `${ui.bottom_margin}px`,
+          <div aria-label={isWindow ? 'Window 操作提示' : '按键提示预览'} style={{ position: 'absolute', left: `${left}px`, top: `${top}px`,
             width: `${layout.width}px`, height: `${layout.height}px`, background, borderRadius: `${ui.border_radius}px`,
             boxShadow: `inset 0 0 0 ${ui.border_width}px ${color(ui.border_color, '#00000000')}`,
             fontFamily: ui.font_family || indicator.font_family || 'system-ui, sans-serif', lineHeight: 1.4, color: foreground }}>
-            <div style={{ ...titleStyle, position: 'absolute', left: `${layout.padding}px`, top: `${ui.padding_y}px`, width: `${Math.max(1, layout.width - layout.padding * 2 - closeWidth - ui.key_gap)}px` }}>{props.mode} · Available keys</div>
+            <div style={{ ...titleStyle, position: 'absolute', left: `${layout.padding}px`, top: `${ui.padding_y}px`, width: `${Math.max(1, layout.width - layout.padding * 2 - closeWidth - ui.key_gap)}px` }}>{isWindow ? `Window · ${props.detail}` : `${props.mode} · Available keys`}</div>
             <div style={{ ...titleStyle, position: 'absolute', right: `${layout.padding}px`, top: `${ui.padding_y}px`, width: `${closeWidth}px` }}>{closeText}</div>
+            {props.status && <div style={{ position: 'absolute', left: `${layout.padding}px`, top: `${ui.padding_y + layout.headerHeight}px`, width: `${layout.width - layout.padding * 2}px`, height: `${statusHeight}px`, fontSize: `${ui.font_size}px`, overflow: 'hidden', whiteSpace: 'nowrap', opacity: .85 }}>{props.status}</div>}
+            {preview && <div class="ks-window-quick-preview" aria-label="Window 快速布局" style={{ left: `${layout.padding}px`, top: `${ui.padding_y + layout.headerHeight + statusHeight}px`, width: `${layout.width - layout.padding * 2}px`, height: `${previewHeight}px` }}>
+              <span class="ks-help-layout-mini"><i style={{ left: `${preview.x * 100}%`, top: `${preview.y * 100}%`, width: `${preview.width * 100}%`, height: `${preview.height * 100}%` }} /></span>
+              <span>{quickCaption(props.windowState!.quick)}</span>
+            </div>}
             {entries.value.map((entry, index) => {
               const column = Math.floor(index / layout.rows)
               const widths = layout.widths[column]
               const left = layout.bodyLeft + layout.widths.slice(0, column).reduce((sum, w) => sum + w.key + w.action + ui.key_gap + ui.column_gap, 0)
-              const top = ui.padding_y + layout.headerHeight + index % layout.rows * layout.rowHeight
+              const top = ui.padding_y + layout.headerHeight + statusHeight + previewHeight + index % layout.rows * layout.rowHeight
               return <div key={entry.keys} style={{ position: 'absolute', left: `${left}px`, top: `${top}px`, display: 'flex', alignItems: 'center',
                 height: `${Math.max(1, layout.rowHeight - ui.row_gap)}px`, gap: `${ui.key_gap}px`, fontSize: `${ui.font_size * scale}px`, whiteSpace: 'nowrap' }}>
                 <span style={{ width: `${widths.key}px`, display: 'flex', justifyContent: 'flex-end' }}>
@@ -1190,11 +1320,56 @@ function readable(background: string, text = '#10172DFF', alternate = '#FFFFFFFF
 
 interface HelpEntry { keys: string; action: string }
 
-function keyHelpEntries(document: ConfigDocument, mode: string): HelpEntry[] {
+function windowNumberLabels(state: WindowState): Array<{ number: number; x: number; y: number }> {
+  const labels: Array<{ number: number; x: number; y: number }> = []
+  for (const window of state.windows.filter(w => w.screen === state.screen).sort((a, b) => state.numbers[a.id] - state.numbers[b.id])) {
+    let x = (window.x + window.width / 2) / WINDOW_AREA.width * 100
+    let y = (window.y + window.height / 2) / WINDOW_AREA.height * 100
+    for (let i = 0; i < labels.length && labels.some(l => Math.abs(l.x - x) < 5 && Math.abs(l.y - y) < 6); i++) {
+      y += 6
+      if (y > 94) { y = 6; x += 6 }
+    }
+    labels.push({ number: state.numbers[window.id], x: Math.max(3, Math.min(97, x)), y: Math.max(3, Math.min(97, y)) })
+  }
+  return labels
+}
+
+function keyHelpEntries(document: ConfigDocument, mode: string, window?: WindowState, layoutBindings: WindowLayoutBinding[] = []): HelpEntry[] {
   const groups = new Map<string, string[]>()
-  for (const [chord, binding] of effectiveBindings(document, mode)) {
+  const bindings = effectiveBindings(document, mode)
+  if (mode === 'window' && window?.panel !== 'none') {
+    for (const entry of layoutBindings) {
+      if (window && windowActionAvailable(window, entry.action) && bindings.get(entry.chord)?.value !== 'window_edit'
+        && !(bindings.get(entry.chord)?.value === 'window_layout' && windowDoubleTap(window, document.window ?? {}))) {
+        bindings.set(entry.chord, { value: entry.action, source: 'window' })
+      }
+    }
+  }
+  if (mode === 'window') {
+    bindings.set('1–9 / 10…', { value: 'window_number', source: 'window' })
+    if (window?.panel === 'tree') bindings.set('`', { value: 'window_area_number', source: 'window' })
+  }
+  for (const [chord, binding] of bindings) {
     if (binding.value === '__disabled__') continue
-    const action = Array.isArray(binding.value) ? binding.value.join(' → ') : String(binding.value)
+    let action = Array.isArray(binding.value) ? binding.value.join(' → ') : String(binding.value)
+    if (mode === 'window') {
+      if (window && !['window_number', 'window_area_number'].includes(action) && !windowActionAvailable(window, action)) continue
+      const labels: Record<string, string> = {
+        window_left: 'Left', window_right: 'Right', window_up: 'Up', window_down: 'Down',
+        window_size: 'Move / resize', window_layout: 'Quick / double tap to tile', window_edit: 'Edit layout tree', window_tile: 'Tile windows',
+        window_number: '选择窗口编号', window_area_number: '区域编号前缀',
+        window_screen_next: 'Next screen', window_screen_previous: 'Previous screen', window_maximize: 'Maximize / restore',
+        window_center: 'Center window', window_select: 'Next window', window_undo: 'Undo',
+        window_confirm: 'Apply / exit', window_cancel: 'Back / exit', window_exit: 'Exit',
+      }
+      for (const direction of ['left', 'right', 'up', 'down']) {
+        labels[`window_layout_${direction}`] = `Layout ${direction}`
+        labels[`window_split_${direction}`] = `Split ${direction}`
+        labels[`window_ratio_${direction}`] = `Move divider ${direction}`
+      }
+      if (!labels[action]) continue
+      action = labels[action]
+    }
     const keys = groups.get(action) ?? []
     keys.push(chord.replaceAll('_', ' ').toUpperCase())
     groups.set(action, keys)
@@ -1204,11 +1379,11 @@ function keyHelpEntries(document: ConfigDocument, mode: string): HelpEntry[] {
 }
 
 /** Same logical-pixel sizing as the native help decorator (browser font metrics differ). */
-function keyHelpLayout(ui: ConfigDocument, entries: HelpEntry[], screenWidth: number, screenHeight: number) {
+function keyHelpLayout(ui: ConfigDocument, entries: HelpEntry[], screenWidth: number, screenHeight: number, extraHeight = 0, windowHelp = false) {
   ui = keyHelpStyle(ui)
   const availableWidth = Math.max(1, screenWidth - ui.screen_margin * 2)
   const padding = Math.min(ui.padding_x, availableWidth / 4)
-  const columns = availableWidth >= ui.column_threshold && entries.length > 8
+  const columns = availableWidth >= (windowHelp ? Math.min(440, ui.column_threshold) : ui.column_threshold) && entries.length > 8
     ? Math.max(1, Math.min(ui.max_columns, entries.length)) : 1
   const rows = Math.max(1, Math.ceil(entries.length / columns))
   const widths = Array.from({ length: columns }, (_, column) => {
@@ -1224,8 +1399,8 @@ function keyHelpLayout(ui: ConfigDocument, entries: HelpEntry[], screenWidth: nu
   const squeeze = Math.max(0.01, Math.min(1, (width - padding * 2 - gaps) / textWidth))
   widths.forEach(column => { column.key *= squeeze; column.action *= squeeze })
   const headerHeight = Math.max(ui.header_height, ui.title_font_size * 1.4)
-  const rowHeight = Math.min(ui.row_height, Math.max(8, (screenHeight * ui.max_height_ratio - headerHeight - ui.padding_y * 2) / rows))
-  const height = headerHeight + rows * rowHeight + ui.padding_y * 2
+  const rowHeight = Math.min(ui.row_height, Math.max(8, (screenHeight * (windowHelp ? .75 : ui.max_height_ratio) - headerHeight - extraHeight - ui.padding_y * 2) / rows))
+  const height = headerHeight + extraHeight + rows * rowHeight + ui.padding_y * 2
   const bodyScale = Math.max(0.01, Math.min(squeeze, (rowHeight - ui.row_gap) / (ui.font_size * 1.4 + ui.key_padding_y * 2)))
   return { width, height, padding, columns, rows, widths, rowHeight, headerHeight, bodyScale,
     bodyLeft: (width - textWidth * squeeze - gaps) / 2 }

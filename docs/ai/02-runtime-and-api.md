@@ -56,6 +56,7 @@ macOS 原生全屏移动启动后也返回 `None`；后端保留窗口，按 pol
 
 - 原生层向上只产生 `BackendEvent`。
 - Engine 向 Mode 只发送 `ModeEvent` 和只读 `HostContext`。
+- `HostContext::present(View)` 通过注入的 `Presenter` 同步构造场景；Mode 只提交借用数据，具体布局归 `presentation`。
 - Mode/Plugin 向外只返回 `CommandBatch`；批次只包含 `Command`。
 - Engine 将 `Command` 翻译成 `Backend` 调用或新的 Mode 事件。
 
@@ -89,7 +90,7 @@ Engine 的 Frame、指针、按键等通用热路径直接调用借用式 `Mode:
   override profile key。`CompiledKeymap` 内部仍保持已经验证过的结构，不使用曾回退的排序 Vec。
 - 异步：`Scheduler` 持有动作序列、Mode timer 和 frame clock owner；scan id 仍映射 owner。
 - 环境：屏幕、权威光标坐标、当前应用。
-- 绘制：`OverlayCoordinator` 持有 Mode 原始 scene、最后 scene、去重和位置快路状态。
+- 绘制：`OverlayCoordinator` 持有统一 composer 生成的内容 scene、最后 scene、去重和位置快路状态。
 - 控制：启用/暂停、退出、配置存储、输入失败抑制。
 
 `RuntimePlan` 不再分别保存 route、Mode 和 Plugin 三套可失配集合。每个 `ModeSpec` 原子包含
@@ -219,6 +220,18 @@ macOS 更新事件在 Hook 有界队列忙时转入 fallback channel，后台线
 系统浏览器。配置 fragment 不得放进 query、不得启动本地 HTTP 服务，也不得在启动时预计算。
 生成的 source/compressed/encoded/url 均为单次局部值且不缓存；Engine 对成功打开后的快速
 重复菜单事件做 2 秒防抖，避免重复压缩和连续打开浏览器标签页。
+
+## Window 请求与会话
+
+`BeginEdit` 异步返回完整库存与最小尺寸快照；`ApplyLayout` 发送事务 id、递增修订号及标准化绝对矩形；`EndEdit` 结束并分组撤销记录，内部恢复路径仍可请求回滚。默认交互即时生效，不绑定 Enter；Esc 返回和 Q 退出均保留最新布局。Mode 保持单个在途批次并合并后续目标；worker 只写入变化矩形，拒绝陈旧修订，原生拒绝后回读并恢复上一成功布局。提交失败必须反馈结束状态，避免模式等待不存在的确认。
+
+Mode 的可选 `help_anchor` / `help_previews` 提供纯几何提示数据。Window 的常显面板由 Engine 的 key_help decorator 合并状态、真实绑定和缩略图，并基于锁定窗口定位。其他模式的可选 key_help 和临时 Normal 保持原语义。
+
+Window 以 modal push/pop 进入和返回，暂停旧模式时释放其连续手势，但保留物理键的消费配对和旧模式选择实例。`Binding::Window` 由模式处理，返回 `Command::WindowRequest`；Engine 在消费确认之后调用后端，并以 session→owner 路由 `BackendEvent::WindowResult`。原生 HWND/AX 引用不进入 API。
+
+请求有 session 和递增 id。`CancelPending` 取消较旧的查询/调整并保留目标、Tab 顺序和撤销；模式同时推进接受结果的下界。退出、捕获恢复、计划替换和 shutdown 取消整个会话并清除路由，晚到结果不能 warp。显示器变化取消旧操作，并按新屏幕数据回读当前目标。
+
+按住临时 Normal 激活键时，`TemporaryModeChanged` 在本次 disposition 发布之后送达 Window，停止窗口连续运动、取消过期操作并隐藏其覆盖层；Normal 继续接收真实绑定。Window 的裸方向键不抢占临时 Normal，完整显式组合键仍优先。其他定位模式在临时 Normal 已有真实绑定或 `none` 时保持旧语义；没有临时绑定时可解析完整 Alt+W 启动键。
 
 ## 可恢复输入失败
 

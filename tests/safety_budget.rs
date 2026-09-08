@@ -11,10 +11,14 @@ use std::path::{Path, PathBuf};
 // CGEvent Unicode extraction and Win32 ToUnicodeEx with no-state-change flags.
 // Candidate filtering adds a foreground HKL read, cold translation enumeration,
 // and an explicitly requested read-only loaded-layout test probe on Windows.
-const MAX_UNSAFE_EXPRESSIONS: usize = 262;
-const MAX_UNSAFE_FILES: usize = 21;
+// Window mode adds eight bounded Win32 identity/placement operations, two blocks
+// for an explicitly run disposable-window probe, and 10 retained/type-checked
+// AX/Quartz operations. Its state machine and shared worker remain safe Rust.
+const MAX_UNSAFE_EXPRESSIONS: usize = 282;
+const MAX_UNSAFE_FILES: usize = 23;
 const PER_FILE_BUDGET: &[(&str, usize)] = &[
     ("src/platform/macos/accessibility.rs", 18),
+    ("src/platform/macos/accessibility/window_manager.rs", 10),
     ("src/platform/macos/autostart.rs", 5),
     ("src/platform/macos/display_link.rs", 4),
     ("src/platform/macos/native.rs", 7),
@@ -30,6 +34,7 @@ const PER_FILE_BUDGET: &[(&str, usize)] = &[
     ("src/platform/windows/overlay.rs", 9),
     ("src/platform/windows/screens.rs", 5),
     ("src/platform/windows/window_mover.rs", 4),
+    ("src/platform/windows/window_manager.rs", 10),
     ("src/platform/windows/status_item.rs", 14),
     ("src/platform/windows/update_installer/candidate.rs", 4),
     ("src/platform/windows/update_installer/mod.rs", 11),
@@ -145,7 +150,15 @@ fn unsafe_surface_does_not_regress() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn portable_layers_are_safe_rust() -> Result<(), Box<dyn std::error::Error>> {
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    for relative in ["api", "app", "config", "modes", "plugins", "support"] {
+    for relative in [
+        "api",
+        "app",
+        "config",
+        "modes",
+        "plugins",
+        "presentation",
+        "support",
+    ] {
         let mut files = Vec::new();
         rust_files(&source_root.join(relative), &mut files)?;
         for path in files {

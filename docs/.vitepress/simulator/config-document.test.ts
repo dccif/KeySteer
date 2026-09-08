@@ -1,6 +1,14 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { reactive } from 'vue'
+
+test('fraction ratios preserve source strings and reject invalid configurations', () => {
+  const parsed = parseConfigDocument('[window]\nsplit_ratios = ["1/5", " 2 / 5 ", "4/5"]')
+  assert.deepEqual(parsed.document.window.split_ratios, ['1/5', ' 2 / 5 ', '4/5'])
+  for (const values of ['[]', '[0.0]', '[1.0]', '[-0.1]', '[nan]', '[inf]', '["0.5"]', '["1/0"]', '["0/1"]', '["1/1"]', '["1/4294967296"]']) {
+    assert.throws(() => parseConfigDocument(`[window]\nsplit_ratios = ${values}`), /split_ratios/)
+  }
+})
 import {
   cloneConfigDocument,
   getConfigPath,

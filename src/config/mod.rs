@@ -13,6 +13,8 @@
 
 mod aliases;
 mod settings;
+mod window;
+pub use window::{SplitRatio, Window};
 pub mod store;
 pub mod theme;
 mod validation;
@@ -75,6 +77,8 @@ pub struct ConfigFile {
     #[serde(default)]
     pub normal: Normal,
     #[serde(default)]
+    pub window: Window,
+    #[serde(default)]
     pub ui_hint: UiHint,
     #[serde(default)]
     pub grid: Grid,
@@ -121,6 +125,7 @@ impl Default for ConfigFile {
             theme: Theme::default(),
             hotkeys: default_idle_bindings(),
             normal: Normal::default(),
+            window: Window::default(),
             ui_hint: UiHint::default(),
             grid: Grid::default(),
             recursive_grid: RecursiveGrid::default(),
@@ -169,8 +174,9 @@ fn default_plugin_modes() -> BTreeMap<String, PluginModeConfig> {
 /// letters here avoid both.
 fn default_idle_bindings() -> Bindings {
     let entries: &[(&str, &str)] = &[
-        // Idle remains silent until this single portable launcher is pressed.
+        // Idle remains silent until an explicitly configured launcher is pressed.
         ("primary+e", "normal"),
+        ("alt+w", "window"),
     ];
     builtin_bindings(entries)
 }
@@ -441,6 +447,7 @@ impl ConfigFile {
         let aliases = self.resolved_key_aliases.clone();
         normalize_binding_keys(&mut self.hotkeys, "[hotkeys]", &aliases)?;
         normalize_binding_keys(&mut self.normal.bindings, "[normal.bindings]", &aliases)?;
+        normalize_binding_keys(&mut self.window.bindings, "[window.bindings]", &aliases)?;
         normalize_binding_keys(&mut self.grid.bindings, "[grid.bindings]", &aliases)?;
         normalize_binding_keys(
             &mut self.recursive_grid.bindings,
@@ -465,6 +472,7 @@ impl ConfigFile {
         for (label, overrides) in [
             ("[[app_configs]]", &mut self.app_configs),
             ("[[normal.app_configs]]", &mut self.normal.app_configs),
+            ("[[window.app_configs]]", &mut self.window.app_configs),
             ("[[grid.app_configs]]", &mut self.grid.app_configs),
             (
                 "[[recursive_grid.app_configs]]",
@@ -488,6 +496,7 @@ impl ConfigFile {
         }
         normalize_key_if_aliased(&mut self.ui_hint.overlap_cycle_key, &aliases)?;
         for keys in [
+            &mut self.window.temporary_mode_keys,
             &mut self.grid.temporary_mode_keys,
             &mut self.recursive_grid.temporary_mode_keys,
             &mut self.ui_hint.temporary_mode_keys,

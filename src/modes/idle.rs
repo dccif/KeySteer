@@ -76,6 +76,7 @@ mod tests {
         }
         fn ctx(&self) -> HostContext<'_> {
             HostContext {
+                presenter: &crate::presentation::COMPOSER,
                 screens: &self.screens,
                 cursor: Point::new(500.0, 400.0),
                 focused_app: None,

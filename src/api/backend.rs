@@ -16,6 +16,7 @@ use std::time::Duration;
 /// Something that happened natively and must reach the engine.
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
+    WindowResult(Box<super::window::WindowResult>),
     /// A key was pressed or released.
     Input(InputEvent),
     /// A previously accepted native input request failed during execution.
@@ -101,6 +102,11 @@ pub enum KeyDisposition {
 /// A native backend. Implementations live in `src/platform/<os>.rs` and are
 /// selected by `cfg(target_os)` in `src/platform/mod.rs`.
 pub trait Backend {
+    fn request_window(&mut self, _request: super::window::WindowRequest) -> Result<(), String> {
+        Err("window management is not supported by this backend".into())
+    }
+
+    fn cancel_window_session(&mut self, _session: u64) {}
     /// Block for up to `timeout` for the next event.
     ///
     /// Returning `Ok(None)` on timeout is how the engine gets its chance to

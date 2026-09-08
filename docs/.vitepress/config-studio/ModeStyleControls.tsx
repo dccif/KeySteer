@@ -7,7 +7,7 @@ import {
   type ConfigDocument,
 } from './document'
 
-type TargetingMode = 'grid' | 'recursive_grid' | 'ui_hint' | 'key_help'
+type TargetingMode = 'grid' | 'recursive_grid' | 'ui_hint' | 'key_help' | 'window'
 type Appearance = 'dark' | 'light'
 type ControlKind = 'color' | 'number' | 'text' | 'boolean' | 'select'
 
@@ -28,6 +28,28 @@ interface ModeFields {
 }
 
 const fields: Record<TargetingMode, ModeFields> = {
+  window: {
+    colors: [
+      { path: 'key_help.background_color', label: '面板背景（共用 key_help）', kind: 'color' },
+      { path: 'key_help.text_color', label: '面板文字（共用 key_help）', kind: 'color' },
+      { path: 'window.ui.border_color', label: '目标描边', kind: 'color' },
+    ],
+    layout: [
+      { path: 'window.enabled', label: '启用 Window', kind: 'boolean' },
+      { path: 'window.gap', label: '布局间距', kind: 'number', min: 0, max: 100, step: 1 },
+      { path: 'window.double_tap_ms', label: 'AA 间隔（毫秒）', kind: 'number', min: 100, max: 2000, step: 10 },
+      { path: 'window.number_timeout_ms', label: '歧义编号等待（毫秒）', kind: 'number', min: 100, max: 2000, step: 10 },
+      { path: 'window.move_step', label: '移动步长', kind: 'number', min: 0, max: 10000, step: 1 },
+      { path: 'window.resize_step', label: '缩放步长', kind: 'number', min: 0, max: 10000, step: 1 },
+      { path: 'window.border_width', label: '目标描边宽度', kind: 'number', min: 0, max: 20, step: .5 },
+    ],
+    advanced: [
+      { path: 'window.move_speed', label: '移动速度', kind: 'number', min: 0, max: 10000, step: 10 },
+      { path: 'window.resize_speed', label: '缩放速度', kind: 'number', min: 0, max: 10000, step: 10 },
+      { path: 'key_help.font_family', label: '面板字体（共用 key_help）', kind: 'text' },
+      { path: 'key_help.font_size', label: '面板字号（共用 key_help）', kind: 'number', min: 1, max: 72, step: 1 },
+    ],
+  },
   key_help: {
     colors: [
       { path: 'key_help.background_color', label: '背景色', kind: 'color' },
@@ -280,5 +302,5 @@ function withAlpha(next: string, previous: unknown): string {
 }
 
 function modeLabel(mode: TargetingMode): string {
-  return mode === 'key_help' ? '按键提示' : mode === 'grid' ? 'Grid' : mode === 'recursive_grid' ? 'Recursive Grid' : 'UI Hint'
+  return mode === 'window' ? 'Window' : mode === 'key_help' ? '按键提示' : mode === 'grid' ? 'Grid' : mode === 'recursive_grid' ? 'Recursive Grid' : 'UI Hint'
 }

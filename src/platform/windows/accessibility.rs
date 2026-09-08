@@ -716,7 +716,7 @@ fn normalize_root_owner(hwnd: HWND) -> HWND {
     if root.is_invalid() { hwnd } else { root }
 }
 
-fn scannable_target(hwnd: HWND) -> Option<(HWND, u32, Rect)> {
+pub(super) fn scannable_target(hwnd: HWND) -> Option<(HWND, u32, Rect)> {
     let hwnd = normalize_root_owner(hwnd);
     let desktop = super::native::desktop_window();
     let valid = super::native::is_window(hwnd);

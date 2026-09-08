@@ -157,7 +157,31 @@ pub fn built_in(config: &Config) -> Vec<Box<dyn Mode>> {
     if config.ui_hint.enabled {
         catalog.push(Box::new(hint(config)));
     }
+    if config.window.enabled {
+        catalog.push(Box::new(window(config)));
+    }
     catalog
+}
+
+pub(crate) fn window(config: &Config) -> modes::window::WindowMode {
+    let w = &config.window;
+    modes::window::WindowMode::new(modes::window::Settings {
+        double_tap_ms: w.double_tap_ms,
+        number_timeout_ms: w.number_timeout_ms,
+        split_ratios: w.parsed_split_ratios().unwrap_or_else(|error| {
+            // Runtime compilation validates first; direct catalog callers
+            // still receive a usable mode without a panic.
+            crate::report_error!("configuration", "{error}");
+            crate::api::window_layout::DEFAULT_SPLIT_RATIOS.to_vec()
+        }),
+        move_step: w.move_step,
+        move_speed: w.move_speed,
+        resize_step: w.resize_step,
+        resize_speed: w.resize_speed,
+        gap: w.gap,
+        border_width: w.border_width,
+        ui: w.ui.clone(),
+    })
 }
 
 pub(crate) fn bundled_plugin_settings(config: &Config) -> BundledSettings {
@@ -232,6 +256,18 @@ pub(crate) fn built_in_specs(config: &Config) -> Result<Vec<ModeSpec>, String> {
                 config.ui_hint.temporary_mode.as_deref(),
                 &config.ui_hint.temporary_mode_keys,
                 ui_hint_overrides(&config.ui_hint.app_configs),
+            )?,
+        ));
+    }
+    if config.window.enabled {
+        specs.push(ModeSpec::built_in(
+            Box::new(window(config)),
+            compile_route(
+                &config.window.bindings,
+                &config.window.inherits,
+                config.window.temporary_mode.as_deref(),
+                &config.window.temporary_mode_keys,
+                app_overrides(&config.window.app_configs),
             )?,
         ));
     }
@@ -342,6 +378,7 @@ mod tests {
         config.grid.enabled = false;
         config.recursive_grid.enabled = false;
         config.ui_hint.enabled = false;
+        config.window.enabled = false;
         let ids: Vec<_> = built_in(&config).iter().map(|mode| mode.id()).collect();
         assert_eq!(ids, vec![ModeId::idle(), ModeId::normal()]);
     }

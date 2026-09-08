@@ -52,6 +52,8 @@ pub enum FinishCause {
 /// including drawing its own grid or full-screen overlay.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
+    WindowRequest(Box<super::window::WindowRequest>),
+    CancelWindowSession(u64),
     /// Move the window and physical pointer together, preserving relative position.
     MoveWindowToScreen(WindowScreenTarget),
     /// Dispatch high-level actions through the same path used by config.
@@ -433,13 +435,20 @@ impl<'a> IntoIterator for &'a CommandBatch {
 /// Everything the host tells a mode.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModeEvent {
+    WindowResult(Box<super::window::WindowResult>),
+    /// Temporary binding inheritance started/stopped without suspending the mode.
+    TemporaryModeChanged {
+        active: bool,
+    },
     /// This mode just became active. Build the first overlay here.
     Activated {
         /// Mode that was active before, if any.
         previous: Option<ModeId>,
     },
     /// This mode was pushed modally and must later return with `PopMode`.
-    Pushed { previous: ModeId },
+    Pushed {
+        previous: ModeId,
+    },
     /// This mode is about to be torn down.
     Deactivated,
     /// A modal mode temporarily covered this mode without destroying state.
@@ -450,7 +459,9 @@ pub enum ModeEvent {
     /// return destination.
     Restarted,
     /// A targeting session should enter its completed state.
-    FinishRequested { cause: FinishCause },
+    FinishRequested {
+        cause: FinishCause,
+    },
     /// A semantic KeySteer click completed successfully.
     Clicked {
         button: MouseButton,
@@ -484,14 +495,19 @@ pub enum ModeEvent {
         key: Key,
     },
     /// A parameterized verb exported by a plugin was invoked.
-    Invoked { verb: String, args: Vec<String> },
+    Invoked {
+        verb: String,
+        args: Vec<String>,
+    },
 
     /// The pointer moved, whoever moved it.
     PointerMoved(Point),
 
     /// A native display refresh occurred. The measured interval keeps motion
     /// speed stable across 60 Hz, 120 Hz, ProMotion and external displays.
-    Frame { elapsed: Duration },
+    Frame {
+        elapsed: Duration,
+    },
 
     /// The focused application changed.
     FocusChanged(Option<FocusedApp>),
@@ -500,7 +516,10 @@ pub enum ModeEvent {
     ScreensChanged(Vec<Screen>),
     /// Move this mode's state to another display. Grid-like modes can replay
     /// their logical selection path when `preserve` is true.
-    ScreenRetargeted { screen: Screen, preserve: bool },
+    ScreenRetargeted {
+        screen: Screen,
+        preserve: bool,
+    },
 
     /// A [`Command::ScanUi`] completed.
     UiScanned(UiScanResult),
@@ -508,7 +527,10 @@ pub enum ModeEvent {
     /// A timer armed with [`Command::SetTimer`] elapsed. `elapsed` is measured
     /// by the runtime so animation and movement stay independent of display
     /// refresh rate and scheduler jitter.
-    Timer { id: String, elapsed: Duration },
+    Timer {
+        id: String,
+        elapsed: Duration,
+    },
 }
 
 /// Identity of the focused application, for per-app configuration.
@@ -632,6 +654,7 @@ pub struct UiScanResult {
 /// Read-only view of host state, passed to a mode on every dispatch.
 #[derive(Clone)]
 pub struct HostContext<'a> {
+    pub presenter: &'a dyn super::presentation::Presenter,
     pub screens: &'a [Screen],
     pub cursor: Point,
     pub focused_app: Option<&'a FocusedApp>,
@@ -651,6 +674,12 @@ impl std::fmt::Debug for HostContext<'_> {
 }
 
 impl HostContext<'_> {
+    /// Compose borrowed semantic content through the host's central presenter.
+    /// Only the resulting immutable scene enters the existing command pipeline.
+    pub fn present(&self, view: super::presentation::View<'_>) -> Command {
+        Command::show_overlay(self.presenter.compose(view, self))
+    }
+
     /// Screen under the cursor, falling back to the primary screen.
     pub fn active_screen(&self) -> Option<&Screen> {
         Screen::containing(self.screens, &self.cursor)
@@ -705,6 +734,21 @@ pub trait Mode: Send {
         false
     }
 
+    /// Whether the host should route compiled Normal movement as discrete
+    /// window-layout directions. This does not activate temporary Normal.
+    fn window_layout_active(&self) -> bool {
+        false
+    }
+
+    /// Only the layout entry binding needs the AA deadline check.
+    fn window_layout_double_tap(&self) -> bool {
+        false
+    }
+
+    fn window_action_available(&self, _action: &super::window::WindowAction) -> bool {
+        true
+    }
+
     /// Currently available raw inputs for the optional live help overlay.
     /// Bindings are supplied separately by the host's effective keymap.
     /// If these change during Frame/PointerMoved, return ShowOverlay to
@@ -721,6 +765,22 @@ pub trait Mode: Send {
     /// Color of this mode's indicator badge; `None` uses the theme accent.
     fn indicator_color(&self, _palette: &Palette) -> Option<Color> {
         None
+    }
+
+    /// Optional second line of the mode indicator.
+    fn indicator_detail(&self) -> Option<String> {
+        None
+    }
+
+    /// Anchor for a persistent, host-rendered key-help panel. Coordinates use
+    /// the same desktop space as overlay scenes; native handles stay private.
+    fn help_anchor(&self) -> Option<Rect> {
+        None
+    }
+
+    /// Optional key, caption and normalized rectangle previews within the help panel.
+    fn help_previews(&self) -> Vec<(String, String, Rect, bool)> {
+        Vec::new()
     }
 }
 

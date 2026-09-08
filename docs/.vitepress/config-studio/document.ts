@@ -1,5 +1,6 @@
 import { toRaw } from 'vue'
 import { parse, stringify } from 'smol-toml'
+import { parseSplitRatios } from '../simulator/window-ratios.ts'
 
 export type ConfigDocument = Record<string, any>
 
@@ -19,6 +20,7 @@ const replacementTables = new Set([
   'key_aliases.keys',
   'mode_indicator.modes',
   'normal.bindings',
+  'window.bindings',
   'grid.bindings',
   'recursive_grid.bindings',
   'ui_hint.bindings',
@@ -34,6 +36,7 @@ export function cloneConfigDocument(document: ConfigDocument): ConfigDocument {
 export function parseConfigDocument(source: string): ParsedConfigDocument {
   const parsed = parse(source)
   if (!isRecord(parsed)) throw new Error('TOML 顶层必须是配置表')
+  parseSplitRatios((parsed.window as Record<string, unknown> | undefined)?.split_ratios)
 
   // Stringifying once catches values that the editor would be unable to save.
   stringify(parsed)

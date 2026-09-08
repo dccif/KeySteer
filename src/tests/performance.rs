@@ -17,6 +17,7 @@ fn steady_normal_frames_do_not_allocate() {
     let config = Config::default();
     let palette = config.palette(Appearance::Dark);
     let context = HostContext {
+        presenter: &crate::presentation::COMPOSER,
         screens: &[],
         cursor: Point::default(),
         focused_app: None,
@@ -141,6 +142,7 @@ fn owned_hint_delivery_stays_within_allocation_budget() {
         name: None,
     }];
     let context = HostContext {
+        presenter: &crate::presentation::COMPOSER,
         screens: &screens,
         cursor: Point::default(),
         focused_app: None,

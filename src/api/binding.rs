@@ -178,6 +178,8 @@ pub enum Binding {
     Escape,
     /// Toggle the available-key panel.
     KeyHelp,
+    /// An operation handled by the built-in Window mode.
+    Window(super::window::WindowAction),
     /// Stop the program.
     Quit,
     /// Explicitly unbound: removes an inherited default.
@@ -346,6 +348,9 @@ impl Binding {
     }
 
     fn verb(word: &str) -> Option<Self> {
+        if let Some(action) = super::window::WindowAction::parse(word) {
+            return Some(Self::Window(action));
+        }
         use Binding as B;
         use Button::{Left, Middle, Right, X1, X2};
         use Direction::{Down, Up};
@@ -410,6 +415,7 @@ impl Binding {
     pub fn is_held(&self) -> bool {
         match self {
             Binding::Sequence(actions) => actions.iter().any(Binding::is_held),
+            Binding::Window(action) => action.is_held(),
             Binding::Move(_) | Binding::Scroll(..) | Binding::Speed(_) => true,
             _ => false,
         }
@@ -440,6 +446,7 @@ impl Binding {
             Direction::Right => "right",
         };
         match self {
+            B::Window(action) => action.name().into(),
             B::Sequence(actions) => actions
                 .iter()
                 .map(Binding::canonical)

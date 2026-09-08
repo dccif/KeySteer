@@ -18,8 +18,11 @@ pub mod input;
 pub mod lifecycle;
 pub mod overlay;
 pub mod plugin;
+pub mod presentation;
 pub mod style;
 pub mod theme;
+pub mod window;
+pub mod window_layout;
 
 pub use autostart::Autostart;
 pub use backend::{

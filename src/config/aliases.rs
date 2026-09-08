@@ -74,7 +74,9 @@ pub(super) fn platform_warning(chord: &KeyChord) -> Option<String> {
 
     // macOS: Option+<letter> is a dead key or special character, so the OS
     // consumes it to compose text. This is why `alt+e` never fires.
-    if cfg!(target_os = "macos") && alt && !cmd && !ctrl && is_letter {
+    // Window's intentional Option+W launcher is matched by physical key code
+    // before forwarding. Keep the existing advisory for other Option letters.
+    if cfg!(target_os = "macos") && alt && !cmd && !ctrl && is_letter && activation != "w" {
         return Some(format!(
             "on macOS, Option+{} types a special character (Option+E is a \
              dead-key accent) and may not reach this program. Prefer \

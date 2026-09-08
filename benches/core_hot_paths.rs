@@ -43,6 +43,7 @@ fn benchmark_hint_owned_delivery() -> Result<(), String> {
         name: None,
     }];
     let context = HostContext {
+        presenter: &keysteer::benchmark::COMPOSER,
         screens: &screens,
         cursor: Point::default(),
         focused_app: None,
@@ -106,6 +107,7 @@ fn benchmark_normal_frame() -> Result<(), String> {
     let config = Config::default();
     let palette = config.palette(Appearance::Dark);
     let context = HostContext {
+        presenter: &keysteer::benchmark::COMPOSER,
         screens: &[],
         cursor: Point::default(),
         focused_app: None,

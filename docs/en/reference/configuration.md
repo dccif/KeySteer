@@ -242,6 +242,42 @@ after_click = "normal"
 
 macOS supports Accessibility Tree, Vision, and Hybrid. Windows defaults to `hybrid`: UIA and the full visual pipeline run in parallel, stream their results, deduplicate, and merge them; this includes native minimise, maximise, and close buttons. `vision` uses available system OCR and automatically discovered WeChat OCR in parallel, then falls back to built-in pixel-region recognition. OCR needs no configuration and WeChat components are not distributed with KeySteer. `clickable_roles` are cross-platform semantic roles; use `ax:` or `uia:` for native roles.
 
+## Window configuration
+
+`[window]` configures window management; `[window.bindings]` defines its independent controls. The default launcher is `"alt+w" = "window"` in `[hotkeys]`. Window inherits only hotkeys by default and temporarily uses Normal while Primary is held, so rebinding Normal movement does not change Window directions.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Register Window mode. |
+| `inherits` | `["hotkeys"]` | Ordered binding inheritance after local bindings. |
+| `temporary_mode` / `temporary_mode_keys` | `"normal"` / `["primary"]` | Temporary mode preserving the target and substate. |
+| `double_tap_ms` | `300` | AA interval, 100–2000ms. |
+| `move_step` / `move_speed` | `20.0` / `600.0` | Tap distance / continuous movement speed. |
+| `resize_step` / `resize_speed` | `20.0` / `500.0` | Centred resize step / speed. |
+| `gap` | `8.0` | Layout gap. |
+| `number_timeout_ms` | `250` | Wait only for ambiguous numeric prefixes; valid range 100–2000ms. |
+| `split_ratios` | `["1/4", "1/3", "1/2", "2/3", "3/4"]` | Tree divider steps as a nonempty array of fraction strings and/or decimals, e.g. `["3/4", 0.3, "1/2", 0.4]`. Sorted and deduplicated on load; each value must be finite, greater than 0 and less than 1. |
+| `layout_keys` | `"123456789qwe"` | Legacy parse compatibility; ignored by the new layout controls. |
+| `border_width` | `3.0` | Target outline width. |
+| `ui.border_color` | Derived from the theme | Locked target outline colour. The combined operation panel uses `[key_help]` for fonts, colours, and rounded corners. |
+
+Distances and gaps use logical pixels; speeds use logical pixels per second. Windows converts them using the target display's DPI. Tab immediately cycles windows and centres the pointer; no window-label or confirmation settings are needed.
+
+```toml
+[window]
+move_step = 12.0
+resize_step = 10.0
+gap = 12.0
+
+[window.ui]
+border_color = { dark = "#58A6FFFF", light = "#0969DAFF" }
+
+[key_help]
+font_size = 12
+```
+
+Overriding these settings retains the default controls. Defining `[window.bindings]` replaces that entire default binding table, so copy the desired defaults before rebinding, for example changing `z = "window_undo"` to `x = "window_undo"`. Per-app overrides use `[[window.app_configs]]`. See [Window mode](/en/reference/modes-and-actions#window-mode) for actions, or edit and preview them in the configuration studio's Window tab.
+
 ## Pointer, scrolling, and theme
 
 ```toml

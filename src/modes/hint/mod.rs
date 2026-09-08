@@ -20,18 +20,17 @@ use crate::api::geometry::{Rect, UiTarget};
 use crate::api::hint::LabelDirection;
 use crate::api::input::{Key, KeyChord, KeyState, ModeId};
 use crate::api::lifecycle::TargetingLifecycle;
-use crate::api::overlay::{
-    Color, LabelStyle, OverlayLabel, OverlayScene, OverlayShape, OverlayText, SharedLabelStyle,
-};
-use crate::api::style::{AUTO, BoundaryHighlight, HintPlacement, LabelUi, SearchInputUi};
+use crate::api::overlay::{Color, OverlayText};
+use crate::api::style::{BoundaryHighlight, HintPlacement, LabelUi, SearchInputUi};
 use crate::api::theme::Palette;
 pub(crate) mod labeling;
 mod session;
-mod view;
 
+use crate::api::presentation::{
+    HintContent, HintSelectionView, HintStyle, HintView, StatusView, View, VisualLayerPlan,
+};
 use labeling::{self as hints, CompactHint};
 use session::ScanSession;
-use view::{VisualLayerPlan, build_visual_layer_plan};
 
 #[derive(Debug, Clone, PartialEq)]
 enum Match<T> {
@@ -47,14 +46,7 @@ const NO_WINDOW_UNDER_POINTER: &str =
 /// Elements and their strings are still dropped on exit; only empty capacity
 /// is retained, and larger scans cannot become an Idle high-water mark.
 const MAX_IDLE_RETAINED_TARGETS: usize = 128;
-/// Ignore border contact that remains readable; center occlusion always counts.
-const MIN_VISUAL_STACK_AREA_RATIO: f64 = 0.20;
-const MIN_TEXT_OCCLUSION_EXTENT: f64 = 0.5;
-const HINT_LAYER_Z_BASE: i32 = 1;
-const SEARCH_INPUT_Z_INDEX: i32 = 10_000;
 const MAX_SCAN_TIMEOUT_MS: u64 = 30_000;
-const AUTO_HINT_PADDING_X_RATIO: f64 = 2.0 / 17.0;
-const AUTO_HINT_PADDING_Y_RATIO: f64 = 0.06;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppStrategyOverride {
@@ -161,25 +153,6 @@ impl HintMode {
         }
     }
 
-    fn resolved_hint_label_style(&self, palette: &Palette) -> LabelStyle {
-        let mut style = self.config.ui.resolve(
-            palette,
-            palette.surface_label(),
-            palette.text,
-            palette.accent,
-        );
-        // UI Hint labels are deliberately denser than larger grid cells and
-        // badges. Keep -1 as a font-relative auto value without changing the
-        // shared LabelUi auto rules used by those other components.
-        if self.config.ui.padding_x == AUTO {
-            style.padding_x = (style.font_size * AUTO_HINT_PADDING_X_RATIO).round();
-        }
-        if self.config.ui.padding_y == AUTO {
-            style.padding_y = (style.font_size * AUTO_HINT_PADDING_Y_RATIO).round();
-        }
-        style
-    }
-
     fn request_scan(&mut self, ctx: &HostContext<'_>) -> CommandBatch {
         self.session.scanning = true;
         self.session.status = None;
@@ -281,7 +254,7 @@ impl HintMode {
                 self.session.retry_attempt + 1,
                 self.config.scan_retry_count
             ));
-            let mut commands = self.status_scene(ctx);
+            let mut commands = self.show_status(ctx);
             commands.push(Command::SetTimer {
                 id: SCAN_RETRY_TIMER_ID.into(),
                 delay: Duration::from_millis(self.config.scan_retry_delay_ms),
@@ -328,7 +301,7 @@ impl HintMode {
             UiScanStatus::ContextChanged => None,
         };
         if self.session.hints.is_empty() {
-            return self.status_scene(ctx);
+            return self.show_status(ctx);
         }
         self.redraw(ctx)
     }
@@ -380,58 +353,18 @@ impl HintMode {
     }
 
     fn rebuild_overlap_plan(&mut self, ctx: &HostContext<'_>) -> bool {
-        let style = self.resolved_hint_label_style(ctx.palette);
-        let visual_scale = visual_layer_scale(ctx, self.session.scan_bounds);
-        let visual_padding_x = (style.padding_x * visual_scale).round();
-        let visual_padding_y = (style.padding_y * visual_scale).round();
-        let visible = self
-            .session
-            .hints
-            .iter()
-            .filter(|hint| self.hint_is_visible(hint))
-            .count();
-        let stacked =
-            |left, right| visually_stacked(left, right, visual_padding_x, visual_padding_y);
-        if visible > 128 {
-            let mut placements = self.wide_placements.take().unwrap_or_default();
-            placements.clear();
-            placements.extend(
-                self.session
-                    .hints
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, hint)| self.hint_is_visible(hint))
-                    .map(|(index, hint)| {
-                        let rect = placed_hint_rect(&self.config, hint, &style);
-                        (index, visual_layer_rect(rect, visual_scale))
-                    }),
-            );
-            build_visual_layer_plan(
-                &placements,
-                self.session.hints.len(),
-                stacked,
-                &mut self.overlap_plan,
-            );
-            self.wide_placements = Some(placements);
-        } else {
-            let placements: SmallVec<[(usize, Rect); 128]> = self
-                .session
-                .hints
-                .iter()
-                .enumerate()
-                .filter(|(_, hint)| self.hint_is_visible(hint))
-                .map(|(index, hint)| {
-                    let rect = placed_hint_rect(&self.config, hint, &style);
-                    (index, visual_layer_rect(rect, visual_scale))
-                })
-                .collect();
-            build_visual_layer_plan(
-                &placements,
-                self.session.hints.len(),
-                stacked,
-                &mut self.overlap_plan,
-            );
-        }
+        let content = hint_content(
+            &self.config,
+            &self.session.hints,
+            &self.input,
+            self.session.scan_bounds,
+        );
+        ctx.presenter.prepare_hints(
+            content,
+            &mut self.overlap_plan,
+            &mut self.wide_placements,
+            ctx,
+        );
         if self.held_overlap_keys.is_empty() {
             self.overlap_cycle = 0;
         } else if self.overlap_plan.layer_count() > 1 {
@@ -516,181 +449,47 @@ impl HintMode {
         })
     }
 
-    fn scene(&self, ctx: &HostContext<'_>) -> OverlayScene {
-        let palette = ctx.palette;
-        let visible_count = self
-            .session
-            .hints
-            .iter()
-            .filter(|hint| self.hint_is_visible(hint))
-            .count();
-        let shape_capacity = if self.config.boundary_highlight.enabled {
-            visible_count
+    fn view(&self) -> View<'_> {
+        if self.session.finished {
+            View::HintSelection(HintSelectionView {
+                target: self
+                    .session
+                    .selected
+                    .and_then(|index| self.session.scanned.get(index))
+                    .map(|target| target.rect),
+                scan_bounds: self.session.scan_bounds,
+                boundary: &self.config.boundary_highlight,
+            })
         } else {
-            0
-        };
-        let label_capacity = visible_count + usize::from(matches!(&self.input, Input::Search(_)));
-        let mut scene = OverlayScene::with_capacity(shape_capacity, label_capacity);
-        scene.clip = self
-            .session
-            .scan_bounds
-            .or_else(|| Some(ctx.active_bounds()));
-
-        let mut label_style = self.resolved_hint_label_style(palette);
-        // This highlight belongs specifically to UI Hint's typed-prefix
-        // interaction. Keep the generic overlay/config defaults unchanged.
-        if self.config.ui.matched_text_color.is_none() {
-            label_style.matched_text_color = Color::rgb(0xE4, 0xB4, 0x00);
+            View::Hints(HintView {
+                content: hint_content(
+                    &self.config,
+                    &self.session.hints,
+                    &self.input,
+                    self.session.scan_bounds,
+                ),
+                layers: &self.overlap_plan,
+                active_layer: self.active_overlap_layer(),
+            })
         }
-        let label_style = SharedLabelStyle::from(label_style);
-
-        // Optional outlines behind only the currently visible candidates.
-        if self.config.boundary_highlight.enabled {
-            let bh = &self.config.boundary_highlight;
-            for hint in self
-                .session
-                .hints
-                .iter()
-                .filter(|hint| self.hint_is_visible(hint))
-            {
-                scene.push_shape(OverlayShape::Rect {
-                    rect: hint.bounds,
-                    fill: bh.fill(palette),
-                    stroke: bh.stroke(palette),
-                    stroke_width: bh.border_width.max(0) as f64,
-                    corner_radius: bh.radius(),
-                    z_index: 0,
-                });
-            }
-        }
-
-        // Remove non-matching labels as the prefix narrows. The matched part of
-        // each remaining label is painted with `matched_text_color`.
-        let typed = match &self.input {
-            Input::Labels(s) => s.as_str(),
-            Input::Search(_) => "",
-        };
-        let matched_prefix_len = typed.chars().count();
-        let active_overlap_layer = self.active_overlap_layer();
-        let z_for = |hint_index| {
-            active_overlap_layer
-                .and_then(|layer| self.overlap_plan.draw_rank(hint_index, layer))
-                .and_then(|rank| i32::try_from(rank).ok())
-                .map_or(HINT_LAYER_Z_BASE + 1, |rank| {
-                    HINT_LAYER_Z_BASE.saturating_add(rank)
-                })
-        };
-        // Emit final stable z order directly. Typical components are only
-        // 2..=5 layers, so a few allocation-free linear passes are cheaper
-        // than sorting and preserve equal-z source order exactly.
-        let final_z = HINT_LAYER_Z_BASE.saturating_add(
-            i32::try_from(self.overlap_plan.layer_count().max(1)).unwrap_or(i32::MAX),
-        );
-        for z_index in HINT_LAYER_Z_BASE..=final_z {
-            for (hint_index, hint) in self
-                .session
-                .hints
-                .iter()
-                .enumerate()
-                .filter(|(_, hint)| self.hint_is_visible(hint))
-            {
-                if z_for(hint_index) != z_index {
-                    continue;
-                }
-                let rect = placed_hint_rect(&self.config, hint, &label_style);
-                scene.push_label(
-                    OverlayLabel::new(hint.label.as_str(), rect, label_style.clone())
-                        .with_matched_prefix(matched_prefix_len)
-                        .with_z_index(z_index),
-                );
-            }
-        }
-
-        // Search box, shown only while searching.
-        if let Input::Search(query) = &self.input {
-            let cfg = &self.config.search_input_ui;
-            let style = cfg.label.resolve(
-                palette,
-                palette.surface_label(),
-                palette.text,
-                palette.accent,
-            );
-            let height = style.font_size * 1.8 + style.padding_y * 2.0;
-            let rect = cfg.position.place(
-                ctx.active_bounds(),
-                cfg.width.max(1) as f64,
-                height,
-                cfg.x_offset as f64,
-                cfg.y_offset as f64,
-            );
-            scene.push_label(
-                OverlayLabel::new(format!("/{query}"), rect, style)
-                    .with_z_index(SEARCH_INPUT_Z_INDEX),
-            );
-        }
-
-        scene
     }
 
     fn redraw(&self, ctx: &HostContext<'_>) -> CommandBatch {
-        CommandBatch::one(Command::show_overlay(if self.session.finished {
-            self.finished_scene(ctx)
-        } else {
-            self.scene(ctx)
-        }))
+        CommandBatch::one(ctx.present(self.view()))
     }
 
-    fn finished_scene(&self, ctx: &HostContext<'_>) -> OverlayScene {
-        let mut scene = OverlayScene::new();
-        scene.clip = self
-            .session
-            .scan_bounds
-            .or_else(|| Some(ctx.active_bounds()));
-        let Some(target) = self
-            .session
-            .selected
-            .and_then(|index| self.session.scanned.get(index))
-        else {
-            return scene;
-        };
-        let boundary = &self.config.boundary_highlight;
-        scene.push_shape(OverlayShape::Rect {
-            rect: target.rect,
-            fill: boundary.fill(ctx.palette),
-            stroke: boundary.stroke(ctx.palette),
-            stroke_width: boundary.border_width.max(1) as f64,
-            corner_radius: boundary.radius(),
-            z_index: 1,
-        });
-        scene
-    }
-
-    fn status_scene(&self, ctx: &HostContext<'_>) -> CommandBatch {
-        let palette = ctx.palette;
-        let style = self.config.ui.resolve(
-            palette,
-            palette.surface_label(),
-            palette.text,
-            palette.accent,
-        );
-        let text = self
-            .session
-            .status
-            .as_deref()
-            .unwrap_or("No accessible targets — Esc to exit");
-        let width = text.chars().count() as f64 * style.font_size * 0.65 + style.padding_x * 2.0;
-        let height = style.font_size * 1.4 + style.padding_y * 2.0;
-        let bounds = ctx.active_bounds();
-        let rect = Rect::new(
-            bounds.center().x - width / 2.0,
-            bounds.center().y - height / 2.0,
-            width,
-            height,
-        );
-        let mut scene = OverlayScene::new();
-        scene.clip = self.session.scan_bounds.or(Some(bounds));
-        scene.push_label(OverlayLabel::new(text, rect, style).with_z_index(10));
-        CommandBatch::one(Command::show_overlay(scene))
+    fn show_status(&self, ctx: &HostContext<'_>) -> CommandBatch {
+        CommandBatch::one(
+            ctx.present(View::Status(StatusView {
+                text: self
+                    .session
+                    .status
+                    .as_deref()
+                    .unwrap_or("No accessible targets — Esc to exit"),
+                ui: &self.config.ui,
+                clip: self.session.scan_bounds,
+            })),
+        )
     }
 
     fn select(&mut self, index: usize) -> CommandBatch {
@@ -865,111 +664,32 @@ fn match_compact_input(hints: &[CompactHint<usize>], input: &str) -> Match<usize
     }
 }
 
-fn placed_hint_rect(config: &Settings, hint: &CompactHint<usize>, style: &LabelStyle) -> Rect {
-    let width =
-        style.font_size * 0.75 * hint.label.as_str().chars().count() as f64 + style.padding_x * 2.0;
-    let height = style.font_size * 1.4 + style.padding_y * 2.0;
-    let placed = config.placement.place(&hint.bounds, width, height);
-    Rect::new(
-        placed.x + config.label_x_offset as f64,
-        placed.y + config.label_y_offset as f64,
-        placed.width,
-        placed.height,
-    )
-}
-
-#[cfg(target_os = "windows")]
-fn visual_layer_scale(ctx: &HostContext<'_>, scan_bounds: Option<Rect>) -> f64 {
-    let center = scan_bounds.unwrap_or_else(|| ctx.active_bounds()).center();
-    let scale = ctx
-        .screens
-        .iter()
-        .find(|screen| screen.bounds.contains(&center))
-        .map_or(1.0, |screen| screen.scale);
-    crate::api::overlay::normalized_label_scale(scale)
-}
-
-#[cfg(not(target_os = "windows"))]
-fn visual_layer_scale(_ctx: &HostContext<'_>, _scan_bounds: Option<Rect>) -> f64 {
-    1.0
-}
-
-#[cfg(target_os = "windows")]
-fn visual_layer_rect(rect: Rect, scale: f64) -> Rect {
-    if scale > 1.0 {
-        crate::api::overlay::scaled_compact_label_rect(rect, scale)
-    } else {
-        rect
+fn hint_style(config: &Settings) -> HintStyle<'_> {
+    HintStyle {
+        ui: &config.ui,
+        placement: config.placement,
+        label_x_offset: config.label_x_offset,
+        label_y_offset: config.label_y_offset,
+        boundary_highlight: &config.boundary_highlight,
+        search_input_ui: &config.search_input_ui,
     }
 }
-
-#[cfg(not(target_os = "windows"))]
-fn visual_layer_rect(rect: Rect, _scale: f64) -> Rect {
-    rect
-}
-
-fn visually_stacked(
-    left: Rect,
-    right: Rect,
-    horizontal_padding: f64,
-    vertical_padding: f64,
-) -> bool {
-    let Some(intersection) = left.intersect(&right) else {
-        return false;
+fn hint_content<'a>(
+    config: &'a Settings,
+    hints: &'a [CompactHint<usize>],
+    input: &'a Input,
+    scan_bounds: Option<Rect>,
+) -> HintContent<'a> {
+    let (prefix, search) = match input {
+        Input::Labels(prefix) => (prefix.as_str(), None),
+        Input::Search(query) => ("", Some(query.as_str())),
     };
-    if left.contains(&right.center()) || right.contains(&left.center()) {
-        return true;
-    }
-    let intersection_area = intersection.width * intersection.height;
-    let smaller_area = (left.width * left.height).min(right.width * right.height);
-    (smaller_area > 0.0 && intersection_area >= smaller_area * MIN_VISUAL_STACK_AREA_RATIO)
-        || obscures_label_text(left, right, horizontal_padding, vertical_padding)
-        || obscures_label_text(right, left, horizontal_padding, vertical_padding)
-}
-
-fn obscures_label_text(
-    cover: Rect,
-    target: Rect,
-    horizontal_padding: f64,
-    vertical_padding: f64,
-) -> bool {
-    let inset_x = horizontal_padding.clamp(0.0, target.width / 2.0);
-    let inset_y = vertical_padding.clamp(0.0, target.height / 2.0);
-    let content = Rect::new(
-        target.x + inset_x,
-        target.y + inset_y,
-        target.width - inset_x * 2.0,
-        target.height - inset_y * 2.0,
-    );
-    cover.intersect(&content).is_some_and(|intersection| {
-        intersection.width > MIN_TEXT_OCCLUSION_EXTENT
-            && intersection.height > MIN_TEXT_OCCLUSION_EXTENT
-    })
-}
-
-#[cfg(test)]
-fn rotate_overlapping_labels(labels: &mut [OverlayLabel], cycle: usize) {
-    let placements: SmallVec<[(usize, Rect); 128]> = labels
-        .iter()
-        .enumerate()
-        .map(|(index, label)| (index, label.rect))
-        .collect();
-    let mut plan = VisualLayerPlan::default();
-    let style = LabelStyle::default();
-    build_visual_layer_plan(
-        &placements,
-        labels.len(),
-        |left, right| visually_stacked(left, right, style.padding_x, style.padding_y),
-        &mut plan,
-    );
-    if plan.layer_count() == 0 {
-        return;
-    }
-    let selected_layer = cycle.wrapping_sub(1) % plan.layer_count();
-    for (index, label) in labels.iter_mut().enumerate() {
-        if plan.is_selected(index, selected_layer) {
-            label.z_index = 3;
-        }
+    HintContent {
+        hints,
+        prefix,
+        search,
+        scan_bounds,
+        style: hint_style(config),
     }
 }
 
@@ -1122,7 +842,7 @@ impl Mode for HintMode {
             ModeEvent::Resumed if self.session.scanning && self.session.hints.is_empty() => {
                 CommandBatch::one(Command::HideOverlay)
             }
-            ModeEvent::Resumed if self.session.hints.is_empty() => self.status_scene(ctx),
+            ModeEvent::Resumed if self.session.hints.is_empty() => self.show_status(ctx),
             ModeEvent::Resumed => self.redraw(ctx),
             ModeEvent::Key {
                 key,
@@ -1158,6 +878,47 @@ impl Mode for HintMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::overlay::{LabelStyle, OverlayLabel, OverlayScene, OverlayShape};
+    use crate::api::style::AUTO;
+    use crate::presentation::hint::layers::build_visual_layer_plan;
+    use crate::presentation::hint::{visual_layer_rect, visual_layer_scale, visually_stacked};
+    impl HintMode {
+        fn scene(&self, ctx: &HostContext<'_>) -> OverlayScene {
+            ctx.presenter.compose(self.view(), ctx)
+        }
+        fn resolved_hint_label_style(&self, palette: &Palette) -> LabelStyle {
+            crate::presentation::hint::resolved_hint_label_style(&hint_style(&self.config), palette)
+        }
+    }
+    fn placed_hint_rect(config: &Settings, hint: &CompactHint<usize>, style: &LabelStyle) -> Rect {
+        crate::presentation::hint::placed_hint_rect(&hint_style(config), hint, style)
+    }
+    #[cfg(test)]
+    fn rotate_overlapping_labels(labels: &mut [OverlayLabel], cycle: usize) {
+        let placements: SmallVec<[(usize, Rect); 128]> = labels
+            .iter()
+            .enumerate()
+            .map(|(index, label)| (index, label.rect))
+            .collect();
+        let mut plan = VisualLayerPlan::default();
+        let style = LabelStyle::default();
+        build_visual_layer_plan(
+            &placements,
+            labels.len(),
+            |left, right| visually_stacked(left, right, style.padding_x, style.padding_y),
+            &mut plan,
+        );
+        if plan.layer_count() == 0 {
+            return;
+        }
+        let selected_layer = cycle.wrapping_sub(1) % plan.layer_count();
+        for (index, label) in labels.iter_mut().enumerate() {
+            if plan.is_selected(index, selected_layer) {
+                label.z_index = 3;
+            }
+        }
+    }
+
     use crate::api::geometry::{Point, Screen};
     use crate::config::Config;
     use std::collections::HashSet;
@@ -1189,6 +950,7 @@ mod tests {
         }
         fn ctx(&self) -> HostContext<'_> {
             HostContext {
+                presenter: &crate::presentation::COMPOSER,
                 screens: &self.screens,
                 cursor: self.cursor,
                 focused_app: None,

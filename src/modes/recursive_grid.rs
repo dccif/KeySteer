@@ -14,9 +14,9 @@ use crate::api::command::{Command, CommandBatch, FinishCause, HostContext, Mode,
 use crate::api::geometry::{Point, Rect};
 use crate::api::input::{Key, KeyState, ModeId};
 use crate::api::lifecycle::TargetingLifecycle;
-use crate::api::overlay::{Color, LabelStyle, OverlayLabel, OverlayScene, OverlayShape};
-use crate::api::style::LabelUi;
-use crate::api::theme::{Palette, ThemedColor};
+use crate::api::overlay::Color;
+use crate::api::presentation::{GridLayout, RecursiveGridView, View};
+use crate::api::theme::Palette;
 use smallvec::SmallVec;
 
 use super::targeting::TargetingSession;
@@ -29,22 +29,7 @@ pub struct LayerSettings {
     pub keys: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct VisualSettings {
-    pub label: LabelUi,
-    pub line_width: i32,
-    pub line_color: Option<ThemedColor>,
-    pub highlight_color: Option<ThemedColor>,
-    pub label_background: bool,
-    pub label_background_color: Option<ThemedColor>,
-    pub label_char: String,
-    pub label_min_font_size: i32,
-    pub label_autohide_multiplier: f64,
-    pub sub_key_preview: bool,
-    pub sub_key_preview_font_size: i32,
-    pub sub_key_preview_text_color: Option<ThemedColor>,
-    pub sub_key_preview_autohide_multiplier: f64,
-}
+pub use crate::api::presentation::RecursiveGridStyle as VisualSettings;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
@@ -148,220 +133,37 @@ impl RecursiveGridMode {
         cell_w >= self.min_size.0 && cell_h >= self.min_size.1
     }
 
-    /// Label text for a cell key, honouring `label_char`.
-    fn label_text(&self, key: char) -> String {
-        if self.ui.label_char.is_empty() {
-            key.to_string()
-        } else {
-            self.ui.label_char.clone()
-        }
-    }
-
-    /// A label is hidden once its cell is too small to read it in.
-    fn label_fits(&self, cell: Rect, font_size: f64, multiplier: f64) -> bool {
-        if multiplier <= 0.0 {
-            return true;
-        }
-        let need = font_size * multiplier;
-        cell.width >= need && cell.height >= need
-    }
-
-    fn scene(&self, palette: &Palette) -> OverlayScene {
-        let Some(area) = self.current() else {
-            return OverlayScene::new();
-        };
-        let appearance = palette.appearance;
-        let resolve = crate::api::style::resolve;
-
-        let line_color = resolve(self.ui.line_color.as_ref(), appearance, palette.accent);
-        let highlight = resolve(
-            self.ui.highlight_color.as_ref(),
-            appearance,
-            palette.highlight(),
-        );
-        let label_bg = if self.ui.label_background {
-            resolve(
-                self.ui.label_background_color.as_ref(),
-                appearance,
-                palette.surface_label(),
-            )
-        } else {
-            Color::TRANSPARENT
-        };
-
-        let base_style = self.ui.label.resolve(
-            palette,
-            label_bg,
-            palette.text,
-            if self.ui.label_background {
-                palette.accent_border()
-            } else {
-                Color::TRANSPARENT
-            },
-        );
-        let line_width = self.ui.line_width.max(0) as f64;
+    fn view(&self) -> RecursiveGridView<'_> {
         let layout = self.layout_at(self.depth());
-        let shape_capacity = if self.session.terminal {
-            1
-        } else {
-            1 + layout.rows.saturating_sub(1) + layout.cols.saturating_sub(1)
-        };
-        let label_capacity = if self.session.terminal {
-            0
-        } else if self.ui.sub_key_preview && self.can_descend() {
-            layout.keys.len().saturating_mul(2)
-        } else {
-            layout.keys.len()
-        };
-        let mut scene = OverlayScene::with_capacity(shape_capacity, label_capacity);
-
-        if self.session.terminal {
-            scene.push_shape(OverlayShape::Rect {
-                rect: area,
-                fill: highlight.with_opacity(0.55),
-                stroke: line_color,
-                stroke_width: line_width.max(1.0),
-                corner_radius: 0.0,
-                z_index: 0,
-            });
-            scene.backdrop = Some(Color::rgba(0, 0, 0, 0x40));
-            scene.clip = self.session.stack.first().copied();
-            return scene;
+        let next = self.layout_at(self.depth() + 1);
+        RecursiveGridView {
+            layout: GridLayout {
+                rows: layout.rows,
+                cols: layout.cols,
+                keys: &layout.keys,
+            },
+            next_layout: GridLayout {
+                rows: next.rows,
+                cols: next.cols,
+                keys: &next.keys,
+            },
+            ui: &self.ui,
+            current: self.current(),
+            root: self.session.root(),
+            terminal: self.session.terminal,
+            can_descend: self.can_descend(),
         }
-
-        // Highlight the narrowed area and outline it.
-        scene.push_shape(OverlayShape::Rect {
-            rect: area,
-            fill: highlight,
-            stroke: line_color,
-            stroke_width: line_width.max(1.0),
-            corner_radius: 0.0,
-            z_index: 0,
-        });
-
-        // Interior rulings.
-        let cell_w = area.width / layout.cols as f64;
-        let cell_h = area.height / layout.rows as f64;
-        for c in 1..layout.cols {
-            let x = area.x + c as f64 * cell_w;
-            scene.push_shape(OverlayShape::Line {
-                from: Point::new(x, area.top()),
-                to: Point::new(x, area.bottom()),
-                color: line_color,
-                width: line_width,
-                z_index: 1,
-            });
-        }
-        for r in 1..layout.rows {
-            let y = area.y + r as f64 * cell_h;
-            scene.push_shape(OverlayShape::Line {
-                from: Point::new(area.left(), y),
-                to: Point::new(area.right(), y),
-                color: line_color,
-                width: line_width,
-                z_index: 1,
-            });
-        }
-
-        // Cell keys, plus an optional preview of the next level's keys.
-        let next_keys: String = if self.ui.sub_key_preview && self.can_descend() {
-            self.layout_at(self.depth() + 1)
-                .keys
-                .iter()
-                .map(|k| {
-                    if self.ui.sub_key_preview_label_char().is_empty() {
-                        *k
-                    } else {
-                        self.ui
-                            .sub_key_preview_label_char()
-                            .chars()
-                            .next()
-                            .unwrap_or(*k)
-                    }
-                })
-                .collect()
-        } else {
-            String::new()
-        };
-
-        for (index, key) in layout.keys.iter().copied().enumerate() {
-            let Some(cell) = area.subdivision(layout.rows, layout.cols, index) else {
-                break;
-            };
-            let text = self.label_text(key);
-            let scale = base_style.fit_scale(&text, cell);
-            let fitted_font_size = base_style.font_size * scale;
-            if fitted_font_size >= self.ui.label_min_font_size.max(1) as f64 {
-                let label_style = base_style.scaled(scale);
-                if self.label_fits(
-                    cell,
-                    label_style.font_size,
-                    self.ui.label_autohide_multiplier,
-                ) {
-                    scene.push_label(
-                        OverlayLabel::new(text, cell, label_style)
-                            .fitted()
-                            .with_z_index(3),
-                    );
-                }
-            }
-
-            if !next_keys.is_empty() {
-                // Sit the preview in the lower part of the cell, then fit the
-                // complete next-key string inside that smaller rectangle.
-                let preview = Rect::new(
-                    cell.x,
-                    cell.center().y + cell.height * 0.15,
-                    cell.width,
-                    cell.height * 0.3,
-                );
-                let sub_style = LabelStyle {
-                    font_size: self.ui.sub_key_preview_font_size.max(1) as f64,
-                    text_color: resolve(
-                        self.ui.sub_key_preview_text_color.as_ref(),
-                        appearance,
-                        palette.text.with_opacity(0.6),
-                    ),
-                    background: Color::TRANSPARENT,
-                    border_color: Color::TRANSPARENT,
-                    border_width: 0.0,
-                    bold: false,
-                    ..base_style.clone()
-                };
-                let scale = sub_style.fit_scale(&next_keys, preview);
-                let fitted_font_size = sub_style.font_size * scale;
-                let sub_style = sub_style.scaled(scale);
-                if fitted_font_size >= 4.0
-                    && self.label_fits(
-                        preview,
-                        sub_style.font_size,
-                        self.ui.sub_key_preview_autohide_multiplier,
-                    )
-                {
-                    scene.push_label(
-                        OverlayLabel::new(next_keys.clone(), preview, sub_style)
-                            .fitted()
-                            .with_z_index(2),
-                    );
-                }
-            }
-        }
-
-        // Keep the window scoped to the original active screen while the
-        // visible cell narrows through successive recursive selections.
-        scene.clip = self.session.stack.first().copied();
-        scene
     }
 
-    fn redraw(&self, palette: &Palette) -> CommandBatch {
-        CommandBatch::one(Command::show_overlay(self.scene(palette)))
+    fn redraw(&self, ctx: &HostContext<'_>) -> CommandBatch {
+        CommandBatch::one(ctx.present(View::RecursiveGrid(self.view())))
     }
 
     /// Complete selection by moving only; lifecycle configuration decides what follows.
-    fn commit(&self, point: Point, palette: &Palette) -> CommandBatch {
+    fn commit(&self, point: Point, ctx: &HostContext<'_>) -> CommandBatch {
         let mut commands = CommandBatch::two(
             Command::warp_to(point),
-            Command::show_overlay(self.scene(palette)),
+            ctx.present(View::RecursiveGrid(self.view())),
         );
         commands.push(Command::FinishMode {
             cause: FinishCause::Selection,
@@ -376,12 +178,12 @@ impl RecursiveGridMode {
         )
     }
 
-    fn toggle_cursor_follow(&mut self, palette: &Palette) -> CommandBatch {
+    fn toggle_cursor_follow(&mut self, ctx: &HostContext<'_>) -> CommandBatch {
         let mut commands = CommandBatch::new();
         if let Some(area) = self.session.toggle_cursor_follow() {
             commands.push(Command::warp_to(area.center()));
         }
-        commands.extend(self.redraw(palette));
+        commands.extend(self.redraw(ctx));
         commands
     }
 
@@ -389,7 +191,7 @@ impl RecursiveGridMode {
         self.session.reset(bounds);
     }
 
-    fn retarget(&mut self, bounds: Rect, preserve: bool, palette: &Palette) -> CommandBatch {
+    fn retarget(&mut self, bounds: Rect, preserve: bool, ctx: &HostContext<'_>) -> CommandBatch {
         let path = if preserve {
             self.session.path.clone()
         } else {
@@ -416,11 +218,11 @@ impl RecursiveGridMode {
         }
         let mut commands =
             CommandBatch::one(Command::warp_to(self.current().unwrap_or(bounds).center()));
-        commands.extend(self.redraw(palette));
+        commands.extend(self.redraw(ctx));
         commands
     }
 
-    fn select(&mut self, index: usize, cell: Rect, palette: &Palette) -> CommandBatch {
+    fn select(&mut self, index: usize, cell: Rect, ctx: &HostContext<'_>) -> CommandBatch {
         self.session.stack.push(cell);
         self.session.path.push(index);
         // A selected cell is terminal after the configured depth, or when it
@@ -428,14 +230,14 @@ impl RecursiveGridMode {
         self.session.terminal = self.depth() >= self.max_depth || !self.can_descend();
 
         if self.session.terminal {
-            return self.commit(cell.center(), palette);
+            return self.commit(cell.center(), ctx);
         }
 
         let mut commands = CommandBatch::new();
         if self.session.cursor_follow_selection {
             commands.push(Command::warp_to(cell.center()));
         }
-        commands.extend(self.redraw(palette));
+        commands.extend(self.redraw(ctx));
         commands
     }
 
@@ -444,7 +246,7 @@ impl RecursiveGridMode {
             "esc" => return self.cancel(),
             "enter" => {
                 return match self.current() {
-                    Some(area) => self.commit(area.center(), ctx.palette),
+                    Some(area) => self.commit(area.center(), ctx),
                     None => self.cancel(),
                 };
             }
@@ -457,11 +259,11 @@ impl RecursiveGridMode {
                 self.session.path.pop();
                 self.session.terminal = false;
                 self.session.finished = false;
-                return self.redraw(ctx.palette);
+                return self.redraw(ctx);
             }
             "space" => {
                 self.reset(ctx.active_bounds());
-                return self.redraw(ctx.palette);
+                return self.redraw(ctx);
             }
             _ => {}
         }
@@ -482,7 +284,7 @@ impl RecursiveGridMode {
         else {
             return CommandBatch::new();
         };
-        self.select(index, cell, ctx.palette)
+        self.select(index, cell, ctx)
     }
 }
 
@@ -504,12 +306,6 @@ fn compile_layouts(base: &Layout, layers: &[LayerSettings], max_depth: u32) -> V
             layout
         })
         .collect()
-}
-
-impl VisualSettings {
-    fn sub_key_preview_label_char(&self) -> &str {
-        &self.label_char
-    }
 }
 
 impl Mode for RecursiveGridMode {
@@ -552,16 +348,16 @@ impl Mode for RecursiveGridMode {
             ModeEvent::Activated { previous } => {
                 self.session.return_mode = previous.clone().unwrap_or_else(ModeId::idle);
                 self.reset(ctx.active_bounds());
-                self.redraw(ctx.palette)
+                self.redraw(ctx)
             }
             ModeEvent::Restarted => {
                 self.reset(ctx.active_bounds());
-                self.redraw(ctx.palette)
+                self.redraw(ctx)
             }
             ModeEvent::FinishRequested { .. } if self.session.finished => CommandBatch::new(),
             ModeEvent::FinishRequested { .. } => {
                 self.session.finished = true;
-                let mut commands = self.redraw(ctx.palette);
+                let mut commands = self.redraw(ctx);
                 commands.extend(super::targeting::lifecycle_commands(
                     &self.session.lifecycle.after_finish,
                     &self.session.return_mode,
@@ -581,24 +377,24 @@ impl Mode for RecursiveGridMode {
             }
             ModeEvent::ScreensChanged(_) => {
                 self.reset(ctx.active_bounds());
-                self.redraw(ctx.palette)
+                self.redraw(ctx)
             }
             ModeEvent::ScreenRetargeted { screen, preserve } => {
-                self.retarget(screen.bounds, *preserve, ctx.palette)
+                self.retarget(screen.bounds, *preserve, ctx)
             }
             ModeEvent::PointerMoved(_)
                 if self.session.stack.first().copied() != Some(ctx.active_bounds()) =>
             {
                 self.reset(ctx.active_bounds());
-                self.redraw(ctx.palette)
+                self.redraw(ctx)
             }
-            ModeEvent::Resumed => self.redraw(ctx.palette),
+            ModeEvent::Resumed => self.redraw(ctx),
             ModeEvent::Binding {
                 binding,
                 state: KeyState::Down,
                 ..
             } if matches!(binding.as_ref(), Binding::ToggleCursorFollowSelection) => {
-                self.toggle_cursor_follow(ctx.palette)
+                self.toggle_cursor_follow(ctx)
             }
             ModeEvent::Key {
                 key,
@@ -613,6 +409,15 @@ impl Mode for RecursiveGridMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::overlay::{LabelStyle, OverlayLabel, OverlayScene, OverlayShape};
+    use crate::api::style::LabelUi;
+    use crate::api::theme::ThemedColor;
+    impl RecursiveGridMode {
+        fn scene(&self, palette: &Palette) -> OverlayScene {
+            self.view().scene(palette)
+        }
+    }
+
     use crate::api::geometry::Screen;
     use crate::config::{Config, GridLayer};
 
@@ -652,6 +457,7 @@ mod tests {
         }
         fn ctx(&self) -> HostContext<'_> {
             HostContext {
+                presenter: &crate::presentation::COMPOSER,
                 screens: &self.screens,
                 cursor: self.cursor,
                 focused_app: None,

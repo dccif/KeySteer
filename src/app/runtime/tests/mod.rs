@@ -42,6 +42,8 @@ fn active_config(engine: &Engine) -> Config {
 /// Records what the engine asked of the platform.
 #[derive(Default)]
 struct Recorder {
+    window_requests: Vec<crate::api::window::WindowRequest>,
+    cancelled_window_sessions: Vec<u64>,
     character_bindings: Vec<Vec<String>>,
     window_moves: Vec<crate::api::command::WindowScreenTarget>,
     presents: usize,
@@ -104,6 +106,19 @@ impl FakeBackend {
 }
 
 impl Backend for FakeBackend {
+    fn request_window(&mut self, request: crate::api::window::WindowRequest) -> Result<(), String> {
+        let mut log = self.log.lock().unwrap();
+        log.timeline.push("window");
+        log.window_requests.push(request);
+        Ok(())
+    }
+    fn cancel_window_session(&mut self, session: u64) {
+        self.log
+            .lock()
+            .unwrap()
+            .cancelled_window_sessions
+            .push(session);
+    }
     fn set_character_bindings(&mut self, keys: &[Key]) {
         let mut keys: Vec<_> = keys.iter().map(|key| key.as_str().to_string()).collect();
         keys.sort();
@@ -306,6 +321,8 @@ impl Mode for ProbeMode {
             ModeEvent::PointerMoved(_) => "pointer",
             ModeEvent::Frame { .. } => "frame",
             ModeEvent::FocusChanged(_) => "focus",
+            ModeEvent::WindowResult(_) => "window",
+            ModeEvent::TemporaryModeChanged { .. } => "temporary",
         };
         self.seen
             .lock()
@@ -504,3 +521,4 @@ include!("lifecycle.rs");
 include!("overlay.rs");
 include!("reload_scheduler.rs");
 include!("window_mover.rs");
+include!("window_mode.rs");

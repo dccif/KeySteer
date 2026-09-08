@@ -10,6 +10,24 @@
   预算以 `tests/safety_budget.rs` 为准；Window Mover 增加四个 Win32 调用和六个 AX 操作（含保留窗口的 messaging timeout），并同时禁止 `transmute`/`transmute_copy`；`domain` 与其余 portable 层使用编译期
   `forbid(unsafe_code)`/测试门禁保持零 unsafe。
 
+## Window 原生会话
+
+编辑事务在 worker 内捕获窗口原始快照和最小尺寸。批量标准化布局先验证、再写入变化矩形，直接复用已验证的原生结果；严格树布局发生部分失败时恢复前批次。正常返回／退出保留即时布局，把原始快照合为一步撤销；强制清理只释放检查点。内部错误恢复仍可有界回滚。编辑约束在进入编辑与原生拒绝尺寸后查询；普通连续缩放按目标、手势、屏幕与缩放比例复用最小尺寸。
+
+Windows 复用枚举缓冲区，property 标记直接查找稳定身份，几何等待只轮询句柄和矩形；应用名按身份缓存。macOS 按批次复用 Quartz 查询键并缓存应用名。明确销毁的窗口通过 `WindowResult.closed` 回收身份、AX 引用、约束和撤销记录；不可见、最小化或临时 AX 超时不能当作销毁。被取消查询的关闭通知留给下一次结果。Windows adapter 的 Drop 也清理自有 property。错误统一调用 `report_error!` 进入 `support/logging.rs`。
+
+Window 首次使用时启动 `common/window_session::WindowWorker`，原生 adapter 在线程内部创建和释放；backend 仅提交 API 请求并转发事件。队列上限 64，同一手势的相对位移/尺寸增量合并。查询、批量写入和全屏过渡均检查会话及请求取消水位，不能在 Engine 中等待。取消保留会话历史的操作与结束整个会话分开；shutdown 使用现有有界 WorkerJoin。
+
+Windows adapter 持有 HWND、PID/TID 和独有窗口 property 标记；窗口销毁后即使 HWND 被同进程重用，也不能通过旧 WindowId 操作它。重用已有普通窗口过滤（含 cloaked/minimized/self/tool 排除），按需枚举最多 256 个候选，包含普通被遮挡窗口。placement 的读取/异步提交与旧 `window_mover.rs` 共用；读写区分 DWM 可见矩形、原生 resize border 和 workspace 还原坐标。尺寸下限查询使用 50ms SendMessageTimeout，异步移动只在 worker 中进行有界回读。逻辑步长、速度和布局间距按目标 Screen.scale 换算。
+
+macOS adapter 保留 AX 元素，以公开 Quartz on-screen 元数据匹配当前 Space 的普通 AXStandardWindow；无法唯一匹配的重叠候选跳过，所有 AX messaging 有有限超时。AXSize 写入后读取实际尺寸再定位中心；普通最大化以工作区尺寸实现并保留还原矩形。原生全屏跨屏复用既有 WindowMove 状态机，在 worker 中轮询并检查取消；其等待不占用主事件循环。
+
+Tab 每次按需枚举，维护稳定 ID 顺序，再激活下一个目标并返回其中心鼠标位置。AA 只处理目标所在屏幕，跳过不可缩放/原生全屏窗口，整个批次不逐个 warp。单窗及撤销使用原生快照回读，窗口拒绝或关闭时保留实际改变/跳过计数。共享几何不调用平台 API。
+
+Windows 显式 Tab 先调用 SetForegroundWindow，被拒绝后使用 SwitchToThisWindow 的键盘切换路径，并在 worker 中有界回读前台。不得用 AttachThreadInput 连接外部输入队列造成无界同步等待。最终拒绝焦点时仍锁定下一窗口、返回其中心坐标并提示。
+
+平铺优先保留满足所有最小尺寸的均分方案，否则重新分配行列空间；没有无重叠方案时按最小尺寸提交并约束位置，不能因格子太小跳过应用。尺寸下限查询之间检查取消。原生回读决定实际变化及撤销记录。
+
 ## 共同契约
 
 跨屏窗口移动复用 `common/window_placement.rs`：以窗口与屏幕的最大交集选择源屏，按显示器

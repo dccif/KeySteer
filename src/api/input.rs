@@ -448,6 +448,7 @@ enum ModeName {
     Grid,
     RecursiveGrid,
     UiHint,
+    Window,
     Shared(Arc<str>),
 }
 
@@ -469,6 +470,7 @@ impl ModeId {
                 "grid" => ModeName::Grid,
                 "recursive_grid" => ModeName::RecursiveGrid,
                 "ui_hint" => ModeName::UiHint,
+                "window" => ModeName::Window,
                 _ => ModeName::Shared(Arc::from(value)),
             };
             Ok(Self(name))
@@ -478,7 +480,14 @@ impl ModeId {
     }
 
     /// The ids of the five built-in modes.
-    pub const BUILT_IN: [&'static str; 5] = ["idle", "normal", "grid", "recursive_grid", "ui_hint"];
+    pub const BUILT_IN: [&'static str; 6] = [
+        "idle",
+        "normal",
+        "grid",
+        "recursive_grid",
+        "ui_hint",
+        "window",
+    ];
 
     /// Whether `name` could name a mode in configuration.
     ///
@@ -504,6 +513,9 @@ impl ModeId {
     pub fn ui_hint() -> Self {
         Self(ModeName::UiHint)
     }
+    pub fn window() -> Self {
+        Self(ModeName::Window)
+    }
 
     pub fn as_str(&self) -> &str {
         match &self.0 {
@@ -512,6 +524,7 @@ impl ModeId {
             ModeName::Grid => "grid",
             ModeName::RecursiveGrid => "recursive_grid",
             ModeName::UiHint => "ui_hint",
+            ModeName::Window => "window",
             ModeName::Shared(name) => name,
         }
     }

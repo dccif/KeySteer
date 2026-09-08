@@ -1,5 +1,5 @@
 //! On-demand, asynchronous Win32 window placement. No focus or input injection.
-use windows::Win32::Foundation::{POINT, RECT};
+use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GetWindowPlacement, GetWindowRect, SW_SHOWMAXIMIZED, SWP_ASYNCWINDOWPOS,
     SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPlacement, SetWindowPos, WINDOWPLACEMENT,
@@ -65,40 +65,44 @@ fn maximized_frame(bounds: Rect, source: &Screen, target: &Screen) -> Rect {
     Rect::new(left, top, right - left, bottom - top)
 }
 
-pub(super) fn move_to_screen(target: WindowScreenTarget) -> Result<Option<Point>, String> {
-    let cursor = super::input::cursor_position()?;
-    let Some((hwnd, _, visible)) = super::accessibility::movable_window_under_pointer(cursor)?
-    else {
-        return Ok(None);
-    };
-    let screens = super::screens::list_screens()?;
-    let Some((source, target)) = destination(&screens, visible, target) else {
-        return Ok(None);
-    };
-    let source = &screens[source];
-    let target = &screens[target];
+pub(super) fn read_placement(hwnd: HWND) -> Result<WINDOWPLACEMENT, String> {
     let mut placement = WINDOWPLACEMENT {
         length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
         ..Default::default()
     };
-    // SAFETY: hwnd is a borrowed OS handle; placement is initialized with the
-    // required length and lives throughout the synchronous output query.
+    // SAFETY: correctly initialized writable structure; HWND is only borrowed.
     unsafe { GetWindowPlacement(hwnd, &mut placement) }
         .map_err(|error| format!("cannot read window placement: {error}"))?;
-    let maximized = placement.showCmd == SW_SHOWMAXIMIZED.0 as u32;
+    Ok(placement)
+}
+
+pub(super) fn read_bounds(hwnd: HWND) -> Result<Rect, String> {
     let mut bounds = RECT::default();
-    // SAFETY: bounds is writable and hwnd is only borrowed for this query.
+    // SAFETY: writable out-buffer, no pointers retained by the query.
     unsafe { GetWindowRect(hwnd, &mut bounds) }
         .map_err(|error| format!("cannot read window bounds: {error}"))?;
-    let mapped = if maximized {
-        maximized_frame(rect(bounds), source, target)
-    } else {
-        map_between_screens(rect(bounds), source, target)
-    };
-    let mapped = native_rect(mapped);
-    // SAFETY: no pointers are retained. NOACTIVATE/NOZORDER preserve focus;
-    // ASYNC queues the operation to the owning UI thread without waiting.
-    // This moves the actual maximized window without a restore/maximize cycle.
+    Ok(rect(bounds))
+}
+
+pub(super) fn submit_frame(hwnd: HWND, bounds: Rect) -> Result<Rect, String> {
+    if ![
+        bounds.x,
+        bounds.y,
+        bounds.right(),
+        bounds.bottom(),
+        bounds.width,
+        bounds.height,
+    ]
+    .iter()
+    .all(|v| v.is_finite() && v.abs() < i32::MAX as f64 / 2.0)
+        || bounds.width < 1.0
+        || bounds.height < 1.0
+    {
+        return Err("invalid native window geometry".into());
+    }
+    let mapped = native_rect(bounds);
+    // SAFETY: finite validated i32 coordinates; no Rust data is retained.
+    // ASYNC avoids foreign UI-thread waits; preserve focus and Z-order.
     unsafe {
         SetWindowPos(
             hwnd,
@@ -111,18 +115,49 @@ pub(super) fn move_to_screen(target: WindowScreenTarget) -> Result<Option<Point>
         )
     }
     .map_err(|error| format!("cannot move window: {error}"))?;
+    Ok(rect(mapped))
+}
+
+pub(super) fn submit_placement(hwnd: HWND, placement: &WINDOWPLACEMENT) -> Result<(), String> {
+    let mut placement = *placement;
+    placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+    placement.flags |= WPF_ASYNCWINDOWPLACEMENT;
+    // SAFETY: initialized, correctly sized structure copied by the asynchronous
+    // placement request; the HWND is borrowed and no Rust pointer is retained.
+    unsafe { SetWindowPlacement(hwnd, &placement) }
+        .map_err(|error| format!("cannot update window placement: {error}"))
+}
+
+pub(super) fn move_to_screen(target: WindowScreenTarget) -> Result<Option<Point>, String> {
+    let cursor = super::input::cursor_position()?;
+    let Some((hwnd, _, visible)) = super::accessibility::movable_window_under_pointer(cursor)?
+    else {
+        return Ok(None);
+    };
+    let screens = super::screens::list_screens()?;
+    let Some((source, target)) = destination(&screens, visible, target) else {
+        return Ok(None);
+    };
+    let source = &screens[source];
+    let target = &screens[target];
+    let placement = read_placement(hwnd)?;
+    let maximized = placement.showCmd == SW_SHOWMAXIMIZED.0 as u32;
+    let bounds = read_bounds(hwnd)?;
+    let mapped = if maximized {
+        maximized_frame(bounds, source, target)
+    } else {
+        map_between_screens(bounds, source, target)
+    };
+    let mapped = submit_frame(hwnd, mapped)?;
     let pointer = if maximized {
         let workspace =
             super::native::window_long(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW.0 == 0;
         let placement = maximized_relocation(placement, source, target, workspace);
-        // SAFETY: placement has the required length and retains the maximized
-        // show state. Queue its restore rectangle after the actual frame move.
-        unsafe { SetWindowPlacement(hwnd, &placement) }
-            .map_err(|error| format!("cannot update maximized window restore position: {error}"))?;
+        submit_placement(hwnd, &placement)?;
         following_pointer(cursor, source.work_area, target.work_area, target.bounds)
     } else {
         // Match the integer coordinates actually submitted to SetWindowPos.
-        following_pointer(cursor, rect(bounds), rect(mapped), target.bounds)
+        following_pointer(cursor, bounds, mapped, target.bounds)
     };
     Ok(Some(pointer))
 }

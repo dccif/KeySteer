@@ -1,23 +1,7 @@
 use crate::api::geometry::Rect;
 use crate::api::hint::LabelDirection;
-use smallvec::SmallVec;
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct HintCode(SmallVec<[u8; 8]>);
-
-impl HintCode {
-    pub(crate) fn as_str(&self) -> &str {
-        // `push` is the only mutation path and appends complete encoded chars.
-        // Keep the conversion safe even if that invariant changes later.
-        std::str::from_utf8(&self.0).unwrap_or_default()
-    }
-}
-
-pub(crate) struct CompactHint<T> {
-    pub(crate) label: HintCode,
-    pub(crate) bounds: Rect,
-    pub(crate) value: T,
-}
+pub(crate) use crate::api::hint::{CompactHint, HintCode};
 
 trait LabelBuffer {
     fn clear(&mut self);

@@ -2,10 +2,7 @@
 
 use super::*;
 
-struct HeldTargetsText {
-    value: String,
-    character_count: usize,
-}
+use crate::presentation::dynamic::HeldTargetsText;
 
 fn held_targets_text(
     targets: &LatchedTargets,
@@ -84,30 +81,7 @@ pub(super) struct OverlayPositions {
     pub(super) indicator: Option<Point>,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(super) struct IndicatorGeometry {
-    pub(super) width: f64,
-    pub(super) height: f64,
-    pub(super) x_offset: f64,
-    pub(super) y_offset: f64,
-}
-
-impl IndicatorGeometry {
-    pub(super) fn position(self, cursor: Point, screens: &[Screen]) -> Point {
-        let mut position = Point::new(cursor.x + self.x_offset, cursor.y + self.y_offset);
-        if let Some(screen) = Screen::containing(screens, &cursor) {
-            position.x = position.x.clamp(
-                (screen.bounds.x + self.width).min(screen.bounds.right()),
-                screen.bounds.right(),
-            );
-            position.y = position.y.clamp(
-                screen.bounds.y,
-                (screen.bounds.bottom() - self.height).max(screen.bounds.y),
-            );
-        }
-        position
-    }
-}
+use crate::presentation::dynamic::IndicatorGeometry;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct DynamicOverlayState {
@@ -208,41 +182,15 @@ impl Engine {
             .into_iter()
             .find(|button| self.input.latched.contains(&InputTarget::Mouse(*button)))
             .or_else(|| self.input.active_click_indicators.latest_button());
-            let pressed_color = match pressed_button {
-                Some(crate::api::binding::Button::Left) => cursor.left_pressed_color,
-                Some(crate::api::binding::Button::Middle) => cursor.middle_pressed_color,
-                Some(crate::api::binding::Button::Right) => cursor.right_pressed_color,
-                Some(crate::api::binding::Button::X1 | crate::api::binding::Button::X2) | None => {
-                    None
-                }
-            }
-            .and_then(|color| color.resolve(self.palette.appearance));
-            let fill = pressed_color.map_or_else(
-                || {
-                    crate::api::style::resolve(
-                        cursor.fill_color,
-                        self.palette.appearance,
-                        self.palette.accent.with_alpha(34),
-                    )
-                },
-                |color| color.with_opacity(0.2),
-            );
-            let stroke = pressed_color.unwrap_or_else(|| {
-                crate::api::style::resolve(
-                    cursor.stroke_color,
-                    self.palette.appearance,
-                    self.palette.accent_alt.with_alpha(210),
-                )
-            });
-            scene.cursor_marker = Some(CursorMarker {
-                center: self.cursor,
-                radius: cursor.radius.max(1) as f64,
-                fill,
-                stroke,
-                stroke_width: cursor.stroke_width.max(0) as f64,
-            });
+            scene.cursor_marker = Some(crate::presentation::dynamic::cursor_marker(
+                cursor,
+                pressed_button,
+                &self.palette,
+                self.cursor,
+            ));
         }
         if scene.indicator.is_none()
+            && display_mode != ModeId::window()
             && let Some((indicator, geometry)) = self.build_indicator(&display_mode)
         {
             scene.indicator = Some(indicator);
@@ -466,42 +414,21 @@ impl Engine {
         let background = mode
             .indicator_color(&self.palette)
             .unwrap_or_else(|| self.palette.surface_label());
-        let style = ui.label.resolve(
-            &self.palette,
+        let held_text = mode
+            .indicator_detail()
+            .map(|value| HeldTargetsText {
+                character_count: value.chars().count(),
+                value,
+            })
+            .or_else(|| held_targets_text(&self.input.latched, self.overlay.speed_toggle));
+        Some(crate::presentation::dynamic::indicator(
+            text,
+            &ui,
             background,
-            self.palette.readable_on(background),
-            self.palette.accent,
-        );
-        let held_text = held_targets_text(&self.input.latched, self.overlay.speed_toggle);
-        let text_width = |character_count: usize| {
-            (character_count as f64 * style.font_size * 0.75 + style.padding_x * 2.0)
-                .max(style.font_size * 2.0)
-                .ceil()
-        };
-        let width = held_text
-            .as_ref()
-            .map(|held| text_width(held.character_count))
-            .unwrap_or_default()
-            .max(text_width(text.chars().count()));
-        let line_height = (style.font_size * 1.4 + style.padding_y * 2.0).ceil();
-        let height = line_height + held_text.as_ref().map_or(0.0, |_| line_height + 4.0);
-        // `position.x` is the shared right edge of both badges. Keeping the
-        // anchor independent of the longest line prevents a wide held-input
-        // badge from pushing the shorter mode badge away from the cursor.
-        let geometry = IndicatorGeometry {
-            width,
-            height,
-            x_offset: ui.indicator_x_offset as f64,
-            y_offset: ui.indicator_y_offset as f64,
-        };
-        Some((
-            Indicator {
-                text,
-                held_text: held_text.map(|held| held.value),
-                position: geometry.position(self.cursor, &self.screens),
-                style,
-            },
-            geometry,
+            held_text,
+            &self.palette,
+            self.cursor,
+            &self.screens,
         ))
     }
 }

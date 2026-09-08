@@ -15,7 +15,7 @@
 - `general`、`debug`、`platform`
 - `theme.dark` / `theme.light`
 - `hotkeys`
-- `normal`、`grid`、`recursive_grid`、`ui_hint`
+- `normal`、`window`、`grid`、`recursive_grid`、`ui_hint`
 - `pointer`、`scroll`、`mode_indicator`
 - `plugin_modes`、根级和 Mode 级 `app_configs`
 
@@ -39,6 +39,14 @@ KeyUp 立即注入 MouseUp 完成点击；达到阈值后只把已经按下的�
 `mode_indicator.cursor.{left,middle,right}_pressed_color` 控制合成鼠标按钮被 `press` 或
 `toggle` 锁定时，以及等待短按/长按判定的 click 物理触发键仍按住时的光标圆形颜色；每个
 Mode 的 cursor override 可单独覆盖这些值。普通反馈由物理按键释放清除；长按转交给 latch 后由 latch 生命周期负责，并在自动释放成功时同步清除。
+
+## Window 配置边界
+
+`split_ratios` 是可混用分数字符串与小数的非空数组，允许乱序与重复，解析后排序去重，默认 `["1/4", "1/3", "1/2", "2/3", "3/4"]`。正整数分子与分母按 u32 解析，分子必须小于分母；等值分数与小数合为同一档位。数字必须有限且位于 (0, 1)。配置校验后，mode catalog 将其转换为 Settings 的数值数组，方向键只借用该缓存。它控制树编辑的分割线档位；初始二分仍为一半，空间导入与原生最小尺寸约束保持原语义。网页 `simulator/window-ratios.ts` 同步解析、校验并用 WeakMap 缓存，导出保留用户的分数／小数类型和书写顺序；排序去重只用于运行时缓存。
+
+`config/window.rs` 保存 `[window]` DTO，`app/mode_catalog.rs` 转为 `modes/window::Settings`。绑定和 app overrides 经过统一别名规范化及继承校验；完整默认配置与嵌入默认值必须一致。Window 的操作键独立于 Normal，默认仅继承 hotkeys；Primary 通过既有 temporary route 借用 Normal。
+
+`layout_keys` 保留 12 个唯一小写 ASCII 字母/数字的解析兼容，但不再传入模式。`number_timeout_ms` 默认 250（100–2000ms），仅消歧数字前缀使用。布局方向按当前有效 Normal Move 绑定编译缓存，包含继承、应用覆盖和别名；`window_edit` 入口与方向冲突由配置检查提示。`double_tap_ms`、步长、速度、间距和描边有有限值/范围校验。`ui` 复用 LabelUi；border_color 同时影响目标描边。Tab 使用 `window_select` 直接循环并居中鼠标，不需要额外确认；窗口编号由有效库存生成。默认撤销键是 Z；仅 D 循环切屏，不绑定 Shift+D 或 Enter。所有布局即时生效，Esc 返回、Q 退出均保留结果。旧动作名保留自定义配置解析兼容。
 
 ## 加载与发现
 

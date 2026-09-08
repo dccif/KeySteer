@@ -25,6 +25,7 @@ pub mod idle;
 pub mod normal;
 pub mod recursive_grid;
 pub(crate) mod targeting;
+pub mod window;
 
 pub use grid::GridMode;
 pub use hint::HintMode;

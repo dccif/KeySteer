@@ -186,6 +186,24 @@ GitHub Pages。API 暂时不可用、限流或某个平台资产缺失时，下�
 
 修改 Rust 默认绑定或 UI style 字段时，需要检查网页默认配置是否仍能正确解析、染色和显示。
 
+## Window 验证
+
+`api/window_layout.rs` 验证比例、空间导入、空区域和最小尺寸；`modes/window/numbering.rs` 与运行时测试覆盖唯一编号立即执行、歧义计时、事务合并及临时模式。网页 `window.test.ts` 验证同一语言。
+
+原生事务探针：`cargo test native_window_layout_transaction_probe -- --ignored --nocapture --test-threads=1`，默认只操作自有窗口；显式设置 `KEYSTEER_PROBE_HWND` 可纳入指定窗口并在断言前恢复。`native_tab_activation_visits_two_windows` 验证多窗口激活与中心位置。macOS 交叉编译不能替代 AX 原生实测。
+
+`app/runtime/tests/window_mode.rs` 覆盖目标锁定、临时 Normal、自定义绑定、modal 返回、Tab 无确认切换/居中、取消和旧结果隔离。`common/window_geometry.rs`、`window_session.rs` 覆盖负坐标、逻辑 DPI、中心缩放、平铺、32 步撤销分组、部分失败及可取消 worker。
+
+Windows 原生探针只创建并操作自有临时窗口，可显式运行：
+
+```sh
+cargo test --lib native_window_adjust_restore_and_closed_identity -- --ignored --nocapture --test-threads=1
+```
+
+它验证真实 Win32 移动、尺寸回读、最大化/还原、撤销恢复及关闭后身份失效。普通测试不会创建这些窗口。完整验收仍需分别在 Windows/macOS 检查真实应用尺寸限制、多屏 DPI、Tab 焦点切换、Spaces 和原生全屏；交叉编译不能替代原生验收。
+
+网页 Window 的示例窗口、布局与平铺由 `docs/.vitepress/simulator/window.ts` 实现，对应 `window.test.ts`；物理别名和临时激活匹配由现有 `bindings.ts` 提供。配置导入的 `[window.bindings]` 与 Rust 一样整体替换，不能深合并回默认表。
+
 ## 测试层次
 
 - 源文件 `#[cfg(test)]`：API parse/canonical、geometry、Mode 状态、runtime 路由、平台纯逻辑。
@@ -225,3 +243,11 @@ these samples locate latency stages but do not pass or fail release performance 
 Global `stats_alloc` regions are process-wide. Allocation assertions that need
 exact counts are ignored in ordinary parallel CI and must run alone with
 `--test-threads=1`; ordinary CI checks deterministic Arc/SmallVec invariants.
+
+## 场景边界验证
+
+`tests/architecture_dependencies.rs` 检查 presentation 只依赖 api，Mode/Plugin 不依赖具体 composer，
+且不能直接构造 OverlayLabel、OverlayShape、LabelStyle 等绘制原语。Grid 的注入测试使用替代
+Presenter 验证提交的是原始借用状态，并且最终场景由该端口控制。既有 Grid/Hint/Window/help
+行为测试继续检查实际 compositor 输出；Hint 分层测试随实现归入 `presentation/hint/layers.rs`。
+重构后仍需运行单线程分配预算、帮助缓存开关释放与位置更新探针，不能仅凭编译判断热路径不变。

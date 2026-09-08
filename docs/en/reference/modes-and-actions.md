@@ -23,6 +23,7 @@ Array entries run in written order. Empty arrays are invalid. Arrays do not bloc
 | `grid` | Full-screen coordinate grid. |
 | `recursive_grid` | Repeatedly subdivides the current region. |
 | `ui_hint` | Shows labels for interactive elements. |
+| `window` | Locks the window under the pointer for movement, centred resizing, layouts, and tiling. |
 | `plugin:<id>` | A plugin Mode, for example `plugin:screen-selector`. |
 
 ```toml
@@ -38,6 +39,34 @@ f = "recursive_grid"
 # "primary+k" = "up"
 # "primary+l" = "right"
 ```
+
+## Window mode
+
+`Alt+W` locks the ordinary window under the pointer. Every non-minimized ordinary window on the current display, including occluded windows, receives a stable centre label: `1–9, 10, 11…`. Closing a window never renumbers the others. A completed number activates and locks that window and centres the pointer. Only a prefix with a longer valid number waits, by default 250ms: with 23 windows, `1` and `2` wait, while `3–9` act immediately. Completing `12` immediately selects 12 without first activating 1. Numbers execute automatically when complete or when the ambiguity timer expires.
+
+| Default key | Action | Behaviour |
+| --- | --- | --- |
+| Arrows | `window_left/down/up/right` | Tap to move one step; hold for continuous movement in ordinary Window. |
+| `S` | `window_size` | Toggle movement / centred resizing. |
+| `A` | `window_layout` | Enter quick layout immediately. A second independent tap within 300ms, with no intervening action, tiles once. |
+| `E` | `window_edit` | Enter the layout tree from quick layout. |
+| `D` | `window_screen_next` | Cycle to the next display in ordinary Window, with pointer following. |
+| `F` / `C` | `window_maximize` / `window_center` | Maximize / restore, or centre. |
+| `Tab` | `window_select` | Immediately activate and lock the next window, centring the pointer; tree editing cycles only this display. |
+| `Z` | `window_undo` | Undo one edit step; leaving the editor groups the edit into one ordinary Window undo step. |
+| `Esc` | `window_cancel` | Keep the applied layout and return to ordinary Window; otherwise exit. |
+| `Q` / `Primary+Q` | `window_exit` | Exit and keep the applied layout. |
+| Unbound | `window_tile` | Tile once directly. |
+
+Quick layout derives directions from the effective Normal `move_left/right/up/down` bindings (H/L/K/J by default), including inheritance, application overrides and aliases. Layout directions take priority over ordinary Window actions on those keys. The first direction on each axis selects its half; repeating the anchor direction shrinks and the opposite direction grows through `1/4, 1/3, 1/2, 2/3, 3/4, 1`, stopping at each end. Axes are independent: left then up gives the top-left quarter. Changes apply live. Selecting another target by number or Tab keeps the changes and resets the ratios. When A also means left, AA wins only during the entrance double-tap deadline. Configuration checks report conflicts with the E entry binding.
+
+E imports the target display's current positions into a BSP tree, preferring existing gaps and preserving spatial order. Directions navigate regions. Shift+direction splits the selected region and creates an empty region on that side. Ctrl+direction moves the nearest ancestor divider on that axis, carrying all descendants on both sides, using the fraction steps in `[window].split_ratios`, defaulting to `["1/4", "1/3", "1/2", "2/3", "3/4"]`. For example: `split_ratios = ["1/5", "2/5", "3/5", "4/5"]`. The array may mix unordered fraction strings and decimals, e.g. `["3/4", 0.3, "1/2", 0.4]`; loading sorts and deduplicates the steps. It must be nonempty and contain only finite values greater than 0 and less than 1. Steps stop at the endpoints. Application minimum sizes constrain dividers; infeasible changes are rejected with a message.
+
+The first complete window number selects a swap source; the second swaps windows, or cancels if it is the same number. Region labels use a backtick followed by a number: tap backtick, then type the region number. With a source this moves it into that region, swapping if occupied; without a source it only selects the region. Other editing actions clear the source. Esc first clears pending number or swap state; another Esc returns to ordinary Window and keeps the applied layout. Closing a window leaves an empty region. Fixed-size and native fullscreen windows remain selectable but stay outside the tree, with an explanation in the panel.
+
+One help panel below the locked window shows actual bindings, ratios, region and swap state, moving inside the work area when needed. Holding `[window].temporary_mode_keys` (Primary by default) temporarily uses Normal, hides overlays and preserves the edit. Releasing resumes it. Window inherits only hotkeys by default.
+
+AA arranges eligible ordinary windows on the target display and current desktop once. It adapts partitions to minimum sizes; if they cannot all fit without overlap, it attempts the arrangement and explains the limitation. New windows do not trigger automatic rearrangement. Each continuous movement gesture, AA, or completed edit is one undo step, with up to 32 steps per session. `move_window previous/next/<number>` remains independent. Legacy `layout_keys` is parsed for compatibility and no longer controls layout or numbering.
 
 ## Movement, scrolling, and speed
 

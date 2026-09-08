@@ -6,8 +6,9 @@ use crate::api::binding::Binding;
 use crate::api::command::{Command, CommandBatch, HostContext, Mode, ModeEvent};
 use crate::api::geometry::Rect;
 use crate::api::input::{KeyChord, KeyState, ModeId};
-use crate::api::overlay::{Color, LabelStyle, OverlayLabel, OverlayScene, OverlayShape, Placement};
+use crate::api::overlay::Color;
 use crate::api::plugin::{Manifest, Plugin};
+use crate::api::presentation::{ScreenSelectorView, View};
 use std::collections::BTreeMap;
 
 const MODE_ID: &str = "plugin:screen-selector";
@@ -67,49 +68,11 @@ impl ScreenSelector {
         self.input.clear();
     }
 
-    fn style(palette: &Palette) -> LabelStyle {
-        LabelStyle {
-            background: palette.surface_label(),
-            text_color: palette.text,
-            border_color: palette.accent,
-            font_size: 72.0,
-            padding_x: 30.0,
-            padding_y: 20.0,
-            border_radius: 14.0,
-            bold: true,
-            ..LabelStyle::default()
-        }
-    }
-
-    fn scene(&self, ctx: &HostContext<'_>) -> OverlayScene {
-        let palette = ctx.palette;
-        let style = Self::style(palette);
-        let mut scene = OverlayScene::new().with_backdrop(Color::rgba(0, 0, 0, 0x60));
-        for (label, _, bounds) in &self.cells {
-            scene.push_shape(OverlayShape::Rect {
-                rect: bounds.inset(8.0, 8.0),
-                fill: palette.highlight(),
-                stroke: palette.accent,
-                stroke_width: 4.0,
-                corner_radius: 8.0,
-                z_index: 0,
-            });
-            let size = style.font_size * 2.2;
-            scene.push_label(
-                OverlayLabel::new(
-                    label.clone(),
-                    Placement::Center.place(bounds, size, size),
-                    style.clone(),
-                )
-                .with_matched_prefix(if label.starts_with(&self.input) {
-                    self.input.chars().count()
-                } else {
-                    0
-                })
-                .with_z_index(1),
-            );
-        }
-        scene
+    fn view(&self) -> View<'_> {
+        View::ScreenSelector(ScreenSelectorView {
+            cells: &self.cells,
+            input: &self.input,
+        })
     }
 
     fn current_index(ctx: &HostContext<'_>) -> usize {
@@ -177,12 +140,12 @@ impl ScreenSelector {
         let multiple = matches.next().is_some();
         let Some((exact, index)) = first else {
             self.input.clear();
-            return CommandBatch::one(Command::show_overlay(self.scene(ctx)));
+            return CommandBatch::one(ctx.present(self.view()));
         };
         if !multiple && exact {
             return self.close_and_retarget(index);
         }
-        CommandBatch::one(Command::show_overlay(self.scene(ctx)))
+        CommandBatch::one(ctx.present(self.view()))
     }
 }
 
@@ -231,17 +194,17 @@ impl Mode for ScreenSelector {
                 self.modal = true;
                 self.return_mode = previous.clone();
                 self.build(ctx);
-                CommandBatch::one(Command::show_overlay(self.scene(ctx)))
+                CommandBatch::one(ctx.present(self.view()))
             }
             ModeEvent::Activated { previous } => {
                 self.modal = false;
                 self.return_mode = previous.clone().unwrap_or_else(ModeId::idle);
                 self.build(ctx);
-                CommandBatch::one(Command::show_overlay(self.scene(ctx)))
+                CommandBatch::one(ctx.present(self.view()))
             }
             ModeEvent::ScreensChanged(_) => {
                 self.build(ctx);
-                CommandBatch::one(Command::show_overlay(self.scene(ctx)))
+                CommandBatch::one(ctx.present(self.view()))
             }
             ModeEvent::Deactivated => {
                 self.cells.clear();
@@ -256,7 +219,7 @@ impl Mode for ScreenSelector {
                 "esc" => self.cancel(),
                 "backspace" => {
                     self.input.pop();
-                    CommandBatch::one(Command::show_overlay(self.scene(ctx)))
+                    CommandBatch::one(ctx.present(self.view()))
                 }
                 "enter" => self
                     .cells
@@ -314,6 +277,7 @@ mod tests {
         }
         fn ctx(&self) -> HostContext<'_> {
             HostContext {
+                presenter: &crate::presentation::COMPOSER,
                 screens: &self.screens,
                 cursor: self.cursor,
                 focused_app: None,

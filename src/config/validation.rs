@@ -54,12 +54,80 @@ impl ConfigFile {
             }
         }
 
+        let normal_tables: Vec<_> = self
+            .binding_tables()
+            .into_iter()
+            .filter(|(label, _)| label.contains("normal") || label.contains("hotkeys"))
+            .collect();
+        for (label, table) in self
+            .binding_tables()
+            .into_iter()
+            .filter(|(label, _)| label.contains("window"))
+        {
+            for (key, binding) in table {
+                if !matches!(
+                    binding,
+                    Binding::Window(crate::api::window::WindowAction::Edit)
+                ) {
+                    continue;
+                }
+                let Ok(edit) = KeyChord::parse_with_aliases(key, self.resolved_key_aliases())
+                else {
+                    continue;
+                };
+                for (normal_label, normal) in &normal_tables {
+                    if normal.iter().any(|(key, binding)| {
+                        matches!(binding, Binding::Move(_))
+                            && KeyChord::parse_with_aliases(key, self.resolved_key_aliases())
+                                .is_ok_and(|key| key.canonical() == edit.canonical())
+                    }) {
+                        warnings.push(format!("{label} {key:?} (window_edit) conflicts with a movement direction in {normal_label}; edit takes priority in layouts, so rebind window_edit to keep that direction"));
+                    }
+                }
+            }
+        }
         warnings
     }
 
     /// Reject configurations that would misbehave at runtime.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let bad = |m: String| ConfigError::Invalid(m);
+        let window = &self.window;
+        for (name, value) in [
+            ("move_step", window.move_step),
+            ("move_speed", window.move_speed),
+            ("resize_step", window.resize_step),
+            ("resize_speed", window.resize_speed),
+            ("gap", window.gap),
+            ("border_width", window.border_width),
+        ] {
+            if !value.is_finite() || !(0.0..=10000.0).contains(&value) {
+                return Err(bad(format!("window.{name} must be finite and 0..=10000")));
+            }
+        }
+        if !(100..=2000).contains(&window.double_tap_ms) {
+            return Err(bad("window.double_tap_ms must be 100..=2000".into()));
+        }
+        if !(100..=2000).contains(&window.number_timeout_ms) {
+            return Err(bad(
+                "window.number_timeout_ms must be 100..=2000 (ambiguous numbers only)".into(),
+            ));
+        }
+        let chars: BTreeSet<_> = window.layout_keys.chars().collect();
+        window
+            .parsed_split_ratios()
+            .map_err(|error| bad(error.into()))?;
+        if chars.len() != window.layout_keys.chars().count()
+            || chars.len() != 12
+            || !chars
+                .iter()
+                .all(|c| c.is_ascii_alphanumeric() && !c.is_ascii_uppercase())
+        {
+            return Err(bad(
+                "window.layout_keys requires 12 unique lowercase ASCII letters/digits".into(),
+            ));
+        }
+        validate_label_colors("window.ui", &window.ui)?;
 
         let help = &self.key_help;
         for (name, value) in [
@@ -328,6 +396,7 @@ impl ConfigFile {
             ("grid", &self.grid.temporary_mode_keys),
             ("recursive_grid", &self.recursive_grid.temporary_mode_keys),
             ("ui_hint", &self.ui_hint.temporary_mode_keys),
+            ("window", &self.window.temporary_mode_keys),
         ] {
             for key in keys {
                 let key = Key::new(key).map_err(|error| {
@@ -503,6 +572,7 @@ impl ConfigFile {
         let mut tables: Vec<(String, &Bindings)> = vec![
             ("[hotkeys]".into(), &self.hotkeys),
             ("[normal.bindings]".into(), &self.normal.bindings),
+            ("[window.bindings]".into(), &self.window.bindings),
             ("[grid.bindings]".into(), &self.grid.bindings),
             (
                 "[recursive_grid.bindings]".into(),
@@ -516,6 +586,12 @@ impl ConfigFile {
         for over in &self.app_configs {
             tables.push((
                 format!("[[app_configs]] {:?}", over.bundle_id),
+                &over.bindings,
+            ));
+        }
+        for over in &self.window.app_configs {
+            tables.push((
+                format!("[[window.app_configs]] {:?}", over.bundle_id),
                 &over.bindings,
             ));
         }
@@ -558,6 +634,7 @@ impl ConfigFile {
 fn validate_inheritance(config: &Config) -> Result<(), String> {
     let mut graph: BTreeMap<String, Vec<String>> = BTreeMap::from([
         ("normal".into(), config.normal.inherits.clone()),
+        ("window".into(), config.window.inherits.clone()),
         ("grid".into(), config.grid.inherits.clone()),
         (
             "recursive_grid".into(),
@@ -580,6 +657,7 @@ fn validate_inheritance(config: &Config) -> Result<(), String> {
     }
     for (mode, source) in [
         ("grid", config.grid.temporary_mode.as_deref()),
+        ("window", config.window.temporary_mode.as_deref()),
         (
             "recursive_grid",
             config.recursive_grid.temporary_mode.as_deref(),

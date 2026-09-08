@@ -320,6 +320,9 @@ impl Engine {
         }
         self.input.reset_for_plan_swap();
         self.registry.modal_stack.clear();
+        for session in std::mem::take(&mut self.scheduler.window_sessions).into_keys() {
+            backend.cancel_window_session(session);
+        }
         self.scheduler.reset();
         if let Err(cancel_error) = self.cancel_all_scans(backend) {
             crate::support::logging::report_error(
@@ -342,6 +345,7 @@ impl Engine {
 
         if previous != ModeId::idle() {
             let context = HostContext {
+                presenter: &crate::presentation::COMPOSER,
                 screens: &self.screens,
                 cursor: self.cursor,
                 focused_app: self.focused_app.as_ref(),
@@ -354,6 +358,7 @@ impl Engine {
             }
             self.set_active(ModeId::idle());
             let context = HostContext {
+                presenter: &crate::presentation::COMPOSER,
                 screens: &self.screens,
                 cursor: self.cursor,
                 focused_app: self.focused_app.as_ref(),
@@ -558,6 +563,9 @@ impl Engine {
     ) -> Result<(), String> {
         let mut errors = crate::support::errors::ErrorBundle::default();
         errors.record("runtime", result);
+        for session in std::mem::take(&mut self.scheduler.window_sessions).into_keys() {
+            backend.cancel_window_session(session);
+        }
         self.scheduler.sequences.clear();
         errors.record(
             "cancel pending mouse presses",
@@ -602,6 +610,11 @@ impl Engine {
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
         match event {
+            BackendEvent::WindowResult(result) => {
+                if let Some(owner) = self.scheduler.window_sessions.get(&result.session).cloned() {
+                    self.dispatch_owned_to(&owner, ModeEvent::WindowResult(result), backend)?;
+                }
+            }
             BackendEvent::Input(input) => {
                 crate::support::perf_probe::mark("input_received");
                 self.handle_key(input, backend)?;
@@ -877,6 +890,7 @@ impl Engine {
         // retire every task and every synthetic input owned by the old plan.
         let previous = self.registry.active.clone();
         let context = HostContext {
+            presenter: &crate::presentation::COMPOSER,
             screens: &self.screens,
             cursor: self.cursor,
             focused_app: self.focused_app.as_ref(),
@@ -884,6 +898,9 @@ impl Engine {
         };
         if let Some(mode) = self.registry.get_mut(&previous) {
             let _ = mode.handle(&ModeEvent::Deactivated, &context);
+        }
+        for session in std::mem::take(&mut self.scheduler.window_sessions).into_keys() {
+            backend.cancel_window_session(session);
         }
         self.scheduler.reset();
         self.registry.modal_stack.clear();
@@ -979,6 +996,7 @@ impl Engine {
 
             // Tear down the outgoing mode and drop the timers it owned.
             let context = HostContext {
+                presenter: &crate::presentation::COMPOSER,
                 screens: &self.screens,
                 cursor: self.cursor,
                 focused_app: self.focused_app.as_ref(),
@@ -1171,6 +1189,51 @@ impl Engine {
                 )
             });
             match command {
+                Command::WindowRequest(request) => {
+                    self.scheduler
+                        .window_sessions
+                        .insert(request.session, owner.clone());
+                    let (session, id) = (request.session, request.id);
+                    let edit = match &request.operation {
+                        crate::api::window::WindowOperation::BeginEdit { transaction, .. }
+                        | crate::api::window::WindowOperation::ApplyLayout {
+                            transaction, ..
+                        }
+                        | crate::api::window::WindowOperation::EndEdit { transaction, .. } => {
+                            Some(Box::new(crate::api::window::WindowEditResult::Ended {
+                                transaction: *transaction,
+                                committed: false,
+                            }))
+                        }
+                        _ => None,
+                    };
+                    if let Err(error) = backend.request_window(*request) {
+                        if edit.is_some() {
+                            backend.cancel_window_session(session);
+                        }
+                        crate::report_error!("window", "{error}");
+                        self.dispatch_to(
+                            owner,
+                            ModeEvent::WindowResult(Box::new(crate::api::window::WindowResult {
+                                closed: Vec::new(),
+                                session,
+                                id,
+                                target: None,
+                                windows: Some(Vec::new()),
+                                pointer: None,
+                                changed: 0,
+                                skipped: 0,
+                                message: Some(error),
+                                edit,
+                            })),
+                            backend,
+                        )?;
+                    }
+                }
+                Command::CancelWindowSession(session) => {
+                    self.scheduler.window_sessions.remove(&session);
+                    backend.cancel_window_session(session);
+                }
                 Command::DispatchActions(actions) => {
                     let input = crate::api::input::InputEvent {
                         character: None,
@@ -1579,6 +1642,7 @@ impl Engine {
                 | Binding::Speed(_)
                 | Binding::SpeedToggle(_)
                 | Binding::ToggleCursorFollowSelection
+                | Binding::Window(_)
                 | Binding::RescanUi
         ) {
             return self
@@ -1668,6 +1732,26 @@ impl Engine {
                         "binding targets unknown mode {:?}; is the plugin registered?",
                         id.as_str()
                     );
+                    return Ok(true);
+                }
+                if *id == ModeId::window() {
+                    if self.registry.active == *id {
+                        self.dispatch(
+                            ModeEvent::Binding {
+                                binding: Arc::new(Binding::Window(
+                                    crate::api::window::WindowAction::Exit,
+                                )),
+                                state: KeyState::Down,
+                                key: input.key.clone(),
+                            },
+                            backend,
+                        )?;
+                    } else {
+                        if let Ok(pointer) = backend.pointer() {
+                            self.cursor = pointer;
+                        }
+                        self.push_mode(id.clone(), backend)?;
+                    }
                     return Ok(true);
                 }
                 // Pressing a mode's own key while it is active leaves it.
@@ -1832,6 +1916,7 @@ impl Engine {
             | Binding::Speed(_)
             | Binding::SpeedToggle(_)
             | Binding::ToggleCursorFollowSelection
+            | Binding::Window(_)
             | Binding::RescanUi => {
                 Err("stateful binding reached the stateless runtime dispatch boundary".into())
             }

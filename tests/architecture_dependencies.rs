@@ -53,7 +53,14 @@ fn api_is_the_dependency_floor() -> std::io::Result<()> {
     assert_forbidden(
         "src/api",
         &[
-            "app", "config", "modes", "platform", "plugins", "runtime", "support",
+            "app",
+            "config",
+            "modes",
+            "platform",
+            "plugins",
+            "runtime",
+            "support",
+            "presentation",
         ],
     )
 }
@@ -75,7 +82,7 @@ fn config_owns_documents_without_reaching_outward() -> std::io::Result<()> {
 }
 
 #[test]
-fn runtime_consumes_only_api_and_support() -> std::io::Result<()> {
+fn runtime_consumes_api_support_and_presentation() -> std::io::Result<()> {
     assert_forbidden(
         "src/app/runtime",
         &["app", "config", "modes", "platform", "plugins"],
@@ -84,7 +91,14 @@ fn runtime_consumes_only_api_and_support() -> std::io::Result<()> {
 
 #[test]
 fn modes_and_compiled_plugins_only_consume_the_api() -> std::io::Result<()> {
-    let forbidden = ["app", "config", "platform", "runtime", "support"];
+    let forbidden = [
+        "app",
+        "config",
+        "platform",
+        "runtime",
+        "support",
+        "presentation",
+    ];
     assert_forbidden("src/modes", &forbidden)?;
     assert_forbidden("src/plugins", &forbidden)
 }
@@ -95,4 +109,44 @@ fn native_platform_code_cannot_reach_business_layers() -> std::io::Result<()> {
         "src/platform",
         &["app", "config", "modes", "plugins", "runtime"],
     )
+}
+
+#[test]
+fn presentation_only_consumes_api() -> std::io::Result<()> {
+    assert_forbidden(
+        "src/presentation",
+        &[
+            "app", "config", "modes", "platform", "plugins", "runtime", "support",
+        ],
+    )
+}
+
+#[test]
+fn built_in_modes_and_plugins_do_not_build_overlay_primitives() -> std::io::Result<()> {
+    for root in ["src/modes", "src/plugins"] {
+        let mut files = Vec::new();
+        rust_files(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join(root),
+            &mut files,
+        )?;
+        for path in files {
+            let source = production_source(&path)?;
+            for constructor in [
+                "OverlayLabel::",
+                "OverlayShape::",
+                "OverlayScene::",
+                "LabelStyle",
+                "CursorMarker {",
+                "Indicator {",
+                "Command::show_overlay",
+            ] {
+                assert!(
+                    !source.contains(constructor),
+                    "mode/plugin must submit a view through HostContext, found {constructor}: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(())
 }

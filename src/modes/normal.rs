@@ -491,7 +491,7 @@ impl Mode for NormalMode {
         Some(palette.accent)
     }
 
-    fn handle(&mut self, event: &ModeEvent, _ctx: &HostContext<'_>) -> CommandBatch {
+    fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
         match event {
             ModeEvent::Activated { .. } => {
                 let selected = self.toggled_speed;
@@ -504,9 +504,7 @@ impl Mode for NormalMode {
                         active: false,
                     });
                 }
-                out.push(Command::show_overlay(
-                    crate::api::overlay::OverlayScene::new(),
-                ));
+                out.push(ctx.present(crate::api::presentation::View::Empty));
                 out
             }
             ModeEvent::Deactivated => {
@@ -531,9 +529,7 @@ impl Mode for NormalMode {
             ModeEvent::ScreenRetargeted { screen, .. } => {
                 Command::warp_to(screen.bounds.center()).into()
             }
-            ModeEvent::Resumed => {
-                Command::show_overlay(crate::api::overlay::OverlayScene::new()).into()
-            }
+            ModeEvent::Resumed => ctx.present(crate::api::presentation::View::Empty).into(),
             _ => CommandBatch::new(),
         }
     }
@@ -582,6 +578,7 @@ mod tests {
         }
         fn ctx(&self) -> HostContext<'_> {
             HostContext {
+                presenter: &crate::presentation::COMPOSER,
                 screens: &self.screens,
                 cursor: Point::new(500.0, 400.0),
                 focused_app: None,

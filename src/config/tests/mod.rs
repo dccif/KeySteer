@@ -5,6 +5,69 @@ use crate::api::binding::{Button, Direction, ScrollAmount, Speed};
 use crate::api::{ButtonAction, ModeId, MouseButton, VisionOptions};
 
 #[test]
+fn window_split_ratios_validate_and_round_trip() {
+    let config =
+        Config::parse("[window]\nsplit_ratios = [\"1/5\", \"2/5\", \"3/5\", \"4/5\"]").unwrap();
+    config.validate().unwrap();
+    assert_eq!(
+        config.window.parsed_split_ratios().unwrap(),
+        vec![0.2, 0.4, 0.6, 0.8]
+    );
+    let reparsed = Config::parse(&config.to_toml().unwrap()).unwrap();
+    assert_eq!(reparsed.window.split_ratios, config.window.split_ratios);
+    assert_eq!(
+        Config::parse("")
+            .unwrap()
+            .window
+            .parsed_split_ratios()
+            .unwrap(),
+        crate::api::window_layout::DEFAULT_SPLIT_RATIOS
+    );
+    for values in [
+        "[]",
+        "[\"0/4\"]",
+        "[\"1/0\"]",
+        "[\"1/1\"]",
+        "[0.0]",
+        "[1.0]",
+        "[-0.1]",
+        "[nan]",
+        "[inf]",
+        "[\"0.5\"]",
+        "[\"nan\"]",
+        "[\"1/4294967296\"]",
+    ] {
+        let config = Config::parse(&format!("[window]\nsplit_ratios = {values}")).unwrap();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("window.split_ratios"),
+            "{values}"
+        );
+    }
+}
+
+#[test]
+fn window_split_ratios_sort_and_deduplicate_mixed_inputs_without_rewriting_source() {
+    for (source, expected) in [
+        (
+            "[\"3/4\", 0.3, \"1/2\", 0.4, \"2/4\", 0.5]",
+            vec![0.3, 0.4, 0.5, 0.75],
+        ),
+        ("[0.4, 0.3, 0.4]", vec![0.3, 0.4]),
+        ("[\"3/5\", \"1/5\", \"2/10\"]", vec![0.2, 0.6]),
+    ] {
+        let config = Config::parse(&format!("[window]\nsplit_ratios = {source}")).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.window.parsed_split_ratios().unwrap(), expected);
+        let reparsed = Config::parse(&config.to_toml().unwrap()).unwrap();
+        assert_eq!(config.window.split_ratios, reparsed.window.split_ratios);
+    }
+}
+
+#[test]
 fn portable_config_names_require_a_profile() {
     assert!(Config::is_portable_config_name(
         "keysteer.user.toml".as_ref()
@@ -335,7 +398,7 @@ fn idle_binds_only_mode_launchers() {
         config.hotkeys
     );
     // And `normal` must be among them, or the program is unreachable.
-    assert_eq!(config.hotkeys.len(), 1);
+    assert_eq!(config.hotkeys.len(), 2);
     assert!(
         config
             .hotkeys
@@ -1145,6 +1208,11 @@ fn macos_option_letter_chords_are_flagged() {
     // Adding Cmd or Ctrl removes the text-composition behaviour.
     assert_eq!(warn("primary+shift+e"), None);
     assert_eq!(warn("ctrl+alt+e"), None);
+    assert_eq!(
+        warn("alt+w"),
+        None,
+        "Window uses the physical Option+W chord"
+    );
 }
 
 #[test]

@@ -63,3 +63,83 @@ function inheritedModes(document: BindingDocument, mode: string): string[] {
 function asRecord(value: unknown): Record<string, any> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, any> : {}
 }
+
+function aliasesFor(document: BindingDocument, isMac: boolean): Record<string, string> {
+  const source = asRecord(document.key_aliases)
+  const platform = asRecord(source[isMac ? 'macos' : 'windows'])
+  const aliases: Record<string, string> = { primary: isMac ? 'cmd' : 'ctrl' }
+  for (const [key, value] of Object.entries({ ...source, ...platform })) {
+    if (typeof value === 'string') aliases[key.toLowerCase()] = value.toLowerCase()
+  }
+  return aliases
+}
+
+function physicalName(key: string, aliases: Record<string, string>): string {
+  key = key.toLowerCase()
+  const visited = new Set<string>()
+  while (aliases[key] && !visited.has(key)) { visited.add(key); key = aliases[key] }
+  return key.replace('command', 'cmd').replace('control', 'ctrl').replace('option', 'alt').replace('escape', 'esc')
+}
+
+function keyMatches(configured: string, physical: string): boolean {
+  return configured === physical || ['shift', 'ctrl', 'alt', 'cmd', 'win'].includes(configured) && physical.endsWith(`_${configured}`)
+}
+
+/** Physical matching used by Window's independently configurable bindings. */
+export function resolvePhysicalBinding(document: BindingDocument, mode: string, pressed: string[], key: string, isMac: boolean, localOnly = false): ResolvedBinding | undefined {
+  const aliases = aliasesFor(document, isMac)
+  let best: ResolvedBinding | undefined, specificity = 0
+  const table = localOnly ? collectBindings({ [mode]: { bindings: bindingTable(document, mode) } }, mode, new Set()) : collectBindings(document, mode, new Set())
+  for (const [chord, binding] of table) {
+    const keys = chord === '+' ? ['+'] : chord.split('+').map(v => physicalName(v, aliases))
+    if (!keys.some(k => keyMatches(k, key)) || !keys.every(k => pressed.some(p => keyMatches(k, p)))) continue
+    if (pressed.some(p => /^(left_|right_)?(shift|ctrl|alt|cmd|win)$/.test(p) && !keys.some(k => keyMatches(k, p)))) continue
+    if (keys.length > specificity) { specificity = keys.length; best = binding }
+  }
+  return best
+}
+
+export function temporaryPhysicalKeys(document: BindingDocument, mode: string, pressed: string[], isMac: boolean): string[] {
+  const settings = asRecord(document[mode])
+  if (!settings.temporary_mode) return []
+  const aliases = aliasesFor(document, isMac)
+  const active = new Set<string>()
+  for (const chord of Array.isArray(settings.temporary_mode_keys) ? settings.temporary_mode_keys : []) {
+    const keys = String(chord).split('+').map(k => physicalName(k, aliases))
+    if (keys.every(k => pressed.some(p => keyMatches(k, p)))) {
+      pressed.filter(p => keys.some(k => keyMatches(k, p))).forEach(p => active.add(p))
+    }
+  }
+  return [...active]
+}
+
+export interface WindowLayoutBinding { chord: string; keys: string[]; activation: string; action: string }
+
+/** Rebuilt with the effective configuration, never by a key or animation frame. */
+export function compileWindowLayoutBindings(document: BindingDocument, isMac: boolean): WindowLayoutBinding[] {
+  const aliases = aliasesFor(document, isMac), bindings = new Map<string, WindowLayoutBinding>()
+  const directions: Array<{ chord: string; keys: string[]; direction: string }> = []
+  for (const [chord, binding] of effectiveBindings(document, 'normal')) {
+    const direction = /^move_(left|right|up|down)$/.exec(String(binding.value))?.[1]
+    if (!direction) continue
+    const keys = chord.split('+').map(k => physicalName(k, aliases))
+    const activation = keys.findLast(k => !/^(left_|right_)?(shift|ctrl|alt|cmd|win)$/.test(k)) ?? keys.at(-1)!
+    if (resolvePhysicalBinding(document, 'normal', keys, activation, isMac)?.value !== binding.value) continue
+    directions.push({ chord, keys, direction })
+    bindings.set([...keys].sort().join('+'), { chord, keys, activation, action: `window_layout_${direction}` })
+  }
+  for (const { chord, keys, direction } of directions) {
+    for (const [modifier, operation] of [['shift', 'split'], ['ctrl', 'ratio']]) {
+      if (keys.some(k => keyMatches(modifier, k))) continue
+      const parts = [modifier, ...keys], canonical = [...parts].sort().join('+')
+      if (!bindings.has(canonical)) bindings.set(canonical, { chord: `${modifier}+${chord}`, keys: parts,
+        activation: keys.findLast(k => !/^(left_|right_)?(shift|ctrl|alt|cmd|win)$/.test(k)) ?? keys.at(-1)!, action: `window_${operation}_${direction}` })
+    }
+  }
+  return [...bindings.values()].sort((a, b) => b.keys.length - a.keys.length)
+}
+
+export function resolveWindowLayoutBinding(bindings: WindowLayoutBinding[], pressed: string[], key: string): string | undefined {
+  return bindings.find(entry => keyMatches(entry.activation, key) && entry.keys.length === pressed.length
+    && entry.keys.every(k => pressed.some(p => keyMatches(k, p))))?.action
+}

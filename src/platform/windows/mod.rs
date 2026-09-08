@@ -25,6 +25,7 @@ mod ui_scan;
 mod update_installer;
 mod vision;
 mod wechat_ocr;
+mod window_manager;
 mod window_mover;
 
 #[cfg(feature = "benchmark-hooks")]
@@ -140,6 +141,7 @@ pub struct WindowsBackend {
     ui_automation: Option<accessibility::UiAutomationWorker>,
     vision: vision::VisionWorker,
     update_worker: Option<crate::platform::common::update::UpdateWorker>,
+    window_worker: Option<crate::platform::common::window_session::WindowWorker>,
     held_buttons: Cell<u8>,
     update_ready_signaled: bool,
     shutdown_complete: bool,
@@ -252,6 +254,7 @@ impl WindowsBackend {
             ui_automation,
             vision,
             update_worker: None,
+            window_worker: None,
             held_buttons: Cell::new(0),
             update_ready_signaled: false,
             shutdown_complete: false,
@@ -401,6 +404,14 @@ impl WindowsBackend {
         let now = Instant::now();
         let deadline = now.checked_add(BACKEND_SHUTDOWN_TIMEOUT).unwrap_or(now);
         let mut errors = crate::support::errors::ErrorBundle::default();
+        if let Some(worker) = self.window_worker.as_mut() {
+            match worker.stop_until(deadline) {
+                Ok(()) => {
+                    self.window_worker.take();
+                }
+                Err(error) => errors.push("window worker", error),
+            }
+        }
         if let Some(worker) = self.update_worker.as_mut() {
             match worker.cancel_and_wait_until(deadline) {
                 Ok(()) => {
@@ -535,6 +546,28 @@ impl Drop for WindowsBackend {
 }
 
 impl Backend for WindowsBackend {
+    fn request_window(&mut self, request: crate::api::window::WindowRequest) -> Result<(), String> {
+        if self.window_worker.is_none() {
+            let tx = self.event_tx.clone();
+            self.window_worker = Some(
+                crate::platform::common::window_session::WindowWorker::start(
+                    window_manager::Windows::default,
+                    move |event| {
+                        let _ = tx.send(event);
+                    },
+                )?,
+            );
+        }
+        self.window_worker
+            .as_ref()
+            .ok_or("window worker did not initialize")?
+            .submit(request, &self.screens)
+    }
+    fn cancel_window_session(&mut self, session: u64) {
+        if let Some(worker) = &self.window_worker {
+            worker.cancel(session);
+        }
+    }
     fn start(&mut self) -> Result<(), String> {
         self.hook = Some(hook::HookThread::start()?);
         Ok(())

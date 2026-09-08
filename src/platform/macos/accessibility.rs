@@ -18,6 +18,7 @@ use crate::api::geometry::{Rect, UiTarget};
 
 use super::native::OwnedCf;
 use super::window_move::WriteError;
+pub(super) mod window_manager;
 
 const AX_OK: i32 = 0;
 const AX_CANNOT_COMPLETE: i32 = -25204;

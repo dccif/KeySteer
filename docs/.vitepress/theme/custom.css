@@ -1282,3 +1282,23 @@
   color: var(--vp-c-text-1);
   font-size: 0.95rem;
 }
+.ks-window-demo { position: absolute; inset: 0; pointer-events: none; }
+.ks-window-count { position: absolute; right: 12px; top: 10px; z-index: 15; display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--ks-target-text); pointer-events: auto; }
+.ks-window-count select { padding: 3px 8px; border: 1px solid #738ace; border-radius: 5px; background: #172b55; color: white; }
+.ks-window-screen-label { position: absolute; top: 14px; right: 16px; color: var(--ks-target-text); opacity: .75; font-size: 11px; }
+.ks-demo-window { position: absolute; overflow: hidden; border: 1px solid color-mix(in srgb, var(--ks-target-accent) 40%, transparent); border-radius: 7px; background: var(--ks-target-surface); box-shadow: 0 8px 20px #0002; }
+.ks-demo-window.target { outline: 3px solid var(--ks-target-accent); outline-offset: -1px; }
+.ks-demo-window-title { overflow: hidden; padding: 7px 10px; color: var(--ks-target-text); white-space: nowrap; text-overflow: ellipsis; font-size: 10px; border-bottom: 1px solid var(--ks-target-preview-border); }
+.ks-demo-window-lines { padding: 16px; }
+.ks-demo-window-lines i { display: block; width: 75%; height: 5px; margin-bottom: 12px; border-radius: 3px; background: var(--ks-target-preview-border); }
+.ks-demo-window-lines i:nth-child(2) { width: 90%; }
+.ks-demo-window-lines i:nth-child(3) { width: 55%; }
+.ks-window-quick-preview { position: absolute; display: flex; align-items: center; gap: 14px; padding: 8px 0; font-size: 12px; }
+.ks-window-quick-preview .ks-help-layout-mini { flex: none; width: 88px; height: 54px; opacity: 1; }
+.ks-help-layout-mini { display: block; flex: 1; min-height: 8px; position: relative; border: 1px solid currentColor; border-radius: 2px; opacity: .55; }
+.ks-help-layout-mini i { position: absolute; display: block; background: currentColor; opacity: .4; }
+.ks-window-number { position: absolute; z-index: 12; transform: translate(-50%, -50%); min-width: 30px; padding: 3px 8px; border: 1px solid #91a7ff; border-radius: 6px; background: #243d8e; color: white; font-size: 16px; line-height: 1.5; font-weight: 700; pointer-events: auto; box-shadow: 0 2px 8px #0004; }
+.ks-window-slot { position: absolute; z-index: 9; border: 1px dashed #8ca5ef; pointer-events: none; }
+.ks-window-slot.selected { border: 3px solid #6585ee; }
+.ks-window-slot button { position: absolute; left: 4px; top: 4px; padding: 2px 6px; background: #23396e; border: 1px solid #8ca5ef; color: #fff; border-radius: 4px; font-size: 13px; pointer-events: auto; }
+.ks-window-instructions { padding: 0 18px; font-size: 12px; color: var(--vp-c-text-2); }

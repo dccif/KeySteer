@@ -33,6 +33,7 @@ pub(crate) mod modes;
 pub(crate) mod platform;
 #[allow(dead_code, unused_imports)]
 pub(crate) mod plugins;
+pub(crate) mod presentation;
 pub(crate) mod support;
 
 /// Doc-hidden access for the repository's standalone release-profile benchmark.
@@ -46,6 +47,7 @@ pub mod benchmark {
         UiScanStatus, UiTarget,
     };
     pub use crate::config::Config;
+    pub use crate::presentation::COMPOSER;
 
     #[cfg(target_os = "windows")]
     pub use crate::platform::windows::{CharacterCapture, observe_character_unfiltered};

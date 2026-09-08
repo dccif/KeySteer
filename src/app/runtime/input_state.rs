@@ -296,6 +296,7 @@ impl<T> IntoIterator for KeyMap<T> {
 
 #[derive(Debug, Default)]
 pub(super) struct InputState {
+    window_temporary_transition: Option<bool>,
     pub(super) pending_chords: SmallVec<[super::prefix_chords::PendingChord; 2]>,
     pub(super) pressed: PressedKeys,
     pub(super) key_dispositions: KeyMap<KeyDisposition>,
@@ -311,6 +312,7 @@ impl InputState {
     /// Clear plan-owned transient state while preserving physical key edges and
     /// their disposition until the corresponding real KeyUp arrives.
     pub(super) fn reset_for_plan_swap(&mut self) {
+        self.window_temporary_transition = None;
         self.pending_chords.clear();
         self.active_gestures.clear();
         self.active_click_indicators.clear();
@@ -577,6 +579,10 @@ impl Engine {
                 .any(|key| key != &input.key && self.input.pressed.contains(key));
         let display_changed = pressed_changed
             && display_before.is_some_and(|display_before| display_before != self.display_mode());
+        if display_changed && self.registry.active == ModeId::window() {
+            self.input.window_temporary_transition =
+                Some(self.temporary_mode_is_active(&self.registry.active));
+        }
 
         if !self.enabled || self.is_excluded_app() {
             self.input.pending_chords.clear();
@@ -884,6 +890,11 @@ impl Engine {
         backend
             .dispose_key(disposition)
             .map_err(|error| self.recoverable_input_error("keyboard disposition", error))?;
+        if let Some(active) = self.input.window_temporary_transition.take()
+            && self.registry.active == ModeId::window()
+        {
+            self.dispatch(ModeEvent::TemporaryModeChanged { active }, backend)?;
+        }
         self.trace_lazy(trace_key, "key", || {
             format!(
                 "received key={} state={:?} repeat={} injected={} mode={} disposition={disposition:?}",
@@ -1535,6 +1546,20 @@ impl Engine {
         if self.registry.active == ModeId::ui_hint() && self.ui_hint_overlap_matches(key) {
             return None;
         }
+        // Window palettes own their single-character selection labels. Explicit
+        // chords (notably Primary+Q) and temporary Normal retain normal priority.
+        if self.registry.active == ModeId::window()
+            && pressed.len() == 1
+            && self.active_claims_raw_key(key)
+            && !active_match.as_ref().is_some_and(|(binding, _)| {
+                matches!(
+                    binding.as_ref(),
+                    Binding::Window(crate::api::window::WindowAction::Layout)
+                )
+            })
+        {
+            return None;
+        }
 
         let Some(route) = self.registry.routes.get(&self.registry.active) else {
             return active_match.map(|(binding, _)| ResolvedBinding {
@@ -1548,7 +1573,9 @@ impl Engine {
             // Explicit bindings of the targeting mode retain their physical
             // chord, including `none`. The temporary layer consumes its
             // activation keys before looking up the target and its parents.
-            if let Some((binding, _)) = active_match {
+            if let Some((binding, specificity)) = active_match
+                && (self.registry.active != ModeId::window() || specificity > 1)
+            {
                 return (binding.as_ref() != &Binding::Disabled).then(|| ResolvedBinding {
                     binding,
                     owner: self.registry.active.clone(),
@@ -1576,7 +1603,70 @@ impl Engine {
             }
             // Do not fall back to the original pressed set: that would
             // resurrect shortcuts containing the consumed activation keys.
-            return self.lookup_inherited(owner, key, &remaining, &mut SmallVec::new());
+            let temporary = self.lookup_inherited(owner, key, &remaining, &mut SmallVec::new());
+            if temporary.is_some()
+                || self
+                    .lookup_with_specificity_for_pressed(owner, key, &remaining)
+                    .is_some()
+            {
+                return temporary;
+            }
+            // Alt+W can share the temporary modifier. Allow the complete Window
+            // launcher only when the temporary mode has no binding for W;
+            // existing custom WASD and explicit `none` retain their semantics.
+            if route.inherits.contains(&ModeId::idle())
+                && let Some((binding, specificity)) =
+                    self.lookup_with_specificity_for_pressed(&ModeId::idle(), key, pressed)
+                && specificity > 1
+                && specificity == pressed.len()
+                && matches!(binding.as_ref(), Binding::Mode(mode) if *mode == ModeId::window())
+            {
+                return Some(ResolvedBinding {
+                    binding,
+                    owner: ModeId::idle(),
+                });
+            }
+            return None;
+        }
+
+        if self.registry.active == ModeId::window()
+            && let Some(mode) = self.registry.get(&self.registry.active)
+            && mode.window_layout_active()
+        {
+            let reserved =
+                active_match
+                    .as_ref()
+                    .is_some_and(|(binding, _)| match binding.as_ref() {
+                        Binding::Window(crate::api::window::WindowAction::Edit) => true,
+                        Binding::Window(crate::api::window::WindowAction::Layout) => {
+                            mode.window_layout_double_tap()
+                        }
+                        _ => false,
+                    });
+            if !reserved
+                && let Some((binding, specificity)) = self
+                    .registry
+                    .window_layout_table
+                    .lookup_with_specificity(key, pressed)
+                && specificity == pressed.len()
+                && matches!(binding.as_ref(), Binding::Window(action) if mode.window_action_available(action))
+            {
+                return Some(ResolvedBinding {
+                    binding,
+                    owner: ModeId::window(),
+                });
+            }
+        }
+
+        if self.registry.active == ModeId::window()
+            && let Some((binding, _)) = &active_match
+            && let Binding::Window(action) = binding.as_ref()
+            && self
+                .registry
+                .get(&self.registry.active)
+                .is_some_and(|mode| !mode.window_action_available(action))
+        {
+            return None;
         }
 
         match active_match {

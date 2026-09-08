@@ -13,10 +13,12 @@ fn captures_keyboard(&self) -> bool;
 
 Mode 是有状态但平台无关的对象。它可以读取屏幕、光标、前台应用、palette 和只读 host
 settings；不能注入输入、创建窗口或直接扫描 UI。
+内置 Mode/Plugin 用 `ctx.present(View)` 提交状态视图；布局、字体、颜色解析和标签/形状构建均位于
+`src/presentation/`，模式只依赖 API 端口，不依赖具体 composer。参见 [统一场景构建](07-rendering-and-performance.md#统一场景构建)。
 只有需要消费 `UiScanned` 大型载荷的 Mode 才覆盖 `handle_owned`；Frame、指针和按键仍直接走
 `handle`，默认实现保证已有插件源码兼容。
 
-## 五个内置 Mode
+## 六个内置 Mode
 
 ### Idle (`src/modes/idle.rs`)
 
@@ -106,12 +108,24 @@ settings；不能注入输入、创建窗口或直接扫描 UI。
 finished/active 标志的唯一 owner；`labeling.rs` 与 `view.rs` 保持纯标签和视觉层算法。前缀匹配
 直接作用于 session 的紧凑 Hint 索引，不保留只供测试使用的重复 matching 实现。
 
+### Window (`src/modes/window.rs`)
+
+- 会话保存稳定窗口编号，中心标签包含被遮挡的普通窗口。`numbering.rs` 缓存有效编号的前缀索引，仅歧义前缀启动一次性计时；完整编号才选窗／交换。反引号切换区域编号输入。
+- `inventory.rs` 接收拥有所有权的结果，复用未变化库存与可见编号索引；明确关闭通知回收编号与布局引用，取消查询不丢关闭通知。
+- `editing.rs` 持有 QuickPlacement/BSP 模型、上一成功布局、32 步本地历史和单个在途修订；连续输入只保留最新目标。进入树编辑后等待异步约束与完整库存，首次空间导入只做一次。
+- `interaction.rs` 路由快速布局、树导航、分割、祖先比例、交换、撤销与返回／退出。AA 只在入口双击期限内且没有其他操作时生效。
+- 树的 Ctrl＋方向调整借用配置编译后的 `split_ratios`，从当前实际比例跳到指定方向的相邻档位，不在按键路径解析分数或构建数组。
+- `view.rs` 借用窗口库存和布局树，`presentation/window.rs` 构造编号和稳定区域描边，复用锚定窗口下方的单个 key_help 面板。布局方向来自 Registry 编译的当前有效 Normal Move 绑定，临时 Normal 优先，E 入口优先于方向。
+- 500ms 可见态计时合并后台库存请求，原生查询异步且可被布局／选窗抢占；相同结果不重绘，不在按键或 Frame 枚举。关闭窗口保留空区域和其余编号。
+- worker 拥有约束快照与原生事务；修改即时生效，无需 Enter。Esc 返回、Q 退出前发送最新布局并将整轮记为一步撤销；强制退出／重载只释放检查点，保留已应用几何。临时 Normal 保留编辑、停止新布局提交并隐藏覆盖层。
+- Tab 普通态按稳定环直接激活锁定，树内仅本屏；焦点被拒绝仍锁定目标并说明原因。所有原生对象留在平台层。
+
 ## Finish 不是 Mode
 
 Finish 是当前 targeting session 的幂等完成态：
 
 1. 自然选择终点或 `finish` verb 产生 `FinishRequested`。
-2. Mode 设置 `finished = true`，保留最终目标/路径并绘制 finished scene。
+2. Mode 设置 `finished = true`，保留最终目标/路径并提交 finished 视图。
 3. 执行 `after_finish`。
 4. 成功的 KeySteer click 产生一次 `Clicked`，执行 `after_click`。
 

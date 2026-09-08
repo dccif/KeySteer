@@ -3,7 +3,10 @@
 KeySteer 保持单 crate，并采用混合模块布局：聚合目录使用 `mod.rs`，简单叶子使用
 `foo.rs`。文件命名不是架构规则；依赖方向和状态所有权才是。`tests/architecture_dependencies.rs`
 锁定稳定内层：`support` 不依赖业务层，`api` 是依赖底座，`config` 不访问 app/platform，
-`runtime` 只消费 api/support，生产 Mode/Plugin 不读取配置或平台类型，平台层不访问业务层。
+`runtime` 消费 api/support/presentation，`presentation` 只依赖 api；生产 Mode/Plugin 不读取配置、平台或具体 presentation 类型，也不构造场景原语，平台层不访问业务层。
+
+`HostContext` 注入 API 的 `Presenter` 端口。借用视图在调用内同步消费，输出沿用 ShowOverlay；
+Mode 的状态与 compositor 的布局算法分离。统一场景构建和扩展方式见 [覆盖层](07-rendering-and-performance.md#统一场景构建)。
 
 ## 配置编译
 

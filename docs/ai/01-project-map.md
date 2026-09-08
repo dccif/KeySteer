@@ -26,7 +26,8 @@ keysteer/
 | `src/app/` | 唯一应用聚合根：启动、CLI、配置编译、Mode catalog 和 runtime | `bootstrap.rs`, `configuration.rs`, `mode_catalog.rs`, `runtime/` |
 | `src/config/` | TOML 文档、Mode section DTO、别名规范化、校验、主题与 comment-preserving store | `mod.rs`, `settings.rs`, `aliases.rs`, `validation.rs`, `store.rs` |
 | `src/app/runtime/` | 应用私有 Engine、原子运行计划、命令执行及有状态协作者 | `mod.rs`, `plan.rs`, `registry.rs`, `input_state.rs`, `scheduler.rs`, `overlay_coordinator.rs`, `key_help.rs` |
-| `src/modes/` | 五个内置 Mode 状态机；UI Hint 私有状态和算法位于 `hint/` | `normal.rs`, `grid.rs`, `recursive_grid.rs`, `hint/mod.rs`, `hint/session.rs` |
+| `src/modes/` | 六个内置 Mode 状态机；UI Hint 私有状态和算法位于 `hint/` | `normal.rs`, `window.rs`, `grid.rs`, `recursive_grid.rs`, `hint/mod.rs`, `hint/session.rs` |
+| `src/presentation/` | 统一布局、样式与场景构建；仅依赖 api | `mod.rs`, `hint/`, `grid.rs`, `recursive_grid.rs`, `window.rs`, `key_help.rs`, `dynamic.rs` |
 | `src/plugins/` | 使用公共 API 实现的内置插件 | `builtin/screen_selector.rs`, `builtin/window_mover.rs` |
 | `src/platform/common/` | 两端共享的字符需求/ASCII 过滤、原生候选快照、updater、app info、mailbox、batcher 和 spatial index | `mod.rs`, `character_candidates.rs` |
 | `src/support/` | 日志、worker、错误聚合和性能探针 | `mod.rs` |
@@ -44,6 +45,8 @@ keysteer/
 - `src/platform/mod.rs`：唯一的目标平台选择点。
 - `src/app/runtime/prefix_chords.rs`：消费已匹配短组合、等待释放或长组合完成；候选关系由 `input_router.rs` 在路由重建时编译。
 - `src/platform/common/window_placement.rs`：跨屏窗口位置的纯几何计算；Windows `window_mover.rs` 与 macOS `accessibility.rs` 负责原生操作。
+- `src/modes/window/inventory.rs` 负责拥有所有权的库存结果和关闭回收；`src/platform/common/window_session.rs`：Window 按需 worker、请求取消/合并、稳定 Tab 循环和最多 32 步撤销；`window_geometry.rs`：中心缩放、工作区约束、单窗口布局和等面积平铺。
+- `src/platform/windows/window_manager.rs` 与 `src/platform/macos/accessibility/window_manager.rs`：worker 私有窗口身份、枚举、尺寸写入与回读。Windows 与旧 Window Mover 共用原生 placement helpers；macOS 复用 `MovableWindow` 和原生全屏过渡状态机。
 - `src/platform/common/partial_batcher.rs` / `scan_mailbox.rs`：两端共用的纯计数流式批次与
   generation-aware latest-only 扫描邮箱。
 - `src/platform/macos/latest_point_mailbox.rs`：macOS EventTap 使用的无锁 latest-point
@@ -58,6 +61,9 @@ keysteer/
 | `command.rs` | `Command`、`ModeEvent`、`Mode`、扫描请求/结果、`HostContext` |
 | `input.rs` | `Key`、`KeyChord`、`InputEvent`、`ModeId`、平台中立别名 |
 | `geometry.rs` | `Point`、`Rect`、`Screen`、`UiTarget` |
+| `window_layout.rs` | 纯 QuickPlacement 与受最小尺寸约束的 BSP LayoutTree |
+| `window.rs` | 不透明 `WindowId`、窗口能力/结果、会话请求、窗口动作与带修订号的编辑事务 |
+| `presentation.rs` | 借用式 View、Presenter 端口和会话级 Hint 分层缓存 |
 | `overlay.rs` | RGBA `Color`、标签/形状、光标标记、模式徽章、`OverlayScene` |
 | `plugin.rs` | 插件 `Manifest` 和 `Plugin: Mode` |
 | `lifecycle.rs` | targeting 生命周期动作 |

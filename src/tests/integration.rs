@@ -233,6 +233,11 @@ fn the_shipped_config_launchers_are_platform_neutral() {
     let document = shipped_document();
     let hotkeys = document["hotkeys"].as_table().unwrap();
     for chord in hotkeys.keys() {
+        // Window explicitly uses physical Alt+W; unlike Option+E, W is not a
+        // dead-key launcher. Its physical chord is consumed before injection.
+        if chord == "alt+w" && hotkeys[chord].as_str() == Some("window") {
+            continue;
+        }
         assert!(
             chord.contains("primary"),
             "launcher {chord:?} should use `primary` so one file works everywhere"
@@ -250,6 +255,9 @@ fn the_shipped_config_has_no_macos_option_letter_chords() {
     ];
     for table in tables {
         for chord in table.keys() {
+            if chord == "alt+w" && table[chord].as_str() == Some("window") {
+                continue;
+            }
             let lower = chord.to_lowercase();
             let uses_alt = lower.contains("alt") || lower.contains("option");
             if !uses_alt {
@@ -332,7 +340,7 @@ fn defaults_and_shipped_config_agree_on_mode_availability() {
         .iter()
         .map(|m| m.id())
         .collect();
-    assert_eq!(ids.len(), 5, "expected all five modes: {ids:?}");
+    assert_eq!(ids.len(), 6, "expected all six modes: {ids:?}");
 }
 
 #[test]
@@ -433,10 +441,11 @@ fn every_targeting_mode_returns_to_idle_on_escape() {
 
     for mut mode in keysteer::app::mode_catalog::built_in(&config) {
         // idle has nowhere to go; normal's escape is the engine's job.
-        if mode.id() == ModeId::idle() || mode.id() == ModeId::normal() {
+        if matches!(mode.id().as_str(), "idle" | "normal" | "window") {
             continue;
         }
         let ctx = HostContext {
+            presenter: &crate::presentation::COMPOSER,
             screens: &screens,
             cursor: Point::new(960.0, 540.0),
             focused_app: None,
@@ -466,6 +475,7 @@ fn a_grid_overlay_covers_the_active_screen_at_any_scale() {
     let screens = screens();
     let palette = config.palette(Appearance::Dark);
     let ctx = HostContext {
+        presenter: &crate::presentation::COMPOSER,
         screens: &screens,
         cursor: Point::new(960.0, 540.0),
         focused_app: None,

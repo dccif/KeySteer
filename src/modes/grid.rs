@@ -10,19 +10,14 @@ use crate::api::command::{Command, CommandBatch, FinishCause, HostContext, Mode,
 use crate::api::geometry::{Point, Rect};
 use crate::api::input::{Key, KeyState, ModeId};
 use crate::api::lifecycle::TargetingLifecycle;
-use crate::api::overlay::{Color, LabelStyle, OverlayLabel, OverlayScene, OverlayShape};
-use crate::api::style::LabelUi;
-use crate::api::theme::{Palette, ThemedColor};
+use crate::api::overlay::Color;
+use crate::api::presentation::{GridLayout, GridView, View};
+use crate::api::theme::Palette;
 use smallvec::SmallVec;
 
 use super::targeting::TargetingSession;
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct VisualSettings {
-    pub label: LabelUi,
-    pub matched_background_color: Option<ThemedColor>,
-    pub matched_border_color: Option<ThemedColor>,
-}
+pub use crate::api::presentation::GridStyle as VisualSettings;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
@@ -97,281 +92,32 @@ impl GridMode {
             .collect()
     }
 
-    fn style(&self, palette: &Palette) -> LabelStyle {
-        self.ui.label.resolve(
-            palette,
-            palette.surface_cell(),
-            palette.text,
-            palette.accent_border(),
-        )
-    }
-
-    fn previews_second_layer(&self) -> bool {
-        !self.session.terminal && self.depth() == 0 && self.max_depth > 1
-    }
-
-    fn push_rulings(
-        scene: &mut OverlayScene,
-        area: Rect,
-        rows: usize,
-        cols: usize,
-        color: Color,
-        width: f64,
-        z_index: i32,
-    ) {
-        if width <= 0.0 || color.is_transparent() {
-            return;
-        }
-        let cell_width = area.width / cols as f64;
-        let cell_height = area.height / rows as f64;
-        for column in 1..cols {
-            let x = area.x + column as f64 * cell_width;
-            scene.push_shape(OverlayShape::Line {
-                from: Point::new(x, area.top()),
-                to: Point::new(x, area.bottom()),
-                color,
-                width,
-                z_index,
-            });
-        }
-        for row in 1..rows {
-            let y = area.y + row as f64 * cell_height;
-            scene.push_shape(OverlayShape::Line {
-                from: Point::new(area.left(), y),
-                to: Point::new(area.right(), y),
-                color,
-                width,
-                z_index,
-            });
+    fn view(&self) -> GridView<'_> {
+        GridView {
+            layout: GridLayout {
+                rows: self.layout.rows,
+                cols: self.layout.cols,
+                keys: &self.layout.keys,
+            },
+            ui: &self.ui,
+            current: self.current(),
+            root: self.root(),
+            terminal: self.session.terminal,
+            depth: self.depth(),
+            max_depth: self.max_depth,
         }
     }
 
-    fn push_second_layer_preview(
-        &self,
-        scene: &mut OverlayScene,
-        area: Rect,
-        style: &LabelStyle,
-        palette: &Palette,
-    ) {
-        // Because every depth uses the same layout, the nested rulings align
-        // into one fine grid. Draw only the fine lines that are not already an
-        // outer boundary, avoiding per-cell duplicate edges and alpha blending.
-        let preview_rows = self.layout.rows.saturating_mul(self.layout.rows);
-        let preview_cols = self.layout.cols.saturating_mul(self.layout.cols);
-        let line_color = crate::api::style::resolve(
-            self.ui.matched_border_color.as_ref(),
-            palette.appearance,
-            style.border_color,
-        )
-        .with_opacity(0.35);
-        let line_width = style.border_width * 0.7;
-        if line_width > 0.0 && !line_color.is_transparent() {
-            let cell_width = area.width / preview_cols as f64;
-            let cell_height = area.height / preview_rows as f64;
-            for column in 1..preview_cols {
-                if column % self.layout.cols == 0 {
-                    continue;
-                }
-                let x = area.x + column as f64 * cell_width;
-                scene.push_shape(OverlayShape::Line {
-                    from: Point::new(x, area.top()),
-                    to: Point::new(x, area.bottom()),
-                    color: line_color,
-                    width: line_width,
-                    z_index: 1,
-                });
-            }
-            for row in 1..preview_rows {
-                if row % self.layout.rows == 0 {
-                    continue;
-                }
-                let y = area.y + row as f64 * cell_height;
-                scene.push_shape(OverlayShape::Line {
-                    from: Point::new(area.left(), y),
-                    to: Point::new(area.right(), y),
-                    color: line_color,
-                    width: line_width,
-                    z_index: 1,
-                });
-            }
-        }
-
-        let preview_color = style.text_color.with_opacity(0.62);
-        let preview_style = LabelStyle {
-            background: Color::TRANSPARENT,
-            text_color: preview_color,
-            matched_text_color: preview_color,
-            border_color: Color::TRANSPARENT,
-            border_width: 0.0,
-            border_radius: 0.0,
-            bold: false,
-            ..style.clone()
-        };
-        for outer_index in 0..self.layout.keys.len() {
-            let Some(outer) = area.subdivision(self.layout.rows, self.layout.cols, outer_index)
-            else {
-                break;
-            };
-            for (inner_index, suffix) in self.layout.keys.iter().copied().enumerate() {
-                let Some(rect) = outer.subdivision(self.layout.rows, self.layout.cols, inner_index)
-                else {
-                    break;
-                };
-                let text = suffix.to_string();
-                let label_style = preview_style.fit_to(&text, rect);
-                scene.push_label(
-                    OverlayLabel::new(text, rect, label_style)
-                        .fitted()
-                        .with_z_index(2),
-                );
-            }
-        }
-
-        // The large prefix sits above the faint suffix grid, matching the
-        // visual hierarchy of Mousemaster's nested decorations. Its size is
-        // relative to the outer cell rather than capped by the ordinary label
-        // font, so the first key remains readable at a glance on any display.
-        let primary_color = style.matched_text_color.with_opacity(0.92);
-        for (outer_index, prefix) in self.layout.keys.iter().copied().enumerate() {
-            let Some(outer) = area.subdivision(self.layout.rows, self.layout.cols, outer_index)
-            else {
-                break;
-            };
-            let text = prefix.to_string();
-            let primary_style = LabelStyle {
-                font_size: style.font_size.max(outer.width.min(outer.height) * 0.62),
-                text_color: primary_color,
-                matched_text_color: primary_color,
-                background: Color::TRANSPARENT,
-                border_color: Color::TRANSPARENT,
-                border_width: 0.0,
-                border_radius: 0.0,
-                padding_x: 0.0,
-                padding_y: 0.0,
-                bold: false,
-                ..style.clone()
-            }
-            .fit_to(&text, outer);
-            scene.push_label(
-                OverlayLabel::new(text, outer, primary_style)
-                    .fitted()
-                    .with_z_index(3),
-            );
-        }
+    fn redraw(&self, ctx: &HostContext<'_>) -> CommandBatch {
+        CommandBatch::one(ctx.present(View::Grid(self.view())))
     }
 
-    fn scene(&self, palette: &Palette) -> OverlayScene {
-        let preview_second_layer = self.previews_second_layer();
-        let outer_rulings = self.layout.rows.saturating_sub(1) + self.layout.cols.saturating_sub(1);
-        let preview_rulings = if preview_second_layer {
-            self.layout
-                .rows
-                .saturating_mul(self.layout.rows.saturating_sub(1))
-                + self
-                    .layout
-                    .cols
-                    .saturating_mul(self.layout.cols.saturating_sub(1))
-        } else {
-            0
-        };
-        let shape_capacity = if self.session.terminal {
-            1
-        } else {
-            1 + outer_rulings + preview_rulings
-        };
-        let label_capacity = if preview_second_layer {
-            self.layout
-                .keys
-                .len()
-                .saturating_mul(self.layout.keys.len())
-                .saturating_add(self.layout.keys.len())
-        } else {
-            usize::from(!self.session.terminal) * self.layout.keys.len()
-        };
-        let mut scene = OverlayScene::with_capacity(shape_capacity, label_capacity);
-        let style = self.style(palette);
-
-        if self.session.terminal {
-            if let Some(rect) = self.current() {
-                scene.push_shape(OverlayShape::Rect {
-                    rect,
-                    fill: palette.highlight().with_opacity(0.55),
-                    stroke: palette.accent_border(),
-                    stroke_width: style.border_width.max(1.0),
-                    corner_radius: 0.0,
-                    z_index: 1,
-                });
-            }
-        } else {
-            let Some(area) = self.current() else {
-                return scene;
-            };
-
-            // Paint the common cell background once and each ruling once.
-            // Drawing a filled/stroked rectangle per cell makes the software
-            // Windows backend traverse the whole overlay multiple times and
-            // alpha-blend shared edges twice. A grid is the same geometry as
-            // one background rectangle plus O(rows + columns) straight lines.
-            scene.push_shape(OverlayShape::Rect {
-                rect: area,
-                fill: style.background.with_opacity(0.55),
-                stroke: style.border_color,
-                stroke_width: style.border_width,
-                corner_radius: 0.0,
-                z_index: 0,
-            });
-
-            Self::push_rulings(
-                &mut scene,
-                area,
-                self.layout.rows,
-                self.layout.cols,
-                style.border_color,
-                style.border_width,
-                1,
-            );
-
-            let text_style = LabelStyle {
-                background: Color::TRANSPARENT,
-                border_color: Color::TRANSPARENT,
-                border_width: 0.0,
-                border_radius: 0.0,
-                ..style.clone()
-            };
-            if preview_second_layer {
-                self.push_second_layer_preview(&mut scene, area, &style, palette);
-            } else {
-                for (index, key) in self.layout.keys.iter().copied().enumerate() {
-                    let Some(rect) = area.subdivision(self.layout.rows, self.layout.cols, index)
-                    else {
-                        break;
-                    };
-                    let text = key.to_string();
-                    let label_style = text_style.fit_to(&text, rect);
-                    scene.push_label(
-                        OverlayLabel::new(text, rect, label_style)
-                            .fitted()
-                            .with_z_index(2),
-                    );
-                }
-            }
-        }
-
-        scene.backdrop = Some(Color::rgba(0, 0, 0, 0x40));
-        scene.clip = self.root();
-        scene
-    }
-
-    fn redraw(&self, palette: &Palette) -> CommandBatch {
-        CommandBatch::one(Command::show_overlay(self.scene(palette)))
-    }
-
-    fn toggle_cursor_follow(&mut self, palette: &Palette) -> CommandBatch {
+    fn toggle_cursor_follow(&mut self, ctx: &HostContext<'_>) -> CommandBatch {
         let mut commands = CommandBatch::new();
         if let Some(area) = self.session.toggle_cursor_follow() {
             commands.push(Command::warp_to(area.center()));
         }
-        commands.extend(self.redraw(palette));
+        commands.extend(self.redraw(ctx));
         commands
     }
 
@@ -379,7 +125,7 @@ impl GridMode {
         self.session.reset(bounds);
     }
 
-    fn retarget(&mut self, bounds: Rect, preserve: bool, palette: &Palette) -> CommandBatch {
+    fn retarget(&mut self, bounds: Rect, preserve: bool, ctx: &HostContext<'_>) -> CommandBatch {
         let path = if preserve {
             self.session.path.clone()
         } else {
@@ -405,11 +151,11 @@ impl GridMode {
         }
         let mut commands =
             CommandBatch::one(Command::warp_to(self.current().unwrap_or(bounds).center()));
-        commands.extend(self.redraw(palette));
+        commands.extend(self.redraw(ctx));
         commands
     }
 
-    fn select(&mut self, index: usize, cell: Rect, palette: &Palette) -> CommandBatch {
+    fn select(&mut self, index: usize, cell: Rect, ctx: &HostContext<'_>) -> CommandBatch {
         self.session.stack.push(cell);
         self.session.path.push(index);
         if self.depth() >= self.max_depth {
@@ -419,7 +165,7 @@ impl GridMode {
         if self.session.terminal {
             let mut commands = CommandBatch::two(
                 Command::warp_to(cell.center()),
-                Command::show_overlay(self.scene(palette)),
+                ctx.present(View::Grid(self.view())),
             );
             commands.push(Command::FinishMode {
                 cause: FinishCause::Selection,
@@ -431,17 +177,17 @@ impl GridMode {
         if self.session.cursor_follow_selection {
             commands.push(Command::warp_to(cell.center()));
         }
-        commands.extend(self.redraw(palette));
+        commands.extend(self.redraw(ctx));
         commands
     }
 
-    fn commit_current(&self, palette: &Palette) -> CommandBatch {
+    fn commit_current(&self, ctx: &HostContext<'_>) -> CommandBatch {
         let Some(area) = self.current() else {
             return self.cancel();
         };
         let mut commands = CommandBatch::two(
             Command::warp_to(area.center()),
-            Command::show_overlay(self.scene(palette)),
+            ctx.present(View::Grid(self.view())),
         );
         commands.push(Command::FinishMode {
             cause: FinishCause::Selection,
@@ -459,7 +205,7 @@ impl GridMode {
     fn key_down(&mut self, key: &Key, ctx: &HostContext<'_>) -> CommandBatch {
         match key.as_str() {
             "esc" => return self.cancel(),
-            "enter" => return self.commit_current(ctx.palette),
+            "enter" => return self.commit_current(ctx),
             "backspace" | "tab" => {
                 if self.session.stack.len() <= 1 {
                     return self.cancel();
@@ -468,12 +214,12 @@ impl GridMode {
                 self.session.path.pop();
                 self.session.terminal = false;
                 self.session.finished = false;
-                return self.redraw(ctx.palette);
+                return self.redraw(ctx);
             }
             "space" => {
                 if let Some(root) = self.root() {
                     self.reset(root);
-                    return self.redraw(ctx.palette);
+                    return self.redraw(ctx);
                 }
                 return self.cancel();
             }
@@ -500,7 +246,7 @@ impl GridMode {
         else {
             return CommandBatch::new();
         };
-        self.select(index, cell, ctx.palette)
+        self.select(index, cell, ctx)
     }
 }
 
@@ -541,16 +287,16 @@ impl Mode for GridMode {
             ModeEvent::Activated { previous } => {
                 self.session.return_mode = previous.clone().unwrap_or_else(ModeId::idle);
                 self.reset(ctx.active_bounds());
-                self.redraw(ctx.palette)
+                self.redraw(ctx)
             }
             ModeEvent::Restarted => {
                 self.reset(ctx.active_bounds());
-                self.redraw(ctx.palette)
+                self.redraw(ctx)
             }
             ModeEvent::FinishRequested { .. } if self.session.finished => CommandBatch::new(),
             ModeEvent::FinishRequested { .. } => {
                 self.session.finished = true;
-                let mut commands = self.redraw(ctx.palette);
+                let mut commands = self.redraw(ctx);
                 commands.extend(super::targeting::lifecycle_commands(
                     &self.session.lifecycle.after_finish,
                     &self.session.return_mode,
@@ -563,16 +309,16 @@ impl Mode for GridMode {
             ),
             ModeEvent::ScreensChanged(_) => {
                 self.reset(ctx.active_bounds());
-                self.redraw(ctx.palette)
+                self.redraw(ctx)
             }
             ModeEvent::ScreenRetargeted { screen, preserve } => {
-                self.retarget(screen.bounds, *preserve, ctx.palette)
+                self.retarget(screen.bounds, *preserve, ctx)
             }
             ModeEvent::PointerMoved(_) if self.root() != Some(ctx.active_bounds()) => {
                 self.reset(ctx.active_bounds());
-                self.redraw(ctx.palette)
+                self.redraw(ctx)
             }
-            ModeEvent::Resumed => self.redraw(ctx.palette),
+            ModeEvent::Resumed => self.redraw(ctx),
             ModeEvent::Deactivated => {
                 self.session.stack.clear();
                 self.session.path.clear();
@@ -585,7 +331,7 @@ impl Mode for GridMode {
                 state: KeyState::Down,
                 ..
             } if matches!(binding.as_ref(), Binding::ToggleCursorFollowSelection) => {
-                self.toggle_cursor_follow(ctx.palette)
+                self.toggle_cursor_follow(ctx)
             }
             ModeEvent::Key {
                 key,
@@ -600,6 +346,15 @@ impl Mode for GridMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::overlay::{LabelStyle, OverlayLabel, OverlayScene, OverlayShape};
+    use crate::api::style::LabelUi;
+    use crate::api::theme::ThemedColor;
+    impl GridMode {
+        fn scene(&self, palette: &Palette) -> OverlayScene {
+            self.view().scene(palette)
+        }
+    }
+
     use crate::api::geometry::{Point, Screen};
     use crate::config::Config;
 
@@ -632,6 +387,7 @@ mod tests {
 
         fn ctx(&self) -> HostContext<'_> {
             HostContext {
+                presenter: &crate::presentation::COMPOSER,
                 screens: &self.screens,
                 cursor: self.cursor,
                 focused_app: None,
@@ -680,6 +436,54 @@ mod tests {
                 _ => None,
             })
             .expect("expected an overlay")
+    }
+
+    #[test]
+    fn activation_submits_borrowed_state_to_injected_presenter() {
+        use crate::api::presentation::{HintContent, Presenter, View, VisualLayerPlan};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Recorder {
+            calls: AtomicUsize,
+            keys: usize,
+        }
+        impl Presenter for Recorder {
+            fn compose(&self, view: View<'_>, _: &HostContext<'_>) -> OverlayScene {
+                let View::Grid(view) = view else {
+                    panic!("expected Grid view")
+                };
+                assert_eq!(view.layout.keys.as_ptr() as usize, self.keys);
+                assert_eq!(view.depth, 0);
+                assert!(view.root.is_some());
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                // A substituted composer controls the entire rendered content.
+                let mut scene = OverlayScene::new();
+                scene.clip = Some(Rect::new(11.0, 22.0, 33.0, 44.0));
+                scene
+            }
+            fn prepare_hints(
+                &self,
+                _: HintContent<'_>,
+                _: &mut VisualLayerPlan,
+                _: &mut Option<Vec<(usize, Rect)>>,
+                _: &HostContext<'_>,
+            ) {
+                panic!("unexpected hint layout")
+            }
+        }
+        let env = Env::new();
+        let mut mode = crate::app::mode_catalog::grid(&env.config);
+        let recorder = Recorder {
+            calls: AtomicUsize::new(0),
+            keys: mode.view().layout.keys.as_ptr() as usize,
+        };
+        let mut context = env.ctx();
+        context.presenter = &recorder;
+        let commands = mode.handle(&ModeEvent::Activated { previous: None }, &context);
+        assert_eq!(recorder.calls.load(Ordering::Relaxed), 1);
+        let commands: Vec<_> = commands.into_iter().collect();
+        let scene = scene_of(&commands);
+        assert_eq!(scene.clip, Some(Rect::new(11.0, 22.0, 33.0, 44.0)));
+        assert!(scene.labels.is_empty() && scene.shapes.is_empty());
     }
 
     #[test]
@@ -784,7 +588,7 @@ mod tests {
             scene
                 .labels
                 .iter()
-                .all(|label| label.style.text_color == mode.style(&env.palette).text_color)
+                .all(|label| label.style.text_color == mode.view().style(&env.palette).text_color)
         );
     }
 

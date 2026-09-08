@@ -1,4 +1,6 @@
-export type SimulatorMode = 'idle' | 'normal' | 'grid' | 'recursive_grid' | 'ui_hint'
+import { createWindowState, type WindowState } from './window.ts'
+
+export type SimulatorMode = 'idle' | 'normal' | 'grid' | 'recursive_grid' | 'ui_hint' | 'window'
 
 export interface Point {
   x: number
@@ -17,6 +19,7 @@ export interface TargetingState {
 }
 
 export interface SimulatorState {
+  window: WindowState
   mode: SimulatorMode
   keyHelpVisible: boolean
   pointer: Point
@@ -34,6 +37,7 @@ export const MOVEMENT_ACTIONS = new Set([
 
 export function createSimulatorState(): SimulatorState {
   return {
+    window: createWindowState(),
     mode: 'normal',
     keyHelpVisible: false,
     pointer: { x: 50, y: 50 },
