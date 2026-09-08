@@ -12,11 +12,7 @@
 
 性能变更使用独立 target/worktree A/B：关键 p99 回退不得超过 2%；目标延迟改善至少 3%或内存下降至少 5%才保留。`cargo bench --features benchmark-hooks --bench core_hot_paths` 使用 release profile 和系统分配器；`benchmark-hooks` 只改变内部构造器的可见性，不启用探针、替代算法或运行参数。Normal 与每个 Hint 规模固定使用 20k 样本，精准候选验收还需进行多轮交替 A/B。`tools/benchmark-windows-dist.ps1` 记录进程与资源样本；`-UsePerfProbe` 产生的生命周期 JSONL 仅用于诊断 ready 顺序，并明确标记为 instrumented。普通发行包的 `--check` 结果只标记为 config-check，两者都不能冒充未插桩的真实 ready 延迟。
 
-0.9.20 对 `afa0a44f13ea57ba727693944dfcb425964414f4`（0.9.13）的 Windows x64 五轮交替复测见[完整报告](performance-0.9.20.md)。最终核心 p99 均满足 2% 回退门槛：默认键位持平、WASD +1.25%、初始化 +0.58%；64–2000 个 Hint 的 p99 改善 9%–50%。实际 release 配置检查 p99 为 13.043→12.991ms，待机线程数不变。数据仅覆盖报告列出的本机工作负载，不替代 macOS 原生或端到端验收。
-
-更新检查保留系统 `native-tls`：Windows x64 同一 release profile 的 A/B 中，Rustls+WebPKI
-使 EXE 从 2,652,672 B 增至 3,573,248 B（+34.7%），同内容 ZIP 从 1,283,773 B 增至
-1,758,220 B（+37.0%）。TLS 只在手动检查更新时创建，不进入输入、overlay 或 Idle 热路径。
+更新检查使用系统 `native-tls`。TLS 只在手动检查更新时创建，不进入输入、overlay 或 Idle 热路径。
 
 ## Cargo 结构
 
@@ -31,12 +27,6 @@ macOS 目前只有交叉编译验证，尚无原生延迟数据；不能把跳�
 Windows 显式原生正确性检查为
 `cargo test --lib native_character_layout_probe -- --ignored --nocapture`，要求已加载美式布局；
 测试只读取布局，不加载或切换用户的键盘布局。
-
-2026-09-07 本机 Windows x64 的三轮交替测量中，字符观察的 p50 为：未过滤 2.379–2.381µs、
-无字符绑定 1ns、绑定 `?` 后普通 H 键 658–659ns；候选表冷编译约 25ms。另以独立源码副本
-恢复旧逐模式字符查找，对核心路由做五轮交替、固定 CPU 的 A/B，默认键位 p99 的轮次中位数
-为 236→229ns，WASD 为 235→230ns，初始化为 95.7→95.8µs。它们是本机局部验收数据，
-不包含真实 Hook 握手、系统调度到指针更新或 macOS 原生路径，不能当作端到端延迟承诺。
 
 项目是一个 crate，同时提供：
 

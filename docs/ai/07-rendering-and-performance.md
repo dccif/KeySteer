@@ -4,13 +4,13 @@
 
 Windows DirectComposition 保持设备、字体和紧致 cursor/indicator surface 预热，但 cursor-only Normal 不创建全屏 static surface。只有 backdrop、shape 或 label 存在时才挂载 static visual；回到无静态内容时立即释放 screen-sized surface。
 
-Windows OCR 不属于预热常驻集。Backend ready 后首次事件轮询派发的 discovery 只缓存能力与路径，临时 `OcrEngine`/COM 在探测线程结束前释放；视觉 coordinator、截图、`SoftwareBitmap`、fallback scratch、微信 helper/reader 和临时 PNG 都是 generation-scoped，并在 terminal 结果进入 Engine 前完成清理。15 秒空闲基线约为 35.5 MiB working set、51.4 MiB private bytes、343 handles、30 threads，采样保持平稳；高于早期 18 MiB 的主要部分是预热的 DirectComposition/D3D/字体资源及系统工作集缓存，不能用 `SetProcessWorkingSetSize` 人为压低任务管理器数字。
+Windows OCR 不属于预热常驻集。Backend ready 后首次事件轮询派发的 discovery 只缓存能力与路径，临时 `OcrEngine`/COM 在探测线程结束前释放；视觉 coordinator、截图、`SoftwareBitmap`、fallback scratch、微信 helper/reader 和临时 PNG 都是 generation-scoped，并在 terminal 结果进入 Engine 前完成清理。不要用 `SetProcessWorkingSetSize` 人为压低任务管理器数字。
 
 热路径使用 inline storage：`CommandBatch` 的 0/1/2 命令不分配，Normal held-key map inline 4 项，Grid/Recursive stack/path inline 12 项，继承 visited inline 8 项。
 
 ## 提交模型
 
-`Backend::present` 接收 `Arc<OverlayScene>`。Windows 使用 latest-frame 单槽队列：Engine 只替换待绘制帧并立即返回，已经过期的帧不会进入原生绘制。frame/position 更新与 empty→ready 判定在同一次锁内完成，并用 outstanding-wake 合并突发提交；渲染线程每次 drain 才清除标志，8000 次积压位置更新只需要一个 wake 并只保留最终位置。同一输入批次中的 Warp、Show、Finish、Click、Hide 会先合并覆盖层意图；输入注入保持立即执行，批次结束只提交一次最终画面。
+`Backend::present` 接收 `Arc<OverlayScene>`。Windows 使用 latest-frame 单槽队列：Engine 只替换待绘制帧并立即返回，已经过期的帧不会进入原生绘制。frame/position 更新与 empty→ready 判定在同一次锁内完成，并用 outstanding-wake 合并突发提交；渲染线程每次 drain 才清除标志，积压位置更新合并为一次唤醒，并只保留最终位置。同一输入批次中的 Warp、Show、Finish、Click、Hide 会先合并覆盖层意图；输入注入保持立即执行，批次结束只提交一次最终画面。
 
 Windows 截图不再生成约 32 MiB 的 4K BGRA `Vec`。GDI DIB 在所属线程上以验证过长度的临时 slice 借出；截图仍始终只有一次。系统 OCR 从该 slice 直接写入按逻辑线程与至少 64px 核心边长自适应的重叠小块，完成一块即发布；只有微信能力可用时才创建微信专用完整 bitmap，并在 PNG 编码后立即关闭；fallback 直接生成不超过 2,073,600 像素的灰度图，随后销毁 DIB。8,388,608 像素上限让 UHD 4K 原生命中一次 `BitBlt`；只有 5K/8K 等实际超限画面才使用 `StretchBlt + HALFTONE`。fallback 灰度映射使用商余数步进，连通区域按 scanline run 维护活跃组件；形态位图复用并使用最多 2000 项的紧凑 top-K，只有最终候选才构造 role 字符串。
 
@@ -27,8 +27,7 @@ Engine 另外缓存自己生成的 cursor/indicator 几何。普通指针移动�
 首帧未就绪或原生更新失败时立即退回完整 `present`。
 
 Windows 低级鼠标 Hook 是 pointer seqlock 的唯一写者，因此写侧使用 odd/payload/even 的普通
-原子 store 与 Release fence，不再为每个移动执行两次 locked RMW。release 交错微测中每批
-8,000 次写入的 p99 从约 63.1µs 降到 11.1µs；pointer wake 只由 overlay `present/dismiss`
+原子 store 与 Release fence，不再为每个移动执行两次 locked RMW。pointer wake 只由 overlay `present/dismiss`
 切换，停止移动帧时钟不会覆盖它。Idle 关闭 wake 后仍只更新 packed 坐标，进入非 Idle 模式
 继续通过 `Backend::pointer()` 获取权威位置。
 
@@ -256,7 +255,5 @@ macOS 原生探针使用固定 AppKit fixture 子进程，运行：
 关闭、Idle、Reload/overlay reset 与 shutdown 释放缓存；没有跨会话历史表、后台任务或定时轮询。构建时的 String/Vec 为临时所有权，显示期间所需文字由场景持有，最后一个 Arc 释放后回收。后端可能还持有最后一帧或字体缓存，这是已有有界渲染资源，不是每次帮助刷新累积的新条目。
 
 性能探针位于 runtime/tests/overlay.rs：release 下单线程运行 `key_help_decoration_probe`、`key_help_cache_close_cycles_release_allocations`、`key_help_cache_position_updates_allocate_nothing`，每项 20k 次；前两项分别验证缓存命中零分配、反复开关分配与释放平衡，第三项验证开启帮助后的鼠标位置路径零分配。功能测试覆盖标签存储共享、键输入/流式结果失效、路由/主题更新和跨屏动态居中。
-
-本机 release 单线程交替 A/B 三轮，每轮 20k 次相同帮助装饰：旧版每轮 7,500,000 次分配（471,520,000 字节），缓存版为 0；p99 中位数 41µs → 0.1µs（计时分辨率约 0.1µs）。20k 次完整开关中缓存版分配/释放均为 7,520,000 次、476,320,000 字节，未残留构建分配。开启帮助后 20k 次位置更新零分配；关闭帮助的既有 overlay_position_performance_probe 交替三轮 p99 中位数保持 position 0.1µs / complete 0.6µs。以上是隔离的 Engine 微基准，不代表原生渲染或端到端输入延迟，也不是双 4K 真机资源验收结论。
 
 帮助面板关闭时，`handle_key` 直接进入既有输入处理，不追加提示刷新收尾。注册表查询复用已有的活动模式槽位缓存，取用前验证槽位中的 ModeId，避免按键路由重复搜索模式索引；切换模式、重载和其他模式查询仍安全回退到索引表。没有字符数据的输入直接走物理键解析；仅有带修饰键的组合前缀时，单个普通键跳过前缀仲裁。上述优化均位于公共运行时。

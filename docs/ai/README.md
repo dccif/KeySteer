@@ -27,7 +27,6 @@
 | 修改覆盖层、实时按键提示及其缓存、帧时钟或性能 | [覆盖层、帧同步与性能](07-rendering-and-performance.md) |
 | 修改跨平台字符需求/ASCII 过滤、Windows 布局候选过滤或输入延迟 | [核心运行时与公共 API](02-runtime-and-api.md)、[原生后端](06-platform-backends.md)、[构建与性能验收](08-build-docs-and-tests.md) |
 | 修改构建、打包、文档或测试 | [构建、打包、文档站与测试](08-build-docs-and-tests.md) |
-| 对比 0.9.20 与 0.9.13 性能 | [本机性能报告](performance-0.9.20.md) |
 | 准备实施跨层改动 | [改动导航与不变量](09-change-guide.md) |
 | 检查模块依赖和配置编译边界 | [架构边界与运行计划](10-architecture-boundaries.md) |
 
