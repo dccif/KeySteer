@@ -30,6 +30,7 @@ pub struct WindowInfo {
     pub screen: usize,
     pub resizable: bool,
     pub maximized: bool,
+    pub minimized: bool,
     pub fullscreen: bool,
 }
 
@@ -40,24 +41,19 @@ pub enum WindowAction {
     Up,
     Right,
     Size,
-    Layout,
-    Edit,
     Navigate(Direction),
     Split(Direction),
     Ratio(Direction),
     Tile,
     NextScreen,
     PreviousScreen,
-    Maximize,
+    CycleState,
     Center,
     Select,
     Undo,
     RemoveRegion,
-    SavedLayouts,
     SaveLayout,
     Confirm,
-    Cancel,
-    Exit,
 }
 
 impl WindowAction {
@@ -75,8 +71,6 @@ impl WindowAction {
             Self::Up => "window_up",
             Self::Right => "window_right",
             Self::Size => "window_size",
-            Self::Layout => "window_layout",
-            Self::Edit => "window_edit",
             Self::Navigate(Direction::Left) => "window_layout_left",
             Self::Navigate(Direction::Down) => "window_layout_down",
             Self::Navigate(Direction::Up) => "window_layout_up",
@@ -92,16 +86,13 @@ impl WindowAction {
             Self::Tile => "window_tile",
             Self::NextScreen => "window_screen_next",
             Self::PreviousScreen => "window_screen_previous",
-            Self::Maximize => "window_maximize",
+            Self::CycleState => "size_cycle",
             Self::Center => "window_center",
             Self::Select => "window_select",
             Self::Undo => "window_undo",
             Self::RemoveRegion => "window_remove_region",
-            Self::SavedLayouts => "window_saved_layouts",
             Self::SaveLayout => "window_save_layout",
             Self::Confirm => "window_confirm",
-            Self::Cancel => "window_cancel",
-            Self::Exit => "window_exit",
         }
     }
 
@@ -112,8 +103,6 @@ impl WindowAction {
             Self::Up,
             Self::Right,
             Self::Size,
-            Self::Layout,
-            Self::Edit,
             Self::Navigate(Direction::Left),
             Self::Navigate(Direction::Down),
             Self::Navigate(Direction::Up),
@@ -129,16 +118,13 @@ impl WindowAction {
             Self::Tile,
             Self::NextScreen,
             Self::PreviousScreen,
-            Self::Maximize,
+            Self::CycleState,
             Self::Center,
             Self::Select,
             Self::Undo,
             Self::RemoveRegion,
-            Self::SavedLayouts,
             Self::SaveLayout,
             Self::Confirm,
-            Self::Cancel,
-            Self::Exit,
         ]
         .into_iter()
         .find(|action| action.name() == value)
@@ -151,7 +137,7 @@ pub enum WindowChange {
     Resize { dw: f64, dh: f64 },
     Place { index: usize, gap: f64 },
     Center,
-    Maximize,
+    CycleState,
     Screen(WindowScreenTarget),
 }
 
@@ -254,4 +240,19 @@ pub enum WindowEditResult {
         transaction: u64,
         committed: bool,
     },
+}
+
+#[cfg(test)]
+mod state_cycle_tests {
+    use super::WindowAction;
+    #[test]
+    fn size_cycle_is_the_only_supported_state_cycle_name() {
+        assert_eq!(
+            WindowAction::parse("size_cycle"),
+            Some(WindowAction::CycleState)
+        );
+        assert_eq!(WindowAction::parse("window_maximize"), None);
+        assert_eq!(WindowAction::parse("window_cycle_state"), None);
+        assert_eq!(WindowAction::CycleState.name(), "size_cycle");
+    }
 }

@@ -3,10 +3,10 @@ use super::*;
 use crate::api::Direction;
 use crate::api::window_layout::placed_rect;
 
-impl WindowMode {
+impl WindowSession {
     pub(super) fn start_edit(&mut self, tree: bool, ctx: &HostContext<'_>, out: &mut CommandBatch) {
         let target = self.target.as_ref();
-        if target.is_none() && !(tree && self.pending_template.is_some()) {
+        if target.is_none() && !tree {
             self.status = Some("Select a window first".into());
             return;
         }
@@ -14,6 +14,9 @@ impl WindowMode {
             self.screen = target.screen;
         }
         let Some(screen) = ctx.screens.get(self.screen) else {
+            self.restore_pending = false;
+            self.pending_template = None;
+            self.status = Some("Display is unavailable".into());
             return;
         };
         if !tree && target.is_some_and(|target| !target.resizable || target.fullscreen) {
@@ -82,7 +85,7 @@ impl WindowMode {
                 EditModel::Quick(quick) => self
                     .target
                     .as_ref()
-                    .map(|w| vec![(w.id, quick.rect())])
+                    .map(|w| vec![(w.id, quick.rect_with(&self.settings.split_ratios))])
                     .unwrap_or_default(),
                 EditModel::Tree(tree) => tree
                     .slots()
@@ -120,6 +123,9 @@ impl WindowMode {
         self.swap_source = None;
         if let Some(edit) = &mut self.edit {
             if edit.ending {
+                if matches!(finish, Finish::Transition) {
+                    edit.finishing = Some(finish);
+                }
                 return;
             }
             edit.finishing = Some(finish);
@@ -178,7 +184,7 @@ impl WindowMode {
                 if split || ratio {
                     return;
                 }
-                quick.step(direction);
+                quick.step_with(direction, &self.settings.split_ratios);
             }
             EditModel::Tree(tree) => {
                 if !edit.ready {
@@ -458,6 +464,13 @@ impl WindowMode {
                 gap_scale,
                 ..
             } => {
+                if self
+                    .edit
+                    .as_ref()
+                    .is_none_or(|e| e.transaction != *transaction || e.ending)
+                {
+                    return;
+                }
                 let saved = if self
                     .edit
                     .as_ref()
@@ -480,6 +493,7 @@ impl WindowMode {
                         Ok(tree) => Some(tree),
                         Err(error) => {
                             self.status = Some(error);
+                            self.restore_pending = false;
                             None
                         }
                     }
@@ -561,8 +575,12 @@ impl WindowMode {
                             )
                         });
                     let fit_error = fit.err();
+                    if fit_error.is_some() {
+                        self.restore_pending = false;
+                    }
                     edit.accepted = edit.model.clone();
-                    edit.entry_layout &= fit_error.is_none();
+                    edit.entry_layout &=
+                        fit_error.is_none() && (saved.is_none() || self.restore_pending);
                     edit.dirty = edit.entry_layout;
                     let excluded = self
                         .inventory
@@ -633,6 +651,9 @@ impl WindowMode {
                     edit.model = edit.accepted.clone();
                     edit.dirty = false;
                     edit.history.clear();
+                    self.status.get_or_insert_with(|| {
+                        "Layout could not be applied; choose a layout to retry".into()
+                    });
                     if !minimums.is_empty() {
                         edit.minimums = minimums.iter().copied().collect();
                     }
@@ -640,6 +661,14 @@ impl WindowMode {
                 }
                 self.rebuild_numbers();
                 self.flush_edit(out);
+                if self.restore_pending {
+                    self.restore_pending = false;
+                    if *accepted && self.pending_transition.is_none() {
+                        out.push(Command::FinishMode {
+                            cause: crate::api::FinishCause::Explicit,
+                        });
+                    }
+                }
             }
             WindowEditResult::Ended {
                 transaction,
@@ -653,6 +682,13 @@ impl WindowMode {
                     return;
                 }
                 let Some(edit) = self.edit.take() else { return };
+                if !committed && self.restore_pending {
+                    self.restore_pending = false;
+                    self.pending_template = None;
+                    self.status.get_or_insert_with(|| {
+                        "Layout could not be restored; choose a layout to retry".into()
+                    });
+                }
                 if *committed && let EditModel::Tree(tree) = edit.model {
                     self.trees.insert(edit.screen, tree);
                 }
@@ -667,6 +703,8 @@ impl WindowMode {
                             | Finish::Commit
                     )
                 {
+                    self.restore_pending = false;
+                    self.pending_template = None;
                     self.rebuild_numbers();
                     return;
                 }
@@ -688,7 +726,11 @@ impl WindowMode {
                         self.request(WindowOperation::Cycle, out);
                     }
                     Finish::Tile => self.tile(out),
-                    Finish::Exit => self.exit(out),
+                    Finish::Transition => {
+                        if let Some(target) = self.pending_transition.take() {
+                            out.push(Command::SwitchMode(target));
+                        }
+                    }
                     Finish::Commit | Finish::Cancel => {}
                 }
                 self.rebuild_numbers();

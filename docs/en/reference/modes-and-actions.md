@@ -24,6 +24,10 @@ Array entries run in written order. Empty arrays are invalid. Arrays do not bloc
 | `recursive_grid` | Repeatedly subdivides the current region. |
 | `ui_hint` | Shows labels for interactive elements. |
 | `window` | Locks the window under the pointer for movement, centred resizing, layouts, and tiling. |
+| `window_quick` | Quick ratio layout. |
+| `window_editor` | Automatic arrangement and region editing. |
+| `window_restore` | Restore saved layouts. |
+| `window_delete` | Confirm deletion of saved layouts. |
 | `plugin:<id>` | A plugin Mode, for example `plugin:screen-selector`. |
 
 ```toml
@@ -42,40 +46,29 @@ f = "recursive_grid"
 
 ## Window mode
 
-`Alt+W` locks the ordinary window under the pointer. Every non-minimized ordinary window on the current display, including occluded windows, receives a stable centre label: `1–9, 10, 11…`. Closing a window never renumbers the others. A completed number activates and locks that window and centres the pointer. Only a prefix with a longer valid number waits, by default 250ms: with 23 windows, `1` and `2` wait, while `3–9` act immediately. Completing `12` immediately selects 12 without first activating 1. Numbers execute automatically when complete or when the ambiguity timer expires.
+Window operations use five independently registered modes. Each has its own bindings, inheritance, application overrides, temporary mode and style. H/J/K/L are explicit defaults and do not follow Normal remapping.
 
-| Default key | Action | Behaviour |
+| Mode | Default entry | Default Q destination |
 | --- | --- | --- |
-| Normal movement keys (default H/J/K/L) | `window_left/down/up/right` | Tap to move one step; hold for continuous movement in ordinary Window. |
-| `S` | `window_size` | Toggle movement / centred resizing. |
-| `A` | `window_layout` | Enter quick layout; press E to arrange and edit regions. |
-| `E` | `window_edit` | Automatically arrange windows and enter the layout tree directly from ordinary Window. |
-| `D` | `window_screen_next` | Cycle to the next display in ordinary Window, with pointer following. |
-| `F` / `C` | `window_maximize` / `window_center` | Maximize / restore, or centre. |
-| `Tab` | `window_select` | Immediately activate and lock the next window, centring the pointer; tree editing cycles only this display. |
-| `X` | `window_remove_region` | Remove the selected tree region without closing its window. |
-| `Ctrl+S` | `window_save_layout` | Save the current regions with an optional note. |
-| `R` | `window_saved_layouts` | List saved layouts; type a number to restore, PageUp/PageDown to browse. |
-| `Z` | `window_undo` | Undo one edit step; leaving the editor groups the edit into one ordinary Window undo step. |
-| `Q` | `window_cancel` | Return one level, keeping the applied layout; at the root, leave through `exit_mode`. |
-| `Primary+Q` | `window_exit` | Leave Window directly through `exit_mode`, keeping the applied layout. |
-| Unbound | `window_tile` | Tile once directly. |
+| `window` | Global Alt+W | `idle` |
+| `window_quick` | A in Window | `window` |
+| `window_editor` | E in Window | `window` |
+| `window_restore` | R in Window | `window` |
+| `window_delete` | X in Restore | `window_restore` |
 
-Quick layout derives directions from the effective Normal `move_left/right/up/down` bindings (H/L/K/J by default), including inheritance, application overrides and aliases. Layout directions take priority over ordinary Window actions on those keys. The first direction on each axis selects its half; repeating the anchor direction shrinks and the opposite direction grows through `1/4, 1/3, 1/2, 2/3, 3/4, 1`, stopping at each end. Axes are independent: left then up gives the top-left quarter. Changes apply live. Selecting another target by number or Tab keeps the changes and resets the ratios. When A also means left in Normal, it acts as a layout direction immediately after entering Quick; there is no AA deadline or priority rule. Configuration checks report conflicts with the E entry binding.
+Q is an ordinary mode binding and behaves identically regardless of the entry path. Launching Editor directly from Idle still makes its default Q enter Window. Rebinding Q selects another destination; activating the current mode follows the normal toggle-to-Idle rule.
 
-E imports the target display's current positions into a BSP tree, preferring gaps and preserving spatial order. Entering E automatically applies the arrangement and stays in the editor. Directions navigate regions. Shift+direction splits the selected region. Ctrl+direction moves the nearest ancestor divider on that axis, carrying both subtrees: a short press moves by `resize_step`, and holding moves continuously at `resize_speed`. One hold is one undo step. Legacy `split_ratios` still parses but no longer controls dividers. Application minimum sizes, gaps and the work area constrain movement; reaching a limit or having no matching divider shows a message. X removes the selected region and promotes its sibling without closing its window; Z undoes it. At least one region remains.
+Alt+W locks the window under the pointer. Visible-screen windows receive stable numbers; closing one does not renumber the others. A complete number focuses and locks its window and centers the pointer; only ambiguous prefixes wait, for 250ms by default. Tab cycles windows, S switches movement/centered resizing, H/J/K/L adjusts, D changes display, F cycles maximize → minimize → restore, C centers, and Z undoes.
 
-The first complete window number selects a swap source; the second swaps windows, or cancels if it is the same number. Region labels use a backtick followed by a number: tap backtick, then type the region number. With a source this moves it into that region, swapping if occupied; without a source it selects the region and activates its window, or moves the pointer to an empty region center. Other editing actions clear the source. Q first clears pending number or swap state; another Q returns to ordinary Window and keeps the applied layout. Closing a window leaves an empty region. Fixed-size and native fullscreen windows remain selectable but stay outside the tree, with an explanation in the panel.
+Quick adjusts each axis independently with H/J/K/L. The first direction chooses the configured ratio nearest one half; the same direction shrinks and the opposite expands. `window_quick.split_ratios` defaults to 1/4, 1/3, 1/2, 2/3 and 3/4, with full size appended automatically. Tab changes target and resets ratios; Z undoes.
 
-One help panel prefers the inside bottom of the locked window, showing a larger title, current input, actual bindings, ratios, region and swap state; small windows use the work area. Holding `[window].temporary_mode_keys` (Primary by default) temporarily uses Normal, hides overlays and preserves the edit. Releasing resumes it. Window inherits only hotkeys by default.
+Editor automatically arranges windows on entry. H/J/K/L navigates regions, Shift+direction splits, Ctrl+direction moves the divider using Editor's own `resize_step`/`resize_speed`, X removes a region and Z undoes. Select two window numbers to swap them, or use backtick followed by a region number to select or fill an empty region. Changes apply immediately. Pending transactions finish before handoff; window modes preserve the target and stable numbers.
 
-E arranges eligible windows on the current display once and leaves the tree open for editing. New windows do not trigger rearrangement. Infeasible minimum sizes leave actual windows intact with an explanation. Z undoes editing steps, then the entry arrangement, restoring actual entry geometry and maximization while retaining the editor. Each continuous gesture or completed edit is one undo step, with up to 32 steps per session. `move_window previous/next/<number>` remains independent. Legacy `layout_keys` is parsed for compatibility and no longer controls layout or numbering.
+Ctrl+S in Editor opens the bottom note field and saves a layout. Notes are optional and limited to 80 characters. In Restore, type a layout number; PageUp/PageDown changes pages. Only successful application triggers `window_restore.lifecycle.after_finish`, which defaults to Editor. Failure stays in Restore with an error. Layouts store geometry, window count and notes without application or native window identity. Restoration fills regions in recent-activity order, leaves extra windows untouched and retains empty regions when there are fewer windows.
 
-In the tree editor, press `Ctrl+S` to save the region structure and divider ratios, using the inline input bar at the bottom of the screen. Blank notes get names such as `Layout 1 · 9 windows`, or `Layout 1 · 4 windows / 9 regions` when regions are empty. `Alt+W → R → 1` restores layout 1 and keeps editing; PageUp/PageDown browse the saved list. Nine saved regions with four current windows fill the first four regions and leave the rest empty. Four saved regions with more current windows take four eligible windows in front-to-back activity order and leave all others in place. Window handles, app names, and titles are not stored, and restoring does not launch apps.
+X in Restore enters Delete. Type a number to see the selected name, then Enter to delete. Q returns to Restore and cancels the pending choice. Deletion stays in Delete, refreshes pages and preserves all other IDs. Deleting the final item writes a valid empty library. The record is reread before submission; external changes require selection again, and failed writes preserve the original file.
 
-Layouts persist in the compact binary file `window-layouts.kslayout`. Windows and portable builds keep it beside the running executable, following the log directory policy; packaged macOS builds use `~/Library/Application Support/KeySteer/`. Temporary-file writes and atomic replacement preserve the previous file if saving fails. An unwritable directory or damaged file produces an error. The browser simulator keeps a separate library in browser storage.
-
-The app's **Configuration & Simulator...** command imports active bindings and the layout library together. After editing, download and replace the same `.kslayout` file. Opening R reloads it each time, and native saves read the latest file before writing; no file watcher is used. Browser edits keep existing layout numbers and export the complete library.
+`window-layouts.kslayout` uses the same application-data directory policy as logs. The format is unchanged and interoperates with the [web simulator](/en/simulator). Browser edits affect demo windows and browser storage; download and replace the program's layout file, then enter Restore to read it.
 
 ## Movement, scrolling, and speed
 
@@ -235,3 +228,5 @@ See the [default configuration](/generated/keysteer.default.toml) for the comple
 Toggle the available-key panel without restarting the active mode or clearing its selection. Enable with `"?" = "key_help"` in Normal, inherited by targeting modes. Omit or comment out the entry to disable it. Configure its appearance in `[key_help]`.
 
 Window cards emphasize application names above longer window titles and use thicker leader lines when displaced. Editing uses a shaded grid with region numbers centered in their regions. The help panel keeps the configured font size and falls back to the screen when the target is too small. Move / Resize / Quick / Edit appear as separate keycap badges; the application and window title each get their own line. Backtick plus a region number also opens the tree editor from ordinary Window or Quick, selects that region, and activates its window; empty regions move the pointer to their center.
+
+The default is `f = "size_cycle"`. After minimizing, press F to restore the same window to its original position and size, then press F again to repeat.

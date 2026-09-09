@@ -19,7 +19,8 @@ use std::path::{Path, PathBuf};
 // action-construction block, owned by existing tray/main-thread lifecycles.
 // Inline input adds one audited AppKit superclass initialization for the
 // borderless NSPanel subclass; its retained owner and main-thread lifetime stay unchanged.
-const MAX_UNSAFE_EXPRESSIONS: usize = 291;
+// Window state cycle adds one bounded ShowWindowAsync minimization request.
+const MAX_UNSAFE_EXPRESSIONS: usize = 292;
 const MAX_UNSAFE_FILES: usize = 24;
 const PER_FILE_BUDGET: &[(&str, usize)] = &[
     ("src/platform/macos/accessibility.rs", 18),
@@ -40,7 +41,7 @@ const PER_FILE_BUDGET: &[(&str, usize)] = &[
     ("src/platform/windows/overlay.rs", 9),
     ("src/platform/windows/screens.rs", 5),
     ("src/platform/windows/window_mover.rs", 4),
-    ("src/platform/windows/window_manager.rs", 10),
+    ("src/platform/windows/window_manager.rs", 11),
     ("src/platform/windows/status_item.rs", 14),
     ("src/platform/windows/update_installer/candidate.rs", 4),
     ("src/platform/windows/update_installer/mod.rs", 11),

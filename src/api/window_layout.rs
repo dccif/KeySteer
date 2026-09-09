@@ -41,22 +41,39 @@ pub struct QuickPlacement {
 
 impl QuickPlacement {
     pub fn step(&mut self, direction: Direction) {
+        self.step_with(direction, &RATIOS);
+    }
+
+    pub fn step_with(&mut self, direction: Direction, ratios: &[f64]) {
         let axis = match Axis::of(direction) {
             Axis::X => &mut self.horizontal,
             Axis::Y => &mut self.vertical,
         };
         let near = negative(direction);
         match axis {
-            None => *axis = Some(AxisPlacement { near, ratio: 2 }),
+            None => {
+                *axis = Some(AxisPlacement {
+                    near,
+                    ratio: ratios
+                        .iter()
+                        .enumerate()
+                        .min_by(|(_, a), (_, b)| (**a - 0.5).abs().total_cmp(&(**b - 0.5).abs()))
+                        .map_or(0, |(i, _)| i),
+                })
+            }
             Some(value) if value.near == near => value.ratio = value.ratio.saturating_sub(1),
-            Some(value) => value.ratio = (value.ratio + 1).min(RATIOS.len() - 1),
+            Some(value) => value.ratio = (value.ratio + 1).min(ratios.len().saturating_sub(1)),
         }
     }
 
     pub fn rect(self) -> Rect {
+        self.rect_with(&RATIOS)
+    }
+
+    pub fn rect_with(self, ratios: &[f64]) -> Rect {
         let axis = |value: Option<AxisPlacement>| {
             value.map_or((0.0, 1.0), |value| {
-                let ratio = RATIOS[value.ratio];
+                let ratio = ratios.get(value.ratio).copied().unwrap_or(1.0);
                 (if value.near { 0.0 } else { 1.0 - ratio }, ratio)
             })
         };
@@ -66,11 +83,22 @@ impl QuickPlacement {
     }
 
     pub fn caption(self) -> String {
+        self.caption_with(&RATIOS)
+    }
+
+    pub fn caption_with(self, ratios: &[f64]) -> String {
         const NAMES: [&str; 6] = ["1/4", "1/3", "1/2", "2/3", "3/4", "1"];
         let axis = |value: Option<AxisPlacement>, near: &str, far: &str| {
             value.map_or_else(
                 || "1".into(),
-                |v| format!("{} {}", if v.near { near } else { far }, NAMES[v.ratio]),
+                |v| {
+                    let ratio = ratios.get(v.ratio).copied().unwrap_or(1.0);
+                    let name = RATIOS
+                        .iter()
+                        .position(|r| (*r - ratio).abs() < 1e-9)
+                        .map_or_else(|| format!("{ratio:.3}"), |i| NAMES[i].into());
+                    format!("{} {}", if v.near { near } else { far }, name)
+                },
             )
         };
         format!(
@@ -728,6 +756,7 @@ mod tests {
                 screen: 0,
                 resizable: true,
                 maximized: false,
+                minimized: false,
                 fullscreen: false,
             })
             .collect();
@@ -856,6 +885,7 @@ mod tests {
             screen: 0,
             resizable: true,
             maximized: false,
+            minimized: false,
             fullscreen: false,
         };
         let windows = vec![

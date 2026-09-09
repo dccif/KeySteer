@@ -33,8 +33,6 @@ pub(super) struct ModeRegistry {
     pub(super) binding_profile_key: Vec<Bindings>,
     pub(super) prefixes_require_modifier: bool,
     pub(super) character_keys: HashMap<char, crate::api::Key>,
-    pub(super) window_layout_table: CompiledKeymap,
-    pub(super) window_motion_table: CompiledKeymap,
     #[cfg(test)]
     pub(super) table_rebuild_count: usize,
     pub(super) plugin_bindings: Vec<(KeyChord, Binding)>,
@@ -53,8 +51,6 @@ impl Default for ModeRegistry {
             binding_profile_key: Vec::new(),
             prefixes_require_modifier: true,
             character_keys: HashMap::new(),
-            window_layout_table: CompiledKeymap::default(),
-            window_motion_table: CompiledKeymap::default(),
             #[cfg(test)]
             table_rebuild_count: 0,
             plugin_bindings: Vec::new(),
@@ -396,74 +392,6 @@ impl Engine {
         // user works, and only if that chord is still free.
         self.registry.merge_plugin_bindings_into_normal();
 
-        // Compile the effective Normal movement language once per profile,
-        // including inherited bindings, application overrides and key aliases.
-        // Layout input never scans configuration or allocates an action per key.
-        let mut directions = BTreeMap::new();
-        for (_, table) in self.registry.tables() {
-            for entry in table.iter_entries() {
-                let Binding::Move(direction) = entry.binding.as_ref() else {
-                    continue;
-                };
-                if self
-                    .lookup_inherited(
-                        &crate::api::ModeId::normal(),
-                        entry.chord.activation_key(),
-                        entry.chord.keys(),
-                        &mut smallvec::SmallVec::new(),
-                    )
-                    .is_some_and(|resolved| resolved.binding == entry.binding)
-                {
-                    directions.insert(entry.chord.canonical(), *direction);
-                }
-            }
-        }
-        self.registry.window_motion_table = CompiledKeymap::compile(
-            directions
-                .iter()
-                .map(|(key, direction)| {
-                    use crate::api::Direction;
-                    use crate::api::window::WindowAction as W;
-                    let action = match direction {
-                        Direction::Left => W::Left,
-                        Direction::Right => W::Right,
-                        Direction::Up => W::Up,
-                        Direction::Down => W::Down,
-                    };
-                    (key.clone(), Binding::Window(action))
-                })
-                .collect(),
-            &self.settings.resolved_key_aliases,
-        );
-        let mut bindings = BTreeMap::new();
-        for (key, direction) in &directions {
-            bindings.insert(
-                key.clone(),
-                Binding::Window(crate::api::window::WindowAction::Navigate(*direction)),
-            );
-        }
-        for (key, direction) in directions {
-            let Ok(chord) = KeyChord::parse(&key) else {
-                continue;
-            };
-            for (modifier, action) in [
-                ("shift", crate::api::window::WindowAction::Split(direction)),
-                ("ctrl", crate::api::window::WindowAction::Ratio(direction)),
-            ] {
-                if !chord.keys().iter().any(|k| {
-                    k.as_str() == modifier || k.as_str().ends_with(&format!("_{modifier}"))
-                }) {
-                    bindings
-                        .entry(format!("{modifier}+{key}"))
-                        .or_insert(Binding::Window(action));
-                }
-            }
-        }
-        self.registry.window_layout_table = CompiledKeymap::compile(
-            bindings.into_iter().collect(),
-            &self.settings.resolved_key_aliases,
-        );
-
         // A literal character can only select a single-key chord. Keep one
         // interned Key per character instead of searching every mode per input.
         self.registry.character_keys = self
@@ -690,22 +618,6 @@ impl Engine {
             self.release_toggle_session_for_safe_mode(backend)?;
         }
         let previous = self.registry.active.clone();
-        if target == ModeId::window() {
-            // Suspend motion as well as the visible mode. Keep physical key
-            // dispositions so subsequent releases are still correctly paired.
-            let gestures = std::mem::take(&mut self.input.active_gestures);
-            for (key, gesture) in gestures {
-                self.dispatch_to(
-                    &gesture.owner,
-                    ModeEvent::Binding {
-                        binding: gesture.binding,
-                        state: crate::api::KeyState::Up,
-                        key,
-                    },
-                    backend,
-                )?;
-            }
-        }
         self.dispatch(ModeEvent::Suspended, backend)?;
         self.registry.modal_stack.push(previous.clone());
         self.set_active(target);

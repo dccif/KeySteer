@@ -7,18 +7,22 @@ use crate::api::{ButtonAction, ModeId, MouseButton, VisionOptions};
 #[test]
 fn window_split_ratios_validate_and_round_trip() {
     let config =
-        Config::parse("[window]\nsplit_ratios = [\"1/5\", \"2/5\", \"3/5\", \"4/5\"]").unwrap();
+        Config::parse("[window_quick]\nsplit_ratios = [\"1/5\", \"2/5\", \"3/5\", \"4/5\"]")
+            .unwrap();
     config.validate().unwrap();
     assert_eq!(
-        config.window.parsed_split_ratios().unwrap(),
+        config.window_quick.parsed_split_ratios().unwrap(),
         vec![0.2, 0.4, 0.6, 0.8]
     );
     let reparsed = Config::parse(&config.to_toml().unwrap()).unwrap();
-    assert_eq!(reparsed.window.split_ratios, config.window.split_ratios);
+    assert_eq!(
+        reparsed.window_quick.split_ratios,
+        config.window_quick.split_ratios
+    );
     assert_eq!(
         Config::parse("")
             .unwrap()
-            .window
+            .window_quick
             .parsed_split_ratios()
             .unwrap(),
         crate::api::window_layout::DEFAULT_SPLIT_RATIOS
@@ -37,13 +41,13 @@ fn window_split_ratios_validate_and_round_trip() {
         "[\"nan\"]",
         "[\"1/4294967296\"]",
     ] {
-        let config = Config::parse(&format!("[window]\nsplit_ratios = {values}")).unwrap();
+        let config = Config::parse(&format!("[window_quick]\nsplit_ratios = {values}")).unwrap();
         assert!(
             config
                 .validate()
                 .unwrap_err()
                 .to_string()
-                .contains("window.split_ratios"),
+                .contains("window_quick.split_ratios"),
             "{values}"
         );
     }
@@ -59,11 +63,14 @@ fn window_split_ratios_sort_and_deduplicate_mixed_inputs_without_rewriting_sourc
         ("[0.4, 0.3, 0.4]", vec![0.3, 0.4]),
         ("[\"3/5\", \"1/5\", \"2/10\"]", vec![0.2, 0.6]),
     ] {
-        let config = Config::parse(&format!("[window]\nsplit_ratios = {source}")).unwrap();
+        let config = Config::parse(&format!("[window_quick]\nsplit_ratios = {source}")).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.window.parsed_split_ratios().unwrap(), expected);
+        assert_eq!(config.window_quick.parsed_split_ratios().unwrap(), expected);
         let reparsed = Config::parse(&config.to_toml().unwrap()).unwrap();
-        assert_eq!(config.window.split_ratios, reparsed.window.split_ratios);
+        assert_eq!(
+            config.window_quick.split_ratios,
+            reparsed.window_quick.split_ratios
+        );
     }
 }
 
@@ -1286,4 +1293,62 @@ fn the_default_config_produces_no_platform_warnings() {
     // Nothing we ship may warn on the platform it runs on.
     let warnings = Config::default().platform_warnings();
     assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn window_modes_have_independent_sparse_defaults_and_migration_errors() {
+    let config = Config::parse(
+        "[window_editor]\ngap = 16\n[window_quick.bindings]\nv = 'window_layout_left'\nq = 'grid'",
+    )
+    .unwrap();
+    assert_eq!(config.window_editor.gap, 16.0);
+    assert_eq!(
+        config.window_editor.bindings.get("q"),
+        Some(&Binding::Mode(ModeId::window()))
+    );
+    assert_eq!(config.window_quick.bindings.len(), 2);
+    assert_eq!(
+        config.window_quick.bindings.get("q"),
+        Some(&Binding::Mode(ModeId::grid()))
+    );
+    assert!(config.window.bindings.contains_key("h"));
+    assert_eq!(
+        config.window_restore.lifecycle.after_finish,
+        crate::api::LifecycleAction::Mode(ModeId::window_editor())
+    );
+    for property in [
+        "exit_mode = 'idle'",
+        "gap = 8",
+        "split_ratios = [0.5]",
+        "layout_keys = 'asdfghjklqwe'",
+        "double_tap_ms = 200",
+    ] {
+        assert!(
+            Config::parse(&format!("[window]\n{property}")).is_err(),
+            "{property}"
+        );
+    }
+    for action in [
+        "window_layout",
+        "window_edit",
+        "window_saved_layouts",
+        "window_cancel",
+        "window_exit",
+    ] {
+        let error = Config::parse(&format!("[window.bindings]\nx = '{action}'")).unwrap_err();
+        assert!(error.to_string().contains(action), "{error}");
+    }
+}
+
+#[test]
+fn sparse_restore_lifecycle_preserves_default_finish_destination() {
+    let config = Config::parse("[window_restore.lifecycle]\nafter_click = 'idle'").unwrap();
+    assert_eq!(
+        config.window_restore.lifecycle.after_finish,
+        crate::api::LifecycleAction::Mode(ModeId::window_editor())
+    );
+    assert_eq!(
+        config.window_restore.lifecycle.after_click,
+        crate::api::LifecycleAction::Mode(ModeId::idle())
+    );
 }

@@ -160,6 +160,9 @@ pub struct LayoutLibraryRequest {
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayoutLibraryOperation {
     List,
+    Delete {
+        expected: SavedLayout,
+    },
     Save {
         regions: RegionTemplate,
         window_count: usize,
@@ -214,6 +217,7 @@ mod tests {
                 screen: 0,
                 resizable: true,
                 maximized: false,
+                minimized: false,
                 fullscreen: false,
             })
             .collect()

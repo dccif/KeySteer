@@ -1,25 +1,25 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { createSimulatorState } from './state.ts'
+import { createSimulatorState, applyModeAction } from './state.ts'
 import { applyWindowAction, chooseWindowNumber, enterWindow, finishWindowNumber, refreshWindowNumbers, temporaryWindow, tileWindows, windowSelectionKey, windowTarget, WINDOW_AREA } from './window.ts'
-import { compileWindowLayoutBindings, resolvePhysicalBinding, resolveWindowLayoutBinding, temporaryPhysicalKeys } from './bindings.ts'
+import { resolvePhysicalBinding, temporaryPhysicalKeys } from './bindings.ts'
 import { automaticTree, importTree, fitTree, treeSlots } from './window-layout.ts'
 import { parseSplitRatios } from './window-ratios.ts'
 
-test('E enters automatic editing directly; configured back returns one level and exit_mode controls the root', () => {
+test('E enters automatic editing directly; ordinary mode bindings control all return destinations', () => {
   const state = createSimulatorState()
   enterWindow(state)
-  applyWindowAction(state, 'window_edit')
+  applyWindowAction(state, 'window_editor')
   assert.equal(state.window.panel, 'tree')
-  applyWindowAction(state, 'window_cancel', { exit_mode: 'idle' })
+  applyWindowAction(state, 'window')
   assert.equal(state.window.panel, 'none')
   assert.equal(state.mode, 'window')
-  applyWindowAction(state, 'window_layout')
+  applyWindowAction(state, 'window_quick')
   assert.equal(state.window.panel, 'quick')
-  applyWindowAction(state, 'window_cancel', { exit_mode: 'idle' })
+  applyWindowAction(state, 'window')
   assert.equal(state.mode, 'window')
   assert.equal(state.window.panel, 'none')
-  applyWindowAction(state, 'window_cancel', { exit_mode: 'idle' })
+  applyWindowAction(state, 'window')
   assert.equal(state.mode, 'idle')
 })
 
@@ -43,7 +43,7 @@ test('divider short presses use pixel steps independently of legacy fractions', 
   ]
   const settings = { split_ratios: ['4/5', .4, '1/5', .6, '2/5', .8] }
   state.pointer = { x: 25, y: 30 }
-  enterWindow(state); applyWindowAction(state, 'window_layout', settings); applyWindowAction(state, 'window_edit', settings)
+  enterWindow(state); applyWindowAction(state, 'window_quick', settings); applyWindowAction(state, 'window_editor', settings)
   for (const expected of [.52, .54, .56]) {
     applyWindowAction(state, 'window_ratio_right', settings)
     const root = state.window.tree!.root
@@ -64,7 +64,7 @@ test('mixed ratios normalize order and duplicates while preserving source', () =
   assert.deepEqual(parseSplitRatios([.4, .3, .4]), [.3, .4])
 })
 
-test('Window locks the pointer target and returns to the previous selection state', () => {
+test('Window locks the pointer target and an Idle binding releases its session', () => {
   const state = createSimulatorState()
   state.mode = 'grid'; state.targeting.grid.path = ['a', 'b']
   enterWindow(state)
@@ -72,8 +72,8 @@ test('Window locks the pointer target and returns to the previous selection stat
   state.pointer = { x: 1, y: 1 }
   applyWindowAction(state, 'window_right')
   assert.equal(state.window.target, 2)
-  applyWindowAction(state, 'window_exit')
-  assert.equal(state.mode, 'grid')
+  applyModeAction(state, 'idle')
+  assert.equal(state.mode, 'idle')
   assert.deepEqual(state.targeting.grid.path, ['a', 'b'])
   assert.equal(state.window.history.length, 0)
 })
@@ -97,11 +97,10 @@ test('A opens quick, E arranges and edits, and undo restores the entry geometry'
   const state = createSimulatorState()
   enterWindow(state)
   const before = JSON.stringify(state.window.windows)
-  applyWindowAction(state, 'window_layout', {}, 1000)
-  applyWindowAction(state, 'window_layout', {}, 1200)
+  applyWindowAction(state, 'window_quick', {}, 1000)
   assert.equal(JSON.stringify(state.window.windows), before)
   assert.equal(state.window.panel, 'quick')
-  applyWindowAction(state, 'window_edit')
+  applyWindowAction(state, 'window_editor')
   assert.notEqual(JSON.stringify(state.window.windows), before)
   assert.equal(state.window.panel, 'tree')
   applyWindowAction(state, 'window_undo')
@@ -114,18 +113,17 @@ test('quick ratios apply immediately and back keeps them until undo', () => {
   enterWindow(state)
   applyWindowAction(state, 'window_size')
   const before = JSON.stringify(state.window.windows)
-  applyWindowAction(state, 'window_layout', {}, 1000)
-  applyWindowAction(state, 'window_layout', {}, 1500)
+  applyWindowAction(state, 'window_quick', {}, 1000)
   assert.equal(state.window.history.length, 0)
   assert.equal(windowSelectionKey(state, 'q', {}), false)
   applyWindowAction(state, 'window_layout_left')
   applyWindowAction(state, 'window_layout_left')
-  assert.equal(state.mode, 'window')
+  assert.equal(state.mode, 'window_quick')
   assert.equal(state.window.size, true)
   assert.equal(windowTarget(state.window)!.x, 4)
   assert.equal(windowTarget(state.window)!.width, 1000 / 3 - 8)
   const applied = JSON.stringify(state.window.windows)
-  applyWindowAction(state, 'window_cancel')
+  applyWindowAction(state, 'window')
   assert.equal(JSON.stringify(state.window.windows), applied)
   applyWindowAction(state, 'window_undo')
   assert.equal(JSON.stringify(state.window.windows), before)
@@ -149,12 +147,11 @@ test('temporary Normal preserves target and substate without a double-tap state'
   const state = createSimulatorState()
   enterWindow(state)
   applyWindowAction(state, 'window_size')
-  applyWindowAction(state, 'window_layout', {}, 1000)
+  applyWindowAction(state, 'window_quick', {}, 1000)
   const before = JSON.stringify(state.window.windows)
   temporaryWindow(state.window, true)
   applyWindowAction(state, 'window_right')
   temporaryWindow(state.window, false)
-  applyWindowAction(state, 'window_layout', {}, 1100)
   assert.equal(JSON.stringify(state.window.windows), before)
   assert.equal(state.window.size, true)
   assert.equal(state.window.panel, 'quick')
@@ -175,7 +172,7 @@ test('all tiling counts have equal areas and contain no empty or overlapping cel
 test('physical Window bindings honor custom aliases and independent Normal controls', () => {
   const document = { key_aliases: { windows: { Primary: 'right_alt' } },
     normal: { bindings: { a: 'move_left' } }, window: { temporary_mode: 'normal', temporary_mode_keys: ['primary'],
-      bindings: { a: 'window_layout', 'primary+q': 'window_exit', x: 'window_undo', z: 'none' } } }
+      bindings: { a: 'window_quick', 'primary+q': 'window_exit', x: 'window_undo', z: 'none' } } }
   const pressed = ['right_alt', 'a']
   assert.deepEqual(temporaryPhysicalKeys(document, 'window', pressed, false), ['right_alt'])
   assert.equal(resolvePhysicalBinding(document, 'window', pressed, 'a', false), undefined)
@@ -214,21 +211,19 @@ test('number parsing waits only for live ambiguous prefixes and never activates 
   assert.equal(state.window.numberDeadline, null)
 })
 
-test('compiled layout directions honor aliases, inheritance, WASD, and extra modifiers', () => {
-  const document = { key_aliases: { west: 'a' }, normal: { inherits: ['hotkeys'], bindings: { west: 'move_left', w: 'move_up', d: 'move_right', s: 'move_down', h: 'none' } }, hotkeys: { h: 'move_left' } }
-  const compiled = compileWindowLayoutBindings(document, false)
-  assert.equal(resolveWindowLayoutBinding(compiled, ['a'], 'a'), 'window_layout_left')
-  assert.equal(resolveWindowLayoutBinding(compiled, ['left_shift', 'a'], 'a'), 'window_split_left')
-  assert.equal(resolveWindowLayoutBinding(compiled, ['right_ctrl', 'd'], 'd'), 'window_ratio_right')
-  assert.equal(resolveWindowLayoutBinding(compiled, ['h'], 'h'), undefined)
-  assert.equal(resolveWindowLayoutBinding(compiled, ['left_alt', 'a'], 'a'), undefined)
+test('independent layout bindings honor aliases, inheritance and explicit modifiers', () => {
+  const document = { key_aliases: { west: 'a' }, window_quick: { bindings: { west: 'window_layout_left', h: 'none' } }, window_editor: { inherits: ['window_quick'], bindings: { 'shift+west': 'window_split_left', 'ctrl+d': 'window_ratio_right' } }, normal: { bindings: { a: 'move_right' } } }
+  assert.equal(resolvePhysicalBinding(document, 'window_quick', ['a'], 'a', false)?.value, 'window_layout_left')
+  assert.equal(resolvePhysicalBinding(document, 'window_editor', ['left_shift', 'a'], 'a', false)?.value, 'window_split_left')
+  assert.equal(resolvePhysicalBinding(document, 'window_editor', ['right_ctrl', 'd'], 'd', false)?.value, 'window_ratio_right')
+  assert.equal(resolvePhysicalBinding(document, 'window_quick', ['h'], 'h', false)?.value, 'none')
 })
 
 test('tree splits, moves into empty slots, swaps, and exits without reverting', () => {
   const state = createSimulatorState(); enterWindow(state)
-  applyWindowAction(state, 'window_layout')
+  applyWindowAction(state, 'window_quick')
   const before = JSON.stringify(state.window.windows)
-  applyWindowAction(state, 'window_edit')
+  applyWindowAction(state, 'window_editor')
   assert.equal(state.window.panel, 'tree')
   const count = treeSlots(state.window.tree!).length
   applyWindowAction(state, 'window_split_right')
@@ -237,6 +232,7 @@ test('tree splits, moves into empty slots, swaps, and exits without reverting', 
   const source = state.window.target!
   chooseWindowNumber(state, state.window.numbers[source])
   assert.equal(state.window.swapSource, source)
+  if (state.mode !== 'window_editor') applyWindowAction(state, 'window_editor')
   windowSelectionKey(state, '`', {})
   windowSelectionKey(state, String(empty.id), {})
   assert.equal(treeSlots(state.window.tree!).find(s => s.id === empty.id)!.window, source)
@@ -248,7 +244,7 @@ test('tree splits, moves into empty slots, swaps, and exits without reverting', 
   assert.equal(treeSlots(state.window.tree!).find(s => s.id === oldTargetSlot)!.window, source)
   assert.equal(treeSlots(state.window.tree!).find(s => s.id === oldSourceSlot)!.window, another.id)
   const applied = JSON.stringify(state.window.windows)
-  applyWindowAction(state, 'window_cancel')
+  applyWindowAction(state, 'window')
   assert.equal(JSON.stringify(state.window.windows), applied)
   applyWindowAction(state, 'window_undo')
   assert.equal(JSON.stringify(state.window.windows), before)
@@ -260,7 +256,7 @@ test('tree minimum sizes constrain the divider and infeasible splits leave geome
     { id: 1, title: 'Small', app: 'Demo', screen: 0, x: 0, y: 0, width: 220, height: 650 },
     { id: 2, title: 'Constrained', app: 'ChatGPT', screen: 0, x: 240, y: 0, width: 760, height: 650, minWidth: 720, minHeight: 620 },
   ]
-  enterWindow(state); applyWindowAction(state, 'window_layout'); applyWindowAction(state, 'window_edit')
+  enterWindow(state); applyWindowAction(state, 'window_quick'); applyWindowAction(state, 'window_editor')
   assert.equal(state.window.panel, 'tree')
   applyWindowAction(state, 'window_ratio_right')
   assert.ok(windowTarget(state.window)!.width >= 720 - 1e-6)
@@ -273,36 +269,36 @@ test('tree minimum sizes constrain the divider and infeasible splits leave geome
 test('leaving tree editing is one ordinary undo, and closing windows preserves empty slots and numbering', () => {
   const state = createSimulatorState(); enterWindow(state)
   const before = JSON.stringify(state.window.windows)
-  applyWindowAction(state, 'window_layout'); applyWindowAction(state, 'window_edit')
+  applyWindowAction(state, 'window_quick'); applyWindowAction(state, 'window_editor')
   applyWindowAction(state, 'window_split_right'); applyWindowAction(state, 'window_ratio_left')
-  applyWindowAction(state, 'window_cancel')
+  applyWindowAction(state, 'window')
   assert.equal(state.window.history.length, 1)
   applyWindowAction(state, 'window_undo')
   assert.equal(JSON.stringify(state.window.windows), before)
-  applyWindowAction(state, 'window_layout'); applyWindowAction(state, 'window_edit')
+  applyWindowAction(state, 'window_quick'); applyWindowAction(state, 'window_editor')
   const count = treeSlots(state.window.tree!).length, numbers = { ...state.window.numbers }
   const closing = state.window.windows.find(w => w.screen === 0 && w.id !== state.window.target)!
   state.window.windows = state.window.windows.filter(w => w.id !== closing.id); refreshWindowNumbers(state.window)
   assert.equal(treeSlots(state.window.tree!).length, count)
   assert.ok(treeSlots(state.window.tree!).some(s => s.window === null))
   assert.deepEqual(state.window.numbers, numbers)
-  applyWindowAction(state, 'window_cancel')
+  applyWindowAction(state, 'window')
   assert.ok(!state.window.windows.some(w => w.id === closing.id))
 })
 
 
-test('ordinary Window directions reuse Normal movement without implicit arrow bindings', () => {
-  const bindings = compileWindowLayoutBindings({ normal: { bindings: { v: 'move_left', l: 'move_right' } } }, false)
-  assert.equal(resolveWindowLayoutBinding(bindings, ['v'], 'v', false), 'window_left')
-  assert.equal(resolveWindowLayoutBinding(bindings, ['left'], 'left', false), undefined)
-  assert.equal(resolveWindowLayoutBinding(bindings, ['shift', 'v'], 'v', false), undefined)
-  assert.equal(resolveWindowLayoutBinding(bindings, ['v'], 'v'), 'window_layout_left')
+test('Window directions are independent of Normal bindings', () => {
+  const document = { window: { bindings: { h: 'window_left' } }, normal: { bindings: { v: 'move_left' } } }
+  assert.equal(resolvePhysicalBinding(document, 'window', ['h'], 'h', false)?.value, 'window_left')
+  assert.equal(resolvePhysicalBinding(document, 'window', ['v'], 'v', false), undefined)
+  assert.equal(resolvePhysicalBinding(document, 'window', ['left'], 'left', false), undefined)
 })
 
-test('backtick enters auto layout and region selection activates its window', () => {
+test('backtick in Editor selects a region and region selection activates its window', () => {
   const state = createSimulatorState()
   enterWindow(state)
   const before = structuredClone(state.window.windows)
+  if (state.mode !== 'window_editor') applyWindowAction(state, 'window_editor')
   windowSelectionKey(state, '`', {})
   assert.equal(state.window.panel, 'tree')
   assert.notDeepEqual(state.window.windows, before)
@@ -317,6 +313,7 @@ test('continuous divider motion is one undo and X removes a region with stable I
   const state = createSimulatorState()
   state.window.windows = [{ id: 1, title: 'One', app: 'Demo', screen: 0, x: 100, y: 100, width: 600, height: 400 }]
   enterWindow(state)
+  if (state.mode !== 'window_editor') applyWindowAction(state, 'window_editor')
   windowSelectionKey(state, '`', {})
   applyWindowAction(state, 'window_split_right')
   const before = structuredClone(state.window.tree)
@@ -332,4 +329,52 @@ test('continuous divider motion is one undo and X removes a region with stable I
   assert.equal(state.window.windows.length, 1)
   applyWindowAction(state, 'window_undo')
   assert.equal(treeSlots(state.window.tree!).length, 2)
+})
+
+
+test('all window modes launch directly from Idle and share session numbers', () => {
+  for (const mode of ['window', 'window_quick', 'window_editor', 'window_restore', 'window_delete']) {
+    const state = createSimulatorState(); state.mode = 'idle'
+    applyWindowAction(state, mode)
+    assert.equal(state.mode, mode)
+    const target = state.window.target, numbers = { ...state.window.numbers }
+    applyWindowAction(state, mode === 'window_restore' ? 'window_delete' : 'window_restore')
+    assert.equal(state.window.target, target)
+    assert.deepEqual(state.window.numbers, numbers)
+    applyModeAction(state, 'grid')
+    assert.equal(state.mode, 'grid')
+    assert.equal(state.window.library, false)
+  }
+})
+
+test('Quick uses independently configured ratios', () => {
+  const state = createSimulatorState(); applyWindowAction(state, 'window_quick', { split_ratios: [.2, .4, .6, .8] })
+  applyWindowAction(state, 'window_layout_left')
+  assert.equal(windowTarget(state.window)!.width, 392)
+  applyWindowAction(state, 'window_layout_left')
+  assert.equal(windowTarget(state.window)!.width, 192)
+})
+
+
+test('state cycle preserves target, restores original geometry and rejects old names and supports undo', () => {
+  const state = createSimulatorState()
+  enterWindow(state)
+  const target = windowTarget(state.window)!
+  const original = { x: target.x, y: target.y, width: target.width, height: target.height }
+  for (const old of ['window_maximize', 'window_cycle_state']) assert.equal(applyWindowAction(state, old), false)
+  for (let i = 0; i < 2; i++) {
+    applyWindowAction(state, 'size_cycle')
+    assert.equal(target.width, WINDOW_AREA.width)
+    applyWindowAction(state, 'size_cycle')
+    assert.equal(target.minimized, true)
+    assert.equal(windowTarget(state.window)?.id, target.id)
+    applyWindowAction(state, 'size_cycle')
+    assert.equal(target.minimized, false)
+    assert.deepEqual({ x: target.x, y: target.y, width: target.width, height: target.height }, original)
+  }
+  applyWindowAction(state, 'window_undo')
+  assert.equal(windowTarget(state.window)?.minimized, true)
+  applyWindowAction(state, 'window_undo')
+  assert.equal(!!windowTarget(state.window)?.minimized, false)
+  assert.equal(windowTarget(state.window)?.width, WINDOW_AREA.width)
 })

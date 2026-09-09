@@ -449,6 +449,10 @@ enum ModeName {
     RecursiveGrid,
     UiHint,
     Window,
+    WindowQuick,
+    WindowEditor,
+    WindowRestore,
+    WindowDelete,
     Shared(Arc<str>),
 }
 
@@ -471,6 +475,10 @@ impl ModeId {
                 "recursive_grid" => ModeName::RecursiveGrid,
                 "ui_hint" => ModeName::UiHint,
                 "window" => ModeName::Window,
+                "window_quick" => ModeName::WindowQuick,
+                "window_editor" => ModeName::WindowEditor,
+                "window_restore" => ModeName::WindowRestore,
+                "window_delete" => ModeName::WindowDelete,
                 _ => ModeName::Shared(Arc::from(value)),
             };
             Ok(Self(name))
@@ -479,14 +487,18 @@ impl ModeId {
         }
     }
 
-    /// The ids of the five built-in modes.
-    pub const BUILT_IN: [&'static str; 6] = [
+    /// The ids of the built-in modes.
+    pub const BUILT_IN: [&'static str; 10] = [
         "idle",
         "normal",
         "grid",
         "recursive_grid",
         "ui_hint",
         "window",
+        "window_quick",
+        "window_editor",
+        "window_restore",
+        "window_delete",
     ];
 
     /// Whether `name` could name a mode in configuration.
@@ -517,6 +529,28 @@ impl ModeId {
         Self(ModeName::Window)
     }
 
+    pub fn window_quick() -> Self {
+        Self(ModeName::WindowQuick)
+    }
+    pub fn window_editor() -> Self {
+        Self(ModeName::WindowEditor)
+    }
+    pub fn window_restore() -> Self {
+        Self(ModeName::WindowRestore)
+    }
+    pub fn window_delete() -> Self {
+        Self(ModeName::WindowDelete)
+    }
+    pub fn is_window(&self) -> bool {
+        matches!(
+            self.0,
+            ModeName::Window
+                | ModeName::WindowQuick
+                | ModeName::WindowEditor
+                | ModeName::WindowRestore
+                | ModeName::WindowDelete
+        )
+    }
     pub fn as_str(&self) -> &str {
         match &self.0 {
             ModeName::Idle => "idle",
@@ -525,6 +559,10 @@ impl ModeId {
             ModeName::RecursiveGrid => "recursive_grid",
             ModeName::UiHint => "ui_hint",
             ModeName::Window => "window",
+            ModeName::WindowQuick => "window_quick",
+            ModeName::WindowEditor => "window_editor",
+            ModeName::WindowRestore => "window_restore",
+            ModeName::WindowDelete => "window_delete",
             ModeName::Shared(name) => name,
         }
     }

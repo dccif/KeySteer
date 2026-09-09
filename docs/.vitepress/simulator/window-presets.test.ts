@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { readFileSync } from 'node:fs'
-import { createSimulatorState } from './state.ts'
+import { createSimulatorState, applyModeAction } from './state.ts'
 import { applyWindowAction, enterWindow, saveWindowLayout, restoreWindowLayout, windowSelectionKey } from './window.ts'
 import { decodeLayoutFile, encodeLayoutFile, instantiateLayout, readSavedLayouts, savedLayoutName } from './window-presets.ts'
 import type { RegionTemplate, SavedWindowLayout } from './window-presets.ts'
@@ -39,7 +39,7 @@ test('R then 1 restores a saved layout and extra windows stay put', () => {
   state.pointer = { x: 25, y: 25 }; enterWindow(state)
   state.window.presets = [preset(1)]
   const before = state.window.windows.map(w => ({ ...w }))
-  applyWindowAction(state, 'window_saved_layouts')
+  applyWindowAction(state, 'window_restore')
   assert.equal(state.window.library, true)
   assert.equal(windowSelectionKey(state, '1', {}), true)
   assert.equal(state.window.library, false)
@@ -52,7 +52,7 @@ test('R then 1 restores a saved layout and extra windows stay put', () => {
 test('notes and automatic names persist as geometry without app or window metadata', () => {
   const state = createSimulatorState()
   state.pointer = { x: 25, y: 25 }; enterWindow(state)
-  applyWindowAction(state, 'window_layout'); applyWindowAction(state, 'window_edit')
+  applyWindowAction(state, 'window_quick'); applyWindowAction(state, 'window_editor')
   applyWindowAction(state, 'window_save_layout'); assert.equal(state.window.noteOpen, true)
   saveWindowLayout(state, '  中文 🦀  ')
   assert.equal(savedLayoutName(state.window.presets[0]), '中文 🦀')
@@ -63,4 +63,51 @@ test('notes and automatic names persist as geometry without app or window metada
   assert.equal(savedLayoutName(empty), 'Layout 1 · 4 windows / 9 regions')
   assert.throws(() => readSavedLayouts('[{"id":1}]'))
   assert.throws(() => readSavedLayouts(JSON.stringify([{ ...empty, window_count: 10 }])))
+})
+
+
+test('Delete requires confirmation, preserves IDs and produces a valid empty file', () => {
+  const state = createSimulatorState(); enterWindow(state)
+  state.window.presets = [{ ...preset(1), id: 2 }, { ...preset(1), id: 7 }]
+  applyWindowAction(state, 'window_delete')
+  windowSelectionKey(state, '7', {})
+  assert.equal(state.window.presets.length, 2)
+  assert.equal(state.window.deleteSelection?.id, 7)
+  applyWindowAction(state, 'window_restore')
+  applyWindowAction(state, 'window_delete')
+  applyWindowAction(state, 'window_confirm')
+  assert.equal(state.window.presets.length, 2)
+  for (const id of [7, 2]) {
+    windowSelectionKey(state, String(id), {})
+    applyWindowAction(state, 'window_confirm')
+    assert.equal(state.mode, 'window_delete')
+  }
+  assert.deepEqual(decodeLayoutFile(encodeLayoutFile(state.window.presets)), [])
+})
+
+test('Delete refuses a record replaced after selection', () => {
+  const state = createSimulatorState(); enterWindow(state)
+  state.window.presets = [preset(1)]
+  applyWindowAction(state, 'window_delete'); windowSelectionKey(state, '1', {})
+  state.window.presets[0] = { ...state.window.presets[0], note: 'Changed' }
+  applyWindowAction(state, 'window_confirm')
+  assert.equal(state.window.presets.length, 1)
+  assert.equal(state.window.deleteSelection, null)
+})
+
+test('Restore uses lifecycle targets and failed fitting stays in Restore', () => {
+  const state = createSimulatorState(); enterWindow(state)
+  state.window.presets = [preset(1)]
+  applyWindowAction(state, 'window_restore')
+  windowSelectionKey(state, '1', { lifecycle: { after_finish: 'keep' } })
+  assert.equal(state.mode, 'window_restore')
+  assert.equal(state.window.library, true)
+  state.window.windows.forEach(w => { w.minWidth = 5000 })
+  const before = JSON.stringify(state.window.windows)
+  windowSelectionKey(state, '1', { lifecycle: { after_finish: 'idle' } })
+  assert.equal(state.mode, 'window_restore')
+  assert.equal(JSON.stringify(state.window.windows), before)
+  state.window.windows.forEach(w => { w.minWidth = 10 })
+  windowSelectionKey(state, '1', { lifecycle: { after_finish: 'idle' } })
+  assert.equal(state.mode, 'idle')
 })

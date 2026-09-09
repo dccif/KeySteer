@@ -9,9 +9,8 @@ import {
   movePointer,
   toggleButton,
 } from '../simulator/state'
-import { compileWindowLayoutBindings, effectiveBindings, resolveBinding, resolvePhysicalBinding, resolveWindowLayoutBinding, temporaryPhysicalKeys } from '../simulator/bindings'
-import type { WindowLayoutBinding } from '../simulator/bindings'
-import { applyWindowAction, chooseWindowNumber, enterWindow, finishWindowNumber, hasWindowLayoutChanges, replaceWindowLayouts, restoreWindowLayout, saveWindowLayout, setDemoWindowCount, temporaryWindow, windowActionAvailable, windowDetail, windowInputStatus, windowSelectionKey, windowTarget, WINDOW_AREA, WINDOW_MOTION } from '../simulator/window'
+import { effectiveBindings, resolveBinding, resolvePhysicalBinding, temporaryPhysicalKeys } from '../simulator/bindings'
+import { applyWindowAction, chooseWindowNumber, switchWindowMode, isWindowMode, finishWindowNumber, hasWindowLayoutChanges, replaceWindowLayouts, restoreWindowLayout, saveWindowLayout, setDemoWindowCount, temporaryWindow, windowActionAvailable, windowDetail, windowInputStatus, windowSelectionKey, windowTarget, WINDOW_AREA, WINDOW_MOTION } from '../simulator/window'
 import { decodeLayoutFile, encodeLayoutFile, LAYOUT_STORAGE_KEY, readSavedLayouts, savedLayoutName } from '../simulator/window-presets'
 import type { WindowState } from '../simulator/window'
 import { layoutRect, quickCaption, quickRect, treeSlots } from '../simulator/window-layout'
@@ -25,7 +24,7 @@ import {
   type ConfigDocument,
 } from '../config-studio/document'
 
-type EditorMode = 'hotkeys' | 'normal' | 'grid' | 'recursive_grid' | 'ui_hint' | 'window'
+type EditorMode = 'hotkeys' | 'normal' | 'grid' | 'recursive_grid' | 'ui_hint' | 'window' | 'window_quick' | 'window_editor' | 'window_restore' | 'window_delete'
 type Modifier = 'primary' | 'shift' | 'alt'
 type Appearance = 'dark' | 'light'
 
@@ -61,16 +60,22 @@ const modes: Array<{ id: EditorMode; label: string }> = [
   { id: 'recursive_grid', label: 'Recursive Grid' },
   { id: 'ui_hint', label: 'UI Hint' },
   { id: 'window', label: 'Window' },
+  ...(['window_quick', 'window_editor', 'window_restore', 'window_delete'] as const).map(id => ({ id, label: id })),
 ]
 
 const actionGroups: ActionGroup[] = [
   { name: 'Window', actions: [
     ['window_left', '窗口向左'], ['window_down', '窗口向下'], ['window_up', '窗口向上'], ['window_right', '窗口向右'],
-    ['window_size', '移动／缩放'], ['window_layout', '快速布局'], ['window_edit', '编辑布局树'], ['window_tile', '直接平铺'],
+    ['window_size', '移动／缩放'], ['window_quick', '快速布局'], ['window_editor', '编辑布局树'], ['window_tile', '直接平铺'],
     ['window_screen_next', '循环切屏'],
-    ['window_maximize', '最大化／还原'], ['window_center', '窗口居中'], ['window_select', '切换下一个窗口'],
-    ['window_undo', '撤销窗口调整'], ['window_remove_region', '删除当前区域'], ['window_saved_layouts', '保存的布局'], ['window_save_layout', '保存布局'], ['window_cancel', '返回／退出'], ['window_exit', '退出 Window'],
+    ['size_cycle', '最大化／最小化／还原'], ['window_center', '窗口居中'], ['window_select', '切换下一个窗口'],
+    ['window_undo', '撤销窗口调整'], ['window_remove_region', '删除当前区域'], ['window_restore', '保存的布局'], ['window_save_layout', '保存布局'], ['window_confirm', '确认'],
   ].map(([value, label]) => ({ value, label })) },
+  { name: '窗口布局方向', actions: ['left', 'down', 'up', 'right'].flatMap(direction => [
+    { value: `window_layout_${direction}`, label: `布局方向 ${direction}` },
+    { value: `window_split_${direction}`, label: `切分 ${direction}` },
+    { value: `window_ratio_${direction}`, label: `移动分割线 ${direction}` },
+  ]) },
   { name: '按键提示', actions: [
     { value: 'key_help', label: '切换按键提示' },
   ] },
@@ -116,7 +121,7 @@ const actionGroups: ActionGroup[] = [
     actions: [
       ['normal', 'Normal'], ['grid', 'Grid'],
       ['recursive_grid', 'Recursive Grid'], ['ui_hint', 'UI Hint'],
-      ['idle', 'Idle'], ['window', 'Window'],
+      ['idle', 'Idle'], ['window', 'Window'], ['window_quick', 'Quick'], ['window_editor', 'Editor'], ['window_restore', 'Restore'], ['window_delete', 'Delete layouts'],
     ].map(([value, label]) => ({ value, label })),
   },
   {
@@ -209,7 +214,7 @@ export default defineComponent({
         if (file.size > 1024 * 1024) throw new Error('布局文件超过 1 MiB')
         const layouts = decodeLayoutFile(new Uint8Array(await file.arrayBuffer()))
         replaceWindowLayouts(simulator, layouts); layoutStorageError.value = ''; persistLayoutLibrary()
-        simulator.window.library = true; simulator.lastEvent = `已导入 ${layouts.length} 个布局`
+        switchWindowMode(simulator, 'window_restore', effectiveDocument.value?.window_restore ?? {}); simulator.lastEvent = `已导入 ${layouts.length} 个布局`
       } catch (error) { simulator.lastEvent = `导入失败：${formatError(error)}` }
       finally { input.value = '' }
     }
@@ -269,11 +274,11 @@ export default defineComponent({
 
     const targetingVisual = computed(() => targetingAppearance(effectiveDocument.value, simulator.mode, appearance.value))
     const targetingSettings = computed(() => effectiveDocument.value?.[simulator.mode] ?? {})
-    const windowLayoutBindings = computed(() => compileWindowLayoutBindings(effectiveDocument.value ?? {}, isMac.value))
+    const temporaryMode = computed(() => String(targetingSettings.value.temporary_mode ?? 'normal'))
     let windowNumberTimer: ReturnType<typeof setTimeout> | undefined
-    watch(() => simulator.mode === 'window' && !simulator.window.temporary ? simulator.window.numberDeadline : null, deadline => {
+    watch(() => isWindowMode(simulator.mode) && !simulator.window.temporary ? simulator.window.numberDeadline : null, deadline => {
       clearTimeout(windowNumberTimer)
-      if (deadline !== null) windowNumberTimer = setTimeout(() => finishWindowNumber(simulator, effectiveDocument.value?.window ?? {}), Math.max(0, deadline - Date.now()))
+      if (deadline !== null) windowNumberTimer = setTimeout(() => finishWindowNumber(simulator, effectiveDocument.value?.[simulator.mode] ?? {}), Math.max(0, deadline - Date.now()))
     })
     onBeforeUnmount(() => clearTimeout(windowNumberTimer))
     const editorVisual = computed(() => editorAppearance(effectiveDocument.value, appearance.value))
@@ -316,7 +321,7 @@ export default defineComponent({
           )
           if (result.layouts !== undefined) {
             replaceWindowLayouts(simulator, result.layouts); layoutStorageError.value = ''; persistLayoutLibrary()
-            setPreviewMode('window'); simulator.window.library = true
+            setPreviewMode('window_restore')
             message.value = `已从 KeySteer 同时导入按键配置和 ${result.layouts.length} 个布局`
           }
           if (result.layoutError) message.value += `；布局未导入：${result.layoutError}`
@@ -401,14 +406,18 @@ export default defineComponent({
 
     function resolveAction(chord: string): string[] {
       if (!effectiveDocument.value) return []
-      const lookupMode = simulator.mode === 'idle' ? 'hotkeys' : simulator.mode === 'window' && simulator.window.temporary ? 'normal' : simulator.mode
+      const lookupMode = simulator.mode === 'idle' ? 'hotkeys' : isWindowMode(simulator.mode) && simulator.window.temporary ? temporaryMode.value : simulator.mode
       const binding = resolveBinding(effectiveDocument.value, lookupMode, chord)?.value
       if (Array.isArray(binding)) return binding.map(String)
       return typeof binding === 'string' ? [binding] : []
     }
 
     function executeAction(action: string, continuous = false): void {
-      if (applyWindowAction(simulator, action, effectiveDocument.value?.window ?? {}, Date.now(), continuous ? .016 : undefined)) return
+      if (action === 'window_restore' || action === 'window_delete' || action === 'window_confirm' && simulator.mode === 'window_delete' && simulator.window.deleteSelection) {
+        try { simulator.window.presets = readSavedLayouts(localStorage.getItem(LAYOUT_STORAGE_KEY)) }
+        catch (error) { layoutStorageError.value = formatError(error); simulator.lastEvent = layoutStorageError.value; return }
+      }
+      if (applyWindowAction(simulator, action, effectiveDocument.value?.[isWindowMode(action) ? action : simulator.mode] ?? {}, Date.now(), continuous ? .016 : undefined)) { persistLayoutLibrary(); return }
       if (applyKeyHelpAction(simulator, action, effectiveDocument.value?.key_help?.enabled !== false)) return
       if (MOVEMENT_ACTIONS.has(action)) {
         movePointer(simulator, action, continuous ? 0.45 : 2.5)
@@ -449,7 +458,7 @@ export default defineComponent({
       const physical = physicalKey(event)
       physicalKeys.add(physical)
       updateTemporaryWindow(event)
-      if (event.key === 'Escape' && simulator.mode !== 'window') {
+      if (event.key === 'Escape' && !isWindowMode(simulator.mode)) {
         simulatorArmed.value = false
         heldActions.clear(); heldCharacterActions.clear()
         return
@@ -457,20 +466,14 @@ export default defineComponent({
       const document = effectiveDocument.value
       if (document) {
         const pressed = currentPhysicalKeys(event)
-        const launcher = resolvePhysicalBinding(document, 'hotkeys', pressed, physical, isMac.value)
-        if (simulator.mode === 'window') {
-          const local = resolvePhysicalBinding(document, 'window', pressed, physical, isMac.value, true)
-          const temporary = simulator.window.temporary ? temporaryPhysicalKeys(document, 'window', pressed, isMac.value) : []
-          if (!temporary.length && pressed.length === 1 && windowSelectionKey(simulator, physical, document.window ?? {})) { event.preventDefault(); return }
-          let resolved = local ?? (temporary.length
-            ? resolvePhysicalBinding(document, String(document.window?.temporary_mode ?? 'normal'), pressed.filter(k => !temporary.includes(k)), physical, isMac.value)
-            : resolvePhysicalBinding(document, 'window', pressed, physical, isMac.value))
-          if (!temporary.length) {
-            const direction = resolveWindowLayoutBinding(windowLayoutBindings.value, pressed, physical, simulator.window.panel !== 'none')
-            const reserved = simulator.window.panel === 'none' && !!resolved || resolved?.value === 'window_edit'
-            if (!reserved && direction && windowActionAvailable(simulator.window, direction)) resolved = { value: direction, source: 'window' }
-          }
-          if (!temporary.length && resolved?.source === 'window' && !windowActionAvailable(simulator.window, String(resolved.value))) resolved = undefined
+        if (isWindowMode(simulator.mode)) {
+          const local = resolvePhysicalBinding(document, simulator.mode, pressed, physical, isMac.value, true)
+          const temporary = simulator.window.temporary ? temporaryPhysicalKeys(document, simulator.mode, pressed, isMac.value) : []
+          let resolved = (temporary.length ? undefined : local) ?? (temporary.length
+            ? resolvePhysicalBinding(document, String(document[simulator.mode]?.temporary_mode ?? 'normal'), pressed.filter(k => !temporary.includes(k)), physical, isMac.value)
+            : resolvePhysicalBinding(document, simulator.mode, pressed, physical, isMac.value))
+          if (!temporary.length && resolved && !windowActionAvailable(simulator.window, String(resolved.value))) resolved = undefined
+          if (!resolved && !temporary.length && pressed.length === 1 && windowSelectionKey(simulator, physical, document[simulator.mode] ?? {})) { event.preventDefault(); persistLayoutLibrary(); return }
           if (resolved) {
             event.preventDefault()
             const actions = Array.isArray(resolved.value) ? resolved.value.map(String) : [String(resolved.value)]
@@ -483,8 +486,12 @@ export default defineComponent({
           }
           if (temporary.includes(physical)) { event.preventDefault(); return }
           event.preventDefault(); return
-        } else if (launcher?.value === 'window') {
-          event.preventDefault(); heldActions.clear(); executeAction('window'); return
+        } else {
+          const resolved = resolvePhysicalBinding(document, simulator.mode === 'idle' ? 'hotkeys' : simulator.mode, pressed, physical, isMac.value)
+          const actions = Array.isArray(resolved?.value) ? resolved.value.map(String) : [String(resolved?.value)]
+          if (actions.some(action => ['idle', 'normal', 'grid', 'recursive_grid', 'ui_hint'].includes(action) || isWindowMode(action))) {
+            event.preventDefault(); heldActions.clear(); actions.forEach(action => executeAction(action)); return
+          }
         }
       }
       const character = event.key.toLowerCase()
@@ -527,14 +534,13 @@ export default defineComponent({
       return keys
     }
     function updateTemporaryWindow(event: KeyboardEvent): void {
-      if (simulator.mode !== 'window' || !effectiveDocument.value) return
+      if (!isWindowMode(simulator.mode) || !effectiveDocument.value) return
       const pressed = currentPhysicalKeys(event), physical = physicalKey(event)
-      const local = resolvePhysicalBinding(effectiveDocument.value, 'window', pressed, physical, isMac.value, true)
-      const direction = resolveWindowLayoutBinding(windowLayoutBindings.value, pressed, physical, simulator.window.panel !== 'none')
-      const ownChord = pressed.length > 1 && (local?.source === 'window' && windowActionAvailable(simulator.window, String(local.value)) || !!direction && windowActionAvailable(simulator.window, direction))
-      const active = !ownChord && temporaryPhysicalKeys(effectiveDocument.value, 'window', pressed, isMac.value).length > 0
+      const local = resolvePhysicalBinding(effectiveDocument.value, simulator.mode, pressed, physical, isMac.value, true)
+      const ownChord = pressed.length > 1 && !!local && windowActionAvailable(simulator.window, String(local.value))
+      const active = !ownChord && temporaryPhysicalKeys(effectiveDocument.value, simulator.mode, pressed, isMac.value).length > 0
       if (active !== simulator.window.temporary) heldActions.clear()
-      temporaryWindow(simulator.window, active, effectiveDocument.value.window ?? {})
+      temporaryWindow(simulator.window, active, effectiveDocument.value[simulator.mode] ?? {})
     }
     function onSimulatorKeyUp(event: KeyboardEvent): void {
       physicalKeys.delete(physicalKey(event))
@@ -554,7 +560,7 @@ export default defineComponent({
       const delta = previousFrame ? Math.min(32, timestamp - previousFrame) : 16
       previousFrame = timestamp
       heldActions.forEach((action) => {
-        if (WINDOW_MOTION.has(action)) applyWindowAction(simulator, action, effectiveDocument.value?.window ?? {}, Date.now(), delta / 1000)
+        if (WINDOW_MOTION.has(action)) applyWindowAction(simulator, action, effectiveDocument.value?.[simulator.mode] ?? {}, Date.now(), delta / 1000)
         else movePointer(simulator, action, delta * 0.028)
       })
       animationFrame = requestAnimationFrame(animate)
@@ -580,10 +586,10 @@ export default defineComponent({
       return true
     }
 
-    function setPreviewMode(mode: 'normal' | 'grid' | 'recursive_grid' | 'ui_hint' | 'window'): void {
+    function setPreviewMode(mode: 'normal' | 'grid' | 'recursive_grid' | 'ui_hint' | 'window' | 'window_quick' | 'window_editor' | 'window_restore' | 'window_delete'): void {
       heldActions.clear(); physicalKeys.clear()
-      if (mode === 'window') enterWindow(simulator)
-      else simulator.mode = mode
+      if (isWindowMode(mode)) switchWindowMode(simulator, mode, effectiveDocument.value?.[mode] ?? {})
+      else applyModeAction(simulator, mode)
       simulator.lastEvent = `预览 ${mode}`
     }
 
@@ -688,11 +694,11 @@ export default defineComponent({
                 <span class={{ 'ks-status': true, armed: simulatorArmed.value }}>{simulatorArmed.value ? '键盘已捕获' : '点击预览可试按键'}</span>
               </div>
               <div class="ks-simulator-modes" aria-label="预览模式">
-                {(['normal', 'grid', 'recursive_grid', 'ui_hint', 'window'] as const).map((mode) => (
+                {(['normal', 'grid', 'recursive_grid', 'ui_hint', 'window', 'window_quick', 'window_editor', 'window_restore', 'window_delete'] as const).map((mode) => (
                   <button class={{ active: simulator.mode === mode }} onClick={() => setPreviewMode(mode)}>{mode}</button>
                 ))}
               </div>
-              {simulator.mode === 'window' && <div class="ks-layout-file-tools"><input ref={layoutFileInput} type="file" accept=".kslayout,application/octet-stream" aria-label="导入布局文件" hidden onChange={importLayoutFile} />
+              {isWindowMode(simulator.mode) && <div class="ks-layout-file-tools"><input ref={layoutFileInput} type="file" accept=".kslayout,application/octet-stream" aria-label="导入布局文件" hidden onChange={importLayoutFile} />
                     <button onClick={() => layoutFileInput.value?.click()}>导入布局文件</button><button onClick={downloadLayouts}>{hasWindowLayoutChanges(simulator.window) ? '保存并下载布局' : '下载布局文件'}</button>
                   </div>}
               <div
@@ -706,16 +712,16 @@ export default defineComponent({
                 onKeyup={onSimulatorKeyUp}
               >
                 <div class="ks-screen-grid" />
-                {simulator.mode !== 'window' && <DesktopBackdrop />}
-                {(simulator.mode !== 'window' || simulator.window.temporary) && <div class="ks-mode-badge">{simulator.mode === 'window' ? 'normal' : simulator.mode}</div>}
-                {simulator.mode === 'window' && <div class="ks-window-demo">
+                {!isWindowMode(simulator.mode) && <DesktopBackdrop />}
+                {(!isWindowMode(simulator.mode) || simulator.window.temporary) && <div class="ks-mode-badge">{isWindowMode(simulator.mode) ? temporaryMode.value : simulator.mode}</div>}
+                {isWindowMode(simulator.mode) && <div class="ks-window-demo">
                   <div class="ks-window-screen-label">示例屏幕 {simulator.window.screen + 1} / 2</div>
 
                   <label class="ks-window-count">示例窗口数 <select aria-label="示例窗口数量" value={simulator.window.windows.filter(w => w.screen === simulator.window.screen).length}
                     onChange={e => setDemoWindowCount(simulator, Number((e.target as HTMLSelectElement).value))}>
                     {[1, 3, 9, 20, 23, 30].map(count => <option value={count}>{count}</option>)}
                   </select></label>
-                  {simulator.window.windows.filter(w => w.screen === simulator.window.screen).map(w => <div
+                  {simulator.window.windows.filter(w => !w.minimized && w.screen === simulator.window.screen).map(w => <div
                     class={{ 'ks-demo-window': true, target: w.id === simulator.window.target && !simulator.window.temporary }}
                     style={{ left: `${w.x / WINDOW_AREA.width * 100}%`, top: `${w.y / WINDOW_AREA.height * 100}%`, width: `${w.width / WINDOW_AREA.width * 100}%`, height: `${w.height / WINDOW_AREA.height * 100}%`, outlineWidth: `${numberSetting(targetingSettings.value.border_width, 3)}px`, zIndex: w.id === simulator.window.target ? 2 : 1 }}>
                     <div class="ks-demo-window-title">{w.app} · {w.title}</div>
@@ -732,7 +738,7 @@ export default defineComponent({
                     </div>
                   })}
                 </div>}
-                {simulator.mode === 'window' && simulator.window.noteOpen && <div class="ks-layout-note-backdrop"><form class="ks-layout-note" aria-label="Save layout"
+                {isWindowMode(simulator.mode) && simulator.window.noteOpen && <div class="ks-layout-note-backdrop"><form class="ks-layout-note" aria-label="Save layout"
                   onSubmit={e => { e.preventDefault(); finishLayoutNote(true) }}
                   onKeydown={e => { e.stopPropagation(); if (e.key === 'Escape' && !e.isComposing) { e.preventDefault(); finishLayoutNote(false) } }} onKeyup={e => e.stopPropagation()}>
                   <div class="ks-layout-note-heading"><strong>{simulator.window.editingPresetId === null ? 'Save layout' : `Update layout ${simulator.window.editingPresetId}`}</strong><span>备注可留空，将自动命名</span></div>
@@ -746,17 +752,17 @@ export default defineComponent({
                   <span key={clickPulse.value} class={clickPulse.value ? 'pulse' : ''} />
                 </div>
                 {scrollPulse.value && <div class="ks-scroll-pulse">{scrollPulse.value}</div>}
-                {effectiveDocument.value && simulator.mode === 'window' && !simulator.window.temporary && !simulator.window.noteOpen && (
-                  <KeyHelpPreview document={effectiveDocument.value} mode="window" appearance={appearance.value}
+                {effectiveDocument.value && isWindowMode(simulator.mode) && !simulator.window.temporary && !simulator.window.noteOpen && (
+                  <KeyHelpPreview document={effectiveDocument.value} mode={simulator.mode} appearance={appearance.value}
                     anchor={simulator.window.library ? undefined : windowTarget(simulator.window)} detail={windowDetail(simulator.window)}
-                    onRestore={(id: number) => restoreWindowLayout(simulator, id, targetingSettings.value)}
-                    status={windowInputStatus(simulator.window) || (simulator.lastEvent.startsWith('window_') ? '' : simulator.lastEvent)}
-                    windowState={simulator.window} layoutBindings={windowLayoutBindings.value} />
+                    onRestore={(id: number) => { restoreWindowLayout(simulator, id, targetingSettings.value); persistLayoutLibrary() }}
+                    status={windowInputStatus(simulator.window) || ((simulator.lastEvent.startsWith('window_') || simulator.lastEvent === 'size_cycle') ? '' : simulator.lastEvent)}
+                    windowState={simulator.window} />
                 )}
-                {effectiveDocument.value && simulator.keyHelpVisible && simulator.mode !== 'idle' && (simulator.mode !== 'window' || simulator.window.temporary) && effectiveDocument.value.key_help?.enabled !== false && (
-                  <KeyHelpPreview document={effectiveDocument.value} mode={simulator.mode === 'window' ? 'normal' : simulator.mode} appearance={appearance.value} />
+                {effectiveDocument.value && simulator.keyHelpVisible && simulator.mode !== 'idle' && (!isWindowMode(simulator.mode) || simulator.window.temporary) && effectiveDocument.value.key_help?.enabled !== false && (
+                  <KeyHelpPreview document={effectiveDocument.value} mode={isWindowMode(simulator.mode) ? temporaryMode.value : simulator.mode} appearance={appearance.value} />
                 )}
-                {simulator.mode !== 'window' && <div class="ks-event-log">{simulator.lastEvent}</div>}
+                {!isWindowMode(simulator.mode) && <div class="ks-event-log">{simulator.lastEvent}</div>}
               </div>
               <div class="ks-toolbar ks-compact-toolbar">
                 <button class="ks-button" onClick={() => executeAction('key_help')}>切换按键提示预览</button>
@@ -766,8 +772,8 @@ export default defineComponent({
                 <ModeStyleControls document={document.value} effectiveDocument={effectiveDocument.value} mode="key_help" appearance={appearance.value}
                   onChange={(next) => { document.value = next }} onAppearanceChange={(next) => { appearance.value = next }} />
               )}
-              {simulator.mode === 'window' && <p class="ks-window-instructions">数字选窗；A 快速布局，使用 Normal 方向键调整比例，E 自动布局并进入编辑：Shift＋方向分区，Ctrl＋方向连续移动分割线，X 删除分区。A / E 可从窗口模式直接进入；Q 逐层返回，Z 撤销；按住 Primary 临时使用 Normal。这里只调整示例窗口。</p>}
-              {document.value && effectiveDocument.value && !editKeyHelp.value && (simulator.mode === 'grid' || simulator.mode === 'recursive_grid' || simulator.mode === 'ui_hint' || simulator.mode === 'window') && (
+              {isWindowMode(simulator.mode) && <p class="ks-window-instructions">数字选窗；A 快速布局，使用独立方向绑定调整比例，E 自动布局并进入编辑：Shift＋方向分区，Ctrl＋方向连续移动分割线，X 删除分区。A / E 可从窗口模式直接进入；Q 按当前模式绑定切换，Z 撤销；按住 Primary 临时使用 Normal。这里只调整示例窗口。</p>}
+              {document.value && effectiveDocument.value && !editKeyHelp.value && (simulator.mode === 'grid' || simulator.mode === 'recursive_grid' || simulator.mode === 'ui_hint' || isWindowMode(simulator.mode)) && (
                 <ModeStyleControls
                   document={document.value}
                   effectiveDocument={effectiveDocument.value}
@@ -1309,7 +1315,6 @@ const KeyHelpPreview = defineComponent({
     detail: { type: String, default: '' },
     status: { type: String, default: '' },
     windowState: { type: Object as () => WindowState },
-    layoutBindings: { type: Array as () => WindowLayoutBinding[], default: () => [] },
   },
   setup(props, { emit }) {
     const host = ref<HTMLElement>()
@@ -1322,20 +1327,20 @@ const KeyHelpPreview = defineComponent({
       if (host.value) observer.observe(host.value)
     })
     onBeforeUnmount(() => observer?.disconnect())
-    const entries = computed(() => keyHelpEntries(props.document, props.mode, props.windowState, props.layoutBindings))
+    const entries = computed(() => keyHelpEntries(props.document, props.mode, props.windowState))
     return () => {
       if (!props.document.key_help) return null
       const ui = keyHelpStyle(props.document.key_help)
-      const isWindow = props.mode === 'window'
+      const isWindow = isWindowMode(props.mode)
       if (isWindow) ui.title_font_size = ui.font_size * 1.75
-      const preview = props.windowState?.panel === 'quick' ? quickRect(props.windowState.quick) : null
+      const preview = props.mode === 'window_quick' && props.windowState?.panel === 'quick' ? quickRect(props.windowState.quick, props.windowState.ratios) : null
       const previewHeight = preview ? Math.min(84, size.value.height * .18) : 0
       const target = props.windowState ? windowTarget(props.windowState) : null
       const library = props.windowState?.library ? props.windowState : undefined
       const presets = library?.presets.slice(library.libraryPage * 6, library.libraryPage * 6 + 6) ?? []
-      const info = library ? [`输入布局编号恢复 · 第 ${library.libraryPage + 1} / ${Math.max(1, Math.ceil(library.presets.length / 6))} 页`,
+      const info = library ? [`${props.mode === 'window_delete' ? '输入编号选择要删除的布局' : '输入布局编号恢复'} · 第 ${library.libraryPage + 1} / ${Math.max(1, Math.ceil(library.presets.length / 6))} 页`,
         ...(presets.length ? presets.map(preset => `${preset.id}   ${savedLayoutName(preset)}`) : ['尚未保存布局，请先在编辑模式保存。'])]
-        : isWindow && target ? [target.app, target.title] : []
+        : isWindow && target ? [target.app, target.title, ...(target.minimized ? ['已最小化 · 再次循环可还原'] : [])] : []
       const statusHeight = (info.length + (props.status ? 1 : 0)) * ui.font_size * 1.8
       const anchorWidth = props.anchor ? props.anchor.width / WINDOW_AREA.width * size.value.width : size.value.width
       const anchorHeight = props.anchor ? props.anchor.height / WINDOW_AREA.height * size.value.height : size.value.height
@@ -1372,7 +1377,7 @@ const KeyHelpPreview = defineComponent({
             {[...info, ...(props.status ? [props.status] : [])].map((text, index) => <div onMousedown={e => e.preventDefault()} onClick={() => { if (library && presets[index - 1]) emit('restore', presets[index - 1].id) }} style={{ position: 'absolute', left: `${layout.padding}px`, top: `${ui.padding_y + layout.headerHeight + index * ui.font_size * 1.8}px`, width: `${layout.width - layout.padding * 2}px`, height: `${ui.font_size * 1.8}px`, fontSize: `${ui.font_size}px`, fontWeight: index === 0 && info.length ? '700' : '400', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', opacity: .9, pointerEvents: library && presets[index - 1] ? 'auto' : undefined, cursor: library && presets[index - 1] ? 'pointer' : undefined }}>{text}</div>)}
             {preview && <div class="ks-window-quick-preview" aria-label="Window 快速布局" style={{ left: `${layout.padding}px`, top: `${ui.padding_y + layout.headerHeight + statusHeight}px`, width: `${layout.width - layout.padding * 2}px`, height: `${previewHeight}px` }}>
               <span class="ks-help-layout-mini"><i style={{ left: `${preview.x * 100}%`, top: `${preview.y * 100}%`, width: `${preview.width * 100}%`, height: `${preview.height * 100}%` }} /></span>
-              <span>{quickCaption(props.windowState!.quick)}</span>
+              <span>{quickCaption(props.windowState!.quick, props.windowState!.ratios)}</span>
             </div>}
             {entries.value.map((entry, index) => {
               const column = Math.floor(index / layout.rows)
@@ -1411,7 +1416,7 @@ interface HelpEntry { keys: string; action: string }
 
 function windowNumberLabels(state: WindowState): Array<{ number: number; x: number; y: number; app: string; title: string }> {
   const labels: Array<{ number: number; x: number; y: number; app: string; title: string }> = []
-  for (const window of state.windows.filter(w => w.screen === state.screen).sort((a, b) => state.numbers[a.id] - state.numbers[b.id])) {
+  for (const window of state.windows.filter(w => !w.minimized && w.screen === state.screen).sort((a, b) => state.numbers[a.id] - state.numbers[b.id])) {
     const slot = state.tree ? treeSlots(state.tree).find(s => s.window === window.id) : undefined
     let x = Math.max(17, Math.min(83, (slot ? slot.rect.x + slot.rect.width / 2 : (window.x + window.width / 2) / WINDOW_AREA.width) * 100))
     let y = Math.max(6, Math.min(94, slot ? slot.rect.y * 100 + 6 : (window.y + window.height / 2) / WINDOW_AREA.height * 100))
@@ -1429,38 +1434,28 @@ function windowNumberLabels(state: WindowState): Array<{ number: number; x: numb
   return labels
 }
 
-function keyHelpEntries(document: ConfigDocument, mode: string, window?: WindowState, layoutBindings: WindowLayoutBinding[] = []): HelpEntry[] {
+function keyHelpEntries(document: ConfigDocument, mode: string, window?: WindowState): HelpEntry[] {
   const groups = new Map<string, string[]>()
   const bindings = effectiveBindings(document, mode)
-  if (mode === 'window') {
-    for (const original of layoutBindings) {
-      const action = window?.panel === 'none' ? (original.action.startsWith('window_layout_') ? original.action.replace('window_layout_', 'window_') : '') : original.action
-      const entry = { ...original, action }
-      if (!action || window?.panel === 'none' && bindings.has(entry.chord)) continue
-      if (window && windowActionAvailable(window, entry.action) && bindings.get(entry.chord)?.value !== 'window_edit') {
-        bindings.set(entry.chord, { value: entry.action, source: 'window' })
-      }
-    }
-  }
-  if (mode === 'window' && !window?.library) {
+  if (mode === 'window_editor' && !window?.library) {
     bindings.set('`', { value: 'window_area_number', source: 'window' })
   }
-  if (mode === 'window' && window?.library) {
+  if (isWindowMode(mode) && window?.library) {
     if (window.libraryPage > 0) groups.set('Previous page', ['PAGEUP'])
     if ((window.libraryPage + 1) * 6 < window.presets.length) groups.set('Next page', ['PAGEDOWN'])
   }
   for (const [chord, binding] of bindings) {
     if (binding.value === '__disabled__') continue
     let action = Array.isArray(binding.value) ? binding.value.join(' → ') : String(binding.value)
-    if (mode === 'window') {
+    if (isWindowMode(mode)) {
       if (window && !['window_number', 'window_area_number'].includes(action) && !windowActionAvailable(window, action)) continue
       const labels: Record<string, string> = {
         window_left: 'Left', window_right: 'Right', window_up: 'Up', window_down: 'Down',
         window_size: 'Move / resize', window_layout: 'Quick layout', window_edit: 'Edit layout tree', window_tile: 'Tile windows',
         window_number: '选择窗口编号', window_area_number: '区域编号前缀',
-        window_screen_next: 'Next screen', window_screen_previous: 'Previous screen', window_maximize: 'Maximize / restore',
+        window_screen_next: 'Next screen', window_screen_previous: 'Previous screen', size_cycle: 'Maximize / minimize / restore',
         window_center: 'Center window', window_select: 'Next window', window_undo: 'Undo', window_remove_region: 'Delete region', window_saved_layouts: 'Restore layout', window_save_layout: 'Save layout',
-        window_confirm: 'Apply / exit', window_cancel: 'Back / exit', window_exit: 'Exit',
+        window_confirm: 'Confirm', window: 'Window', window_quick: 'Quick layout', window_editor: 'Editor', window_restore: 'Restore', window_delete: 'Delete layouts', idle: 'Exit', normal: 'Normal', grid: 'Grid', recursive_grid: 'Recursive Grid', ui_hint: 'UI Hint',
       }
       for (const direction of ['left', 'right', 'up', 'down']) {
         labels[`window_layout_${direction}`] = `Layout ${direction}`

@@ -112,35 +112,3 @@ export function temporaryPhysicalKeys(document: BindingDocument, mode: string, p
   }
   return [...active]
 }
-
-export interface WindowLayoutBinding { chord: string; keys: string[]; activation: string; action: string }
-
-/** Rebuilt with the effective configuration, never by a key or animation frame. */
-export function compileWindowLayoutBindings(document: BindingDocument, isMac: boolean): WindowLayoutBinding[] {
-  const aliases = aliasesFor(document, isMac), bindings = new Map<string, WindowLayoutBinding>()
-  const directions: Array<{ chord: string; keys: string[]; direction: string }> = []
-  for (const [chord, binding] of effectiveBindings(document, 'normal')) {
-    const direction = /^move_(left|right|up|down)$/.exec(String(binding.value))?.[1]
-    if (!direction) continue
-    const keys = chord.split('+').map(k => physicalName(k, aliases))
-    const activation = keys.findLast(k => !/^(left_|right_)?(shift|ctrl|alt|cmd|win)$/.test(k)) ?? keys.at(-1)!
-    if (resolvePhysicalBinding(document, 'normal', keys, activation, isMac)?.value !== binding.value) continue
-    directions.push({ chord, keys, direction })
-    bindings.set([...keys].sort().join('+'), { chord, keys, activation, action: `window_layout_${direction}` })
-  }
-  for (const { chord, keys, direction } of directions) {
-    for (const [modifier, operation] of [['shift', 'split'], ['ctrl', 'ratio']]) {
-      if (keys.some(k => keyMatches(modifier, k))) continue
-      const parts = [modifier, ...keys], canonical = [...parts].sort().join('+')
-      if (!bindings.has(canonical)) bindings.set(canonical, { chord: `${modifier}+${chord}`, keys: parts,
-        activation: keys.findLast(k => !/^(left_|right_)?(shift|ctrl|alt|cmd|win)$/.test(k)) ?? keys.at(-1)!, action: `window_${operation}_${direction}` })
-    }
-  }
-  return [...bindings.values()].sort((a, b) => b.keys.length - a.keys.length)
-}
-
-export function resolveWindowLayoutBinding(bindings: WindowLayoutBinding[], pressed: string[], key: string, editing = true): string | undefined {
-  const action = bindings.find(entry => keyMatches(entry.activation, key) && entry.keys.length === pressed.length
-    && entry.keys.every(k => pressed.some(p => keyMatches(k, p))))?.action
-  return editing ? action : action?.startsWith('window_layout_') ? action.replace('window_layout_', 'window_') : undefined
-}

@@ -4,7 +4,7 @@ use crate::api::window_presets::{
     LayoutLibraryOperation, LayoutLibraryRequest, LayoutLibraryResult, RegionTemplate,
 };
 pub(super) const PAGE_SIZE: usize = 6;
-impl WindowMode {
+impl WindowSession {
     pub(super) fn open_library(&mut self, out: &mut CommandBatch) {
         self.library_open = true;
         self.library_page = 0;
@@ -45,6 +45,9 @@ impl WindowMode {
         if result.message.is_none() || !result.layouts.is_empty() {
             self.saved_layouts = result.layouts;
             self.library_index = NumberIndex::new(self.saved_layouts.iter().map(|l| l.id));
+            self.library_page = self
+                .library_page
+                .min(self.saved_layouts.len().saturating_sub(1) / PAGE_SIZE);
         }
         self.status = result.message.or_else(|| {
             result.saved.and_then(|id| {
@@ -67,7 +70,17 @@ impl WindowMode {
         let Some(saved) = self.saved_layouts.iter().find(|l| l.id == number).cloned() else {
             return;
         };
-        self.library_open = false;
+        if self.kind == WindowKind::Delete {
+            self.delete_selection = Some(saved);
+            self.cancel_number(out);
+            self.status = None;
+            return;
+        }
+        if self.restore_pending {
+            return;
+        }
+        self.restore_pending = true;
+        self.finished = false;
         self.pending_template = Some(saved);
         self.cancel_number(out);
         if self.edit.is_some() {
@@ -92,6 +105,7 @@ impl WindowMode {
                 ..
             } => {
                 if let Some(digit) = key.as_char().filter(char::is_ascii_digit) {
+                    self.delete_selection = None;
                     for (_, number) in
                         self.number
                             .digit(digit, &self.library_index, &self.slot_index)
@@ -126,27 +140,23 @@ impl WindowMode {
                 binding,
                 state: KeyState::Down,
                 ..
-            } => match binding.as_ref() {
-                Binding::Window(W::SavedLayouts) => self.open_library(&mut out),
-                Binding::Window(W::Cancel) => {
-                    self.library_open = false;
-                    self.cancel_number(&mut out);
-                    self.status = None;
-                }
-                Binding::Window(W::Exit) => {
-                    self.library_open = false;
-                    self.exit(&mut out);
-                    return Some(out);
-                }
-                Binding::Window(W::Confirm) => {
+            } => {
+                if let Binding::Window(W::Confirm) = binding.as_ref() {
+                    if let Some(expected) = self.delete_selection.take() {
+                        self.status = Some("Deleting layout…".into());
+                        out.push(Command::WindowLayouts(Box::new(LayoutLibraryRequest {
+                            session: self.session,
+                            operation: LayoutLibraryOperation::Delete { expected },
+                        })));
+                        return Some(out);
+                    }
                     if let Some((_, number)) =
                         self.number.finish(&self.library_index, &self.slot_index)
                     {
                         self.restore_saved(number, ctx, &mut out);
                     }
                 }
-                _ => {}
-            },
+            }
             _ => return None,
         }
         if !out

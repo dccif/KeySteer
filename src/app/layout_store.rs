@@ -13,6 +13,10 @@ pub(crate) struct LayoutStore {
     memory: Vec<SavedLayout>,
 }
 impl super::runtime::LayoutRepository for LayoutStore {
+    fn delete(&mut self, expected: &SavedLayout) -> Result<Vec<SavedLayout>, String> {
+        Self::delete(self, expected)
+    }
+
     fn list(&self) -> Result<Vec<SavedLayout>, String> {
         Self::list(self)
     }
@@ -86,8 +90,25 @@ impl LayoutStore {
         layout.validate()?;
         layouts.push(layout);
         layouts.sort_by_key(|l| l.id);
+        self.write_layouts(&layouts)?;
+        Ok((id, layouts))
+    }
+    pub(crate) fn delete(&mut self, expected: &SavedLayout) -> Result<Vec<SavedLayout>, String> {
+        let mut layouts = self.list()?;
+        let current = layouts
+            .iter()
+            .find(|layout| layout.id == expected.id)
+            .ok_or("Layout no longer exists; select a layout again")?;
+        if current != expected {
+            return Err("Layout changed outside KeySteer; select it again before deleting".into());
+        }
+        layouts.retain(|layout| layout.id != expected.id);
+        self.write_layouts(&layouts)?;
+        Ok(layouts)
+    }
+    fn write_layouts(&mut self, layouts: &[SavedLayout]) -> Result<(), String> {
         if let Some((path, replace)) = &self.file {
-            let bytes = codec::encode(&layouts)?;
+            let bytes = codec::encode(layouts)?;
             if bytes.len() as u64 > MAX_FILE_BYTES {
                 return Err("Saved layouts file is too large".into());
             }
@@ -125,9 +146,9 @@ impl LayoutStore {
             }
             result?;
         } else {
-            self.memory = layouts.clone();
+            self.memory = layouts.to_vec();
         }
-        Ok((id, layouts))
+        Ok(())
     }
 }
 
@@ -186,6 +207,43 @@ mod tests {
                 .is_err()
         );
         assert_eq!(std::fs::read(&path).unwrap(), b"broken");
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn delete_rechecks_records_preserves_ids_and_persists_a_valid_empty_library() {
+        let path = path();
+        let mut store = LayoutStore::persistent(path.clone(), replace);
+        store
+            .save(RegionTemplate::Slot { id: 1 }, 1, "First".into())
+            .unwrap();
+        store
+            .save(RegionTemplate::Slot { id: 1 }, 1, "Second".into())
+            .unwrap();
+        let old = store.list().unwrap();
+        let remaining = store.delete(&old[0]).unwrap();
+        assert_eq!(remaining, vec![old[1].clone()]);
+        assert!(store.delete(&old[0]).is_err());
+        let bytes = std::fs::read(&path).unwrap();
+        let mut failed = LayoutStore::persistent(path.clone(), fail);
+        assert!(failed.delete(&old[1]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let mut changed = old[1].clone();
+        changed.note = "Replaced externally".into();
+        std::fs::write(&path, codec::encode(&[changed.clone()]).unwrap()).unwrap();
+        assert!(store.delete(&old[1]).is_err());
+        assert_eq!(store.list().unwrap(), vec![changed.clone()]);
+        assert!(store.delete(&changed).unwrap().is_empty());
+        assert!(
+            codec::decode(&std::fs::read(&path).unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            LayoutStore::persistent(path.clone(), replace)
+                .list()
+                .unwrap()
+                .is_empty()
+        );
         std::fs::remove_file(path).unwrap();
     }
 }

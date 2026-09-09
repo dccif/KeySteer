@@ -26,7 +26,7 @@ keysteer/
 | `src/app/` | 唯一应用聚合根：启动、CLI、配置编译、Mode catalog 和 runtime | `bootstrap.rs`, `configuration.rs`, `mode_catalog.rs`, `runtime/` |
 | `src/config/` | TOML 文档、Mode section DTO、别名规范化、校验、主题与 comment-preserving store | `mod.rs`, `settings.rs`, `aliases.rs`, `validation.rs`, `store.rs` |
 | `src/app/runtime/` | 应用私有 Engine、原子运行计划、命令执行及有状态协作者 | `mod.rs`, `plan.rs`, `registry.rs`, `input_state.rs`, `scheduler.rs`, `overlay_coordinator.rs`, `key_help.rs` |
-| `src/modes/` | 六个内置 Mode 状态机；UI Hint 私有状态和算法位于 `hint/` | `normal.rs`, `window.rs`, `grid.rs`, `recursive_grid.rs`, `hint/mod.rs`, `hint/session.rs` |
+| `src/modes/` | 十个内置 Mode 状态机；UI Hint 私有状态和算法位于 `hint/` | `normal.rs`, `window.rs`, `window/mode.rs`, `grid.rs`, `recursive_grid.rs`, `hint/mod.rs`, `hint/session.rs` |
 | `src/presentation/` | 统一布局、样式与场景构建；仅依赖 api | `mod.rs`, `hint/`, `grid.rs`, `recursive_grid.rs`, `window.rs`, `key_help.rs`, `dynamic.rs` |
 | `src/plugins/` | 使用公共 API 实现的内置插件 | `builtin/screen_selector.rs`, `builtin/window_mover.rs` |
 | `src/platform/common/` | 两端共享的字符需求/ASCII 过滤、原生候选快照、updater、app info、mailbox、batcher 和 spatial index | `mod.rs`, `character_candidates.rs` |
@@ -39,7 +39,8 @@ keysteer/
 
 - `src/api/window_presets.rs`：无原生身份的区域模板、布局库请求和异步文本输入契约。
 - `src/app/layout_store.rs` / `layout_store/codec.rs`：有界二进制布局文件、版本检查、原子替换；`runtime/window_presets.rs` 持有备注请求和会话取消。
-- `src/modes/window/presets.rs` / `view.rs`：编号布局列表与状态数据，由 `presentation/key_help.rs` 在底部面板统一展示；不读文件或调用原生 UI。
+- `src/modes/window/mode.rs`：五个独立 Window Mode 及共享会话交接；`config/window.rs` 分别定义配置 DTO。
+- `src/modes/window/presets.rs` / `view.rs`：恢复／删除编号布局列表与状态数据，由 `presentation/key_help.rs` 在底部面板统一展示；不读文件或调用原生 UI。
 - `src/platform/windows/text_prompt.rs`：已有托盘线程拥有的 modeless EDIT 对话框；macOS 备注面板由 `status_item.rs` 在主线程持有。
 
 - `src/main.rs`：Windows 使用 GUI subsystem；只调用 `app::prepare_console_for_cli()` 和

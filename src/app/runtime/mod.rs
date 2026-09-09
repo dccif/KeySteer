@@ -964,6 +964,34 @@ impl Engine {
             return Ok(());
         }
 
+        if target != self.registry.active {
+            // Native text entry belongs to the outgoing interaction, even when
+            // its final layout acknowledgement defers the actual mode switch.
+            if self
+                .window_layouts
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.owner == self.registry.active)
+                && let Some(pending) = self.window_layouts.pending.take()
+            {
+                backend.cancel_text_prompt(pending.id);
+            }
+            let context = HostContext {
+                presenter: &crate::presentation::COMPOSER,
+                screens: &self.screens,
+                cursor: self.cursor,
+                focused_app: self.focused_app.as_ref(),
+                palette: &self.palette,
+            };
+            let deferred = self
+                .registry
+                .get_mut(&self.registry.active.clone())
+                .and_then(|mode| mode.prepare_transition(&target, &context));
+            if let Some(commands) = deferred {
+                return self.execute(commands, backend);
+            }
+        }
+
         if self.registry.active == ModeId::normal()
             && target != ModeId::normal()
             && !Self::releases_toggle_session_on_entry(&target)
@@ -1005,6 +1033,23 @@ impl Engine {
                 )?;
             }
 
+            let shared_group = self
+                .registry
+                .get(&self.registry.active)
+                .and_then(|mode| mode.session_group())
+                .filter(|group| {
+                    self.registry
+                        .get(&target)
+                        .and_then(|mode| mode.session_group())
+                        == Some(*group)
+                });
+            if shared_group.is_some() {
+                for owner in self.scheduler.window_sessions.values_mut() {
+                    if *owner == self.registry.active {
+                        *owner = target.clone();
+                    }
+                }
+            }
             // Tear down the outgoing mode and drop the timers it owned.
             let context = HostContext {
                 presenter: &crate::presentation::COMPOSER,
@@ -1626,6 +1671,18 @@ impl Engine {
     /// Returns whether the key was consumed. Host-level verbs are executed
     /// here; everything else is forwarded to the mode as a
     /// [`ModeEvent::Binding`], which is what a plugin sees too.
+    fn stateful_binding_owner(&self, resolved: &ResolvedBinding) -> ModeId {
+        // Window operations act on the active shared session, even when their
+        // chord is inherited from another mode's binding table.
+        if matches!(resolved.binding.as_ref(), Binding::Window(_))
+            && self.registry.active.is_window()
+        {
+            self.registry.active.clone()
+        } else {
+            resolved.owner.clone()
+        }
+    }
+
     fn apply_binding(
         &mut self,
         resolved: ResolvedBinding,
@@ -1668,9 +1725,10 @@ impl Engine {
                 | Binding::Window(_)
                 | Binding::RescanUi
         ) {
+            let recipient = self.stateful_binding_owner(&resolved);
             return self
                 .dispatch_to(
-                    &resolved.owner,
+                    &recipient,
                     ModeEvent::Binding {
                         binding: resolved.binding,
                         state: input.state,
@@ -1755,26 +1813,6 @@ impl Engine {
                         "binding targets unknown mode {:?}; is the plugin registered?",
                         id.as_str()
                     );
-                    return Ok(true);
-                }
-                if *id == ModeId::window() {
-                    if self.registry.active == *id {
-                        self.dispatch(
-                            ModeEvent::Binding {
-                                binding: Arc::new(Binding::Window(
-                                    crate::api::window::WindowAction::Exit,
-                                )),
-                                state: KeyState::Down,
-                                key: input.key.clone(),
-                            },
-                            backend,
-                        )?;
-                    } else {
-                        if let Ok(pointer) = backend.pointer() {
-                            self.cursor = pointer;
-                        }
-                        self.push_mode(id.clone(), backend)?;
-                    }
                     return Ok(true);
                 }
                 // Pressing a mode's own key while it is active leaves it.

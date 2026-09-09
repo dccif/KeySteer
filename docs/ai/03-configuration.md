@@ -1,6 +1,6 @@
 # 配置、按键和持久化
 
-Window 的 `exit_mode` 使用现有 LifecycleAction 解析，仅允许 `return` 或已注册的非 Window 模式。默认 `return` 恢复入口模式；modal 入口通过 PopMode 恢复原实例。默认 Q 绑定 `window_cancel`，在布局或列表中先返回一层，根层才退出；`window_exit` 直接退出。A/E 分别在根层进入快速／树编辑，均使用普通可重绑动作。
+窗口操作拆成五个独立配置段，所有入口和 Q 都是普通 Mode 绑定；不存在专用退出字段或路径相关返回栈。详见下方配置边界。
 
 ## 配置模型
 
@@ -17,7 +17,7 @@ Window 的 `exit_mode` 使用现有 LifecycleAction 解析，仅允许 `return` 
 - `general`、`debug`、`platform`
 - `theme.dark` / `theme.light`
 - `hotkeys`
-- `normal`、`window`、`grid`、`recursive_grid`、`ui_hint`
+- `normal`、`window`、`window_quick`、`window_editor`、`window_restore`、`window_delete`、`grid`、`recursive_grid`、`ui_hint`
 - `pointer`、`scroll`、`mode_indicator`
 - `plugin_modes`、根级和 Mode 级 `app_configs`
 
@@ -46,11 +46,11 @@ Mode 的 cursor override 可单独覆盖这些值。普通反馈由物理按键�
 
 布局收藏独立于 TOML：`window-layouts.kslayout` 使用与日志相同的目录规则（Windows/portable 在运行程序同目录，packaged macOS 在 Application Support）。格式为 `KSLAYOUT` magic、版本字节、布局数量、定长小整数/UTF-8 备注长度和先序区域树；分割比例按 little-endian f64 保存。读取限 1 MiB、99 个布局、每树 256 叶/深度 32、备注 80 字符，拒绝未知版本、重复编号、非法比例和尾随字节。写入前验证已有文件，再用同目录 create_new 临时文件、sync_all 和平台 atomic_replace；不在读取失败时覆盖旧文件。布局只保存几何、原窗口数量和备注，不保存应用或原生窗口身份。
 
-`split_ratios` 保留分数字符串／小数的解析、校验与原样导出兼容性，但不再传入 Mode Settings，也不影响树编辑。Ctrl＋方向与窗口缩放共用 `resize_step`（短按逻辑像素）和 `resize_speed`（长按逻辑像素／秒）；原生帧时钟驱动连续移动，Windows 按目标屏幕 DPI 换算。默认 `x = "window_remove_region"` 只在树编辑中可用。
+`config/window.rs` 定义五个独立 DTO，共用字段 schema，不隐式继承绑定。`app/mode_catalog.rs` 分别编译 Settings 和路由，并创建共享 WindowSession 的五个实例。反序列化平面文档必须使用各模式自己的缺省值，不能让 flatten 的空 bindings 覆盖 Editor/Restore 等默认值；显式 bindings 表仍整体替换，稀疏 lifecycle 保留该模式的默认完成目标。
 
-`config/window.rs` 保存 `[window]` DTO，`app/mode_catalog.rs` 转为 `modes/window::Settings`。绑定和 app overrides 经过统一别名规范化及继承校验；完整默认配置与嵌入默认值必须一致。Window 的离散操作键独立配置，移动/缩放及布局方向从有效 Normal Move 绑定编译；默认仅继承 hotkeys；Primary 通过既有 temporary route 借用 Normal。
+`window_quick.split_ratios` 支持分数／小数、排序去重，进入 Quick 时传给 Settings，自动附加满屏比例。Editor 独立持有 resize_step、resize_speed、gap；Restore 有独立 gap。移除的旧 window 参数和入口动作必须明确报错，不保留派生 Normal 方向或旧动作回退。HJKL 是各模式的普通显式绑定；继承、别名、应用覆盖和临时键走统一编译路径。
 
-`layout_keys` 保留 12 个唯一小写 ASCII 字母/数字的解析兼容，但不再传入模式。`number_timeout_ms` 默认 250（100–2000ms），仅消歧数字前缀使用。布局方向按当前有效 Normal Move 绑定编译缓存，包含继承、应用覆盖和别名；`window_edit` 入口与方向冲突由配置检查提示。步长、速度、间距和描边有有限值/范围校验。`double_tap_ms` 仅保留旧文件解析兼容，不再传入 Mode，不维护 AA 状态／计时／优先级。`ui` 复用 LabelUi；border_color 同时影响目标描边。Tab 使用 `window_select` 直接循环并居中鼠标，不需要额外确认；窗口编号由有效库存生成。默认撤销键是 Z；仅 D 循环切屏，不绑定 Shift+D 或 Enter。所有布局即时生效，Esc 返回、Q 退出均保留结果。旧动作名保留自定义配置解析兼容。
+`number_timeout_ms` 仅消歧数字前缀，步长、速度、间距、描边有范围检查。Restore 的 after_finish 默认为 window_editor，仅成功应用触发；Q 目的地由各自 bindings 指定。Delete 输入编号后等待 Confirm，取消只靠普通模式切换；存储提交前重新读取并比较整条记录，原子替换，保留其他 ID 和有效空库，文件格式不变。
 
 ## 加载与发现
 
@@ -210,3 +210,5 @@ Settings，不存在 `ConfigReloaded` 广播。
 解析为 `Binding::Click(Button::X1/X2)`，也支持 `press` / `release` / `toggle` 的鼠标目标；
 它们不属于键盘 `send` 目标。点击复用普通点击的长按锁定与清理流程。默认配置只提供注释示例，不占用用户的前进/后退键。未绑定或 `none`
 时侧键保持透传。示例见 [配置参考](/reference/configuration#鼠标侧键)。
+
+普通 Window 默认 `f = "size_cycle"`：最大化→最小化→恢复原位置和尺寸→循环，不提供旧动作名称的兼容别名。

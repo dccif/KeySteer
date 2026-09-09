@@ -1,6 +1,6 @@
-import { createWindowState, type WindowState } from './window.ts'
+import { createWindowState, leaveWindow, type WindowState, type WindowMode } from './window.ts'
 
-export type SimulatorMode = 'idle' | 'normal' | 'grid' | 'recursive_grid' | 'ui_hint' | 'window'
+export type SimulatorMode = 'idle' | 'normal' | 'grid' | 'recursive_grid' | 'ui_hint' | WindowMode
 
 export interface Point {
   x: number
@@ -63,6 +63,7 @@ export function movePointer(state: SimulatorState, action: string, distance: num
 export function applyModeAction(state: SimulatorState, action: string): boolean {
   if (!isSimulatorMode(action)) return false
   if (action === 'idle') state.keyHelpVisible = false
+  if (state.mode.startsWith('window')) leaveWindow(state)
   state.mode = action
   state.lastEvent = `进入 ${action}`
   return true

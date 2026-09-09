@@ -256,56 +256,130 @@ y = "end"
 # window — lock, move, resize and arrange ordinary windows
 # ---------------------------------------------------------------------------
 
-# Window mode locks the ordinary window under the pointer. Tab cycles to the next
-# window and centres the pointer there, without a picker or confirmation.
-# Exit keeps changes and returns to the previous mode with its selection
-# preserved. Undo history is session-local.
+# All five window modes have independent bindings. Q is an ordinary mode binding.
+# Any mode can be entered directly from [hotkeys], for example:
+# "alt+a" = "window_quick"
+# "alt+e" = "window_editor"
+# "alt+r" = "window_restore"
 [window]
-exit_mode = "return" # Root Q / window_exit restores the entry mode; "normal" / "idle" selects a destination.
 enabled = true
 inherits = ["hotkeys"]
 temporary_mode = "normal"
 temporary_mode_keys = ["primary"]
-# Legacy double_tap_ms is still accepted; the AA gesture has been removed.
-number_timeout_ms = 250 # Only ambiguous number prefixes wait; unique numbers are immediate.
-# Legacy compatibility only. Tree dividers now use resize_step and resize_speed.
-split_ratios = ["1/4", "1/3", "1/2", "2/3", "3/4"]
-# Distances, speeds and gaps are logical pixels (pixels/second for speeds).
-# resize_step / resize_speed also control Ctrl+direction divider movement in E.
+number_timeout_ms = 250
 move_step = 20.0
 move_speed = 600.0
 resize_step = 20.0
 resize_speed = 500.0
-gap = 8.0
-# Legacy compatibility only; numeric selection and Normal directions are independent.
-layout_keys = "123456789qwe"
 border_width = 3.0
 
 [window.bindings]
-# Move and resize use the effective Normal move_left/right/up/down keys (default H/J/K/L).
+h = "window_left"
+j = "window_down"
+k = "window_up"
+l = "window_right"
 s = "window_size"
-# A enters quick layout using effective Normal directions; E edits its BSP tree.
-# A opens quick layout; E then arranges this screen and opens the tree editor.
-a = "window_layout"
-e = "window_edit"
+a = "window_quick"
+e = "window_editor"
+r = "window_restore"
 d = "window_screen_next"
-f = "window_maximize"
+f = "size_cycle" # Maximize → minimize → restore
 c = "window_center"
 tab = "window_select"
 z = "window_undo"
-x = "window_remove_region"
-r = "window_saved_layouts"
-"ctrl+s" = "window_save_layout"
-q = "window_cancel" # Return one level; leave Window from its root.
-"primary+q" = "window_exit"
-"alt+w" = "window"
-# Optional direct tiling action: "primary+a" = "window_tile"
-# Layouts apply immediately. Esc returns to Window; Q exits, keeping adjustments.
-
+q = "idle"
+"primary+q" = "idle"
 [window.ui]
 font_size = 28
-# Locked target outline color. The combined operation/layout panel uses [key_help].
-# border_color = "#58A6FFFF"
+
+[window_quick]
+enabled = true
+inherits = ["hotkeys"]
+temporary_mode = "normal"
+temporary_mode_keys = ["primary"]
+number_timeout_ms = 250
+split_ratios = ["1/4", "1/3", "1/2", "2/3", "3/4"]
+gap = 8.0
+border_width = 3.0
+[window_quick.bindings]
+h = "window_layout_left"
+j = "window_layout_down"
+k = "window_layout_up"
+l = "window_layout_right"
+e = "window_editor"
+r = "window_restore"
+tab = "window_select"
+z = "window_undo"
+q = "window"
+"primary+q" = "idle"
+[window_quick.ui]
+font_size = 28
+
+[window_editor]
+enabled = true
+inherits = ["hotkeys"]
+temporary_mode = "normal"
+temporary_mode_keys = ["primary"]
+number_timeout_ms = 250
+resize_step = 20.0
+resize_speed = 500.0
+gap = 8.0
+border_width = 3.0
+[window_editor.bindings]
+h = "window_layout_left"
+j = "window_layout_down"
+k = "window_layout_up"
+l = "window_layout_right"
+"shift+h" = "window_split_left"
+"shift+j" = "window_split_down"
+"shift+k" = "window_split_up"
+"shift+l" = "window_split_right"
+"ctrl+h" = "window_ratio_left"
+"ctrl+j" = "window_ratio_down"
+"ctrl+k" = "window_ratio_up"
+"ctrl+l" = "window_ratio_right"
+tab = "window_select"
+z = "window_undo"
+x = "window_remove_region"
+"ctrl+s" = "window_save_layout"
+r = "window_restore"
+q = "window"
+"primary+q" = "idle"
+[window_editor.ui]
+font_size = 28
+
+[window_restore]
+enabled = true
+inherits = ["hotkeys"]
+temporary_mode = "normal"
+temporary_mode_keys = ["primary"]
+number_timeout_ms = 250
+gap = 8.0
+border_width = 3.0
+[window_restore.lifecycle]
+after_finish = "window_editor"
+after_click = "keep"
+[window_restore.bindings]
+x = "window_delete"
+enter = "window_confirm"
+q = "window"
+"primary+q" = "idle"
+[window_restore.ui]
+font_size = 28
+
+[window_delete]
+enabled = true
+inherits = ["hotkeys"]
+temporary_mode = "normal"
+temporary_mode_keys = ["primary"]
+number_timeout_ms = 250
+border_width = 3.0
+[window_delete.bindings]
+enter = "window_confirm"
+q = "window_restore"
+"primary+q" = "idle"
+[window_delete.ui]
+font_size = 28
 
 # ---------------------------------------------------------------------------
 # ui_hint — label every clickable element

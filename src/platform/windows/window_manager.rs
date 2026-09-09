@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GWL_STYLE, GetPropW, MINMAXINFO, RemovePropW, SMTO_ABORTIFHUNG, SMTO_BLOCK,
-    SW_RESTORE, SW_SHOWMAXIMIZED, SendMessageTimeoutW, SetForegroundWindow, SetPropW,
-    ShowWindowAsync, SwitchToThisWindow, WINDOWPLACEMENT, WM_GETMINMAXINFO,
-    WPF_ASYNCWINDOWPLACEMENT, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_MAXIMIZE,
-    WS_THICKFRAME,
+    SW_MINIMIZE, SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SendMessageTimeoutW,
+    SetForegroundWindow, SetPropW, ShowWindowAsync, SwitchToThisWindow, WINDOWPLACEMENT,
+    WM_GETMINMAXINFO, WPF_ASYNCWINDOWPLACEMENT, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_MAXIMIZE, WS_THICKFRAME,
 };
 use windows::core::{BOOL, PCWSTR};
 
@@ -21,6 +21,7 @@ struct Identity {
     pid: u32,
     thread: u32,
     app: String,
+    cycle_restore: Option<Rect>,
 }
 
 pub(super) struct Windows {
@@ -101,6 +102,7 @@ impl Windows {
                     pid,
                     thread,
                     app,
+                    cycle_restore: None,
                 },
             );
             id
@@ -144,6 +146,38 @@ impl Windows {
         }
         Ok(w.hwnd)
     }
+    fn minimize(
+        &mut self,
+        id: WindowId,
+        screens: &[Screen],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<WindowInfo, String> {
+        let before = self.snapshot(id, screens)?;
+        if cancelled() {
+            return Ok(before.info);
+        }
+        self.windows
+            .get_mut(&id)
+            .ok_or("window was closed")?
+            .cycle_restore = Some(before.restored);
+        let hwnd = self.hwnd(id)?;
+        // SAFETY: validated borrowed HWND; asynchronous request retains no Rust data.
+        if !unsafe { ShowWindowAsync(hwnd, SW_MINIMIZE) }.as_bool() {
+            return Err("cannot minimize window".into());
+        }
+        let deadline = Instant::now() + Duration::from_millis(250);
+        loop {
+            let hwnd = self.hwnd(id)?;
+            // SAFETY: identity was revalidated above.
+            if super::native::is_window_iconic(hwnd) || cancelled() {
+                return self.snapshot(id, screens).map(|s| s.info);
+            }
+            if Instant::now() >= deadline {
+                return Err("Timed out minimizing window".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
     fn placement(&self, hwnd: HWND) -> Result<WINDOWPLACEMENT, String> {
         read_placement(hwnd)
     }
@@ -167,8 +201,9 @@ impl Windows {
                 return self.snapshot(id, screens).map(|s| s.info);
             }
             let state_matches = maximized.is_none_or(|expected| {
-                (super::native::window_long(hwnd, GWL_STYLE) as u32 & WS_MAXIMIZE.0 != 0)
-                    == expected
+                !super::native::is_window_iconic(hwnd)
+                    && (super::native::window_long(hwnd, GWL_STYLE) as u32 & WS_MAXIMIZE.0 != 0)
+                        == expected
             });
             if state_matches
                 && desired.is_some_and(|d| {
@@ -246,7 +281,7 @@ impl WindowAccess for Windows {
     }
     fn snapshot(&self, id: WindowId, screens: &[Screen]) -> Result<Snapshot, String> {
         let hwnd = self.hwnd(id)?;
-        let bounds =
+        let mut bounds =
             super::accessibility::window_bounds(hwnd).ok_or("cannot read window bounds")?;
         let screen = window_geometry::screen_index(screens, bounds).ok_or("no displays")?;
         let p = self.placement(hwnd)?;
@@ -258,12 +293,21 @@ impl WindowAccess for Windows {
         if restored.width <= 0.0 || restored.height <= 0.0 {
             restored = bounds;
         }
-        if let Ok(outer) = read_bounds(hwnd) {
+        // SAFETY: validated borrowed HWND.
+        let minimized = super::native::is_window_iconic(hwnd);
+        if !minimized && let Ok(outer) = read_bounds(hwnd) {
             restored.x += bounds.x - outer.x;
             restored.y += bounds.y - outer.y;
             restored.width += bounds.width - outer.width;
             restored.height += bounds.height - outer.height;
         }
+        if let Some(original) = self.windows[&id].cycle_restore {
+            restored = original;
+        }
+        if minimized {
+            bounds = restored;
+        }
+        let screen = window_geometry::screen_index(screens, bounds).ok_or("no displays")?;
         let title = super::native::window_title(hwnd);
         let app = self.windows[&id].app.clone();
         let info = WindowInfo {
@@ -274,6 +318,7 @@ impl WindowAccess for Windows {
             screen,
             resizable: super::native::window_long(hwnd, GWL_STYLE) as u32 & WS_THICKFRAME.0 != 0,
             maximized: p.showCmd == SW_SHOWMAXIMIZED.0 as u32,
+            minimized,
             fullscreen: false,
         };
         Ok(Snapshot { info, restored })
@@ -295,21 +340,32 @@ impl WindowAccess for Windows {
         }
         let hwnd = self.hwnd(id)?;
         let before = self.snapshot(id, screens)?;
-        if before.info.maximized {
+        if before.info.maximized || before.info.minimized {
             // SAFETY: validated borrowed HWND; asynchronous request retains no Rust data.
-            if !unsafe { ShowWindowAsync(hwnd, SW_RESTORE) }.as_bool() {
+            if !unsafe {
+                ShowWindowAsync(
+                    hwnd,
+                    if before.info.minimized {
+                        SW_SHOWNORMAL
+                    } else {
+                        SW_RESTORE
+                    },
+                )
+            }
+            .as_bool()
+            {
                 return Err("cannot restore maximized window".into());
             }
             let restored =
                 self.wait_frame(id, screens, Some(before.restored), Some(false), cancelled)?;
-            if restored.maximized && !cancelled() {
+            if (restored.maximized || restored.minimized) && !cancelled() {
                 return Err("Timed out restoring maximized window before resizing".into());
             }
         }
         if cancelled() {
             return self.snapshot(id, screens).map(|s| s.info);
         }
-        let visible = if before.info.maximized {
+        let visible = if before.info.maximized || before.info.minimized {
             super::accessibility::window_bounds(hwnd).ok_or("window was closed")?
         } else {
             before.info.bounds
@@ -328,6 +384,10 @@ impl WindowAccess for Windows {
             desired.width + (raw.width - visible.width) * scale,
             desired.height + (raw.height - visible.height) * scale,
         );
+        self.windows
+            .get_mut(&id)
+            .ok_or("window was closed")?
+            .cycle_restore = None;
         submit_frame(hwnd, native)?;
         self.wait_frame(id, screens, Some(desired), Some(false), cancelled)
     }
@@ -337,6 +397,10 @@ impl WindowAccess for Windows {
         screens: &[Screen],
         cancelled: &dyn Fn() -> bool,
     ) -> Result<WindowInfo, String> {
+        if snapshot.info.minimized {
+            self.set_frame(snapshot.info.id, snapshot.restored, screens, cancelled)?;
+            return self.minimize(snapshot.info.id, screens, cancelled);
+        }
         if snapshot.info.maximized {
             self.set_frame(snapshot.info.id, snapshot.restored, screens, cancelled)?;
             if cancelled() {
@@ -365,42 +429,44 @@ impl WindowAccess for Windows {
             self.set_frame(snapshot.info.id, snapshot.info.bounds, screens, cancelled)
         }
     }
-    fn maximize(
+    fn cycle_state(
         &mut self,
         id: WindowId,
         screens: &[Screen],
         cancelled: &dyn Fn() -> bool,
     ) -> Result<WindowInfo, String> {
         let before = self.snapshot(id, screens)?;
+        if before.info.minimized {
+            return self.set_frame(id, before.restored, screens, cancelled);
+        }
+        if before.info.maximized {
+            return self.minimize(id, screens, cancelled);
+        }
+        if cancelled() {
+            return Ok(before.info);
+        }
+        self.windows
+            .get_mut(&id)
+            .ok_or("window was closed")?
+            .cycle_restore = Some(before.info.bounds);
         let hwnd = self.hwnd(id)?;
-        // SAFETY: validated borrowed HWND; ShowWindowAsync retains no Rust pointers.
-        if !unsafe {
-            ShowWindowAsync(
-                hwnd,
-                if before.info.maximized {
-                    SW_RESTORE
-                } else {
-                    SW_SHOWMAXIMIZED
-                },
-            )
+        // SAFETY: validated borrowed HWND; no Rust pointers retained.
+        if !unsafe { ShowWindowAsync(hwnd, SW_SHOWMAXIMIZED) }.as_bool() {
+            return Err("cannot maximize window".into());
         }
-        .as_bool()
-        {
-            return Err("cannot change maximized state".into());
-        }
-        let desired = if before.info.maximized {
-            before.restored
-        } else {
-            screens[before.info.screen].work_area
-        };
-        self.wait_frame(
+        let after = self.wait_frame(
             id,
             screens,
-            Some(desired),
-            Some(!before.info.maximized),
+            Some(screens[before.info.screen].work_area),
+            Some(true),
             cancelled,
-        )
+        )?;
+        if !after.maximized && !cancelled() {
+            return Err("Timed out maximizing window".into());
+        }
+        Ok(after)
     }
+
     fn select(&self, id: WindowId) -> Result<(), String> {
         let hwnd = self.hwnd(id)?;
         // SAFETY: borrowed validated HWND; no pointers retained. This fallback
@@ -565,6 +631,61 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "creates and cycles only a disposable test-owned window"]
+    fn native_window_three_state_cycle_and_undo() {
+        use crate::api::window::{WindowChange, WindowOperation};
+        use crate::platform::common::window_session::WindowSessionProbe;
+        let _ = super::super::screens::enable_dpi_awareness();
+        let screens = super::super::screens::list_screens().unwrap();
+        let area = screens.iter().find(|s| s.is_primary).unwrap().work_area;
+        let owned = Probe::start(area.inset(60.0, 60.0));
+        let mut access = Windows::default();
+        let info = access.retain(owned.hwnd, &screens).unwrap();
+        let original = info.bounds;
+        let mut session = WindowSessionProbe::new(info.id);
+        for round in 0..2 {
+            for phase in 0..3 {
+                let result = session.execute(
+                    &mut access,
+                    WindowOperation::Adjust {
+                        target: info.id,
+                        change: WindowChange::CycleState,
+                        group: round * 3 + phase + 1,
+                    },
+                    &screens,
+                );
+                assert!(result.message.is_none(), "{:?}", result.message);
+                let target = result.target.unwrap();
+                assert_eq!(target.id, info.id);
+                assert_eq!(target.minimized, phase == 1);
+                if phase == 0 {
+                    assert!(target.maximized);
+                }
+                if phase == 1 {
+                    assert!(result.pointer.is_none());
+                }
+                if phase == 2 {
+                    assert!(!target.maximized);
+                    assert!(
+                        target.bounds.center().distance_to(&original.center()) < 3.0,
+                        "{target:?} original={original:?}"
+                    );
+                    assert!((target.bounds.width - original.width).abs() < 3.0);
+                    assert!((target.bounds.height - original.height).abs() < 3.0);
+                }
+            }
+        }
+        let undone = session.execute(&mut access, WindowOperation::Undo, &screens);
+        assert_eq!(undone.skipped, 0, "{:?}", undone.message);
+        assert_eq!(undone.changed, 1);
+        assert!(undone.target.unwrap().minimized);
+        let undone = session.execute(&mut access, WindowOperation::Undo, &screens);
+        assert_eq!(undone.skipped, 0, "{:?}", undone.message);
+        assert_eq!(undone.changed, 1);
+        assert!(undone.target.unwrap().maximized);
+    }
+
+    #[test]
     #[ignore = "temporarily resizes KEYSTEER_PROBE_HWND, then restores its original placement"]
     fn native_window_minimum_tile_and_restore_probe() {
         let _ = super::super::screens::enable_dpi_awareness();
@@ -670,7 +791,7 @@ mod tests {
             access.snapshot(second.id, &screens).unwrap(),
         ];
         let outcome = (|| -> Result<(), String> {
-            let maximized = access.maximize(first.id, &screens, &|| false)?;
+            let maximized = access.cycle_state(first.id, &screens, &|| false)?;
             if !maximized.maximized {
                 return Err("maximize did not settle".into());
             }
@@ -957,7 +1078,7 @@ mod tests {
             "{adjusted:?} desired={desired:?}"
         );
         assert!((adjusted.bounds.width - desired.width).abs() < 3.0);
-        let maximized = access.maximize(info.id, &screens, &|| false).unwrap();
+        let maximized = access.cycle_state(info.id, &screens, &|| false).unwrap();
         assert!(maximized.maximized);
         let max_snapshot = access.snapshot(info.id, &screens).unwrap();
         access

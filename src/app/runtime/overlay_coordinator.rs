@@ -190,7 +190,7 @@ impl Engine {
             ));
         }
         if scene.indicator.is_none()
-            && display_mode != ModeId::window()
+            && !display_mode.is_window()
             && let Some((indicator, geometry)) = self.build_indicator(&display_mode)
         {
             scene.indicator = Some(indicator);

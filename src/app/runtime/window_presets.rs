@@ -6,6 +6,12 @@ use crate::api::window_presets::{
 };
 
 pub(crate) trait LayoutRepository {
+    fn delete(
+        &mut self,
+        _expected: &crate::api::window_presets::SavedLayout,
+    ) -> Result<Vec<crate::api::window_presets::SavedLayout>, String> {
+        Err("Layout storage is unavailable".into())
+    }
     fn list(&self) -> Result<Vec<crate::api::window_presets::SavedLayout>, String> {
         Ok(Vec::new())
     }
@@ -41,7 +47,7 @@ impl Default for LayoutController {
 pub(super) struct PendingSave {
     pub(super) id: u64,
     pub(super) session: u64,
-    owner: ModeId,
+    pub(super) owner: ModeId,
     regions: RegionTemplate,
     window_count: usize,
 }
@@ -56,6 +62,28 @@ impl Engine {
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
         match request.operation {
+            LayoutLibraryOperation::Delete { expected } => {
+                let (layouts, message) = match self.window_layouts.store.delete(&expected) {
+                    Ok(layouts) => (layouts, None),
+                    Err(error) => {
+                        crate::report_error!("window-layouts", "{error}");
+                        (
+                            self.window_layouts.store.list().unwrap_or_default(),
+                            Some(error),
+                        )
+                    }
+                };
+                self.dispatch_owned_to(
+                    owner,
+                    ModeEvent::WindowLayouts(Box::new(LayoutLibraryResult {
+                        session: request.session,
+                        layouts,
+                        saved: None,
+                        message,
+                    })),
+                    backend,
+                )
+            }
             LayoutLibraryOperation::List => {
                 let (layouts, message) = match self.window_layouts.store.list() {
                     Ok(layouts) => (layouts, None),

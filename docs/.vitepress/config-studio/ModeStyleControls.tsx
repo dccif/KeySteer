@@ -1,3 +1,4 @@
+import { parseSplitRatios } from '../simulator/window-ratios.ts'
 import { computed, defineComponent } from 'vue'
 import {
   cloneConfigDocument,
@@ -7,9 +8,9 @@ import {
   type ConfigDocument,
 } from './document'
 
-type TargetingMode = 'grid' | 'recursive_grid' | 'ui_hint' | 'key_help' | 'window'
+type TargetingMode = 'grid' | 'recursive_grid' | 'ui_hint' | 'key_help' | 'window' | 'window_quick' | 'window_editor' | 'window_restore' | 'window_delete'
 type Appearance = 'dark' | 'light'
-type ControlKind = 'color' | 'number' | 'text' | 'boolean' | 'select'
+type ControlKind = 'color' | 'number' | 'text' | 'boolean' | 'select' | 'ratios'
 
 interface StyleField {
   path: string
@@ -27,7 +28,7 @@ interface ModeFields {
   advanced: StyleField[]
 }
 
-const fields: Record<TargetingMode, ModeFields> = {
+const fields = {
   window: {
     colors: [
       { path: 'key_help.background_color', label: '面板背景（共用 key_help）', kind: 'color' },
@@ -36,8 +37,6 @@ const fields: Record<TargetingMode, ModeFields> = {
     ],
     layout: [
       { path: 'window.enabled', label: '启用 Window', kind: 'boolean' },
-      { path: 'window.exit_mode', label: '退出窗口模式后', kind: 'select', options: ['return', 'normal', 'idle', 'grid', 'recursive_grid', 'ui_hint'] },
-      { path: 'window.gap', label: '布局间距', kind: 'number', min: 0, max: 100, step: 1 },
       { path: 'window.number_timeout_ms', label: '歧义编号等待（毫秒）', kind: 'number', min: 100, max: 2000, step: 10 },
       { path: 'window.move_step', label: '移动步长', kind: 'number', min: 0, max: 10000, step: 1 },
       { path: 'window.resize_step', label: '缩放步长', kind: 'number', min: 0, max: 10000, step: 1 },
@@ -138,6 +137,16 @@ const fields: Record<TargetingMode, ModeFields> = {
       { path: 'ui_hint.boundary_highlight.border_width', label: '轮廓线宽', kind: 'number', min: 0, max: 8, step: 0.5 },
     ],
   },
+} as Record<TargetingMode, ModeFields>
+
+for (const mode of ['window_quick', 'window_editor', 'window_restore', 'window_delete'] as const) {
+  const common = (items: StyleField[]) => items.filter(f => !/window\.(move_|resize_)/.test(f.path)).map(f => ({ ...f, path: f.path.replace(/^window\./, `${mode}.`) }))
+  ;(fields as Record<string, ModeFields>)[mode] = { colors: common(fields.window.colors), layout: common(fields.window.layout), advanced: common(fields.window.advanced) }
+  const own = (fields as Record<string, ModeFields>)[mode]
+  if (mode === 'window_quick') own.layout.push({ path: `${mode}.split_ratios`, label: '比例（逗号分隔，支持分数）', kind: 'ratios' })
+  if (mode !== 'window_delete') own.layout.push({ path: `${mode}.gap`, label: '布局间距', kind: 'number', min: 0, step: 1 })
+  if (mode === 'window_editor') own.advanced.push({ path: `${mode}.resize_step`, label: '分割线步长', kind: 'number', min: 0 }, { path: `${mode}.resize_speed`, label: '分割线速度', kind: 'number', min: 0 })
+  if (mode === 'window_restore') own.advanced.push({ path: `${mode}.lifecycle.after_finish`, label: '恢复成功后', kind: 'select', options: ['window_editor', 'window', 'window_restore', 'keep', 'normal', 'idle'] })
 }
 
 const paletteFields = ['surface', 'accent', 'accent_alt', 'on_accent_alt', 'text'] as const
@@ -257,6 +266,13 @@ const StyleControl = defineComponent({
               <input type="color" value={normalizeColor(value, props.appearance)} onInput={(event) => updateColor(withAlpha((event.target as HTMLInputElement).value, value))} />
               <input value={String(value)} onInput={(event) => updateColor((event.target as HTMLInputElement).value)} />
             </div>
+          ) : field.kind === 'ratios' ? (
+            <input value={Array.isArray(value) ? value.join(', ') : String(value)} onChange={event => {
+              const input = event.target as HTMLInputElement
+              const values = input.value.split(',').map(part => part.trim()).map(part => part.includes('/') ? part : Number(part))
+              try { parseSplitRatios(values); input.setCustomValidity(''); props.onUpdate(values) }
+              catch (error) { input.setCustomValidity(String(error)); input.reportValidity() }
+            }} />
           ) : field.kind === 'select' ? (
             <select value={String(value)} onChange={(event) => props.onUpdate((event.target as HTMLSelectElement).value)}>
               {field.options?.map((option) => <option value={option}>{option}</option>)}
@@ -302,5 +318,5 @@ function withAlpha(next: string, previous: unknown): string {
 }
 
 function modeLabel(mode: TargetingMode): string {
-  return mode === 'window' ? 'Window' : mode === 'key_help' ? '按键提示' : mode === 'grid' ? 'Grid' : mode === 'recursive_grid' ? 'Recursive Grid' : 'UI Hint'
+  return mode.startsWith('window') ? mode : mode === 'key_help' ? '按键提示' : mode === 'grid' ? 'Grid' : mode === 'recursive_grid' ? 'Recursive Grid' : 'UI Hint'
 }

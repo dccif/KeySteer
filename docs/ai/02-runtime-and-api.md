@@ -227,15 +227,15 @@ macOS 更新事件在 Hook 有界队列忙时转入 fallback channel，后台线
 
 ## Window 请求与会话
 
-`BeginEdit` 异步返回完整库存与最小尺寸快照；`ApplyLayout` 发送事务 id、递增修订号及标准化绝对矩形；`EndEdit` 结束并分组撤销记录，内部恢复路径仍可请求回滚。默认交互即时生效，不绑定 Enter；Q 在 Quick／Tree 返回普通 Window，根层按 window.exit_mode 退出，均保留最新布局。Mode 保持单个在途批次并合并后续目标；worker 只写入变化矩形，拒绝陈旧修订，原生拒绝后回读并恢复上一成功布局。提交失败必须反馈结束状态，避免模式等待不存在的确认。
+`BeginEdit` 异步返回完整库存与最小尺寸快照；`ApplyLayout` 发送事务 id、递增修订号及标准化绝对矩形；`EndEdit` 结束并分组撤销记录，内部恢复路径仍可请求回滚。移动与编辑即时生效；Q 是当前模式的普通绑定，交接前完成最新布局。Restore／Delete 的 Enter 用于编号确认／删除确认。Mode 保持单个在途批次并合并后续目标；worker 只写入变化矩形，拒绝陈旧修订，原生拒绝后回读并恢复上一成功布局。提交失败必须反馈结束状态，避免模式等待不存在的确认。
 
 Mode 的可选 `help_anchor` / `help_previews` 提供纯几何提示数据。Window 的常显面板由 Engine 的 key_help decorator 合并状态、真实绑定和缩略图，并基于锁定窗口定位。其他模式的可选 key_help 和临时 Normal 保持原语义。
 
-Window 以 modal push/pop 进入和返回，暂停旧模式时释放其连续手势，但保留物理键的消费配对和旧模式选择实例。`Binding::Window` 由模式处理，返回 `Command::WindowRequest`；Engine 在消费确认之后调用后端，并以 session→owner 路由 `BackendEvent::WindowResult`。原生 HWND/AX 引用不进入 API。
+五个 Window 模式走普通 Binding::Mode 激活流程。Mode 的可选 session_group 标识共享会话；prepare_transition 可返回命令批次推迟切换，事务完成后再发 SwitchMode。保留树的交接等到最新修订完成，其余编辑交接等待 EndEdit；整个过程不阻塞 Engine。组内切换在 Deactivated 前转移 session→owner；组外退出释放会话，取消计时器和备注。Window 动作即使继承自其他表也发给当前窗口交互实例，绑定来源仍用于帮助提示和覆盖解析。原生 HWND/AX 引用不进入 API。
 
 请求有 session 和递增 id。`CancelPending` 取消较旧的查询/调整并保留目标、Tab 顺序和撤销；模式同时推进接受结果的下界。退出、捕获恢复、计划替换和 shutdown 取消整个会话并清除路由，晚到结果不能 warp。显示器变化取消旧操作，并按新屏幕数据回读当前目标。
 
-按住临时 Normal 激活键时，`TemporaryModeChanged` 在本次 disposition 发布之后送达 Window，停止窗口连续运动、取消过期操作并隐藏其覆盖层；Normal 继续接收真实绑定。Window 的裸方向键不抢占临时 Normal，完整显式组合键仍优先。其他定位模式在临时 Normal 已有真实绑定或 `none` 时保持旧语义；没有临时绑定时可解析完整 Alt+W 启动键。
+按住临时 Normal 激活键时，`TemporaryModeChanged` 在本次 disposition 发布之后送达 Window，停止窗口连续运动、取消过期操作并隐藏其覆盖层；Normal 继续接收真实绑定。Window 的裸方向键不抢占临时 Normal，完整显式组合键仍优先。其他定位模式在临时 Normal 已有真实绑定或 `none` 时保持旧语义；没有临时绑定时可解析完整的全局模式启动键。
 
 ## 可恢复输入失败
 
@@ -264,3 +264,5 @@ Window 以 modal push/pop 进入和返回，暂停旧模式时释放其连续手
 原生边沿映射和超时配对见 [原生后端](06-platform-backends.md#鼠标侧键绑定)。
 
 WindowAction::Ratio 使用 held 按键生命周期及现有 FrameClock；RemoveRegion 仅在 Tree 可用。LayoutTree::resize_by 接收屏幕像素位移与 work_area，Mode 负责最小尺寸约束与事务合并。区域编号选择返回原生 Select 请求（空区域返回 WarpPointer），展示本身不调用平台 API。
+
+WindowInfo.minimized 在原生结果中传递最小化状态，Mode 保留目标但 presentation 隐藏其边框和编号。WindowAction/WindowChange::CycleState 对应 size_cycle，不提供旧动作名称的兼容别名。

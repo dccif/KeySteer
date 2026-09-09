@@ -31,7 +31,7 @@ impl KeyHelpCache {
 
 impl Engine {
     fn window_help_visible(&self) -> bool {
-        self.display_mode() == ModeId::window()
+        self.display_mode().is_window()
     }
 
     pub(super) fn help_screen(&self) -> Option<&Screen> {
@@ -94,31 +94,6 @@ impl Engine {
                     entry.chord.canonical(),
                     entry.binding.canonical()
                 ));
-            }
-        }
-        if self.display_mode() == ModeId::window() {
-            let table = if self
-                .registry
-                .get(&self.registry.active)
-                .is_some_and(|m| m.window_layout_active())
-            {
-                &self.registry.window_layout_table
-            } else {
-                &self.registry.window_motion_table
-            };
-            for entry in table.iter_entries() {
-                if self
-                    .lookup_for_pressed(entry.chord.activation_key(), entry.chord.keys())
-                    .is_some_and(|resolved| {
-                        resolved.binding == entry.binding && resolved.owner == ModeId::window()
-                    })
-                {
-                    entries.insert(format!(
-                        "{}  ·  {}",
-                        entry.chord.canonical(),
-                        entry.binding.canonical()
-                    ));
-                }
             }
         }
         if self.display_mode() == self.registry.active

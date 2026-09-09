@@ -338,3 +338,5 @@ Windows Hook 将 XBUTTON1/2 的 down/up、macOS Hook 将 OtherMouse 的按钮 3/
 物理侧键不产生语义 `Clicked`。左右键、中键和滚轮不接入此次绑定链路。
 
 Windows 窗口布局的异步恢复等待同时核对最大化样式与目标几何，不能把旧最大化帧短暂稳定误认为恢复完成。严格布局拒绝时，未变化或仍最大化的几何不能提升缓存的最小尺寸。保留原生 checkpoint 的 show state，撤销可恢复最大化。
+
+`size_cycle`依据窗口状态循环最大化→最小化→恢复普通大小。Windows 保留可见原始矩形并核对 IsIconic；macOS 保留恢复矩形并写入/回读 AXMinimized。最小化不释放身份或目标，不移动指针、不绘制目标边框/编号；checkpoint 包含 minimized 状态供撤销使用。退出会话仍遵守原有身份释放规则。

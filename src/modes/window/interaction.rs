@@ -2,7 +2,7 @@
 use super::*;
 use crate::api::command::WindowScreenTarget;
 
-impl WindowMode {
+impl WindowSession {
     pub(super) fn action(
         &mut self,
         action: W,
@@ -49,39 +49,16 @@ impl WindowMode {
             }
             return;
         }
-        if action == W::Cancel {
-            let number = self.cancel_number(out);
-            let swap = self.swap_source.take().is_some();
-            if number || swap {
-                return;
-            }
-        }
         if !matches!(action, W::Navigate(_) | W::Split(_) | W::Ratio(_)) {
             self.cancel_number(out);
             self.swap_source = None;
         }
         match action {
-            W::SavedLayouts => self.open_library(out),
             W::SaveLayout => self.save_layout(out),
             W::RemoveRegion => self.remove_region(ctx, out),
             W::Navigate(direction) => self.edit_direction(direction, false, false, ctx, out),
             W::Split(direction) => self.edit_direction(direction, true, false, ctx, out),
             W::Ratio(direction) => self.edit_direction(direction, false, true, ctx, out),
-            W::Layout => {
-                if self.edit.is_none() {
-                    self.start_edit(false, ctx, out);
-                }
-            }
-            W::Edit => {
-                if matches!(
-                    self.edit.as_ref().map(|e| &e.model),
-                    Some(EditModel::Quick(_))
-                ) {
-                    self.finish_edit(Finish::Tree, out);
-                } else if self.edit.is_none() {
-                    self.start_edit(true, ctx, out);
-                }
-            }
             W::Select => {
                 if let Some(edit) = &self.edit
                     && let EditModel::Tree(tree) = &edit.model
@@ -140,10 +117,6 @@ impl WindowMode {
                     self.trees.clear();
                 }
             }
-            W::Confirm if self.edit.is_some() => self.finish_edit(Finish::Commit, out),
-            W::Cancel if self.edit.is_some() => self.finish_edit(Finish::Commit, out),
-            W::Exit if self.edit.is_some() => self.finish_edit(Finish::Exit, out),
-            W::Exit | W::Confirm | W::Cancel => self.exit(out),
             W::Tile => {
                 if self.edit.is_some() {
                     self.finish_edit(Finish::Tile, out);
@@ -153,12 +126,12 @@ impl WindowMode {
             }
             _ if self.edit.is_some() => {}
             W::Size => self.size = !self.size,
-            W::NextScreen | W::PreviousScreen | W::Maximize | W::Center => {
+            W::NextScreen | W::PreviousScreen | W::CycleState | W::Center => {
                 self.group += 1;
                 let change = match action {
                     W::NextScreen => WindowChange::Screen(WindowScreenTarget::Next),
                     W::PreviousScreen => WindowChange::Screen(WindowScreenTarget::Previous),
-                    W::Maximize => WindowChange::Maximize,
+                    W::CycleState => WindowChange::CycleState,
                     _ => WindowChange::Center,
                 };
                 self.adjust(change, out);

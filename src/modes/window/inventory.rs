@@ -2,7 +2,7 @@
 use super::*;
 use crate::api::window::WindowResult;
 
-impl WindowMode {
+impl WindowSession {
     pub(super) fn window_result(
         &mut self,
         mut result: WindowResult,
@@ -50,7 +50,8 @@ impl WindowMode {
                     match self.inventory.get_mut(&window.id) {
                         Some(old) if *old == window => {}
                         Some(old) => {
-                            self.inventory_dirty |= old.screen != window.screen;
+                            self.inventory_dirty |=
+                                old.screen != window.screen || old.minimized != window.minimized;
                             *old = window;
                             changed = true;
                         }
@@ -72,7 +73,7 @@ impl WindowMode {
                 self.inventory_dirty |= self
                     .inventory
                     .get(&target.id)
-                    .is_none_or(|w| w.screen != target.screen);
+                    .is_none_or(|w| w.screen != target.screen || w.minimized != target.minimized);
                 self.inventory.insert(target.id, target.clone());
                 changed = true;
             }
@@ -130,9 +131,19 @@ impl WindowMode {
             );
             self.edit_result(feedback, ctx, &mut out);
         }
-        if self.resume_quick && result.pointer.is_some() && self.edit.is_none() {
+        if result.edit.is_none()
+            && self.target.is_some()
+            && self.edit.is_none()
+            && self.pending_transition.is_none()
+            && (self.resume_quick || (!had_target && self.kind == WindowKind::Quick))
+        {
             self.resume_quick = false;
             self.start_edit(false, ctx, &mut out);
+            changed = true;
+        }
+        if self.enter_pending && result.id >= 1 {
+            self.enter_pending = false;
+            self.enter_kind(ctx, &mut out);
             changed = true;
         }
         if self.target.is_none() && self.edit.is_none() {
@@ -150,9 +161,12 @@ impl WindowMode {
             self.refresh(&mut out);
         }
         if changed
-            && !out
-                .iter()
-                .any(|c| matches!(c, Command::PopMode | Command::SwitchMode(_)))
+            && !out.iter().any(|c| {
+                matches!(
+                    c,
+                    Command::PopMode | Command::SwitchMode(_) | Command::FinishMode { .. }
+                )
+            })
         {
             out.push(ctx.present(self.view()));
         }

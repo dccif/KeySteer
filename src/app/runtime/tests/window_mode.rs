@@ -1,18 +1,17 @@
 #[test]
 fn window_help_shows_restore_and_complete_descriptions_from_effective_bindings() {
-    use crate::api::window::WindowAction as W;
     for rebound in [false, true] {
         let mut config = Config::default();
         if rebound {
             config.window.bindings.insert("r".into(), Binding::Disabled);
-            config.window.bindings.insert("v".into(), Binding::Window(W::SavedLayouts));
+            config.window.bindings.insert("v".into(), Binding::Mode(ModeId::window_restore()));
         }
         let (mut engine, mut backend, log) = window_test_engine(&config);
         enter_window(&mut engine, &mut backend, &log);
         {
             let recorded = log.lock().unwrap();
             let labels = &recorded.scenes.last().unwrap().labels;
-            for text in ["Restore layout", "Edit layout tree", "Maximize / restore", if rebound { "V" } else { "R" }] {
+            for text in ["Restore layout", "Edit layout tree", "Maximize / minimize / restore", if rebound { "V" } else { "R" }] {
                 assert!(labels.iter().any(|label| label.text == text), "missing {text}");
             }
             assert!(!labels.iter().any(|label| label.text == "Save layout"));
@@ -85,24 +84,24 @@ fn window_card_text_stays_inside_its_background_at_each_dpi_without_font_shrinki
 }
 
 #[test]
-fn window_root_e_is_available_and_rebound_back_returns_one_level_then_uses_exit_mode() {
-    use crate::api::window::{WindowAction as W, WindowOperation as O};
+fn window_root_e_and_independent_rebound_mode_destinations() {
+    use crate::api::window::WindowOperation as O;
     let mut config = Config::default();
-    config.window.exit_mode = crate::api::lifecycle::LifecycleAction::Mode(ModeId::idle());
     config.window.bindings.insert("q".into(), Binding::Disabled);
-    config.window.bindings.insert("v".into(), Binding::Window(W::Cancel));
+    config.window.bindings.insert("v".into(), Binding::Mode(ModeId::idle()));
+    config.window_editor.bindings.insert("q".into(), Binding::Disabled);
+    config.window_editor.bindings.insert("v".into(), Binding::Mode(ModeId::window()));
     let (mut engine, mut backend, log) = window_test_engine(&config);
     enter_window(&mut engine, &mut backend, &log);
-    assert!(engine.key_help_entries().iter().any(|e| e.starts_with("e ") && e.contains("window_edit")));
+    assert!(engine.key_help_entries().iter().any(|e| e.starts_with("e ") && e.contains("window_editor")));
     for event in [key_down("e"), key_up("e")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
     acknowledge_window_edit(&mut engine, &mut backend, &log);
     assert!(log.lock().unwrap().window_requests.iter().any(|r| matches!(r.operation, O::ApplyLayout { .. })));
     for event in [key_down("q"), key_up("q")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
-    assert!(engine.registry.get(&ModeId::window()).unwrap().window_layout_active());
+    assert_eq!(engine.active_mode(), &ModeId::window_editor());
     for event in [key_down("v"), key_up("v")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
     acknowledge_window_edit(&mut engine, &mut backend, &log);
     assert_eq!(engine.active_mode(), &ModeId::window());
-    assert!(!engine.registry.get(&ModeId::window()).unwrap().window_layout_active());
     for event in [key_down("v"), key_up("v")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
     assert_eq!(engine.active_mode(), &ModeId::idle());
 }
@@ -157,7 +156,7 @@ fn reopening_r_reads_layouts_replaced_outside_the_program() {
     engine.attach_layout_store(Box::new(crate::app::layout_store::LayoutStore::persistent(path.clone(), crate::platform::atomic_replace))); enter_window(&mut engine, &mut backend, &log);
     for event in [key_down("r"), key_up("r")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
     assert!(log.lock().unwrap().scenes.last().unwrap().labels.iter().any(|l| l.text.contains("Original layout")));
-    for event in [key_down("r"), key_up("r")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    for event in [key_down("q"), key_up("q")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
     external.save(RegionTemplate::Slot { id: 1 }, 1, "Browser edited layout".into()).unwrap();
     for event in [key_down("r"), key_up("r")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
     assert!(log.lock().unwrap().scenes.last().unwrap().labels.iter().any(|l| l.text.contains("Browser edited layout")));
@@ -170,7 +169,11 @@ fn restoring_while_quick_start_is_pending_keeps_the_saved_template_for_tree_star
     let (mut engine, mut backend, log) = window_test_engine(&Config::default());
     engine.window_layouts.store.save(T::Split { axis: crate::api::window_layout::Axis::X, ratio: 0.25, first: Box::new(T::Slot { id: 1 }), second: Box::new(T::Slot { id: 2 }) }, 1, "Quarter".into()).unwrap();
     enter_window(&mut engine, &mut backend, &log);
-    for event in [key_down("a"), key_up("a"), key_down("r"), key_up("r"), key_down("1"), key_up("1")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    for event in [key_down("a"), key_up("a"), key_down("r"), key_up("r")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    assert_eq!(engine.active_mode(), &ModeId::window_quick());
+    acknowledge_window_edit(&mut engine, &mut backend, &log);
+    assert_eq!(engine.active_mode(), &ModeId::window_restore());
+    for event in [key_down("1"), key_up("1")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
     acknowledge_window_edit(&mut engine, &mut backend, &log);
     assert!(log.lock().unwrap().window_requests.iter().any(|r| matches!(&r.operation, crate::api::window::WindowOperation::ApplyLayout { placements, .. } if placements.iter().any(|(id, bounds)| *id == crate::api::window::WindowId(77) && (bounds.width - 0.25).abs() < 0.001))));
 }
@@ -198,11 +201,11 @@ fn enter_window(engine: &mut Engine, backend: &mut FakeBackend, log: &Arc<Mutex<
         session: request.session, id: request.id, target: Some(crate::api::window::WindowInfo {
             id: crate::api::window::WindowId(77), title: "Test window".into(), app: "test".into(),
             bounds: Rect::new(100.0, 100.0, 400.0, 300.0), screen: 0,
-            resizable: true, maximized: false, fullscreen: false,
+            resizable: true, maximized: false, minimized: false, fullscreen: false,
         }), windows: Some(vec![crate::api::window::WindowInfo {
             id: crate::api::window::WindowId(77), title: "Test window".into(), app: "test".into(),
             bounds: Rect::new(100.0, 100.0, 400.0, 300.0), screen: 0,
-            resizable: true, maximized: false, fullscreen: false,
+            resizable: true, maximized: false, minimized: false, fullscreen: false,
         }]), pointer: None, changed: 0, skipped: 0, message: None, edit: None,
     })), backend).unwrap();
     request
@@ -296,7 +299,7 @@ fn window_a_opens_quick_without_any_double_tap_tiling() {
 }
 
 #[test]
-fn layout_q_keeps_adjustments_before_returning_to_preserved_grid() {
+fn layout_q_waits_for_commit_then_uses_ordinary_mode_binding() {
     use crate::api::window::WindowOperation as O;
     let config = Config::default();
     let (mut engine, mut backend, log) = window_test_engine(&config);
@@ -305,15 +308,15 @@ fn layout_q_keeps_adjustments_before_returning_to_preserved_grid() {
     engine.set_active(ModeId::grid());
     enter_window(&mut engine, &mut backend, &log);
     for event in [key_down("a"), key_up("a"), key_down("q"), key_up("q")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
-    assert_eq!(engine.active_mode(), &ModeId::window());
+    assert_eq!(engine.active_mode(), &ModeId::window_quick());
     acknowledge_window_edit(&mut engine, &mut backend, &log);
     assert!(log.lock().unwrap().window_requests.iter().any(|r| matches!(r.operation, O::EndEdit { commit: true, .. })));
     assert_eq!(engine.active_mode(), &ModeId::window());
     for event in [key_down("q"), key_up("q")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
-    assert_eq!(engine.active_mode(), &ModeId::grid());
+    assert_eq!(engine.active_mode(), &ModeId::idle());
     let seen = seen.lock().unwrap();
-    assert!(seen.iter().any(|e| e == "grid:resumed"));
-    assert!(!seen.iter().any(|e| e == "grid:restarted" || e == "grid:deactivated"));
+    assert!(seen.iter().any(|e| e == "grid:deactivated"));
+    assert!(!seen.iter().any(|e| e == "grid:resumed"));
 }
 
 #[test]
@@ -321,7 +324,7 @@ fn window_exit_cancels_and_late_results_cannot_warp_pointer() {
     let (mut engine, mut backend, log) = window_test_engine(&Config::default());
     let request = enter_window(&mut engine, &mut backend, &log);
     engine.handle_backend_event(key_down("q"), &mut backend).unwrap();
-    assert_eq!(engine.active_mode(), &ModeId::normal());
+    assert_eq!(engine.active_mode(), &ModeId::idle());
     assert!(log.lock().unwrap().cancelled_window_sessions.contains(&request.session));
     let before = log.lock().unwrap().warps.len();
     engine.handle_backend_event(BackendEvent::WindowResult(Box::new(crate::api::window::WindowResult { closed: Vec::new(),
@@ -385,6 +388,9 @@ fn window_help_follows_target_not_pointer_and_contains_quick_layout_in_one_panel
 // Runtime tests acknowledge the worker boundary; geometry and native rollback
 // are exercised separately against Session and platform probes.
 fn acknowledge_window_edit(engine: &mut Engine, backend: &mut FakeBackend, log: &Arc<Mutex<Recorder>>) {
+    acknowledge_window_edit_with_acceptance(engine, backend, log, true);
+}
+fn acknowledge_window_edit_with_acceptance(engine: &mut Engine, backend: &mut FakeBackend, log: &Arc<Mutex<Recorder>>, accepted: bool) {
     use crate::api::window::{WindowEditResult as E, WindowOperation as O, WindowInfo, WindowId, WindowResult};
     let mut acknowledged = 0;
     for _ in 0..20 {
@@ -393,14 +399,14 @@ fn acknowledge_window_edit(engine: &mut Engine, backend: &mut FakeBackend, log: 
         acknowledged = request.id;
         let mut target = WindowInfo { id: WindowId(77), title: "Test window".into(), app: "test".into(),
             bounds: Rect::new(100.0, 100.0, 400.0, 300.0), screen: 0,
-            resizable: true, maximized: false, fullscreen: false };
+            resizable: true, maximized: false, minimized: false, fullscreen: false };
         let edit = match request.operation {
             O::BeginEdit { transaction, targets, screen, .. } => E::Started { transaction, minimums: if screen.is_some() { vec![(target.id, Point::new(100.0, 80.0))] } else { targets.iter().map(|id| (*id, Point::new(100.0, 80.0))).collect() }, gap_scale: 1.0, full_inventory: screen.is_some() },
             O::ApplyLayout { transaction, revision, ref placements, gap, .. } => {
                 if let Some((_, rect)) = placements.iter().find(|(id, _)| *id == target.id) {
                     target.bounds = crate::api::window_layout::placed_rect(engine.screens[0].work_area, *rect, gap);
                 }
-                E::Applied { transaction, revision, accepted: true, minimums: Vec::new() }
+                E::Applied { transaction, revision, accepted, minimums: Vec::new() }
             }
             O::EndEdit { transaction, commit } => E::Ended { transaction, committed: commit },
             _ => break,
@@ -417,7 +423,10 @@ fn window_direction_language_uses_effective_wasd_and_modifiers_without_pointer_m
     use crate::api::window::WindowOperation as O;
     let mut config = Config::default();
     for (key, direction) in [("a", Direction::Left), ("s", Direction::Down), ("w", Direction::Up), ("d", Direction::Right)] {
-        config.normal.bindings.insert(key.into(), Binding::Move(direction));
+        config.window_quick.bindings.insert(key.into(), Binding::Window(crate::api::window::WindowAction::Navigate(direction)));
+        config.window_editor.bindings.insert(key.into(), Binding::Window(crate::api::window::WindowAction::Navigate(direction)));
+        config.window_editor.bindings.insert(format!("shift+{key}"), Binding::Window(crate::api::window::WindowAction::Split(direction)));
+        config.window_editor.bindings.insert(format!("ctrl+{key}"), Binding::Window(crate::api::window::WindowAction::Ratio(direction)));
     }
     let (mut engine, mut backend, log) = window_test_engine(&config);
     enter_window(&mut engine, &mut backend, &log);
@@ -448,7 +457,7 @@ fn window_number_deadline_only_exists_for_a_live_ambiguous_prefix() {
         let (mut engine, mut backend, log) = window_test_engine(&Config::default());
         let request = enter_window(&mut engine, &mut backend, &log);
         let windows: Vec<_> = (1..=count).map(|id| WindowInfo { id: WindowId(id), title: format!("Window {id}"), app: "test".into(),
-            bounds: Rect::new(0.0, 0.0, 300.0, 200.0), screen: 0, resizable: true, maximized: false, fullscreen: false }).collect();
+            bounds: Rect::new(0.0, 0.0, 300.0, 200.0), screen: 0, resizable: true, maximized: false, minimized: false, fullscreen: false }).collect();
         // Supply the inventory on a real outstanding enumerate request.
         engine.dispatch_to(&ModeId::window(), ModeEvent::Timer { id: "window_inventory".into(), elapsed: Duration::from_millis(500) }, &mut backend).unwrap();
         let id = log.lock().unwrap().window_requests.last().unwrap().id;
@@ -474,7 +483,7 @@ fn window_help_shows_rebound_keys_and_retains_result_status_after_key_up() {
     let request = enter_window(&mut engine, &mut backend, &log);
     engine.handle_backend_event(key_down("x"), &mut backend).unwrap();
     let target = crate::api::window::WindowInfo { id: crate::api::window::WindowId(77), title: "Test window".into(), app: "test".into(),
-        bounds: Rect::new(100.0, 100.0, 400.0, 300.0), screen: 0, resizable: true, maximized: false, fullscreen: false };
+        bounds: Rect::new(100.0, 100.0, 400.0, 300.0), screen: 0, resizable: true, maximized: false, minimized: false, fullscreen: false };
     engine.handle_backend_event(BackendEvent::WindowResult(Box::new(crate::api::window::WindowResult { closed: Vec::new(),
         session: request.session, id: request.id + 1, target: Some(target), windows: None,
         pointer: None, changed: 0, skipped: 0, message: Some("Nothing to undo".into()), edit: None,
@@ -498,7 +507,7 @@ fn window_tab_cycles_immediately_and_centers_pointer_without_confirmation() {
     let request = log.lock().unwrap().window_requests.last().unwrap().clone();
     assert!(matches!(request.operation, WindowOperation::Cycle));
     let target = WindowInfo { id: WindowId(88), title: "Next window".into(), app: "test".into(),
-        bounds: Rect::new(500.0, 200.0, 400.0, 300.0), screen: 0, resizable: true, maximized: false, fullscreen: false };
+        bounds: Rect::new(500.0, 200.0, 400.0, 300.0), screen: 0, resizable: true, maximized: false, minimized: false, fullscreen: false };
     engine.handle_backend_event(BackendEvent::WindowResult(Box::new(WindowResult { closed: Vec::new(),
         session, id: request.id, pointer: Some(target.bounds.center()), target: Some(target),
         windows: None, changed: 0, skipped: 0, message: None, edit: None,
@@ -557,7 +566,7 @@ fn entering_window_stops_previous_normal_motion_without_restarting_it_on_return(
     enter_window(&mut engine, &mut backend, &log);
     assert!(engine.input.active_gestures.is_empty());
     engine.handle_backend_event(key_down("q"), &mut backend).unwrap();
-    assert_eq!(engine.active_mode(), &ModeId::normal());
+    assert_eq!(engine.active_mode(), &ModeId::idle());
     assert_ne!(engine.scheduler.frame_clock_owner, Some(ModeId::normal()));
     engine.handle_backend_event(key_up("h"), &mut backend).unwrap();
 }
@@ -574,7 +583,7 @@ fn unchanged_window_inventory_does_not_redraw_and_refresh_is_coalesced() {
     }
     assert_eq!(log.lock().unwrap().window_requests.len(), requests + 1);
     let id = log.lock().unwrap().window_requests.last().unwrap().id;
-    let target = WindowInfo { id: WindowId(77), title: "Test window".into(), app: "test".into(), bounds: Rect::new(100.0,100.0,400.0,300.0), screen: 0, resizable: true, maximized: false, fullscreen: false };
+    let target = WindowInfo { id: WindowId(77), title: "Test window".into(), app: "test".into(), bounds: Rect::new(100.0,100.0,400.0,300.0), screen: 0, resizable: true, maximized: false, minimized: false, fullscreen: false };
     engine.handle_backend_event(BackendEvent::WindowResult(Box::new(WindowResult { closed: Vec::new(), session: initial.session, id, target: Some(target.clone()), windows: Some(vec![target]), pointer: None, changed:0, skipped:0, message:None, edit:None })), &mut backend).unwrap();
     assert_eq!(log.lock().unwrap().scenes.len(), before);
 }
@@ -599,26 +608,26 @@ fn quick_input_coalesces_then_undo_restores_entry_transaction() {
         acknowledge_window_edit(&mut engine, &mut backend, &log);
     }
     assert!(log.lock().unwrap().window_requests.iter().any(|r| matches!(r.operation, O::EndEdit { commit:false, .. })));
-    assert_eq!(engine.active_mode(), &ModeId::window());
+    assert_eq!(engine.active_mode(), &ModeId::window_quick());
 }
 
 #[test]
-fn window_base_motion_follows_rebound_normal_keys_and_ignores_default_arrows() {
+fn window_base_motion_ignores_rebound_normal_keys_and_ignores_default_arrows() {
     use crate::api::window::WindowOperation as O;
     let mut config = Config::default();
     config.normal.bindings.insert("h".into(), Binding::Disabled);
     config.normal.bindings.insert("v".into(), Binding::Move(Direction::Left));
     let (mut engine, mut backend, log) = window_test_engine(&config);
     enter_window(&mut engine, &mut backend, &log);
-    for key in ["left", "h"] {
+    for key in ["left", "v"] {
         for event in [key_down(key), key_up(key)] { engine.handle_backend_event(event, &mut backend).unwrap(); }
     }
     assert!(!log.lock().unwrap().window_requests.iter().any(|r| matches!(r.operation, O::Adjust { .. })));
-    for event in [key_down("v"), key_up("v")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    for event in [key_down("h"), key_up("h")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
     assert!(log.lock().unwrap().window_requests.iter().any(|r| matches!(r.operation, O::Adjust { .. })));
     let log = log.lock().unwrap();
     assert!(log.moves.is_empty());
-    assert!(log.scenes.last().unwrap().labels.iter().any(|l| l.text == "V"));
+    assert!(log.scenes.last().unwrap().labels.iter().any(|l| l.text == "H"));
 }
 
 #[test]
@@ -649,6 +658,8 @@ fn backtick_opens_auto_layout_and_pending_region_input_focuses_window() {
             for event in [key_down("a"), key_up("a")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
             acknowledge_window_edit(&mut engine, &mut backend, &log);
         }
+        for event in [key_down("e"), key_up("e")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+        acknowledge_window_edit(&mut engine, &mut backend, &log);
         for key in ["`", "1"] {
             for event in [key_down(key), key_up(key)] { engine.handle_backend_event(event, &mut backend).unwrap(); }
         }
@@ -680,4 +691,138 @@ fn x_deletes_a_tree_region_without_closing_its_window_and_z_restores_it() {
     for event in [key_down("z"), key_up("z")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
     acknowledge_window_edit(&mut engine, &mut backend, &log);
     assert!(log.lock().unwrap().scenes.last().unwrap().labels.iter().any(|l| l.text == "`2"));
+}
+
+#[test]
+fn every_window_mode_launches_from_idle_and_q_uses_its_binding() {
+    for (mode, back) in [(ModeId::window(), ModeId::idle()), (ModeId::window_quick(), ModeId::window()), (ModeId::window_editor(), ModeId::window()), (ModeId::window_restore(), ModeId::window()), (ModeId::window_delete(), ModeId::window_restore())] {
+        let mut config = Config::default();
+        config.hotkeys.insert("alt+v".into(), Binding::Mode(mode.clone()));
+        let (mut engine, mut backend, log) = window_test_engine(&config);
+        engine.set_active(ModeId::idle());
+        for event in [key_down("left_alt"), key_down("v"), key_up("v"), key_up("left_alt")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+        assert_eq!(engine.active_mode(), &mode);
+        for event in [key_down("q"), key_up("q")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+        acknowledge_window_edit(&mut engine, &mut backend, &log);
+        assert_eq!(engine.active_mode(), &back);
+    }
+}
+
+#[test]
+fn custom_editor_q_commits_then_enters_the_configured_mode() {
+    for destination in [ModeId::idle(), ModeId::normal(), ModeId::grid(), ModeId::window_delete()] {
+        let mut config = Config::default();
+        config.window_editor.bindings.insert("q".into(), Binding::Mode(destination.clone()));
+        let (mut engine, mut backend, log) = window_test_engine(&config);
+        let session = enter_window(&mut engine, &mut backend, &log).session;
+        for event in [key_down("e"), key_up("e")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+        acknowledge_window_edit(&mut engine, &mut backend, &log);
+        for event in [key_down("left_shift"), key_down("l"), key_up("l"), key_up("left_shift"), key_down("q"), key_up("q")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+        assert_eq!(engine.active_mode(), &ModeId::window_editor());
+        acknowledge_window_edit(&mut engine, &mut backend, &log);
+        assert_eq!(engine.active_mode(), &destination);
+        assert_eq!(log.lock().unwrap().cancelled_window_sessions.contains(&session), !destination.is_window());
+    }
+}
+
+#[test]
+fn restore_finish_uses_configured_lifecycle_after_matching_apply() {
+    for destination in [crate::api::LifecycleAction::Keep, crate::api::LifecycleAction::Mode(ModeId::window_editor()), crate::api::LifecycleAction::Mode(ModeId::idle())] {
+        let mut config = Config::default(); config.window_restore.lifecycle.after_finish = destination.clone();
+        let (mut engine, mut backend, log) = window_test_engine(&config);
+        engine.window_layouts.store.save(crate::api::window_presets::RegionTemplate::Slot { id: 1 }, 1, "One".into()).unwrap();
+        enter_window(&mut engine, &mut backend, &log);
+        for event in [key_down("r"), key_up("r"), key_down("1"), key_up("1")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+        assert_eq!(engine.active_mode(), &ModeId::window_restore());
+        acknowledge_window_edit(&mut engine, &mut backend, &log);
+        let expected = match destination { crate::api::LifecycleAction::Mode(mode) => mode, _ => ModeId::window_restore() };
+        assert_eq!(engine.active_mode(), &expected);
+    }
+}
+
+#[test]
+fn delete_confirmation_cancel_and_empty_library_at_multiple_dpi() {
+    for scale in [1.0, 1.5, 2.0] {
+        let (mut engine, mut backend, log) = window_test_engine(&Config::default());
+        engine.screens[0].scale = scale;
+        engine.screens[0].work_area = Rect::new(0.0, 0.0, 1920.0 * scale, 1080.0 * scale);
+        engine.screens[0].bounds = engine.screens[0].work_area;
+        for i in 1..=7 { engine.window_layouts.store.save(crate::api::window_presets::RegionTemplate::Slot { id: 1 }, 1, format!("Delete me {i}")).unwrap(); }
+        enter_window(&mut engine, &mut backend, &log);
+        for key in ["r", "x", "7"] { for event in [key_down(key), key_up(key)] { engine.handle_backend_event(event, &mut backend).unwrap(); } }
+        assert_eq!(engine.window_layouts.store.list().unwrap().len(), 7);
+        {
+            let recorded = log.lock().unwrap(); let scene = recorded.scenes.last().unwrap();
+            let panel = scene.labels.iter().find(|l| l.z_index == i32::MAX - 1).unwrap().rect;
+            assert!(scene.labels.iter().any(|l| l.text.contains("Delete me 7")));
+            for label in &scene.labels {
+                let rect = crate::api::overlay::scaled_label_geometry(&label.text, label.rect, &label.style, scale).0;
+                assert!(rect.x >= panel.x - 1.0 && rect.right() <= panel.right() + 1.0 && rect.y >= panel.y - 1.0 && rect.bottom() <= panel.bottom() + 1.0);
+            }
+        }
+        for key in ["q", "x", "enter"] { for event in [key_down(key), key_up(key)] { engine.handle_backend_event(event, &mut backend).unwrap(); } }
+        assert_eq!(engine.window_layouts.store.list().unwrap().len(), 7);
+        for i in (1..=7).rev() {
+            for key in [i.to_string(), "enter".into()] { for event in [key_down(&key), key_up(&key)] { engine.handle_backend_event(event, &mut backend).unwrap(); } }
+            assert_eq!(engine.active_mode(), &ModeId::window_delete());
+            let layouts = engine.window_layouts.store.list().unwrap();
+            assert_eq!(layouts.iter().map(|p| p.id).collect::<Vec<_>>(), (1..i).collect::<Vec<_>>());
+        }
+    }
+}
+
+#[test]
+fn inherited_window_actions_and_app_overrides_use_the_active_session() {
+    let mut config = Config::default();
+    config.window_quick.bindings.insert("v".into(), Binding::Window(crate::api::window::WindowAction::Navigate(Direction::Right)));
+    config.window_editor.inherits = vec!["window_quick".into()];
+    config.window_editor.bindings.insert("h".into(), Binding::Disabled);
+    config.window_editor.app_configs.push(crate::config::AppOverride { bundle_id: "override-app".into(), bindings: Bindings::from([("v".into(), Binding::Window(crate::api::window::WindowAction::Split(Direction::Right)))]) });
+    let (mut engine, mut backend, log) = window_test_engine(&config);
+    enter_window(&mut engine, &mut backend, &log);
+    for event in [key_down("e"), key_up("e")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    acknowledge_window_edit(&mut engine, &mut backend, &log);
+    let help = engine.key_help_entries();
+    assert!(help.iter().any(|entry| entry.contains("v")), "{help:?}");
+    assert!(!help.iter().any(|entry| entry == "h"));
+    engine.handle_backend_event(BackendEvent::FocusChanged(Some(FocusedApp { bundle_id: "override-app".into(), window_title: "example".into(), process_id: 9 })), &mut backend).unwrap();
+    for event in [key_down("v"), key_up("v")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    acknowledge_window_edit(&mut engine, &mut backend, &log);
+    assert!(log.lock().unwrap().scenes.last().unwrap().labels.iter().any(|label| label.text == "`2"));
+    engine.handle_backend_event(BackendEvent::FocusChanged(None), &mut backend).unwrap();
+    for event in [key_down("v"), key_up("v")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    assert_eq!(engine.active_mode(), &ModeId::window_editor());
+    assert!(log.lock().unwrap().scenes.last().unwrap().labels.iter().any(|label| label.text.contains("area `2")));
+}
+
+#[test]
+fn failed_restore_stays_in_restore_and_can_be_retried() {
+    let (mut engine, mut backend, log) = window_test_engine(&Config::default());
+    engine.window_layouts.store.save(crate::api::window_presets::RegionTemplate::Slot { id: 1 }, 1, "Retry".into()).unwrap();
+    enter_window(&mut engine, &mut backend, &log);
+    for key in ["r", "1"] { for event in [key_down(key), key_up(key)] { engine.handle_backend_event(event, &mut backend).unwrap(); } }
+    acknowledge_window_edit_with_acceptance(&mut engine, &mut backend, &log, false);
+    assert_eq!(engine.active_mode(), &ModeId::window_restore());
+    for event in [key_down("1"), key_up("1")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    acknowledge_window_edit(&mut engine, &mut backend, &log);
+    assert_eq!(engine.active_mode(), &ModeId::window_editor());
+}
+
+#[test]
+fn quick_can_select_a_window_when_entry_has_no_pointer_target() {
+    use crate::api::window::{WindowInfo, WindowId, WindowResult, WindowOperation as O};
+    let (mut engine, mut backend, log) = window_test_engine(&Config::default());
+    enter_window(&mut engine, &mut backend, &log);
+    engine.dispatch_to(&ModeId::window(), ModeEvent::Timer { id: "window_inventory".into(), elapsed: Duration::from_millis(500) }, &mut backend).unwrap();
+    let window = WindowInfo { id: WindowId(77), title: "Selectable".into(), app: "test".into(), bounds: Rect::new(0.0, 0.0, 400.0, 300.0), screen: 0, resizable: true, maximized: false, minimized: false, fullscreen: false };
+    let request = log.lock().unwrap().window_requests.last().unwrap().clone();
+    engine.handle_backend_event(BackendEvent::WindowResult(Box::new(WindowResult { session: request.session, id: request.id, target: None, windows: Some(vec![window.clone()]), pointer: None, closed: Vec::new(), changed: 0, skipped: 0, message: None, edit: None })), &mut backend).unwrap();
+    for key in ["a", "1"] { for event in [key_down(key), key_up(key)] { engine.handle_backend_event(event, &mut backend).unwrap(); } }
+    let select = log.lock().unwrap().window_requests.last().unwrap().clone();
+    assert!(matches!(select.operation, O::Select(WindowId(77))));
+    engine.handle_backend_event(BackendEvent::WindowResult(Box::new(WindowResult { session: select.session, id: select.id, target: Some(window), windows: None, pointer: None, closed: Vec::new(), changed: 0, skipped: 0, message: None, edit: None })), &mut backend).unwrap();
+    assert!(matches!(log.lock().unwrap().window_requests.last().unwrap().operation, O::BeginEdit { .. }));
+    acknowledge_window_edit(&mut engine, &mut backend, &log);
+    for event in [key_down("h"), key_up("h")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    assert!(matches!(log.lock().unwrap().window_requests.last().unwrap().operation, O::ApplyLayout { .. }));
 }

@@ -19,14 +19,15 @@ fn window_idle_inventory_and_number_input_do_not_allocate() {
         palette: &palette,
     };
     let w = &config.window;
-    let mut mode = WindowMode::new(Settings {
-        exit_mode: crate::api::lifecycle::LifecycleAction::Mode(ModeId::normal()),
+    let mut mode = WindowSession::new(Settings {
+        lifecycle: crate::api::TargetingLifecycle::default(),
+        split_ratios: crate::api::window_layout::RATIOS.to_vec(),
         number_timeout_ms: w.number_timeout_ms,
         move_step: w.move_step,
         move_speed: w.move_speed,
         resize_step: w.resize_step,
         resize_speed: w.resize_speed,
-        gap: w.gap,
+        gap: config.window_editor.gap,
         border_width: w.border_width,
         ui: w.ui.clone(),
     });
@@ -40,6 +41,7 @@ fn window_idle_inventory_and_number_input_do_not_allocate() {
             screen: 0,
             resizable: true,
             maximized: false,
+            minimized: false,
             fullscreen: false,
         })
         .collect();
@@ -112,6 +114,7 @@ fn divider_hold_uses_elapsed_pixels_and_one_undo_checkpoint() {
         screen: 0,
         resizable: true,
         maximized: false,
+        minimized: false,
         fullscreen: false,
     });
     mode.edit = Some(LiveEdit {

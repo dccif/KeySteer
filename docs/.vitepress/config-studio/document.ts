@@ -21,6 +21,7 @@ const replacementTables = new Set([
   'mode_indicator.modes',
   'normal.bindings',
   'window.bindings',
+  'window_quick.bindings', 'window_editor.bindings', 'window_restore.bindings', 'window_delete.bindings',
   'grid.bindings',
   'recursive_grid.bindings',
   'ui_hint.bindings',
@@ -36,7 +37,23 @@ export function cloneConfigDocument(document: ConfigDocument): ConfigDocument {
 export function parseConfigDocument(source: string): ParsedConfigDocument {
   const parsed = parse(source)
   if (!isRecord(parsed)) throw new Error('TOML 顶层必须是配置表')
-  parseSplitRatios((parsed.window as Record<string, unknown> | undefined)?.split_ratios)
+  const oldWindow = parsed.window as Record<string, unknown> | undefined
+  for (const key of ['exit_mode', 'gap', 'split_ratios', 'layout_keys', 'double_tap_ms']) {
+    if (oldWindow && key in oldWindow) throw new Error(`window.${key} 已移除，请迁移至独立窗口模式配置；返回目标使用 bindings`)
+  }
+  function checkBindings(value: unknown): void {
+    if (Array.isArray(value)) { value.forEach(checkBindings); return }
+    if (!isRecord(value)) return
+    for (const [key, child] of Object.entries(value)) {
+      if ((key === 'bindings' || key === 'hotkeys') && isRecord(child)) for (const action of Object.values(child).flat()) {
+        if (['window_maximize', 'window_cycle_state'].includes(String(action))) throw new Error(`${action} 已移除，请使用 size_cycle`)
+        if (['window_layout', 'window_edit', 'window_saved_layouts', 'window_cancel', 'window_exit'].includes(String(action))) throw new Error(`${action} 已移除，请使用 window_quick / window_editor / window_restore 或普通模式绑定`)
+      }
+      checkBindings(child)
+    }
+  }
+  checkBindings(parsed)
+  parseSplitRatios((parsed.window_quick as Record<string, unknown> | undefined)?.split_ratios)
 
   // Stringifying once catches values that the editor would be unable to save.
   stringify(parsed)

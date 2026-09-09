@@ -135,10 +135,9 @@ pub(crate) fn compose(scene: &mut OverlayScene, input: KeyHelpView<'_>) {
     let width = (content_width + padding * 2.0)
         .max(
             if window_help
-                && input
-                    .detail
-                    .as_deref()
-                    .is_some_and(|detail| detail.starts_with("Restore\n"))
+                && input.detail.as_deref().is_some_and(|detail| {
+                    detail.starts_with("Restore\n") || detail.starts_with("Delete layouts\n")
+                })
             {
                 560.0 * scale
             } else {
@@ -556,9 +555,14 @@ fn window_action_label(action: &str) -> Option<&'static str> {
         "window_up" => "Up",
         "window_down" => "Down",
         "window_size" => "Move / resize",
-        "window_layout" => "Quick layout",
-        "window_edit" => "Edit layout tree",
-        "window_saved_layouts" => "Restore layout",
+        "window_editor" => "Edit layout tree",
+        "window_quick" => "Quick layout",
+        "window_restore" => "Restore layout",
+        "window_delete" => "Delete layouts",
+        "window" => "Window",
+        "idle" => "Idle",
+        "normal" => "Normal",
+        "grid" => "Grid",
         "window_save_layout" => "Save layout",
         "Area number" => "Area number prefix",
         "window_layout_left" => "Layout left",
@@ -576,14 +580,12 @@ fn window_action_label(action: &str) -> Option<&'static str> {
         "window_tile" => "Tile windows",
         "window_screen_next" => "Next screen",
         "window_screen_previous" => "Previous screen",
-        "window_maximize" => "Maximize / restore",
+        "size_cycle" => "Maximize / minimize / restore",
         "window_center" => "Center window",
         "window_select" => "Next window",
         "window_undo" => "Undo",
         "window_remove_region" => "Delete region",
-        "window_confirm" => "Apply / exit",
-        "window_cancel" => "Back / exit",
-        "window_exit" => "Exit",
+        "window_confirm" => "Confirm",
         _ => return None,
     })
 }

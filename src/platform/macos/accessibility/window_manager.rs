@@ -5,6 +5,7 @@ use crate::api::{Point, Screen};
 use crate::platform::common::window_geometry;
 use crate::platform::common::window_session::{Snapshot, WindowAccess};
 use core_foundation::base::{CFEqual, CFRetain};
+use core_foundation::boolean::CFBoolean;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
 use core_graphics::window::{
@@ -223,6 +224,33 @@ impl MacWindows {
         }
         self.closed.extend(closed);
     }
+    fn set_minimized(
+        &self,
+        id: WindowId,
+        minimized: bool,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), String> {
+        if cancelled() {
+            return Ok(());
+        }
+        let window = &self.entry(id)?.window;
+        let attribute = CFString::new("AXMinimized");
+        let value = CFBoolean::from(minimized);
+        window
+            .set_attribute(&attribute, value.as_CFTypeRef())
+            .map_err(|e| e.message().to_string())?;
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while !cancelled() {
+            if copy_bool_attribute(window.window.as_ptr(), &attribute) == Some(minimized) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err("Timed out changing minimized state".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
     fn set_size(window: &MovableWindow, width: f64, height: f64) -> Result<(), String> {
         let size = CGSize::new(width, height);
         // SAFETY: the type tag describes the stack CGSize; AX copies it into a
@@ -377,6 +405,11 @@ impl WindowAccess for MacWindows {
                 screen,
                 resizable,
                 maximized,
+                minimized: copy_bool_attribute(
+                    window.window.as_ptr(),
+                    &CFString::new("AXMinimized"),
+                )
+                .unwrap_or(false),
                 fullscreen: copy_bool_attribute(window.window.as_ptr(), &window.fullscreen)
                     .unwrap_or(false),
             },
@@ -402,6 +435,9 @@ impl WindowAccess for MacWindows {
         let before = self.snapshot(id, screens)?;
         if before.info.fullscreen {
             return Err("Exit native fullscreen before adjusting this window".into());
+        }
+        if before.info.minimized {
+            self.set_minimized(id, false, cancelled)?;
         }
         let window = &self.entry(id)?.window;
         if cancelled() {
@@ -457,29 +493,51 @@ impl WindowAccess for MacWindows {
             .get_mut(&snapshot.info.id)
             .ok_or("window was closed")?
             .restored = snapshot.info.maximized.then_some(snapshot.restored);
-        self.set_frame(snapshot.info.id, snapshot.info.bounds, screens, cancelled)
+        self.set_frame(snapshot.info.id, snapshot.info.bounds, screens, cancelled)?;
+        self.set_minimized(snapshot.info.id, snapshot.info.minimized, cancelled)?;
+        self.snapshot(snapshot.info.id, screens).map(|s| s.info)
     }
-    fn maximize(
+    fn cycle_state(
         &mut self,
         id: WindowId,
         screens: &[Screen],
         cancelled: &dyn Fn() -> bool,
     ) -> Result<WindowInfo, String> {
         let before = self.snapshot(id, screens)?;
-        let desired = if before.info.maximized {
-            before.restored
-        } else {
-            screens
-                .get(before.info.screen)
-                .ok_or("display unavailable")?
-                .work_area
-        };
+        if cancelled() {
+            return Ok(before.info);
+        }
+        if before.info.minimized {
+            self.set_minimized(id, false, cancelled)?;
+            let after = self.set_frame(id, before.restored, screens, cancelled)?;
+            self.entries
+                .get_mut(&id)
+                .ok_or("window was closed")?
+                .restored = None;
+            return Ok(WindowInfo {
+                maximized: false,
+                ..after
+            });
+        }
+        if before.info.maximized {
+            self.set_minimized(id, true, cancelled)?;
+            return self.snapshot(id, screens).map(|s| s.info);
+        }
         self.entries
             .get_mut(&id)
             .ok_or("window was closed")?
-            .restored = (!before.info.maximized).then_some(before.info.bounds);
-        self.set_frame(id, desired, screens, cancelled)
+            .restored = Some(before.info.bounds);
+        self.set_frame(
+            id,
+            screens
+                .get(before.info.screen)
+                .ok_or("display unavailable")?
+                .work_area,
+            screens,
+            cancelled,
+        )
     }
+
     fn select(&self, id: WindowId) -> Result<(), String> {
         let entry = self.entry(id)?;
         let app = NSRunningApplication::runningApplicationWithProcessIdentifier(entry.pid)

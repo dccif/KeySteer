@@ -244,39 +244,45 @@ macOS supports Accessibility Tree, Vision, and Hybrid. Windows defaults to `hybr
 
 ## Window configuration
 
-`[window]` configures window management; `[window.bindings]` defines its independent controls. The default launcher is `"alt+w" = "window"` in `[hotkeys]`. Window inherits only hotkeys by default and temporarily uses Normal while Primary is held, Window movement, resizing and layout directions follow the effective Normal `move_left/right/up/down` bindings (H/J/K/L by default), without extra arrow-key bindings.
+Use the five top-level sections `[window]`, `[window_quick]`, `[window_editor]`, `[window_restore]` and `[window_delete]`. Each supports its own `enabled`, `bindings`, `inherits`, `app_configs`, `temporary_mode`, `temporary_mode_keys`, `number_timeout_ms`, `border_width`, `ui` and `lifecycle`. Defaults inherit hotkeys and temporarily use Normal while Primary is held.
 
-| Field | Default | Meaning |
+| Parameter | Section | Default |
 | --- | --- | --- |
-| `enabled` | `true` | Register Window mode. |
-| `inherits` | `["hotkeys"]` | Ordered binding inheritance after local bindings. |
-| `temporary_mode` / `temporary_mode_keys` | `"normal"` / `["primary"]` | Temporary mode preserving the target and substate. |
-| `double_tap_ms` | Compatibility only | Accepted in older files; the AA gesture and timing logic have been removed. |
-| `move_step` / `move_speed` | `20.0` / `600.0` | Tap distance / continuous movement speed. |
-| `resize_step` / `resize_speed` | `20.0` / `500.0` | Centred resize step / speed. |
-| `gap` | `8.0` | Layout gap. |
-| `number_timeout_ms` | `250` | Wait only for ambiguous numeric prefixes; valid range 100–2000ms. |
-| `split_ratios` | `["1/4", "1/3", "1/2", "2/3", "3/4"]` | Legacy parsing only; dividers now share `resize_step` and `resize_speed` with window resizing. |
-| `layout_keys` | `"123456789qwe"` | Legacy parse compatibility; ignored by the new layout controls. |
-| `border_width` | `3.0` | Target outline width. |
-| `ui.border_color` | Derived from the theme | Locked target outline colour. The combined operation panel uses `[key_help]` for fonts, colours, and rounded corners. |
+| `move_step` / `move_speed` | Window | 20 / 600 |
+| `resize_step` / `resize_speed` | Window and Editor, independently | 20 / 500 |
+| `split_ratios` | Quick | `["1/4", "1/3", "1/2", "2/3", "3/4"]` |
+| `gap` | Quick, Editor and Restore, independently | 8 |
+| `number_timeout_ms` | All five | 250, range 100–2000 |
+| `border_width` | All five | 3 |
+| `lifecycle.after_finish` | Restore | `"window_editor"` |
 
-Distances and gaps use logical pixels; speeds use logical pixels per second. Windows converts them using the target display's DPI. Tab immediately cycles windows and centres the pointer; no window-label or confirmation settings are needed.
+Steps and gaps use logical pixels, speeds use logical pixels/second, and Windows applies the target display's DPI. Numbers and borders use each mode's `ui`; the shared panel uses `[key_help]` fonts and colors.
+
+Merge these launchers into the existing hotkeys table:
 
 ```toml
-[window]
-move_step = 12.0
+[hotkeys]
+"alt+w" = "window"
+"alt+a" = "window_quick"
+"alt+e" = "window_editor"
+"alt+r" = "window_restore"
+"alt+x" = "window_delete"
+
+[window_quick]
+split_ratios = ["1/5", "2/5", "3/5", "4/5"]
+gap = 12.0
+
+[window_editor]
 resize_step = 10.0
 gap = 12.0
 
-[window.ui]
-border_color = { dark = "#58A6FFFF", light = "#0969DAFF" }
-
-[key_help]
-font_size = 12
+[window_restore.lifecycle]
+after_finish = "window_editor"
 ```
 
-Overriding these settings retains the default controls. Defining `[window.bindings]` replaces that entire default binding table, so copy the desired defaults before rebinding, for example changing `z = "window_undo"` to `x = "window_undo"`. Per-app overrides use `[[window.app_configs]]`. See [Window mode](/en/reference/modes-and-actions#window-mode) for actions, or edit and preview them in the configuration studio's Window tab.
+Setting parameters alone preserves default bindings. An explicit `[mode.bindings]` replaces that mode's whole default map. Copy the keys you need before changing one; Editor's `q = "grid"`, for example, always enters Grid regardless of entry path. Use `[[window_editor.app_configs]]` for app overrides and `inherits` to share bindings explicitly.
+
+To migrate, replace `window_layout`, `window_edit` and `window_saved_layouts` with `window_quick`, `window_editor` and `window_restore`. Replace `window_cancel`/`window_exit` with the destination mode, such as `window` or `idle`. Remove `window.exit_mode`, `layout_keys` and `double_tap_ms`; move `window.split_ratios` to Quick and assign `window.gap` to Quick, Editor or Restore as needed. Removed fields and actions produce migration errors; user files are never rewritten automatically.
 
 ## Pointer, scrolling, and theme
 
@@ -421,6 +427,3 @@ button to a keyboard shortcut, bind the shortcut that the driver actually emits.
 
 
 Window and region labels use `[window.ui].font_size`, defaulting to 28. Region labels appear below the window-centre number. Help stays near the inside bottom edge when space permits and omits the redundant window-number key list.
-
-
-`[window].exit_mode` defaults to `"return"`, restoring the entry mode and selection state when leaving the root. Set it to `"normal"`, `"idle"`, or another registered mode to choose a destination. In `[window.bindings]`, `q = "window_cancel"` goes back one level, while `a = "window_layout"` and `e = "window_edit"` enter their layouts directly. `window_exit` leaves all Window layers. All these actions can be rebound; defaults do not require Esc.

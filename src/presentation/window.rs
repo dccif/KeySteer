@@ -154,7 +154,7 @@ impl WindowView<'_> {
             .visible
             .iter()
             .filter_map(|id| self.inventory.get(id))
-            .filter(|w| self.numbers.contains_key(&w.id))
+            .filter(|w| !w.minimized && self.numbers.contains_key(&w.id))
             .collect();
         let centers: Vec<_> = windows
             .iter()

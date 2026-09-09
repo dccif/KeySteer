@@ -14,7 +14,9 @@
 mod aliases;
 mod settings;
 mod window;
-pub use window::{SplitRatio, Window};
+pub use window::{
+    SplitRatio, Window, WindowDelete, WindowEditor, WindowModeConfig, WindowQuick, WindowRestore,
+};
 pub mod store;
 pub mod theme;
 mod validation;
@@ -79,6 +81,14 @@ pub struct ConfigFile {
     #[serde(default)]
     pub window: Window,
     #[serde(default)]
+    pub window_quick: WindowQuick,
+    #[serde(default)]
+    pub window_editor: WindowEditor,
+    #[serde(default)]
+    pub window_restore: WindowRestore,
+    #[serde(default)]
+    pub window_delete: WindowDelete,
+    #[serde(default)]
     pub ui_hint: UiHint,
     #[serde(default)]
     pub grid: Grid,
@@ -126,6 +136,10 @@ impl Default for ConfigFile {
             hotkeys: default_idle_bindings(),
             normal: Normal::default(),
             window: Window::default(),
+            window_quick: WindowQuick::default(),
+            window_editor: WindowEditor::default(),
+            window_restore: WindowRestore::default(),
+            window_delete: WindowDelete::default(),
             ui_hint: UiHint::default(),
             grid: Grid::default(),
             recursive_grid: RecursiveGrid::default(),
@@ -423,6 +437,33 @@ impl ConfigFile {
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
         let value: toml::Value =
             toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        if let Some(window) = value.get("window").and_then(toml::Value::as_table) {
+            for (old, replacement) in [
+                (
+                    "exit_mode",
+                    "[window.bindings] q = \"idle\" (or another mode)",
+                ),
+                ("split_ratios", "window_quick.split_ratios"),
+                (
+                    "gap",
+                    "window_editor.gap / window_quick.gap / window_restore.gap",
+                ),
+                (
+                    "layout_keys",
+                    "numeric selection in the independent window modes",
+                ),
+                (
+                    "double_tap_ms",
+                    "direct window_quick / window_editor bindings",
+                ),
+            ] {
+                if window.contains_key(old) {
+                    return Err(ConfigError::Invalid(format!(
+                        "window.{old} was removed; use {replacement}"
+                    )));
+                }
+            }
+        }
         let key_aliases = value
             .get("key_aliases")
             .cloned()
@@ -447,7 +488,17 @@ impl ConfigFile {
         let aliases = self.resolved_key_aliases.clone();
         normalize_binding_keys(&mut self.hotkeys, "[hotkeys]", &aliases)?;
         normalize_binding_keys(&mut self.normal.bindings, "[normal.bindings]", &aliases)?;
-        normalize_binding_keys(&mut self.window.bindings, "[window.bindings]", &aliases)?;
+        for (name, mode) in self.window_modes_mut() {
+            normalize_binding_keys(&mut mode.bindings, &format!("[{name}.bindings]"), &aliases)?;
+            for over in &mut mode.app_configs {
+                normalize_binding_keys(
+                    &mut over.bindings,
+                    &format!("[[{name}.app_configs]]"),
+                    &aliases,
+                )?;
+            }
+            normalize_key_list(&mut mode.temporary_mode_keys, &aliases)?;
+        }
         normalize_binding_keys(&mut self.grid.bindings, "[grid.bindings]", &aliases)?;
         normalize_binding_keys(
             &mut self.recursive_grid.bindings,
@@ -472,7 +523,6 @@ impl ConfigFile {
         for (label, overrides) in [
             ("[[app_configs]]", &mut self.app_configs),
             ("[[normal.app_configs]]", &mut self.normal.app_configs),
-            ("[[window.app_configs]]", &mut self.window.app_configs),
             ("[[grid.app_configs]]", &mut self.grid.app_configs),
             (
                 "[[recursive_grid.app_configs]]",
@@ -496,7 +546,6 @@ impl ConfigFile {
         }
         normalize_key_if_aliased(&mut self.ui_hint.overlap_cycle_key, &aliases)?;
         for keys in [
-            &mut self.window.temporary_mode_keys,
             &mut self.grid.temporary_mode_keys,
             &mut self.recursive_grid.temporary_mode_keys,
             &mut self.ui_hint.temporary_mode_keys,
@@ -586,3 +635,24 @@ impl ConfigFile {
 
 #[cfg(test)]
 mod tests;
+
+impl ConfigFile {
+    pub(crate) fn window_modes(&self) -> [(&'static str, &WindowModeConfig); 5] {
+        [
+            ("window", &self.window.common),
+            ("window_quick", &self.window_quick.common),
+            ("window_editor", &self.window_editor.common),
+            ("window_restore", &self.window_restore.common),
+            ("window_delete", &self.window_delete.common),
+        ]
+    }
+    fn window_modes_mut(&mut self) -> [(&'static str, &mut WindowModeConfig); 5] {
+        [
+            ("window", &mut self.window.common),
+            ("window_quick", &mut self.window_quick.common),
+            ("window_editor", &mut self.window_editor.common),
+            ("window_restore", &mut self.window_restore.common),
+            ("window_delete", &mut self.window_delete.common),
+        ]
+    }
+}

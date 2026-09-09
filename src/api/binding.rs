@@ -197,6 +197,19 @@ impl Binding {
     /// surfaces at load time instead of silently doing nothing.
     pub fn parse(value: &str) -> Result<Self, String> {
         let text = value.trim();
+        let replacement = match text {
+            "window_layout" => Some("window_quick"),
+            "window_edit" => Some("window_editor"),
+            "window_saved_layouts" => Some("window_restore"),
+            "window_cancel" | "window_exit" => Some("a destination mode such as window or idle"),
+            _ => None,
+        };
+        if let Some(replacement) = replacement {
+            return Err(format!(
+                "{text} was removed; bind directly to {replacement}"
+            ));
+        }
+
         if text.is_empty() {
             return Err("binding must not be empty".into());
         }

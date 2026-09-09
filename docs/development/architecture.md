@@ -122,3 +122,7 @@ flowchart LR
 - 改动 Finish、点击或 held input 时，重点检查失败清理和 key-up 路由。无效配置重载必须零副作用；有效重载执行完整 runtime restart，同时保留物理 Down/Up disposition 配对。
 
 下一步可阅读 [扩展指南](/development/extension-guide)、[开发流程与测试](/development/workflow) 或 [插件开发](/development/plugin-development)。
+
+## 窗口模式共享会话
+
+Window、Quick、Editor、Restore、Delete 分别注册并拥有独立配置，入口与返回均使用普通模式绑定。平台无关的 WindowSession 保留库存、稳定编号、编辑事务和撤销状态。Mode 的 prepare_transition 发出异步收尾命令，确认后再切换；Engine 转移会话结果所有者，组外退出才释放会话。Restore 成功通过现有 Finish 生命周期进入配置的目标，Delete 通过 Host 的布局存储端口比较记录并原子删除。五个模式复用 presentation 的帮助面板。

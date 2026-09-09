@@ -706,6 +706,23 @@ pub trait Mode: Send {
     /// Stable identifier used to activate this mode from config and hotkeys.
     fn id(&self) -> ModeId;
 
+    /// Modes in the same group may retain a shared non-native session on switch.
+    /// The host transfers outstanding result ownership to the incoming mode.
+    fn session_group(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Defer activation until an asynchronous operation is committed. Returning
+    /// Some keeps this mode active; it must emit SwitchMode when ready. None
+    /// follows the ordinary Deactivated/Activated sequence immediately.
+    fn prepare_transition(
+        &mut self,
+        _target: &ModeId,
+        _ctx: &HostContext<'_>,
+    ) -> Option<CommandBatch> {
+        None
+    }
+
     /// Human-readable name for the mode indicator badge.
     fn display_name(&self) -> String {
         self.id().as_str().replace('_', " ")
@@ -736,12 +753,7 @@ pub trait Mode: Send {
         false
     }
 
-    /// Whether the host should route compiled Normal movement as discrete
-    /// window-layout directions. This does not activate temporary Normal.
-    fn window_layout_active(&self) -> bool {
-        false
-    }
-
+    /// Whether a window operation is meaningful in the current interaction.
     fn window_action_available(&self, _action: &super::window::WindowAction) -> bool {
         true
     }

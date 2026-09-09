@@ -305,39 +305,45 @@ macOS 支持 Accessibility tree、Vision 和 Hybrid。Windows 默认使用 `hybr
 
 ## Window 配置
 
-`[window]` 控制窗口调整，`[window.bindings]` 控制独立的操作键。默认入口位于 `[hotkeys]`：`"alt+w" = "window"`。Window 默认只继承 `hotkeys`，按住 Primary 才临时使用 Normal；Window 的移动、缩放和布局方向统一跟随 Normal 的 `move_left/right/up/down` 绑定，默认 H/J/K/L，不再额外绑定箭头键。
+五个顶层配置段分别为 `[window]`、`[window_quick]`、`[window_editor]`、`[window_restore]`、`[window_delete]`。它们都支持 `enabled`、`bindings`、`inherits`、`app_configs`、`temporary_mode`、`temporary_mode_keys`、`number_timeout_ms`、`border_width`、`ui` 和 `lifecycle`。默认仅继承 hotkeys，按住 Primary 临时使用 Normal。
 
-| 字段 | 默认值 | 说明 |
+| 参数 | 所属配置 | 默认值 |
 | --- | --- | --- |
-| `enabled` | `true` | 注册 Window 模式。 |
-| `inherits` | `["hotkeys"]` | 未被本地绑定覆盖时按顺序继承。 |
-| `temporary_mode` / `temporary_mode_keys` | `"normal"` / `["primary"]` | 保留目标和子状态的临时模式。 |
-| `double_tap_ms` | 兼容字段 | 旧配置可保留；AA 双击行为及计时已移除。 |
-| `move_step` / `move_speed` | `20.0` / `600.0` | 短按步长／连续移动速度。 |
-| `resize_step` / `resize_speed` | `20.0` / `500.0` | 中心缩放步长／速度。 |
-| `gap` | `8.0` | 布局间距。 |
-| `number_timeout_ms` | `250` | 仅歧义数字前缀等待，允许 100–2000ms。 |
-| `split_ratios` | `["1/4", "1/3", "1/2", "2/3", "3/4"]` | 旧配置兼容字段，不再控制分割线。树编辑与窗口缩放共用 `resize_step` 和 `resize_speed`。 |
-| `layout_keys` | `"123456789qwe"` | 旧配置解析兼容，不再控制新布局交互。 |
-| `border_width` | `3.0` | 目标描边宽度。 |
-| `ui.border_color` | 跟随主题 | 锁定目标的描边颜色；合并操作面板的字体、颜色及圆角使用 `[key_help]`。 |
+| `move_step` / `move_speed` | `window` | 20 / 600 |
+| `resize_step` / `resize_speed` | `window`、`window_editor`，各自独立 | 20 / 500 |
+| `split_ratios` | `window_quick` | `["1/4", "1/3", "1/2", "2/3", "3/4"]` |
+| `gap` | Quick、Editor、Restore，各自独立 | 8 |
+| `number_timeout_ms` | 五个模式 | 250，允许 100–2000 |
+| `border_width` | 五个模式 | 3 |
+| `lifecycle.after_finish` | Restore | `"window_editor"` |
 
-步长和间距使用逻辑像素，速度使用逻辑像素／秒；Windows 按目标屏幕 DPI 换算。Tab 直接循环切换窗口并居中鼠标，不需要窗口标签或确认配置。
+步长和间距为逻辑像素，速度为逻辑像素／秒；Windows 按目标屏幕 DPI 换算。编号和描边使用各模式的 `ui`，统一操作面板使用 `[key_help]` 字体和颜色。
+
+以下是全局直达和独立参数示例；请把启动键合并到已有 `[hotkeys]`，避免重复表名：
 
 ```toml
-[window]
-move_step = 12.0
+[hotkeys]
+"alt+w" = "window"
+"alt+a" = "window_quick"
+"alt+e" = "window_editor"
+"alt+r" = "window_restore"
+"alt+x" = "window_delete"
+
+[window_quick]
+split_ratios = ["1/5", "2/5", "3/5", "4/5"]
+gap = 12.0
+
+[window_editor]
 resize_step = 10.0
 gap = 12.0
 
-[window.ui]
-border_color = { dark = "#58A6FFFF", light = "#0969DAFF" }
-
-[key_help]
-font_size = 12
+[window_restore.lifecycle]
+after_finish = "window_editor"
 ```
 
-配置只写上述参数时保留默认操作键。如果写入 `[window.bindings]`，该绑定表会整体替换默认表；请从完整默认配置复制所需动作再改键，例如把 `z = "window_undo"` 改成 `x = "window_undo"`。应用覆盖支持 `[[window.app_configs]]`。全部动作见 [Window 模式](/reference/modes-and-actions#window-模式)，也可在配置编辑器的 Window 页签编辑并预览。
+只写参数时保留该模式的默认绑定。写入 `[模式.bindings]` 会整体替换该模式的默认表，应复制需要保留的键后修改；例如 Editor 的 `q = "grid"` 总是进入 Grid，与进入 Editor 的路径无关。应用覆盖如 `[[window_editor.app_configs]]`，共享键通过 `inherits` 明确继承。
+
+迁移旧配置：把 `window_layout`、`window_edit`、`window_saved_layouts` 分别改为模式名 `window_quick`、`window_editor`、`window_restore`；把 `window_cancel`／`window_exit` 改为所需目的模式（如 `window` 或 `idle`）。删除 `window.exit_mode`、`layout_keys`、`double_tap_ms`；将旧 `window.split_ratios` 移至 Quick，`window.gap` 按用途移至 Quick／Editor／Restore。旧字段和动作会报错并提示迁移，不自动重写用户文件。
 
 ## 指针、滚动和主题
 
@@ -449,6 +455,3 @@ timers = true
 
 
 Window 的中央编号与分区编号使用 `[window.ui].font_size`，默认 28。分区编号位于窗口中心编号下方；帮助面板优先放在目标窗口内底部，不重复列出数字选窗键。
-
-
-Window 的 `[window].exit_mode` 默认 `"return"`，退出根层时恢复进入前的模式和选择状态，也可配置为 `"normal"`、`"idle"` 或其他已注册模式。`[window.bindings]` 中 `q = "window_cancel"` 逐层返回，`a = "window_layout"`、`e = "window_edit"` 分别直接进入快速布局和编辑布局；`window_exit` 直接退出全部 Window 层级。这些动作可绑定其他按键，默认无需 Esc。

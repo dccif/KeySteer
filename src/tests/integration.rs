@@ -340,7 +340,7 @@ fn defaults_and_shipped_config_agree_on_mode_availability() {
         .iter()
         .map(|m| m.id())
         .collect();
-    assert_eq!(ids.len(), 6, "expected all six modes: {ids:?}");
+    assert_eq!(ids.len(), 10, "expected all ten modes: {ids:?}");
 }
 
 #[test]
@@ -441,7 +441,7 @@ fn every_targeting_mode_returns_to_idle_on_escape() {
 
     for mut mode in keysteer::app::mode_catalog::built_in(&config) {
         // idle has nowhere to go; normal's escape is the engine's job.
-        if matches!(mode.id().as_str(), "idle" | "normal" | "window") {
+        if matches!(mode.id().as_str(), "idle" | "normal") || mode.id().is_window() {
             continue;
         }
         let ctx = HostContext {

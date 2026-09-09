@@ -2,17 +2,29 @@
 use super::*;
 use crate::api::presentation::{View, WindowView};
 
-impl WindowMode {
+impl WindowSession {
     pub(super) fn detail(&self) -> String {
         if self.library_open {
             let mut detail = format!(
-                "Restore\nType a layout number · page {} / {}",
+                "{}\nType a layout number · page {} / {}",
+                if self.kind == WindowKind::Delete {
+                    "Delete layouts"
+                } else {
+                    "Restore"
+                },
                 self.library_page + 1,
                 self.saved_layouts
                     .len()
                     .div_ceil(super::presets::PAGE_SIZE)
                     .max(1)
             );
+            if let Some(layout) = &self.delete_selection {
+                return format!(
+                    "Delete layouts\nDelete {}   {}?\nConfirm deletion or use the configured mode key to leave",
+                    layout.id,
+                    layout.name()
+                );
+            }
             if self.saved_layouts.is_empty() {
                 detail.push_str("\nNo saved layouts · save a layout in the editor");
             }
@@ -33,9 +45,18 @@ impl WindowMode {
             return detail;
         }
         let state = match self.edit.as_ref().map(|e| &e.model) {
-            Some(EditModel::Quick(quick)) => format!("Quick · {}", quick.caption()),
+            Some(EditModel::Quick(quick)) => format!(
+                "Quick · {}",
+                quick.caption_with(&self.settings.split_ratios)
+            ),
             Some(EditModel::Tree(tree)) => format!("Edit · area `{}", tree.selected),
-            None => if self.size { "Resize" } else { "Move" }.into(),
+            None => match self.kind {
+                WindowKind::Quick => "Quick",
+                WindowKind::Editor => "Edit",
+                _ if self.size => "Resize",
+                _ => "Move",
+            }
+            .into(),
         };
         let mut detail = state;
         if let Some(window) = &self.target {
@@ -46,6 +67,9 @@ impl WindowMode {
                 .unwrap_or(&window.app)
                 .trim_end_matches(".exe");
             detail.push_str(&format!("\n{app}\n{}", window.title));
+            if window.minimized {
+                detail.push_str("\nMinimized · cycle to restore");
+            }
         }
         if !self.number.display.is_empty() {
             detail.push_str("\nInput: ");
@@ -82,7 +106,7 @@ impl WindowMode {
         View::Window(WindowView {
             ui: &self.settings.ui,
             border_width: self.settings.border_width,
-            target: self.target.as_ref(),
+            target: self.target.as_ref().filter(|w| !w.minimized),
             screen: self.screen,
             inventory: &self.inventory,
             visible: &self.visible,

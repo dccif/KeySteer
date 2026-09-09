@@ -40,7 +40,7 @@ pub(crate) trait WindowAccess {
         screens: &[Screen],
         cancelled: &dyn Fn() -> bool,
     ) -> Result<WindowInfo, String>;
-    fn maximize(
+    fn cycle_state(
         &mut self,
         id: WindowId,
         screens: &[Screen],
@@ -935,7 +935,7 @@ impl Session {
                 let resize_center =
                     matches!(change, WindowChange::Resize { .. }).then_some(base.center());
                 let change_result = match change {
-                    WindowChange::Maximize => access.maximize(target, screens, cancelled),
+                    WindowChange::CycleState => access.cycle_state(target, screens, cancelled),
                     change => {
                         let next = match change {
                             WindowChange::Move { dx, dy } => geometry::constrain_move(
@@ -1012,7 +1012,7 @@ impl Session {
                                     &screens[dest],
                                 )
                             }
-                            WindowChange::Maximize => unreachable!(),
+                            WindowChange::CycleState => unreachable!(),
                         };
                         if cancelled() {
                             return Ok(());
@@ -1043,11 +1043,13 @@ impl Session {
                 // applied part of the operation, and that part must remain undoable.
                 if let Ok(after) = access.snapshot(target, screens)
                     && (after.info.bounds != before.info.bounds
-                        || after.info.maximized != before.info.maximized)
+                        || after.info.maximized != before.info.maximized
+                        || after.info.minimized != before.info.minimized)
                 {
                     self.remember(group, before.clone());
                     result.changed = 1;
-                    if let Some(pointer) = pointer
+                    if !after.info.minimized
+                        && let Some(pointer) = pointer
                         && let Some(screen) = screens.get(after.info.screen)
                     {
                         result.pointer = Some(window_placement::following_pointer(
@@ -1237,6 +1239,7 @@ mod tests {
                                     screen: 0,
                                     resizable: true,
                                     maximized: false,
+                                    minimized: false,
                                     fullscreen: false,
                                 },
                                 restored: bounds,
@@ -1312,16 +1315,19 @@ mod tests {
             self.writes.push(before.info.id);
             Ok(value.info.clone())
         }
-        fn maximize(
+        fn cycle_state(
             &mut self,
             id: WindowId,
             screens: &[Screen],
             _: &dyn Fn() -> bool,
         ) -> Result<WindowInfo, String> {
             let s = self.windows.get_mut(&id).ok_or("closed")?;
-            if s.info.maximized {
+            if s.info.minimized {
+                s.info.minimized = false;
                 s.info.bounds = s.restored;
                 s.info.maximized = false;
+            } else if s.info.maximized {
+                s.info.minimized = true;
             } else {
                 s.restored = s.info.bounds;
                 s.info.bounds = screens[s.info.screen].work_area;
@@ -1684,11 +1690,52 @@ mod tests {
     }
 
     #[test]
+    fn state_cycle_retains_minimized_target_and_undo_restores_each_state() {
+        let mut access = Fake::new(1);
+        let original = access.windows[&WindowId(1)].info.bounds;
+        let mut session = Session::default();
+        for round in 0..2 {
+            let first = run(
+                &mut session,
+                &mut access,
+                adjust(round * 3 + 1, WindowChange::CycleState),
+            );
+            assert!(first.target.unwrap().maximized);
+            let second = run(
+                &mut session,
+                &mut access,
+                adjust(round * 3 + 2, WindowChange::CycleState),
+            );
+            assert!(second.target.unwrap().minimized);
+            assert_eq!(second.changed, 1);
+            assert!(second.pointer.is_none());
+            assert_eq!(session.target, Some(WindowId(1)));
+            let third = run(
+                &mut session,
+                &mut access,
+                adjust(round * 3 + 3, WindowChange::CycleState),
+            );
+            let restored = third.target.unwrap();
+            assert!(!restored.minimized && !restored.maximized);
+            assert_eq!(restored.bounds, original);
+        }
+        let undone = run(&mut session, &mut access, WindowOperation::Undo);
+        assert!(undone.target.unwrap().minimized);
+        let undone = run(&mut session, &mut access, WindowOperation::Undo);
+        assert!(!undone.target.as_ref().unwrap().minimized);
+        assert!(undone.target.unwrap().maximized);
+    }
+
+    #[test]
     fn maximized_window_uses_restored_size_and_undo_restores_maximized_state() {
         let mut access = Fake::new(1);
         let normal = access.windows[&WindowId(1)].info.bounds;
         let mut session = Session::default();
-        run(&mut session, &mut access, adjust(1, WindowChange::Maximize));
+        run(
+            &mut session,
+            &mut access,
+            adjust(1, WindowChange::CycleState),
+        );
         assert!(access.windows[&WindowId(1)].info.maximized);
         run(
             &mut session,
@@ -1862,13 +1909,13 @@ mod tests {
             ) -> Result<WindowInfo, String> {
                 self.fake.restore(before, s, c)
             }
-            fn maximize(
+            fn cycle_state(
                 &mut self,
                 id: WindowId,
                 s: &[Screen],
                 c: &dyn Fn() -> bool,
             ) -> Result<WindowInfo, String> {
-                self.fake.maximize(id, s, c)
+                self.fake.cycle_state(id, s, c)
             }
             fn select(&self, id: WindowId) -> Result<(), String> {
                 self.fake.select(id)

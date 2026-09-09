@@ -579,7 +579,7 @@ impl Engine {
                 .any(|key| key != &input.key && self.input.pressed.contains(key));
         let display_changed = pressed_changed
             && display_before.is_some_and(|display_before| display_before != self.display_mode());
-        if display_changed && self.registry.active == ModeId::window() {
+        if display_changed && self.registry.active.is_window() {
             self.input.window_temporary_transition =
                 Some(self.temporary_mode_is_active(&self.registry.active));
         }
@@ -759,7 +759,7 @@ impl Engine {
                     input.key.clone(),
                     ActiveGesture {
                         binding: resolved.binding.clone(),
-                        owner: resolved.owner.clone(),
+                        owner: self.stateful_binding_owner(&resolved),
                     },
                 );
             }
@@ -891,7 +891,7 @@ impl Engine {
             .dispose_key(disposition)
             .map_err(|error| self.recoverable_input_error("keyboard disposition", error))?;
         if let Some(active) = self.input.window_temporary_transition.take()
-            && self.registry.active == ModeId::window()
+            && self.registry.active.is_window()
         {
             self.dispatch(ModeEvent::TemporaryModeChanged { active }, backend)?;
         }
@@ -1463,23 +1463,14 @@ impl Engine {
     }
 
     fn temporary_mode_is_active_for_pressed(&self, mode: &ModeId, pressed: &[Key]) -> bool {
-        // Explicit editor chords (including Ctrl+S and divider movement) outrank
-        // a temporary-mode modifier even when users bind that modifier to Ctrl.
-        if *mode == ModeId::window()
-            && let Some(window) = self.registry.get(mode)
-        {
-            for key in pressed {
-                let binding = self
-                    .lookup_with_specificity_for_pressed(mode, key, pressed)
-                    .filter(|(_, specificity)| *specificity > 1)
-                    .or_else(|| {
-                        self.registry
-                            .window_layout_table
-                            .lookup_with_specificity(key, pressed)
-                            .filter(|(_, specificity)| *specificity > 1)
-                    });
-                if binding.is_some_and(|(binding, _)| matches!(binding.as_ref(), Binding::Window(action) if window.window_action_available(action))) { return false; }
-            }
+        // An explicit multi-key binding wins over a temporary modifier in every mode.
+        if pressed.iter().any(|key| {
+            self.lookup_with_specificity_for_pressed(mode, key, pressed)
+                .is_some_and(|(binding, specificity)| {
+                    specificity > 1 && self.binding_available(mode, &binding)
+                })
+        }) {
+            return false;
         }
         self.registry.temporary_chords(mode).is_some_and(|chords| {
             chords.iter().any(|entry| {
@@ -1491,7 +1482,7 @@ impl Engine {
     }
 
     pub(super) fn key_may_change_temporary_mode(&self, key: &Key) -> bool {
-        if self.registry.active == ModeId::window() {
+        if self.registry.active.is_window() {
             return true;
         }
         self.registry
@@ -1554,6 +1545,16 @@ impl Engine {
         self.lookup_for_pressed(symbol, std::slice::from_ref(symbol))
     }
 
+    fn binding_available(&self, mode: &ModeId, binding: &Binding) -> bool {
+        match binding {
+            Binding::Window(action) => self
+                .registry
+                .get(mode)
+                .is_none_or(|mode| mode.window_action_available(action)),
+            _ => true,
+        }
+    }
+
     pub(super) fn lookup_for_pressed(&self, key: &Key, pressed: &[Key]) -> Option<ResolvedBinding> {
         let active_match =
             self.lookup_with_specificity_for_pressed(&self.registry.active, key, pressed);
@@ -1567,21 +1568,6 @@ impl Engine {
         if self.registry.active == ModeId::ui_hint() && self.ui_hint_overlap_matches(key) {
             return None;
         }
-        // Window palettes own their single-character selection labels. Explicit
-        // chords (notably Primary+Q) and temporary Normal retain normal priority.
-        if self.registry.active == ModeId::window()
-            && pressed.len() == 1
-            && self.active_claims_raw_key(key)
-            && !active_match.as_ref().is_some_and(|(binding, _)| {
-                matches!(
-                    binding.as_ref(),
-                    Binding::Window(crate::api::window::WindowAction::Layout)
-                )
-            })
-        {
-            return None;
-        }
-
         let Some(route) = self.registry.routes.get(&self.registry.active) else {
             return active_match.map(|(binding, _)| ResolvedBinding {
                 binding,
@@ -1594,11 +1580,11 @@ impl Engine {
             // Explicit bindings of the targeting mode retain their physical
             // chord, including `none`. The temporary layer consumes its
             // activation keys before looking up the target and its parents.
-            if let Some((binding, specificity)) = active_match
-                && (self.registry.active != ModeId::window() || specificity > 1)
+            if let Some((binding, specificity)) = &active_match
+                && *specificity == pressed.len()
             {
                 return (binding.as_ref() != &Binding::Disabled).then(|| ResolvedBinding {
-                    binding,
+                    binding: Arc::clone(binding),
                     owner: self.registry.active.clone(),
                 });
             }
@@ -1632,15 +1618,14 @@ impl Engine {
             {
                 return temporary;
             }
-            // Alt+W can share the temporary modifier. Allow the complete Window
-            // launcher only when the temporary mode has no binding for W;
-            // existing custom WASD and explicit `none` retain their semantics.
+            // A global mode launcher may share the temporary modifier. Resolve
+            // its full chord only when the temporary layer has no binding.
             if route.inherits.contains(&ModeId::idle())
                 && let Some((binding, specificity)) =
                     self.lookup_with_specificity_for_pressed(&ModeId::idle(), key, pressed)
                 && specificity > 1
                 && specificity == pressed.len()
-                && matches!(binding.as_ref(), Binding::Mode(mode) if *mode == ModeId::window())
+                && matches!(binding.as_ref(), Binding::Mode(_))
             {
                 return Some(ResolvedBinding {
                     binding,
@@ -1650,40 +1635,8 @@ impl Engine {
             return None;
         }
 
-        if self.registry.active == ModeId::window()
-            && let Some(mode) = self.registry.get(&self.registry.active)
-        {
-            let reserved = !mode.window_layout_active() && active_match.is_some()
-                || active_match.as_ref().is_some_and(|(binding, _)| {
-                    matches!(
-                        binding.as_ref(),
-                        Binding::Window(crate::api::window::WindowAction::Edit)
-                    )
-                });
-            if !reserved
-                && let Some((binding, specificity)) = (if mode.window_layout_active() {
-                    &self.registry.window_layout_table
-                } else {
-                    &self.registry.window_motion_table
-                })
-                .lookup_with_specificity(key, pressed)
-                && specificity == pressed.len()
-                && matches!(binding.as_ref(), Binding::Window(action) if mode.window_action_available(action))
-            {
-                return Some(ResolvedBinding {
-                    binding,
-                    owner: ModeId::window(),
-                });
-            }
-        }
-
-        if self.registry.active == ModeId::window()
-            && let Some((binding, _)) = &active_match
-            && let Binding::Window(action) = binding.as_ref()
-            && self
-                .registry
-                .get(&self.registry.active)
-                .is_some_and(|mode| !mode.window_action_available(action))
+        if let Some((binding, _)) = &active_match
+            && !self.binding_available(&self.registry.active, binding)
         {
             return None;
         }
@@ -1700,6 +1653,9 @@ impl Engine {
                     return None;
                 }
                 self.lookup_inherited(owner, key, pressed, &mut SmallVec::new())
+                    .filter(|resolved| {
+                        self.binding_available(&self.registry.active, &resolved.binding)
+                    })
             }),
         }
     }

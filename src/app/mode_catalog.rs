@@ -157,25 +157,69 @@ pub fn built_in(config: &Config) -> Vec<Box<dyn Mode>> {
     if config.ui_hint.enabled {
         catalog.push(Box::new(hint(config)));
     }
-    if config.window.enabled {
-        catalog.push(Box::new(window(config)));
-    }
+    catalog.extend(
+        window_family(config)
+            .into_iter()
+            .map(|mode| Box::new(mode) as Box<dyn Mode>),
+    );
     catalog
 }
 
-pub(crate) fn window(config: &Config) -> modes::window::WindowMode {
-    let w = &config.window;
-    modes::window::WindowMode::new(modes::window::Settings {
-        exit_mode: w.exit_mode.clone(),
-        number_timeout_ms: w.number_timeout_ms,
-        move_step: w.move_step,
-        move_speed: w.move_speed,
-        resize_step: w.resize_step,
-        resize_speed: w.resize_speed,
-        gap: w.gap,
-        border_width: w.border_width,
-        ui: w.ui.clone(),
-    })
+fn window_settings(config: &Config, kind: modes::window::WindowKind) -> modes::window::Settings {
+    use modes::window::WindowKind as K;
+    let common = match kind {
+        K::Move => &config.window.common,
+        K::Quick => &config.window_quick.common,
+        K::Editor => &config.window_editor.common,
+        K::Restore => &config.window_restore.common,
+        K::Delete => &config.window_delete.common,
+    };
+    modes::window::Settings {
+        lifecycle: common.lifecycle.clone(),
+        split_ratios: config
+            .window_quick
+            .parsed_split_ratios()
+            .unwrap_or_else(|error| {
+                panic!("window settings require validated configuration: {error}")
+            })
+            .into_iter()
+            .chain([1.0])
+            .collect(),
+        number_timeout_ms: common.number_timeout_ms,
+        move_step: config.window.move_step,
+        move_speed: config.window.move_speed,
+        resize_step: if kind == K::Editor {
+            config.window_editor.resize_step
+        } else {
+            config.window.resize_step
+        },
+        resize_speed: if kind == K::Editor {
+            config.window_editor.resize_speed
+        } else {
+            config.window.resize_speed
+        },
+        gap: match kind {
+            K::Quick => config.window_quick.gap,
+            K::Restore => config.window_restore.gap,
+            _ => config.window_editor.gap,
+        },
+        border_width: common.border_width,
+        ui: common.ui.clone(),
+    }
+}
+fn window_family(config: &Config) -> Vec<modes::window::WindowMode> {
+    use modes::window::WindowKind as K;
+    modes::window::WindowMode::family(
+        [K::Move, K::Quick, K::Editor, K::Restore, K::Delete]
+            .into_iter()
+            .zip(config.window_modes())
+            .filter(|(_, (_, mode))| mode.enabled)
+            .map(|(kind, _)| (kind, window_settings(config, kind))),
+    )
+}
+#[cfg(test)]
+pub(crate) fn window(config: &Config) -> modes::window::WindowSession {
+    modes::window::WindowSession::new(window_settings(config, modes::window::WindowKind::Move))
 }
 
 pub(crate) fn bundled_plugin_settings(config: &Config) -> BundledSettings {
@@ -253,15 +297,20 @@ pub(crate) fn built_in_specs(config: &Config) -> Result<Vec<ModeSpec>, String> {
             )?,
         ));
     }
-    if config.window.enabled {
+    for (mode, (_, section)) in window_family(config).into_iter().zip(
+        config
+            .window_modes()
+            .into_iter()
+            .filter(|(_, section)| section.enabled),
+    ) {
         specs.push(ModeSpec::built_in(
-            Box::new(window(config)),
+            Box::new(mode),
             compile_route(
-                &config.window.bindings,
-                &config.window.inherits,
-                config.window.temporary_mode.as_deref(),
-                &config.window.temporary_mode_keys,
-                app_overrides(&config.window.app_configs),
+                &section.bindings,
+                &section.inherits,
+                section.temporary_mode.as_deref(),
+                &section.temporary_mode_keys,
+                app_overrides(&section.app_configs),
             )?,
         ));
     }
@@ -373,6 +422,10 @@ mod tests {
         config.recursive_grid.enabled = false;
         config.ui_hint.enabled = false;
         config.window.enabled = false;
+        config.window_quick.enabled = false;
+        config.window_editor.enabled = false;
+        config.window_restore.enabled = false;
+        config.window_delete.enabled = false;
         let ids: Vec<_> = built_in(&config).iter().map(|mode| mode.id()).collect();
         assert_eq!(ids, vec![ModeId::idle(), ModeId::normal()]);
     }

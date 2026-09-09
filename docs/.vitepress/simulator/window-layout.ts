@@ -17,20 +17,20 @@ const near = (direction: LayoutDirection): boolean => direction === 'left' || di
 const center = (rect: WindowRect, axis: Axis): number => rect[axis] + (axis === 'x' ? rect.width : rect.height) / 2
 const clamp = (value: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, value))
 
-export function quickStep(quick: QuickPlacement, direction: LayoutDirection): void {
+export function quickStep(quick: QuickPlacement, direction: LayoutDirection, ratios: readonly number[] = LAYOUT_RATIOS): void {
   const axis = axisOf(direction) === 'x' ? 'horizontal' : 'vertical'
   const value = quick[axis]
-  if (!value) quick[axis] = { near: near(direction), ratio: 2 }
-  else value.ratio = clamp(value.ratio + (value.near === near(direction) ? -1 : 1), 0, 5)
+  if (!value) quick[axis] = { near: near(direction), ratio: ratios.reduce((best, value, i) => Math.abs(value - .5) < Math.abs(ratios[best] - .5) ? i : best, 0) }
+  else value.ratio = clamp(value.ratio + (value.near === near(direction) ? -1 : 1), 0, ratios.length - 1)
 }
-export function quickRect(quick: QuickPlacement): WindowRect {
+export function quickRect(quick: QuickPlacement, ratios: readonly number[] = LAYOUT_RATIOS): WindowRect {
   const axis = (value: AxisPlacement | null): [number, number] => !value ? [0, 1]
-    : [value.near ? 0 : 1 - LAYOUT_RATIOS[value.ratio], LAYOUT_RATIOS[value.ratio]]
+    : [value.near ? 0 : 1 - ratios[value.ratio], ratios[value.ratio]]
   const [x, width] = axis(quick.horizontal), [y, height] = axis(quick.vertical)
   return { x, y, width, height }
 }
-export function quickCaption(quick: QuickPlacement): string {
-  const axis = (v: AxisPlacement | null, a: string, b: string): string => v ? `${v.near ? a : b} ${ratioNames[v.ratio]}` : '1'
+export function quickCaption(quick: QuickPlacement, ratios: readonly number[] = LAYOUT_RATIOS): string {
+  const axis = (v: AxisPlacement | null, a: string, b: string): string => v ? `${v.near ? a : b} ${ratioNames[LAYOUT_RATIOS.indexOf(ratios[v.ratio])] ?? Number(ratios[v.ratio].toFixed(3))}` : '1'
   return `${axis(quick.horizontal, '左', '右')} × ${axis(quick.vertical, '上', '下')}`
 }
 export function layoutRect(rect: WindowRect, area: { width: number; height: number }, gap: number): WindowRect {
