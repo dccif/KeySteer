@@ -274,7 +274,7 @@ impl Engine {
 
     fn hide_overlay_now(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
         self.overlay.content = None;
-        if self.registry.active != ModeId::idle() {
+        if self.registry.active != ModeId::idle() && self.window_layouts.pending.is_none() {
             return self.present_overlay(OverlayScene::new(), backend);
         }
         if self.overlay.visible {

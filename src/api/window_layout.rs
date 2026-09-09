@@ -7,7 +7,8 @@ use super::{Direction, Point, Rect};
 pub const DEFAULT_SPLIT_RATIOS: [f64; 5] = [0.25, 1.0 / 3.0, 0.5, 2.0 / 3.0, 0.75];
 pub const RATIOS: [f64; 6] = [0.25, 1.0 / 3.0, 0.5, 2.0 / 3.0, 0.75, 1.0];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Axis {
     X,
     Y,
@@ -251,6 +252,83 @@ fn split_rect(rect: Rect, axis: Axis, ratio: f64) -> (Rect, Rect) {
 }
 
 impl LayoutTree {
+    /// Try balanced row/column arrangements against actual native minimums.
+    /// Window overlap on entry must not turn every split into a narrow column.
+    pub fn automatic(
+        windows: &[WindowInfo],
+        target: Option<WindowId>,
+        area: Rect,
+        minimums: &BTreeMap<WindowId, Point>,
+        gap: f64,
+    ) -> Result<Self, String> {
+        if windows.is_empty() {
+            return Ok(Self::import(windows, target, area));
+        }
+        let count = windows.len();
+        let mut columns: Vec<_> = (1..=count).collect();
+        columns.sort_by(|a, b| {
+            let score = |cols: usize| {
+                ((area.width / cols as f64) / (area.height / count.div_ceil(cols) as f64))
+                    .ln()
+                    .abs()
+            };
+            score(*a).total_cmp(&score(*b))
+        });
+        for columns in columns {
+            let rows = count.div_ceil(columns);
+            fn row(windows: &[WindowInfo], start: usize, end: usize) -> LayoutNode {
+                if end - start == 1 {
+                    return LayoutNode::Slot {
+                        id: start as u32 + 1,
+                        window: Some(windows[start].id),
+                    };
+                }
+                let mid = start + (end - start) / 2;
+                LayoutNode::Split {
+                    axis: Axis::X,
+                    ratio: (mid - start) as f64 / (end - start) as f64,
+                    first: Box::new(row(windows, start, mid)),
+                    second: Box::new(row(windows, mid, end)),
+                }
+            }
+            fn grid(
+                windows: &[WindowInfo],
+                columns: usize,
+                start: usize,
+                end: usize,
+            ) -> LayoutNode {
+                if end - start == 1 {
+                    return row(windows, start * columns, (end * columns).min(windows.len()));
+                }
+                let mid = start + (end - start) / 2;
+                LayoutNode::Split {
+                    axis: Axis::Y,
+                    ratio: (mid - start) as f64 / (end - start) as f64,
+                    first: Box::new(grid(windows, columns, start, mid)),
+                    second: Box::new(grid(windows, columns, mid, end)),
+                }
+            }
+            let mut tree = Self::from_saved_root(grid(windows, columns, 0, rows));
+            if let Some(target) = target {
+                tree.focus_window(target);
+            }
+            if tree.fit(minimums, area, gap).is_ok() {
+                return Ok(tree);
+            }
+        }
+        Err("The available screen cannot fit these windows' minimum sizes; reduce the number of windows".into())
+    }
+    pub(super) fn from_saved_root(root: LayoutNode) -> Self {
+        let mut tree = Self {
+            root,
+            selected: 1,
+            next_slot: 1,
+        };
+        let slots = tree.slots();
+        tree.next_slot = slots.iter().map(|s| s.id).max().unwrap_or(1) + 1;
+        tree.selected = slots.first().map_or(1, |s| s.id);
+        tree
+    }
     pub fn import(windows: &[WindowInfo], target: Option<WindowId>, area: Rect) -> Self {
         // Input order is the stable display-number order, independent of Z-order.
         fn build(mut values: Vec<(u32, WindowId, Rect)>, area: Rect) -> LayoutNode {
@@ -377,7 +455,13 @@ impl LayoutTree {
 
     /// Splits only append stable IDs; undo restores both the tree and counter.
     pub fn slot_count(&self) -> u32 {
-        self.next_slot - 1
+        fn count(node: &LayoutNode) -> u32 {
+            match node {
+                LayoutNode::Slot { .. } => 1,
+                LayoutNode::Split { first, second, .. } => count(first) + count(second),
+            }
+        }
+        count(&self.root)
     }
 
     pub fn focus_window(&mut self, window: WindowId) -> bool {
@@ -387,6 +471,32 @@ impl LayoutTree {
         } else {
             false
         }
+    }
+
+    /// Remove a leaf and promote its sibling. Window identities are not closed;
+    /// the removed leaf's occupant simply leaves this tree.
+    pub fn remove_selected(&mut self) -> bool {
+        fn remove(node: &mut LayoutNode, selected: u32) -> bool {
+            let LayoutNode::Split { first, second, .. } = node else {
+                return false;
+            };
+            if matches!(first.as_ref(), LayoutNode::Slot { id, .. } if *id == selected) {
+                *node = second.as_ref().clone();
+                return true;
+            }
+            if matches!(second.as_ref(), LayoutNode::Slot { id, .. } if *id == selected) {
+                *node = first.as_ref().clone();
+                return true;
+            }
+            remove(first, selected) || remove(second, selected)
+        }
+        if !remove(&mut self.root, self.selected) {
+            return false;
+        }
+        if let Some(slot) = self.slots().first() {
+            self.selected = slot.id;
+        }
+        true
     }
 
     pub fn focus_slot(&mut self, slot: u32) -> bool {
@@ -424,7 +534,7 @@ impl LayoutTree {
     }
 
     pub fn split(&mut self, direction: Direction) -> bool {
-        if self.slot_count() >= 256 {
+        if self.slot_count() >= 256 || self.next_slot == u32::MAX {
             return false;
         }
         if self.root.split(self.selected, direction, self.next_slot) {
@@ -433,6 +543,50 @@ impl LayoutTree {
         } else {
             false
         }
+    }
+
+    /// Move the nearest matching ancestor divider by screen-space pixels.
+    pub fn resize_by(&mut self, direction: Direction, pixels: f64, area: Rect) -> bool {
+        fn move_divider(
+            node: &mut LayoutNode,
+            slot: u32,
+            direction: Direction,
+            pixels: f64,
+            rect: Rect,
+        ) -> bool {
+            let LayoutNode::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } = node
+            else {
+                return false;
+            };
+            let (a, b) = split_rect(rect, *axis, *ratio);
+            let found = if first.contains(slot) {
+                move_divider(first, slot, direction, pixels, a)
+            } else if second.contains(slot) {
+                move_divider(second, slot, direction, pixels, b)
+            } else {
+                return false;
+            };
+            if found {
+                return true;
+            }
+            if *axis != Axis::of(direction) {
+                return false;
+            }
+            let length = match axis {
+                Axis::X => rect.width,
+                Axis::Y => rect.height,
+            };
+            *ratio = (*ratio
+                + if negative(direction) { -pixels } else { pixels } / length.max(1.0))
+            .clamp(0.0, 1.0);
+            true
+        }
+        move_divider(&mut self.root, self.selected, direction, pixels, area)
     }
 
     pub fn resize(&mut self, direction: Direction, ratios: &[f64]) -> bool {
@@ -562,6 +716,50 @@ impl LayoutTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn automatic_grid_fits_overlapping_windows_instead_of_narrow_columns() {
+        let area = Rect::new(-1920.0, 40.0, 1920.0, 1080.0);
+        let windows: Vec<_> = (1..=9)
+            .map(|id| WindowInfo {
+                id: WindowId(id),
+                title: String::new(),
+                app: String::new(),
+                bounds: Rect::new(-1800.0, 80.0, 1000.0, 700.0),
+                screen: 0,
+                resizable: true,
+                maximized: false,
+                fullscreen: false,
+            })
+            .collect();
+        let minimums = windows
+            .iter()
+            .map(|w| (w.id, Point::new(600.0, 250.0)))
+            .collect();
+        assert!(
+            LayoutTree::import(&windows, None, area)
+                .fit(&minimums, area, 8.0)
+                .is_err()
+        );
+        let tree =
+            LayoutTree::automatic(&windows, Some(WindowId(5)), area, &minimums, 8.0).unwrap();
+        assert_eq!(tree.selected, 5);
+        let slots = tree.slots();
+        assert_eq!(slots.len(), 9);
+        for (index, slot) in slots.iter().enumerate() {
+            let rect = placed_rect(area, slot.rect, 8.0);
+            assert!(rect.width >= 600.0 && rect.height >= 250.0);
+            assert!(
+                slots[..index]
+                    .iter()
+                    .all(|other| slot.rect.intersect(&other.rect).is_none())
+            );
+        }
+        let impossible = windows
+            .iter()
+            .map(|w| (w.id, Point::new(1000.0, 700.0)))
+            .collect();
+        assert!(LayoutTree::automatic(&windows, None, area, &impossible, 8.0).is_err());
+    }
 
     #[test]
     fn custom_dividers_step_from_imported_ratio_and_stop_at_endpoints() {
@@ -576,6 +774,30 @@ mod tests {
             tree.resize(Direction::Left, &ratios);
             assert_eq!(tree.slots()[0].rect.width, expected);
         }
+    }
+
+    #[test]
+    fn pixel_dividers_clamp_at_minimums_and_deleted_ids_are_not_reused() {
+        let area = Rect::new(0.0, 0.0, 1000.0, 700.0);
+        let mut tree = LayoutTree::import(&[], None, area);
+        assert!(!tree.resize_by(Direction::Right, 20.0, area));
+        tree.split(Direction::Right);
+        tree.resize_by(Direction::Right, 20.0, area);
+        assert!((tree.slots()[0].rect.width - 0.52).abs() < 1e-9);
+        tree.resize_by(Direction::Right, 10000.0, area);
+        tree.fit(&BTreeMap::new(), area, 8.0).unwrap();
+        assert!((tree.slots()[1].rect.width * area.width - 32.0).abs() < 1e-9);
+        tree.focus_slot(2);
+        assert!(tree.remove_selected());
+        assert_eq!(tree.slot_count(), 1);
+        assert_eq!(tree.selected, 1);
+        assert!(!tree.remove_selected());
+        tree.split(Direction::Down);
+        assert_eq!(
+            tree.slots().iter().map(|s| s.id).collect::<Vec<_>>(),
+            [1, 3]
+        );
+        assert!(!tree.focus_slot(2));
     }
 
     #[test]

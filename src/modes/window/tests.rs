@@ -20,9 +20,8 @@ fn window_idle_inventory_and_number_input_do_not_allocate() {
     };
     let w = &config.window;
     let mut mode = WindowMode::new(Settings {
-        double_tap_ms: w.double_tap_ms,
+        exit_mode: crate::api::lifecycle::LifecycleAction::Mode(ModeId::normal()),
         number_timeout_ms: w.number_timeout_ms,
-        split_ratios: w.parsed_split_ratios().unwrap(),
         move_step: w.move_step,
         move_speed: w.move_speed,
         resize_step: w.resize_step,
@@ -81,4 +80,106 @@ fn window_idle_inventory_and_number_input_do_not_allocate() {
     println!("window idle inventory: {inventory:?}; number input: {digits:?}");
     assert_eq!(inventory.allocations, 0, "unchanged inventory allocated");
     assert_eq!(digits.allocations, 0, "number input allocated");
+}
+
+#[test]
+fn divider_hold_uses_elapsed_pixels_and_one_undo_checkpoint() {
+    use crate::api::{Direction, Screen};
+    let config = crate::config::Config::default();
+    let palette = config.palette(Appearance::Dark);
+    let screens = [Screen {
+        bounds: Rect::new(0.0, 0.0, 1000.0, 700.0),
+        work_area: Rect::new(0.0, 0.0, 1000.0, 700.0),
+        scale: 1.0,
+        is_primary: true,
+        name: None,
+    }];
+    let ctx = HostContext {
+        presenter: &crate::presentation::COMPOSER,
+        screens: &screens,
+        cursor: Point::default(),
+        focused_app: None,
+        palette: &palette,
+    };
+    let mut mode = crate::app::mode_catalog::window(&config);
+    let mut tree = LayoutTree::import(&[], None, screens[0].work_area);
+    tree.split(Direction::Right);
+    mode.target = Some(WindowInfo {
+        id: crate::api::window::WindowId(1),
+        app: "test".into(),
+        title: "Test".into(),
+        bounds: screens[0].work_area,
+        screen: 0,
+        resizable: true,
+        maximized: false,
+        fullscreen: false,
+    });
+    mode.edit = Some(LiveEdit {
+        transaction: 1,
+        screen: 0,
+        model: EditModel::Tree(tree.clone()),
+        accepted: EditModel::Tree(tree),
+        history: Vec::new(),
+        divider_gesture: false,
+        entry_layout: false,
+        minimums: BTreeMap::new(),
+        gap_scale: 1.0,
+        ready: true,
+        revision: 0,
+        in_flight: None,
+        dirty: false,
+        finishing: None,
+        ending: false,
+        deferred: Vec::new(),
+    });
+    let mut out = CommandBatch::default();
+    let key = Key::new("l").unwrap();
+    mode.action(
+        W::Ratio(Direction::Right),
+        KeyState::Down,
+        &key,
+        &ctx,
+        &mut out,
+    );
+    assert!(
+        out.iter()
+            .any(|c| matches!(c, Command::SetFrameClock(true)))
+    );
+    // Native key repeats do not add another short-press step.
+    mode.action(
+        W::Ratio(Direction::Right),
+        KeyState::Down,
+        &key,
+        &ctx,
+        &mut out,
+    );
+    for _ in 0..5 {
+        mode.motion(Some(0.02), &ctx, &mut out);
+    }
+    let edit = mode.edit.as_ref().unwrap();
+    let EditModel::Tree(tree) = &edit.model else {
+        panic!()
+    };
+    let expected = 0.5 + (config.window.resize_step + 0.1 * config.window.resize_speed) / 1000.0;
+    assert!((tree.slots()[0].rect.width - expected).abs() < 1e-9);
+    assert_eq!(edit.history.len(), 1);
+    // Backpressure retains one submitted revision and the latest desired tree.
+    assert_eq!(out.iter().filter(|c| matches!(c, Command::WindowRequest(r) if matches!(r.operation, WindowOperation::ApplyLayout { .. }))).count(), 1);
+    mode.action(
+        W::Ratio(Direction::Right),
+        KeyState::Up,
+        &key,
+        &ctx,
+        &mut out,
+    );
+    assert!(mode.held.is_empty());
+    assert!(!mode.edit.as_ref().unwrap().divider_gesture);
+    mode.action(
+        W::Undo,
+        KeyState::Down,
+        &Key::new("z").unwrap(),
+        &ctx,
+        &mut out,
+    );
+    assert!(out.iter().any(|c| matches!(c, Command::WindowRequest(r) if matches!(r.operation, WindowOperation::EndEdit { commit: false, .. }))));
 }

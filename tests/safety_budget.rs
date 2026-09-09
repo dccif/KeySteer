@@ -14,8 +14,13 @@ use std::path::{Path, PathBuf};
 // Window mode adds eight bounded Win32 identity/placement operations, two blocks
 // for an explicitly run disposable-window probe, and 10 retained/type-checked
 // AX/Quartz operations. Its state machine and shared worker remain safe Rust.
-const MAX_UNSAFE_EXPRESSIONS: usize = 282;
-const MAX_UNSAFE_FILES: usize = 23;
+// Modeless note entry adds six bounded Win32 dialog operations, one explicit
+// disposable-dialog Unicode probe, and one AppKit
+// action-construction block, owned by existing tray/main-thread lifecycles.
+// Inline input adds one audited AppKit superclass initialization for the
+// borderless NSPanel subclass; its retained owner and main-thread lifetime stay unchanged.
+const MAX_UNSAFE_EXPRESSIONS: usize = 291;
+const MAX_UNSAFE_FILES: usize = 24;
 const PER_FILE_BUDGET: &[(&str, usize)] = &[
     ("src/platform/macos/accessibility.rs", 18),
     ("src/platform/macos/accessibility/window_manager.rs", 10),
@@ -24,7 +29,8 @@ const PER_FILE_BUDGET: &[(&str, usize)] = &[
     ("src/platform/macos/native.rs", 7),
     ("src/platform/macos/overlay.rs", 6),
     ("src/platform/macos/permissions.rs", 5),
-    ("src/platform/macos/status_item.rs", 4),
+    ("src/platform/macos/status_item.rs", 6),
+    ("src/platform/windows/text_prompt.rs", 7),
     ("src/platform/macos/vision.rs", 5),
     ("src/platform/windows/accessibility.rs", 33),
     ("src/platform/windows/autostart.rs", 4),

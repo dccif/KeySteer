@@ -305,19 +305,19 @@ macOS 支持 Accessibility tree、Vision 和 Hybrid。Windows 默认使用 `hybr
 
 ## Window 配置
 
-`[window]` 控制窗口调整，`[window.bindings]` 控制独立的操作键。默认入口位于 `[hotkeys]`：`"alt+w" = "window"`。Window 默认只继承 `hotkeys`，按住 Primary 才临时使用 Normal；因此重绑 Normal 的方向键不会改变 Window 的方向键。
+`[window]` 控制窗口调整，`[window.bindings]` 控制独立的操作键。默认入口位于 `[hotkeys]`：`"alt+w" = "window"`。Window 默认只继承 `hotkeys`，按住 Primary 才临时使用 Normal；Window 的移动、缩放和布局方向统一跟随 Normal 的 `move_left/right/up/down` 绑定，默认 H/J/K/L，不再额外绑定箭头键。
 
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
 | `enabled` | `true` | 注册 Window 模式。 |
 | `inherits` | `["hotkeys"]` | 未被本地绑定覆盖时按顺序继承。 |
 | `temporary_mode` / `temporary_mode_keys` | `"normal"` / `["primary"]` | 保留目标和子状态的临时模式。 |
-| `double_tap_ms` | `300` | AA 双击间隔，100–2000ms。 |
+| `double_tap_ms` | 兼容字段 | 旧配置可保留；AA 双击行为及计时已移除。 |
 | `move_step` / `move_speed` | `20.0` / `600.0` | 短按步长／连续移动速度。 |
 | `resize_step` / `resize_speed` | `20.0` / `500.0` | 中心缩放步长／速度。 |
 | `gap` | `8.0` | 布局间距。 |
 | `number_timeout_ms` | `250` | 仅歧义数字前缀等待，允许 100–2000ms。 |
-| `split_ratios` | `["1/4", "1/3", "1/2", "2/3", "3/4"]` | 树编辑分割线的比例档位。非空数组，可混用分数字符串和小数，例如 `["3/4", 0.3, "1/2", 0.4]`；加载时自动排序、去重，每项须大于 0 且小于 1。 |
+| `split_ratios` | `["1/4", "1/3", "1/2", "2/3", "3/4"]` | 旧配置兼容字段，不再控制分割线。树编辑与窗口缩放共用 `resize_step` 和 `resize_speed`。 |
 | `layout_keys` | `"123456789qwe"` | 旧配置解析兼容，不再控制新布局交互。 |
 | `border_width` | `3.0` | 目标描边宽度。 |
 | `ui.border_color` | 跟随主题 | 锁定目标的描边颜色；合并操作面板的字体、颜色及圆角使用 `[key_help]`。 |
@@ -446,3 +446,9 @@ timers = true
 `[key_help]` 只提供常用样式项：`enabled`、`font_family`、`font_size`、`background_color`、`text_color`、`border_color`、`border_width`、`border_radius`、`padding_x`、`padding_y`。空字体和未指定的背景/文字色跟随模式指示器与主题。颜色支持 `#RRGGBBAA` 或 `{ light = "#RRGGBBAA", dark = "#RRGGBBAA" }`。标题大小、分列和居中自动适配。
 
 在[模拟器](/simulator)点击“编辑按键提示样式”，即可修改、预览并导出 TOML。
+
+
+Window 的中央编号与分区编号使用 `[window.ui].font_size`，默认 28。分区编号位于窗口中心编号下方；帮助面板优先放在目标窗口内底部，不重复列出数字选窗键。
+
+
+Window 的 `[window].exit_mode` 默认 `"return"`，退出根层时恢复进入前的模式和选择状态，也可配置为 `"normal"`、`"idle"` 或其他已注册模式。`[window.bindings]` 中 `q = "window_cancel"` 逐层返回，`a = "window_layout"`、`e = "window_edit"` 分别直接进入快速布局和编辑布局；`window_exit` 直接退出全部 Window 层级。这些动作可绑定其他按键，默认无需 Esc。

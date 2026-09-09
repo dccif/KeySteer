@@ -33,6 +33,10 @@ pub enum BackendEvent {
     PointerMoved(Point),
     /// An asynchronous window move finished. Only success requests a pointer warp.
     WindowMoveCompleted(Result<Point, String>),
+    TextPromptResult {
+        id: u64,
+        value: Result<Option<String>, String>,
+    },
     /// The display is ready for another animation frame.
     ///
     /// This is sourced from the native display link rather than a fixed-rate
@@ -231,6 +235,15 @@ pub trait Backend {
     fn appearance(&self) -> Appearance {
         Appearance::Dark
     }
+
+    /// Open a native nonblocking text editor with normal IME support.
+    fn request_text_prompt(
+        &mut self,
+        _prompt: super::window_presets::TextPrompt,
+    ) -> Result<(), String> {
+        Err("Native text entry is unavailable".into())
+    }
+    fn cancel_text_prompt(&mut self, _id: u64) {}
 
     /// Keep native controls in sync with the engine's paused state.
     fn set_enabled(&mut self, _enabled: bool) -> Result<(), String> {

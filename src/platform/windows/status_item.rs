@@ -50,7 +50,7 @@ const CMD_ABOUT: i32 = 6;
 const CMD_QUIT: i32 = 7;
 const ABOUT_REPOSITORY_BUTTON: i32 = 1001;
 
-static SENDER: OnceLock<Mutex<Option<EventSender>>> = OnceLock::new();
+pub(super) static SENDER: OnceLock<Mutex<Option<EventSender>>> = OnceLock::new();
 static ENABLED: AtomicBool = AtomicBool::new(true);
 static DISPLAY_CHANGED: AtomicBool = AtomicBool::new(false);
 static APPEARANCE_CHANGED: AtomicBool = AtomicBool::new(false);
@@ -111,6 +111,17 @@ pub struct StatusItem {
 const TRAY_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl StatusItem {
+    pub(super) fn request_text_prompt(
+        &self,
+        prompt: crate::api::window_presets::TextPrompt,
+    ) -> Result<(), String> {
+        super::text_prompt::request(self.hwnd, prompt)
+    }
+    pub(super) fn cancel_text_prompt(&self, id: u64) {
+        if let Err(error) = super::text_prompt::cancel(self.hwnd, id) {
+            crate::report_error!("windows-dialog", "{error}");
+        }
+    }
     pub fn new(sender: EventSender) -> Result<Self, String> {
         set_update_menu_state(UpdateMenuState::Idle);
         *SENDER
@@ -276,6 +287,9 @@ fn tray_thread(ready: std::sync::mpsc::SyncSender<Result<(u32, isize), String>>)
             );
             break;
         }
+        if super::text_prompt::dispatch(&message) {
+            continue;
+        }
         // SAFETY: `message` was initialized by GetMessageW and is dispatched
         // synchronously on this same tray thread.
         unsafe {
@@ -283,6 +297,7 @@ fn tray_thread(ready: std::sync::mpsc::SyncSender<Result<(u32, isize), String>>)
             DispatchMessageW(&message);
         }
     }
+    super::text_prompt::shutdown();
     drop(session_notifications);
     destroy_window(window);
 }
@@ -411,7 +426,7 @@ pub(super) fn open_https_url(url: &str) -> Result<(), String> {
     }
 }
 
-fn emit(event: BackendEvent) {
+pub(super) fn emit(event: BackendEvent) {
     let sender = SENDER
         .get()
         .and_then(|sender| sender.lock().ok())
@@ -835,6 +850,10 @@ extern "system" fn window_proc(
         return LRESULT(0);
     }
     match message {
+        super::text_prompt::MESSAGE => {
+            super::text_prompt::process();
+            LRESULT(0)
+        }
         CALLBACK_MESSAGE => {
             match lparam.0 as u32 {
                 // Left and right click have the same harmless behaviour. Pause

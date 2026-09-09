@@ -135,6 +135,11 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
         super::configuration::ConfigRepository::new(config, source, store, discovery_directory);
     let mut engine = Engine::from_plan(plan, backend.appearance())?;
     engine.attach_configuration(Box::new(repository));
+    let data = super::paths::data_dir().ok_or("Cannot determine saved layouts directory")?;
+    engine.attach_layout_store(Box::new(super::layout_store::LayoutStore::persistent(
+        data.join("window-layouts.kslayout"),
+        crate::platform::atomic_replace,
+    )));
 
     engine.run(backend.as_mut())
 }

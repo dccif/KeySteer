@@ -584,7 +584,7 @@ impl Engine {
                 Some(self.temporary_mode_is_active(&self.registry.active));
         }
 
-        if !self.enabled || self.is_excluded_app() {
+        if !self.enabled || self.is_excluded_app() || self.window_layouts.pending.is_some() {
             self.input.pending_chords.clear();
             if let Some(pending) = completed_long_press
                 && let Err(error) = self.cancel_pending_long_press(pending, backend)
@@ -1463,6 +1463,24 @@ impl Engine {
     }
 
     fn temporary_mode_is_active_for_pressed(&self, mode: &ModeId, pressed: &[Key]) -> bool {
+        // Explicit editor chords (including Ctrl+S and divider movement) outrank
+        // a temporary-mode modifier even when users bind that modifier to Ctrl.
+        if *mode == ModeId::window()
+            && let Some(window) = self.registry.get(mode)
+        {
+            for key in pressed {
+                let binding = self
+                    .lookup_with_specificity_for_pressed(mode, key, pressed)
+                    .filter(|(_, specificity)| *specificity > 1)
+                    .or_else(|| {
+                        self.registry
+                            .window_layout_table
+                            .lookup_with_specificity(key, pressed)
+                            .filter(|(_, specificity)| *specificity > 1)
+                    });
+                if binding.is_some_and(|(binding, _)| matches!(binding.as_ref(), Binding::Window(action) if window.window_action_available(action))) { return false; }
+            }
+        }
         self.registry.temporary_chords(mode).is_some_and(|chords| {
             chords.iter().any(|entry| {
                 let reserved_for_overlap = self.registry.active == ModeId::ui_hint()
@@ -1473,6 +1491,9 @@ impl Engine {
     }
 
     pub(super) fn key_may_change_temporary_mode(&self, key: &Key) -> bool {
+        if self.registry.active == ModeId::window() {
+            return true;
+        }
         self.registry
             .temporary_chords(&self.registry.active)
             .is_some_and(|chords| {
@@ -1631,23 +1652,21 @@ impl Engine {
 
         if self.registry.active == ModeId::window()
             && let Some(mode) = self.registry.get(&self.registry.active)
-            && mode.window_layout_active()
         {
-            let reserved =
-                active_match
-                    .as_ref()
-                    .is_some_and(|(binding, _)| match binding.as_ref() {
-                        Binding::Window(crate::api::window::WindowAction::Edit) => true,
-                        Binding::Window(crate::api::window::WindowAction::Layout) => {
-                            mode.window_layout_double_tap()
-                        }
-                        _ => false,
-                    });
+            let reserved = !mode.window_layout_active() && active_match.is_some()
+                || active_match.as_ref().is_some_and(|(binding, _)| {
+                    matches!(
+                        binding.as_ref(),
+                        Binding::Window(crate::api::window::WindowAction::Edit)
+                    )
+                });
             if !reserved
-                && let Some((binding, specificity)) = self
-                    .registry
-                    .window_layout_table
-                    .lookup_with_specificity(key, pressed)
+                && let Some((binding, specificity)) = (if mode.window_layout_active() {
+                    &self.registry.window_layout_table
+                } else {
+                    &self.registry.window_motion_table
+                })
+                .lookup_with_specificity(key, pressed)
                 && specificity == pressed.len()
                 && matches!(binding.as_ref(), Binding::Window(action) if mode.window_action_available(action))
             {

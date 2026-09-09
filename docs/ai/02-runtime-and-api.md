@@ -41,6 +41,10 @@ emergency stderr 使用不 panic 的 `Write` 路径，且不创建后台日志�
 
 ## API 边界
 
+托盘 `OpenConfigSimulator` 一次性读取当前 TOML source 和 `LayoutStore::export_file`；有布局文件时通过 v2 zlib/base64url fragment 传递 `{source, layouts, layout_error}`（layouts 为同一二进制文件的 base64url），无文件保留 v1 source-only 兼容。浏览器同步清除 fragment 后有界解压并校验两份数据；文件读取错误保留按键配置导入并显示布局错误。v2 解压上限 2 MiB、URL fragment 仍限 24 KiB，文件/源码继续各自限制。只在显式打开、R 列表及保存时读文件，没有文件监听。
+
+Window 保存/列表经 `Command::WindowLayouts` → Engine `LayoutController` → `LayoutStore`，结果用带 session 的 `ModeEvent::WindowLayouts` 返回。保存时 Backend 异步展示通用 `TextPrompt`，`BackendEvent::TextPromptResult` 以独立请求 id 匹配；备注期间输入保持原生 down/up 配对并 forward，保留窗口／网格覆盖层，暂时撤下帮助列表；TextPrompt 携带工作区底部矩形，原生输入控件无标题栏并置顶。取消 Window 会话先取消所属原生输入框，迟到的结果不能写入文件。保存、取消和错误后模式重新请求目标激活并绘制。磁盘和文本 UI 只在显式保存/列表操作触发，不进入帧热路径。
+
 跨屏窗口移动通过 `Command::MoveWindowToScreen(WindowScreenTarget)` 到
 `Backend::move_window_to_screen`。窗口命中与位置查询按动作执行时的物理鼠标完成，不使用
 前台应用代替鼠标下窗口。后端返回 `Option<Point>`：提交移动后返回对应的鼠标目标位置，
@@ -223,7 +227,7 @@ macOS 更新事件在 Hook 有界队列忙时转入 fallback channel，后台线
 
 ## Window 请求与会话
 
-`BeginEdit` 异步返回完整库存与最小尺寸快照；`ApplyLayout` 发送事务 id、递增修订号及标准化绝对矩形；`EndEdit` 结束并分组撤销记录，内部恢复路径仍可请求回滚。默认交互即时生效，不绑定 Enter；Esc 返回和 Q 退出均保留最新布局。Mode 保持单个在途批次并合并后续目标；worker 只写入变化矩形，拒绝陈旧修订，原生拒绝后回读并恢复上一成功布局。提交失败必须反馈结束状态，避免模式等待不存在的确认。
+`BeginEdit` 异步返回完整库存与最小尺寸快照；`ApplyLayout` 发送事务 id、递增修订号及标准化绝对矩形；`EndEdit` 结束并分组撤销记录，内部恢复路径仍可请求回滚。默认交互即时生效，不绑定 Enter；Q 在 Quick／Tree 返回普通 Window，根层按 window.exit_mode 退出，均保留最新布局。Mode 保持单个在途批次并合并后续目标；worker 只写入变化矩形，拒绝陈旧修订，原生拒绝后回读并恢复上一成功布局。提交失败必须反馈结束状态，避免模式等待不存在的确认。
 
 Mode 的可选 `help_anchor` / `help_previews` 提供纯几何提示数据。Window 的常显面板由 Engine 的 key_help decorator 合并状态、真实绑定和缩略图，并基于锁定窗口定位。其他模式的可选 key_help 和临时 Normal 保持原语义。
 
@@ -258,3 +262,5 @@ Window 以 modal push/pop 进入和返回，暂停旧模式时释放其连续手
 按下、松开仍通过 `dispose_key` 配对。未匹配的侧键总是透传，不受 Mode 的
 `captures_keyboard` 影响，不派发原始 `ModeEvent::Key`，也不产生语义 `Clicked`。
 原生边沿映射和超时配对见 [原生后端](06-platform-backends.md#鼠标侧键绑定)。
+
+WindowAction::Ratio 使用 held 按键生命周期及现有 FrameClock；RemoveRegion 仅在 Tree 可用。LayoutTree::resize_by 接收屏幕像素位移与 work_area，Mode 负责最小尺寸约束与事务合并。区域编号选择返回原生 Select 请求（空区域返回 WarpPointer），展示本身不调用平台 API。

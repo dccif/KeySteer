@@ -347,6 +347,20 @@ impl Drop for MacOsBackend {
 }
 
 impl Backend for MacOsBackend {
+    fn request_text_prompt(
+        &mut self,
+        prompt: crate::api::window_presets::TextPrompt,
+    ) -> Result<(), String> {
+        self.status_item
+            .as_ref()
+            .ok_or("macOS status item is unavailable")?
+            .request_text_prompt(prompt)
+    }
+    fn cancel_text_prompt(&mut self, id: u64) {
+        if let Some(item) = &self.status_item {
+            item.cancel_text_prompt(id);
+        }
+    }
     fn request_window(&mut self, request: crate::api::window::WindowRequest) -> Result<(), String> {
         if self.window_worker.is_none() {
             let tx = self.event_tx.clone();

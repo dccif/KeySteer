@@ -12,6 +12,8 @@
 
 ## Window 原生会话
 
+备注框为原生 modeless 控件，支持系统输入法。Windows `text_prompt.rs` 通过无指针 WM_APP 消息唤醒已有托盘线程，由其创建工作区底部无标题栏的 EDIT/Save/Cancel 输入条、调用 IsDialogMessage 并在 shutdown 销毁；不新建 detached worker。macOS `status_item.rs` 的可获取键盘焦点的 borderless retained NSPanel 子类/NSTextField 由主线程状态目标持有，Save/Cancel 返回带 id 的 BackendEvent，关闭状态栏时一并清理。macOS 窗口枚举在按应用收集 AX 后恢复 Quartz 全局前后顺序，供模板填充使用；顺序是当前系统堆叠顺序，不宣称拥有未观察到的历史焦点记录。
+
 编辑事务在 worker 内捕获窗口原始快照和最小尺寸。批量标准化布局先验证、再写入变化矩形，直接复用已验证的原生结果；严格树布局发生部分失败时恢复前批次。正常返回／退出保留即时布局，把原始快照合为一步撤销；强制清理只释放检查点。内部错误恢复仍可有界回滚。编辑约束在进入编辑与原生拒绝尺寸后查询；普通连续缩放按目标、手势、屏幕与缩放比例复用最小尺寸。
 
 Windows 复用枚举缓冲区，property 标记直接查找稳定身份，几何等待只轮询句柄和矩形；应用名按身份缓存。macOS 按批次复用 Quartz 查询键并缓存应用名。明确销毁的窗口通过 `WindowResult.closed` 回收身份、AX 引用、约束和撤销记录；不可见、最小化或临时 AX 超时不能当作销毁。被取消查询的关闭通知留给下一次结果。Windows adapter 的 Drop 也清理自有 property。错误统一调用 `report_error!` 进入 `support/logging.rs`。
@@ -22,7 +24,7 @@ Windows adapter 持有 HWND、PID/TID 和独有窗口 property 标记；窗口�
 
 macOS adapter 保留 AX 元素，以公开 Quartz on-screen 元数据匹配当前 Space 的普通 AXStandardWindow；无法唯一匹配的重叠候选跳过，所有 AX messaging 有有限超时。AXSize 写入后读取实际尺寸再定位中心；普通最大化以工作区尺寸实现并保留还原矩形。原生全屏跨屏复用既有 WindowMove 状态机，在 worker 中轮询并检查取消；其等待不占用主事件循环。
 
-Tab 每次按需枚举，维护稳定 ID 顺序，再激活下一个目标并返回其中心鼠标位置。AA 只处理目标所在屏幕，跳过不可缩放/原生全屏窗口，整个批次不逐个 warp。单窗及撤销使用原生快照回读，窗口拒绝或关闭时保留实际改变/跳过计数。共享几何不调用平台 API。
+Tab 每次按需枚举，维护稳定 ID 顺序，再激活下一个目标并返回其中心鼠标位置。显式 window_tile 只处理目标所在屏幕，跳过不可缩放/原生全屏窗口，整个批次不逐个 warp。单窗及撤销使用原生快照回读，窗口拒绝或关闭时保留实际改变/跳过计数。共享几何不调用平台 API。
 
 Windows 显式 Tab 先调用 SetForegroundWindow，被拒绝后使用 SwitchToThisWindow 的键盘切换路径，并在 worker 中有界回读前台。不得用 AttachThreadInput 连接外部输入队列造成无界同步等待。最终拒绝焦点时仍锁定下一窗口、返回其中心坐标并提示。
 
@@ -334,3 +336,5 @@ Windows Hook 将 XBUTTON1/2 的 down/up、macOS Hook 将 OtherMouse 的按钮 3/
 也不能拆散 down/up。Windows 使用 VK_XBUTTON1/2 的独立 bitset 槽，并复用 Alt 菜单抑制。
 未匹配绑定的侧键必须透传，不能受 `captures_keyboard` 影响，也不发送原始 `ModeEvent::Key`；
 物理侧键不产生语义 `Clicked`。左右键、中键和滚轮不接入此次绑定链路。
+
+Windows 窗口布局的异步恢复等待同时核对最大化样式与目标几何，不能把旧最大化帧短暂稳定误认为恢复完成。严格布局拒绝时，未变化或仍最大化的几何不能提升缓存的最小尺寸。保留原生 checkpoint 的 show state，撤销可恢复最大化。

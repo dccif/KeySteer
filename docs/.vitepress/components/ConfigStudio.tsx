@@ -1,4 +1,4 @@
-import { computed, defineComponent, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, defineComponent, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { withBase } from 'vitepress'
 import { stringify } from 'smol-toml'
 import {
@@ -11,7 +11,8 @@ import {
 } from '../simulator/state'
 import { compileWindowLayoutBindings, effectiveBindings, resolveBinding, resolvePhysicalBinding, resolveWindowLayoutBinding, temporaryPhysicalKeys } from '../simulator/bindings'
 import type { WindowLayoutBinding } from '../simulator/bindings'
-import { applyWindowAction, chooseWindowNumber, enterWindow, finishWindowNumber, setDemoWindowCount, temporaryWindow, windowActionAvailable, windowDetail, windowDoubleTap, windowInputStatus, windowSelectionKey, windowTarget, WINDOW_AREA, WINDOW_MOTION } from '../simulator/window'
+import { applyWindowAction, chooseWindowNumber, enterWindow, finishWindowNumber, hasWindowLayoutChanges, replaceWindowLayouts, restoreWindowLayout, saveWindowLayout, setDemoWindowCount, temporaryWindow, windowActionAvailable, windowDetail, windowInputStatus, windowSelectionKey, windowTarget, WINDOW_AREA, WINDOW_MOTION } from '../simulator/window'
+import { decodeLayoutFile, encodeLayoutFile, LAYOUT_STORAGE_KEY, readSavedLayouts, savedLayoutName } from '../simulator/window-presets'
 import type { WindowState } from '../simulator/window'
 import { layoutRect, quickCaption, quickRect, treeSlots } from '../simulator/window-layout'
 import { consumeConfigHandoff } from '../simulator/config-handoff'
@@ -65,10 +66,10 @@ const modes: Array<{ id: EditorMode; label: string }> = [
 const actionGroups: ActionGroup[] = [
   { name: 'Window', actions: [
     ['window_left', '窗口向左'], ['window_down', '窗口向下'], ['window_up', '窗口向上'], ['window_right', '窗口向右'],
-    ['window_size', '移动／缩放'], ['window_layout', '快速布局／AA 平铺'], ['window_edit', '编辑布局树'], ['window_tile', '直接平铺'],
+    ['window_size', '移动／缩放'], ['window_layout', '快速布局'], ['window_edit', '编辑布局树'], ['window_tile', '直接平铺'],
     ['window_screen_next', '循环切屏'],
     ['window_maximize', '最大化／还原'], ['window_center', '窗口居中'], ['window_select', '切换下一个窗口'],
-    ['window_undo', '撤销窗口调整'], ['window_cancel', '返回／退出'], ['window_exit', '退出 Window'],
+    ['window_undo', '撤销窗口调整'], ['window_remove_region', '删除当前区域'], ['window_saved_layouts', '保存的布局'], ['window_save_layout', '保存布局'], ['window_cancel', '返回／退出'], ['window_exit', '退出 Window'],
   ].map(([value, label]) => ({ value, label })) },
   { name: '按键提示', actions: [
     { value: 'key_help', label: '切换按键提示' },
@@ -192,7 +193,54 @@ export default defineComponent({
     const simulator = reactive(createSimulatorState())
     const screen = ref<HTMLElement | null>(null)
     const simulatorArmed = ref(false)
+    const layoutNote = ref('')
+    const layoutNoteInput = ref<HTMLInputElement>()
+    const layoutStorageError = ref('')
+    const layoutFileInput = ref<HTMLInputElement>()
+    function persistLayoutLibrary(): void {
+      if (layoutStorageError.value) return
+      try { localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(simulator.window.presets)) }
+      catch (error) { simulator.lastEvent = `浏览器无法保留布局，请下载文件：${formatError(error)}` }
+    }
+    async function importLayoutFile(event: Event): Promise<void> {
+      const input = event.target as HTMLInputElement, file = input.files?.[0]
+      if (!file) return
+      try {
+        if (file.size > 1024 * 1024) throw new Error('布局文件超过 1 MiB')
+        const layouts = decodeLayoutFile(new Uint8Array(await file.arrayBuffer()))
+        replaceWindowLayouts(simulator, layouts); layoutStorageError.value = ''; persistLayoutLibrary()
+        simulator.window.library = true; simulator.lastEvent = `已导入 ${layouts.length} 个布局`
+      } catch (error) { simulator.lastEvent = `导入失败：${formatError(error)}` }
+      finally { input.value = '' }
+    }
+    function downloadLayouts(): void {
+      try {
+        if (hasWindowLayoutChanges(simulator.window)) {
+          const note = simulator.window.presets.find(p => p.id === simulator.window.editingPresetId)?.note ?? ''
+          saveWindowLayout(simulator, note); persistLayoutLibrary()
+        }
+        downloadLayoutBinary(encodeLayoutFile(simulator.window.presets))
+        simulator.lastEvent = '已下载 window-layouts.kslayout · 替换程序同名文件后，按 R 重新读取'
+      } catch (error) { simulator.lastEvent = `下载失败：${formatError(error)}` }
+    }
+    function finishLayoutNote(save: boolean): void {
+      if (!save) { simulator.window.noteOpen = false; return }
+      const before = simulator.window.presets
+      try {
+        saveWindowLayout(simulator, layoutNote.value)
+        persistLayoutLibrary()
+      } catch (error) {
+        simulator.window.presets = before; simulator.window.noteOpen = true
+        simulator.lastEvent = `保存失败：${formatError(error)}`
+      }
+    }
     const heldActions = new Set<string>()
+    watch(() => simulator.window.noteOpen, async open => {
+      heldActions.clear(); heldCharacterActions.clear(); physicalKeys.clear()
+      if (open) layoutNote.value = simulator.window.presets.find(p => p.id === simulator.window.editingPresetId)?.note ?? ''
+      await nextTick()
+      if (open) layoutNoteInput.value?.focus(); else screen.value?.focus()
+    })
     const clickPulse = ref(0)
     const scrollPulse = ref('')
     const isMac = ref(false)
@@ -266,6 +314,12 @@ export default defineComponent({
             '当前 KeySteer 配置',
             '已从 KeySteer 导入当前配置；数据仅在本机浏览器中处理',
           )
+          if (result.layouts !== undefined) {
+            replaceWindowLayouts(simulator, result.layouts); layoutStorageError.value = ''; persistLayoutLibrary()
+            setPreviewMode('window'); simulator.window.library = true
+            message.value = `已从 KeySteer 同时导入按键配置和 ${result.layouts.length} 个布局`
+          }
+          if (result.layoutError) message.value += `；布局未导入：${result.layoutError}`
         } catch (error) {
           message.value = `TOML 解析失败：${formatError(error)}`
         }
@@ -390,6 +444,7 @@ export default defineComponent({
     }
 
     function onSimulatorKeyDown(event: KeyboardEvent): void {
+      if (simulator.window.noteOpen) return
       if (!simulatorArmed.value || event.repeat) return
       const physical = physicalKey(event)
       physicalKeys.add(physical)
@@ -405,14 +460,14 @@ export default defineComponent({
         const launcher = resolvePhysicalBinding(document, 'hotkeys', pressed, physical, isMac.value)
         if (simulator.mode === 'window') {
           const local = resolvePhysicalBinding(document, 'window', pressed, physical, isMac.value, true)
-          const temporary = temporaryPhysicalKeys(document, 'window', pressed, isMac.value)
+          const temporary = simulator.window.temporary ? temporaryPhysicalKeys(document, 'window', pressed, isMac.value) : []
           if (!temporary.length && pressed.length === 1 && windowSelectionKey(simulator, physical, document.window ?? {})) { event.preventDefault(); return }
           let resolved = local ?? (temporary.length
             ? resolvePhysicalBinding(document, String(document.window?.temporary_mode ?? 'normal'), pressed.filter(k => !temporary.includes(k)), physical, isMac.value)
             : resolvePhysicalBinding(document, 'window', pressed, physical, isMac.value))
-          if (!temporary.length && simulator.window.panel !== 'none') {
-            const direction = resolveWindowLayoutBinding(windowLayoutBindings.value, pressed, physical)
-            const reserved = resolved?.value === 'window_edit' || resolved?.value === 'window_layout' && windowDoubleTap(simulator.window, document.window ?? {})
+          if (!temporary.length) {
+            const direction = resolveWindowLayoutBinding(windowLayoutBindings.value, pressed, physical, simulator.window.panel !== 'none')
+            const reserved = simulator.window.panel === 'none' && !!resolved || resolved?.value === 'window_edit'
             if (!reserved && direction && windowActionAvailable(simulator.window, direction)) resolved = { value: direction, source: 'window' }
           }
           if (!temporary.length && resolved?.source === 'window' && !windowActionAvailable(simulator.window, String(resolved.value))) resolved = undefined
@@ -473,7 +528,11 @@ export default defineComponent({
     }
     function updateTemporaryWindow(event: KeyboardEvent): void {
       if (simulator.mode !== 'window' || !effectiveDocument.value) return
-      const active = temporaryPhysicalKeys(effectiveDocument.value, 'window', currentPhysicalKeys(event), isMac.value).length > 0
+      const pressed = currentPhysicalKeys(event), physical = physicalKey(event)
+      const local = resolvePhysicalBinding(effectiveDocument.value, 'window', pressed, physical, isMac.value, true)
+      const direction = resolveWindowLayoutBinding(windowLayoutBindings.value, pressed, physical, simulator.window.panel !== 'none')
+      const ownChord = pressed.length > 1 && (local?.source === 'window' && windowActionAvailable(simulator.window, String(local.value)) || !!direction && windowActionAvailable(simulator.window, direction))
+      const active = !ownChord && temporaryPhysicalKeys(effectiveDocument.value, 'window', pressed, isMac.value).length > 0
       if (active !== simulator.window.temporary) heldActions.clear()
       temporaryWindow(simulator.window, active, effectiveDocument.value.window ?? {})
     }
@@ -530,6 +589,8 @@ export default defineComponent({
 
     onMounted(() => {
       isMac.value = /Mac|iPhone|iPad/.test(navigator.platform)
+      try { simulator.window.presets = readSavedLayouts(localStorage.getItem(LAYOUT_STORAGE_KEY)) }
+      catch (error) { layoutStorageError.value = formatError(error) }
       void initialize()
       animationFrame = requestAnimationFrame(animate)
     })
@@ -631,6 +692,9 @@ export default defineComponent({
                   <button class={{ active: simulator.mode === mode }} onClick={() => setPreviewMode(mode)}>{mode}</button>
                 ))}
               </div>
+              {simulator.mode === 'window' && <div class="ks-layout-file-tools"><input ref={layoutFileInput} type="file" accept=".kslayout,application/octet-stream" aria-label="导入布局文件" hidden onChange={importLayoutFile} />
+                    <button onClick={() => layoutFileInput.value?.click()}>导入布局文件</button><button onClick={downloadLayouts}>{hasWindowLayoutChanges(simulator.window) ? '保存并下载布局' : '下载布局文件'}</button>
+                  </div>}
               <div
                 ref={screen}
                 class={{ 'ks-screen': true, armed: simulatorArmed.value, [`mode-${simulator.mode}`]: true }}
@@ -646,6 +710,7 @@ export default defineComponent({
                 {(simulator.mode !== 'window' || simulator.window.temporary) && <div class="ks-mode-badge">{simulator.mode === 'window' ? 'normal' : simulator.mode}</div>}
                 {simulator.mode === 'window' && <div class="ks-window-demo">
                   <div class="ks-window-screen-label">示例屏幕 {simulator.window.screen + 1} / 2</div>
+
                   <label class="ks-window-count">示例窗口数 <select aria-label="示例窗口数量" value={simulator.window.windows.filter(w => w.screen === simulator.window.screen).length}
                     onChange={e => setDemoWindowCount(simulator, Number((e.target as HTMLSelectElement).value))}>
                     {[1, 3, 9, 20, 23, 30].map(count => <option value={count}>{count}</option>)}
@@ -656,17 +721,23 @@ export default defineComponent({
                     <div class="ks-demo-window-title">{w.app} · {w.title}</div>
                     <div class="ks-demo-window-lines"><i /><i /><i /></div>
                   </div>)}
-                  {!simulator.window.temporary && windowNumberLabels(simulator.window).map(label => <button class="ks-window-number"
-                    aria-label={`选择窗口 ${label.number}`} style={{ left: `${label.x}%`, top: `${label.y}%` }}
-                    onMousedown={e => e.preventDefault()} onClick={() => chooseWindowNumber(simulator, label.number, targetingSettings.value)}>{label.number}</button>)}
-                  {!simulator.window.temporary && simulator.window.tree && treeSlots(simulator.window.tree).map(slot => {
+                  {!simulator.window.temporary && !simulator.window.library && windowNumberLabels(simulator.window).map(label => <button class="ks-window-number"
+                    aria-label={`选择窗口 ${label.number}`} style={{ left: `${label.x}%`, top: `${label.y}%`, fontSize: `${numberSetting(targetingSettings.value.ui?.font_size, 28)}px` }}
+                    onMousedown={e => e.preventDefault()} onClick={() => chooseWindowNumber(simulator, label.number, targetingSettings.value)}><b>{label.number}</b><span><strong>{label.app}</strong><small>{label.title}</small></span></button>)}
+                  {!simulator.window.temporary && !simulator.window.library && simulator.window.tree && treeSlots(simulator.window.tree).map(slot => {
                     const rect = layoutRect(slot.rect, WINDOW_AREA, numberSetting(targetingSettings.value.gap, 8))
                     return <div class={{ 'ks-window-slot': true, selected: simulator.window.tree?.selected === slot.id }}
                       style={{ left: `${rect.x / WINDOW_AREA.width * 100}%`, top: `${rect.y / WINDOW_AREA.height * 100}%`, width: `${rect.width / WINDOW_AREA.width * 100}%`, height: `${rect.height / WINDOW_AREA.height * 100}%` }}>
-                      <button aria-label={`选择区域 ${slot.id}`} onMousedown={e => e.preventDefault()} onClick={() => chooseWindowNumber(simulator, slot.id, targetingSettings.value, true)}>{'`'}{slot.id}</button>
+                      <button aria-label={`选择区域 ${slot.id}`} style={{ fontSize: `${numberSetting(targetingSettings.value.ui?.font_size, 28)}px` }} onMousedown={e => e.preventDefault()} onClick={() => chooseWindowNumber(simulator, slot.id, targetingSettings.value, true)}>{'`'}{slot.id}</button>
                     </div>
                   })}
                 </div>}
+                {simulator.mode === 'window' && simulator.window.noteOpen && <div class="ks-layout-note-backdrop"><form class="ks-layout-note" aria-label="Save layout"
+                  onSubmit={e => { e.preventDefault(); finishLayoutNote(true) }}
+                  onKeydown={e => { e.stopPropagation(); if (e.key === 'Escape' && !e.isComposing) { e.preventDefault(); finishLayoutNote(false) } }} onKeyup={e => e.stopPropagation()}>
+                  <div class="ks-layout-note-heading"><strong>{simulator.window.editingPresetId === null ? 'Save layout' : `Update layout ${simulator.window.editingPresetId}`}</strong><span>备注可留空，将自动命名</span></div>
+                  <div class="ks-layout-note-row"><input aria-label="备注（可留空）" ref={layoutNoteInput} value={layoutNote.value} onInput={e => layoutNote.value = (e.target as HTMLInputElement).value} placeholder="例如：写代码 / 阅读" /><button type="submit">Save</button><button type="button" onClick={() => finishLayoutNote(false)}>Cancel</button></div>
+                </form></div>}
                 {(simulator.mode === 'grid' || simulator.mode === 'recursive_grid') && <div class="ks-target-backdrop" />}
                 {simulator.mode === 'grid' && <TargetGrid mode="grid" settings={targetingSettings.value} path={simulator.targeting.grid.path} />}
                 {simulator.mode === 'recursive_grid' && <TargetGrid mode="recursive_grid" settings={targetingSettings.value} path={simulator.targeting.recursiveGrid.path} />}
@@ -675,9 +746,10 @@ export default defineComponent({
                   <span key={clickPulse.value} class={clickPulse.value ? 'pulse' : ''} />
                 </div>
                 {scrollPulse.value && <div class="ks-scroll-pulse">{scrollPulse.value}</div>}
-                {effectiveDocument.value && simulator.mode === 'window' && !simulator.window.temporary && (
+                {effectiveDocument.value && simulator.mode === 'window' && !simulator.window.temporary && !simulator.window.noteOpen && (
                   <KeyHelpPreview document={effectiveDocument.value} mode="window" appearance={appearance.value}
-                    anchor={windowTarget(simulator.window)} detail={windowDetail(simulator.window)}
+                    anchor={simulator.window.library ? undefined : windowTarget(simulator.window)} detail={windowDetail(simulator.window)}
+                    onRestore={(id: number) => restoreWindowLayout(simulator, id, targetingSettings.value)}
                     status={windowInputStatus(simulator.window) || (simulator.lastEvent.startsWith('window_') ? '' : simulator.lastEvent)}
                     windowState={simulator.window} layoutBindings={windowLayoutBindings.value} />
                 )}
@@ -694,7 +766,7 @@ export default defineComponent({
                 <ModeStyleControls document={document.value} effectiveDocument={effectiveDocument.value} mode="key_help" appearance={appearance.value}
                   onChange={(next) => { document.value = next }} onAppearanceChange={(next) => { appearance.value = next }} />
               )}
-              {simulator.mode === 'window' && <p class="ks-window-instructions">数字选窗；A 快速布局，使用 Normal 方向键调整比例，AA 平铺。E 编辑布局树：Shift＋方向分区，Ctrl＋方向调分割线。修改即时生效，Esc 返回，Q 退出，Z 撤销；按住 Primary 临时使用 Normal。这里只调整示例窗口。</p>}
+              {simulator.mode === 'window' && <p class="ks-window-instructions">数字选窗；A 快速布局，使用 Normal 方向键调整比例，E 自动布局并进入编辑：Shift＋方向分区，Ctrl＋方向连续移动分割线，X 删除分区。A / E 可从窗口模式直接进入；Q 逐层返回，Z 撤销；按住 Primary 临时使用 Normal。这里只调整示例窗口。</p>}
               {document.value && effectiveDocument.value && !editKeyHelp.value && (simulator.mode === 'grid' || simulator.mode === 'recursive_grid' || simulator.mode === 'ui_hint' || simulator.mode === 'window') && (
                 <ModeStyleControls
                   document={document.value}
@@ -1204,6 +1276,11 @@ function escapeHtml(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 }
 
+function downloadLayoutBinary(bytes: Uint8Array): void {
+  const buffer = new ArrayBuffer(bytes.byteLength); new Uint8Array(buffer).set(bytes)
+  const url = URL.createObjectURL(new Blob([buffer], { type: 'application/octet-stream' }))
+  const anchor = document.createElement('a'); anchor.href = url; anchor.download = 'window-layouts.kslayout'; anchor.click(); URL.revokeObjectURL(url)
+}
 function downloadText(source: string, fileName: string): void {
   const url = URL.createObjectURL(new Blob([source], { type: 'text/plain;charset=utf-8' }))
   const anchor = document.createElement('a')
@@ -1223,6 +1300,7 @@ function formatBytes(bytes: number): string {
 }
 
 const KeyHelpPreview = defineComponent({
+  emits: ['restore'],
   props: {
     document: { type: Object as () => ConfigDocument, required: true },
     mode: { type: String, required: true },
@@ -1233,7 +1311,7 @@ const KeyHelpPreview = defineComponent({
     windowState: { type: Object as () => WindowState },
     layoutBindings: { type: Array as () => WindowLayoutBinding[], default: () => [] },
   },
-  setup(props) {
+  setup(props, { emit }) {
     const host = ref<HTMLElement>()
     const size = ref({ width: 800, height: 450 })
     let observer: ResizeObserver | undefined
@@ -1249,10 +1327,20 @@ const KeyHelpPreview = defineComponent({
       if (!props.document.key_help) return null
       const ui = keyHelpStyle(props.document.key_help)
       const isWindow = props.mode === 'window'
+      if (isWindow) ui.title_font_size = ui.font_size * 1.75
       const preview = props.windowState?.panel === 'quick' ? quickRect(props.windowState.quick) : null
       const previewHeight = preview ? Math.min(84, size.value.height * .18) : 0
-      const statusHeight = props.status ? ui.font_size * 1.8 : 0
-      const layout = keyHelpLayout(ui, entries.value, isWindow ? Math.min(size.value.width, 784) : size.value.width, size.value.height, previewHeight + statusHeight, isWindow)
+      const target = props.windowState ? windowTarget(props.windowState) : null
+      const library = props.windowState?.library ? props.windowState : undefined
+      const presets = library?.presets.slice(library.libraryPage * 6, library.libraryPage * 6 + 6) ?? []
+      const info = library ? [`输入布局编号恢复 · 第 ${library.libraryPage + 1} / ${Math.max(1, Math.ceil(library.presets.length / 6))} 页`,
+        ...(presets.length ? presets.map(preset => `${preset.id}   ${savedLayoutName(preset)}`) : ['尚未保存布局，请先在编辑模式保存。'])]
+        : isWindow && target ? [target.app, target.title] : []
+      const statusHeight = (info.length + (props.status ? 1 : 0)) * ui.font_size * 1.8
+      const anchorWidth = props.anchor ? props.anchor.width / WINDOW_AREA.width * size.value.width : size.value.width
+      const anchorHeight = props.anchor ? props.anchor.height / WINDOW_AREA.height * size.value.height : size.value.height
+      const inside = false // Anchors affect placement, never font sizing.
+      const layout = keyHelpLayout(ui, entries.value, isWindow ? Math.min(inside ? anchorWidth : size.value.width, 784) : size.value.width, inside ? anchorHeight : size.value.height, previewHeight + statusHeight, isWindow)
       const theme = props.document.theme?.[props.appearance] ?? {}
       const indicator = { ...props.document.mode_indicator?.ui, ...props.document.mode_indicator?.modes?.[props.mode]?.ui }
       const color = (value: unknown, fallback: string): string => {
@@ -1268,19 +1356,20 @@ const KeyHelpPreview = defineComponent({
       const titleStyle = { fontSize: `${ui.title_font_size}px`, fontWeight: ui.title_bold ? '700' : '400', color: color(ui.title_color, foreground),
         height: `${layout.headerHeight}px`, display: 'flex', alignItems: 'center', overflow: 'hidden', whiteSpace: 'nowrap' as const }
       const scale = layout.bodyScale
-      const left = props.anchor ? Math.max(0, Math.min(size.value.width - layout.width,
+      const fitsAnchor = props.anchor && anchorWidth >= layout.width + 16 && anchorHeight >= layout.height + 16
+      const left = fitsAnchor ? Math.max(0, Math.min(size.value.width - layout.width,
         (props.anchor.x + props.anchor.width / 2) / WINDOW_AREA.width * size.value.width - layout.width / 2)) : (size.value.width - layout.width) / 2
-      const top = props.anchor ? Math.max(0, Math.min(size.value.height - layout.height - 8,
-        (props.anchor.y + props.anchor.height) / WINDOW_AREA.height * size.value.height + 10)) : size.value.height - layout.height - ui.bottom_margin
+      const top = fitsAnchor ? Math.max(0, Math.min(size.value.height - layout.height - 8,
+        (props.anchor.y + props.anchor.height) / WINDOW_AREA.height * size.value.height - layout.height - 8)) : size.value.height - layout.height - ui.bottom_margin
       return (
         <div ref={host} style={{ position: 'absolute', inset: 0, pointerEvents: 'none', zIndex: 20, overflow: 'hidden' }}>
           <div aria-label={isWindow ? 'Window 操作提示' : '按键提示预览'} style={{ position: 'absolute', left: `${left}px`, top: `${top}px`,
             width: `${layout.width}px`, height: `${layout.height}px`, background, borderRadius: `${ui.border_radius}px`,
             boxShadow: `inset 0 0 0 ${ui.border_width}px ${color(ui.border_color, '#00000000')}`,
             fontFamily: ui.font_family || indicator.font_family || 'system-ui, sans-serif', lineHeight: 1.4, color: foreground }}>
-            <div style={{ ...titleStyle, position: 'absolute', left: `${layout.padding}px`, top: `${ui.padding_y}px`, width: `${Math.max(1, layout.width - layout.padding * 2 - closeWidth - ui.key_gap)}px` }}>{isWindow ? `Window · ${props.detail}` : `${props.mode} · Available keys`}</div>
+            <div style={{ ...titleStyle, position: 'absolute', gap: '12px', left: `${layout.padding}px`, top: `${ui.padding_y}px`, width: `${Math.max(1, layout.width - layout.padding * 2 - closeWidth - ui.key_gap)}px` }}>{isWindow ? <><span>Window</span><span style={{ fontSize: `${ui.font_size}px`, padding: '2px 6px', background: '#ebedf2', color: '#1e222b', border: '1px solid #c4c9d3', borderRadius: '3px' }}>{props.detail}</span></> : `${props.mode} · Available keys`}</div>
             <div style={{ ...titleStyle, position: 'absolute', right: `${layout.padding}px`, top: `${ui.padding_y}px`, width: `${closeWidth}px` }}>{closeText}</div>
-            {props.status && <div style={{ position: 'absolute', left: `${layout.padding}px`, top: `${ui.padding_y + layout.headerHeight}px`, width: `${layout.width - layout.padding * 2}px`, height: `${statusHeight}px`, fontSize: `${ui.font_size}px`, overflow: 'hidden', whiteSpace: 'nowrap', opacity: .85 }}>{props.status}</div>}
+            {[...info, ...(props.status ? [props.status] : [])].map((text, index) => <div onMousedown={e => e.preventDefault()} onClick={() => { if (library && presets[index - 1]) emit('restore', presets[index - 1].id) }} style={{ position: 'absolute', left: `${layout.padding}px`, top: `${ui.padding_y + layout.headerHeight + index * ui.font_size * 1.8}px`, width: `${layout.width - layout.padding * 2}px`, height: `${ui.font_size * 1.8}px`, fontSize: `${ui.font_size}px`, fontWeight: index === 0 && info.length ? '700' : '400', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', opacity: .9, pointerEvents: library && presets[index - 1] ? 'auto' : undefined, cursor: library && presets[index - 1] ? 'pointer' : undefined }}>{text}</div>)}
             {preview && <div class="ks-window-quick-preview" aria-label="Window 快速布局" style={{ left: `${layout.padding}px`, top: `${ui.padding_y + layout.headerHeight + statusHeight}px`, width: `${layout.width - layout.padding * 2}px`, height: `${previewHeight}px` }}>
               <span class="ks-help-layout-mini"><i style={{ left: `${preview.x * 100}%`, top: `${preview.y * 100}%`, width: `${preview.width * 100}%`, height: `${preview.height * 100}%` }} /></span>
               <span>{quickCaption(props.windowState!.quick)}</span>
@@ -1297,7 +1386,7 @@ const KeyHelpPreview = defineComponent({
                     padding: `${ui.key_padding_y * scale}px ${ui.key_padding_x * scale}px`, borderRadius: `${ui.key_border_radius * scale}px`,
                     boxShadow: `inset 0 0 0 ${ui.key_border_width * scale}px ${color(ui.key_border_color, '#C4C9D3FF')}` }}>{entry.keys}</span>
                 </span>
-                <span style={{ width: `${widths.action}px`, overflow: 'hidden', opacity: ui.text_opacity, fontWeight: ui.text_bold ? '700' : '400' }}>{entry.action}</span>
+                <span style={{ width: `${widths.action}px`, whiteSpace: isWindow ? 'normal' : 'nowrap', overflowWrap: 'anywhere', opacity: ui.text_opacity, fontWeight: ui.text_bold ? '700' : '400' }}>{entry.action}</span>
               </div>
             })}
           </div>
@@ -1320,16 +1409,22 @@ function readable(background: string, text = '#10172DFF', alternate = '#FFFFFFFF
 
 interface HelpEntry { keys: string; action: string }
 
-function windowNumberLabels(state: WindowState): Array<{ number: number; x: number; y: number }> {
-  const labels: Array<{ number: number; x: number; y: number }> = []
+function windowNumberLabels(state: WindowState): Array<{ number: number; x: number; y: number; app: string; title: string }> {
+  const labels: Array<{ number: number; x: number; y: number; app: string; title: string }> = []
   for (const window of state.windows.filter(w => w.screen === state.screen).sort((a, b) => state.numbers[a.id] - state.numbers[b.id])) {
-    let x = (window.x + window.width / 2) / WINDOW_AREA.width * 100
-    let y = (window.y + window.height / 2) / WINDOW_AREA.height * 100
-    for (let i = 0; i < labels.length && labels.some(l => Math.abs(l.x - x) < 5 && Math.abs(l.y - y) < 6); i++) {
-      y += 6
-      if (y > 94) { y = 6; x += 6 }
+    const slot = state.tree ? treeSlots(state.tree).find(s => s.window === window.id) : undefined
+    let x = Math.max(17, Math.min(83, (slot ? slot.rect.x + slot.rect.width / 2 : (window.x + window.width / 2) / WINDOW_AREA.width) * 100))
+    let y = Math.max(6, Math.min(94, slot ? slot.rect.y * 100 + 6 : (window.y + window.height / 2) / WINDOW_AREA.height * 100))
+    if (labels.some(l => Math.abs(l.x - x) < 33 && Math.abs(l.y - y) < 10)) {
+      let distance = Infinity
+      for (let row = 0; row < 9; row++) for (let col = 0; col < 3; col++) {
+        const cx = 17 + col * 33, cy = 6 + row * 10
+        if (labels.some(l => Math.abs(l.x - cx) < 33 && Math.abs(l.y - cy) < 10)) continue
+        const d = (cx - x) ** 2 + (cy - y) ** 2
+        if (d < distance) { distance = d; x = cx; y = cy }
+      }
     }
-    labels.push({ number: state.numbers[window.id], x: Math.max(3, Math.min(97, x)), y: Math.max(3, Math.min(97, y)) })
+    labels.push({ number: state.numbers[window.id], x, y, app: window.app, title: window.title })
   }
   return labels
 }
@@ -1337,17 +1432,22 @@ function windowNumberLabels(state: WindowState): Array<{ number: number; x: numb
 function keyHelpEntries(document: ConfigDocument, mode: string, window?: WindowState, layoutBindings: WindowLayoutBinding[] = []): HelpEntry[] {
   const groups = new Map<string, string[]>()
   const bindings = effectiveBindings(document, mode)
-  if (mode === 'window' && window?.panel !== 'none') {
-    for (const entry of layoutBindings) {
-      if (window && windowActionAvailable(window, entry.action) && bindings.get(entry.chord)?.value !== 'window_edit'
-        && !(bindings.get(entry.chord)?.value === 'window_layout' && windowDoubleTap(window, document.window ?? {}))) {
+  if (mode === 'window') {
+    for (const original of layoutBindings) {
+      const action = window?.panel === 'none' ? (original.action.startsWith('window_layout_') ? original.action.replace('window_layout_', 'window_') : '') : original.action
+      const entry = { ...original, action }
+      if (!action || window?.panel === 'none' && bindings.has(entry.chord)) continue
+      if (window && windowActionAvailable(window, entry.action) && bindings.get(entry.chord)?.value !== 'window_edit') {
         bindings.set(entry.chord, { value: entry.action, source: 'window' })
       }
     }
   }
-  if (mode === 'window') {
-    bindings.set('1–9 / 10…', { value: 'window_number', source: 'window' })
-    if (window?.panel === 'tree') bindings.set('`', { value: 'window_area_number', source: 'window' })
+  if (mode === 'window' && !window?.library) {
+    bindings.set('`', { value: 'window_area_number', source: 'window' })
+  }
+  if (mode === 'window' && window?.library) {
+    if (window.libraryPage > 0) groups.set('Previous page', ['PAGEUP'])
+    if ((window.libraryPage + 1) * 6 < window.presets.length) groups.set('Next page', ['PAGEDOWN'])
   }
   for (const [chord, binding] of bindings) {
     if (binding.value === '__disabled__') continue
@@ -1356,10 +1456,10 @@ function keyHelpEntries(document: ConfigDocument, mode: string, window?: WindowS
       if (window && !['window_number', 'window_area_number'].includes(action) && !windowActionAvailable(window, action)) continue
       const labels: Record<string, string> = {
         window_left: 'Left', window_right: 'Right', window_up: 'Up', window_down: 'Down',
-        window_size: 'Move / resize', window_layout: 'Quick / double tap to tile', window_edit: 'Edit layout tree', window_tile: 'Tile windows',
+        window_size: 'Move / resize', window_layout: 'Quick layout', window_edit: 'Edit layout tree', window_tile: 'Tile windows',
         window_number: '选择窗口编号', window_area_number: '区域编号前缀',
         window_screen_next: 'Next screen', window_screen_previous: 'Previous screen', window_maximize: 'Maximize / restore',
-        window_center: 'Center window', window_select: 'Next window', window_undo: 'Undo',
+        window_center: 'Center window', window_select: 'Next window', window_undo: 'Undo', window_remove_region: 'Delete region', window_saved_layouts: 'Restore layout', window_save_layout: 'Save layout',
         window_confirm: 'Apply / exit', window_cancel: 'Back / exit', window_exit: 'Exit',
       }
       for (const direction of ['left', 'right', 'up', 'down']) {
@@ -1381,27 +1481,41 @@ function keyHelpEntries(document: ConfigDocument, mode: string, window?: WindowS
 /** Same logical-pixel sizing as the native help decorator (browser font metrics differ). */
 function keyHelpLayout(ui: ConfigDocument, entries: HelpEntry[], screenWidth: number, screenHeight: number, extraHeight = 0, windowHelp = false) {
   ui = keyHelpStyle(ui)
+  if (windowHelp) ui.title_font_size = ui.font_size * 1.75
   const availableWidth = Math.max(1, screenWidth - ui.screen_margin * 2)
   const padding = Math.min(ui.padding_x, availableWidth / 4)
-  const columns = availableWidth >= (windowHelp ? Math.min(440, ui.column_threshold) : ui.column_threshold) && entries.length > 8
+  let columns = availableWidth >= (windowHelp ? Math.min(340, ui.column_threshold) : ui.column_threshold) && entries.length > 8
     ? Math.max(1, Math.min(ui.max_columns, entries.length)) : 1
+  if (windowHelp && columns > 1) {
+    const count = Math.ceil(entries.length / columns)
+    const needed = Array.from({ length: columns }, (_, col) => {
+      const chunk = entries.slice(col * count, (col + 1) * count)
+      return Math.max(1, ...chunk.map(e => e.keys.length)) * ui.font_size * .75 + ui.key_padding_x * 2
+        + Math.max(1, ...chunk.map(e => e.action.length)) * ui.font_size * .75 + ui.font_size / 3 + ui.key_gap
+    }).reduce((a, b) => a + b, 0) + (columns - 1) * ui.column_gap + padding * 2
+    if (needed > availableWidth) columns = 1
+  }
   const rows = Math.max(1, Math.ceil(entries.length / columns))
   const widths = Array.from({ length: columns }, (_, column) => {
     const chunk = entries.slice(column * rows, (column + 1) * rows)
     return {
       key: Math.max(1, ...chunk.map(entry => [...entry.keys].length)) * ui.font_size * 0.75 + ui.key_padding_x * 2,
-      action: Math.max(1, ...chunk.map(entry => [...entry.action].length)) * ui.font_size * 0.6 + ui.font_size / 3,
+      action: Math.max(1, ...chunk.map(entry => [...entry.action].length)) * ui.font_size * 0.75 + ui.font_size / 3,
     }
   })
   const textWidth = widths.reduce((sum, column) => sum + column.key + column.action, 0)
   const gaps = (columns - 1) * ui.column_gap + columns * ui.key_gap
   const width = Math.min(availableWidth, Math.max(ui.min_width, textWidth + gaps + padding * 2))
   const squeeze = Math.max(0.01, Math.min(1, (width - padding * 2 - gaps) / textWidth))
-  widths.forEach(column => { column.key *= squeeze; column.action *= squeeze })
+  widths.forEach(column => {
+    if (windowHelp) column.action = Math.max(ui.font_size, column.action - (column.key + column.action) * (1 - squeeze))
+    else { column.key *= squeeze; column.action *= squeeze }
+  })
   const headerHeight = Math.max(ui.header_height, ui.title_font_size * 1.4)
-  const rowHeight = Math.min(ui.row_height, Math.max(8, (screenHeight * (windowHelp ? .75 : ui.max_height_ratio) - headerHeight - extraHeight - ui.padding_y * 2) / rows))
+  const lines = Math.max(1, ...entries.map((entry, index) => Math.ceil(entry.action.length * ui.font_size * .75 / widths[Math.floor(index / rows)].action)))
+  const rowHeight = windowHelp ? ui.font_size * (lines * 1.4 + .6) : Math.min(ui.row_height, Math.max(8, (screenHeight * ui.max_height_ratio - headerHeight - extraHeight - ui.padding_y * 2) / rows))
   const height = headerHeight + extraHeight + rows * rowHeight + ui.padding_y * 2
-  const bodyScale = Math.max(0.01, Math.min(squeeze, (rowHeight - ui.row_gap) / (ui.font_size * 1.4 + ui.key_padding_y * 2)))
+  const bodyScale = windowHelp ? 1 : Math.max(0.01, Math.min(squeeze, (rowHeight - ui.row_gap) / (ui.font_size * 1.4 + ui.key_padding_y * 2)))
   return { width, height, padding, columns, rows, widths, rowHeight, headerHeight, bodyScale,
     bodyLeft: (width - textWidth * squeeze - gaps) / 2 }
 }

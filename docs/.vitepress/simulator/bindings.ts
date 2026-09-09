@@ -139,7 +139,8 @@ export function compileWindowLayoutBindings(document: BindingDocument, isMac: bo
   return [...bindings.values()].sort((a, b) => b.keys.length - a.keys.length)
 }
 
-export function resolveWindowLayoutBinding(bindings: WindowLayoutBinding[], pressed: string[], key: string): string | undefined {
-  return bindings.find(entry => keyMatches(entry.activation, key) && entry.keys.length === pressed.length
+export function resolveWindowLayoutBinding(bindings: WindowLayoutBinding[], pressed: string[], key: string, editing = true): string | undefined {
+  const action = bindings.find(entry => keyMatches(entry.activation, key) && entry.keys.length === pressed.length
     && entry.keys.every(k => pressed.some(p => keyMatches(k, p))))?.action
+  return editing ? action : action?.startsWith('window_layout_') ? action.replace('window_layout_', 'window_') : undefined
 }

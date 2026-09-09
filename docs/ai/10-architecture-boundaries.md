@@ -23,6 +23,8 @@ store 和平台原子替换由 `app::configuration::ConfigRepository` 适配。�
 
 ## Runtime 所有权
 
+布局库沿用依赖反转：Engine 只持有 `LayoutRepository` trait object（列表、保存和 handoff 导出），`app/layout_store.rs` 实现二进制持久化并由 bootstrap 注入路径和平台 atomic_replace。Runtime 的 `LayoutController` 只拥有原生备注请求、会话归属和完成路由，不导入 app/config 的具体 store 或文件替换类型。
+
 Engine 组合四类有状态协作者：`ModeRegistry`、`InputState`、`Scheduler` 和
 `OverlayCoordinator`。Mode 通过 `claims_key` 与 `wants_pointer_events` 声明自己的输入兴趣；
 Engine 不识别 Grid/UI Hint 字符表。`ModeRegistry` 独占实例、活动 slot、路由、插件 manifest、

@@ -34,7 +34,7 @@ impl Engine {
         self.display_mode() == ModeId::window()
     }
 
-    fn help_screen(&self) -> Option<&Screen> {
+    pub(super) fn help_screen(&self) -> Option<&Screen> {
         let anchor = self
             .registry
             .get(&self.display_mode())
@@ -96,13 +96,17 @@ impl Engine {
                 ));
             }
         }
-        if self.display_mode() == ModeId::window()
-            && self
+        if self.display_mode() == ModeId::window() {
+            let table = if self
                 .registry
                 .get(&self.registry.active)
                 .is_some_and(|m| m.window_layout_active())
-        {
-            for entry in self.registry.window_layout_table.iter_entries() {
+            {
+                &self.registry.window_layout_table
+            } else {
+                &self.registry.window_motion_table
+            };
+            for entry in table.iter_entries() {
                 if self
                     .lookup_for_pressed(entry.chord.activation_key(), entry.chord.keys())
                     .is_some_and(|resolved| {
@@ -147,6 +151,7 @@ impl Engine {
     pub(super) fn decorate_key_help(&mut self, scene: &mut OverlayScene) {
         if (!self.overlay.key_help_visible && !self.window_help_visible())
             || self.registry.active == ModeId::idle()
+            || self.window_layouts.pending.is_some()
         {
             self.overlay.key_help_cache = None;
             return;

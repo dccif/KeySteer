@@ -4,22 +4,55 @@ use crate::api::presentation::{View, WindowView};
 
 impl WindowMode {
     pub(super) fn detail(&self) -> String {
+        if self.library_open {
+            let mut detail = format!(
+                "Restore\nType a layout number · page {} / {}",
+                self.library_page + 1,
+                self.saved_layouts
+                    .len()
+                    .div_ceil(super::presets::PAGE_SIZE)
+                    .max(1)
+            );
+            if self.saved_layouts.is_empty() {
+                detail.push_str("\nNo saved layouts · save a layout in the editor");
+            }
+            for layout in self
+                .saved_layouts
+                .iter()
+                .skip(self.library_page * super::presets::PAGE_SIZE)
+                .take(super::presets::PAGE_SIZE)
+            {
+                detail.push_str(&format!("\n{}   {}", layout.id, layout.name()));
+            }
+            if !self.number.display.is_empty() {
+                detail.push_str(&format!("\nInput: {}", self.number.display));
+            }
+            if let Some(status) = &self.status {
+                detail.push_str(&format!("\n{status}"));
+            }
+            return detail;
+        }
         let state = match self.edit.as_ref().map(|e| &e.model) {
             Some(EditModel::Quick(quick)) => format!("Quick · {}", quick.caption()),
             Some(EditModel::Tree(tree)) => format!("Edit · area `{}", tree.selected),
-            None => if self.size { "size" } else { "move" }.into(),
+            None => if self.size { "Resize" } else { "Move" }.into(),
         };
-        let title = self
-            .target
-            .as_ref()
-            .map_or("No target", |w| w.title.as_str());
-        let mut detail = format!("{state} · {}", title.chars().take(40).collect::<String>());
-        if self.number.pending() {
-            detail.push_str(&format!(
-                "\nNumber: {}{}…",
-                if self.number.slot { "`" } else { "" },
-                self.number.prefix
-            ));
+        let mut detail = state;
+        if let Some(window) = &self.target {
+            let app = window
+                .app
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(&window.app)
+                .trim_end_matches(".exe");
+            detail.push_str(&format!("\n{app}\n{}", window.title));
+        }
+        if !self.number.display.is_empty() {
+            detail.push_str("\nInput: ");
+            detail.push_str(&self.number.display);
+            if self.number.pending() {
+                detail.push('…');
+            }
         }
         if let Some(source) = self.swap_source.and_then(|id| self.numbers.get(&id)) {
             detail.push_str(&format!("\nWindow {source} → window number / `area"));
@@ -33,6 +66,9 @@ impl WindowMode {
 
     pub(super) fn view(&self) -> View<'_> {
         if self.temporary {
+            return View::Empty;
+        }
+        if self.library_open {
             return View::Empty;
         }
         let tree = self

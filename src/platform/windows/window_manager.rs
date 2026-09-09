@@ -11,7 +11,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GWL_STYLE, GetPropW, MINMAXINFO, RemovePropW, SMTO_ABORTIFHUNG, SMTO_BLOCK,
     SW_RESTORE, SW_SHOWMAXIMIZED, SendMessageTimeoutW, SetForegroundWindow, SetPropW,
     ShowWindowAsync, SwitchToThisWindow, WINDOWPLACEMENT, WM_GETMINMAXINFO,
-    WPF_ASYNCWINDOWPLACEMENT, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_THICKFRAME,
+    WPF_ASYNCWINDOWPLACEMENT, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_MAXIMIZE,
+    WS_THICKFRAME,
 };
 use windows::core::{BOOL, PCWSTR};
 
@@ -151,6 +152,7 @@ impl Windows {
         id: WindowId,
         screens: &[Screen],
         desired: Option<Rect>,
+        maximized: Option<bool>,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<WindowInfo, String> {
         let deadline = Instant::now() + Duration::from_millis(250);
@@ -164,12 +166,18 @@ impl Windows {
             if cancelled() {
                 return self.snapshot(id, screens).map(|s| s.info);
             }
-            if desired.is_some_and(|d| {
-                (d.x - bounds.x).abs() < 2.0
-                    && (d.y - bounds.y).abs() < 2.0
-                    && (d.width - bounds.width).abs() < 2.0
-                    && (d.height - bounds.height).abs() < 2.0
-            }) {
+            let state_matches = maximized.is_none_or(|expected| {
+                (super::native::window_long(hwnd, GWL_STYLE) as u32 & WS_MAXIMIZE.0 != 0)
+                    == expected
+            });
+            if state_matches
+                && desired.is_some_and(|d| {
+                    (d.x - bounds.x).abs() < 2.0
+                        && (d.y - bounds.y).abs() < 2.0
+                        && (d.width - bounds.width).abs() < 2.0
+                        && (d.height - bounds.height).abs() < 2.0
+                })
+            {
                 return self.snapshot(id, screens).map(|s| s.info);
             }
             if previous == Some(bounds) {
@@ -177,7 +185,7 @@ impl Windows {
             } else {
                 stable = 0;
             }
-            if stable >= 5 || Instant::now() >= deadline {
+            if state_matches && desired.is_none() && stable >= 5 || Instant::now() >= deadline {
                 return self.snapshot(id, screens).map(|s| s.info);
             }
             previous = Some(bounds);
@@ -292,7 +300,11 @@ impl WindowAccess for Windows {
             if !unsafe { ShowWindowAsync(hwnd, SW_RESTORE) }.as_bool() {
                 return Err("cannot restore maximized window".into());
             }
-            self.wait_frame(id, screens, Some(before.restored), cancelled)?;
+            let restored =
+                self.wait_frame(id, screens, Some(before.restored), Some(false), cancelled)?;
+            if restored.maximized && !cancelled() {
+                return Err("Timed out restoring maximized window before resizing".into());
+            }
         }
         if cancelled() {
             return self.snapshot(id, screens).map(|s| s.info);
@@ -317,7 +329,7 @@ impl WindowAccess for Windows {
             desired.height + (raw.height - visible.height) * scale,
         );
         submit_frame(hwnd, native)?;
-        self.wait_frame(id, screens, Some(desired), cancelled)
+        self.wait_frame(id, screens, Some(desired), Some(false), cancelled)
     }
     fn restore(
         &mut self,
@@ -342,7 +354,13 @@ impl WindowAccess for Windows {
             // bounds back into WINDOWPLACEMENT.
             p.ptMaxPosition = POINT { x: -1, y: -1 };
             submit_placement(hwnd, &p)?;
-            self.wait_frame(snapshot.info.id, screens, Some(screen.work_area), cancelled)
+            self.wait_frame(
+                snapshot.info.id,
+                screens,
+                Some(screen.work_area),
+                Some(true),
+                cancelled,
+            )
         } else {
             self.set_frame(snapshot.info.id, snapshot.info.bounds, screens, cancelled)
         }
@@ -375,7 +393,13 @@ impl WindowAccess for Windows {
         } else {
             screens[before.info.screen].work_area
         };
-        self.wait_frame(id, screens, Some(desired), cancelled)
+        self.wait_frame(
+            id,
+            screens,
+            Some(desired),
+            Some(!before.info.maximized),
+            cancelled,
+        )
     }
     fn select(&self, id: WindowId) -> Result<(), String> {
         let hwnd = self.hwnd(id)?;
@@ -626,6 +650,85 @@ mod tests {
         access.reset();
         assert!(retained.is_ok());
         assert!(eligible(hwnd));
+    }
+
+    #[test]
+    #[ignore = "maximizes and tiles disposable owned windows, then restores their entry state"]
+    fn native_maximized_window_can_tile_and_undo() {
+        use crate::api::window::{WindowEditResult, WindowOperation as O};
+        use crate::platform::common::window_session::WindowSessionProbe;
+        let _ = super::super::screens::enable_dpi_awareness();
+        let screens = super::super::screens::list_screens().unwrap();
+        let area = screens.iter().find(|s| s.is_primary).unwrap().work_area;
+        let first_probe = Probe::start(Rect::new(area.x + 40.0, area.y + 40.0, 480.0, 320.0));
+        let second_probe = Probe::start(Rect::new(area.x + 100.0, area.y + 100.0, 480.0, 320.0));
+        let mut access = Windows::default();
+        let first = access.retain(first_probe.hwnd, &screens).unwrap();
+        let second = access.retain(second_probe.hwnd, &screens).unwrap();
+        let originals = [
+            access.snapshot(first.id, &screens).unwrap(),
+            access.snapshot(second.id, &screens).unwrap(),
+        ];
+        let outcome = (|| -> Result<(), String> {
+            let maximized = access.maximize(first.id, &screens, &|| false)?;
+            if !maximized.maximized {
+                return Err("maximize did not settle".into());
+            }
+            let mut session = WindowSessionProbe::new(first.id);
+            session.execute(
+                &mut access,
+                O::BeginEdit {
+                    transaction: 91,
+                    group: 91,
+                    targets: vec![first.id, second.id],
+                    screen: None,
+                },
+                &screens,
+            );
+            let applied = session.execute(
+                &mut access,
+                O::ApplyLayout {
+                    transaction: 91,
+                    revision: 1,
+                    screen: first.screen,
+                    gap: 8.0,
+                    strict: true,
+                    placements: vec![
+                        (first.id, Rect::new(0.0, 0.0, 0.5, 1.0)),
+                        (second.id, Rect::new(0.5, 0.0, 0.5, 1.0)),
+                    ],
+                },
+                &screens,
+            );
+            if !matches!(
+                applied.edit.as_deref(),
+                Some(WindowEditResult::Applied { accepted: true, .. })
+            ) {
+                return Err(applied
+                    .message
+                    .unwrap_or_else(|| "maximized layout rejected".into()));
+            }
+            if access.snapshot(first.id, &screens)?.info.maximized {
+                return Err("window remained maximized".into());
+            }
+            session.execute(
+                &mut access,
+                O::EndEdit {
+                    transaction: 91,
+                    commit: true,
+                },
+                &screens,
+            );
+            session.execute(&mut access, O::Undo, &screens);
+            if !access.snapshot(first.id, &screens)?.info.maximized {
+                return Err("undo did not restore maximization".into());
+            }
+            Ok(())
+        })();
+        for before in originals {
+            access.restore(&before, &screens, &|| false).unwrap();
+        }
+        assert!(outcome.is_ok(), "{outcome:?}");
     }
 
     #[test]

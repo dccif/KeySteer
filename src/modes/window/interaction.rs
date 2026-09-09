@@ -16,19 +16,22 @@ impl WindowMode {
                 self.held.remove(key);
                 if self.held.is_empty() {
                     out.push(Command::SetFrameClock(false));
+                    if let Some(edit) = &mut self.edit {
+                        edit.divider_gesture = false;
+                    }
                 }
-            } else if self.edit.is_none()
+            } else if (self.edit.is_none()
+                || matches!((&self.edit, action), (Some(edit), W::Ratio(_)) if matches!(edit.model, EditModel::Tree(_))))
                 && !self.temporary
                 && self.target.is_some()
                 && !self.held.contains_key(key)
             {
-                self.last_layout = None;
                 if self.held.is_empty() {
                     self.group += 1;
                     out.push(Command::SetFrameClock(true));
                 }
                 self.held.insert(key.clone(), action);
-                self.motion(None, out);
+                self.motion(None, ctx, out);
             }
             return;
         }
@@ -36,9 +39,6 @@ impl WindowMode {
             return;
         }
         self.stop_movement(out);
-        if action != W::Layout {
-            self.last_layout = None;
-        }
         if action == W::Confirm && self.number.pending() {
             let completed = self.number.finish(&self.window_index, &self.slot_index);
             out.push(Command::CancelTimer {
@@ -61,15 +61,15 @@ impl WindowMode {
             self.swap_source = None;
         }
         match action {
+            W::SavedLayouts => self.open_library(out),
+            W::SaveLayout => self.save_layout(out),
+            W::RemoveRegion => self.remove_region(ctx, out),
             W::Navigate(direction) => self.edit_direction(direction, false, false, ctx, out),
             W::Split(direction) => self.edit_direction(direction, true, false, ctx, out),
             W::Ratio(direction) => self.edit_direction(direction, false, true, ctx, out),
             W::Layout => {
-                if self.window_layout_double_tap() {
-                    self.finish_edit(Finish::Tile, out);
-                } else if self.edit.is_none() {
+                if self.edit.is_none() {
                     self.start_edit(false, ctx, out);
-                    self.last_layout = Some(Instant::now());
                 }
             }
             W::Edit => {
@@ -112,8 +112,16 @@ impl WindowMode {
                 }
             }
             W::Undo => {
+                self.numbered_slots = 0;
                 if let Some(edit) = &mut self.edit {
                     if let Some(previous) = edit.history.pop() {
+                        if edit.history.is_empty()
+                            && !edit.entry_layout
+                            && matches!(previous, EditModel::Tree(_))
+                        {
+                            self.finish_edit(Finish::TreeReset, out);
+                            return;
+                        }
                         if previous == EditModel::Quick(QuickPlacement::default()) {
                             self.finish_edit(Finish::QuickReset, out);
                             return;
@@ -122,6 +130,8 @@ impl WindowMode {
                         edit.dirty = true;
                         self.flush_edit(out);
                         self.rebuild_numbers();
+                    } else if edit.entry_layout && matches!(edit.model, EditModel::Tree(_)) {
+                        self.finish_edit(Finish::TreeReset, out);
                     } else {
                         self.status = Some("Nothing to undo in this edit".into());
                     }

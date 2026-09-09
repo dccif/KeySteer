@@ -34,6 +34,7 @@ pub(super) struct ModeRegistry {
     pub(super) prefixes_require_modifier: bool,
     pub(super) character_keys: HashMap<char, crate::api::Key>,
     pub(super) window_layout_table: CompiledKeymap,
+    pub(super) window_motion_table: CompiledKeymap,
     #[cfg(test)]
     pub(super) table_rebuild_count: usize,
     pub(super) plugin_bindings: Vec<(KeyChord, Binding)>,
@@ -53,6 +54,7 @@ impl Default for ModeRegistry {
             prefixes_require_modifier: true,
             character_keys: HashMap::new(),
             window_layout_table: CompiledKeymap::default(),
+            window_motion_table: CompiledKeymap::default(),
             #[cfg(test)]
             table_rebuild_count: 0,
             plugin_bindings: Vec::new(),
@@ -416,6 +418,23 @@ impl Engine {
                 }
             }
         }
+        self.registry.window_motion_table = CompiledKeymap::compile(
+            directions
+                .iter()
+                .map(|(key, direction)| {
+                    use crate::api::Direction;
+                    use crate::api::window::WindowAction as W;
+                    let action = match direction {
+                        Direction::Left => W::Left,
+                        Direction::Right => W::Right,
+                        Direction::Up => W::Up,
+                        Direction::Down => W::Down,
+                    };
+                    (key.clone(), Binding::Window(action))
+                })
+                .collect(),
+            &self.settings.resolved_key_aliases,
+        );
         let mut bindings = BTreeMap::new();
         for (key, direction) in &directions {
             bindings.insert(

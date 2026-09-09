@@ -52,3 +52,40 @@ impl Presenter for Composer {
         hint::prepare_hints(content, layers, workspace, context);
     }
 }
+
+/// Bound labels by Unicode scalar count without splitting UTF-8.
+pub(crate) fn elide(text: &str, capacity: usize) -> String {
+    let mut characters = text.chars();
+    let mut value: String = characters.by_ref().take(capacity).collect();
+    if characters.next().is_some() && capacity > 0 {
+        value.pop();
+        value.push('…');
+    }
+    value
+}
+
+pub(crate) fn text_units(text: &str) -> f64 {
+    text.chars()
+        .map(|c| if c.is_ascii() { 0.75 } else { 1.0 })
+        .sum()
+}
+
+/// Caption budget in font-size units; reserve a full em for non-ASCII text.
+pub(crate) fn elide_width(text: &str, units: f64) -> String {
+    if text_units(text) <= units {
+        return text.into();
+    }
+    let mut output = String::new();
+    let mut used = 1.0; // ellipsis
+    for c in text.chars() {
+        used += if c.is_ascii() { 0.75 } else { 1.0 };
+        if used > units {
+            break;
+        }
+        output.push(c);
+    }
+    if units >= 1.0 {
+        output.push('…');
+    }
+    output
+}

@@ -20,6 +20,8 @@ mod plan;
 mod prefix_chords;
 mod registry;
 mod scheduler;
+mod window_presets;
+pub(crate) use window_presets::LayoutRepository;
 
 pub use plan::{
     AppRouteOverride, ConfigurationCandidate, ConfigurationRepository, DebugSettings,
@@ -140,6 +142,7 @@ pub struct Engine {
     pending_runtime_error: Option<RuntimeError>,
     should_quit: bool,
     configuration: Option<Box<dyn ConfigurationRepository>>,
+    window_layouts: window_presets::LayoutController,
     /// Prevent rapid status-menu clicks from opening duplicate browser tabs.
     last_config_simulator_open: Option<Instant>,
     started_at: Instant,
@@ -186,6 +189,7 @@ impl Engine {
             pending_runtime_error: None,
             should_quit: false,
             configuration: None,
+            window_layouts: window_presets::LayoutController::default(),
             last_config_simulator_open: None,
             started_at: Instant::now(),
         };
@@ -610,6 +614,9 @@ impl Engine {
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
         match event {
+            BackendEvent::TextPromptResult { id, value } => {
+                self.finish_layout_note(id, value, backend)?
+            }
             BackendEvent::WindowResult(result) => {
                 if let Some(owner) = self.scheduler.window_sessions.get(&result.session).cloned() {
                     self.dispatch_owned_to(&owner, ModeEvent::WindowResult(result), backend)?;
@@ -759,7 +766,11 @@ impl Engine {
                     .as_ref()
                     .ok_or_else(|| "no configuration source is attached".to_string())?
                     .source_text()?;
-                let url = config_handoff::url_for_config(&source);
+                let layouts = self.window_layouts.store.export_file();
+                if let Err(error) = &layouts {
+                    crate::report_error!("window-layouts", "{error}");
+                }
+                let url = config_handoff::url_for_workspace(&source, layouts);
                 if let Err(error) = backend.open_url(&url) {
                     crate::support::logging::report_error("config-simulator", error);
                 } else {
@@ -1189,6 +1200,9 @@ impl Engine {
                 )
             });
             match command {
+                Command::WindowLayouts(request) => {
+                    self.request_window_layouts(owner, *request, backend)?
+                }
                 Command::WindowRequest(request) => {
                     self.scheduler
                         .window_sessions
@@ -1231,6 +1245,15 @@ impl Engine {
                     }
                 }
                 Command::CancelWindowSession(session) => {
+                    if self
+                        .window_layouts
+                        .pending
+                        .as_ref()
+                        .is_some_and(|p| p.session == session)
+                        && let Some(prompt) = self.window_layouts.pending.take()
+                    {
+                        backend.cancel_text_prompt(prompt.id);
+                    }
                     self.scheduler.window_sessions.remove(&session);
                     backend.cancel_window_session(session);
                 }

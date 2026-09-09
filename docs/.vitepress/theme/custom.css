@@ -1298,7 +1298,39 @@
 .ks-help-layout-mini { display: block; flex: 1; min-height: 8px; position: relative; border: 1px solid currentColor; border-radius: 2px; opacity: .55; }
 .ks-help-layout-mini i { position: absolute; display: block; background: currentColor; opacity: .4; }
 .ks-window-number { position: absolute; z-index: 12; transform: translate(-50%, -50%); min-width: 30px; padding: 3px 8px; border: 1px solid #91a7ff; border-radius: 6px; background: #243d8e; color: white; font-size: 16px; line-height: 1.5; font-weight: 700; pointer-events: auto; box-shadow: 0 2px 8px #0004; }
-.ks-window-slot { position: absolute; z-index: 9; border: 1px dashed #8ca5ef; pointer-events: none; }
-.ks-window-slot.selected { border: 3px solid #6585ee; }
-.ks-window-slot button { position: absolute; left: 4px; top: 4px; padding: 2px 6px; background: #23396e; border: 1px solid #8ca5ef; color: #fff; border-radius: 4px; font-size: 13px; pointer-events: auto; }
+.ks-window-slot { position: absolute; z-index: 9; border: 2px solid #dce6ff; background: #0a101e99; box-shadow: 0 0 0 1px #101828; pointer-events: none; }
+.ks-window-slot.selected { border: 4px solid #6585ee; box-shadow: 0 0 0 3px #101828; }
+.ks-window-slot button { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); padding: 2px 6px; background: #23396e; border: 1px solid #8ca5ef; color: #fff; border-radius: 4px; font-size: 28px; pointer-events: auto; }
 .ks-window-instructions { padding: 0 18px; font-size: 12px; color: var(--vp-c-text-2); }
+
+.ks-window-number { display: flex; align-items: center; gap: 8px; width: 32%; text-align: left; }
+.ks-window-number span { display: flex; flex-direction: column; min-width: 0; font-size: 12px; line-height: 1.5; }
+.ks-window-number strong, .ks-window-number small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ks-window-number strong { font-size: 14px; }
+.ks-window-number small { font-size: 12px; }
+
+.ks-layout-library, .ks-layout-note { color: var(--vp-c-text-1); background: var(--vp-c-bg); border: 1px solid var(--vp-c-divider); border-radius: 12px; box-shadow: 0 14px 40px #0003; padding: 20px; }
+.ks-layout-library { position: absolute; z-index: 20; left: 15%; right: 15%; top: 7%; }
+.ks-layout-library h3, .ks-layout-note h3 { margin: 0 0 8px; font-size: 20px; }
+.ks-layout-library p, .ks-layout-note p { margin: 8px 0 14px; font-size: 12px; color: var(--vp-c-text-2); }
+.ks-layout-library > button { display: flex; align-items: center; gap: 16px; width: 100%; padding: 10px 12px; text-align: left; border-radius: 6px; }
+.ks-layout-library > button:hover { background: var(--vp-c-bg-soft); }
+.ks-layout-library > button b { color: var(--vp-c-brand-1); font-size: 20px; }
+.ks-layout-library > button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ks-layout-pages { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; font-size: 12px; }
+.ks-layout-pages button:disabled { opacity: .4; }
+.ks-layout-note-backdrop { position: absolute; z-index: 50; left: 12px; right: 12px; bottom: 12px; display: flex; justify-content: center; pointer-events: none; }
+.ks-layout-note { width: min(720px, 100%); pointer-events: auto; box-shadow: none; padding: 12px; }
+.ks-layout-note label { display: grid; gap: 8px; font-size: 13px; }
+.ks-layout-note input { width: 100%; border: 1px solid var(--vp-c-divider); border-radius: 6px; padding: 10px; background: var(--vp-c-bg-soft); }
+.ks-layout-note > div { display: flex; justify-content: flex-end; gap: 10px; }
+.ks-layout-note > .ks-layout-note-heading { justify-content: space-between; align-items: center; margin-bottom: 8px; font-size: 13px; }
+.ks-layout-note-heading span { color: var(--vp-c-text-2); font-size: 12px; }
+.ks-layout-note-row { align-items: center; }
+.ks-layout-note-row input { flex: 1; min-width: 0; width: auto; }
+.ks-layout-note-row button { flex-shrink: 0; }
+.ks-layout-note button { padding: 6px 16px; border: 1px solid var(--vp-c-divider); border-radius: 6px; }
+.ks-layout-note button[type=submit] { color: white; background: var(--vp-c-brand-1); border-color: transparent; }
+.ks-layout-file-tools { display: flex; gap: 6px; padding: 0 18px 10px; }
+.ks-layout-file-tools button { background: var(--vp-c-bg); color: var(--vp-c-text-1); border: 1px solid var(--vp-c-divider); border-radius: 5px; padding: 3px 8px; font-size: 11px; }
+.ks-layout-library { top: 14%; }

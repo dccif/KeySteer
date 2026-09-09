@@ -1,5 +1,9 @@
 # 构建、打包、文档站与测试
 
+Rust 与 TypeScript 使用同一 `tests/fixtures/window-layouts-v1.kslayout` 做逐字节往返，覆盖二进制布局文件互导；v2 handoff 测试同时校验按键 source、布局 bytes 和 URL 清理，runtime 测试验证重新打开 R 后读到外部替换的文件。
+
+布局收藏的 API 测试覆盖 9/4 区域与窗口数量不匹配、空区域及排序、备注/隐私字段；`app/layout_store` 测试覆盖二进制往返、逐字节截断、版本、持久化及写入失败不覆盖。runtime 测试覆盖 Ctrl+S、原生输入放行、R→编号恢复和会话取消后的迟到结果。Windows ignored `native_note_dialog_preserves_unicode_and_cancels_owned_windows` 在交互桌面创建并清理自有对话框，验证 Unicode 保存和取消；macOS 编译检查不能替代实机 IME 验证。网页 `window-presets.test.ts` 覆盖独立浏览器布局库与恢复撤销。
+
 ## 优化构建档位（2026-08）
 
 - 通用发布保留目标默认 CPU baseline；版本变更应在提交前同步 Cargo.lock 中的 `keysteer` 根包版本。为避免只修改 Cargo.toml 导致正式打包失败，workflow 在每个原生 matrix runner 上先读取 manifest 版本，并用 `cargo update --package keysteer --precise <version>` 定向同步根包条目，不主动升级第三方依赖；后续打包仍使用 `--locked`。打包从 commit 生成 `SOURCE_DATE_EPOCH`，Windows 发布入口同时传递 `/Brepro`。
@@ -251,3 +255,5 @@ exact counts are ignored in ordinary parallel CI and must run alone with
 Presenter 验证提交的是原始借用状态，并且最终场景由该端口控制。既有 Grid/Hint/Window/help
 行为测试继续检查实际 compositor 输出；Hint 分层测试随实现归入 `presentation/hint/layers.rs`。
 重构后仍需运行单线程分配预算、帮助缓存开关释放与位置更新探针，不能仅凭编译判断热路径不变。
+
+Window 回归应覆盖：E/反引号入口自动布局、撤销入口不再自动重排、A 无双击分支、区域编号原生聚焦、空区定位、X 删除与稳定 ID、Ctrl 短按与长按像素移动及一次撤销、应用最小尺寸边界。Windows ignored `native_maximized_window_can_tile_and_undo` 使用自有临时窗口验证最大化恢复、严格分屏和撤销，不操作用户应用。

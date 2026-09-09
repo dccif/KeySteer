@@ -31,9 +31,27 @@ const STATUS_ICON_PNG: &[u8] = include_bytes!("../../../assets/icons/keysteer-ic
 const STATUS_ICON_SIZE: f64 = 18.0;
 
 struct StatusTargetIvars {
+    note: RefCell<Option<NotePanel>>,
     update_alert: RefCell<Option<Retained<NSPanel>>>,
     downloaded_update: RefCell<Option<PathBuf>>,
 }
+
+struct NotePanel {
+    id: u64,
+    panel: Retained<NSPanel>,
+    field: Retained<NSTextField>,
+}
+
+define_class!(
+    #[unsafe(super(NSPanel))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "KeySteerInlineInputPanel"]
+    struct InlineInputPanel;
+    impl InlineInputPanel {
+        #[unsafe(method(canBecomeKeyWindow))]
+        fn can_become_key_window(&self) -> bool { true }
+    }
+);
 
 define_class!(
     #[unsafe(super(NSObject))]
@@ -43,6 +61,10 @@ define_class!(
     struct StatusTarget;
 
     impl StatusTarget {
+        #[unsafe(method(saveLayoutNote:))]
+        fn save_layout_note(&self, _sender: Option<&AnyObject>) { self.finish_note(true); }
+        #[unsafe(method(cancelLayoutNote:))]
+        fn cancel_layout_note(&self, _sender: Option<&AnyObject>) { self.finish_note(false); }
         #[unsafe(method(toggleEnabled:))]
         fn toggle_enabled(&self, _sender: Option<&AnyObject>) {
             emit(BackendEvent::ToggleEnabled);
@@ -124,9 +146,21 @@ define_class!(
 );
 
 impl StatusTarget {
+    fn finish_note(&self, save: bool) {
+        let note = self.ivars().note.borrow_mut().take();
+        if let Some(note) = note {
+            let value = save.then(|| note.field.stringValue().to_string());
+            note.panel.close();
+            emit(BackendEvent::TextPromptResult {
+                id: note.id,
+                value: Ok(value),
+            });
+        }
+    }
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this: Allocated<Self> = mtm.alloc();
         let this = this.set_ivars(StatusTargetIvars {
+            note: RefCell::new(None),
             update_alert: RefCell::new(None),
             downloaded_update: RefCell::new(None),
         });
@@ -186,6 +220,99 @@ pub(super) fn prepare_application(mtm: MainThreadMarker) -> Result<(), String> {
 }
 
 impl StatusItem {
+    pub(super) fn cancel_text_prompt(&self, id: u64) {
+        if self
+            ._target
+            .ivars()
+            .note
+            .borrow()
+            .as_ref()
+            .is_some_and(|n| n.id == id)
+        {
+            self._target.finish_note(false);
+        }
+    }
+    pub(super) fn request_text_prompt(
+        &self,
+        request: crate::api::window_presets::TextPrompt,
+    ) -> Result<(), String> {
+        let target = &self._target;
+        target.finish_note(false);
+        let mtm = target.mtm();
+        let screens = super::screens::list_screens()?;
+        let primary = crate::api::Screen::primary(&screens).ok_or("No display for layout input")?;
+        let bounds = request.bounds;
+        let rect = NSRect::new(
+            NSPoint::new(bounds.x, primary.bounds.bottom() - bounds.bottom()),
+            NSSize::new(bounds.width, bounds.height),
+        );
+        let allocated = InlineInputPanel::alloc(mtm).set_ivars(());
+        // SAFETY: initializes this retained NSPanel subclass on the AppKit thread.
+        let panel: Retained<InlineInputPanel> = unsafe {
+            msg_send![super(allocated),
+            initWithContentRect: rect, styleMask: NSWindowStyleMask::Borderless,
+            backing: NSBackingStoreType::Buffered, defer: false]
+        };
+        if panel.isReleasedWhenClosed() {
+            return Err("Note panel has ambiguous ownership".into());
+        }
+        panel.setHidesOnDeactivate(false);
+        panel.setBecomesKeyOnlyIfNeeded(false);
+        panel.setTitle(&NSString::from_str(&request.title));
+        panel.setLevel(26);
+        panel.setHasShadow(false);
+        let content = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), rect.size),
+        );
+        let label =
+            NSTextField::wrappingLabelWithString(&NSString::from_str(&request.message), mtm);
+        label.setFrame(NSRect::new(
+            NSPoint::new(12.0, 62.0),
+            NSSize::new(bounds.width - 24.0, 28.0),
+        ));
+        content.addSubview(&label);
+        let field = NSTextField::textFieldWithString(&NSString::from_str(""), mtm);
+        field.setPlaceholderString(Some(&NSString::from_str(&request.placeholder)));
+        field.setFrame(NSRect::new(
+            NSPoint::new(12.0, 20.0),
+            NSSize::new((bounds.width - 204.0).max(40.0), 30.0),
+        ));
+        content.addSubview(&field);
+        for (title, selector, x, key) in [
+            ("Save", sel!(saveLayoutNote:), bounds.width - 180.0, "\r"),
+            (
+                "Cancel",
+                sel!(cancelLayoutNote:),
+                bounds.width - 90.0,
+                "\u{1b}",
+            ),
+        ] {
+            // SAFETY: selectors are implemented above and the retained status target
+            // outlives all buttons. AppKit retains no temporary Rust references.
+            let button = unsafe {
+                NSButton::buttonWithTitle_target_action(
+                    &NSString::from_str(title),
+                    Some(&**target),
+                    Some(selector),
+                    mtm,
+                )
+            };
+            button.setFrame(NSRect::new(NSPoint::new(x, 20.0), NSSize::new(86.0, 30.0)));
+            button.setKeyEquivalent(&NSString::from_str(key));
+            content.addSubview(&button);
+        }
+        panel.setContentView(Some(&content));
+        *target.ivars().note.borrow_mut() = Some(NotePanel {
+            id: request.id,
+            panel: Retained::into_super(panel.clone()),
+            field: field.clone(),
+        });
+        NSApplication::sharedApplication(mtm).activate();
+        panel.makeKeyAndOrderFront(None);
+        panel.makeFirstResponder(Some(&field));
+        Ok(())
+    }
     pub(super) fn new(mtm: MainThreadMarker, sender: EventSender) -> Self {
         *SENDER
             .get_or_init(|| Mutex::new(None))
@@ -528,6 +655,7 @@ fn status_icon(size: f64) -> Option<Retained<NSImage>> {
 
 impl Drop for StatusItem {
     fn drop(&mut self) {
+        self._target.finish_note(false);
         self._target.dismiss_update_alert();
         if let Some(mutex) = SENDER.get() {
             *mutex.lock().unwrap_or_else(|error| error.into_inner()) = None;

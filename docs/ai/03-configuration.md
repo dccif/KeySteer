@@ -1,5 +1,7 @@
 # 配置、按键和持久化
 
+Window 的 `exit_mode` 使用现有 LifecycleAction 解析，仅允许 `return` 或已注册的非 Window 模式。默认 `return` 恢复入口模式；modal 入口通过 PopMode 恢复原实例。默认 Q 绑定 `window_cancel`，在布局或列表中先返回一层，根层才退出；`window_exit` 直接退出。A/E 分别在根层进入快速／树编辑，均使用普通可重绑动作。
+
 ## 配置模型
 
 根类型是 `src/config/mod.rs::ConfigFile`（`Config` 暂为内部迁移别名）。所有主要 section 都有默认值，因此空配置或没有
@@ -42,11 +44,13 @@ Mode 的 cursor override 可单独覆盖这些值。普通反馈由物理按键�
 
 ## Window 配置边界
 
-`split_ratios` 是可混用分数字符串与小数的非空数组，允许乱序与重复，解析后排序去重，默认 `["1/4", "1/3", "1/2", "2/3", "3/4"]`。正整数分子与分母按 u32 解析，分子必须小于分母；等值分数与小数合为同一档位。数字必须有限且位于 (0, 1)。配置校验后，mode catalog 将其转换为 Settings 的数值数组，方向键只借用该缓存。它控制树编辑的分割线档位；初始二分仍为一半，空间导入与原生最小尺寸约束保持原语义。网页 `simulator/window-ratios.ts` 同步解析、校验并用 WeakMap 缓存，导出保留用户的分数／小数类型和书写顺序；排序去重只用于运行时缓存。
+布局收藏独立于 TOML：`window-layouts.kslayout` 使用与日志相同的目录规则（Windows/portable 在运行程序同目录，packaged macOS 在 Application Support）。格式为 `KSLAYOUT` magic、版本字节、布局数量、定长小整数/UTF-8 备注长度和先序区域树；分割比例按 little-endian f64 保存。读取限 1 MiB、99 个布局、每树 256 叶/深度 32、备注 80 字符，拒绝未知版本、重复编号、非法比例和尾随字节。写入前验证已有文件，再用同目录 create_new 临时文件、sync_all 和平台 atomic_replace；不在读取失败时覆盖旧文件。布局只保存几何、原窗口数量和备注，不保存应用或原生窗口身份。
 
-`config/window.rs` 保存 `[window]` DTO，`app/mode_catalog.rs` 转为 `modes/window::Settings`。绑定和 app overrides 经过统一别名规范化及继承校验；完整默认配置与嵌入默认值必须一致。Window 的操作键独立于 Normal，默认仅继承 hotkeys；Primary 通过既有 temporary route 借用 Normal。
+`split_ratios` 保留分数字符串／小数的解析、校验与原样导出兼容性，但不再传入 Mode Settings，也不影响树编辑。Ctrl＋方向与窗口缩放共用 `resize_step`（短按逻辑像素）和 `resize_speed`（长按逻辑像素／秒）；原生帧时钟驱动连续移动，Windows 按目标屏幕 DPI 换算。默认 `x = "window_remove_region"` 只在树编辑中可用。
 
-`layout_keys` 保留 12 个唯一小写 ASCII 字母/数字的解析兼容，但不再传入模式。`number_timeout_ms` 默认 250（100–2000ms），仅消歧数字前缀使用。布局方向按当前有效 Normal Move 绑定编译缓存，包含继承、应用覆盖和别名；`window_edit` 入口与方向冲突由配置检查提示。`double_tap_ms`、步长、速度、间距和描边有有限值/范围校验。`ui` 复用 LabelUi；border_color 同时影响目标描边。Tab 使用 `window_select` 直接循环并居中鼠标，不需要额外确认；窗口编号由有效库存生成。默认撤销键是 Z；仅 D 循环切屏，不绑定 Shift+D 或 Enter。所有布局即时生效，Esc 返回、Q 退出均保留结果。旧动作名保留自定义配置解析兼容。
+`config/window.rs` 保存 `[window]` DTO，`app/mode_catalog.rs` 转为 `modes/window::Settings`。绑定和 app overrides 经过统一别名规范化及继承校验；完整默认配置与嵌入默认值必须一致。Window 的离散操作键独立配置，移动/缩放及布局方向从有效 Normal Move 绑定编译；默认仅继承 hotkeys；Primary 通过既有 temporary route 借用 Normal。
+
+`layout_keys` 保留 12 个唯一小写 ASCII 字母/数字的解析兼容，但不再传入模式。`number_timeout_ms` 默认 250（100–2000ms），仅消歧数字前缀使用。布局方向按当前有效 Normal Move 绑定编译缓存，包含继承、应用覆盖和别名；`window_edit` 入口与方向冲突由配置检查提示。步长、速度、间距和描边有有限值/范围校验。`double_tap_ms` 仅保留旧文件解析兼容，不再传入 Mode，不维护 AA 状态／计时／优先级。`ui` 复用 LabelUi；border_color 同时影响目标描边。Tab 使用 `window_select` 直接循环并居中鼠标，不需要额外确认；窗口编号由有效库存生成。默认撤销键是 Z；仅 D 循环切屏，不绑定 Shift+D 或 Enter。所有布局即时生效，Esc 返回、Q 退出均保留结果。旧动作名保留自定义配置解析兼容。
 
 ## 加载与发现
 

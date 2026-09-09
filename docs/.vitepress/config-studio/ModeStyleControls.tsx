@@ -36,8 +36,8 @@ const fields: Record<TargetingMode, ModeFields> = {
     ],
     layout: [
       { path: 'window.enabled', label: '启用 Window', kind: 'boolean' },
+      { path: 'window.exit_mode', label: '退出窗口模式后', kind: 'select', options: ['return', 'normal', 'idle', 'grid', 'recursive_grid', 'ui_hint'] },
       { path: 'window.gap', label: '布局间距', kind: 'number', min: 0, max: 100, step: 1 },
-      { path: 'window.double_tap_ms', label: 'AA 间隔（毫秒）', kind: 'number', min: 100, max: 2000, step: 10 },
       { path: 'window.number_timeout_ms', label: '歧义编号等待（毫秒）', kind: 'number', min: 100, max: 2000, step: 10 },
       { path: 'window.move_step', label: '移动步长', kind: 'number', min: 0, max: 10000, step: 1 },
       { path: 'window.resize_step', label: '缩放步长', kind: 'number', min: 0, max: 10000, step: 1 },

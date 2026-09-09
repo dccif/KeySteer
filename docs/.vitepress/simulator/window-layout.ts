@@ -84,6 +84,28 @@ export function importTree(windows: LayoutWindow[], target: number | null, area:
   tree.selected = treeSlots(tree).find(s => target !== null && s.window === target)?.id ?? 1
   return tree
 }
+export function automaticTree(windows: LayoutWindow[], target: number | null, area: { width: number; height: number }, gap: number): LayoutTree | null {
+  if (!windows.length) return importTree(windows, target, area)
+  const count = windows.length
+  const columns = Array.from({ length: count }, (_, i) => i + 1)
+  const score = (cols: number) => Math.abs(Math.log((area.width / cols) / (area.height / Math.ceil(count / cols))))
+  columns.sort((a, b) => score(a) - score(b))
+  function row(start: number, end: number): LayoutNode {
+    if (end - start === 1) return { kind: 'slot', id: start + 1, window: windows[start].id }
+    const mid = start + Math.floor((end - start) / 2)
+    return { kind: 'split', axis: 'x', ratio: (mid - start) / (end - start), first: row(start, mid), second: row(mid, end) }
+  }
+  function grid(cols: number, start: number, end: number): LayoutNode {
+    if (end - start === 1) return row(start * cols, Math.min(end * cols, count))
+    const mid = start + Math.floor((end - start) / 2)
+    return { kind: 'split', axis: 'y', ratio: (mid - start) / (end - start), first: grid(cols, start, mid), second: grid(cols, mid, end) }
+  }
+  for (const cols of columns) {
+    const tree: LayoutTree = { root: grid(cols, 0, Math.ceil(count / cols)), selected: Math.max(1, windows.findIndex(w => w.id === target) + 1), nextSlot: count + 1 }
+    if (fitTree(tree, windows, area, gap)) return tree
+  }
+  return null
+}
 export function splitSlot(tree: LayoutTree, direction: LayoutDirection): boolean {
   if (treeSlots(tree).length >= 256) return false
   function split(node: LayoutNode): LayoutNode {
@@ -164,4 +186,30 @@ export function fitTree(tree: LayoutTree, windows: LayoutWindow[], area: { width
   if (measured.width > area.width + 1e-6 || measured.height > area.height + 1e-6) return false
   constrain(tree.root, measured, { x: 0, y: 0, ...area })
   return true
+}
+
+export function removeSlot(tree: LayoutTree): boolean {
+  let removed = false
+  function walk(node: LayoutNode): LayoutNode {
+    if (node.kind === 'slot') return node
+    if (node.first.kind === 'slot' && node.first.id === tree.selected) { removed = true; return node.second }
+    if (node.second.kind === 'slot' && node.second.id === tree.selected) { removed = true; return node.first }
+    return { ...node, first: walk(node.first), second: walk(node.second) }
+  }
+  tree.root = walk(tree.root)
+  if (removed) tree.selected = treeSlots(tree)[0].id
+  return removed
+}
+export function resizeSplitBy(tree: LayoutTree, direction: LayoutDirection, pixels: number, area: { width: number; height: number }): boolean {
+  function resize(node: LayoutNode, rect: WindowRect): boolean {
+    if (node.kind === 'slot') return false
+    const [a, b] = splitRect(rect, node.axis, node.ratio)
+    if (slotNode(node.first, tree.selected)) { if (resize(node.first, a)) return true }
+    else if (slotNode(node.second, tree.selected)) { if (resize(node.second, b)) return true }
+    else return false
+    if (node.axis !== axisOf(direction)) return false
+    node.ratio = clamp(node.ratio + (near(direction) ? -pixels : pixels) / Math.max(1, node.axis === 'x' ? rect.width : rect.height), 0, 1)
+    return true
+  }
+  return resize(tree.root, { x: 0, y: 0, ...area })
 }

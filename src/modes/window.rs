@@ -3,13 +3,14 @@ mod editing;
 mod interaction;
 mod inventory;
 mod numbering;
+mod presets;
 #[cfg(test)]
 mod tests;
 mod view;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::api::style::LabelUi;
 use crate::api::window::{
@@ -28,9 +29,8 @@ const INVENTORY_TIMER: &str = "window_inventory";
 
 #[derive(Clone, Debug)]
 pub struct Settings {
-    pub double_tap_ms: u64,
+    pub exit_mode: crate::api::lifecycle::LifecycleAction,
     pub number_timeout_ms: u64,
-    pub split_ratios: Vec<f64>,
     pub move_step: f64,
     pub move_speed: f64,
     pub resize_step: f64,
@@ -51,6 +51,7 @@ enum Finish {
     Commit,
     Cancel,
     QuickReset,
+    TreeReset,
     Tree,
     Select(WindowId),
     Cycle,
@@ -64,6 +65,8 @@ struct LiveEdit {
     model: EditModel,
     accepted: EditModel,
     history: Vec<EditModel>,
+    divider_gesture: bool,
+    entry_layout: bool,
     minimums: BTreeMap<WindowId, Point>,
     gap_scale: f64,
     ready: bool,
@@ -82,6 +85,12 @@ enum DeferredEdit {
 
 pub struct WindowMode {
     settings: Settings,
+    saved_layouts: Vec<crate::api::window_presets::SavedLayout>,
+    library_open: bool,
+    save_pending: bool,
+    library_page: usize,
+    library_index: NumberIndex,
+    pending_template: Option<crate::api::window_presets::SavedLayout>,
     session: u64,
     request: u64,
     result: u64,
@@ -106,15 +115,22 @@ pub struct WindowMode {
     size: bool,
     temporary: bool,
     held: BTreeMap<Key, W>,
-    last_layout: Option<Instant>,
     status: Option<String>,
     modal: bool,
+    previous: ModeId,
 }
 
 impl WindowMode {
     pub fn new(settings: Settings) -> Self {
         Self {
             settings,
+            previous: ModeId::normal(),
+            saved_layouts: Vec::new(),
+            library_open: false,
+            save_pending: false,
+            library_page: 0,
+            library_index: NumberIndex::default(),
+            pending_template: None,
             session: 0,
             request: 0,
             result: 0,
@@ -139,7 +155,6 @@ impl WindowMode {
             size: false,
             temporary: false,
             held: BTreeMap::new(),
-            last_layout: None,
             status: None,
             modal: false,
         }
@@ -158,6 +173,9 @@ impl WindowMode {
     }
 
     fn stop_movement(&mut self, out: &mut CommandBatch) {
+        if let Some(edit) = &mut self.edit {
+            edit.divider_gesture = false;
+        }
         if !self.held.is_empty() {
             self.held.clear();
             out.push(Command::SetFrameClock(false));
@@ -218,7 +236,16 @@ impl WindowMode {
             _ => 0,
         };
         if slots != self.numbered_slots {
-            self.slot_index = NumberIndex::new(1..=slots);
+            self.slot_index = NumberIndex::new(self.edit.as_ref().into_iter().flat_map(|edit| {
+                if let EditModel::Tree(tree) = &edit.model {
+                    tree.slots()
+                        .into_iter()
+                        .map(|slot| slot.id)
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                }
+            }));
             self.numbered_slots = slots;
         }
     }
@@ -236,7 +263,11 @@ impl WindowMode {
         }
     }
 
-    fn motion(&mut self, seconds: Option<f64>, out: &mut CommandBatch) {
+    fn motion(&mut self, seconds: Option<f64>, ctx: &HostContext<'_>, out: &mut CommandBatch) {
+        if self.edit.is_some() {
+            self.divider_motion(seconds, ctx, out);
+            return;
+        }
         if self.temporary || self.edit.is_some() || self.held.is_empty() {
             return;
         }
@@ -281,17 +312,19 @@ impl WindowMode {
 
     fn exit(&mut self, out: &mut CommandBatch) {
         self.stop_movement(out);
-        self.last_layout = None;
         self.cancel_number(out);
         out.push(Command::CancelTimer {
             id: INVENTORY_TIMER.into(),
         });
         out.push(Command::CancelWindowSession(self.session));
         out.push(Command::HideOverlay);
-        out.push(if self.modal {
-            Command::PopMode
-        } else {
-            Command::SwitchMode(ModeId::normal())
+        out.push(match &self.settings.exit_mode {
+            crate::api::lifecycle::LifecycleAction::Return if self.modal => Command::PopMode,
+            crate::api::lifecycle::LifecycleAction::Return => {
+                Command::SwitchMode(self.previous.clone())
+            }
+            crate::api::lifecycle::LifecycleAction::Mode(mode) => Command::SwitchMode(mode.clone()),
+            _ => Command::SwitchMode(ModeId::normal()), // rejected by configuration validation
         });
     }
 
@@ -317,17 +350,24 @@ impl Mode for WindowMode {
     fn window_layout_active(&self) -> bool {
         self.edit.is_some() && !self.temporary
     }
-    fn window_layout_double_tap(&self) -> bool {
-        matches!(
-            self.edit.as_ref().map(|e| &e.model),
-            Some(EditModel::Quick(_))
-        ) && self.last_layout.is_some_and(|last| {
-            last.elapsed() <= Duration::from_millis(self.settings.double_tap_ms)
-        })
-    }
     fn window_action_available(&self, action: &W) -> bool {
+        if self.library_open {
+            return matches!(action, W::SavedLayouts | W::Cancel | W::Exit | W::Confirm);
+        }
+        if *action == W::SavedLayouts {
+            return true;
+        }
+        if *action == W::SaveLayout {
+            return self
+                .edit
+                .as_ref()
+                .is_some_and(|e| e.ready && matches!(e.model, EditModel::Tree(_)));
+        }
         match self.edit.as_ref().map(|e| &e.model) {
-            None => !matches!(action, W::Navigate(_) | W::Split(_) | W::Ratio(_) | W::Edit),
+            None => !matches!(
+                action,
+                W::Navigate(_) | W::Split(_) | W::Ratio(_) | W::RemoveRegion
+            ),
             Some(EditModel::Quick(_)) => matches!(
                 action,
                 W::Navigate(_)
@@ -343,6 +383,7 @@ impl Mode for WindowMode {
             Some(EditModel::Tree(_)) => matches!(
                 action,
                 W::Navigate(_)
+                    | W::RemoveRegion
                     | W::Split(_)
                     | W::Ratio(_)
                     | W::Select
@@ -358,10 +399,13 @@ impl Mode for WindowMode {
         Some(self.detail())
     }
     fn help_anchor(&self) -> Option<Rect> {
+        if self.library_open {
+            return None;
+        }
         self.target.as_ref().map(|w| w.bounds)
     }
     fn help_previews(&self) -> Vec<(String, String, Rect, bool)> {
-        if self.temporary {
+        if self.temporary || self.library_open {
             return Vec::new();
         }
         match self.edit.as_ref().map(|e| &e.model) {
@@ -372,39 +416,55 @@ impl Mode for WindowMode {
         }
     }
     fn claims_key(&self, key: &Key) -> bool {
+        if self.library_open {
+            return !self.temporary
+                && (key.as_char().is_some_and(|c| c.is_ascii_digit())
+                    || matches!(key.as_str(), "page_up" | "page_down"));
+        }
         !self.temporary
-            && key.as_char().is_some_and(|c| {
-                c.is_ascii_digit()
-                    || c == '`'
-                        && matches!(
-                            self.edit.as_ref().map(|e| &e.model),
-                            Some(EditModel::Tree(_))
-                        )
-            })
+            && key
+                .as_char()
+                .is_some_and(|c| c.is_ascii_digit() || c == '`')
     }
     fn available_keys(&self) -> Vec<(String, String)> {
+        if self.library_open {
+            let mut keys = Vec::new();
+            if self.library_page > 0 {
+                keys.push(("PageUp".into(), "Previous page".into()));
+            }
+            if (self.library_page + 1) * presets::PAGE_SIZE < self.saved_layouts.len() {
+                keys.push(("PageDown".into(), "Next page".into()));
+            }
+            return keys;
+        }
         let mut keys: Vec<_> = ('1'..='9')
             .map(|c| (c.to_string(), "Window number".into()))
             .collect();
-        if matches!(
-            self.edit.as_ref().map(|e| &e.model),
-            Some(EditModel::Tree(_))
-        ) {
-            keys.push(("`".into(), "Area number".into()));
-        }
+        keys.push(("`".into(), "Area number".into()));
         keys
     }
     fn handle_owned(&mut self, event: ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
         match event {
             ModeEvent::WindowResult(result) => self.window_result(*result, ctx),
+            ModeEvent::WindowLayouts(result) => self.library_result(*result, ctx),
             other => self.handle(&other, ctx),
         }
     }
     fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
+        if let Some(out) = self.library_event(event, ctx) {
+            return out;
+        }
         let mut out = CommandBatch::new();
         let mut redraw = true;
         match event {
             ModeEvent::Activated { .. } | ModeEvent::Pushed { .. } | ModeEvent::Restarted => {
+                match event {
+                    ModeEvent::Activated { previous } => {
+                        self.previous = previous.clone().unwrap_or_else(ModeId::normal)
+                    }
+                    ModeEvent::Pushed { previous } => self.previous = previous.clone(),
+                    _ => {}
+                }
                 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
                 if self.session != 0 {
                     out.push(Command::CancelWindowSession(self.session));
@@ -415,11 +475,13 @@ impl Mode for WindowMode {
                 self.request = 0;
                 self.result = 0;
                 self.group = 0;
+                self.library_open = false;
+                self.save_pending = false;
+                self.pending_template = None;
                 self.size = false;
                 self.temporary = false;
                 self.held.clear();
                 self.target = None;
-                self.last_layout = None;
                 self.edit = None;
                 self.inventory.clear();
                 self.visible.clear();
@@ -460,7 +522,6 @@ impl Mode for WindowMode {
                 self.numbers.clear();
                 self.status = None;
                 self.target = None;
-                self.last_layout = None;
                 self.edit = None;
                 self.inventory.clear();
                 self.visible.clear();
@@ -474,7 +535,6 @@ impl Mode for WindowMode {
             }
             ModeEvent::Suspended => {
                 self.stop_movement(&mut out);
-                self.last_layout = None;
             }
             ModeEvent::Resumed => {}
             ModeEvent::TemporaryModeChanged { active } => {
@@ -487,14 +547,17 @@ impl Mode for WindowMode {
                     });
                 }
                 self.temporary = *active;
-                self.last_layout = None;
                 self.stop_movement(&mut out);
                 if !active {
                     self.flush_edit(&mut out);
-                    if self
-                        .number
-                        .needs_timer(&self.window_index, &self.slot_index)
-                    {
+                    if self.number.needs_timer(
+                        if self.library_open {
+                            &self.library_index
+                        } else {
+                            &self.window_index
+                        },
+                        &self.slot_index,
+                    ) {
                         out.push(Command::SetTimer {
                             id: NUMBER_TIMER.into(),
                             delay: Duration::from_millis(self.settings.number_timeout_ms),
@@ -504,6 +567,9 @@ impl Mode for WindowMode {
                 }
             }
             ModeEvent::WindowResult(result) => return self.window_result((**result).clone(), ctx),
+            ModeEvent::WindowLayouts(result) => {
+                return self.library_result((**result).clone(), ctx);
+            }
             ModeEvent::Binding {
                 binding,
                 state,
@@ -524,19 +590,31 @@ impl Mode for WindowMode {
                 repeat: false,
             } if !self.temporary => {
                 if let Some(c) = key.as_char() {
-                    if c == '`'
-                        && matches!(
-                            self.edit.as_ref().map(|e| &e.model),
-                            Some(EditModel::Tree(_))
-                        )
-                    {
+                    if c == '`' {
                         self.cancel_number(&mut out);
-                        self.number.slot = true;
-                        self.last_layout = None;
+                        if self
+                            .edit
+                            .as_ref()
+                            .is_some_and(|edit| matches!(edit.model, EditModel::Quick(_)))
+                        {
+                            self.finish_edit(Finish::Tree, &mut out);
+                        } else if self.edit.is_none() {
+                            self.start_edit(true, ctx, &mut out);
+                        }
+                        if self.edit.is_some() {
+                            self.number.begin_slot();
+                        }
                     } else if c.is_ascii_digit() {
-                        self.last_layout = None;
                         self.status = None;
-                        let completed = self.number.digit(c, &self.window_index, &self.slot_index);
+                        let completed = if self.number.slot
+                            && !self.edit.as_ref().is_some_and(|edit| {
+                                edit.ready && matches!(edit.model, EditModel::Tree(_))
+                            }) {
+                            self.number.queue_digit(c);
+                            smallvec::SmallVec::new()
+                        } else {
+                            self.number.digit(c, &self.window_index, &self.slot_index)
+                        };
                         for (slot, number) in completed {
                             self.choose_number(slot, number, ctx, &mut out);
                         }
@@ -555,7 +633,6 @@ impl Mode for WindowMode {
                             });
                         }
                     } else {
-                        self.last_layout = None;
                         self.cancel_number(&mut out);
                         self.swap_source = None;
                     }
@@ -575,12 +652,11 @@ impl Mode for WindowMode {
                 redraw = false;
             }
             ModeEvent::Frame { elapsed } => {
-                self.motion(Some(elapsed.as_secs_f64().min(0.1)), &mut out);
+                self.motion(Some(elapsed.as_secs_f64().min(0.1)), ctx, &mut out);
                 redraw = false;
             }
             ModeEvent::ScreensChanged(_) => {
                 self.stop_movement(&mut out);
-                self.last_layout = None;
                 if self.edit.is_some() {
                     self.finish_edit(Finish::Cancel, &mut out);
                 } else {
@@ -597,7 +673,7 @@ impl Mode for WindowMode {
         {
             return out;
         }
-        if redraw {
+        if redraw && !out.iter().any(|c| matches!(c, Command::WindowLayouts(_))) {
             out.push(ctx.present(self.view()));
         }
         out

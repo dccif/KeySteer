@@ -33,6 +33,7 @@ impl NumberIndex {
 pub(super) struct NumberInput {
     pub prefix: String,
     pub slot: bool,
+    pub display: String,
 }
 
 impl Default for NumberInput {
@@ -41,6 +42,7 @@ impl Default for NumberInput {
         Self {
             prefix: String::with_capacity(10),
             slot: false,
+            display: String::with_capacity(11),
         }
     }
 }
@@ -54,6 +56,7 @@ impl NumberInput {
         let pending = self.pending();
         self.prefix.clear();
         self.slot = false;
+        self.display.clear();
         pending
     }
 
@@ -64,8 +67,31 @@ impl NumberInput {
             .get(&self.prefix)
             .and_then(|p| p.exact)
             .map(|n| (self.slot, n));
-        self.cancel();
+        self.prefix.clear();
+        self.slot = false;
         result
+    }
+
+    pub fn begin_slot(&mut self) {
+        self.cancel();
+        self.slot = true;
+        self.display.push('`');
+    }
+
+    pub fn queue_digit(&mut self, digit: char) {
+        if self.prefix.len() == 10 {
+            self.prefix.clear();
+        }
+        self.prefix.push(digit);
+        self.update_display();
+    }
+
+    fn update_display(&mut self) {
+        self.display.clear();
+        if self.slot {
+            self.display.push('`');
+        }
+        self.display.push_str(&self.prefix);
     }
 
     pub fn digit(
@@ -85,6 +111,7 @@ impl NumberInput {
             }
             self.prefix.push(digit);
         }
+        self.update_display();
         let index = if self.slot { slots } else { windows };
         match index.0.get(&self.prefix) {
             Some(prefix) if !prefix.longer => {

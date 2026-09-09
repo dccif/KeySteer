@@ -54,6 +54,7 @@ pub enum FinishCause {
 pub enum Command {
     WindowRequest(Box<super::window::WindowRequest>),
     CancelWindowSession(u64),
+    WindowLayouts(Box<super::window_presets::LayoutLibraryRequest>),
     /// Move the window and physical pointer together, preserving relative position.
     MoveWindowToScreen(WindowScreenTarget),
     /// Dispatch high-level actions through the same path used by config.
@@ -436,6 +437,7 @@ impl<'a> IntoIterator for &'a CommandBatch {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModeEvent {
     WindowResult(Box<super::window::WindowResult>),
+    WindowLayouts(Box<super::window_presets::LayoutLibraryResult>),
     /// Temporary binding inheritance started/stopped without suspending the mode.
     TemporaryModeChanged {
         active: bool,
@@ -737,11 +739,6 @@ pub trait Mode: Send {
     /// Whether the host should route compiled Normal movement as discrete
     /// window-layout directions. This does not activate temporary Normal.
     fn window_layout_active(&self) -> bool {
-        false
-    }
-
-    /// Only the layout entry binding needs the AA deadline check.
-    fn window_layout_double_tap(&self) -> bool {
         false
     }
 

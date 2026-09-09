@@ -42,6 +42,8 @@ fn active_config(engine: &Engine) -> Config {
 /// Records what the engine asked of the platform.
 #[derive(Default)]
 struct Recorder {
+    text_prompts: Vec<crate::api::window_presets::TextPrompt>,
+    cancelled_text_prompts: Vec<u64>,
     window_requests: Vec<crate::api::window::WindowRequest>,
     cancelled_window_sessions: Vec<u64>,
     character_bindings: Vec<Vec<String>>,
@@ -106,6 +108,16 @@ impl FakeBackend {
 }
 
 impl Backend for FakeBackend {
+    fn request_text_prompt(
+        &mut self,
+        prompt: crate::api::window_presets::TextPrompt,
+    ) -> Result<(), String> {
+        self.log.lock().unwrap().text_prompts.push(prompt);
+        Ok(())
+    }
+    fn cancel_text_prompt(&mut self, id: u64) {
+        self.log.lock().unwrap().cancelled_text_prompts.push(id);
+    }
     fn request_window(&mut self, request: crate::api::window::WindowRequest) -> Result<(), String> {
         let mut log = self.log.lock().unwrap();
         log.timeline.push("window");
@@ -321,6 +333,7 @@ impl Mode for ProbeMode {
             ModeEvent::PointerMoved(_) => "pointer",
             ModeEvent::Frame { .. } => "frame",
             ModeEvent::FocusChanged(_) => "focus",
+            ModeEvent::WindowLayouts(_) => "window-layouts",
             ModeEvent::WindowResult(_) => "window",
             ModeEvent::TemporaryModeChanged { .. } => "temporary",
         };

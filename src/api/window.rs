@@ -52,6 +52,9 @@ pub enum WindowAction {
     Center,
     Select,
     Undo,
+    RemoveRegion,
+    SavedLayouts,
+    SaveLayout,
     Confirm,
     Cancel,
     Exit,
@@ -59,7 +62,10 @@ pub enum WindowAction {
 
 impl WindowAction {
     pub const fn is_held(self) -> bool {
-        matches!(self, Self::Left | Self::Down | Self::Up | Self::Right)
+        matches!(
+            self,
+            Self::Left | Self::Down | Self::Up | Self::Right | Self::Ratio(_)
+        )
     }
 
     pub const fn name(self) -> &'static str {
@@ -90,6 +96,9 @@ impl WindowAction {
             Self::Center => "window_center",
             Self::Select => "window_select",
             Self::Undo => "window_undo",
+            Self::RemoveRegion => "window_remove_region",
+            Self::SavedLayouts => "window_saved_layouts",
+            Self::SaveLayout => "window_save_layout",
             Self::Confirm => "window_confirm",
             Self::Cancel => "window_cancel",
             Self::Exit => "window_exit",
@@ -124,6 +133,9 @@ impl WindowAction {
             Self::Center,
             Self::Select,
             Self::Undo,
+            Self::RemoveRegion,
+            Self::SavedLayouts,
+            Self::SaveLayout,
             Self::Confirm,
             Self::Cancel,
             Self::Exit,

@@ -5,20 +5,27 @@ use crate::api::window_layout::placed_rect;
 
 impl WindowMode {
     pub(super) fn start_edit(&mut self, tree: bool, ctx: &HostContext<'_>, out: &mut CommandBatch) {
-        let Some(target) = &self.target else {
+        let target = self.target.as_ref();
+        if target.is_none() && !(tree && self.pending_template.is_some()) {
             self.status = Some("Select a window first".into());
             return;
-        };
-        self.screen = target.screen;
+        }
+        if let Some(target) = target {
+            self.screen = target.screen;
+        }
         let Some(screen) = ctx.screens.get(self.screen) else {
             return;
         };
-        if !tree && (!target.resizable || target.fullscreen) {
+        if !tree && target.is_some_and(|target| !target.resizable || target.fullscreen) {
             self.status = Some("This window cannot be resized".into());
             return;
         }
         // Build once, from the worker's fresh inventory and constraints.
-        let targets = if tree { Vec::new() } else { vec![target.id] };
+        let targets = if tree {
+            Vec::new()
+        } else {
+            target.map(|target| vec![target.id]).unwrap_or_default()
+        };
         let model = if tree {
             EditModel::Tree(LayoutTree::import(&[], None, screen.work_area))
         } else {
@@ -32,6 +39,8 @@ impl WindowMode {
             accepted: model.clone(),
             model,
             history: Vec::new(),
+            divider_gesture: false,
+            entry_layout: tree,
             minimums: BTreeMap::new(),
             gap_scale: 1.0,
             ready: false,
@@ -97,14 +106,16 @@ impl WindowMode {
             edit.ending = true;
             let operation = WindowOperation::EndEdit {
                 transaction: edit.transaction,
-                commit: !matches!(finish, Finish::Cancel | Finish::QuickReset),
+                commit: !matches!(
+                    finish,
+                    Finish::Cancel | Finish::QuickReset | Finish::TreeReset
+                ),
             };
             self.request(operation, out);
         }
     }
 
     pub(super) fn finish_edit(&mut self, finish: Finish, out: &mut CommandBatch) {
-        self.last_layout = None;
         self.cancel_number(out);
         self.swap_source = None;
         if let Some(edit) = &mut self.edit {
@@ -112,7 +123,10 @@ impl WindowMode {
                 return;
             }
             edit.finishing = Some(finish);
-            if matches!(finish, Finish::Cancel | Finish::QuickReset) {
+            if matches!(
+                finish,
+                Finish::Cancel | Finish::QuickReset | Finish::TreeReset
+            ) {
                 edit.ending = true;
                 edit.dirty = false;
                 edit.in_flight = None;
@@ -152,7 +166,6 @@ impl WindowMode {
         ctx: &HostContext<'_>,
         out: &mut CommandBatch,
     ) {
-        self.last_layout = None;
         self.swap_source = None;
         self.cancel_number(out);
         let Some(edit) = &mut self.edit else { return };
@@ -178,7 +191,13 @@ impl WindowMode {
                 if split {
                     tree.split(direction);
                 } else if ratio {
-                    tree.resize(direction, &self.settings.split_ratios);
+                    if let Some(screen) = ctx.screens.get(edit.screen) {
+                        tree.resize_by(
+                            direction,
+                            self.settings.resize_step * edit.gap_scale,
+                            screen.work_area,
+                        );
+                    }
                 } else {
                     tree.navigate(direction);
                     return;
@@ -196,7 +215,7 @@ impl WindowMode {
                 }
             }
         }
-        if edit.model != before {
+        if edit.model != before && (split || ratio || matches!(edit.model, EditModel::Quick(_))) {
             if edit.history.len() == 32 {
                 edit.history.remove(0);
             }
@@ -207,6 +226,129 @@ impl WindowMode {
         self.rebuild_numbers();
     }
 
+    pub(super) fn divider_motion(
+        &mut self,
+        seconds: Option<f64>,
+        ctx: &HostContext<'_>,
+        out: &mut CommandBatch,
+    ) {
+        if self.temporary || self.held.is_empty() {
+            return;
+        }
+        let Some(edit) = &mut self.edit else { return };
+        if !edit.ready || edit.finishing.is_some() {
+            return;
+        }
+        let Some(screen) = ctx.screens.get(edit.screen) else {
+            return;
+        };
+        let EditModel::Tree(tree) = &mut edit.model else {
+            return;
+        };
+        let before = tree.clone();
+        let amount = seconds.map_or(self.settings.resize_step, |s| {
+            s * self.settings.resize_speed
+        }) * edit.gap_scale;
+        let mut dx: f64 = 0.0;
+        let mut dy: f64 = 0.0;
+        for action in self.held.values() {
+            if let W::Ratio(direction) = action {
+                let (x, y) = direction.delta();
+                dx += x;
+                dy += y;
+            }
+        }
+        let mut found = false;
+        if dx != 0.0 {
+            found |= tree.resize_by(
+                if dx < 0.0 {
+                    Direction::Left
+                } else {
+                    Direction::Right
+                },
+                amount,
+                screen.work_area,
+            );
+        }
+        if dy != 0.0 {
+            found |= tree.resize_by(
+                if dy < 0.0 {
+                    Direction::Up
+                } else {
+                    Direction::Down
+                },
+                amount,
+                screen.work_area,
+            );
+        }
+        if let Err(error) = tree.fit(
+            &edit.minimums,
+            screen.work_area,
+            self.settings.gap * edit.gap_scale,
+        ) {
+            *tree = before;
+            self.status = Some(error);
+            return;
+        }
+        if *tree == before {
+            if dx != 0.0 || dy != 0.0 {
+                self.status = Some(
+                    if found {
+                        "Divider reached the minimum-size limit"
+                    } else {
+                        "No divider in this direction"
+                    }
+                    .into(),
+                );
+            }
+            return;
+        }
+        if !edit.divider_gesture {
+            if edit.history.len() == 32 {
+                edit.history.remove(0);
+            }
+            edit.history.push(EditModel::Tree(before));
+            edit.divider_gesture = true;
+        }
+        self.status = None;
+        edit.dirty = true;
+        self.flush_edit(out);
+    }
+
+    pub(super) fn remove_region(&mut self, ctx: &HostContext<'_>, out: &mut CommandBatch) {
+        let Some(edit) = &mut self.edit else { return };
+        if !edit.ready || edit.finishing.is_some() {
+            return;
+        }
+        let EditModel::Tree(tree) = &mut edit.model else {
+            return;
+        };
+        let before = tree.clone();
+        if !tree.remove_selected() {
+            self.status = Some("Keep at least one region".into());
+            return;
+        }
+        if let Some(screen) = ctx.screens.get(edit.screen)
+            && let Err(error) = tree.fit(
+                &edit.minimums,
+                screen.work_area,
+                self.settings.gap * edit.gap_scale,
+            )
+        {
+            *tree = before;
+            self.status = Some(error);
+            return;
+        }
+        if edit.history.len() == 32 {
+            edit.history.remove(0);
+        }
+        edit.history.push(EditModel::Tree(before));
+        edit.dirty = true;
+        self.numbered_slots = 0;
+        self.rebuild_numbers();
+        self.flush_edit(out);
+    }
+
     pub(super) fn choose_number(
         &mut self,
         slot: bool,
@@ -214,7 +356,6 @@ impl WindowMode {
         ctx: &HostContext<'_>,
         out: &mut CommandBatch,
     ) {
-        self.last_layout = None;
         let id = self
             .visible_windows()
             .find(|w| self.numbers.get(&w.id) == Some(&number))
@@ -236,8 +377,25 @@ impl WindowMode {
                 if let Some(source) = self.swap_source.take() {
                     tree.move_window(source, number)
                 } else {
-                    tree.focus_slot(number);
-                    false
+                    if !tree.focus_slot(number) {
+                        return;
+                    }
+                    let selected = tree.slots().into_iter().find(|region| region.id == number);
+                    if let Some(region) = selected {
+                        if let Some(id) = region.window {
+                            self.request(WindowOperation::Select(id), out);
+                        } else if let Some(screen) = ctx.screens.get(edit.screen) {
+                            out.push(Command::warp_to(
+                                placed_rect(
+                                    screen.work_area,
+                                    region.rect,
+                                    self.settings.gap * edit.gap_scale,
+                                )
+                                .center(),
+                            ));
+                        }
+                    }
+                    return;
                 }
             } else if let Some(id) = id {
                 if let Some(source) = self.swap_source.take() {
@@ -300,7 +458,32 @@ impl WindowMode {
                 gap_scale,
                 ..
             } => {
-                let fresh = if self
+                let saved = if self
+                    .edit
+                    .as_ref()
+                    .is_some_and(|e| matches!(e.model, EditModel::Tree(_)))
+                {
+                    self.pending_template.take()
+                } else {
+                    None
+                };
+                let fresh = if let Some(saved) = &saved {
+                    // BeginEdit minimums preserve the backend's fresh front-to-back
+                    // activity order; stable on-screen numbers do not change it.
+                    let windows: Vec<_> = minimums
+                        .iter()
+                        .filter_map(|(id, _)| self.inventory.get(id))
+                        .filter(|w| w.screen == self.screen)
+                        .cloned()
+                        .collect();
+                    match saved.regions.instantiate(&windows) {
+                        Ok(tree) => Some(tree),
+                        Err(error) => {
+                            self.status = Some(error);
+                            None
+                        }
+                    }
+                } else if self
                     .edit
                     .as_ref()
                     .is_some_and(|e| matches!(e.model, EditModel::Tree(_)))
@@ -335,11 +518,20 @@ impl WindowMode {
                             }
                         }
                         cached.unwrap_or_else(|| {
-                            LayoutTree::import(
+                            LayoutTree::automatic(
                                 &windows,
                                 self.target.as_ref().map(|w| w.id),
                                 screen.work_area,
+                                &minimums.iter().copied().collect(),
+                                self.settings.gap * *gap_scale,
                             )
+                            .unwrap_or_else(|_| {
+                                LayoutTree::import(
+                                    &windows,
+                                    self.target.as_ref().map(|w| w.id),
+                                    screen.work_area,
+                                )
+                            })
                         })
                     })
                 } else {
@@ -368,21 +560,21 @@ impl WindowMode {
                                 self.settings.gap * edit.gap_scale,
                             )
                         });
-                    if let Err(error) = fit {
-                        self.status = Some(error);
-                        self.finish_edit(Finish::Cancel, out);
-                        return;
-                    }
+                    let fit_error = fit.err();
                     edit.accepted = edit.model.clone();
-                    edit.dirty = true;
+                    edit.entry_layout &= fit_error.is_none();
+                    edit.dirty = edit.entry_layout;
                     let excluded = self
                         .inventory
                         .values()
                         .filter(|w| w.screen == self.screen && (!w.resizable || w.fullscreen))
                         .count();
-                    self.status = (excluded > 0).then(|| {
+                    self.status =
+                        fit_error.or_else(|| {
+                            (excluded > 0).then(|| {
                         format!("{excluded} fixed-size/fullscreen windows remain outside the tree")
-                    });
+                    })
+                        });
                 }
                 let deferred = std::mem::take(&mut edit.deferred);
                 let finishing = edit.finishing.take();
@@ -398,6 +590,23 @@ impl WindowMode {
                 }
                 if let Some(edit) = &mut self.edit {
                     edit.finishing = finishing;
+                }
+                self.rebuild_numbers();
+                if self.number.slot && !self.number.prefix.is_empty() {
+                    if self
+                        .number
+                        .needs_timer(&self.window_index, &self.slot_index)
+                    {
+                        out.push(Command::SetTimer {
+                            id: NUMBER_TIMER.into(),
+                            delay: Duration::from_millis(self.settings.number_timeout_ms),
+                            repeating: false,
+                        });
+                    } else if let Some((slot, number)) =
+                        self.number.finish(&self.window_index, &self.slot_index)
+                    {
+                        self.choose_number(slot, number, ctx, out);
+                    }
                 }
                 self.flush_edit(out);
             }
@@ -427,11 +636,9 @@ impl WindowMode {
                     if !minimums.is_empty() {
                         edit.minimums = minimums.iter().copied().collect();
                     }
-                    if *revision == 1 && matches!(edit.model, EditModel::Tree(_)) {
-                        self.finish_edit(Finish::Cancel, out);
-                        return;
-                    }
+                    self.numbered_slots = 0;
                 }
+                self.rebuild_numbers();
                 self.flush_edit(out);
             }
             WindowEditResult::Ended {
@@ -466,6 +673,12 @@ impl WindowMode {
                 match finish {
                     Finish::Tree => self.start_edit(true, ctx, out),
                     Finish::QuickReset => self.start_edit(false, ctx, out),
+                    Finish::TreeReset => {
+                        self.start_edit(true, ctx, out);
+                        if let Some(edit) = &mut self.edit {
+                            edit.entry_layout = false;
+                        }
+                    }
                     Finish::Select(id) => {
                         self.resume_quick = true;
                         self.request(WindowOperation::Select(id), out);

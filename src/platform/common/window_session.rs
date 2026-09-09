@@ -746,15 +746,23 @@ impl Session {
                             actual.push(after);
                         }
                         Ok(after) => {
-                            observed_minimum = Some((
+                            // An unchanged or still-maximized frame is not evidence
+                            // of an application's minimum size (restore may lag).
+                            observed_minimum = (!after.maximized).then_some((
                                 after.id,
                                 Point::new(
-                                    if after.bounds.width > requested.width + 1.5 {
+                                    if after.bounds.width > requested.width + 1.5
+                                        && (after.bounds.width - before.info.bounds.width).abs()
+                                            > 1.5
+                                    {
                                         after.bounds.width
                                     } else {
                                         0.0
                                     },
-                                    if after.bounds.height > requested.height + 1.5 {
+                                    if after.bounds.height > requested.height + 1.5
+                                        && (after.bounds.height - before.info.bounds.height).abs()
+                                            > 1.5
+                                    {
                                         after.bounds.height
                                     } else {
                                         0.0
@@ -1187,6 +1195,7 @@ mod tests {
         reject: Option<WindowId>,
         partial: bool,
         refuse_focus: bool,
+        unchanged_ack: bool,
         minimum: Point,
         minimum_queries: std::cell::Cell<usize>,
         closed: Vec<WindowId>,
@@ -1239,6 +1248,7 @@ mod tests {
                 reject: None,
                 partial: false,
                 refuse_focus: false,
+                unchanged_ack: false,
                 minimum: Point::new(100.0, 80.0),
                 minimum_queries: std::cell::Cell::new(0),
                 closed: Vec::new(),
@@ -1273,6 +1283,9 @@ mod tests {
             cancelled: &dyn Fn() -> bool,
         ) -> Result<WindowInfo, String> {
             if cancelled() {
+                return self.snapshot(id, screens).map(|s| s.info);
+            }
+            if self.unchanged_ack {
                 return self.snapshot(id, screens).map(|s| s.info);
             }
             if self.reject != Some(id) || self.partial {
@@ -1502,6 +1515,26 @@ mod tests {
         for (id, before) in originals {
             assert_eq!(access.windows[&id].info, before.info);
             assert_eq!(access.windows[&id].restored, before.restored);
+        }
+    }
+
+    #[test]
+    fn unchanged_acknowledgements_never_poison_minimum_sizes() {
+        for maximized in [false, true] {
+            let mut access = Fake::new(2);
+            access.windows.get_mut(&WindowId(1)).unwrap().info.maximized = maximized;
+            let mut session = Session::default();
+            begin_edit(&mut session, &mut access);
+            access.unchanged_ack = true;
+            let result = run(&mut session, &mut access, batch(1, 0.15));
+            assert!(matches!(
+                result.edit.as_deref(),
+                Some(WindowEditResult::Applied {
+                    accepted: false,
+                    ..
+                })
+            ));
+            assert_eq!(session.minimums[&WindowId(1)], Point::new(100.0, 80.0));
         }
     }
 

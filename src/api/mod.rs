@@ -23,6 +23,7 @@ pub mod style;
 pub mod theme;
 pub mod window;
 pub mod window_layout;
+pub mod window_presets;
 
 pub use autostart::Autostart;
 pub use backend::{

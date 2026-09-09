@@ -1,7 +1,8 @@
 import type { SimulatorMode, SimulatorState } from './state'
-import { fitTree, importTree, layoutRect, moveToSlot, navigateSlot, quickCaption, quickRect, quickStep, resizeSplit, retainTreeWindows, splitSlot, treeSlots } from './window-layout.ts'
+import { automaticTree, fitTree, importTree, layoutRect, moveToSlot, navigateSlot, quickCaption, quickRect, quickStep, resizeSplitBy, removeSlot, retainTreeWindows, splitSlot, treeSlots } from './window-layout.ts'
 import type { LayoutDirection, LayoutTree, QuickPlacement } from './window-layout.ts'
-import { parseSplitRatios } from './window-ratios.ts'
+import { instantiateLayout, regionTemplate, savedLayoutName } from './window-presets.ts'
+import type { SavedWindowLayout } from './window-presets.ts'
 
 export interface WindowRect { x: number; y: number; width: number; height: number }
 export interface DemoWindow extends WindowRect {
@@ -16,6 +17,14 @@ export interface DemoWindow extends WindowRect {
   fullscreen?: boolean
 }
 export interface WindowState {
+  presets: SavedWindowLayout[]
+  library: boolean
+  libraryPage: number
+  libraryIndex: Map<string, { exact?: number; longer: boolean }>
+  noteOpen: boolean
+  editingPresetId: number | null
+  savedEditSnapshot: string
+  recent: number[]
   windows: DemoWindow[]
   target: number | null
   screen: number
@@ -29,6 +38,7 @@ export interface WindowState {
   editHistory: Array<{ quick: QuickPlacement; tree: LayoutTree | null; windows: DemoWindow[] }>
   numbers: Record<number, number>
   nextNumber: number
+  numberDisplay: string
   numberPrefix: string
   numberSlot: boolean
   numberDeadline: number | null
@@ -36,7 +46,6 @@ export interface WindowState {
   slotIndex: Map<string, { exact?: number; longer: boolean }>
   swapSource: number | null
   previous: SimulatorMode
-  lastLayout: number | null
   gesture: boolean
   group: number
   history: Array<{ group: number; windows: DemoWindow[] }>
@@ -44,11 +53,12 @@ export interface WindowState {
 
 // Coordinates represent a 1000 × 650 logical-pixel demo workspace per screen.
 export const WINDOW_AREA = { width: 1000, height: 650 }
-export const WINDOW_MOTION = new Set(['window_left', 'window_down', 'window_up', 'window_right'])
+export const WINDOW_MOTION = new Set(['window_left', 'window_down', 'window_up', 'window_right', 'window_ratio_left', 'window_ratio_down', 'window_ratio_up', 'window_ratio_right'])
 
 
 export function createWindowState(): WindowState {
   return {
+    presets: [], library: false, libraryPage: 0, libraryIndex: new Map(), noteOpen: false, recent: [], editingPresetId: null, savedEditSnapshot: '',
     windows: [
       { id: 1, title: '项目笔记', app: 'Notes', screen: 0, x: 120, y: 95, width: 430, height: 330 },
       { id: 2, title: 'KeySteer 文档', app: 'Browser', screen: 0, x: 420, y: 180, width: 450, height: 330 },
@@ -56,8 +66,8 @@ export function createWindowState(): WindowState {
       { id: 4, title: '终端', app: 'Terminal', screen: 1, x: 180, y: 130, width: 590, height: 380 },
     ], target: null, screen: 0, size: false, temporary: false, panel: 'none',
     quick: { horizontal: null, vertical: null }, tree: null, trees: {}, editBefore: null, editHistory: [],
-    numbers: {}, nextNumber: 1, numberPrefix: '', numberSlot: false, numberDeadline: null, windowIndex: new Map(), slotIndex: new Map(), swapSource: null,
-    previous: 'normal', lastLayout: null, gesture: false, group: 0, history: [],
+    numbers: {}, nextNumber: 1, numberDisplay: '', numberPrefix: '', numberSlot: false, numberDeadline: null, windowIndex: new Map(), slotIndex: new Map(), swapSource: null,
+    previous: 'normal', gesture: false, group: 0, history: [],
   }
 }
 
@@ -80,7 +90,9 @@ export function enterWindow(state: SimulatorState): void {
   const w = state.window
   if (state.mode === 'window') return
   w.previous = state.mode
-  w.size = false; w.temporary = false; w.history = []; w.lastLayout = null; w.gesture = false
+  w.size = false; w.temporary = false; w.history = []; w.gesture = false
+  w.library = false; w.noteOpen = false
+  w.editingPresetId = null; w.savedEditSnapshot = ''
   const x = state.pointer.x * WINDOW_AREA.width / 100, y = state.pointer.y * WINDOW_AREA.height / 100
   w.target = [...w.windows].reverse().find(v => v.screen === w.screen && x >= v.x && x <= v.x + v.width && y >= v.y && y <= v.y + v.height)?.id ?? null
   w.panel = 'none'; w.tree = null; w.trees = {}; w.editBefore = null; w.editHistory = []
@@ -92,10 +104,11 @@ export function enterWindow(state: SimulatorState): void {
   state.mode = 'window'; state.lastEvent = w.target == null ? 'Tab 切换到示例窗口' : '已锁定示例窗口'
 }
 
-function exitWindow(state: SimulatorState): void {
+function exitWindow(state: SimulatorState, settings: Record<string, any> = {}): void {
+  state.window.library = false; state.window.noteOpen = false
   if (state.window.panel !== 'none') endWindowEdit(state, true)
-  state.mode = state.window.previous
-  state.window.history = []; state.window.panel = 'none'; state.window.lastLayout = null
+  state.mode = !settings.exit_mode || settings.exit_mode === 'return' ? state.window.previous : settings.exit_mode
+  state.window.history = []; state.window.panel = 'none'
   state.window.gesture = false; state.window.temporary = false
   cancelWindowNumber(state.window); state.window.trees = {}
   state.lastEvent = '保留窗口调整，返回上一模式'
@@ -103,8 +116,8 @@ function exitWindow(state: SimulatorState): void {
 
 export function temporaryWindow(state: WindowState, active: boolean, settings: Record<string, any> = {}, now = Date.now()): void {
   if (state.temporary === active) return
-  state.temporary = active; state.lastLayout = null; state.gesture = false
-  state.numberDeadline = !active && (state.numberSlot ? state.slotIndex : state.windowIndex).get(state.numberPrefix)?.longer
+  state.temporary = active; state.gesture = false
+  state.numberDeadline = !active && (state.library ? state.libraryIndex : state.numberSlot ? state.slotIndex : state.windowIndex).get(state.numberPrefix)?.longer
     ? now + settingsNumber(settings, 'number_timeout_ms', 250) : null
 }
 
@@ -180,24 +193,45 @@ export function refreshWindowNumbers(w: WindowState): void {
 }
 export function cancelWindowNumber(w: WindowState): boolean {
   const pending = Boolean(w.numberPrefix || w.numberSlot)
-  w.numberPrefix = ''; w.numberSlot = false; w.numberDeadline = null
+  w.numberDisplay = ''; w.numberPrefix = ''; w.numberSlot = false; w.numberDeadline = null
   return pending
 }
 export function finishWindowNumber(state: SimulatorState, settings: Record<string, any> = {}): void {
   const w = state.window, slot = w.numberSlot
+  if (w.library) { const id = w.libraryIndex.get(w.numberPrefix)?.exact; cancelWindowNumber(w); if (id !== undefined) restoreWindowLayout(state, id, settings); return }
   const value = (slot ? w.slotIndex : w.windowIndex).get(w.numberPrefix)?.exact
+  const display = w.numberDisplay
   cancelWindowNumber(w)
+  w.numberDisplay = display
   if (value !== undefined) chooseWindowNumber(state, value, settings, slot)
 }
 export function windowSelectionKey(state: SimulatorState, key: string, settings: Record<string, any>, now = Date.now()): boolean {
   const w = state.window
   if (state.mode !== 'window' || w.temporary) return false
-  if (key === '`' && w.panel === 'tree') { cancelWindowNumber(w); w.numberSlot = true; w.lastLayout = null; return true }
+  if (w.library) {
+    if (key === 'page_down') { w.libraryPage = Math.min(w.libraryPage + 1, Math.floor(Math.max(0, w.presets.length - 1) / 6)); return true }
+    if (key === 'page_up') { w.libraryPage = Math.max(0, w.libraryPage - 1); return true }
+    if (!/^\d$/.test(key)) return false
+    if (w.numberPrefix && !w.libraryIndex.has(w.numberPrefix + key)) finishWindowNumber(state, settings)
+    if (!w.library) return true
+    w.numberPrefix += key; w.numberDisplay = w.numberPrefix
+    const prefix = w.libraryIndex.get(w.numberPrefix)
+    if (!prefix) cancelWindowNumber(w)
+    else if (prefix.longer) w.numberDeadline = now + settingsNumber(settings, 'number_timeout_ms', 250)
+    else finishWindowNumber(state, settings)
+    return true
+  }
+  if (key === '`') {
+    if (w.panel === 'quick') endWindowEdit(state, true)
+    if (w.panel === 'none') startWindowEdit(state, true, settings)
+    cancelWindowNumber(w); w.numberSlot = true; w.numberDisplay = '`'; return true
+  }
   if (!/^\d$/.test(key)) return false
-  w.lastLayout = null
+
   let index = w.numberSlot ? w.slotIndex : w.windowIndex
   if (w.numberPrefix && !index.has(w.numberPrefix + key)) { finishWindowNumber(state, settings); index = w.windowIndex }
   w.numberPrefix += key
+  w.numberDisplay = (w.numberSlot ? "`" : "") + w.numberPrefix
   const prefix = index.get(w.numberPrefix)
   if (!prefix) cancelWindowNumber(w)
   else if (prefix.longer) w.numberDeadline = now + settingsNumber(settings, 'number_timeout_ms', 250)
@@ -216,6 +250,7 @@ function startWindowEdit(state: SimulatorState, tree: boolean, settings: Record<
   if (!target) { state.lastEvent = '请先选择窗口'; return }
   if (!tree && (target.resizable === false || target.fullscreen)) { state.lastEvent = '此窗口不可调整尺寸'; return }
   w.screen = target.screen; w.editBefore = snapshot(w); w.editHistory = []; w.swapSource = null
+  w.editingPresetId = null; w.savedEditSnapshot = ''
   const windows = w.windows.filter(v => v.screen === w.screen && v.resizable !== false && !v.fullscreen).sort((a, b) => w.numbers[a.id] - w.numbers[b.id])
   if (tree) {
     let cached = w.trees[w.screen] ? copy(w.trees[w.screen]) : null
@@ -229,11 +264,11 @@ function startWindowEdit(state: SimulatorState, tree: boolean, settings: Record<
       })
       if (!same) cached = null
     }
-    w.tree = cached ?? importTree(windows, target.id, WINDOW_AREA)
-    if (!fitTree(w.tree, windows, WINDOW_AREA, settingsNumber(settings, 'gap', 8))) {
-      w.tree = null; w.editBefore = null; w.panel = 'none'; state.lastEvent = '窗口最小尺寸无法放入此布局'; return
-    }
-    w.panel = 'tree'; applyTree(w, settings); state.lastEvent = '方向导航 · Shift 切分 · Ctrl 调整分割线'
+    w.tree = cached ?? automaticTree(windows, target.id, WINDOW_AREA, settingsNumber(settings, 'gap', 8)) ?? importTree(windows, target.id, WINDOW_AREA)
+    w.panel = 'tree'
+    if (fitTree(w.tree, windows, WINDOW_AREA, settingsNumber(settings, 'gap', 8))) {
+      pushEdit(w, editSnapshot(w)); applyTree(w, settings); state.lastEvent = '已自动布局 · Shift 切分 · Ctrl 移动分割线 · X 删除区域'
+    } else state.lastEvent = '窗口最小尺寸无法放入此布局，可删除分区后调整'
   } else { w.quick = { horizontal: null, vertical: null }; w.tree = null; w.panel = 'quick'; state.lastEvent = '按方向选择半屏，再调整比例' }
   refreshWindowNumbers(w)
 }
@@ -243,7 +278,7 @@ function endWindowEdit(state: SimulatorState, commit: boolean): void {
     if (commit) { w.group++; changed(w, w.editBefore); if (w.tree) w.trees[w.screen] = copy(w.tree) }
     else restoreWindows(w, w.editBefore)
   }
-  w.panel = 'none'; w.tree = null; w.editBefore = null; w.editHistory = []; w.lastLayout = null; w.swapSource = null
+  w.panel = 'none'; w.tree = null; w.editBefore = null; w.editHistory = []; w.swapSource = null
   cancelWindowNumber(w); refreshWindowNumbers(w)
   state.lastEvent = commit ? '已保留本轮布局' : '已恢复进入编辑前的布局'
 }
@@ -265,6 +300,7 @@ function selectWindow(state: SimulatorState, id: number): void {
   const w = state.window, next = w.windows.find(v => v.id === id)
   if (!next) return
   w.target = id
+  w.recent = [id, ...w.recent.filter(v => v !== id)]
   if (w.panel !== 'tree') w.screen = next.screen
   state.pointer.x = (next.x + next.width / 2) / WINDOW_AREA.width * 100
   state.pointer.y = (next.y + next.height / 2) / WINDOW_AREA.height * 100
@@ -273,14 +309,21 @@ function selectWindow(state: SimulatorState, id: number): void {
 }
 export function chooseWindowNumber(state: SimulatorState, number: number, settings: Record<string, any> = {}, slot = false): void {
   const w = state.window
-  w.lastLayout = null
+
   const target = w.windows.find(v => v.screen === w.screen && w.numbers[v.id] === number)
   if (w.panel === 'tree' && w.tree) {
     const before = editSnapshot(w), tree = w.tree
     let changed = false
     if (slot) {
       if (w.swapSource !== null) { changed = moveToSlot(tree, w.swapSource, number); w.swapSource = null }
-      else if (treeSlots(tree).some(s => s.id === number)) tree.selected = number
+      else {
+        const region = treeSlots(tree).find(s => s.id === number)
+        if (region) {
+          tree.selected = number
+          if (region.window !== null) selectWindow(state, region.window)
+          else { state.pointer.x = (region.rect.x + region.rect.width / 2) * 100; state.pointer.y = (region.rect.y + region.rect.height / 2) * 100 }
+        }
+      }
     } else if (target) {
       const destination = treeSlots(tree).find(s => s.window === target.id)
       if (w.swapSource !== null) {
@@ -302,29 +345,64 @@ export function chooseWindowNumber(state: SimulatorState, number: number, settin
     if (quick) startWindowEdit(state, false, settings)
   }
 }
+export function saveWindowLayout(state: SimulatorState, note: string): void {
+  const w = state.window
+  if (!w.tree || w.panel !== 'tree') return
+  note = note.trim()
+  if ([...note].length > 80 || /[\x00-\x1f\x7f-\x9f]/.test(note)) throw new Error('备注最多 80 个字符，不能包含换行')
+  const id = w.editingPresetId ?? Array.from({ length: 99 }, (_, i) => i + 1).find(id => !w.presets.some(p => p.id === id))
+  if (!id) throw new Error('布局库已满')
+  const preset = { id, note, window_count: treeSlots(w.tree).filter(s => s.window !== null).length, regions: regionTemplate(w.tree.root) }
+  w.presets = [...w.presets.filter(p => p.id !== id), preset].sort((a, b) => a.id - b.id)
+  w.editingPresetId = id; w.savedEditSnapshot = currentLayoutSnapshot(w)
+  w.noteOpen = false; state.lastEvent = `已保存 ${savedLayoutName(preset)}`
+}
+export function restoreWindowLayout(state: SimulatorState, id: number, settings: Record<string, any> = {}): void {
+  const w = state.window, preset = w.presets.find(p => p.id === id)
+  if (!preset) return
+  if (w.panel !== 'none') endWindowEdit(state, true)
+  w.library = false; cancelWindowNumber(w); w.editBefore = snapshot(w); w.editHistory = []; w.swapSource = null
+  const recent = [...new Set([...(w.target === null ? [] : [w.target]), ...w.recent, ...w.windows.map(v => v.id).reverse()])]
+  const windows = recent.map(id => w.windows.find(v => v.id === id)).filter((v): v is DemoWindow => !!v && v.screen === w.screen)
+  w.tree = instantiateLayout(preset, windows); w.panel = 'tree'
+  if (fitTree(w.tree, windows, WINDOW_AREA, settingsNumber(settings, 'gap', 8))) {
+    pushEdit(w, editSnapshot(w)); applyTree(w, settings); state.lastEvent = `已恢复 ${savedLayoutName(preset)}`
+  } else state.lastEvent = '窗口最小尺寸无法放入此布局，可删除区域后调整'
+  refreshWindowNumbers(w)
+  w.editingPresetId = id; w.savedEditSnapshot = currentLayoutSnapshot(w)
+}
+function currentLayoutSnapshot(w: WindowState): string { return w.tree ? JSON.stringify([regionTemplate(w.tree.root), treeSlots(w.tree).filter(s => s.window !== null).length]) : '' }
+export function hasWindowLayoutChanges(w: WindowState): boolean { return w.panel === 'tree' && !!w.tree && currentLayoutSnapshot(w) !== w.savedEditSnapshot }
+export function replaceWindowLayouts(state: SimulatorState, layouts: SavedWindowLayout[]): void {
+  if (state.window.panel !== 'none') endWindowEdit(state, true)
+  state.window.noteOpen = false
+  state.window.presets = layouts; state.window.libraryIndex = numberIndex(layouts.map(p => p.id)); state.window.libraryPage = 0
+  state.window.editingPresetId = null; state.window.savedEditSnapshot = ''; cancelWindowNumber(state.window)
+}
 export function windowDetail(w: WindowState): string {
-  const phase = w.panel === 'quick' ? `Quick · ${quickCaption(w.quick)}` : w.panel === 'tree' ? `Edit · 区域 \`${w.tree?.selected}` : w.size ? 'size' : 'move'
-  return `${phase} · ${windowTarget(w)?.title ?? 'No target'}`
+  if (w.library) return 'Restore'
+  const phase = w.panel === 'quick' ? `Quick · ${quickCaption(w.quick)}` : w.panel === 'tree' ? `Edit · 区域 \`${w.tree?.selected}` : w.size ? 'Resize' : 'Move'
+  return phase
 }
 export function windowInputStatus(w: WindowState): string {
-  if (w.numberPrefix || w.numberSlot) return `编号：${w.numberSlot ? '\`' : ''}${w.numberPrefix}…`
+  if (w.numberDisplay) return `输入：${w.numberDisplay}${w.numberPrefix || w.numberSlot ? '…' : ''}`
   if (w.swapSource !== null) return `窗口 ${w.numbers[w.swapSource]} → 窗口编号 / 反引号＋区域编号`
   return ''
 }
 export function windowActionAvailable(w: WindowState, action: string): boolean {
-  if (w.panel === 'none') return !/^window_(layout_|split_|ratio_|edit$)/.test(action)
+  if (w.library) return ['window_saved_layouts', 'window_cancel', 'window_confirm', 'window_exit'].includes(action)
+  if (action === 'window_saved_layouts') return true
+  if (action === 'window_save_layout') return w.panel === 'tree'
+  if (action === 'window_remove_region') return w.panel === 'tree'
+  if (w.panel === 'none') return !/^window_(layout_|split_|ratio_)/.test(action)
   if (/^window_(layout_|split_|ratio_)/.test(action)) return w.panel === 'tree' || action.startsWith('window_layout_')
   return ['window_select', 'window_confirm', 'window_cancel', 'window_exit', 'window_tile', 'window_undo', ...(w.panel === 'quick' ? ['window_layout', 'window_edit'] : [])].includes(action)
 }
-export function windowDoubleTap(w: WindowState, settings: Record<string, any> = {}, now = Date.now()): boolean {
-  return w.panel === 'quick' && w.lastLayout !== null && now - w.lastLayout <= settingsNumber(settings, 'double_tap_ms', 300)
-}
-
 /** Dispatch configured actions, keeping Normal movement separate from window motion. */
 export function applyWindowAction(state: SimulatorState, action: string, settings: Record<string, any> = {}, now = Date.now(), seconds?: number): boolean {
   if (action === 'window') {
     if (settings.enabled === false) return true
-    if (state.mode === 'window') exitWindow(state); else enterWindow(state)
+    if (state.mode === 'window') exitWindow(state, settings); else enterWindow(state)
     return true
   }
   if (!action.startsWith('window_')) return false
@@ -332,9 +410,17 @@ export function applyWindowAction(state: SimulatorState, action: string, setting
   const w = state.window, target = windowTarget(w)
   if (w.temporary && action !== 'window_exit') return true
   if (!windowActionAvailable(w, action)) return true
+  if (w.library) {
+    if (action === 'window_saved_layouts') { w.libraryIndex = numberIndex(w.presets.map(p => p.id)); cancelWindowNumber(w) }
+    else if (action === 'window_cancel') { w.library = false; cancelWindowNumber(w) }
+    else if (action === 'window_confirm') finishWindowNumber(state, settings)
+    else if (action === 'window_exit') exitWindow(state, settings)
+    return true
+  }
+  if (action === 'window_saved_layouts') { w.library = true; w.libraryPage = 0; cancelWindowNumber(w); w.libraryIndex = numberIndex(w.presets.map(p => p.id)); return true }
+  if (action === 'window_save_layout') { w.noteOpen = true; return true }
   const layoutAction = /^window_(layout|split|ratio)_(left|down|up|right)$/.exec(action)
-  if (layoutAction) {
-    w.lastLayout = null; w.swapSource = null; cancelWindowNumber(w)
+  if (layoutAction) { w.swapSource = null; cancelWindowNumber(w)
     const before = editSnapshot(w), direction = layoutAction[2] as LayoutDirection
     if (w.panel === 'quick' && target) {
       quickStep(w.quick, direction)
@@ -348,14 +434,14 @@ export function applyWindowAction(state: SimulatorState, action: string, setting
       state.lastEvent = quickCaption(w.quick)
     } else if (w.panel === 'tree' && w.tree) {
       if (layoutAction[1] === 'layout') { navigateSlot(w.tree, direction); return true }
-      if (layoutAction[1] === 'split') splitSlot(w.tree, direction); else resizeSplit(w.tree, direction, parseSplitRatios(settings.split_ratios))
+      if (layoutAction[1] === 'split') splitSlot(w.tree, direction); else resizeSplitBy(w.tree, direction, seconds === undefined ? settingsNumber(settings, 'resize_step', 20) : seconds * settingsNumber(settings, 'resize_speed', 500), WINDOW_AREA)
       if (!fitTree(w.tree, w.windows, WINDOW_AREA, settingsNumber(settings, 'gap', 8))) { w.tree = before.tree; state.lastEvent = '窗口最小尺寸不允许此次切分'; return true }
-      if (JSON.stringify(before.tree) !== JSON.stringify(w.tree)) { applyTree(w, settings); pushEdit(w, before); refreshWindowNumbers(w) }
+      if (JSON.stringify(before.tree) !== JSON.stringify(w.tree)) { applyTree(w, settings); if (layoutAction[1] !== 'ratio' || !w.gesture) pushEdit(w, before); w.gesture = layoutAction[1] === 'ratio'; refreshWindowNumbers(w) }
     }
     return true
   }
   if (WINDOW_MOTION.has(action)) {
-    w.lastLayout = null
+
     if (w.panel !== 'none') return true
     if (!target) return true
     if (!w.gesture) { w.group++; w.gesture = true }
@@ -385,15 +471,17 @@ export function applyWindowAction(state: SimulatorState, action: string, setting
     cancelWindowNumber(w); w.swapSource = null; return true
   }
   cancelWindowNumber(w); w.swapSource = null
-  if (action !== 'window_layout') w.lastLayout = null
   switch (action) {
+    case 'window_remove_region': {
+      if (!w.tree) return true
+      const before = editSnapshot(w)
+      if (!removeSlot(w.tree)) { state.lastEvent = '至少保留一个区域'; return true }
+      if (!fitTree(w.tree, w.windows, WINDOW_AREA, settingsNumber(settings, 'gap', 8))) { w.tree = before.tree; return true }
+      applyTree(w, settings); pushEdit(w, before); refreshWindowNumbers(w); state.lastEvent = '已删除区域'; return true
+    }
     case 'window_size': w.size = !w.size; w.panel = 'none'; break
     case 'window_layout':
-      if (windowDoubleTap(w, settings, now)) {
-        w.lastLayout = null
-        return applyWindowAction(state, 'window_tile', settings, now)
-      }
-      if (w.panel === 'none') { startWindowEdit(state, false, settings); w.lastLayout = now }
+      if (w.panel === 'none') startWindowEdit(state, false, settings)
       return true
     case 'window_edit':
       if (w.panel === 'quick') endWindowEdit(state, true)
@@ -427,11 +515,11 @@ export function applyWindowAction(state: SimulatorState, action: string, setting
     }
     case 'window_confirm':
       if (w.panel !== 'none') { endWindowEdit(state, true); return true }
-      exitWindow(state); return true
+      exitWindow(state, settings); return true
     case 'window_cancel':
       if (w.panel !== 'none') { endWindowEdit(state, true); return true }
-      exitWindow(state); return true
-    case 'window_exit': exitWindow(state); return true
+      exitWindow(state, settings); return true
+    case 'window_exit': exitWindow(state, settings); return true
     case 'window_undo': {
       if (w.panel !== 'none') {
         const previous = w.editHistory.pop()

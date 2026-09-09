@@ -321,7 +321,11 @@ impl WindowAccess for MacWindows {
             }
             // Do not guess among identical windows in different Spaces. Match
             // public on-screen metadata only when one AX candidate is possible.
-            for shown in visible.iter().filter(|v| v.pid == record.pid) {
+            for (rank, shown) in visible
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v.pid == record.pid)
+            {
                 if cancelled() {
                     break;
                 }
@@ -343,11 +347,13 @@ impl WindowAccess for MacWindows {
                 if let Some(index) = unique {
                     let (window, _, _) = candidates.remove(index);
                     if let Ok(info) = self.retain(window, record.pid, screens) {
-                        result.push(info);
+                        result.push((rank, info));
                     }
                 }
             }
         }
+        result.sort_by_key(|(rank, _)| *rank);
+        let result: Vec<_> = result.into_iter().map(|(_, info)| info).collect();
         if !cancelled() {
             self.prune_closed(&result, cancelled);
         }

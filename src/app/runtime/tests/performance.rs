@@ -24,6 +24,18 @@ fn simulator_menu_uses_the_active_config_source() {
 }
 
 #[test]
+fn simulator_menu_includes_current_saved_layouts_without_manual_import() {
+    let config = Config::default(); let source = config.to_toml().unwrap();
+    let mut engine = Engine::new(config, Appearance::Dark);
+    engine.attach_layout_store(Box::new(crate::app::layout_store::LayoutStore::default()));
+    engine.window_layouts.store.save(crate::api::window_presets::RegionTemplate::Slot { id: 1 }, 1, "Coding".into()).unwrap();
+    let expected = config_handoff::url_for_workspace(&source, engine.window_layouts.store.export_file());
+    let (mut backend, log) = FakeBackend::new(vec![BackendEvent::OpenConfigSimulator]);
+    engine.run(&mut backend).unwrap();
+    assert_eq!(log.lock().unwrap().opened_urls, [expected]);
+}
+
+#[test]
 fn simulator_menu_serializes_config_without_a_store() {
     let config = Config::default();
     let expected = config_handoff::url_for_config(&config.to_toml().unwrap());

@@ -43,9 +43,9 @@ Add `"?" = "key_help"` under `[normal.bindings]`, then press `?` (`Shift+/` on a
 
 ## Adjust windows with the keyboard
 
-Place the pointer over a window and press `Alt+W` to enter Window and lock that target. Arrow keys move it; `S` switches to resizing around its centre. Hold `Primary` to use your actual Normal bindings for pointer movement and clicks, then release it to continue adjusting the same window.
+Place the pointer over a window and press `Alt+W` to enter Window and lock that target. Normal movement keys (H/J/K/L by default) move it; `S` switches to resizing around its centre. Hold `Primary` to use your actual Normal bindings for pointer movement and clicks, then release it to continue adjusting the same window.
 
-`A` enters quick layout: use your Normal directions for halves, quarters and other ratios. `E` opens the layout tree; Shift+direction splits and Ctrl+direction adjusts a divider. Numbers select windows; only ambiguous prefixes wait (250ms). All changes apply immediately. Esc returns while keeping the layout, Q exits, and `AA` tiles once. `Tab` switches immediately and `Z` undoes.
+`A` enters quick layout: use your Normal directions for halves, quarters and other ratios. `E` automatically arranges windows and opens the layout tree; Shift+direction splits, Ctrl+direction moves a divider by steps or continuously while held, and X removes a region. Numbers select windows; only ambiguous prefixes wait (250ms). All changes apply immediately. A and E are available directly after Alt+W. Q returns from either layout mode to ordinary Window, then exits from there through `window.exit_mode` (default: `return`). `Tab` switches immediately and `Z` undoes.
 
 ## The operating model at a glance
 

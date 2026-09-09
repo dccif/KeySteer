@@ -1,5 +1,183 @@
+#[test]
+fn window_help_shows_restore_and_complete_descriptions_from_effective_bindings() {
+    use crate::api::window::WindowAction as W;
+    for rebound in [false, true] {
+        let mut config = Config::default();
+        if rebound {
+            config.window.bindings.insert("r".into(), Binding::Disabled);
+            config.window.bindings.insert("v".into(), Binding::Window(W::SavedLayouts));
+        }
+        let (mut engine, mut backend, log) = window_test_engine(&config);
+        enter_window(&mut engine, &mut backend, &log);
+        {
+            let recorded = log.lock().unwrap();
+            let labels = &recorded.scenes.last().unwrap().labels;
+            for text in ["Restore layout", "Edit layout tree", "Maximize / restore", if rebound { "V" } else { "R" }] {
+                assert!(labels.iter().any(|label| label.text == text), "missing {text}");
+            }
+            assert!(!labels.iter().any(|label| label.text == "Save layout"));
+            if rebound { assert!(!labels.iter().any(|label| label.text == "R")); }
+        }
+        for event in [key_down("e"), key_up("e")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+        acknowledge_window_edit(&mut engine, &mut backend, &log);
+        assert!(log.lock().unwrap().scenes.last().unwrap().labels.iter().any(|label| label.text == "Save layout"));
+    }
+}
+
+#[test]
+fn saved_layout_pages_live_inside_one_bottom_panel_at_each_dpi() {
+    use crate::api::overlay::scaled_label_geometry;
+    use crate::api::window_presets::RegionTemplate;
+    for scale in [1.0, 1.5, 2.0] {
+        let config = Config::default();
+        let (mut engine, mut backend, log) = window_test_engine(&config);
+        engine.screens[0].scale = scale;
+        engine.screens[0].bounds = Rect::new(0.0, 0.0, 1920.0 * scale, 1080.0 * scale);
+        engine.screens[0].work_area = engine.screens[0].bounds;
+        for n in 1..=7 { engine.window_layouts.store.save(RegionTemplate::Slot { id: 1 }, 1, format!("Saved layout {n}")).unwrap(); }
+        enter_window(&mut engine, &mut backend, &log);
+        for key in ["r", "page_down"] {
+            for event in [key_down(key), key_up(key)] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+            let recorded = log.lock().unwrap();
+            let scene = recorded.scenes.last().unwrap();
+            let panels: Vec<_> = scene.labels.iter().filter(|l| l.z_index == i32::MAX - 1).collect();
+            assert_eq!(panels.len(), 1);
+            let panel = panels[0].rect;
+            assert!((panel.bottom() - (engine.screens[0].work_area.bottom() - 12.0 * scale)).abs() < 1.0);
+            assert!(panel.y > engine.screens[0].work_area.height / 2.0);
+            for label in &scene.labels {
+                let rect = scaled_label_geometry(&label.text, label.rect, &label.style, scale).0;
+                assert!(rect.x >= panel.x - 1.0 && rect.right() <= panel.right() + 1.0 && rect.y >= panel.y - 1.0 && rect.bottom() <= panel.bottom() + 1.0, "{label:?} outside {panel:?}");
+            }
+            let expected = if key == "r" { "Next page" } else { "Previous page" };
+            let hidden = if key == "r" { "Previous page" } else { "Next page" };
+            assert!(scene.labels.iter().any(|label| label.text == expected));
+            assert!(!scene.labels.iter().any(|label| label.text == hidden));
+            assert_eq!(scene.labels.iter().filter(|label| label.text.contains("Saved layout ")).count(), if key == "r" { 6 } else { 1 });
+        }
+    }
+}
+
+#[test]
+fn window_card_text_stays_inside_its_background_at_each_dpi_without_font_shrinking() {
+    use crate::api::overlay::scaled_label_geometry;
+    for scale in [1.0, 1.5, 2.0] {
+        let config = Config::default();
+        let (mut engine, mut backend, log) = window_test_engine(&config);
+        engine.screens[0].scale = scale;
+        enter_window(&mut engine, &mut backend, &log);
+        let log = log.lock().unwrap();
+        let scene = log.scenes.last().unwrap();
+        let physical = |label: &crate::api::overlay::OverlayLabel| {
+            scaled_label_geometry(&label.text, label.rect, &label.style, scale).0
+        };
+        let card = physical(scene.labels.iter().find(|l| l.z_index == 19).unwrap());
+        for label in scene.labels.iter().filter(|l| (20..=21).contains(&l.z_index)) {
+            let rect = physical(label);
+            assert!(rect.x >= card.x - 1.0 && rect.right() <= card.right() + 1.0, "{label:?} outside {card:?}");
+            assert!(rect.y >= card.y - 1.0 && rect.bottom() <= card.bottom() + 1.0);
+        }
+        let app = scene.labels.iter().find(|l| l.z_index == 21 && l.text == "test").unwrap();
+        assert!((app.style.font_size - (f64::from(config.window.ui.font_size) * 0.6).max(14.0)).abs() < 0.001);
+        let key = scene.labels.iter().find(|l| l.z_index == i32::MAX && l.text == "A").unwrap();
+        assert_eq!(key.style.font_size, config.key_help.font_size);
+    }
+}
+
+#[test]
+fn window_root_e_is_available_and_rebound_back_returns_one_level_then_uses_exit_mode() {
+    use crate::api::window::{WindowAction as W, WindowOperation as O};
+    let mut config = Config::default();
+    config.window.exit_mode = crate::api::lifecycle::LifecycleAction::Mode(ModeId::idle());
+    config.window.bindings.insert("q".into(), Binding::Disabled);
+    config.window.bindings.insert("v".into(), Binding::Window(W::Cancel));
+    let (mut engine, mut backend, log) = window_test_engine(&config);
+    enter_window(&mut engine, &mut backend, &log);
+    assert!(engine.key_help_entries().iter().any(|e| e.starts_with("e ") && e.contains("window_edit")));
+    for event in [key_down("e"), key_up("e")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    acknowledge_window_edit(&mut engine, &mut backend, &log);
+    assert!(log.lock().unwrap().window_requests.iter().any(|r| matches!(r.operation, O::ApplyLayout { .. })));
+    for event in [key_down("q"), key_up("q")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    assert!(engine.registry.get(&ModeId::window()).unwrap().window_layout_active());
+    for event in [key_down("v"), key_up("v")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    acknowledge_window_edit(&mut engine, &mut backend, &log);
+    assert_eq!(engine.active_mode(), &ModeId::window());
+    assert!(!engine.registry.get(&ModeId::window()).unwrap().window_layout_active());
+    for event in [key_down("v"), key_up("v")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    assert_eq!(engine.active_mode(), &ModeId::idle());
+}
+
+#[test]
+fn window_saved_layout_note_forwards_input_then_r_one_restores_the_saved_regions() {
+    let mut config = Config::default();
+    config.window.temporary_mode_keys = vec!["ctrl".into()];
+    let (mut engine, mut backend, log) = window_test_engine(&config);
+    enter_window(&mut engine, &mut backend, &log);
+    for event in [key_down("a"), key_up("a"), key_down("e"), key_up("e")] { engine.handle_backend_event(event, &mut backend).unwrap(); acknowledge_window_edit(&mut engine, &mut backend, &log); }
+    for event in [key_down("left_ctrl"), key_down("s"), key_up("s"), key_up("left_ctrl")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    let prompt = log.lock().unwrap().text_prompts.last().expect("Ctrl+S owns its chord even with Ctrl temporary mode").clone();
+    assert!(prompt.bounds.bottom() <= engine.screens[0].work_area.bottom());
+    assert!(prompt.bounds.y > engine.screens[0].work_area.center().y);
+    assert!(!log.lock().unwrap().scenes.last().unwrap().labels.iter().any(|l| l.z_index == i32::MAX - 1));
+    assert!(log.lock().unwrap().scenes.last().unwrap().labels.iter().any(|l| l.text == "`1"));
+    let before = log.lock().unwrap().window_requests.len();
+    for event in [key_down("x"), key_up("x"), key_down("esc"), key_up("esc")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    assert_eq!(log.lock().unwrap().window_requests.len(), before, "typing notes must not edit the layout");
+    assert!(log.lock().unwrap().dispositions.iter().rev().take(4).all(|d| *d == KeyDisposition::Forward));
+    engine.handle_backend_event(BackendEvent::TextPromptResult { id: prompt.id, value: Ok(Some("工作 · 写代码".into())) }, &mut backend).unwrap();
+    assert!(engine.window_layouts.pending.is_none());
+    for event in [key_down("r"), key_up("r")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    assert!(log.lock().unwrap().scenes.last().unwrap().labels.iter().any(|l| l.text.contains("工作 · 写代码")));
+    let before = log.lock().unwrap().window_requests.len();
+    for event in [key_down("1"), key_up("1")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    acknowledge_window_edit(&mut engine, &mut backend, &log);
+    assert!(log.lock().unwrap().window_requests[before..].iter().any(|r| matches!(r.operation, crate::api::window::WindowOperation::ApplyLayout { .. })));
+}
+
+#[test]
+fn leaving_window_cancels_note_and_ignores_its_late_completion() {
+    let (mut engine, mut backend, log) = window_test_engine(&Config::default());
+    enter_window(&mut engine, &mut backend, &log);
+    for event in [key_down("a"), key_up("a"), key_down("e"), key_up("e")] { engine.handle_backend_event(event, &mut backend).unwrap(); acknowledge_window_edit(&mut engine, &mut backend, &log); }
+    for event in [key_down("left_ctrl"), key_down("s"), key_up("s"), key_up("left_ctrl")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    let id = log.lock().unwrap().text_prompts.last().unwrap().id;
+    engine.handle_backend_event(BackendEvent::ToggleEnabled, &mut backend).unwrap();
+    assert!(log.lock().unwrap().cancelled_text_prompts.contains(&id));
+    engine.handle_backend_event(BackendEvent::TextPromptResult { id, value: Ok(Some("stale".into())) }, &mut backend).unwrap();
+    assert!(engine.window_layouts.store.list().unwrap().is_empty());
+}
+
+#[test]
+fn reopening_r_reads_layouts_replaced_outside_the_program() {
+    use crate::api::window_presets::RegionTemplate;
+    let path = std::env::temp_dir().join(format!("keysteer-r-refresh-{}-{}.kslayout", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let mut external = crate::app::layout_store::LayoutStore::persistent(path.clone(), crate::platform::atomic_replace);
+    external.save(RegionTemplate::Slot { id: 1 }, 1, "Original layout".into()).unwrap();
+    let (mut engine, mut backend, log) = window_test_engine(&Config::default());
+    engine.attach_layout_store(Box::new(crate::app::layout_store::LayoutStore::persistent(path.clone(), crate::platform::atomic_replace))); enter_window(&mut engine, &mut backend, &log);
+    for event in [key_down("r"), key_up("r")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    assert!(log.lock().unwrap().scenes.last().unwrap().labels.iter().any(|l| l.text.contains("Original layout")));
+    for event in [key_down("r"), key_up("r")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    external.save(RegionTemplate::Slot { id: 1 }, 1, "Browser edited layout".into()).unwrap();
+    for event in [key_down("r"), key_up("r")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    assert!(log.lock().unwrap().scenes.last().unwrap().labels.iter().any(|l| l.text.contains("Browser edited layout")));
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn restoring_while_quick_start_is_pending_keeps_the_saved_template_for_tree_start() {
+    use crate::api::window_presets::RegionTemplate as T;
+    let (mut engine, mut backend, log) = window_test_engine(&Config::default());
+    engine.window_layouts.store.save(T::Split { axis: crate::api::window_layout::Axis::X, ratio: 0.25, first: Box::new(T::Slot { id: 1 }), second: Box::new(T::Slot { id: 2 }) }, 1, "Quarter".into()).unwrap();
+    enter_window(&mut engine, &mut backend, &log);
+    for event in [key_down("a"), key_up("a"), key_down("r"), key_up("r"), key_down("1"), key_up("1")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    acknowledge_window_edit(&mut engine, &mut backend, &log);
+    assert!(log.lock().unwrap().window_requests.iter().any(|r| matches!(&r.operation, crate::api::window::WindowOperation::ApplyLayout { placements, .. } if placements.iter().any(|(id, bounds)| *id == crate::api::window::WindowId(77) && (bounds.width - 0.25).abs() < 0.001))));
+}
+
 fn window_test_engine(config: &Config) -> (Engine, FakeBackend, Arc<Mutex<Recorder>>) {
     let mut engine = Engine::from_plan(crate::app::configuration::compile(config).unwrap(), Appearance::Dark).unwrap();
+    engine.attach_layout_store(Box::new(crate::app::layout_store::LayoutStore::default()));
     let (backend, log) = FakeBackend::new(Vec::new());
     engine.screens = backend.screens().unwrap();
     engine.set_active(ModeId::normal());
@@ -56,7 +234,7 @@ fn window_defaults_use_only_d_and_never_require_enter() {
         engine.handle_backend_event(event, &mut backend).unwrap();
     }
     assert!(log.lock().unwrap().window_requests.iter().any(|r| matches!(r.operation, O::ApplyLayout { .. })));
-    for event in [key_down("esc"), key_up("esc")] {
+    for event in [key_down("q"), key_up("q")] {
         engine.handle_backend_event(event, &mut backend).unwrap();
     }
     acknowledge_window_edit(&mut engine, &mut backend, &log);
@@ -66,19 +244,19 @@ fn window_defaults_use_only_d_and_never_require_enter() {
 }
 
 #[test]
-fn window_mode_locks_target_and_uses_independent_arrows_and_size() {
+fn window_mode_locks_target_and_uses_normal_movement_and_size() {
     use crate::api::window::{WindowOperation as O, WindowChange as C};
     let (mut engine, mut backend, log) = window_test_engine(&Config::default());
     enter_window(&mut engine, &mut backend, &log);
     engine.handle_backend_event(BackendEvent::PointerMoved(Point::new(900.0, 700.0)), &mut backend).unwrap();
-    for event in [key_down("right"), key_up("right"), key_down("s"), key_up("s"), key_down("up"), key_up("up")] {
+    for event in [key_down("l"), key_up("l"), key_down("s"), key_up("s"), key_down("k"), key_up("k")] {
         engine.handle_backend_event(event, &mut backend).unwrap();
     }
     let log = log.lock().unwrap();
     assert!(log.window_requests.iter().any(|r| matches!(r.operation, O::Adjust { target: crate::api::window::WindowId(77), change: C::Move { dx, dy: 0.0 }, .. } if dx > 0.0)));
     assert!(log.window_requests.iter().any(|r| matches!(r.operation, O::Adjust { target: crate::api::window::WindowId(77), change: C::Resize { dw: 0.0, dh }, .. } if dh > 0.0)));
     assert!(log.moves.is_empty());
-    assert!(log.scenes.iter().any(|s| s.labels.iter().any(|l| l.text.starts_with("Window · size"))));
+    assert!(log.scenes.iter().any(|s| s.labels.iter().any(|l| l.text == "Resize" && l.style.border_width > 0.0)));
 }
 
 #[test]
@@ -97,11 +275,11 @@ fn window_temporary_normal_uses_custom_movement_and_preserves_size_state() {
     assert!(!log.window_requests.iter().any(|r| matches!(r.operation,
         crate::api::window::WindowOperation::Adjust { .. } | crate::api::window::WindowOperation::Tile { .. })),
         "temporary Normal must not resize or lay out windows");
-    assert!(log.scenes.last().unwrap().labels.iter().any(|l| l.text.starts_with("Window · size")));
+    assert!(log.scenes.last().unwrap().labels.iter().any(|l| l.text == "Resize" && l.style.border_width > 0.0));
 }
 
 #[test]
-fn window_single_a_previews_and_double_a_tiles_once_ignoring_repeat() {
+fn window_a_opens_quick_without_any_double_tap_tiling() {
     use crate::api::window::WindowOperation as O;
     let (mut engine, mut backend, log) = window_test_engine(&Config::default());
     enter_window(&mut engine, &mut backend, &log);
@@ -114,7 +292,7 @@ fn window_single_a_previews_and_double_a_tiles_once_ignoring_repeat() {
     assert_eq!(log.lock().unwrap().window_requests.len(), 2);
     for event in [key_up("a"), key_down("a"), key_up("a")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
     acknowledge_window_edit(&mut engine, &mut backend, &log);
-    assert_eq!(log.lock().unwrap().window_requests.iter().filter(|r| matches!(r.operation, O::Tile { .. })).count(), 1);
+    assert_eq!(log.lock().unwrap().window_requests.iter().filter(|r| matches!(r.operation, O::Tile { .. })).count(), 0);
 }
 
 #[test]
@@ -130,6 +308,8 @@ fn layout_q_keeps_adjustments_before_returning_to_preserved_grid() {
     assert_eq!(engine.active_mode(), &ModeId::window());
     acknowledge_window_edit(&mut engine, &mut backend, &log);
     assert!(log.lock().unwrap().window_requests.iter().any(|r| matches!(r.operation, O::EndEdit { commit: true, .. })));
+    assert_eq!(engine.active_mode(), &ModeId::window());
+    for event in [key_down("q"), key_up("q")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
     assert_eq!(engine.active_mode(), &ModeId::grid());
     let seen = seen.lock().unwrap();
     assert!(seen.iter().any(|e| e == "grid:resumed"));
@@ -182,7 +362,12 @@ fn window_help_follows_target_not_pointer_and_contains_quick_layout_in_one_panel
         && l.z_index == i32::MAX - 1).expect("one rounded help background").rect;
     let initial = log.lock().unwrap().scenes.last().unwrap().clone();
     assert!(initial.indicator.is_none());
-    assert!((panel(&initial).y - 410.0).abs() < 1.0);
+    let bounds = panel(&initial);
+    let work = engine.screens[0].work_area;
+    assert!(bounds.x >= work.x && bounds.y >= work.y && bounds.right() <= work.right() && bounds.bottom() <= work.bottom());
+    for label in initial.labels.iter().filter(|l| l.z_index == i32::MAX && l.text == "A") { assert_eq!(label.style.font_size, 12.0); }
+    assert!(!initial.labels.iter().any(|l| l.text.contains("Select window number")));
+    assert!(initial.labels.iter().any(|l| l.text == "1" && l.style.font_size == 28.0));
     engine.handle_backend_event(BackendEvent::PointerMoved(Point::new(950.0, 750.0)), &mut backend).unwrap();
     assert_eq!(panel(log.lock().unwrap().scenes.last().unwrap()), panel(&initial));
     for event in [key_down("a"), key_up("a")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
@@ -238,7 +423,7 @@ fn window_direction_language_uses_effective_wasd_and_modifiers_without_pointer_m
     enter_window(&mut engine, &mut backend, &log);
     for event in [key_down("a"), key_up("a")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
     acknowledge_window_edit(&mut engine, &mut backend, &log);
-    // W is a different action, so the AA entrance deadline is cancelled.
+    // All layout directions apply immediately, including a rebound A.
     for key in ["w", "a"] {
         for event in [key_down(key), key_up(key)] { engine.handle_backend_event(event, &mut backend).unwrap(); }
         acknowledge_window_edit(&mut engine, &mut backend, &log);
@@ -253,7 +438,7 @@ fn window_direction_language_uses_effective_wasd_and_modifiers_without_pointer_m
     assert!(log.lock().unwrap().scenes.last().unwrap().labels.iter().any(|l| l.text == "`2"));
     for event in [key_down("left_ctrl"), key_down("d"), key_up("d"), key_up("left_ctrl")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
     let requests = log.lock().unwrap().window_requests.clone();
-    assert!(requests.iter().any(|r| matches!(&r.operation, O::ApplyLayout { placements, strict: true, .. } if (placements[0].1.width - 2.0 / 3.0).abs() < 1e-6)));
+    assert!(requests.iter().any(|r| matches!(&r.operation, O::ApplyLayout { placements, strict: true, .. } if (placements[0].1.width - (0.5 + config.window.resize_step / engine.screens[0].work_area.width)).abs() < 1e-6)));
 }
 
 #[test]
@@ -320,7 +505,7 @@ fn window_tab_cycles_immediately_and_centers_pointer_without_confirmation() {
     })), &mut backend).unwrap();
     assert_eq!(log.lock().unwrap().warps.last(), Some(&Point::new(700.0, 350.0)));
     assert!(log.lock().unwrap().scenes.last().unwrap().labels.iter().any(|l| l.text.contains("Next window")), "Tab shows the locked target in the help panel");
-    engine.handle_backend_event(key_down("right"), &mut backend).unwrap();
+    engine.handle_backend_event(key_down("l"), &mut backend).unwrap();
     assert!(matches!(log.lock().unwrap().window_requests.last().unwrap().operation,
         WindowOperation::Adjust { target: WindowId(88), change: crate::api::window::WindowChange::Resize { .. }, .. }));
 }
@@ -331,7 +516,7 @@ fn temporary_normal_cancels_pending_window_motion_and_ignores_its_late_pointer()
     let primary = &config.window.temporary_mode_keys[0];
     let (mut engine, mut backend, log) = window_test_engine(&config);
     enter_window(&mut engine, &mut backend, &log);
-    engine.handle_backend_event(key_down("right"), &mut backend).unwrap();
+    engine.handle_backend_event(key_down("l"), &mut backend).unwrap();
     let pending = log.lock().unwrap().window_requests.last().unwrap().clone();
     engine.handle_backend_event(key_down(primary), &mut backend).unwrap();
     assert!(matches!(log.lock().unwrap().window_requests.last().unwrap().operation,
@@ -343,7 +528,7 @@ fn temporary_normal_cancels_pending_window_motion_and_ignores_its_late_pointer()
     })), &mut backend).unwrap();
     assert_eq!(log.lock().unwrap().warps.len(), before);
     engine.handle_backend_event(key_up(primary), &mut backend).unwrap();
-    engine.handle_backend_event(key_up("right"), &mut backend).unwrap();
+    engine.handle_backend_event(key_up("l"), &mut backend).unwrap();
     assert_eq!(engine.active_mode(), &ModeId::window());
 }
 
@@ -351,7 +536,7 @@ fn temporary_normal_cancels_pending_window_motion_and_ignores_its_late_pointer()
 fn closing_target_stops_window_motion_and_waits_for_explicit_tab() {
     let (mut engine, mut backend, log) = window_test_engine(&Config::default());
     enter_window(&mut engine, &mut backend, &log);
-    engine.handle_backend_event(key_down("right"), &mut backend).unwrap();
+    engine.handle_backend_event(key_down("l"), &mut backend).unwrap();
     let request = log.lock().unwrap().window_requests.last().unwrap().clone();
     let before = log.lock().unwrap().window_requests.len();
     engine.handle_backend_event(BackendEvent::WindowResult(Box::new(crate::api::window::WindowResult { closed: Vec::new(),
@@ -415,4 +600,84 @@ fn quick_input_coalesces_then_undo_restores_entry_transaction() {
     }
     assert!(log.lock().unwrap().window_requests.iter().any(|r| matches!(r.operation, O::EndEdit { commit:false, .. })));
     assert_eq!(engine.active_mode(), &ModeId::window());
+}
+
+#[test]
+fn window_base_motion_follows_rebound_normal_keys_and_ignores_default_arrows() {
+    use crate::api::window::WindowOperation as O;
+    let mut config = Config::default();
+    config.normal.bindings.insert("h".into(), Binding::Disabled);
+    config.normal.bindings.insert("v".into(), Binding::Move(Direction::Left));
+    let (mut engine, mut backend, log) = window_test_engine(&config);
+    enter_window(&mut engine, &mut backend, &log);
+    for key in ["left", "h"] {
+        for event in [key_down(key), key_up(key)] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    }
+    assert!(!log.lock().unwrap().window_requests.iter().any(|r| matches!(r.operation, O::Adjust { .. })));
+    for event in [key_down("v"), key_up("v")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    assert!(log.lock().unwrap().window_requests.iter().any(|r| matches!(r.operation, O::Adjust { .. })));
+    let log = log.lock().unwrap();
+    assert!(log.moves.is_empty());
+    assert!(log.scenes.last().unwrap().labels.iter().any(|l| l.text == "V"));
+}
+
+#[test]
+fn window_tree_labels_are_large_and_centered_in_their_regions() {
+    let (mut engine, mut backend, log) = window_test_engine(&Config::default());
+    enter_window(&mut engine, &mut backend, &log);
+    for key in ["a", "e"] {
+        for event in [key_down(key), key_up(key)] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+        acknowledge_window_edit(&mut engine, &mut backend, &log);
+    }
+    let log = log.lock().unwrap();
+    let scene = log.scenes.last().unwrap();
+    let number = scene.labels.iter().find(|l| l.text == "1").unwrap();
+    let area = scene.labels.iter().find(|l| l.text == "`1").unwrap();
+    assert!(area.rect.y > number.rect.bottom());
+    assert!((area.rect.center().x - engine.screens[0].work_area.center().x).abs() < 1.0);
+    assert!((area.rect.center().y - engine.screens[0].work_area.center().y).abs() < 1.0);
+    assert_eq!(area.style.font_size, 28.0);
+}
+
+#[test]
+fn backtick_opens_auto_layout_and_pending_region_input_focuses_window() {
+    use crate::api::window::{WindowOperation as O, WindowId};
+    for quick in [false, true] {
+        let (mut engine, mut backend, log) = window_test_engine(&Config::default());
+        enter_window(&mut engine, &mut backend, &log);
+        if quick {
+            for event in [key_down("a"), key_up("a")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+            acknowledge_window_edit(&mut engine, &mut backend, &log);
+        }
+        for key in ["`", "1"] {
+            for event in [key_down(key), key_up(key)] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+        }
+        acknowledge_window_edit(&mut engine, &mut backend, &log);
+        let log = log.lock().unwrap();
+        assert!(log.window_requests.iter().any(|r| matches!(r.operation, O::ApplyLayout { strict: true, .. })));
+        assert!(!log.window_requests.iter().any(|r| matches!(r.operation, O::Tile { .. })));
+        assert!(log.window_requests.iter().any(|r| matches!(r.operation, O::Select(WindowId(77)))));
+        assert!(log.scenes.last().unwrap().labels.iter().any(|l| l.text == "Input: `1"));
+    }
+}
+
+#[test]
+fn x_deletes_a_tree_region_without_closing_its_window_and_z_restores_it() {
+    let (mut engine, mut backend, log) = window_test_engine(&Config::default());
+    enter_window(&mut engine, &mut backend, &log);
+    for key in ["a", "e"] {
+        for event in [key_down(key), key_up(key)] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+        acknowledge_window_edit(&mut engine, &mut backend, &log);
+    }
+    for event in [key_down("left_shift"), key_down("l"), key_up("l"), key_up("left_shift")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    acknowledge_window_edit(&mut engine, &mut backend, &log);
+    for key in ["`", "2", "x"] {
+        for event in [key_down(key), key_up(key)] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    }
+    acknowledge_window_edit(&mut engine, &mut backend, &log);
+    assert!(!log.lock().unwrap().scenes.last().unwrap().labels.iter().any(|l| l.text == "`2"));
+    assert!(log.lock().unwrap().scenes.last().unwrap().labels.iter().any(|l| l.text == "1"));
+    for event in [key_down("z"), key_up("z")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+    acknowledge_window_edit(&mut engine, &mut backend, &log);
+    assert!(log.lock().unwrap().scenes.last().unwrap().labels.iter().any(|l| l.text == "`2"));
 }

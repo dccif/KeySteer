@@ -37,6 +37,11 @@ keysteer/
 
 ## 程序入口
 
+- `src/api/window_presets.rs`：无原生身份的区域模板、布局库请求和异步文本输入契约。
+- `src/app/layout_store.rs` / `layout_store/codec.rs`：有界二进制布局文件、版本检查、原子替换；`runtime/window_presets.rs` 持有备注请求和会话取消。
+- `src/modes/window/presets.rs` / `view.rs`：编号布局列表与状态数据，由 `presentation/key_help.rs` 在底部面板统一展示；不读文件或调用原生 UI。
+- `src/platform/windows/text_prompt.rs`：已有托盘线程拥有的 modeless EDIT 对话框；macOS 备注面板由 `status_item.rs` 在主线程持有。
+
 - `src/main.rs`：Windows 使用 GUI subsystem；只调用 `app::prepare_console_for_cli()` 和
   `app::run_cli()`。
 - `src/lib.rs`：单 crate 模块入口；KeySteer 的兼容目标是二进制行为而非 Rust 库 ABI/API。

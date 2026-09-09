@@ -105,9 +105,7 @@ impl ConfigFile {
                 return Err(bad(format!("window.{name} must be finite and 0..=10000")));
             }
         }
-        if !(100..=2000).contains(&window.double_tap_ms) {
-            return Err(bad("window.double_tap_ms must be 100..=2000".into()));
-        }
+
         if !(100..=2000).contains(&window.number_timeout_ms) {
             return Err(bad(
                 "window.number_timeout_ms must be 100..=2000 (ambiguous numbers only)".into(),
@@ -646,6 +644,13 @@ fn validate_inheritance(config: &Config) -> Result<(), String> {
         graph.insert(id.clone(), mode.inherits.clone());
     }
     let known = |name: &str| name == "hotkeys" || graph.contains_key(name);
+    match &config.window.exit_mode {
+        crate::api::lifecycle::LifecycleAction::Return => {}
+        crate::api::lifecycle::LifecycleAction::Mode(mode)
+            if mode.as_str() == "idle"
+                || (graph.contains_key(mode.as_str()) && mode.as_str() != "window") => {}
+        _ => return Err("window.exit_mode must be return or a mode other than window".into()),
+    }
     for (mode, sources) in &graph {
         for source in sources {
             if !known(source) {

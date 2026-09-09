@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { deflateSync } from 'node:zlib'
+import { readFileSync } from 'node:fs'
+import { decodeLayoutFile } from './window-presets.ts'
 import { consumeConfigHandoff } from './config-handoff.ts'
 
 function handoffHash(source: string, version = 'v1'): string {
@@ -59,4 +61,16 @@ test('supports an empty TOML document', async () => {
     kind: 'config',
     source: '',
   })
+})
+test('one-click handoff imports current bindings and native layout bytes together', async () => {
+  const file = readFileSync(new URL('../../../tests/fixtures/window-layouts-v1.kslayout', import.meta.url))
+  const source = '# current bindings\n[normal.bindings]\nh = "move_left"\n'
+  const context = browser(handoffHash(JSON.stringify({ source, layouts: file.toString('base64url'), layout_error: null }), 'v2'))
+  assert.deepEqual(await consumeConfigHandoff(context.location, context.history), { kind: 'config', source, layouts: decodeLayoutFile(file) })
+  assert.equal(context.replacements.length, 1)
+})
+test('a layout read error still imports bindings and explains the missing layouts', async () => {
+  const source = '# current bindings\n'
+  const context = browser(handoffHash(JSON.stringify({ source, layouts: null, layout_error: 'File is damaged' }), 'v2'))
+  assert.deepEqual(await consumeConfigHandoff(context.location, context.history), { kind: 'config', source, layoutError: 'File is damaged' })
 })

@@ -14,9 +14,11 @@ pub enum SplitRatio {
 #[serde(default, deny_unknown_fields)]
 pub struct Window {
     pub enabled: bool,
+    pub exit_mode: crate::api::lifecycle::LifecycleAction,
     pub inherits: Vec<String>,
     pub temporary_mode: Option<String>,
     pub temporary_mode_keys: Vec<String>,
+    /// Legacy configuration compatibility; no double-tap gesture is scheduled.
     pub double_tap_ms: u64,
     pub number_timeout_ms: u64,
     pub split_ratios: Vec<SplitRatio>,
@@ -67,6 +69,7 @@ impl Default for Window {
     fn default() -> Self {
         Self {
             enabled: true,
+            exit_mode: crate::api::lifecycle::LifecycleAction::Return,
             inherits: vec!["hotkeys".into()],
             temporary_mode: Some("normal".into()),
             temporary_mode_keys: vec!["primary".into()],
@@ -82,12 +85,11 @@ impl Default for Window {
             gap: 8.0,
             layout_keys: "123456789qwe".into(),
             border_width: 3.0,
-            ui: LabelUi::default(),
+            ui: LabelUi {
+                font_size: 28,
+                ..LabelUi::default()
+            },
             bindings: [
-                ("left", W::Left),
-                ("down", W::Down),
-                ("up", W::Up),
-                ("right", W::Right),
                 ("s", W::Size),
                 ("a", W::Layout),
                 ("e", W::Edit),
@@ -96,8 +98,10 @@ impl Default for Window {
                 ("c", W::Center),
                 ("tab", W::Select),
                 ("z", W::Undo),
-                ("esc", W::Cancel),
-                ("q", W::Exit),
+                ("x", W::RemoveRegion),
+                ("r", W::SavedLayouts),
+                ("ctrl+s", W::SaveLayout),
+                ("q", W::Cancel),
                 ("primary+q", W::Exit),
             ]
             .into_iter()

@@ -166,14 +166,8 @@ pub fn built_in(config: &Config) -> Vec<Box<dyn Mode>> {
 pub(crate) fn window(config: &Config) -> modes::window::WindowMode {
     let w = &config.window;
     modes::window::WindowMode::new(modes::window::Settings {
-        double_tap_ms: w.double_tap_ms,
+        exit_mode: w.exit_mode.clone(),
         number_timeout_ms: w.number_timeout_ms,
-        split_ratios: w.parsed_split_ratios().unwrap_or_else(|error| {
-            // Runtime compilation validates first; direct catalog callers
-            // still receive a usable mode without a panic.
-            crate::report_error!("configuration", "{error}");
-            crate::api::window_layout::DEFAULT_SPLIT_RATIOS.to_vec()
-        }),
         move_step: w.move_step,
         move_speed: w.move_speed,
         resize_step: w.resize_step,

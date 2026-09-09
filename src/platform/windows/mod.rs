@@ -21,6 +21,7 @@ mod overlay_worker;
 mod screens;
 mod status_item;
 mod system_events;
+mod text_prompt;
 mod ui_scan;
 mod update_installer;
 mod vision;
@@ -546,6 +547,20 @@ impl Drop for WindowsBackend {
 }
 
 impl Backend for WindowsBackend {
+    fn request_text_prompt(
+        &mut self,
+        prompt: crate::api::window_presets::TextPrompt,
+    ) -> Result<(), String> {
+        self.status_item
+            .as_ref()
+            .ok_or("Windows tray is unavailable")?
+            .request_text_prompt(prompt)
+    }
+    fn cancel_text_prompt(&mut self, id: u64) {
+        if let Some(item) = &self.status_item {
+            item.cancel_text_prompt(id);
+        }
+    }
     fn request_window(&mut self, request: crate::api::window::WindowRequest) -> Result<(), String> {
         if self.window_worker.is_none() {
             let tx = self.event_tx.clone();

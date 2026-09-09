@@ -261,15 +261,17 @@ y = "end"
 # Exit keeps changes and returns to the previous mode with its selection
 # preserved. Undo history is session-local.
 [window]
+exit_mode = "return" # Root Q / window_exit restores the entry mode; "normal" / "idle" selects a destination.
 enabled = true
 inherits = ["hotkeys"]
 temporary_mode = "normal"
 temporary_mode_keys = ["primary"]
-double_tap_ms = 300
+# Legacy double_tap_ms is still accepted; the AA gesture has been removed.
 number_timeout_ms = 250 # Only ambiguous number prefixes wait; unique numbers are immediate.
-# Tree divider steps: fractions or decimals between 0 and 1; sorted and deduplicated on load.
+# Legacy compatibility only. Tree dividers now use resize_step and resize_speed.
 split_ratios = ["1/4", "1/3", "1/2", "2/3", "3/4"]
 # Distances, speeds and gaps are logical pixels (pixels/second for speeds).
+# resize_step / resize_speed also control Ctrl+direction divider movement in E.
 move_step = 20.0
 move_speed = 600.0
 resize_step = 20.0
@@ -280,14 +282,10 @@ layout_keys = "123456789qwe"
 border_width = 3.0
 
 [window.bindings]
-left = "window_left"
-down = "window_down"
-up = "window_up"
-right = "window_right"
+# Move and resize use the effective Normal move_left/right/up/down keys (default H/J/K/L).
 s = "window_size"
 # A enters quick layout using effective Normal directions; E edits its BSP tree.
-# A second independent A within double_tap_ms
-# tiles ordinary resizable windows on the target screen once. Repeat is ignored.
+# A opens quick layout; E then arranges this screen and opens the tree editor.
 a = "window_layout"
 e = "window_edit"
 d = "window_screen_next"
@@ -295,14 +293,17 @@ f = "window_maximize"
 c = "window_center"
 tab = "window_select"
 z = "window_undo"
-esc = "window_cancel"
-q = "window_exit"
+x = "window_remove_region"
+r = "window_saved_layouts"
+"ctrl+s" = "window_save_layout"
+q = "window_cancel" # Return one level; leave Window from its root.
 "primary+q" = "window_exit"
 "alt+w" = "window"
 # Optional direct tiling action: "primary+a" = "window_tile"
 # Layouts apply immediately. Esc returns to Window; Q exits, keeping adjustments.
 
 [window.ui]
+font_size = 28
 # Locked target outline color. The combined operation/layout panel uses [key_help].
 # border_color = "#58A6FFFF"
 

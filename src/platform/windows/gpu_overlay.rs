@@ -13,8 +13,8 @@ use windows::Win32::Graphics::Direct2D::Common::{
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
-    D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ROUNDED_RECT,
-    D2D1CreateDevice, ID2D1DeviceContext, ID2D1SolidColorBrush,
+    D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_NONE,
+    D2D1_ROUNDED_RECT, D2D1CreateDevice, ID2D1DeviceContext, ID2D1SolidColorBrush,
 };
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
@@ -801,6 +801,11 @@ impl GpuOverlay {
         self.utf16.clear();
         self.utf16.extend(text.encode_utf16());
         let prefix_utf16_len = analysis.matched_utf16_len;
+        let draw_options = if style.text_alignment == crate::api::overlay::TextAlignment::Left {
+            D2D1_DRAW_TEXT_OPTIONS_CLIP
+        } else {
+            D2D1_DRAW_TEXT_OPTIONS_NONE
+        };
         if prefix_utf16_len > 0 && !style.matched_text_color.is_transparent() {
             let matched_brush = self.brush(style.matched_text_color)?;
             let layout_origin = Vector2 {
@@ -829,12 +834,8 @@ impl GpuOverlay {
                         },
                     )
                     .map_err(|error| format!("SetDrawingEffect failed: {error}"))?;
-                self.d2d.DrawTextLayout(
-                    layout_origin,
-                    &layout,
-                    &normal,
-                    D2D1_DRAW_TEXT_OPTIONS_NONE,
-                );
+                self.d2d
+                    .DrawTextLayout(layout_origin, &layout, &normal, draw_options);
             }
         } else {
             // SAFETY: UTF-16 data, format, brush and layout rectangle remain
@@ -845,7 +846,7 @@ impl GpuOverlay {
                     &format,
                     &rect,
                     &normal,
-                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    draw_options,
                     DWRITE_MEASURING_MODE_NATURAL,
                 )
             };

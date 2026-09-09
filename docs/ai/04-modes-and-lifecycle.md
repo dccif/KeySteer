@@ -105,19 +105,21 @@ settings；不能注入输入、创建窗口或直接扫描 UI。
   上一轮可能已经过期的控件坐标。`Deactivated` 会标记实例 inactive、清空目标/搜索/重叠计划并释放大型 backing；迟到的异步结果不能让 Normal/Idle 后台重新启动扫描。
 
 `hint/session.rs::ScanSession` 是 scan generation、Partial 去重结果、retry、搜索缓存和
-finished/active 标志的唯一 owner；`labeling.rs` 与 `view.rs` 保持纯标签和视觉层算法。前缀匹配
+finished/active 标志的唯一 owner；`labeling.rs` 保持纯标签分配，`presentation/hint/` 负责视觉层算法。前缀匹配
 直接作用于 session 的紧凑 Hint 索引，不保留只供测试使用的重复 matching 实现。
 
 ### Window (`src/modes/window.rs`)
 
+- `presets.rs`：R 列表独立编号索引，每页 6 项；Ctrl+S 仅就绪的 Tree 编辑可用。恢复先结束已有编辑，再用新 BeginEdit 的前后顺序重新分配窗口到按编号排列的区域；超出的窗口不出现在 placement 中，不足时保留空区域。只有 Tree 的 Started 消费 pending 模板，Quick 的迟到 Started 不能抢走它。恢复沿用入口布局、约束、实时编辑及撤销事务。
+
 - 会话保存稳定窗口编号，中心标签包含被遮挡的普通窗口。`numbering.rs` 缓存有效编号的前缀索引，仅歧义前缀启动一次性计时；完整编号才选窗／交换。反引号切换区域编号输入。
 - `inventory.rs` 接收拥有所有权的结果，复用未变化库存与可见编号索引；明确关闭通知回收编号与布局引用，取消查询不丢关闭通知。
-- `editing.rs` 持有 QuickPlacement/BSP 模型、上一成功布局、32 步本地历史和单个在途修订；连续输入只保留最新目标。进入树编辑后等待异步约束与完整库存，首次空间导入只做一次。
-- `interaction.rs` 路由快速布局、树导航、分割、祖先比例、交换、撤销与返回／退出。AA 只在入口双击期限内且没有其他操作时生效。
-- 树的 Ctrl＋方向调整借用配置编译后的 `split_ratios`，从当前实际比例跳到指定方向的相邻档位，不在按键路径解析分数或构建数组。
-- `view.rs` 借用窗口库存和布局树，`presentation/window.rs` 构造编号和稳定区域描边，复用锚定窗口下方的单个 key_help 面板。布局方向来自 Registry 编译的当前有效 Normal Move 绑定，临时 Normal 优先，E 入口优先于方向。
+- `editing.rs` 持有 QuickPlacement/BSP 模型、上一成功布局、32 步本地历史和单个在途修订；连续输入只保留最新目标。进入树编辑后等待异步约束与完整库存，首次按最小尺寸尝试均衡行列布局；已验证且仍匹配实际几何的缓存树保留。
+- `interaction.rs` 路由快速布局、树导航、分割、祖先比例、交换、撤销与返回／退出。E 入口自动提交一次布局，保持树编辑；A 没有双击状态或优先级。
+- 树的 Ctrl＋方向通过已有 FrameClock 连续移动最近同轴祖先分割线：短按 `resize_step`，长按 `resize_speed × elapsed`，屏幕像素位移换算为该祖先比例，再按子树最小尺寸约束；一次手势保留一个编辑撤销检查点，in-flight 期间只保留最新 desired tree。
+- `view.rs` 借用窗口库存和布局树，`presentation/window.rs` 构造编号和稳定区域描边，复用锚定窗口内底部的单个 key_help 面板。布局方向来自 Registry 编译的当前有效 Normal Move 绑定，临时 Normal 优先，E 入口优先于方向。
 - 500ms 可见态计时合并后台库存请求，原生查询异步且可被布局／选窗抢占；相同结果不重绘，不在按键或 Frame 枚举。关闭窗口保留空区域和其余编号。
-- worker 拥有约束快照与原生事务；修改即时生效，无需 Enter。Esc 返回、Q 退出前发送最新布局并将整轮记为一步撤销；强制退出／重载只释放检查点，保留已应用几何。临时 Normal 保留编辑、停止新布局提交并隐藏覆盖层。
+- worker 拥有约束快照与原生事务；修改即时生效，无需 Enter。Q（window_cancel）逐层返回；根层或 window_exit 按 exit_mode 返回入口模式或配置的目的模式。离开编辑前发送最新布局并将整轮记为一步撤销；强制退出／重载只释放检查点，保留已应用几何。临时 Normal 保留编辑、停止新布局提交并隐藏覆盖层。
 - Tab 普通态按稳定环直接激活锁定，树内仅本屏；焦点被拒绝仍锁定目标并说明原因。所有原生对象留在平台层。
 
 ## Finish 不是 Mode
@@ -163,3 +165,9 @@ double-click 成功后生成。普通 click 仍在物理键按下沿原子执行
 `primary+d -> move_window next`，与 `primary+s -> screen next` 独立触发；用户可自定义共享前缀组合，由 Engine 仲裁。
 插件不判断物理按键，也不拥有等待状态。
 默认绑定遵循 key aliases，用户绑定和 `none` 优先，可在任意 Mode 中配置插件 verb。
+
+## 自动布局、编号定位与删除
+
+普通 Window 的 E 直接发 BeginEdit；Started 生成并约束均衡行列树，可行时自动提交 ApplyLayout 并留在树编辑；不可行时保留实际窗口并展示错误以便修改。entry_layout 记录入口布局的撤销基线：Z 先撤销后续编辑，再通过 TreeReset 回滚原生事务并重新导入，恢复真实进入几何及最大化状态；重入的 entry_layout 为 false，避免撤销后再次自动布局。AA 的 Instant、deadline 查询和运行时按键优先级均已删除。
+
+反引号可从普通 Window 或 Quick 转入自动布局及树编辑。异步 Started 前的数字暂存，库存与稳定区域索引建立后再解析；输入显示独立于解析缓冲，完成后仍可显示。无交换源时区域编号激活占用窗口，空区域 WarpPointer 到中心；有源时维持原移动／交换语义。X 删除当前叶、提升兄弟，窗口本身不关闭；保留至少一叶，稳定 ID 不复用，叶数量独立于 next_slot。
