@@ -1,5 +1,19 @@
 # UI Hint 扫描链路
 
+## 可配置范围与跨屏重扫
+
+`ui_hint.scan_scope` 默认为 `window`；`screen` 扫描鼠标所在的整块屏幕，不合并多个显示器。
+Mode 将范围编译为 `UiScanRequest.scope`。Windows 的整屏计划不依赖鼠标下存在普通窗口：
+一次 Z-order 枚举建立有界候选和遮挡，UIA 过滤各自窗口上方的遮挡，Vision 截取完整请求屏幕。
+macOS 整屏 AX 按 Quartz 可见窗口顺序匹配 AXWindows，在同一个截止时间、取消检查和目标上限内遍历；
+Vision 直接使用屏幕矩形。最小化和其他桌面的窗口不进入 AX 候选。
+
+Engine 成功执行跨屏 MovePointer/WarpPointer 后立即派发 PointerMoved，不依赖系统 Hook 回传。
+因此 绑定到 `screen next` 的 `Alt+S` 等组合键、直接坐标移动和物理跨屏都会让未完成的 Hint 清空旧结果、
+取消旧扫描并创建新 scan id；同屏移动不重扫，已完成的标签选中不会被自身 warp 重启。
+扫描依然异步、流式和 latest-only，取消不阻塞 Engine。
+
+
 ## 性能与取消约束（2026-08）
 
 - Windows UIA 以内部 generation/stopping flag 做逐节点取消检查；鼠标目标 HWND/PID/边界每 32 个节点采样一次，并在发布 partial 和 terminal 前强制复核。

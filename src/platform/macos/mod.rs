@@ -19,6 +19,7 @@ mod status_item;
 mod ui_scan;
 mod vision;
 mod window_move;
+mod window_tabs;
 mod workspace;
 
 #[cfg(feature = "benchmark-hooks")]
@@ -306,6 +307,9 @@ impl MacOsBackend {
                 Err(error) => errors.push("window worker", error),
             }
         }
+        if let Some(mtm) = MainThreadMarker::new() {
+            window_tabs::clear(mtm);
+        }
         // Phase two joins only producers that were cancelled above. Every
         // stage shares the same absolute deadline.
         if let Some(hook) = self.hook.as_mut() {
@@ -392,6 +396,9 @@ impl Backend for MacOsBackend {
             }
             crate::support::worker::reap_quarantined();
             self.refresh_native_events();
+            if let Some(mtm) = MainThreadMarker::new() {
+                window_tabs::refresh(mtm, &self.screens);
+            }
             if let Some(result) = self
                 .window_move
                 .get_mut()

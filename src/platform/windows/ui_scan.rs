@@ -251,6 +251,7 @@ mod tests {
 
     fn request(id: u64) -> UiScanRequest {
         UiScanRequest {
+            scope: crate::api::UiScanScope::Window,
             id,
             timeout_ms: 1_000,
             bounds: Some(rect(0.0, 0.0, 1_920.0, 1_080.0)),
@@ -262,6 +263,25 @@ mod tests {
             vision: VisionOptions::default(),
             app: None,
         }
+    }
+
+    #[test]
+    fn screen_scope_accepts_desktop_vision_targets_but_clips_other_displays() {
+        let mut input = request(99);
+        input.scope = crate::api::UiScanScope::Screen;
+        let plan = super::super::accessibility::test_scan_plan(input);
+        let target = UiTarget {
+            rect: rect(100.0, 100.0, 20.0, 20.0),
+            name: String::new(),
+            role: String::new(),
+            native_role: None,
+        };
+        assert!(plan.target_center_is_visible(&target));
+        let outside = UiTarget {
+            rect: rect(-200.0, 100.0, 20.0, 20.0),
+            ..target
+        };
+        assert!(!plan.target_center_is_visible(&outside));
     }
 
     #[test]

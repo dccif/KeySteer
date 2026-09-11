@@ -2,9 +2,9 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { readFileSync } from 'node:fs'
 import { createSimulatorState, applyModeAction } from './state.ts'
-import { applyWindowAction, enterWindow, saveWindowLayout, restoreWindowLayout, windowSelectionKey } from './window.ts'
-import { decodeLayoutFile, encodeLayoutFile, instantiateLayout, readSavedLayouts, savedLayoutName } from './window-presets.ts'
-import type { RegionTemplate, SavedWindowLayout } from './window-presets.ts'
+import { applyWindowAction, enterWindow, saveWindowPreset, restoreWindowPreset, windowSelectionKey } from './window.ts'
+import { decodeWorkspaceFile, encodeWorkspaceFile, instantiateLayout, readSavedPresets, presetName } from './window-presets.ts'
+import type { RegionTemplate, SavedWindowPreset } from './window-presets.ts'
 import { treeSlots } from './window-layout.ts'
 
 function regions(first: number, last: number): RegionTemplate {
@@ -12,22 +12,22 @@ function regions(first: number, last: number): RegionTemplate {
   const mid = Math.floor((first + last) / 2)
   return { kind: 'split', axis: 'x', ratio: .5, first: regions(first, mid), second: regions(mid + 1, last) }
 }
-function preset(count: number): SavedWindowLayout { return { id: 1, note: '', window_count: count, regions: regions(1, count) } }
+function preset(count: number): SavedWindowPreset { return { id: 1, note: '', window_count: count, template: { kind: 'layout', data: regions(1, count) } } }
 test('native binary fixture roundtrips byte for byte and rejects truncation', () => {
-  const file = new Uint8Array(readFileSync(new URL('../../../tests/fixtures/window-layouts-v1.kslayout', import.meta.url)))
-  const layouts = decodeLayoutFile(file)
-  assert.equal(layouts[0].note, 'Code · 阅读'); assert.equal(layouts[1].id, 12)
-  assert.deepEqual(encodeLayoutFile(layouts), file)
-  for (let length = 0; length < file.length; length++) assert.throws(() => decodeLayoutFile(file.subarray(0, length)))
+  const file = new Uint8Array(readFileSync(new URL('../../../tests/fixtures/workspace.ksw', import.meta.url)))
+  const layouts = decodeWorkspaceFile(file)
+  assert.equal(layouts[0].note, 'Code · 阅读'); assert.equal(layouts.at(-1)!.id, 12)
+  assert.deepEqual(encodeWorkspaceFile(layouts), file)
+  for (let length = 0; length < file.length; length++) assert.throws(() => decodeWorkspaceFile(file.subarray(0, length)))
 })
 test('editing an imported layout updates its number and keeps other layouts unchanged', () => {
-  const layouts = decodeLayoutFile(new Uint8Array(readFileSync(new URL('../../../tests/fixtures/window-layouts-v1.kslayout', import.meta.url))))
+  const layouts = decodeWorkspaceFile(new Uint8Array(readFileSync(new URL('../../../tests/fixtures/workspace.ksw', import.meta.url))))
   const state = createSimulatorState(); state.pointer = { x: 25, y: 25 }; enterWindow(state); state.window.presets = layouts
-  const other = JSON.stringify(layouts[1]); restoreWindowLayout(state, 1)
-  applyWindowAction(state, 'window_ratio_right'); saveWindowLayout(state, 'Edited · 中文')
-  assert.equal(state.window.presets.length, 2); assert.equal(state.window.presets[0].id, 1)
-  assert.equal(JSON.stringify(state.window.presets[1]), other)
-  assert.equal(decodeLayoutFile(encodeLayoutFile(state.window.presets))[0].note, 'Edited · 中文')
+  const other = JSON.stringify(layouts.filter(p => p.id !== 1)); restoreWindowPreset(state, 1)
+  applyWindowAction(state, 'window_ratio_right'); saveWindowPreset(state, 'Edited · 中文')
+  assert.equal(state.window.presets.length, 3); assert.equal(state.window.presets[0].id, 1)
+  assert.equal(JSON.stringify(state.window.presets.filter(p => p.id !== 1)), other)
+  assert.equal(decodeWorkspaceFile(encodeWorkspaceFile(state.window.presets))[0].note, 'Edited · 中文')
 })
 test('saved layouts restore MRU first and retain empty regions', () => {
   const windows = Array.from({ length: 9 }, (_, i) => ({ id: 9 - i, title: 'private', app: 'private', screen: 0, x: 0, y: 0, width: 100, height: 80 }))
@@ -54,41 +54,41 @@ test('notes and automatic names persist as geometry without app or window metada
   state.pointer = { x: 25, y: 25 }; enterWindow(state)
   applyWindowAction(state, 'window_quick'); applyWindowAction(state, 'window_editor')
   applyWindowAction(state, 'window_save_layout'); assert.equal(state.window.noteOpen, true)
-  saveWindowLayout(state, '  中文 🦀  ')
-  assert.equal(savedLayoutName(state.window.presets[0]), '中文 🦀')
+  saveWindowPreset(state, '  中文 🦀  ')
+  assert.equal(presetName(state.window.presets[0]), '中文 🦀')
   const encoded = JSON.stringify(state.window.presets)
-  assert.deepEqual(readSavedLayouts(encoded), state.window.presets)
+  assert.deepEqual(readSavedPresets(encoded), state.window.presets)
   assert.ok(!encoded.includes('"window":') && !encoded.includes('title') && !encoded.includes('app'))
   const empty = preset(9); empty.window_count = 4
-  assert.equal(savedLayoutName(empty), 'Layout 1 · 4 windows / 9 regions')
-  assert.throws(() => readSavedLayouts('[{"id":1}]'))
-  assert.throws(() => readSavedLayouts(JSON.stringify([{ ...empty, window_count: 10 }])))
+  assert.equal(presetName(empty), 'Layout 1')
+  assert.throws(() => readSavedPresets('[{"id":1}]'))
+  assert.throws(() => readSavedPresets(JSON.stringify([{ ...empty, window_count: 10 }])))
 })
 
 
 test('Delete requires confirmation, preserves IDs and produces a valid empty file', () => {
   const state = createSimulatorState(); enterWindow(state)
   state.window.presets = [{ ...preset(1), id: 2 }, { ...preset(1), id: 7 }]
-  applyWindowAction(state, 'window_delete')
+  applyWindowAction(state, 'window_restore'); applyWindowAction(state, 'window_delete')
   windowSelectionKey(state, '7', {})
   assert.equal(state.window.presets.length, 2)
   assert.equal(state.window.deleteSelection?.id, 7)
   applyWindowAction(state, 'window_restore')
-  applyWindowAction(state, 'window_delete')
+  applyWindowAction(state, 'window_restore'); applyWindowAction(state, 'window_delete')
   applyWindowAction(state, 'window_confirm')
   assert.equal(state.window.presets.length, 2)
   for (const id of [7, 2]) {
     windowSelectionKey(state, String(id), {})
     applyWindowAction(state, 'window_confirm')
-    assert.equal(state.mode, 'window_delete')
+    assert.equal(state.mode, 'window_restore')
   }
-  assert.deepEqual(decodeLayoutFile(encodeLayoutFile(state.window.presets)), [])
+  assert.deepEqual(decodeWorkspaceFile(encodeWorkspaceFile(state.window.presets)), [])
 })
 
 test('Delete refuses a record replaced after selection', () => {
   const state = createSimulatorState(); enterWindow(state)
   state.window.presets = [preset(1)]
-  applyWindowAction(state, 'window_delete'); windowSelectionKey(state, '1', {})
+  applyWindowAction(state, 'window_restore'); applyWindowAction(state, 'window_delete'); windowSelectionKey(state, '1', {})
   state.window.presets[0] = { ...state.window.presets[0], note: 'Changed' }
   applyWindowAction(state, 'window_confirm')
   assert.equal(state.window.presets.length, 1)
@@ -110,4 +110,28 @@ test('Restore uses lifecycle targets and failed fitting stays in Restore', () =>
   state.window.windows.forEach(w => { w.minWidth = 10 })
   windowSelectionKey(state, '1', { lifecycle: { after_finish: 'idle' } })
   assert.equal(state.mode, 'idle')
+})
+
+test('delete is internal to Restore and toggling preserves its page while cancelling selection', () => {
+  const state = createSimulatorState(); enterWindow(state)
+  state.window.presets = Array.from({ length: 7 }, (_, i) => ({ ...preset(1), id: i + 1 }))
+  applyWindowAction(state, 'window_delete')
+  assert.equal(state.mode, 'window')
+  assert.equal(state.window.deletingPresets, false)
+  applyWindowAction(state, 'window_restore')
+  windowSelectionKey(state, 'page_down', {})
+  for (const action of ['window_delete', 'window_delete', 'window_delete']) {
+    applyWindowAction(state, action)
+    assert.equal(state.mode, 'window_restore')
+    assert.equal(state.window.libraryPage, 1)
+    assert.equal(state.window.deleteSelection, null)
+    if (state.window.deletingPresets) windowSelectionKey(state, '7', {})
+  }
+  applyWindowAction(state, 'window_delete')
+  applyWindowAction(state, 'window_confirm')
+  assert.equal(state.window.presets.length, 7)
+  applyWindowAction(state, 'window_delete')
+  applyWindowAction(state, 'window')
+  applyWindowAction(state, 'window_restore')
+  assert.equal(state.window.deletingPresets, false)
 })

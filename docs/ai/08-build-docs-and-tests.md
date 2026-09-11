@@ -1,8 +1,18 @@
 # 构建、打包、文档站与测试
 
-Rust 与 TypeScript 使用同一 `tests/fixtures/window-layouts-v1.kslayout` 做逐字节往返，覆盖二进制布局文件互导；v2 handoff 测试同时校验按键 source、布局 bytes 和 URL 清理，runtime 测试验证重新打开 R 后读到外部替换的文件。
+范围回归覆盖默认当前屏幕／非最小化、显式全部屏幕／包含最小化、跨模式配置、重入回收关闭和最小化窗口编号、持久组仍保留。多屏事务验证各屏布局不跨屏搬动、失败整体回滚及一次撤销；渲染测试检查实际帮助面板与重叠窗口卡片在 1/1.5/2 倍 DPI 下分离，且排序后的文字仍随背景移动。跨进程自有窗口探针另检查最小化后可枚举、UI Hint 仍排除它、屏幕归属及恢复；macOS 仍需实机 AX 验证。
 
-布局收藏的 API 测试覆盖 9/4 区域与窗口数量不匹配、空区域及排序、备注/隐私字段；`app/layout_store` 测试覆盖二进制往返、逐字节截断、版本、持久化及写入失败不覆盖。runtime 测试覆盖 Ctrl+S、原生输入放行、R→编号恢复和会话取消后的迟到结果。Windows ignored `native_note_dialog_preserves_unicode_and_cancels_owned_windows` 在交互桌面创建并清理自有对话框，验证 Unicode 保存和取消；macOS 编译检查不能替代实机 IME 验证。网页 `window-presets.test.ts` 覆盖独立浏览器布局库与恢复撤销。
+组内优先循环回归覆盖活动成员与旧目标不同、正反循环及数字跳出组；编号回归覆盖同程序大小写归一批次和刷新稳定性；最小化回归覆盖全部成员、非成员不受影响、旧焦点不重开组和恢复单个活动成员。自有 Win32 窗口探针向活动窗口发送最小化，验证全部成员 IsIconic、隐藏成员的还原位置不变和可恢复；因 hook 跳过自身进程，测试在系统完成最小化后显式交付同一原生事件入口。
+
+栏高回归覆盖 1/1.5/2 倍比例的逻辑外框、原生内容框、最小高度、选择后几何、模式外顶部移动和还原不重复扣减。`native_grouped_layout_accounts_for_header_and_dissolves_maximized` 使用自有窗口验证真实严格分屏、布局撤销／重做、最大化和解散归还空间；`native_maximized_tab_header_keeps_state_and_restore` 检查保留最大化状态及三态恢复。拖拽原生探针另验证纵横滚轮后的点击、标题更新保持滚动和自动显示活动项。Mode 测试验证 `move_*` 与全部成员卡片。
+
+标签拖拽回归覆盖退出模式后跨组移动、整组合并、组内排序、剩余单成员位置、撤销／重做和失败回滚。Windows 显式 `native_tab_drag_drop_and_cancel` 向自有临时栏发送鼠标消息，验证单窗口／整组 drop、无效落点与 capture 取消；不移动用户指针。`native_cross_process_tabs_keep_composed_content` 启动自有子进程窗口，反复切换后核对 WS_VISIBLE、WM_SHOWWINDOW 计数与透明样式恢复，不能代替 Explorer/Zed 的实际画面验收。活动成员原生探针同时检查栏 owner、非置顶样式和箭头光标。
+
+活动成员回归覆盖：退出模式后持续拖动时隐藏窗口零几何写入、选择时才对齐、再次进入并追加使用当前活动矩形、关闭标签栏后全体恢复可见、活动成员关闭后显示剩余窗口。Window Session 与 runtime 验证普通窗口和隐藏成员共享编号和前后轮换、可重绑、退出模式后不产生选窗请求。
+
+Rust 与 TypeScript 使用同一 `tests/fixtures/workspace.ksw` 做逐字节往返，覆盖二进制布局文件互导；v2 handoff 测试同时校验按键 source、布局 bytes 和 URL 清理，runtime 测试验证重新打开 R 后读到外部替换的文件。
+
+布局收藏的 API 测试覆盖 9/4 区域与窗口数量不匹配、空区域及排序、备注/隐私字段；`app/preset_store` 测试覆盖二进制往返、逐字节截断、版本、持久化及写入失败不覆盖。runtime 测试覆盖 Ctrl+S、原生输入放行、R→编号恢复和会话取消后的迟到结果。Windows ignored `native_note_dialog_preserves_unicode_and_cancels_owned_windows` 在交互桌面创建并清理自有对话框，验证 Unicode 保存和取消；macOS 编译检查不能替代实机 IME 验证。网页 `window-presets.test.ts` 覆盖独立浏览器布局库与恢复撤销。
 
 ## 优化构建档位（2026-08）
 
@@ -192,6 +202,10 @@ GitHub Pages。API 暂时不可用、限流或某个平台资产缺失时，下�
 
 ## Window 验证
 
+`window_family_shortcut_plan_survives_input_and_scene_refresh_until_routes_change` 覆盖 Window / A / E / R / T：逐键输入、编辑事务反馈和强制场景重绘均复用同一份 Arc 快捷键表，绑定表重建才替换；Editor 尚未就绪时也包含保存键。`window_normal_launcher_hint_stays_visible_across_unrelated_key_edges` 检查进入时启动键仍按住以及后续 HJKL / Shift / Ctrl 按下、松开均不会丢失 Normal 入口。
+
+帮助面板的运行时测试覆盖 Window / Quick / Editor / Tabs / Restore 在 100%、150%、200% DPI 与两种字号下的边界、标签相交、键帽对齐、完整单行文字和底部模式顺序。`window_return_hint_uses_local_configured_destination_and_physical_alias` 验证返回目标改为 Normal、按键改成 F9 别名后，右上角提示与实际跳转同步。`export_grouped_window_help_visual_samples` 为显式运行的忽略测试，导出当前原生合成器几何到 `target/window-help-v14/`，供字形与版式检查；模拟器分组测试位于 `window-help.test.ts`。
+
 `api/window_layout.rs` 验证比例、空间导入、空区域和最小尺寸；`modes/window/numbering.rs` 与运行时测试覆盖唯一编号立即执行、歧义计时、事务合并及临时模式。网页 `window.test.ts` 验证同一语言。
 
 原生事务探针：`cargo test native_window_layout_transaction_probe -- --ignored --nocapture --test-threads=1`，默认只操作自有窗口；显式设置 `KEYSTEER_PROBE_HWND` 可纳入指定窗口并在断言前恢复。`native_tab_activation_visits_two_windows` 验证多窗口激活与中心位置。macOS 交叉编译不能替代 AX 原生实测。
@@ -250,6 +264,14 @@ exact counts are ignored in ordinary parallel CI and must run alone with
 
 ## 场景边界验证
 
+Tab 回归另覆盖空闲组编号复用、重入不重复分组、失焦后标签栏仍可见、显式选择与普通 Window 切换在隐藏旧成员前转移焦点。Windows 原生探针直接向位置回调交付自有窗口的移动事件，在调用共享 pump 之前验证标签栏已到达新位置；查找/关闭仅使用测试 adapter 返回的自有栏句柄，不按全局类名查找用户窗口。消息唤醒测试验证在开始原生等待前排队的命令唤醒不会丢失。
+
+`worker_exit_keeps_bar_tracking_without_moving_hidden_members` 经真实后台请求队列建立组合、取消模式会话，再连续注入外部移动，验证退出后标签栏继续定位且隐藏成员保持原位置；不能只用组合对象的 `reset()` 测试替代这一生命周期覆盖。
+
+持久 Tab 组的测试分三层：`window_tab_model.rs` 验证成员转换与稳定编号；`window_tabs/tests.rs` 验证自动整理一次撤销、跨会话保留、共享几何/最小化、关闭清理、失败回滚与旧焦点事件不能覆盖点击；Mode/模拟器测试验证连续 `12t34t`、多位数字与空格、组前缀、单成员转移、模板恢复取消和混合文件编解码。混合 Layout/Tabs 的 workspace.ksw fixture 必须在 Rust 与浏览器逐字节往返。
+
+Windows 显式 `native_active_only_tabs_move_switch_dissolve_and_close` 只创建自有临时顶层窗口，验证 40 次活动成员移动时隐藏窗口矩形不变、切换时对齐且可见移动计数不增加（包括隐藏的最大化成员）、重入追加采用最新矩形、原父级/样式保持、关闭独立标签栏恢复成员及活动窗口关闭后的单成员释放。前台权限由测试 adapter 隔离，实际几何/显隐/窗口关系使用 Win32；不能用它代替所有第三方应用焦点和动画验收。macOS 交叉编译检查覆盖恢复后的入口、AX observer 与 AppKit 标签栏；原生动画和应用兼容性仍需 Mac 实机验证。
+
 `tests/architecture_dependencies.rs` 检查 presentation 只依赖 api，Mode/Plugin 不依赖具体 composer，
 且不能直接构造 OverlayLabel、OverlayShape、LabelStyle 等绘制原语。Grid 的注入测试使用替代
 Presenter 验证提交的是原始借用状态，并且最终场景由该端口控制。既有 Grid/Hint/Window/help
@@ -258,6 +280,18 @@ Presenter 验证提交的是原始借用状态，并且最终场景由该端口�
 
 Window 回归应覆盖：E/反引号入口自动布局、撤销入口不再自动重排、A 无双击分支、区域编号原生聚焦、空区定位、X 删除与稳定 ID、Ctrl 短按与长按像素移动及一次撤销、应用最小尺寸边界。Windows ignored `native_maximized_window_can_tile_and_undo` 使用自有临时窗口验证最大化恢复、严格分屏和撤销，不操作用户应用。
 
-独立窗口模式验收还覆盖：Idle 直达五模式、路径无关 Q、自定义目的模式、显式方向／继承／应用覆盖、异步事务交接与备注取消、Restore 成功生命周期和失败重试、Delete 确认／取消／连续删除／稳定 ID／有效空库／外部修改／原子替换失败。网页模拟器移除派生 Normal 方向表，与默认配置同步；保留 KSLAYOUT 格式互导测试。macOS 交叉检查只能证明编译，不能代替原生 UI 验证。
+独立窗口模式验收还覆盖：Idle 直达五模式、路径无关 Q、自定义目的模式、显式方向／继承／应用覆盖、异步事务交接与备注取消、Restore 成功生命周期和失败重试、Delete 确认／取消／连续删除／稳定 ID／有效空库／外部修改／原子替换失败。网页模拟器移除派生 Normal 方向表，与默认配置同步；保留 KSWORKSP 格式互导测试。macOS 交叉检查只能证明编译，不能代替原生 UI 验证。
 
 `native_window_three_state_cycle_and_undo` 是显式 Windows 自有临时窗口验收：连续两轮最大化→最小化→恢复，核对目标身份、原位置/尺寸、指针抑制及两步撤销；不得用用户窗口代替。
+
+窗口历史测试覆盖逐步 Undo/Redo、新操作清空 redo、超过 32 组仍可恢复初始状态、跨窗口最大化/最小化恢复、未修改窗口不被重置、取消保留未处理历史，以及可重绑 Shift+Z/Shift+C、等待编辑完成后重置且不自动重排。显式 `native_window_initial_restore_and_redo` 只创建并操作自有临时 Win32 窗口，验证最小化→初始恢复→撤销→重做。网页测试同步覆盖 Quick/Editor 的入口撤销边界与原始状态恢复。
+
+编号保留回归覆盖同一会话反复最大化→最小化→还原、最小化期间新窗口出现、明确关闭释放和新会话重建。模拟器同时验证最小化编号保留但不进入可选数字索引。
+
+恢复模式提示回归关闭可选 `?` 开关，验证进入按键松开即显示完整提示，强制后续刷新场景相同；自定义修饰键、普通键和链式别名的提示须与实际模式切换一致。网页额外覆盖 Windows/macOS 别名覆盖与配置修改后的重新解析。
+
+区域编辑回归覆盖百次删除／分割复用空号、两轴及两侧选中区域增减、最近相邻区域最小尺寸受限时从其他祖先取空间、平铺面积完整及一次手势撤销。运行时以自定义别名改绑增宽动作，验证实际 ApplyLayout 与提示来自配置表。
+
+Window 入口回归测试 acquire_activates_pointer_target_without_warp_or_geometry_change 验证激活、无鼠标移动及拒绝反馈；close_requests_only_the_target_and_preserves_it_until_application_closes 验证只关闭目标且不提前退役。runtime window_close_uses_default_or_configured_alias_and_editor_keeps_remove_region 覆盖默认 X、自定义 F9 别名、即时提示及 Editor X 隔离。
+
+window_close_resolves_active_tab_and_dissolves_only_after_confirmed_closure 覆盖关闭组代表时实际关闭活动成员、3→2 保留组、2→1 解散/撤栏/显示剩余成员，以及保存取消前成员不变。native_close_request_only_closes_owned_target 已在 Windows 显式执行，只创建/关闭自有临时窗口并验证其他窗口与过期身份。

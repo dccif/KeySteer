@@ -1,41 +1,41 @@
-//! Host-owned layout storage and native note-entry lifecycle.
+//! Host-owned preset storage and native note-entry lifecycle.
 use super::*;
 use crate::api::window_presets::{
-    LayoutLibraryOperation, LayoutLibraryRequest, LayoutLibraryResult, MAX_NOTE_CHARS,
-    RegionTemplate, TextPrompt,
+    MAX_NOTE_CHARS, PresetLibraryOperation, PresetLibraryRequest, PresetLibraryResult, TextPrompt,
+    WindowTemplate,
 };
 
-pub(crate) trait LayoutRepository {
+pub(crate) trait PresetRepository {
     fn delete(
         &mut self,
-        _expected: &crate::api::window_presets::SavedLayout,
-    ) -> Result<Vec<crate::api::window_presets::SavedLayout>, String> {
-        Err("Layout storage is unavailable".into())
+        _expected: &crate::api::window_presets::SavedPreset,
+    ) -> Result<Vec<crate::api::window_presets::SavedPreset>, String> {
+        Err("Preset storage is unavailable".into())
     }
-    fn list(&self) -> Result<Vec<crate::api::window_presets::SavedLayout>, String> {
+    fn list(&self) -> Result<Vec<crate::api::window_presets::SavedPreset>, String> {
         Ok(Vec::new())
     }
     fn save(
         &mut self,
-        _regions: RegionTemplate,
+        _template: WindowTemplate,
         _window_count: usize,
         _note: String,
-    ) -> Result<(u32, Vec<crate::api::window_presets::SavedLayout>), String> {
-        Err("Layout storage is unavailable".into())
+    ) -> Result<(u32, Vec<crate::api::window_presets::SavedPreset>), String> {
+        Err("Preset storage is unavailable".into())
     }
     fn export_file(&self) -> Result<Option<Vec<u8>>, String> {
         Ok(None)
     }
 }
 struct UnavailableRepository;
-impl LayoutRepository for UnavailableRepository {}
+impl PresetRepository for UnavailableRepository {}
 
-pub(super) struct LayoutController {
-    pub(super) store: Box<dyn LayoutRepository>,
+pub(super) struct PresetController {
+    pub(super) store: Box<dyn PresetRepository>,
     pub(super) pending: Option<PendingSave>,
     serial: u64,
 }
-impl Default for LayoutController {
+impl Default for PresetController {
     fn default() -> Self {
         Self {
             store: Box::new(UnavailableRepository),
@@ -48,78 +48,78 @@ pub(super) struct PendingSave {
     pub(super) id: u64,
     pub(super) session: u64,
     pub(super) owner: ModeId,
-    regions: RegionTemplate,
+    template: WindowTemplate,
     window_count: usize,
 }
 impl Engine {
-    pub(crate) fn attach_layout_store(&mut self, store: Box<dyn LayoutRepository>) {
-        self.window_layouts.store = store;
+    pub(crate) fn attach_preset_store(&mut self, store: Box<dyn PresetRepository>) {
+        self.window_presets.store = store;
     }
-    pub(super) fn request_window_layouts(
+    pub(super) fn request_window_presets(
         &mut self,
         owner: &ModeId,
-        request: LayoutLibraryRequest,
+        request: PresetLibraryRequest,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
         match request.operation {
-            LayoutLibraryOperation::Delete { expected } => {
-                let (layouts, message) = match self.window_layouts.store.delete(&expected) {
+            PresetLibraryOperation::Delete { expected } => {
+                let (layouts, message) = match self.window_presets.store.delete(&expected) {
                     Ok(layouts) => (layouts, None),
                     Err(error) => {
-                        crate::report_error!("window-layouts", "{error}");
+                        crate::report_error!("window-presets", "{error}");
                         (
-                            self.window_layouts.store.list().unwrap_or_default(),
+                            self.window_presets.store.list().unwrap_or_default(),
                             Some(error),
                         )
                     }
                 };
                 self.dispatch_owned_to(
                     owner,
-                    ModeEvent::WindowLayouts(Box::new(LayoutLibraryResult {
+                    ModeEvent::WindowPresets(Box::new(PresetLibraryResult {
                         session: request.session,
-                        layouts,
+                        presets: layouts,
                         saved: None,
                         message,
                     })),
                     backend,
                 )
             }
-            LayoutLibraryOperation::List => {
-                let (layouts, message) = match self.window_layouts.store.list() {
+            PresetLibraryOperation::List => {
+                let (layouts, message) = match self.window_presets.store.list() {
                     Ok(layouts) => (layouts, None),
                     Err(error) => {
-                        crate::report_error!("window-layouts", "{error}");
+                        crate::report_error!("window-presets", "{error}");
                         (Vec::new(), Some(error))
                     }
                 };
                 self.dispatch_owned_to(
                     owner,
-                    ModeEvent::WindowLayouts(Box::new(LayoutLibraryResult {
+                    ModeEvent::WindowPresets(Box::new(PresetLibraryResult {
                         session: request.session,
-                        layouts,
+                        presets: layouts,
                         saved: None,
                         message,
                     })),
                     backend,
                 )
             }
-            LayoutLibraryOperation::Save {
-                regions,
+            PresetLibraryOperation::Save {
+                template,
                 window_count,
             } => {
-                if self.window_layouts.pending.is_some() {
+                if self.window_presets.pending.is_some() {
                     return Ok(());
                 }
-                self.window_layouts.serial += 1;
-                let id = self.window_layouts.serial;
-                self.window_layouts.pending = Some(PendingSave {
+                self.window_presets.serial += 1;
+                let id = self.window_presets.serial;
+                self.window_presets.pending = Some(PendingSave {
                     id,
                     session: request.session,
                     owner: owner.clone(),
-                    regions,
+                    template,
                     window_count,
                 });
-                let screen = self.help_screen().ok_or("No display for layout input")?;
+                let screen = self.help_screen().ok_or("No display for preset input")?;
                 let scale = crate::presentation::label_scale(screen.scale);
                 let area = screen.work_area;
                 let width = (720.0 * scale).min(area.width - 24.0 * scale).max(1.0);
@@ -137,9 +137,9 @@ impl Engine {
                 let prompt = TextPrompt {
                     bounds,
                     id,
-                    title: "Save layout".into(),
+                    title: "Save preset".into(),
                     message: format!(
-                        "Optional note · {window_count} windows. Leave blank for an automatic name."
+                        "Optional name · {window_count} windows. Leave blank for an automatic name."
                     ),
                     placeholder: "e.g. Coding / Reading".into(),
                     max_chars: MAX_NOTE_CHARS,
@@ -158,40 +158,40 @@ impl Engine {
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
         if !self
-            .window_layouts
+            .window_presets
             .pending
             .as_ref()
             .is_some_and(|p| p.id == id)
         {
             return Ok(());
         }
-        let Some(pending) = self.window_layouts.pending.take() else {
+        let Some(pending) = self.window_presets.pending.take() else {
             return Ok(());
         };
         let (layouts, saved, message) =
             match value {
-                Ok(Some(note)) => match self.window_layouts.store.save(
-                    pending.regions,
+                Ok(Some(note)) => match self.window_presets.store.save(
+                    pending.template,
                     pending.window_count,
                     note,
                 ) {
                     Ok((id, layouts)) => (layouts, Some(id), None),
                     Err(error) => {
-                        crate::report_error!("window-layouts", "{error}");
+                        crate::report_error!("window-presets", "{error}");
                         (Vec::new(), None, Some(error))
                     }
                 },
                 Ok(None) => (Vec::new(), None, Some("Save cancelled".into())),
                 Err(error) => {
-                    crate::report_error!("window-layouts", "{error}");
+                    crate::report_error!("window-presets", "{error}");
                     (Vec::new(), None, Some(error))
                 }
             };
         self.dispatch_owned_to(
             &pending.owner,
-            ModeEvent::WindowLayouts(Box::new(LayoutLibraryResult {
+            ModeEvent::WindowPresets(Box::new(PresetLibraryResult {
                 session: pending.session,
-                layouts,
+                presets: layouts,
                 saved,
                 message,
             })),

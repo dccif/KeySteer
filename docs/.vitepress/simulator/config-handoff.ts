@@ -3,12 +3,12 @@ const CONFIG_ERROR_PREFIX = '#ks-config-error='
 const MAX_SOURCE_BYTES = 256 * 1024
 const MAX_FRAGMENT_BYTES = 24 * 1024
 const MAX_WORKSPACE_BYTES = 2 * 1024 * 1024
-import { decodeLayoutFile } from './window-presets.ts'
-import type { SavedWindowLayout } from './window-presets.ts'
+import { decodeWorkspaceFile } from './window-presets.ts'
+import type { SavedWindowPreset } from './window-presets.ts'
 
 export type ConfigHandoff =
   | { kind: 'none' }
-  | { kind: 'config'; source: string; layouts?: SavedWindowLayout[]; layoutError?: string }
+  | { kind: 'config'; source: string; presets?: SavedWindowPreset[]; presetError?: string }
   | { kind: 'error'; message: string }
 
 interface BrowserLocation {
@@ -70,11 +70,11 @@ export async function consumeConfigHandoff(
     if (match[1] === 'v2') {
       const workspace = JSON.parse(source)
       if (typeof workspace?.source !== 'string' || new TextEncoder().encode(workspace.source).byteLength > MAX_SOURCE_BYTES) throw new Error('按键配置格式或长度无效')
-      if (workspace.layouts !== null && (typeof workspace.layouts !== 'string' || !/^[A-Za-z0-9_-]+$/.test(workspace.layouts))) throw new Error('布局传递格式无效')
-      if (workspace.layout_error !== null && typeof workspace.layout_error !== 'string') throw new Error('布局状态无效')
+      if (workspace.presets !== null && (typeof workspace.presets !== 'string' || !/^[A-Za-z0-9_-]+$/.test(workspace.presets))) throw new Error('预设传递格式无效')
+      if (workspace.preset_error !== null && typeof workspace.preset_error !== 'string') throw new Error('预设状态无效')
       return { kind: 'config', source: workspace.source,
-        ...(workspace.layouts === null ? {} : { layouts: decodeLayoutFile(decodeBase64Url(workspace.layouts)) }),
-        ...(workspace.layout_error === null ? {} : { layoutError: workspace.layout_error }) }
+        ...(workspace.presets === null ? {} : { presets: decodeWorkspaceFile(decodeBase64Url(workspace.presets)) }),
+        ...(workspace.preset_error === null ? {} : { presetError: workspace.preset_error }) }
     }
     return {
       kind: 'config',

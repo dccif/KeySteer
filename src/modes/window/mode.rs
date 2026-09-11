@@ -8,7 +8,7 @@ pub enum WindowKind {
     Quick,
     Editor,
     Restore,
-    Delete,
+    Tab,
 }
 
 impl WindowKind {
@@ -18,11 +18,11 @@ impl WindowKind {
             Self::Quick => ModeId::window_quick(),
             Self::Editor => ModeId::window_editor(),
             Self::Restore => ModeId::window_restore(),
-            Self::Delete => ModeId::window_delete(),
+            Self::Tab => ModeId::window_tab(),
         }
     }
     pub fn is_library(self) -> bool {
-        matches!(self, Self::Restore | Self::Delete)
+        matches!(self, Self::Restore)
     }
 }
 
@@ -72,8 +72,14 @@ impl Mode for WindowMode {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         session.preserve_session = target.is_window();
+        if session.kind == WindowKind::Tab
+            && (session.tabs.in_flight.is_some() || !session.tabs.queue.is_empty())
+        {
+            session.pending_transition = Some(target.clone());
+            session.pending_handoff = true;
+            return Some(CommandBatch::new());
+        }
         let keep_edit = target == &ModeId::window_restore()
-            || target == &ModeId::window_delete()
             || (target == &ModeId::window_editor()
                 && session
                     .edit
@@ -113,17 +119,33 @@ impl Mode for WindowMode {
             .session
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut scope_changed = false;
         if matches!(
             event,
             ModeEvent::Activated { .. } | ModeEvent::Pushed { .. } | ModeEvent::Restarted
         ) {
+            scope_changed = session.settings.all_screens != self.settings.all_screens
+                || session.settings.include_minimized != self.settings.include_minimized;
             session.kind = self.kind;
             session.settings = self.settings.clone();
+            if scope_changed {
+                session.inventory_dirty = true;
+                session.numbers.clear();
+                session.next_number = 1;
+                session.rebuild_numbers();
+            }
         } else if session.kind != self.kind {
             return CommandBatch::new();
         }
-        let mut out = session.handle_owned(event, ctx);
+        let mut out = CommandBatch::new();
+        if scope_changed && session.session != 0 {
+            session.refresh_pending = None;
+            session.refresh(&mut out);
+        }
+        out.extend(session.handle_owned(event, ctx));
         if session.pending_handoff
+            && session.tabs.in_flight.is_none()
+            && session.tabs.queue.is_empty()
             && session
                 .edit
                 .as_ref()
@@ -150,6 +172,9 @@ impl Mode for WindowMode {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .available_keys()
+    }
+    fn window_action_supported(&self, action: &W) -> bool {
+        self.kind.supports_action(action)
     }
     fn window_action_available(&self, action: &W) -> bool {
         self.session
@@ -191,6 +216,7 @@ impl WindowSession {
         }
         self.enter_pending = false;
         match self.kind {
+            WindowKind::Tab => self.enter_tabs(out),
             WindowKind::Quick if self.edit.is_none() => self.start_edit(false, ctx, out),
             WindowKind::Editor if self.edit.is_none() => self.start_edit(true, ctx, out),
             _ => {}

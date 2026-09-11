@@ -51,6 +51,7 @@ const PARTIAL_BATCH_SIZE: usize = 24;
 const MAX_TARGETS: usize = 2_000;
 const MAX_VISITED_ELEMENTS: usize = 20_000;
 const MAX_SCAN_WINDOWS: usize = 16;
+const MAX_SCREEN_WINDOWS: usize = 64;
 type InlineScanWindows = SmallVec<[ScanWindow; MAX_SCAN_WINDOWS]>;
 type InlineOccluders = SmallVec<[Rect; MAX_SCAN_WINDOWS]>;
 const MINIMUM_SPACING: f64 = 8.0;
@@ -564,6 +565,13 @@ impl WindowsScanPlan {
     }
 
     pub(super) fn target_is_current(&self) -> bool {
+        if self.scope == crate::api::UiScanScope::Screen {
+            return self.windows.iter().all(|window| {
+                scannable_target(window.hwnd()).is_some()
+                    && window_bounds(window.hwnd()).and_then(|b| b.intersect(&self.scan_bounds))
+                        == Some(window.bounds)
+            });
+        }
         let target_hwnd = self.target_hwnd();
         if target_hwnd.is_invalid() || !super::native::is_window(target_hwnd) {
             return false;
@@ -583,6 +591,9 @@ impl WindowsScanPlan {
 
     pub(super) fn target_center_is_visible(&self, target: &UiTarget) -> bool {
         let center = target.rect.center();
+        if self.scope == crate::api::UiScanScope::Screen {
+            return self.scan_bounds.contains(&center);
+        }
         self.windows.iter().any(|window| {
             window.bounds.contains(&center)
                 && !self
@@ -665,7 +676,7 @@ pub(super) fn window_bounds(hwnd: HWND) -> Option<Rect> {
     rect_from_native(rect)
 }
 
-fn is_cloaked(hwnd: HWND) -> bool {
+pub(super) fn is_cloaked(hwnd: HWND) -> bool {
     let mut cloaked = 0u32;
     // SAFETY: `cloaked` is a correctly sized writable out-buffer and `hwnd` is
     // borrowed only for this synchronous DWM query.
@@ -717,6 +728,13 @@ fn normalize_root_owner(hwnd: HWND) -> HWND {
 }
 
 pub(super) fn scannable_target(hwnd: HWND) -> Option<(HWND, u32, Rect)> {
+    ordinary_window_target(hwnd, false)
+}
+
+pub(super) fn ordinary_window_target(
+    hwnd: HWND,
+    include_minimized: bool,
+) -> Option<(HWND, u32, Rect)> {
     let hwnd = normalize_root_owner(hwnd);
     let desktop = super::native::desktop_window();
     let valid = super::native::is_window(hwnd);
@@ -724,7 +742,7 @@ pub(super) fn scannable_target(hwnd: HWND) -> Option<(HWND, u32, Rect)> {
         || hwnd == desktop
         || !valid
         || !super::native::is_window_visible(hwnd)
-        || super::native::is_window_iconic(hwnd)
+        || (!include_minimized && super::native::is_window_iconic(hwnd))
         || is_cloaked(hwnd)
         || super::native::window_long(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TRANSPARENT.0 != 0
         || class_name_is_shell_surface(hwnd)
@@ -935,6 +953,7 @@ fn foreground_and_popup_windows(
 
 struct ZOrderCollector {
     candidates: SmallVec<[HWND; MAX_SCAN_WINDOWS]>,
+    full_screen: bool,
     scan_bounds: Rect,
     own_process_id: u32,
     scan_windows: InlineScanWindows,
@@ -964,7 +983,17 @@ extern "system" fn collect_z_order_window(hwnd: HWND, _data: LPARAM) -> BOOL {
             return BOOL(1);
         };
 
-        let candidate = collector.candidates.contains(&hwnd);
+        let limit = if collector.full_screen {
+            MAX_SCREEN_WINDOWS
+        } else {
+            MAX_SCAN_WINDOWS
+        };
+        let candidate = collector.occluders.len() < limit
+            && collector.scan_windows.len() < limit
+            && (collector.candidates.contains(&hwnd)
+                || collector.full_screen
+                    && !class_name_is_shell_surface(hwnd)
+                    && scannable_target(hwnd).is_some());
         if candidate {
             collector.scan_windows.push(ScanWindow {
                 hwnd: hwnd.0 as isize,
@@ -978,7 +1007,7 @@ extern "system" fn collect_z_order_window(hwnd: HWND, _data: LPARAM) -> BOOL {
         // Our click-through overlay was already skipped above. Ignore any other
         // helper/tray HWND owned by this process so it cannot hide application UI.
         if (candidate || process_id != collector.own_process_id)
-            && collector.occluders.len() < MAX_SCAN_WINDOWS
+            && collector.occluders.len() < limit
         {
             collector.occluders.push(bounds_in_scan);
         }
@@ -990,9 +1019,15 @@ fn scan_windows_in_z_order(
     foreground: HWND,
     scan_bounds: Rect,
 ) -> Result<(InlineScanWindows, InlineOccluders), String> {
-    let candidates = foreground_and_popup_windows(foreground)?;
+    let full_screen = foreground.is_invalid();
+    let candidates = if full_screen {
+        SmallVec::new()
+    } else {
+        foreground_and_popup_windows(foreground)?
+    };
     let collector = ZOrderCollector {
         candidates,
+        full_screen,
         scan_bounds,
         own_process_id: super::native::current_process_id(),
         scan_windows: SmallVec::new(),
@@ -1011,6 +1046,21 @@ fn scan_windows_in_z_order(
 pub(super) fn build_scan_plan(
     request: UiScanRequest,
 ) -> Result<Option<Arc<WindowsScanPlan>>, String> {
+    if request.scope == crate::api::UiScanScope::Screen {
+        let bounds = request
+            .bounds
+            .ok_or("screen scan requires display bounds")?;
+        let (windows, occluders) = scan_windows_in_z_order(HWND::default(), bounds)?;
+        return Ok(Some(Arc::new(WindowsScanPlan {
+            request,
+            target_hwnd: 0,
+            target_process_id: 0,
+            target_bounds: bounds,
+            scan_bounds: bounds,
+            windows,
+            occluders,
+        })));
+    }
     let Some((target_hwnd, target_process_id, target_bounds)) = window_under_pointer()? else {
         return Ok(None);
     };
@@ -1057,7 +1107,7 @@ fn stream_scan(
     shared: &SharedQueue,
 ) -> Result<UiScanStatus, String> {
     let hwnd = job.request.target_hwnd();
-    if hwnd.is_invalid() {
+    if hwnd.is_invalid() && job.request.scope != crate::api::UiScanScope::Screen {
         return Ok(UiScanStatus::Success);
     }
     let cache = &query_plan.cache;
@@ -1163,7 +1213,12 @@ fn stream_scan(
                 &allowed,
                 scan_bounds,
                 provider_filters_interactive,
-            ) && job.request.target_center_is_visible(&target)
+            ) && window.bounds.contains(&target.rect.center())
+                && !job
+                    .request
+                    .window_occluders(window)
+                    .iter()
+                    .any(|rect| rect.contains(&target.rect.center()))
                 && deduper.insert(&target)
             {
                 target_count += 1;
@@ -1183,6 +1238,9 @@ fn stream_scan(
         }
     }
     if !queried_window {
+        if job.request.windows().is_empty() {
+            return Ok(UiScanStatus::Success);
+        }
         if provider_timed_out {
             return Ok(UiScanStatus::TimedOut);
         }
@@ -1880,6 +1938,7 @@ mod tests {
         let bounds = Rect::new(0.0, 0.0, 200.0, 100.0);
         let item = target(20.0, 20.0, "Save", "button");
         let mut plan = test_scan_plan(UiScanRequest {
+            scope: crate::api::UiScanScope::Window,
             id: 1,
             timeout_ms: 1_000,
             bounds: Some(bounds),
@@ -1921,6 +1980,7 @@ mod tests {
     #[ignore = "global allocation counter requires --test-threads=1; ordinary CI checks structural invariants"]
     fn shared_scan_plan_has_one_generation_allocation() {
         let request = UiScanRequest {
+            scope: crate::api::UiScanScope::Window,
             id: 2,
             timeout_ms: 1_000,
             bounds: Some(Rect::new(0.0, 0.0, 1_920.0, 1_080.0)),
@@ -1942,6 +2002,7 @@ mod tests {
     #[test]
     fn shared_scan_plan_uses_one_arc_and_inline_common_snapshots() {
         let request = UiScanRequest {
+            scope: crate::api::UiScanScope::Window,
             id: 2,
             timeout_ms: 1_000,
             bounds: Some(Rect::new(0.0, 0.0, 1_920.0, 1_080.0)),

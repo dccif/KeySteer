@@ -571,6 +571,7 @@ impl WindowContent {
                 color,
                 width,
                 z_index,
+                ..
             } => {
                 if color.is_transparent() || *width <= 0.0 {
                     layer.setHidden(true);

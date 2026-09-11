@@ -1,4 +1,4 @@
-//! One-shot handoff of active TOML and optional compact layouts to the web simulator.
+//! One-shot handoff of active TOML and optional compact presets to the web simulator.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -26,8 +26,8 @@ pub(super) fn url_for_config(source: &str) -> String {
     format!("{SIMULATOR_URL}#{fragment}")
 }
 
-pub(super) fn url_for_workspace(source: &str, layouts: Result<Option<Vec<u8>>, String>) -> String {
-    if matches!(&layouts, Ok(None)) {
+pub(super) fn url_for_workspace(source: &str, presets: Result<Option<Vec<u8>>, String>) -> String {
+    if matches!(&presets, Ok(None)) {
         return url_for_config(source);
     }
     if source.len() > MAX_SOURCE_BYTES {
@@ -36,18 +36,18 @@ pub(super) fn url_for_workspace(source: &str, layouts: Result<Option<Vec<u8>>, S
     #[derive(serde::Serialize)]
     struct Workspace<'a> {
         source: &'a str,
-        layouts: Option<String>,
-        layout_error: Option<String>,
+        presets: Option<String>,
+        preset_error: Option<String>,
     }
-    let (layouts, layout_error) = match layouts {
+    let (presets, preset_error) = match presets {
         Ok(Some(bytes)) => (Some(URL_SAFE_NO_PAD.encode(bytes)), None),
         Err(error) => (None, Some(error)),
         Ok(None) => (None, None),
     };
     let Ok(bytes) = serde_json::to_vec(&Workspace {
         source,
-        layouts,
-        layout_error,
+        presets,
+        preset_error,
     }) else {
         return format!("{SIMULATOR_URL}#ks-config-error=too-large");
     };
@@ -68,7 +68,7 @@ mod tests {
     use miniz_oxide::inflate::decompress_to_vec_zlib;
     #[test]
     fn workspace_handoff_carries_the_exact_layout_file_and_config_together() {
-        let file = include_bytes!("../../../tests/fixtures/window-layouts-v1.kslayout");
+        let file = include_bytes!("../../../tests/fixtures/workspace.ksw");
         let source = "# preserved comment\n[normal.bindings]\nh = \"move_left\"\n";
         let url = url_for_workspace(source, Ok(Some(file.to_vec())));
         let payload = url
@@ -83,11 +83,11 @@ mod tests {
         assert_eq!(document["source"], source);
         assert_eq!(
             URL_SAFE_NO_PAD
-                .decode(document["layouts"].as_str().unwrap())
+                .decode(document["presets"].as_str().unwrap())
                 .unwrap(),
             file
         );
-        assert!(document["layout_error"].is_null());
+        assert!(document["preset_error"].is_null());
         assert_eq!(url_for_workspace(source, Ok(None)), url_for_config(source));
     }
 

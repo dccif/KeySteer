@@ -2,7 +2,7 @@
 //! released on its thread; only API values enter the engine's event queue.
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::{window_geometry as geometry, window_placement};
@@ -20,6 +20,97 @@ pub(crate) struct Snapshot {
 }
 
 pub(crate) trait WindowAccess {
+    fn set_scope(&mut self, _scope: Option<crate::api::window::WindowScope>, _reset: bool) {}
+    /// Optional native message-loop wakeup, created on the worker thread.
+    fn event_waker(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        None
+    }
+    /// Wait for native events or the mailbox wakeup. False uses the portable condvar.
+    fn wait_for_events(&self, _timeout: Option<Duration>) -> bool {
+        false
+    }
+    /// Hide a single application window without changing its parent.
+    fn tab_set_hidden(&mut self, _id: WindowId, _hidden: bool) -> Result<(), String> {
+        Ok(())
+    }
+    /// Validate queued focus notifications against the current foreground window.
+    fn tab_selected(&self, _id: WindowId) -> bool {
+        true
+    }
+    fn activate_window(
+        &mut self,
+        id: WindowId,
+        _screens: &[Screen],
+        _cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), String> {
+        self.select(id)
+    }
+    fn tab_operation(
+        &mut self,
+        _operation: crate::api::window_tabs::TabOperation,
+        _screens: &[Screen],
+        _cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), String> {
+        Err("Window tab groups are unavailable on this backend".into())
+    }
+    fn tab_state(&self) -> Option<crate::api::window_tabs::TabState> {
+        None
+    }
+    fn tab_eligible(&self, id: WindowId, screens: &[Screen]) -> Result<(), String> {
+        let window = self.snapshot(id, screens)?.info;
+        if !window.resizable || window.fullscreen {
+            return Err("Only ordinary resizable windows can join a tab group".into());
+        }
+        Ok(())
+    }
+    fn tab_application(&self, id: WindowId, screens: &[Screen]) -> Result<String, String> {
+        Ok(self.snapshot(id, screens)?.info.app)
+    }
+    fn tab_events(&mut self) -> Vec<crate::api::window_tabs::TabNativeEvent> {
+        Vec::new()
+    }
+    fn tab_watch(&mut self, _ids: &[WindowId]) -> Result<(), String> {
+        Ok(())
+    }
+    fn tab_bars(&mut self, _bars: &[crate::api::window_tabs::TabBar]) -> Result<(), String> {
+        Ok(())
+    }
+    fn tab_visible(&self, _id: WindowId) -> bool {
+        true
+    }
+    /// Occupied header height in this backend's screen coordinate system.
+    /// Headless adapters have no native strip.
+    fn tab_bar_height(&self, _screen: &Screen) -> f64 {
+        0.0
+    }
+    /// Minimize a member without restoring or moving an inactive window first.
+    fn tab_minimize(
+        &mut self,
+        id: WindowId,
+        screens: &[Screen],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), String> {
+        let mut snapshot = self.snapshot(id, screens)?;
+        if !snapshot.info.minimized {
+            snapshot.info.minimized = true;
+            self.restore(&snapshot, screens, cancelled)?;
+        }
+        Ok(())
+    }
+    /// Reserve strip space after an external move/maximize, preserving state
+    /// where the platform supports resizing a maximized window in place.
+    fn tab_fit_frame(
+        &mut self,
+        id: WindowId,
+        bounds: Rect,
+        screens: &[Screen],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<WindowInfo, String> {
+        self.set_frame(id, bounds, screens, cancelled)
+    }
+    fn layout_representative(&self, id: WindowId) -> WindowId {
+        id
+    }
     fn acquire(&mut self, point: Point, screens: &[Screen]) -> Result<Option<WindowInfo>, String>;
     fn enumerate(
         &mut self,
@@ -47,6 +138,9 @@ pub(crate) trait WindowAccess {
         cancelled: &dyn Fn() -> bool,
     ) -> Result<WindowInfo, String>;
     fn select(&self, id: WindowId) -> Result<(), String>;
+    fn close(&self, _id: WindowId) -> Result<(), String> {
+        Err("Closing windows is unavailable on this backend".into())
+    }
     fn pointer(&self) -> Result<Point, String>;
     fn minimum_size(&self, _id: WindowId) -> Point {
         Point::new(100.0, 80.0)
@@ -82,6 +176,19 @@ struct Mailbox {
     cancel_before: AtomicU64,
     query_before: AtomicU64,
     stop: AtomicBool,
+    native_waker: OnceLock<Arc<dyn Fn() + Send + Sync>>,
+    native_waiting: AtomicBool,
+}
+
+impl Mailbox {
+    fn notify(&self) {
+        self.ready.notify_one();
+        if self.native_waiting.load(Ordering::Acquire)
+            && let Some(wake) = self.native_waker.get()
+        {
+            wake();
+        }
+    }
 }
 
 pub(crate) struct WindowWorker {
@@ -100,12 +207,44 @@ impl WindowWorker {
             "window-manager",
             std::thread::Builder::new().name("keysteer-window".into()),
             move || {
-                let mut access = create();
+                let native = create();
+                if let Some(wake) = native.event_waker() {
+                    let _ = input.native_waker.set(wake);
+                }
+                let mut access = super::window_tabs::Grouped::new(native);
                 let mut session = Session::default();
+                let mut displays = Vec::new();
                 loop {
+                    if access.persistent()
+                        && let Err(error) =
+                            access.pump(&displays, &|| input.stop.load(Ordering::Acquire))
+                    {
+                        emit(BackendEvent::Warning(format!("window tabs: {error}")));
+                    }
                     let pending = {
                         let mut queue = input.queue.lock().unwrap_or_else(|e| e.into_inner());
                         while queue.is_empty() && !input.stop.load(Ordering::Acquire) {
+                            if access.persistent() {
+                                // Release the mailbox before native waiting. A
+                                // posted wake remains queued even if submission
+                                // races with entering the wait.
+                                if input.native_waker.get().is_some() {
+                                    input.native_waiting.store(true, Ordering::Release);
+                                    drop(queue);
+                                    if !input.stop.load(Ordering::Acquire) {
+                                        access.wait_for_events(None);
+                                    }
+                                    input.native_waiting.store(false, Ordering::Release);
+                                    queue = input.queue.lock().unwrap_or_else(|e| e.into_inner());
+                                    break;
+                                }
+                                queue = input
+                                    .ready
+                                    .wait_timeout(queue, Duration::from_millis(20))
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .0;
+                                break;
+                            }
                             queue = input.ready.wait(queue).unwrap_or_else(|e| e.into_inner());
                         }
                         if input.stop.load(Ordering::Acquire) {
@@ -138,6 +277,9 @@ impl WindowWorker {
                         }
                         continue;
                     }
+                    // Cancellation wakeups carry no displays. Only accepted
+                    // requests may replace the persistent groups' geometry context.
+                    displays.clone_from(&pending.screens);
                     if session.id != id {
                         session.cleanup_edit(&mut access);
                         access.reset();
@@ -163,7 +305,7 @@ impl WindowWorker {
                     }
                 }
                 session.cleanup_edit(&mut access);
-                access.reset();
+                access.shutdown();
             },
         )?;
         Ok(Self { mailbox, worker })
@@ -279,7 +421,7 @@ impl WindowWorker {
             screens: screens.to_vec(),
         });
         drop(queue);
-        self.mailbox.ready.notify_one();
+        self.mailbox.notify();
         Ok(())
     }
 
@@ -299,13 +441,14 @@ impl WindowWorker {
             // snapshots immediately, including when no operation is active.
             queue.push_back(Pending {
                 request: WindowRequest {
+                    scope: None,
                     session,
                     id: 0,
                     operation: WindowOperation::Enumerate,
                 },
                 screens: Vec::new(),
             });
-            self.mailbox.ready.notify_one();
+            self.mailbox.notify();
         }
     }
 
@@ -313,7 +456,7 @@ impl WindowWorker {
         let guard = self.mailbox.queue.lock().unwrap_or_else(|e| e.into_inner());
         self.mailbox.stop.store(true, Ordering::Release);
         drop(guard);
-        self.mailbox.ready.notify_one();
+        self.mailbox.notify();
         self.worker.join_until(deadline)
     }
 }
@@ -323,7 +466,7 @@ impl Drop for WindowWorker {
         let guard = self.mailbox.queue.lock().unwrap_or_else(|e| e.into_inner());
         self.mailbox.stop.store(true, Ordering::Release);
         drop(guard);
-        self.mailbox.ready.notify_one();
+        self.mailbox.notify();
         if !self.worker.shutdown_failure_was_returned()
             && let Err(error) = self.worker.join_timeout(Duration::from_secs(2))
         {
@@ -334,9 +477,13 @@ impl Drop for WindowWorker {
 
 #[derive(Default)]
 struct Session {
+    scope: Option<crate::api::window::WindowScope>,
     id: u64,
     target: Option<WindowId>,
     history: VecDeque<(u64, Vec<Snapshot>)>,
+    redo: VecDeque<(u64, Vec<Snapshot>)>,
+    initial: std::collections::BTreeMap<WindowId, Snapshot>,
+    changed_windows: std::collections::BTreeSet<WindowId>,
     cycle: Vec<WindowId>,
     edit: Option<EditTransaction>,
     screens: Vec<Screen>,
@@ -359,6 +506,14 @@ fn rect_matches(a: Rect, b: Rect) -> bool {
         && (a.y - b.y).abs() <= 1.5
         && (a.width - b.width).abs() <= 1.5
         && (a.height - b.height).abs() <= 1.5
+}
+
+fn same_placement(a: &Snapshot, b: &Snapshot) -> bool {
+    rect_matches(a.info.bounds, b.info.bounds)
+        && a.info.maximized == b.info.maximized
+        && a.info.minimized == b.info.minimized
+        && a.info.fullscreen == b.info.fullscreen
+        && rect_matches(a.restored, b.restored)
 }
 
 /// Let explicit native probes exercise the actual transaction implementation
@@ -391,6 +546,7 @@ impl WindowSessionProbe {
         self.session.execute(
             access,
             WindowRequest {
+                scope: None,
                 session: 1,
                 id: self.request,
                 operation,
@@ -402,6 +558,16 @@ impl WindowSessionProbe {
 }
 
 impl Session {
+    fn enumerate(
+        &self,
+        access: &mut impl WindowAccess,
+        screens: &[Screen],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<WindowInfo>, String> {
+        let mut windows = access.enumerate(screens, cancelled)?;
+        windows.retain(|window| self.scope.is_none_or(|scope| scope.contains(window)));
+        Ok(windows)
+    }
     fn cleanup_edit(&mut self, _access: &mut impl WindowAccess) {
         // Applied changes are final. Teardown releases checkpoints without
         // sending old geometry back to applications or delaying the next session.
@@ -431,6 +597,11 @@ impl Session {
     }
 
     fn remember(&mut self, group: u64, before: Snapshot) {
+        self.initial
+            .entry(before.info.id)
+            .or_insert_with(|| before.clone());
+        self.changed_windows.insert(before.info.id);
+        self.redo.clear();
         if self.history.back().is_none_or(|(g, _)| *g != group) {
             if self.history.len() == 32 {
                 self.history.pop_front();
@@ -442,6 +613,83 @@ impl Session {
         {
             snapshots.push(before);
         }
+    }
+
+    fn capture_initial(&mut self, access: &impl WindowAccess, id: WindowId, screens: &[Screen]) {
+        if let std::collections::btree_map::Entry::Vacant(entry) = self.initial.entry(id)
+            && let Ok(snapshot) = access.snapshot(id, screens)
+        {
+            entry.insert(snapshot);
+        }
+    }
+
+    fn push_history(
+        stack: &mut VecDeque<(u64, Vec<Snapshot>)>,
+        group: u64,
+        snapshots: Vec<Snapshot>,
+    ) {
+        if snapshots.is_empty() {
+            return;
+        }
+        if stack.len() == 32 {
+            stack.pop_front();
+        }
+        stack.push_back((group, snapshots));
+    }
+
+    // Return inverse snapshots for every actual native change, and retain
+    // uncompleted work so cancellation or a refused write can be retried.
+    fn restore_snapshots(
+        access: &mut impl WindowAccess,
+        mut snapshots: Vec<Snapshot>,
+        screens: &[Screen],
+        cancelled: &dyn Fn() -> bool,
+        result: &mut WindowResult,
+    ) -> (Vec<Snapshot>, Vec<Snapshot>) {
+        let mut inverse = Vec::new();
+        let mut remaining = Vec::new();
+        // One geometry operation per live group, preferring its stable anchor.
+        snapshots.sort_by_key(|s| access.layout_representative(s.info.id) != s.info.id);
+        let mut represented = std::collections::BTreeSet::new();
+        snapshots.retain(|s| represented.insert(access.layout_representative(s.info.id)));
+        while let Some(desired) = snapshots.pop() {
+            if cancelled() {
+                snapshots.push(desired);
+                remaining.extend(snapshots);
+                break;
+            }
+            let Ok(before) = access.snapshot(desired.info.id, screens) else {
+                remaining.push(desired);
+                result.skipped += 1;
+                continue;
+            };
+            if same_placement(&before, &desired) {
+                continue;
+            }
+            let applied = access.restore(&desired, screens, cancelled);
+            let after = access.snapshot(desired.info.id, screens);
+            if let Ok(after) = &after {
+                if !same_placement(&before, after) {
+                    inverse.push(before);
+                    result.changed += 1;
+                }
+                if same_placement(after, &desired) {
+                    continue;
+                }
+            } else {
+                // The write may have succeeded before the read timed out.
+                // Keep its inverse without claiming an observed state change.
+                inverse.push(before);
+            }
+            remaining.push(desired);
+            result.skipped += 1;
+            if let Err(error) = applied
+                && !cancelled()
+            {
+                crate::report_error!("window-worker", "restore history: {error}");
+            }
+        }
+        (inverse, remaining)
     }
 
     fn execute(
@@ -456,8 +704,14 @@ impl Session {
             self.screens.clear();
             self.screens.extend_from_slice(screens);
         }
+        access.set_scope(
+            request.scope,
+            matches!(request.operation, WindowOperation::Acquire(_)),
+        );
+        self.scope = request.scope;
         self.error = None;
         let mut result = WindowResult {
+            tabs: None,
             session: request.session,
             id: request.id,
             target: None,
@@ -501,6 +755,8 @@ impl Session {
         if !result.closed.is_empty() {
             for id in &result.closed {
                 self.minimums.remove(id);
+                self.initial.remove(id);
+                self.changed_windows.remove(id);
             }
             if self
                 .resize_minimum
@@ -509,10 +765,11 @@ impl Session {
                 self.resize_minimum = None;
             }
             self.cycle.retain(|id| !result.closed.contains(id));
-            for (_, before) in &mut self.history {
+            for (_, before) in self.history.iter_mut().chain(self.redo.iter_mut()) {
                 before.retain(|s| !result.closed.contains(&s.info.id));
             }
             self.history.retain(|(_, before)| !before.is_empty());
+            self.redo.retain(|(_, before)| !before.is_empty());
             if let Some(edit) = &mut self.edit {
                 edit.before.retain(|s| !result.closed.contains(&s.info.id));
                 edit.minimums.retain(|(id, _)| !result.closed.contains(id));
@@ -521,6 +778,7 @@ impl Session {
         if result.target.is_none() {
             self.target = None;
         }
+        result.tabs = access.tab_state();
         result
     }
 
@@ -533,24 +791,56 @@ impl Session {
         result: &mut WindowResult,
     ) -> Result<(), String> {
         match operation {
+            WindowOperation::Tabs(operation) => {
+                // Pooled group constraints change when members move or dissolve.
+                // Re-query before the next edit instead of retaining old limits.
+                self.minimums.clear();
+                let outcome = access.tab_operation(operation, screens, cancelled);
+                if let Some(state) = access.tab_state() {
+                    self.target = state.active.or(self.target);
+                }
+                result.windows = Some(self.enumerate(access, screens, cancelled)?);
+                outcome?;
+            }
             WindowOperation::CancelPending => {}
             WindowOperation::Acquire(point) => {
                 self.target = access.acquire(point, screens)?.map(|w| w.id);
+                if let Some(id) = self.target {
+                    self.capture_initial(access, id, screens);
+                    if !cancelled() {
+                        access.activate_window(id, screens, cancelled)?;
+                    }
+                }
+            }
+            WindowOperation::Close(id) => {
+                if !cancelled() {
+                    access.close(id)?;
+                    result.message = Some("Close requested".into());
+                }
             }
             WindowOperation::Enumerate => {
-                result.windows = Some(access.enumerate(screens, cancelled)?);
+                let windows = self.enumerate(access, screens, cancelled)?;
+                for window in &windows {
+                    if cancelled() {
+                        break;
+                    }
+                    self.capture_initial(access, window.id, screens);
+                }
+                result.windows = Some(windows);
             }
             WindowOperation::Select(id) => {
+                self.capture_initial(access, id, screens);
                 access.snapshot(id, screens)?;
-                result.message = access.select(id).err();
+                result.message = access.activate_window(id, screens, cancelled).err();
                 self.error.clone_from(&result.message);
                 let after = access.snapshot(id, screens)?;
                 self.target = Some(id);
                 result.pointer = Some(after.info.bounds.center());
                 result.target = Some(after.info);
             }
-            WindowOperation::Cycle => {
-                let windows = access.enumerate(screens, cancelled)?;
+            WindowOperation::Cycle | WindowOperation::CyclePrevious => {
+                let backwards = matches!(operation, WindowOperation::CyclePrevious);
+                let windows = self.enumerate(access, screens, cancelled)?;
                 result.windows = Some(windows.clone());
                 if cancelled() {
                     return Ok(());
@@ -567,15 +857,33 @@ impl Session {
                 if self.cycle.is_empty() {
                     return Err("No ordinary windows available".into());
                 }
-                let start = self
-                    .target
-                    .and_then(|id| self.cycle.iter().position(|v| *v == id))
-                    .map_or(0, |index| (index + 1) % self.cycle.len());
-                for offset in 0..self.cycle.len() {
+                let grouped = access.tab_state().and_then(|state| {
+                    let group = state.containing(self.target?)?;
+                    Some((group.active, group.members.clone()))
+                });
+                let cycle = grouped
+                    .as_ref()
+                    .map_or(self.cycle.as_slice(), |(_, members)| members.as_slice());
+                let current = grouped.as_ref().map(|(active, _)| *active).or(self.target);
+                let start = current
+                    .and_then(|id| cycle.iter().position(|v| *v == id))
+                    .map_or(0, |index| {
+                        if backwards {
+                            (index + cycle.len() - 1) % cycle.len()
+                        } else {
+                            (index + 1) % cycle.len()
+                        }
+                    });
+                for offset in 0..cycle.len() {
                     if cancelled() {
                         return Ok(());
                     }
-                    let id = self.cycle[(start + offset) % self.cycle.len()];
+                    let index = if backwards {
+                        (start + cycle.len() - offset) % cycle.len()
+                    } else {
+                        (start + offset) % cycle.len()
+                    };
+                    let id = cycle[index];
                     if access.snapshot(id, screens).is_err() {
                         result.skipped += 1;
                         continue;
@@ -583,7 +891,7 @@ impl Session {
                     // Focus permission is independent of the selected target.
                     // Do not silently cycle all the way back to the old window
                     // when the OS denies foreground activation.
-                    let activation = access.select(id);
+                    let activation = access.activate_window(id, screens, cancelled);
                     if let Ok(after) = access.snapshot(id, screens) {
                         self.target = Some(id);
                         result.pointer = Some(after.info.bounds.center());
@@ -606,10 +914,17 @@ impl Session {
                     return Err("Finish the current window edit first".into());
                 }
                 let inventory = if let Some(screen) = screen {
-                    let windows = access.enumerate(screens, cancelled)?;
+                    let windows = self.enumerate(access, screens, cancelled)?;
                     targets = windows
                         .iter()
-                        .filter(|w| w.screen == screen && w.resizable && !w.fullscreen)
+                        .filter(|w| {
+                            (self.scope.is_some_and(|scope| scope.screen.is_none())
+                                || w.screen == screen)
+                                && self.scope.is_none_or(|scope| scope.contains(w))
+                                && w.resizable
+                                && !w.fullscreen
+                        })
+                        .filter(|w| access.layout_representative(w.id) == w.id)
                         .map(|w| w.id)
                         .collect();
                     Some(windows)
@@ -626,6 +941,7 @@ impl Session {
                         continue;
                     }
                     if let Ok(snapshot) = access.snapshot(id, screens) {
+                        self.initial.entry(id).or_insert_with(|| snapshot.clone());
                         let queried = access.minimum_size(id);
                         let cached = self.minimums.entry(id).or_insert(queried);
                         *cached = Point::new(cached.x.max(queried.x), cached.y.max(queried.y));
@@ -655,6 +971,7 @@ impl Session {
                 });
             }
             WindowOperation::ApplyLayout {
+                additional_screens,
                 transaction,
                 revision,
                 screen,
@@ -677,51 +994,65 @@ impl Session {
                     return Err("Stale layout revision".into());
                 }
                 edit.revision = revision;
-                let display = screens.get(screen).ok_or("display is unavailable")?;
-                let gap = gap * access.logical_scale(display);
-                let mut batch = Vec::with_capacity(placements.len());
-                for (id, rect) in placements {
-                    if cancelled() {
-                        return Ok(());
-                    }
-                    if !edit.before.iter().any(|s| s.info.id == id) {
-                        return Err("Window is outside the edit transaction".into());
-                    }
-                    let Ok(before) = access.snapshot(id, screens) else {
-                        result.skipped += 1;
-                        continue;
-                    };
-                    if !before.info.resizable || before.info.fullscreen {
-                        return Err("Window does not support this layout".into());
-                    }
-                    if ![rect.x, rect.y, rect.width, rect.height]
+                let count = placements.len()
+                    + additional_screens
                         .iter()
-                        .all(|v| v.is_finite())
-                        || rect.x < 0.0
-                        || rect.y < 0.0
-                        || rect.width <= 0.0
-                        || rect.height <= 0.0
-                        || rect.right() > 1.0 + 1e-6
-                        || rect.bottom() > 1.0 + 1e-6
-                    {
-                        return Err("Invalid normalized window rectangle".into());
-                    }
-                    let mut requested =
-                        crate::api::window_layout::placed_rect(display.work_area, rect, gap);
-                    if !strict {
-                        let minimum = edit
-                            .minimums
+                        .map(|s| s.placements.len())
+                        .sum::<usize>();
+                let mut batch = Vec::with_capacity(count);
+                let mut seen = std::collections::BTreeSet::new();
+                let layouts =
+                    std::iter::once(crate::api::window::WindowScreenLayout { screen, placements })
+                        .chain(additional_screens);
+                for layout in layouts {
+                    let display = screens.get(layout.screen).ok_or("display is unavailable")?;
+                    let gap = gap * access.logical_scale(display);
+                    for (id, rect) in layout.placements {
+                        if !seen.insert(id) {
+                            return Err("Duplicate window in layout transaction".into());
+                        }
+                        if cancelled() {
+                            return Ok(());
+                        }
+                        if !edit.before.iter().any(|s| s.info.id == id) {
+                            return Err("Window is outside the edit transaction".into());
+                        }
+                        let Ok(before) = access.snapshot(id, screens) else {
+                            result.skipped += 1;
+                            continue;
+                        };
+                        if !before.info.resizable || before.info.fullscreen {
+                            return Err("Window does not support this layout".into());
+                        }
+                        if ![rect.x, rect.y, rect.width, rect.height]
                             .iter()
-                            .find(|(w, _)| *w == id)
-                            .map_or(Point::new(100.0, 80.0), |(_, min)| *min);
-                        let center = requested.center();
-                        requested.width = requested.width.max(minimum.x);
-                        requested.height = requested.height.max(minimum.y);
-                        requested.x = center.x - requested.width / 2.0;
-                        requested.y = center.y - requested.height / 2.0;
-                        requested = geometry::constrain_move(requested, display.work_area);
+                            .all(|v| v.is_finite())
+                            || rect.x < 0.0
+                            || rect.y < 0.0
+                            || rect.width <= 0.0
+                            || rect.height <= 0.0
+                            || rect.right() > 1.0 + 1e-6
+                            || rect.bottom() > 1.0 + 1e-6
+                        {
+                            return Err("Invalid normalized window rectangle".into());
+                        }
+                        let mut requested =
+                            crate::api::window_layout::placed_rect(display.work_area, rect, gap);
+                        if !strict {
+                            let minimum = edit
+                                .minimums
+                                .iter()
+                                .find(|(w, _)| *w == id)
+                                .map_or(Point::new(100.0, 80.0), |(_, min)| *min);
+                            let center = requested.center();
+                            requested.width = requested.width.max(minimum.x);
+                            requested.height = requested.height.max(minimum.y);
+                            requested.x = center.x - requested.width / 2.0;
+                            requested.y = center.y - requested.height / 2.0;
+                            requested = geometry::constrain_move(requested, display.work_area);
+                        }
+                        batch.push((before, requested));
                     }
-                    batch.push((before, requested));
                 }
                 let mut failure = None;
                 let mut restore_failed = false;
@@ -733,7 +1064,10 @@ impl Session {
                         failure = Some("Layout cancelled".into());
                         break;
                     }
-                    if rect_matches(before.info.bounds, *requested) && !before.info.maximized {
+                    if rect_matches(before.info.bounds, *requested)
+                        && !before.info.maximized
+                        && !before.info.minimized
+                    {
                         actual.push(before.info.clone());
                         continue;
                     }
@@ -782,7 +1116,10 @@ impl Session {
                     // Restore only writes that were attempted, including the one
                     // whose acknowledgement failed after a possible partial move.
                     for (before, requested) in batch[..attempted].iter().rev() {
-                        if rect_matches(before.info.bounds, *requested) && !before.info.maximized {
+                        if rect_matches(before.info.bounds, *requested)
+                            && !before.info.maximized
+                            && !before.info.minimized
+                        {
                             continue;
                         }
                         match access.restore(before, screens, &|| false) {
@@ -845,6 +1182,9 @@ impl Session {
                 }
                 if let Some(error) = failure {
                     return Err(error);
+                }
+                if result.changed > 0 {
+                    self.redo.clear();
                 }
             }
             WindowOperation::EndEdit {
@@ -1064,37 +1404,48 @@ impl Session {
                 self.target = Some(target);
             }
             WindowOperation::Tile { target, gap, group } => {
-                let before = access.snapshot(target, screens)?;
-                let screen = screens
-                    .get(before.info.screen)
-                    .ok_or("display is unavailable")?;
-                let mut windows = access.enumerate(screens, cancelled)?;
-                windows.retain(|w| w.screen == before.info.screen);
+                let target_screen = access.snapshot(target, screens)?.info.screen;
+                let mut windows = self.enumerate(access, screens, cancelled)?;
+                if self.scope.is_none_or(|scope| scope.screen.is_some()) {
+                    windows.retain(|w| w.screen == target_screen);
+                }
                 result.skipped = windows
                     .iter()
                     .filter(|w| !w.resizable || w.fullscreen)
                     .count();
                 windows.retain(|w| w.resizable && !w.fullscreen);
+                windows.retain(|w| access.layout_representative(w.id) == w.id);
                 windows.sort_by_key(|w| w.id != target);
-                let mut minimums = Vec::with_capacity(windows.len());
-                for window in &windows {
-                    if cancelled() {
-                        return Ok(());
+                let mut placements = Vec::with_capacity(windows.len());
+                let mut overlaps = false;
+                for (index, screen) in screens.iter().enumerate() {
+                    let members: Vec<_> = windows.iter().filter(|w| w.screen == index).collect();
+                    let mut minimums = Vec::with_capacity(members.len());
+                    for window in &members {
+                        if cancelled() {
+                            return Ok(());
+                        }
+                        minimums.push(access.minimum_size(window.id));
                     }
-                    minimums.push(access.minimum_size(window.id));
+                    let areas = geometry::tile_with_minimums(
+                        screen.work_area,
+                        &minimums,
+                        gap * access.logical_scale(screen),
+                    );
+                    overlaps |= areas.iter().enumerate().any(|(i, cell)| {
+                        areas[i + 1..]
+                            .iter()
+                            .any(|other| cell.intersect(other).is_some())
+                    });
+                    placements.extend(
+                        members
+                            .into_iter()
+                            .zip(areas)
+                            .map(|(window, area)| (window, area, screen)),
+                    );
                 }
-                let areas = geometry::tile_with_minimums(
-                    screen.work_area,
-                    &minimums,
-                    gap * access.logical_scale(screen),
-                );
-                let overlaps = areas.iter().enumerate().any(|(i, cell)| {
-                    areas[i + 1..]
-                        .iter()
-                        .any(|other| cell.intersect(other).is_some())
-                });
                 let mut arranged = 0;
-                for (window, area) in windows.into_iter().zip(areas) {
+                for (window, area, screen) in placements {
                     if cancelled() {
                         break;
                     }
@@ -1151,35 +1502,62 @@ impl Session {
                     }
                 ));
             }
-            WindowOperation::Undo => {
-                if let Some((group, mut snapshots)) = self.history.pop_back() {
-                    while let Some(before) = snapshots.pop() {
-                        if cancelled() {
-                            snapshots.push(before);
-                            self.history.push_back((group, snapshots));
-                            break;
-                        }
-                        match access.restore(&before, screens, cancelled) {
-                            Ok(_) => result.changed += 1,
-                            Err(error) => {
-                                result.skipped += 1;
-                                if !cancelled() {
-                                    crate::report_error!(
-                                        "window-worker",
-                                        "undo window {:?}: {error}",
-                                        before.info.id
-                                    );
-                                }
-                            }
-                        }
-                    }
+            operation @ (WindowOperation::Undo | WindowOperation::Redo) => {
+                if self.edit.is_some() {
+                    return Err("Finish the current window edit first".into());
+                }
+                let redo = matches!(operation, WindowOperation::Redo);
+                let source = if redo {
+                    &mut self.redo
+                } else {
+                    &mut self.history
+                };
+                if let Some((group, snapshots)) = source.pop_back() {
+                    let (inverse, remaining) =
+                        Self::restore_snapshots(access, snapshots, screens, cancelled, result);
+                    let (source, destination) = if redo {
+                        (&mut self.redo, &mut self.history)
+                    } else {
+                        (&mut self.history, &mut self.redo)
+                    };
+                    Self::push_history(source, group, remaining);
+                    Self::push_history(destination, group, inverse);
+                    result.windows = Some(self.enumerate(access, screens, cancelled)?);
                     result.message = Some(format!(
                         "Restored {} · skipped {}",
                         result.changed, result.skipped
                     ));
                 } else {
-                    result.message = Some("Nothing to undo".into());
+                    result.message = Some(
+                        if redo {
+                            "Nothing to redo"
+                        } else {
+                            "Nothing to undo"
+                        }
+                        .into(),
+                    );
                 }
+            }
+            WindowOperation::ResetInitial { group } => {
+                if self.edit.is_some() {
+                    return Err("Finish the current window edit first".into());
+                }
+                let snapshots = self
+                    .changed_windows
+                    .iter()
+                    .filter_map(|id| self.initial.get(id).cloned())
+                    .collect();
+                let (inverse, _) =
+                    Self::restore_snapshots(access, snapshots, screens, cancelled, result);
+                if !inverse.is_empty() {
+                    self.redo.clear();
+                    Self::push_history(&mut self.history, group, inverse);
+                }
+                result.windows = Some(self.enumerate(access, screens, cancelled)?);
+                result.message = Some(format!(
+                    "Initial state · restored {} · skipped {}",
+                    result.changed, result.skipped
+                ));
             }
         }
         Ok(())
@@ -1197,7 +1575,10 @@ mod tests {
         reject: Option<WindowId>,
         partial: bool,
         refuse_focus: bool,
+        selected: std::cell::Cell<Option<WindowId>>,
+        close_requests: std::cell::RefCell<Vec<WindowId>>,
         unchanged_ack: bool,
+        snapshot_unavailable: bool,
         minimum: Point,
         minimum_queries: std::cell::Cell<usize>,
         closed: Vec<WindowId>,
@@ -1251,7 +1632,10 @@ mod tests {
                 reject: None,
                 partial: false,
                 refuse_focus: false,
+                selected: std::cell::Cell::new(None),
+                close_requests: Default::default(),
                 unchanged_ack: false,
+                snapshot_unavailable: false,
                 minimum: Point::new(100.0, 80.0),
                 minimum_queries: std::cell::Cell::new(0),
                 closed: Vec::new(),
@@ -1276,6 +1660,9 @@ mod tests {
                 .collect())
         }
         fn snapshot(&self, id: WindowId, _: &[Screen]) -> Result<Snapshot, String> {
+            if self.snapshot_unavailable {
+                return Err("temporarily unavailable".into());
+            }
             self.windows.get(&id).cloned().ok_or("closed".into())
         }
         fn set_frame(
@@ -1335,7 +1722,12 @@ mod tests {
             }
             Ok(s.info.clone())
         }
-        fn select(&self, _: WindowId) -> Result<(), String> {
+        fn close(&self, id: WindowId) -> Result<(), String> {
+            self.close_requests.borrow_mut().push(id);
+            Ok(())
+        }
+        fn select(&self, id: WindowId) -> Result<(), String> {
+            self.selected.set(Some(id));
             if self.refuse_focus {
                 Err("focus denied".into())
             } else {
@@ -1362,6 +1754,7 @@ mod tests {
         session.execute(
             access,
             WindowRequest {
+                scope: None,
                 session: 1,
                 id: 1,
                 operation,
@@ -1371,11 +1764,152 @@ mod tests {
         )
     }
 
+    #[test]
+    fn acquire_activates_pointer_target_without_warp_or_geometry_change() {
+        let mut access = Fake::new(2);
+        let mut session = Session::default();
+        let result = run(
+            &mut session,
+            &mut access,
+            WindowOperation::Acquire(Point::default()),
+        );
+        assert_eq!(access.selected.get(), Some(WindowId(1)));
+        assert_eq!(result.target.as_ref().map(|w| w.id), Some(WindowId(1)));
+        assert!(result.pointer.is_none());
+        assert!(result.message.is_none());
+        assert!(access.writes.is_empty());
+        assert!(session.history.is_empty());
+
+        access.refuse_focus = true;
+        let denied = run(
+            &mut session,
+            &mut access,
+            WindowOperation::Acquire(Point::default()),
+        );
+        assert_eq!(denied.message.as_deref(), Some("focus denied"));
+        assert!(denied.pointer.is_none());
+    }
+
+    #[test]
+    fn close_requests_only_the_target_and_preserves_it_until_application_closes() {
+        let mut access = Fake::new(2);
+        let mut session = Session::default();
+        run(
+            &mut session,
+            &mut access,
+            WindowOperation::Acquire(Point::default()),
+        );
+        let result = run(
+            &mut session,
+            &mut access,
+            WindowOperation::Close(WindowId(1)),
+        );
+        assert_eq!(*access.close_requests.borrow(), vec![WindowId(1)]);
+        assert_eq!(result.message.as_deref(), Some("Close requested"));
+        assert!(result.closed.is_empty());
+        assert_eq!(result.target.as_ref().map(|w| w.id), Some(WindowId(1)));
+        assert!(session.history.is_empty());
+        assert!(access.writes.is_empty());
+        access.windows.remove(&WindowId(1));
+        access.closed.push(WindowId(1));
+        let result = run(&mut session, &mut access, WindowOperation::Enumerate);
+        assert!(result.target.is_none());
+        assert_eq!(result.closed, vec![WindowId(1)]);
+        assert_eq!(result.windows.unwrap().len(), 1);
+    }
+
     fn adjust(group: u64, change: WindowChange) -> WindowOperation {
         WindowOperation::Adjust {
             target: WindowId(1),
             change,
             group,
+        }
+    }
+
+    #[test]
+    fn all_screen_layout_keeps_each_display_and_rolls_back_the_whole_batch() {
+        use crate::api::window::{WindowScope, WindowScreenLayout};
+        for reject in [false, true] {
+            let mut access = Fake::new(3);
+            let other = access.windows.get_mut(&WindowId(2)).unwrap();
+            other.info.screen = 1;
+            other.info.bounds = Rect::new(100.0, 100.0, 320.0, 240.0);
+            other.restored = other.info.bounds;
+            access.windows.get_mut(&WindowId(3)).unwrap().info.minimized = true;
+            let original = access.windows.clone();
+            let mut session = Session::default();
+            let mut execute = |access: &mut Fake, operation| {
+                session.execute(
+                    access,
+                    WindowRequest {
+                        scope: Some(WindowScope {
+                            screen: None,
+                            include_minimized: false,
+                        }),
+                        session: 1,
+                        id: 1,
+                        operation,
+                    },
+                    &screens(),
+                    &|| false,
+                )
+            };
+            let started = execute(
+                &mut access,
+                WindowOperation::BeginEdit {
+                    transaction: 1,
+                    targets: Vec::new(),
+                    screen: Some(0),
+                    group: 1,
+                },
+            );
+            assert_eq!(started.windows.unwrap().len(), 2);
+            access.reject = reject.then_some(WindowId(2));
+            access.partial = reject;
+            let result = execute(
+                &mut access,
+                WindowOperation::ApplyLayout {
+                    transaction: 1,
+                    revision: 1,
+                    screen: 0,
+                    placements: vec![(WindowId(1), Rect::new(0.0, 0.0, 1.0, 1.0))],
+                    additional_screens: vec![WindowScreenLayout {
+                        screen: 1,
+                        placements: vec![(WindowId(2), Rect::new(0.0, 0.0, 1.0, 1.0))],
+                    }],
+                    gap: 0.0,
+                    strict: true,
+                },
+            );
+            assert_eq!(result.message.is_some(), reject);
+            assert_eq!(
+                access.windows[&WindowId(3)].info,
+                original[&WindowId(3)].info
+            );
+            for (id, screen) in [(WindowId(1), 0), (WindowId(2), 1)] {
+                assert_eq!(access.windows[&id].info.screen, screen);
+                assert_eq!(
+                    access.windows[&id].info.bounds,
+                    if reject {
+                        original[&id].info.bounds
+                    } else {
+                        screens()[screen].work_area
+                    }
+                );
+            }
+            execute(
+                &mut access,
+                WindowOperation::EndEdit {
+                    transaction: 1,
+                    commit: true,
+                },
+            );
+            if !reject {
+                execute(&mut access, WindowOperation::Undo);
+                for id in [WindowId(1), WindowId(2)] {
+                    assert_eq!(access.windows[&id].info, original[&id].info);
+                }
+            }
         }
     }
 
@@ -1472,6 +2006,7 @@ mod tests {
 
     fn batch(revision: u64, width: f64) -> WindowOperation {
         WindowOperation::ApplyLayout {
+            additional_screens: Vec::new(),
             transaction: 10,
             revision,
             screen: 0,
@@ -1593,6 +2128,7 @@ mod tests {
         );
         assert_eq!(access.writes.len(), writes);
         let operation = WindowOperation::ApplyLayout {
+            additional_screens: Vec::new(),
             transaction: 10,
             revision: 8,
             screen: 0,
@@ -1686,6 +2222,202 @@ mod tests {
             assert_eq!(session.history.len(), usize::from(partial));
             run(&mut session, &mut access, WindowOperation::Undo);
             assert_eq!(access.windows[&WindowId(1)].info, original);
+        }
+    }
+
+    #[test]
+    fn undo_redo_replays_steps_and_a_new_change_discards_redo() {
+        let mut access = Fake::new(1);
+        let mut session = Session::default();
+        let original = access.windows[&WindowId(1)].clone();
+        run(
+            &mut session,
+            &mut access,
+            adjust(1, WindowChange::Move { dx: 20.0, dy: 0.0 }),
+        );
+        let first = access.windows[&WindowId(1)].clone();
+        run(
+            &mut session,
+            &mut access,
+            adjust(2, WindowChange::Move { dx: 30.0, dy: 0.0 }),
+        );
+        let second = access.windows[&WindowId(1)].clone();
+        run(&mut session, &mut access, WindowOperation::Undo);
+        assert!(same_placement(&access.windows[&WindowId(1)], &first));
+        run(&mut session, &mut access, WindowOperation::Undo);
+        assert!(same_placement(&access.windows[&WindowId(1)], &original));
+        run(&mut session, &mut access, WindowOperation::Undo);
+        for expected in [&first, &second] {
+            assert_eq!(
+                run(&mut session, &mut access, WindowOperation::Redo).changed,
+                1
+            );
+            assert!(same_placement(&access.windows[&WindowId(1)], expected));
+        }
+        run(&mut session, &mut access, WindowOperation::Undo);
+        run(&mut session, &mut access, adjust(3, WindowChange::Center));
+        assert!(session.redo.is_empty());
+        assert_eq!(
+            run(&mut session, &mut access, WindowOperation::Redo).changed,
+            0
+        );
+    }
+
+    #[test]
+    fn initial_restore_outlives_history_limit_and_is_itself_undoable() {
+        let mut access = Fake::new(3);
+        access
+            .cycle_state(WindowId(2), &screens(), &|| false)
+            .unwrap();
+        let original = access.windows.clone();
+        let mut session = Session::default();
+        run(
+            &mut session,
+            &mut access,
+            WindowOperation::Acquire(Point::default()),
+        );
+        run(&mut session, &mut access, WindowOperation::Enumerate);
+        for group in 1..=40 {
+            run(
+                &mut session,
+                &mut access,
+                adjust(group, WindowChange::Move { dx: 1.0, dy: 0.0 }),
+            );
+        }
+        run(
+            &mut session,
+            &mut access,
+            adjust(41, WindowChange::CycleState),
+        );
+        run(
+            &mut session,
+            &mut access,
+            adjust(42, WindowChange::CycleState),
+        );
+        run(
+            &mut session,
+            &mut access,
+            WindowOperation::Adjust {
+                target: WindowId(2),
+                group: 43,
+                change: WindowChange::Move { dx: 50.0, dy: 20.0 },
+            },
+        );
+        // Another application's change is outside this session's write set.
+        access
+            .set_frame(
+                WindowId(3),
+                Rect::new(100.0, 100.0, 300.0, 200.0),
+                &screens(),
+                &|| false,
+            )
+            .unwrap();
+        let before_reset = access.windows.clone();
+        assert_eq!(session.history.len(), 32);
+        let reset = run(
+            &mut session,
+            &mut access,
+            WindowOperation::ResetInitial { group: 44 },
+        );
+        assert_eq!(reset.changed, 2);
+        assert!(same_placement(
+            &access.windows[&WindowId(1)],
+            &original[&WindowId(1)]
+        ));
+        assert!(same_placement(
+            &access.windows[&WindowId(2)],
+            &original[&WindowId(2)]
+        ));
+        assert!(same_placement(
+            &access.windows[&WindowId(3)],
+            &before_reset[&WindowId(3)]
+        ));
+        run(&mut session, &mut access, WindowOperation::Undo);
+        for id in [WindowId(1), WindowId(2), WindowId(3)] {
+            assert!(same_placement(&access.windows[&id], &before_reset[&id]));
+        }
+        run(&mut session, &mut access, WindowOperation::Redo);
+        assert!(access.windows[&WindowId(2)].info.maximized);
+        assert!(!access.windows[&WindowId(1)].info.minimized);
+        assert_eq!(
+            run(
+                &mut session,
+                &mut access,
+                WindowOperation::ResetInitial { group: 45 }
+            )
+            .changed,
+            0
+        );
+    }
+
+    #[test]
+    fn temporarily_unavailable_windows_keep_their_undo_for_retry() {
+        let mut access = Fake::new(1);
+        let mut session = Session::default();
+        run(
+            &mut session,
+            &mut access,
+            adjust(1, WindowChange::Move { dx: 20.0, dy: 0.0 }),
+        );
+        access.snapshot_unavailable = true;
+        let result = run(&mut session, &mut access, WindowOperation::Undo);
+        assert_eq!(result.changed, 0);
+        assert_eq!(result.skipped, 1);
+        assert_eq!(session.history.len(), 1);
+        access.snapshot_unavailable = false;
+        assert_eq!(
+            run(&mut session, &mut access, WindowOperation::Undo).changed,
+            1
+        );
+        assert_eq!(
+            run(&mut session, &mut access, WindowOperation::Redo).changed,
+            1
+        );
+    }
+
+    #[test]
+    fn cancelled_undo_preserves_unprocessed_windows_and_completed_redo() {
+        let mut access = Fake::new(2);
+        let mut session = Session::default();
+        let originals = access.windows.clone();
+        for id in [WindowId(1), WindowId(2)] {
+            run(
+                &mut session,
+                &mut access,
+                WindowOperation::Adjust {
+                    target: id,
+                    group: 1,
+                    change: WindowChange::Move { dx: 15.0, dy: 0.0 },
+                },
+            );
+        }
+        let changed = access.windows.clone();
+        let calls = std::cell::Cell::new(0);
+        let result = session.execute(
+            &mut access,
+            WindowRequest {
+                scope: None,
+                session: 1,
+                id: 3,
+                operation: WindowOperation::Undo,
+            },
+            &screens(),
+            &|| {
+                calls.set(calls.get() + 1);
+                calls.get() > 1
+            },
+        );
+        assert_eq!(result.changed, 1);
+        assert_eq!(session.history.back().unwrap().1.len(), 1);
+        assert_eq!(session.redo.back().unwrap().1.len(), 1);
+        run(&mut session, &mut access, WindowOperation::Undo);
+        for id in [WindowId(1), WindowId(2)] {
+            assert!(same_placement(&access.windows[&id], &originals[&id]));
+        }
+        run(&mut session, &mut access, WindowOperation::Redo);
+        run(&mut session, &mut access, WindowOperation::Redo);
+        for id in [WindowId(1), WindowId(2)] {
+            assert!(same_placement(&access.windows[&id], &changed[&id]));
         }
     }
 
@@ -1943,6 +2675,7 @@ mod tests {
             worker
                 .submit(
                     WindowRequest {
+                        scope: None,
                         session: 7,
                         id,
                         operation,

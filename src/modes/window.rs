@@ -6,6 +6,7 @@ mod interaction;
 mod inventory;
 mod numbering;
 mod presets;
+mod tabs;
 #[cfg(test)]
 mod tests;
 mod view;
@@ -21,8 +22,8 @@ use crate::api::window::{
 };
 use crate::api::window_layout::{LayoutTree, QuickPlacement};
 use crate::api::{
-    Binding, Command, CommandBatch, HostContext, Key, KeyState, Mode, ModeEvent, ModeId, Point,
-    Rect,
+    Binding, Command, CommandBatch, Direction, HostContext, Key, KeyState, Mode, ModeEvent, ModeId,
+    Point, Rect,
 };
 use numbering::{NumberIndex, NumberInput};
 
@@ -31,6 +32,8 @@ const INVENTORY_TIMER: &str = "window_inventory";
 
 #[derive(Clone, Debug)]
 pub struct Settings {
+    pub all_screens: bool,
+    pub include_minimized: bool,
     pub lifecycle: crate::api::TargetingLifecycle,
     pub split_ratios: Vec<f64>,
     pub number_timeout_ms: u64,
@@ -55,19 +58,23 @@ enum Finish {
     Cancel,
     QuickReset,
     TreeReset,
+    History { redo: bool },
+    ResetInitial,
     Tree,
     Select(WindowId),
-    Cycle,
+    Cycle { backwards: bool },
     Tile,
     Transition,
 }
 
 struct LiveEdit {
+    additional_trees: BTreeMap<usize, LayoutTree>,
     transaction: u64,
     screen: usize,
     model: EditModel,
     accepted: EditModel,
     history: Vec<EditModel>,
+    redo: Vec<EditModel>,
     divider_gesture: bool,
     entry_layout: bool,
     minimums: BTreeMap<WindowId, Point>,
@@ -81,12 +88,23 @@ struct LiveEdit {
     deferred: Vec<DeferredEdit>,
 }
 
+impl LiveEdit {
+    fn remember(&mut self, before: EditModel) {
+        if self.history.len() == 32 {
+            self.history.remove(0);
+        }
+        self.history.push(before);
+        self.redo.clear();
+    }
+}
+
 enum DeferredEdit {
     Direction(crate::api::Direction, bool, bool),
     Number(bool, u32),
 }
 
 pub struct WindowSession {
+    tabs: tabs::Interaction,
     settings: Settings,
     kind: WindowKind,
     pending_transition: Option<ModeId>,
@@ -95,13 +113,14 @@ pub struct WindowSession {
     enter_pending: bool,
     restore_pending: bool,
     finished: bool,
-    delete_selection: Option<crate::api::window_presets::SavedLayout>,
-    saved_layouts: Vec<crate::api::window_presets::SavedLayout>,
+    deleting_presets: bool,
+    delete_selection: Option<crate::api::window_presets::SavedPreset>,
+    saved_presets: Vec<crate::api::window_presets::SavedPreset>,
     library_open: bool,
     save_pending: bool,
     library_page: usize,
     library_index: NumberIndex,
-    pending_template: Option<crate::api::window_presets::SavedLayout>,
+    pending_template: Option<crate::api::window_presets::SavedPreset>,
     session: u64,
     request: u64,
     result: u64,
@@ -123,6 +142,7 @@ pub struct WindowSession {
     edit: Option<LiveEdit>,
     trees: BTreeMap<usize, LayoutTree>,
     resume_quick: bool,
+    reopen_edit: Option<u64>,
     size: bool,
     temporary: bool,
     held: BTreeMap<Key, W>,
@@ -133,6 +153,7 @@ pub struct WindowSession {
 impl WindowSession {
     pub fn new(settings: Settings) -> Self {
         Self {
+            tabs: tabs::Interaction::default(),
             settings,
             kind: WindowKind::Move,
             pending_transition: None,
@@ -141,9 +162,10 @@ impl WindowSession {
             enter_pending: false,
             restore_pending: false,
             finished: false,
+            deleting_presets: false,
             delete_selection: None,
             previous: ModeId::normal(),
-            saved_layouts: Vec::new(),
+            saved_presets: Vec::new(),
             library_open: false,
             save_pending: false,
             library_page: 0,
@@ -170,6 +192,7 @@ impl WindowSession {
             edit: None,
             trees: BTreeMap::new(),
             resume_quick: false,
+            reopen_edit: None,
             size: false,
             temporary: false,
             held: BTreeMap::new(),
@@ -183,6 +206,10 @@ impl WindowSession {
         }
         self.request += 1;
         out.push(Command::WindowRequest(Box::new(WindowRequest {
+            scope: Some(crate::api::window::WindowScope {
+                screen: (!self.settings.all_screens).then_some(self.screen),
+                include_minimized: self.settings.include_minimized,
+            }),
             session: self.session,
             id: self.request,
             operation,
@@ -235,11 +262,13 @@ impl WindowSession {
     fn rebuild_numbers(&mut self) {
         if self.inventory_dirty || self.numbered_screen != self.screen {
             self.visible.clear();
-            for window in self
-                .inventory
-                .values()
-                .filter(|w| !w.minimized && w.screen == self.screen)
-            {
+            for window in crate::api::window::application_number_order(
+                self.inventory.values().filter(|w| {
+                    (self.settings.include_minimized || !w.minimized)
+                        && (self.settings.all_screens || w.screen == self.screen)
+                }),
+                self.numbers.iter().map(|(id, number)| (*id, *number)),
+            ) {
                 self.numbers.entry(window.id).or_insert_with(|| {
                     let n = self.next_number;
                     self.next_number += 1;
@@ -340,9 +369,24 @@ impl WindowSession {
     }
 }
 
-impl WindowSession {
-    fn window_action_available(&self, action: &W) -> bool {
-        match self.kind {
+impl WindowKind {
+    fn supports_action(self, action: &W) -> bool {
+        match self {
+            WindowKind::Tab => matches!(
+                action,
+                W::TabEnd
+                    | W::TabPrefix
+                    | W::TabSeparator
+                    | W::TabRemove
+                    | W::TabDissolve
+                    | W::TabNext
+                    | W::TabPrevious
+                    | W::TabMoveLeft
+                    | W::TabMoveRight
+                    | W::Undo
+                    | W::Redo
+                    | W::SaveLayout
+            ),
             WindowKind::Move => matches!(
                 action,
                 W::Tile
@@ -355,30 +399,56 @@ impl WindowSession {
                     | W::PreviousScreen
                     | W::CycleState
                     | W::Center
+                    | W::Close
                     | W::Select
+                    | W::SelectPrevious
                     | W::Undo
+                    | W::Redo
+                    | W::ResetInitial
             ),
-            WindowKind::Quick => matches!(action, W::Navigate(_) | W::Select | W::Undo),
-            WindowKind::Editor => match action {
-                W::SaveLayout => self
-                    .edit
-                    .as_ref()
-                    .is_some_and(|e| e.ready && e.finishing.is_none()),
-                _ => matches!(
-                    action,
-                    W::Navigate(_)
-                        | W::Split(_)
-                        | W::Ratio(_)
-                        | W::Select
-                        | W::Undo
-                        | W::RemoveRegion
-                ),
-            },
-            WindowKind::Restore | WindowKind::Delete => {
-                *action == W::Confirm
-                    && !self.restore_pending
-                    && (self.number.pending() || self.delete_selection.is_some())
+            WindowKind::Quick => matches!(
+                action,
+                W::Navigate(_)
+                    | W::Select
+                    | W::SelectPrevious
+                    | W::Undo
+                    | W::Redo
+                    | W::ResetInitial
+            ),
+            WindowKind::Editor => {
+                matches!(action, W::SaveLayout)
+                    || matches!(
+                        action,
+                        W::Navigate(_)
+                            | W::Split(_)
+                            | W::Ratio(_)
+                            | W::Select
+                            | W::SelectPrevious
+                            | W::Undo
+                            | W::Redo
+                            | W::ResetInitial
+                            | W::RemoveRegion
+                    )
             }
+            WindowKind::Restore => matches!(action, W::Confirm | W::DeletePreset),
+        }
+    }
+}
+
+impl WindowSession {
+    fn window_action_available(&self, action: &W) -> bool {
+        if !self.kind.supports_action(action) {
+            return false;
+        }
+        match (self.kind, action) {
+            (WindowKind::Editor, W::SaveLayout) => self
+                .edit
+                .as_ref()
+                .is_some_and(|e| e.ready && e.finishing.is_none()),
+            (WindowKind::Restore, W::Confirm) => {
+                !self.restore_pending && (self.number.pending() || self.delete_selection.is_some())
+            }
+            _ => true,
         }
     }
     fn indicator_detail(&self) -> Option<String> {
@@ -423,7 +493,7 @@ impl WindowSession {
             if self.library_page > 0 {
                 keys.push(("PageUp".into(), "Previous page".into()));
             }
-            if (self.library_page + 1) * presets::PAGE_SIZE < self.saved_layouts.len() {
+            if (self.library_page + 1) * presets::PAGE_SIZE < self.saved_presets.len() {
                 keys.push(("PageDown".into(), "Next page".into()));
             }
             return keys;
@@ -439,7 +509,7 @@ impl WindowSession {
     pub(crate) fn handle_owned(&mut self, event: ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
         match event {
             ModeEvent::WindowResult(result) => self.window_result(*result, ctx),
-            ModeEvent::WindowLayouts(result) => self.library_result(*result, ctx),
+            ModeEvent::WindowPresets(result) => self.library_result(*result, ctx),
             other => self.handle(&other, ctx),
         }
     }
@@ -460,8 +530,11 @@ impl WindowSession {
                 }
                 self.finished = false;
                 self.delete_selection = None;
+                self.deleting_presets = false;
                 self.pending_transition = None;
                 self.pending_handoff = false;
+                self.tabs.queue.clear();
+                self.tabs.in_flight = None;
                 if self.session != 0 && !matches!(event, ModeEvent::Restarted) {
                     self.temporary = false;
                     self.enter_kind(ctx, &mut out);
@@ -499,6 +572,7 @@ impl WindowSession {
                 self.next_number = 1;
                 self.trees.clear();
                 self.resume_quick = false;
+                self.reopen_edit = None;
                 self.number.cancel();
                 self.swap_source = None;
                 self.refresh_pending = None;
@@ -520,9 +594,14 @@ impl WindowSession {
                 });
             }
             ModeEvent::Deactivated => {
+                if self.kind == WindowKind::Tab {
+                    self.tabs.restore = None;
+                    self.tabs.restoring = None;
+                }
                 self.stop_movement(&mut out);
                 self.cancel_number(&mut out);
                 self.delete_selection = None;
+                self.deleting_presets = false;
                 if std::mem::take(&mut self.preserve_session) {
                     self.restore_pending = false;
                     self.pending_template = None;
@@ -537,6 +616,7 @@ impl WindowSession {
                 });
                 out.push(Command::CancelWindowSession(self.session));
                 self.session = 0;
+                self.reopen_edit = None;
                 self.pending_transition = None;
                 self.pending_handoff = false;
                 self.enter_pending = false;
@@ -577,7 +657,7 @@ impl WindowSession {
             }
             ModeEvent::TemporaryModeChanged { active } => {
                 if *active {
-                    if self.edit.is_none() {
+                    if self.edit.is_none() && self.kind != WindowKind::Tab {
                         self.cancel_pending(&mut out);
                     }
                     out.push(Command::CancelTimer {
@@ -605,7 +685,7 @@ impl WindowSession {
                 }
             }
             ModeEvent::WindowResult(result) => return self.window_result((**result).clone(), ctx),
-            ModeEvent::WindowLayouts(result) => {
+            ModeEvent::WindowPresets(result) => {
                 return self.library_result((**result).clone(), ctx);
             }
             ModeEvent::Binding {
@@ -613,13 +693,20 @@ impl WindowSession {
                 state,
                 key,
             } => {
-                let Binding::Window(action) = binding.as_ref() else {
-                    return out;
+                let action = match binding.as_ref() {
+                    Binding::Window(action) => *action,
+                    Binding::Move(direction) if self.kind == WindowKind::Tab => match direction {
+                        Direction::Left => W::TabMoveLeft,
+                        Direction::Right => W::TabMoveRight,
+                        Direction::Up => W::TabPrevious,
+                        Direction::Down => W::TabNext,
+                    },
+                    _ => return out,
                 };
                 if *state == KeyState::Down {
                     self.status = None;
                 }
-                self.action(*action, *state, key, ctx, &mut out);
+                self.action(action, *state, key, ctx, &mut out);
                 redraw = *state == KeyState::Down;
             }
             ModeEvent::Key {
@@ -634,6 +721,11 @@ impl WindowSession {
                             self.number.begin_slot();
                         }
                     } else if c.is_ascii_digit() {
+                        if self.kind == WindowKind::Tab {
+                            self.tab_input(tabs::Input::Digit(c), ctx, &mut out);
+                            out.push(ctx.present(self.view()));
+                            return out;
+                        }
                         self.status = None;
                         let completed = if self.number.slot
                             && !self.edit.as_ref().is_some_and(|edit| {
@@ -670,6 +762,11 @@ impl WindowSession {
                 }
             }
             ModeEvent::Timer { id, .. } if id == NUMBER_TIMER && !self.temporary => {
+                if self.kind == WindowKind::Tab {
+                    self.tab_input(tabs::Input::Action(W::TabSeparator), ctx, &mut out);
+                    out.push(ctx.present(self.view()));
+                    return out;
+                }
                 if let Some((slot, number)) =
                     self.number.finish(&self.window_index, &self.slot_index)
                 {
@@ -702,7 +799,7 @@ impl WindowSession {
         {
             return out;
         }
-        if redraw && !out.iter().any(|c| matches!(c, Command::WindowLayouts(_))) {
+        if redraw && !out.iter().any(|c| matches!(c, Command::WindowPresets(_))) {
             out.push(ctx.present(self.view()));
         }
         out

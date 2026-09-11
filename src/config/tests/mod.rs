@@ -1331,7 +1331,7 @@ fn window_modes_have_independent_sparse_defaults_and_migration_errors() {
     for action in [
         "window_layout",
         "window_edit",
-        "window_saved_layouts",
+        "window_saved_presets",
         "window_cancel",
         "window_exit",
     ] {
@@ -1351,4 +1351,33 @@ fn sparse_restore_lifecycle_preserves_default_finish_destination() {
         config.window_restore.lifecycle.after_click,
         crate::api::LifecycleAction::Mode(ModeId::idle())
     );
+}
+
+#[test]
+fn ui_hint_scan_scope_defaults_and_round_trips() {
+    assert_eq!(
+        Config::default().ui_hint.scan_scope,
+        crate::api::UiScanScope::Window
+    );
+    let config = Config::parse("[ui_hint]\nscan_scope = 'screen'\n").unwrap();
+    assert_eq!(config.ui_hint.scan_scope, crate::api::UiScanScope::Screen);
+    let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+    assert_eq!(restored.ui_hint.scan_scope, crate::api::UiScanScope::Screen);
+    assert!(Config::parse("[ui_hint]\nscan_scope = 'all'\n").is_err());
+}
+
+#[test]
+fn restore_owns_delete_action_without_a_separate_mode_or_config() {
+    use crate::api::window::WindowAction;
+    let config = Config::default();
+    assert_eq!(
+        config.window_restore.bindings.get("x"),
+        Some(&Binding::Window(WindowAction::DeletePreset))
+    );
+    assert_eq!(
+        Binding::parse("window_delete").unwrap(),
+        Binding::Window(WindowAction::DeletePreset)
+    );
+    assert!(!ModeId::BUILT_IN.contains(&"window_delete"));
+    assert!(Config::parse("[window_delete]\nenabled = true").is_err());
 }

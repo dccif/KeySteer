@@ -10,10 +10,20 @@ pub enum SplitRatio {
     Decimal(f64),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowScreens {
+    #[default]
+    Current,
+    All,
+}
+
 // Shared schema, not binding inheritance. Each mode owns a separate value.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WindowModeConfig {
+    pub screens: WindowScreens,
+    pub include_minimized: bool,
     pub enabled: bool,
     pub inherits: Vec<String>,
     pub temporary_mode: Option<String>,
@@ -28,6 +38,8 @@ pub struct WindowModeConfig {
 impl Default for WindowModeConfig {
     fn default() -> Self {
         Self {
+            screens: WindowScreens::Current,
+            include_minimized: false,
             enabled: true,
             inherits: vec!["hotkeys".into()],
             temporary_mode: Some("normal".into()),
@@ -59,6 +71,7 @@ macro_rules! window_config {
                 #[derive(Deserialize)]
                 #[serde(default, deny_unknown_fields)]
                 struct Document {
+                    screens: WindowScreens, include_minimized: bool,
                     enabled: bool, inherits: Vec<String>, temporary_mode: Option<String>,
                     temporary_mode_keys: Vec<String>, number_timeout_ms: u64, border_width: f64,
                     ui: LabelUi,
@@ -77,14 +90,14 @@ macro_rules! window_config {
                 impl Default for Document {
                     fn default() -> Self {
                         let mode = $name::default(); let common = mode.common;
-                        Self { enabled: common.enabled, inherits: common.inherits, temporary_mode: common.temporary_mode,
+                        Self { screens: common.screens, include_minimized: common.include_minimized, enabled: common.enabled, inherits: common.inherits, temporary_mode: common.temporary_mode,
                             temporary_mode_keys: common.temporary_mode_keys, number_timeout_ms: common.number_timeout_ms,
                             border_width: common.border_width, ui: common.ui, lifecycle: common.lifecycle,
                             bindings: common.bindings, app_configs: common.app_configs, $($field: mode.$field,)* }
                     }
                 }
                 let doc = Document::deserialize(deserializer)?;
-                Ok(Self { common: WindowModeConfig { enabled: doc.enabled, inherits: doc.inherits,
+                Ok(Self { common: WindowModeConfig { screens: doc.screens, include_minimized: doc.include_minimized, enabled: doc.enabled, inherits: doc.inherits,
                     temporary_mode: doc.temporary_mode, temporary_mode_keys: doc.temporary_mode_keys,
                     number_timeout_ms: doc.number_timeout_ms, border_width: doc.border_width, ui: doc.ui,
                     lifecycle: doc.lifecycle, bindings: doc.bindings, app_configs: doc.app_configs }, $($field: doc.$field,)* })
@@ -107,7 +120,7 @@ window_config!(WindowEditor {
     gap: f64
 });
 window_config!(WindowRestore { gap: f64 });
-window_config!(WindowDelete {});
+window_config!(WindowTab {});
 
 fn common(back: ModeId, actions: &[(&str, W)], modes: &[(&str, ModeId)]) -> WindowModeConfig {
     let mut common = WindowModeConfig::default();
@@ -139,12 +152,17 @@ impl Default for Window {
                     ("d", W::NextScreen),
                     ("f", W::CycleState),
                     ("c", W::Center),
+                    ("x", W::Close),
                     ("tab", W::Select),
+                    ("shift+tab", W::SelectPrevious),
                     ("z", W::Undo),
+                    ("shift+z", W::Redo),
+                    ("shift+c", W::ResetInitial),
                 ],
                 &[
                     ("a", ModeId::window_quick()),
                     ("e", ModeId::window_editor()),
+                    ("t", ModeId::window_tab()),
                     ("r", ModeId::window_restore()),
                 ],
             ),
@@ -167,7 +185,10 @@ impl Default for WindowQuick {
                     ("k", W::Navigate(Up)),
                     ("l", W::Navigate(Right)),
                     ("tab", W::Select),
+                    ("shift+tab", W::SelectPrevious),
                     ("z", W::Undo),
+                    ("shift+z", W::Redo),
+                    ("shift+c", W::ResetInitial),
                 ],
                 &[
                     ("e", ModeId::window_editor()),
@@ -177,7 +198,7 @@ impl Default for WindowQuick {
             split_ratios: ["1/4", "1/3", "1/2", "2/3", "3/4"]
                 .map(|v| SplitRatio::Fraction(v.into()))
                 .to_vec(),
-            gap: 8.0,
+            gap: 0.0,
         }
     }
 }
@@ -201,7 +222,10 @@ impl Default for WindowEditor {
                     ("ctrl+k", W::Ratio(Up)),
                     ("ctrl+l", W::Ratio(Right)),
                     ("tab", W::Select),
+                    ("shift+tab", W::SelectPrevious),
                     ("z", W::Undo),
+                    ("shift+z", W::Redo),
+                    ("shift+c", W::ResetInitial),
                     ("x", W::RemoveRegion),
                     ("ctrl+s", W::SaveLayout),
                 ],
@@ -209,7 +233,7 @@ impl Default for WindowEditor {
             ),
             resize_step: 20.0,
             resize_speed: 500.0,
-            gap: 8.0,
+            gap: 0.0,
         }
     }
 }
@@ -217,18 +241,40 @@ impl Default for WindowRestore {
     fn default() -> Self {
         let mut common = common(
             ModeId::window(),
-            &[("enter", W::Confirm)],
-            &[("x", ModeId::window_delete())],
+            &[("enter", W::Confirm), ("x", W::DeletePreset)],
+            &[],
         );
         common.lifecycle.after_finish = LifecycleAction::Mode(ModeId::window_editor());
-        Self { common, gap: 8.0 }
+        Self { common, gap: 0.0 }
     }
 }
-impl Default for WindowDelete {
+
+impl Default for WindowTab {
     fn default() -> Self {
-        Self {
-            common: common(ModeId::window_restore(), &[("enter", W::Confirm)], &[]),
+        use crate::api::Direction::{Down, Left, Right, Up};
+        let mut common = common(
+            ModeId::window(),
+            &[
+                ("t", W::TabEnd),
+                ("~", W::TabPrefix),
+                ("space", W::TabSeparator),
+                ("d", W::TabRemove),
+                ("x", W::TabDissolve),
+                ("tab", W::TabNext),
+                ("shift+tab", W::TabPrevious),
+                ("z", W::Undo),
+                ("shift+z", W::Redo),
+                ("ctrl+s", W::SaveLayout),
+            ],
+            &[("r", ModeId::window_restore())],
+        );
+        common
+            .bindings
+            .insert("esc".into(), Binding::Mode(ModeId::idle()));
+        for (key, direction) in [("h", Left), ("j", Down), ("k", Up), ("l", Right)] {
+            common.bindings.insert(key.into(), Binding::Move(direction));
         }
+        Self { common }
     }
 }
 
@@ -260,5 +306,24 @@ impl WindowQuick {
         values.sort_unstable_by(f64::total_cmp);
         values.dedup();
         Ok(values)
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    #[test]
+    fn window_scope_defaults_and_flat_mode_configuration() {
+        let default = Window::default();
+        assert_eq!(default.screens, WindowScreens::Current);
+        assert!(!default.include_minimized);
+        let editor: WindowEditor =
+            toml::from_str("screens = 'all'\ninclude_minimized = true").unwrap();
+        assert_eq!(editor.screens, WindowScreens::All);
+        assert!(editor.include_minimized);
+        assert!(toml::from_str::<WindowTab>("screens = 'unknown'").is_err());
+        let tabs: WindowTab = toml::from_str("screens = 'all'").unwrap();
+        assert_eq!(tabs.screens, WindowScreens::All);
+        assert!(!tabs.include_minimized);
     }
 }

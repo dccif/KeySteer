@@ -107,7 +107,10 @@ export function automaticTree(windows: LayoutWindow[], target: number | null, ar
   return null
 }
 export function splitSlot(tree: LayoutTree, direction: LayoutDirection): boolean {
-  if (treeSlots(tree).length >= 256) return false
+  const used = new Set(treeSlots(tree).map(slot => slot.id))
+  if (used.size >= 256) return false
+  tree.nextSlot = 1
+  while (used.has(tree.nextSlot)) tree.nextSlot++
   function split(node: LayoutNode): LayoutNode {
     if (node.kind === 'slot') {
       if (node.id !== tree.selected) return node
@@ -212,4 +215,52 @@ export function resizeSplitBy(tree: LayoutTree, direction: LayoutDirection, pixe
     return true
   }
   return resize(tree.root, { x: 0, y: 0, ...area })
+}
+
+
+/** Grow/shrink the selected region, fitting every neighbor before committing. */
+export function resizeRegionBy(tree: LayoutTree, direction: LayoutDirection, pixels: number, area: { width: number; height: number }, windows: LayoutWindow[], gap: number): boolean {
+  if (!Number.isFinite(pixels) || pixels <= 0) return false
+  const axis = axisOf(direction), sign = near(direction) ? -1 : 1
+  const paths: Array<{ path: boolean[]; first: boolean }> = []
+  function collect(node: LayoutNode, path: boolean[]): void {
+    if (node.kind === 'slot') return
+    const first = !!slotNode(node.first, tree.selected)
+    if (!first && !slotNode(node.second, tree.selected)) return
+    if (node.axis === axis) paths.push({ path, first })
+    collect(first ? node.first : node.second, [...path, !first])
+  }
+  function measure(value: LayoutTree): [number, number] | undefined {
+    const slot = treeSlots(value).find(slot => slot.id === value.selected)
+    return slot && (axis === 'x' ? [slot.rect.width * area.width, center(slot.rect, axis) * area.width] : [slot.rect.height * area.height, center(slot.rect, axis) * area.height])
+  }
+  const original = measure(tree)
+  if (!original) return false
+  collect(tree.root, [])
+  if (!paths.length) return false
+  for (const side of [true, false, undefined]) {
+    const [size] = measure(tree)!
+    const remaining = Math.max(0, pixels - sign * (size - original[0]))
+    const step = side === undefined ? remaining : Math.min(remaining, pixels / 2)
+    if (step < 1e-6) continue
+    let best: LayoutTree | undefined, bestChange = 0, bestDrift = Infinity
+    for (const { path, first } of [...paths].reverse()) {
+      if (side !== undefined && side !== first) continue
+      const candidate = JSON.parse(JSON.stringify(tree)) as LayoutTree
+      let node = candidate.root
+      for (const second of path) { if (node.kind === 'split') node = second ? node.second : node.first }
+      if (node.kind !== 'split') continue
+      const fraction = first ? node.ratio : 1 - node.ratio
+      node.ratio = clamp(node.ratio + sign * step * fraction / Math.max(size, 1) * (first ? 1 : -1), 0, 1)
+      if (!fitTree(candidate, windows, area, gap)) continue
+      const [nextSize, nextCenter] = measure(candidate)!
+      const change = sign * (nextSize - size), drift = Math.abs(nextCenter - original[1])
+      if (change <= 1e-6 || change > step + 1e-6) continue
+      if (change > bestChange + 1e-6 || Math.abs(change - bestChange) <= 1e-6 && drift < bestDrift) {
+        best = candidate; bestChange = change; bestDrift = drift
+      }
+    }
+    if (best) tree.root = best.root
+  }
+  return true
 }

@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
+// Window close adds one pointer-free WM_CLOSE post and one retained, type-checked
+// AXCloseButton timeout/AXPress block. Neither terminates processes.
 // Keep the current audited native surface from growing. Portable layers are
 // checked separately below and remain entirely safe Rust.
 // Window Mover adds four Win32 placement calls and five bounded AX operations.
@@ -20,11 +22,27 @@ use std::path::{Path, PathBuf};
 // Inline input adds one audited AppKit superclass initialization for the
 // borderless NSPanel subclass; its retained owner and main-thread lifetime stay unchanged.
 // Window state cycle adds one bounded ShowWindowAsync minimization request.
-const MAX_UNSAFE_EXPRESSIONS: usize = 292;
-const MAX_UNSAFE_FILES: usize = 24;
+// Active-only grouping keeps applications as independent top-level windows.
+// WinEvent/AX observers enqueue identities, separate Win32/AppKit strips own only
+// their own controls, and adapters restore visibility leases before releasing IDs.
+// Native acceptance uses only disposable windows and checks no visible repositioning
+// of incoming members. Portable grouping and placement remain safe Rust.
+// Three bounded worker message-queue operations replace tab polling on Windows.
+// Tab drag feedback invalidates only the existing owned strip.
+// The strip changes only its own popup owner to follow application stacking.
+// Opacity leases preserve content; separate read/reset blocks validate visibility
+// and restore only the adapter's own added compositing style bit.
+// A disposable child-process probe reads its own show-event counter.
+// One bounded disposable-strip probe verifies mouse drop and cancellation.
+// A disposable-window minimize message verifies native group synchronization.
+const MAX_UNSAFE_EXPRESSIONS: usize = 342;
+const MAX_UNSAFE_FILES: usize = 28;
 const PER_FILE_BUDGET: &[(&str, usize)] = &[
+    ("src/platform/macos/accessibility/window_tabs.rs", 12),
+    ("src/platform/macos/window_tabs.rs", 2),
+    ("src/platform/windows/window_tabs/strip.rs", 11),
     ("src/platform/macos/accessibility.rs", 18),
-    ("src/platform/macos/accessibility/window_manager.rs", 10),
+    ("src/platform/macos/accessibility/window_manager.rs", 12),
     ("src/platform/macos/autostart.rs", 5),
     ("src/platform/macos/display_link.rs", 4),
     ("src/platform/macos/native.rs", 7),
@@ -33,7 +51,7 @@ const PER_FILE_BUDGET: &[(&str, usize)] = &[
     ("src/platform/macos/status_item.rs", 6),
     ("src/platform/windows/text_prompt.rs", 7),
     ("src/platform/macos/vision.rs", 5),
-    ("src/platform/windows/accessibility.rs", 33),
+    ("src/platform/windows/accessibility.rs", 31),
     ("src/platform/windows/autostart.rs", 4),
     ("src/platform/windows/gpu_overlay.rs", 28),
     ("src/platform/windows/hook.rs", 8),
@@ -41,7 +59,8 @@ const PER_FILE_BUDGET: &[(&str, usize)] = &[
     ("src/platform/windows/overlay.rs", 9),
     ("src/platform/windows/screens.rs", 5),
     ("src/platform/windows/window_mover.rs", 4),
-    ("src/platform/windows/window_manager.rs", 11),
+    ("src/platform/windows/window_manager.rs", 27),
+    ("src/platform/windows/window_tabs.rs", 7),
     ("src/platform/windows/status_item.rs", 14),
     ("src/platform/windows/update_installer/candidate.rs", 4),
     ("src/platform/windows/update_installer/mod.rs", 11),

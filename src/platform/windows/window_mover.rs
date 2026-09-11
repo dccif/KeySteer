@@ -134,6 +134,7 @@ pub(super) fn move_to_screen(target: WindowScreenTarget) -> Result<Option<Point>
     else {
         return Ok(None);
     };
+
     let screens = super::screens::list_screens()?;
     let Some((source, target)) = destination(&screens, visible, target) else {
         return Ok(None);

@@ -28,6 +28,7 @@ mod vision;
 mod wechat_ocr;
 mod window_manager;
 mod window_mover;
+mod window_tabs;
 
 #[cfg(feature = "benchmark-hooks")]
 pub use input::{CharacterCapture, observe_character_unfiltered};

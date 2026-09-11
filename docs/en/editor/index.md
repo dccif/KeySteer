@@ -8,7 +8,7 @@ With KeySteer 0.8.11 or later, choose **Configuration & Simulator...** from the 
 
 ## Recommended workflow
 
-When `window-layouts.kslayout` exists, opening the simulator from the app menu imports the active bindings and saved layouts together. Select a layout number to edit its regions. Ctrl+S updates its note; **Save and download layouts** includes current edits and preserves the other layouts. Replace the application's `window-layouts.kslayout` with the downloaded file. Each `Alt+W → R` reads it again, without restarting, reloading TOML, or watching files. A separate layout-file import button is also available.
+When `workspace.ksw` exists, opening the simulator from the app menu imports the active bindings and saved Layout/Tabs presets together. Select a layout number to edit its regions. Ctrl+S updates its note; **Save and download workspace** includes current edits and preserves the other presets. Replace the application's `workspace.ksw` with the downloaded file. Each `Alt+W → R` reads it again, without restarting, reloading TOML, or watching files. A separate workspace-file import button is also available.
 
 1. Open the simulator, import an existing TOML file, or start with the default configuration.
 2. Change bindings and mode styles while watching the preview.

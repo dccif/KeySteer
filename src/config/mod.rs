@@ -15,7 +15,8 @@ mod aliases;
 mod settings;
 mod window;
 pub use window::{
-    SplitRatio, Window, WindowDelete, WindowEditor, WindowModeConfig, WindowQuick, WindowRestore,
+    SplitRatio, Window, WindowEditor, WindowModeConfig, WindowQuick, WindowRestore, WindowScreens,
+    WindowTab,
 };
 pub mod store;
 pub mod theme;
@@ -87,7 +88,7 @@ pub struct ConfigFile {
     #[serde(default)]
     pub window_restore: WindowRestore,
     #[serde(default)]
-    pub window_delete: WindowDelete,
+    pub window_tab: WindowTab,
     #[serde(default)]
     pub ui_hint: UiHint,
     #[serde(default)]
@@ -139,7 +140,7 @@ impl Default for ConfigFile {
             window_quick: WindowQuick::default(),
             window_editor: WindowEditor::default(),
             window_restore: WindowRestore::default(),
-            window_delete: WindowDelete::default(),
+            window_tab: WindowTab::default(),
             ui_hint: UiHint::default(),
             grid: Grid::default(),
             recursive_grid: RecursiveGrid::default(),
@@ -643,7 +644,7 @@ impl ConfigFile {
             ("window_quick", &self.window_quick.common),
             ("window_editor", &self.window_editor.common),
             ("window_restore", &self.window_restore.common),
-            ("window_delete", &self.window_delete.common),
+            ("window_tab", &self.window_tab.common),
         ]
     }
     fn window_modes_mut(&mut self) -> [(&'static str, &mut WindowModeConfig); 5] {
@@ -652,7 +653,7 @@ impl ConfigFile {
             ("window_quick", &mut self.window_quick.common),
             ("window_editor", &mut self.window_editor.common),
             ("window_restore", &mut self.window_restore.common),
-            ("window_delete", &mut self.window_delete.common),
+            ("window_tab", &mut self.window_tab.common),
         ]
     }
 }

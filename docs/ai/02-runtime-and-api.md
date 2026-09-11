@@ -1,6 +1,24 @@
 # 核心运行时与公共 API
 
+`Mode::window_action_supported` 描述模式稳定支持的 Window 动作，用于模式进入时构建固定快捷键表；`window_action_available` 描述当前能否执行，仍保留编辑事务、恢复输入和确认状态的检查。两者共享 WindowKind 的动作集合，帮助表不会因瞬时未就绪而丢失保存或确认键。Host 的帮助解析使用独立候选状态，实际输入解析仍使用真实按键状态。
+
+## 合成指针跨屏通知
+
+MovePointer / WarpPointer 成功更新权威 cursor 后，若 active_bounds 改变，立即向当前模式派发
+PointerMoved，使 UI Hint 重扫新屏幕；不依赖可能被原生 Hook 忽略的合成事件。同屏移动不增加该派发。
+
+
+WindowRequest 的 scope 统一约束库存、数字选择与循环候选；模式编译为当前屏幕或全部屏幕及 include_minimized。同一会话内，暂时最小化或退出候选范围不删除编号；明确关闭才释放，进入新会话时重建编号，跨 Window 家族切换采用目的模式自身配置；范围变化立即刷新库存。BeginEdit 在全部屏幕范围捕获各屏候选；ApplyLayout.additional_screens 在各屏工作区分别映射归一化矩形，合成一个原生事务，失败整体回滚、退出后一次撤销覆盖全部参与窗口。Quick 仍只操作所选窗口。
+
+Windows 原生标签拖拽通过 `TabNativeEvent::Drop(TabDrop)` 传递来源窗口／组、目标组和插入位置；共享协调器验证身份、提交一次可撤销事务并在失败时恢复。事件由持续存在的窗口 worker 消费，退出 Window 模式后仍可合并、转移和排序。
+
+分组对 Window 会话返回“标签栏＋活动应用”的外框，原生 `TabBar.bounds` 仍指应用内容框。`Grouped` 在布局写入、快照／还原及最小高度之间转换，标签栏高度由 `WindowAccess::tab_bar_height` 提供；原生 `tab_fit_frame` 在工作区边缘预留空间。分组历史保存真实应用快照，普通布局历史保存逻辑外框，不能混用而重复扣减栏高。
+
 ## 启动链路
+
+Window 的数字、Tab 与 Shift+Tab 继续发送 `Select(WindowId)`、`Cycle`、`CyclePrevious`，不增加全局或容器专用键盘捕获。反向动作名为 `window_select_previous`，与 `window_select` 共用切换逻辑：当前目标在标签组内时，按组成员顺序从活动成员开始循环；组外继续使用稳定窗口环。数字直选仍可跳出组。`WindowAccess::tab_selected` 校验原生焦点通知是否仍然有效。共享协调器先准备并显示新成员，尝试转移系统焦点，最后隐藏旧成员；焦点失败仍提交成员可见性，不能撤销已完成的成员切换。Windows `WindowAccess` 提供原生消息等待与 mailbox 唤醒端口；Engine/Mode 不接触原生消息或线程身份。
+
+跨平台标签组只通过 `WindowOperation::Tabs`、`TabState` 和 `TabNativeEvent` 跨层。关闭独立标签栏报告 `Dissolve(TabGroupId)`。`WindowAccess::tab_set_hidden` 封装单窗口的可见性；共享协调器负责切换时对齐新成员和恢复隐藏租约。Mode/Engine 不接触 HWND、AX 或原生窗口所有权。
 
 ```text
 main.rs
@@ -41,9 +59,9 @@ emergency stderr 使用不 panic 的 `Write` 路径，且不创建后台日志�
 
 ## API 边界
 
-托盘 `OpenConfigSimulator` 一次性读取当前 TOML source 和 `LayoutStore::export_file`；有布局文件时通过 v2 zlib/base64url fragment 传递 `{source, layouts, layout_error}`（layouts 为同一二进制文件的 base64url），无文件保留 v1 source-only 兼容。浏览器同步清除 fragment 后有界解压并校验两份数据；文件读取错误保留按键配置导入并显示布局错误。v2 解压上限 2 MiB、URL fragment 仍限 24 KiB，文件/源码继续各自限制。只在显式打开、R 列表及保存时读文件，没有文件监听。
+托盘 `OpenConfigSimulator` 一次性读取当前 TOML source 和 `PresetStore::export_file`；有布局文件时通过 v2 zlib/base64url fragment 传递 `{source, presets, preset_error}`（presets 为同一二进制文件的 base64url），无文件保留 v1 source-only 兼容。浏览器同步清除 fragment 后有界解压并校验两份数据；文件读取错误保留按键配置导入并显示布局错误。v2 解压上限 2 MiB、URL fragment 仍限 24 KiB，文件/源码继续各自限制。只在显式打开、R 列表及保存时读文件，没有文件监听。
 
-Window 保存/列表经 `Command::WindowLayouts` → Engine `LayoutController` → `LayoutStore`，结果用带 session 的 `ModeEvent::WindowLayouts` 返回。保存时 Backend 异步展示通用 `TextPrompt`，`BackendEvent::TextPromptResult` 以独立请求 id 匹配；备注期间输入保持原生 down/up 配对并 forward，保留窗口／网格覆盖层，暂时撤下帮助列表；TextPrompt 携带工作区底部矩形，原生输入控件无标题栏并置顶。取消 Window 会话先取消所属原生输入框，迟到的结果不能写入文件。保存、取消和错误后模式重新请求目标激活并绘制。磁盘和文本 UI 只在显式保存/列表操作触发，不进入帧热路径。
+Window 保存/列表经 `Command::WindowLayouts` → Engine `PresetController` → `PresetStore`，结果用带 session 的 `ModeEvent::WindowLayouts` 返回。保存时 Backend 异步展示通用 `TextPrompt`，`BackendEvent::TextPromptResult` 以独立请求 id 匹配；备注期间输入保持原生 down/up 配对并 forward，保留窗口／网格覆盖层，暂时撤下帮助列表；TextPrompt 携带工作区底部矩形，原生输入控件无标题栏并置顶。取消 Window 会话先取消所属原生输入框，迟到的结果不能写入文件。保存、取消和错误后模式重新请求目标激活并绘制。磁盘和文本 UI 只在显式保存/列表操作触发，不进入帧热路径。
 
 跨屏窗口移动通过 `Command::MoveWindowToScreen(WindowScreenTarget)` 到
 `Backend::move_window_to_screen`。窗口命中与位置查询按动作执行时的物理鼠标完成，不使用
@@ -227,6 +245,10 @@ macOS 更新事件在 Hook 有界队列忙时转入 fallback channel，后台线
 
 ## Window 请求与会话
 
+T 的命令仍走 `WindowOperation::Tabs(TabOperation)`，结果以 `WindowResult.tabs` 返回不含原生句柄的 `TabState`。`WindowTarget::Window` 只表示一个窗口，`WindowTarget::Group` 才展开全部成员；编号不能替代身份类型。模式只持有输入与展示状态，worker 的 `Grouped<WindowAccess>` 持有真实组合及原生事务。`CancelWindowSession` 结束 Mode 会话，不销毁后台组；仅显式解散或 backend shutdown 释放相应栏和监听。组存在时 worker 有界派发原生事件并合并几何通知，不在 Engine 等待系统写入。
+
+Tab 模板使用 `PresetLibraryOperation::Save { template: WindowTemplate::Tabs(..), .. }` 和现有异步备注流程。恢复先收集全部不同 `WindowId`，完成后只发送一次 `TabOperation::Restore`，原生层预检并在失败时恢复快照。普通 Window 几何历史通过同一包装层操作全组；一次恢复按组代表去重，T 的成员／排序历史独立。
+
 `BeginEdit` 异步返回完整库存与最小尺寸快照；`ApplyLayout` 发送事务 id、递增修订号及标准化绝对矩形；`EndEdit` 结束并分组撤销记录，内部恢复路径仍可请求回滚。移动与编辑即时生效；Q 是当前模式的普通绑定，交接前完成最新布局。Restore／Delete 的 Enter 用于编号确认／删除确认。Mode 保持单个在途批次并合并后续目标；worker 只写入变化矩形，拒绝陈旧修订，原生拒绝后回读并恢复上一成功布局。提交失败必须反馈结束状态，避免模式等待不存在的确认。
 
 Mode 的可选 `help_anchor` / `help_previews` 提供纯几何提示数据。Window 的常显面板由 Engine 的 key_help decorator 合并状态、真实绑定和缩略图，并基于锁定窗口定位。其他模式的可选 key_help 和临时 Normal 保持原语义。
@@ -266,3 +288,9 @@ Mode 的可选 `help_anchor` / `help_previews` 提供纯几何提示数据。Win
 WindowAction::Ratio 使用 held 按键生命周期及现有 FrameClock；RemoveRegion 仅在 Tree 可用。LayoutTree::resize_by 接收屏幕像素位移与 work_area，Mode 负责最小尺寸约束与事务合并。区域编号选择返回原生 Select 请求（空区域返回 WarpPointer），展示本身不调用平台 API。
 
 WindowInfo.minimized 在原生结果中传递最小化状态，Mode 保留目标但 presentation 隐藏其边框和编号。WindowAction/WindowChange::CycleState 对应 size_cycle，不提供旧动作名称的兼容别名。
+
+模式切换在公共输入层记录进入时已按住的物理键。涉及这些键的 temporary_mode_keys 必须等对应键松开后重新按下才生效，避免 Alt+W 等启动组合键在释放过程中误激活目标模式的临时 Normal；显式组合绑定仍使用完整物理按键状态，keep 不重新设门槛。
+
+WindowOperation::Undo/Redo 使用后台会话的双向原生快照历史；ResetInitial { group } 恢复本次会话写过的窗口，作为独立可撤销步骤。三者优先于库存查询，保持异步边界。模式仅发送命令/处理结果，不持有 HWND/AX 或执行原生恢复。
+
+WindowOperation::Acquire 在 worker 内获取鼠标下窗口并通过 activate_window 激活，完成后才返回目标供展示；不移动指针，激活失败通过 WindowResult.message 返回。WindowAction::Close（window_close）只在普通 Window 可用，发送 Close(WindowId)，由原生正常关闭请求处理，不创建撤销历史，不提前退役窗口身份；关闭取消/保存对话框保留目标，真实关闭后沿用库存和 closed 清理。

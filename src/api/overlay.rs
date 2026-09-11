@@ -421,6 +421,26 @@ impl LabelTextAnalysis {
     }
 }
 
+/// How a label participates in one movable annotation. Paint order is independent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LabelPlacementRole {
+    /// The annotation's physical footprint; does not scale around its center.
+    Background,
+    /// Text that moves with its background and retains its width and font size.
+    Fixed,
+    /// Text columns may narrow and elide when available space is limited.
+    Flexible,
+    /// An independent label, whose footprint follows normal label DPI geometry.
+    Standalone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LabelPlacement {
+    /// Nonzero scene-local identity shared by all parts and their connector.
+    pub group: u32,
+    pub role: LabelPlacementRole,
+}
+
 /// A text label to draw — a hint code, a grid cell key, a status badge.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OverlayLabel {
@@ -435,6 +455,8 @@ pub struct OverlayLabel {
     pub z_index: i32,
     /// When false the backend centers text in `rect` without growing it.
     pub fit_to_text: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<LabelPlacement>,
 }
 
 impl OverlayLabel {
@@ -450,6 +472,7 @@ impl OverlayLabel {
             matched_prefix_len: 0,
             z_index: 0,
             fit_to_text: false,
+            placement: None,
         }
     }
 
@@ -469,6 +492,11 @@ impl OverlayLabel {
 
     pub fn with_z_index(mut self, z: i32) -> Self {
         self.z_index = z;
+        self
+    }
+
+    pub fn with_placement(mut self, group: u32, role: LabelPlacementRole) -> Self {
+        self.placement = Some(LabelPlacement { group, role });
         self
     }
 
@@ -549,6 +577,8 @@ pub enum OverlayShape {
         color: Color,
         width: f64,
         z_index: i32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        placement_group: Option<u32>,
     },
 }
 
@@ -582,6 +612,18 @@ impl OverlayShape {
             color,
             width,
             z_index: 0,
+            placement_group: None,
+        }
+    }
+
+    pub fn label_connector(from: Point, to: Point, color: Color, width: f64, group: u32) -> Self {
+        Self::Line {
+            from,
+            to,
+            color,
+            width,
+            z_index: 0,
+            placement_group: Some(group),
         }
     }
 
@@ -854,7 +896,8 @@ mod tests {
     fn compact_overlay_layout_stays_within_budget() {
         assert_eq!(std::mem::size_of::<OverlayText>(), 24);
         assert_eq!(std::mem::size_of::<SharedLabelStyle>(), 8);
-        assert!(std::mem::size_of::<OverlayLabel>() <= 80);
+        // Includes eight bytes of optional annotation grouping metadata.
+        assert!(std::mem::size_of::<OverlayLabel>() <= 88);
         println!(
             "overlay_label_size_candidate={} label_style_size_candidate={}",
             std::mem::size_of::<OverlayLabel>(),

@@ -301,6 +301,15 @@ impl Engine {
     }
 
     pub(super) fn set_active(&mut self, active: ModeId) {
+        self.overlay.window_help_plan = None;
+        if active != self.registry.active {
+            // Activation keys belong to the outgoing input context. A fresh
+            // physical press arms the destination's temporary layer.
+            self.input.temporary_entry_keys.clear();
+            self.input
+                .temporary_entry_keys
+                .extend(self.input.pressed.iter().cloned());
+        }
         self.overlay.key_help_cache = None;
         if active == ModeId::idle() {
             self.overlay.key_help_visible = false;
@@ -350,6 +359,7 @@ impl Engine {
     /// Per-app overrides for the focused application are folded in, so a
     /// binding can differ per application, and disabled entries are dropped.
     pub(super) fn rebuild_tables(&mut self) {
+        self.overlay.window_help_plan = None;
         self.overlay.key_help_cache = None;
         let ids = self.binding_mode_ids();
         let binding_profile_key = self.binding_profile_key_for(self.focused_app.as_ref());

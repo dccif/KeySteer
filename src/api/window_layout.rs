@@ -140,7 +140,6 @@ pub enum LayoutNode {
 pub struct LayoutTree {
     pub root: LayoutNode,
     pub selected: u32,
-    next_slot: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -347,13 +346,8 @@ impl LayoutTree {
         Err("The available screen cannot fit these windows' minimum sizes; reduce the number of windows".into())
     }
     pub(super) fn from_saved_root(root: LayoutNode) -> Self {
-        let mut tree = Self {
-            root,
-            selected: 1,
-            next_slot: 1,
-        };
+        let mut tree = Self { root, selected: 1 };
         let slots = tree.slots();
-        tree.next_slot = slots.iter().map(|s| s.id).max().unwrap_or(1) + 1;
         tree.selected = slots.first().map_or(1, |s| s.id);
         tree
     }
@@ -462,11 +456,7 @@ impl LayoutTree {
                 area,
             )
         };
-        let mut tree = Self {
-            root,
-            selected: 1,
-            next_slot: windows.len().max(1) as u32 + 1,
-        };
+        let mut tree = Self { root, selected: 1 };
         tree.selected = tree
             .slots()
             .iter()
@@ -481,7 +471,7 @@ impl LayoutTree {
         out
     }
 
-    /// Splits only append stable IDs; undo restores both the tree and counter.
+    /// Existing regions keep their IDs; new splits reuse the lowest free ID.
     pub fn slot_count(&self) -> u32 {
         fn count(node: &LayoutNode) -> u32 {
             match node {
@@ -562,15 +552,144 @@ impl LayoutTree {
     }
 
     pub fn split(&mut self, direction: Direction) -> bool {
-        if self.slot_count() >= 256 || self.next_slot == u32::MAX {
+        let occupied: std::collections::BTreeSet<_> =
+            self.slots().iter().map(|slot| slot.id).collect();
+        if occupied.len() >= 256 {
             return false;
         }
-        if self.root.split(self.selected, direction, self.next_slot) {
-            self.next_slot += 1;
-            true
-        } else {
-            false
+        let Some(new_id) = (1..=257).find(|id| !occupied.contains(id)) else {
+            return false;
+        };
+        self.root.split(self.selected, direction, new_id)
+    }
+
+    /// Resize the selected region, preserving tiling and native minimum sizes.
+    /// Opposing boundaries share the change when possible; a constrained edge
+    /// yields to another ancestor instead of making that axis unusable.
+    pub fn resize_region_by(
+        &mut self,
+        direction: Direction,
+        pixels: f64,
+        area: Rect,
+        minimums: &BTreeMap<WindowId, Point>,
+        gap: f64,
+    ) -> bool {
+        if !pixels.is_finite() || pixels <= 0.0 {
+            return false;
         }
+        let axis = Axis::of(direction);
+        fn ancestors(
+            node: &LayoutNode,
+            slot: u32,
+            axis: Axis,
+            path: &mut Vec<bool>,
+            out: &mut Vec<(Vec<bool>, bool)>,
+        ) {
+            if let LayoutNode::Split {
+                axis: split_axis,
+                first,
+                second,
+                ..
+            } = node
+            {
+                let in_first = first.contains(slot);
+                if !in_first && !second.contains(slot) {
+                    return;
+                }
+                if *split_axis == axis {
+                    out.push((path.clone(), in_first));
+                }
+                path.push(!in_first);
+                ancestors(if in_first { first } else { second }, slot, axis, path, out);
+                path.pop();
+            }
+        }
+        fn ratio_at<'a>(node: &'a mut LayoutNode, path: &[bool]) -> Option<&'a mut f64> {
+            let LayoutNode::Split {
+                ratio,
+                first,
+                second,
+                ..
+            } = node
+            else {
+                return None;
+            };
+            if let Some((second_child, rest)) = path.split_first() {
+                ratio_at(if *second_child { second } else { first }, rest)
+            } else {
+                Some(ratio)
+            }
+        }
+        let measure = |tree: &Self| {
+            tree.slots()
+                .iter()
+                .find(|s| s.id == tree.selected)
+                .map(|s| match axis {
+                    Axis::X => (s.rect.width * area.width, s.rect.center().x * area.width),
+                    Axis::Y => (s.rect.height * area.height, s.rect.center().y * area.height),
+                })
+        };
+        let Some((original_size, original_center)) = measure(self) else {
+            return false;
+        };
+        let sign = if negative(direction) { -1.0 } else { 1.0 };
+        let mut paths = Vec::new();
+        ancestors(&self.root, self.selected, axis, &mut Vec::new(), &mut paths);
+        if paths.is_empty() {
+            return false;
+        }
+        for side in [Some(true), Some(false), None] {
+            let Some((size, _)) = measure(self) else {
+                break;
+            };
+            let remaining = (pixels - sign * (size - original_size)).max(0.0);
+            let step = if side.is_some() {
+                remaining.min(pixels / 2.0)
+            } else {
+                remaining
+            };
+            if step < 1e-6 {
+                continue;
+            }
+            let mut best = None;
+            let mut best_change = 0.0;
+            let mut best_drift = f64::INFINITY;
+            for (path, in_first) in paths.iter().rev() {
+                if side.is_some_and(|side| side != *in_first) {
+                    continue;
+                }
+                let mut candidate = self.clone();
+                let Some(ratio) = ratio_at(&mut candidate.root, path) else {
+                    continue;
+                };
+                let fraction = if *in_first { *ratio } else { 1.0 - *ratio };
+                *ratio = (*ratio
+                    + sign * step * fraction / size.max(1.0) * if *in_first { 1.0 } else { -1.0 })
+                .clamp(0.0, 1.0);
+                if candidate.fit(minimums, area, gap).is_err() {
+                    continue;
+                }
+                let Some((next_size, next_center)) = measure(&candidate) else {
+                    continue;
+                };
+                let change = sign * (next_size - size);
+                let drift = (next_center - original_center).abs();
+                if change <= 1e-6 || change > step + 1e-6 {
+                    continue;
+                }
+                if change > best_change + 1e-6
+                    || ((change - best_change).abs() <= 1e-6 && drift < best_drift)
+                {
+                    best_change = change;
+                    best_drift = drift;
+                    best = Some(candidate);
+                }
+            }
+            if let Some(candidate) = best {
+                *self = candidate;
+            }
+        }
+        true
     }
 
     /// Move the nearest matching ancestor divider by screen-space pixels.
@@ -806,7 +925,7 @@ mod tests {
     }
 
     #[test]
-    fn pixel_dividers_clamp_at_minimums_and_deleted_ids_are_not_reused() {
+    fn pixel_dividers_clamp_at_minimums_and_deleted_ids_are_reused() {
         let area = Rect::new(0.0, 0.0, 1000.0, 700.0);
         let mut tree = LayoutTree::import(&[], None, area);
         assert!(!tree.resize_by(Direction::Right, 20.0, area));
@@ -824,9 +943,103 @@ mod tests {
         tree.split(Direction::Down);
         assert_eq!(
             tree.slots().iter().map(|s| s.id).collect::<Vec<_>>(),
-            [1, 3]
+            [1, 2]
         );
-        assert!(!tree.focus_slot(2));
+        assert!(tree.focus_slot(2));
+    }
+
+    #[test]
+    fn region_ids_recycle_without_renumbering_survivors() {
+        let area = Rect::new(0.0, 0.0, 1000.0, 700.0);
+        let mut tree = LayoutTree::import(&[], None, area);
+        for _ in 0..100 {
+            assert!(tree.split(Direction::Right));
+            assert_eq!(
+                tree.slots().iter().map(|s| s.id).collect::<Vec<_>>(),
+                [1, 2]
+            );
+            tree.focus_slot(2);
+            assert!(tree.remove_selected());
+            assert_eq!(tree.selected, 1);
+        }
+    }
+
+    #[test]
+    fn region_resize_grows_the_selected_side_on_both_axes_and_preserves_tiling() {
+        let area = Rect::new(-1000.0, 50.0, 1000.0, 800.0);
+        for (split, grow, shrink) in [
+            (Direction::Right, Direction::Right, Direction::Left),
+            (Direction::Down, Direction::Down, Direction::Up),
+        ] {
+            for selected in [1, 2] {
+                let mut tree = LayoutTree::import(&[], None, area);
+                tree.split(split);
+                tree.focus_slot(selected);
+                let original = tree.clone();
+                let dimension = |tree: &LayoutTree| {
+                    let rect = tree
+                        .slots()
+                        .into_iter()
+                        .find(|s| s.id == selected)
+                        .unwrap()
+                        .rect;
+                    if split == Direction::Right {
+                        rect.width * area.width
+                    } else {
+                        rect.height * area.height
+                    }
+                };
+                let initial = dimension(&tree);
+                assert!(tree.resize_region_by(grow, 40.0, area, &BTreeMap::new(), 0.0));
+                assert!((dimension(&tree) - initial - 40.0).abs() < 1e-6);
+                let slots = tree.slots();
+                assert!(slots[0].rect.intersect(&slots[1].rect).is_none());
+                assert!(
+                    (slots
+                        .iter()
+                        .map(|s| s.rect.width * s.rect.height)
+                        .sum::<f64>()
+                        - 1.0)
+                        .abs()
+                        < 1e-9
+                );
+                tree.resize_region_by(shrink, 40.0, area, &BTreeMap::new(), 0.0);
+                assert!((dimension(&tree) - dimension(&original)).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn region_resize_can_borrow_past_a_constrained_nearest_divider() {
+        let slot = |id| LayoutNode::Slot {
+            id,
+            window: Some(WindowId(id as u64)),
+        };
+        let mut tree = LayoutTree::from_saved_root(LayoutNode::Split {
+            axis: Axis::X,
+            ratio: 0.6,
+            first: Box::new(LayoutNode::Split {
+                axis: Axis::X,
+                ratio: 0.5,
+                first: Box::new(slot(1)),
+                second: Box::new(slot(2)),
+            }),
+            second: Box::new(slot(3)),
+        });
+        let area = Rect::new(0.0, 0.0, 1000.0, 800.0);
+        let minimums = BTreeMap::from([
+            (WindowId(1), Point::new(280.0, 100.0)),
+            (WindowId(2), Point::new(300.0, 100.0)),
+            (WindowId(3), Point::new(100.0, 100.0)),
+        ]);
+        tree.fit(&minimums, area, 0.0).unwrap();
+        tree.resize_region_by(Direction::Right, 40.0, area, &minimums, 0.0);
+        assert!((tree.slots()[0].rect.width * area.width - 340.0).abs() < 1e-6);
+        for slot in tree.slots() {
+            assert!(slot.rect.width * area.width >= minimums[&slot.window.unwrap()].x - 1e-6);
+        }
+        tree.resize_region_by(Direction::Left, 1000.0, area, &minimums, 0.0);
+        assert!(tree.slots()[0].rect.width * area.width >= 280.0 - 1e-6);
     }
 
     #[test]

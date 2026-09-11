@@ -8,7 +8,7 @@ import {
   type ConfigDocument,
 } from './document'
 
-type TargetingMode = 'grid' | 'recursive_grid' | 'ui_hint' | 'key_help' | 'window' | 'window_quick' | 'window_editor' | 'window_restore' | 'window_delete'
+type TargetingMode = 'grid' | 'recursive_grid' | 'ui_hint' | 'key_help' | 'window' | 'window_quick' | 'window_editor' | 'window_restore' | 'window_tab'
 type Appearance = 'dark' | 'light'
 type ControlKind = 'color' | 'number' | 'text' | 'boolean' | 'select' | 'ratios'
 
@@ -36,6 +36,8 @@ const fields = {
       { path: 'window.ui.border_color', label: '目标描边', kind: 'color' },
     ],
     layout: [
+      { path: 'window.screens', label: '窗口范围（current 当前屏幕 / all 全部屏幕）', kind: 'select', options: ['current', 'all'] },
+      { path: 'window.include_minimized', label: '包含最小化窗口', kind: 'boolean' },
       { path: 'window.enabled', label: '启用 Window', kind: 'boolean' },
       { path: 'window.number_timeout_ms', label: '歧义编号等待（毫秒）', kind: 'number', min: 100, max: 2000, step: 10 },
       { path: 'window.move_step', label: '移动步长', kind: 'number', min: 0, max: 10000, step: 1 },
@@ -139,12 +141,12 @@ const fields = {
   },
 } as Record<TargetingMode, ModeFields>
 
-for (const mode of ['window_quick', 'window_editor', 'window_restore', 'window_delete'] as const) {
+for (const mode of ['window_quick', 'window_editor', 'window_restore', 'window_tab'] as const) {
   const common = (items: StyleField[]) => items.filter(f => !/window\.(move_|resize_)/.test(f.path)).map(f => ({ ...f, path: f.path.replace(/^window\./, `${mode}.`) }))
   ;(fields as Record<string, ModeFields>)[mode] = { colors: common(fields.window.colors), layout: common(fields.window.layout), advanced: common(fields.window.advanced) }
   const own = (fields as Record<string, ModeFields>)[mode]
   if (mode === 'window_quick') own.layout.push({ path: `${mode}.split_ratios`, label: '比例（逗号分隔，支持分数）', kind: 'ratios' })
-  if (mode !== 'window_delete') own.layout.push({ path: `${mode}.gap`, label: '布局间距', kind: 'number', min: 0, step: 1 })
+  if (mode !== 'window_tab') own.layout.push({ path: `${mode}.gap`, label: '布局间距', kind: 'number', min: 0, step: 1 })
   if (mode === 'window_editor') own.advanced.push({ path: `${mode}.resize_step`, label: '分割线步长', kind: 'number', min: 0 }, { path: `${mode}.resize_speed`, label: '分割线速度', kind: 'number', min: 0 })
   if (mode === 'window_restore') own.advanced.push({ path: `${mode}.lifecycle.after_finish`, label: '恢复成功后', kind: 'select', options: ['window_editor', 'window', 'window_restore', 'keep', 'normal', 'idle'] })
 }

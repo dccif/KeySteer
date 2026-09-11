@@ -2,8 +2,8 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { createSimulatorState, applyModeAction } from './state.ts'
 import { applyWindowAction, chooseWindowNumber, enterWindow, finishWindowNumber, refreshWindowNumbers, temporaryWindow, tileWindows, windowSelectionKey, windowTarget, WINDOW_AREA } from './window.ts'
-import { resolvePhysicalBinding, temporaryPhysicalKeys } from './bindings.ts'
-import { automaticTree, importTree, fitTree, treeSlots } from './window-layout.ts'
+import { resolvePhysicalBinding, shortcutCaption, temporaryPhysicalKeys } from './bindings.ts'
+import { automaticTree, importTree, fitTree, treeSlots, splitSlot, removeSlot, resizeRegionBy } from './window-layout.ts'
 import { parseSplitRatios } from './window-ratios.ts'
 
 test('E enters automatic editing directly; ordinary mode bindings control all return destinations', () => {
@@ -78,9 +78,9 @@ test('Window locks the pointer target and an Idle binding releases its session',
   assert.equal(state.window.history.length, 0)
 })
 
-test('Tab cycles immediately across screens and centers the pointer without opening a panel', () => {
+test('Tab with all screens enabled cycles across screens and centers the pointer', () => {
   const state = createSimulatorState()
-  enterWindow(state)
+  enterWindow(state, { screens: 'all' })
   applyWindowAction(state, 'window_size')
   for (const id of [3, 4, 1, 2]) {
     applyWindowAction(state, 'window_select')
@@ -120,8 +120,8 @@ test('quick ratios apply immediately and back keeps them until undo', () => {
   applyWindowAction(state, 'window_layout_left')
   assert.equal(state.mode, 'window_quick')
   assert.equal(state.window.size, true)
-  assert.equal(windowTarget(state.window)!.x, 4)
-  assert.equal(windowTarget(state.window)!.width, 1000 / 3 - 8)
+  assert.equal(windowTarget(state.window)!.x, 0)
+  assert.equal(windowTarget(state.window)!.width, 1000 / 3)
   const applied = JSON.stringify(state.window.windows)
   applyWindowAction(state, 'window')
   assert.equal(JSON.stringify(state.window.windows), applied)
@@ -254,7 +254,7 @@ test('tree minimum sizes constrain the divider and infeasible splits leave geome
   const state = createSimulatorState()
   state.window.windows = [
     { id: 1, title: 'Small', app: 'Demo', screen: 0, x: 0, y: 0, width: 220, height: 650 },
-    { id: 2, title: 'Constrained', app: 'ChatGPT', screen: 0, x: 240, y: 0, width: 760, height: 650, minWidth: 720, minHeight: 620 },
+    { id: 2, title: 'Constrained', app: 'ChatGPT', screen: 0, x: 240, y: 0, width: 760, height: 650, minWidth: 720, minHeight: 650 },
   ]
   enterWindow(state); applyWindowAction(state, 'window_quick'); applyWindowAction(state, 'window_editor')
   assert.equal(state.window.panel, 'tree')
@@ -281,6 +281,7 @@ test('leaving tree editing is one ordinary undo, and closing windows preserves e
   state.window.windows = state.window.windows.filter(w => w.id !== closing.id); refreshWindowNumbers(state.window)
   assert.equal(treeSlots(state.window.tree!).length, count)
   assert.ok(treeSlots(state.window.tree!).some(s => s.window === null))
+  delete numbers[closing.id]
   assert.deepEqual(state.window.numbers, numbers)
   applyWindowAction(state, 'window')
   assert.ok(!state.window.windows.some(w => w.id === closing.id))
@@ -333,7 +334,7 @@ test('continuous divider motion is one undo and X removes a region with stable I
 
 
 test('all window modes launch directly from Idle and share session numbers', () => {
-  for (const mode of ['window', 'window_quick', 'window_editor', 'window_restore', 'window_delete']) {
+  for (const mode of ['window', 'window_quick', 'window_editor', 'window_restore']) {
     const state = createSimulatorState(); state.mode = 'idle'
     applyWindowAction(state, mode)
     assert.equal(state.mode, mode)
@@ -350,9 +351,9 @@ test('all window modes launch directly from Idle and share session numbers', () 
 test('Quick uses independently configured ratios', () => {
   const state = createSimulatorState(); applyWindowAction(state, 'window_quick', { split_ratios: [.2, .4, .6, .8] })
   applyWindowAction(state, 'window_layout_left')
-  assert.equal(windowTarget(state.window)!.width, 392)
+  assert.equal(windowTarget(state.window)!.width, 400)
   applyWindowAction(state, 'window_layout_left')
-  assert.equal(windowTarget(state.window)!.width, 192)
+  assert.equal(windowTarget(state.window)!.width, 200)
 })
 
 
@@ -377,4 +378,141 @@ test('state cycle preserves target, restores original geometry and rejects old n
   applyWindowAction(state, 'window_undo')
   assert.equal(!!windowTarget(state.window)?.minimized, false)
   assert.equal(windowTarget(state.window)?.width, WINDOW_AREA.width)
+})
+
+
+test('temporary chords ignore held entry keys without blocking a fresh alternative chord', () => {
+  const document = { window: { temporary_mode: 'normal', temporary_mode_keys: ['alt', 'ctrl'] } }
+  const entry = new Set(['left_alt', 'w'])
+  assert.deepEqual(temporaryPhysicalKeys(document, 'window', ['left_alt'], false, entry), [])
+  assert.deepEqual(temporaryPhysicalKeys(document, 'window', ['left_alt', 'left_ctrl'], false, entry), ['left_ctrl'])
+  entry.delete('left_alt')
+  assert.deepEqual(temporaryPhysicalKeys(document, 'window', ['left_alt'], false, entry), ['left_alt'])
+})
+
+
+test('undo and redo round-trip moves and a new action invalidates redo', () => {
+  const state = createSimulatorState(); enterWindow(state)
+  const initial = structuredClone(windowTarget(state.window)!)
+  applyWindowAction(state, 'window_right'); applyWindowAction(state, 'window_size')
+  const moved = structuredClone(windowTarget(state.window)!)
+  applyWindowAction(state, 'window_undo')
+  assert.deepEqual(windowTarget(state.window), initial)
+  applyWindowAction(state, 'window_undo')
+  applyWindowAction(state, 'window_redo')
+  assert.deepEqual(windowTarget(state.window), moved)
+  applyWindowAction(state, 'window_undo'); applyWindowAction(state, 'window_center')
+  assert.equal(state.window.redo.length, 0)
+})
+
+test('Quick and Editor preserve redo across the original-state undo boundary', () => {
+  for (const mode of ['window_quick', 'window_editor']) {
+    const state = createSimulatorState(); enterWindow(state)
+    const initial = structuredClone(state.window.windows)
+    applyWindowAction(state, mode)
+    if (mode === 'window_quick') applyWindowAction(state, 'window_layout_left')
+    const arranged = JSON.parse(JSON.stringify(state.window.windows))
+    assert.notDeepEqual(arranged, initial)
+    applyWindowAction(state, 'window_undo')
+    assert.deepEqual(state.window.windows, initial)
+    applyWindowAction(state, 'window_undo')
+    applyWindowAction(state, 'window_redo')
+    assert.deepEqual(state.window.windows, arranged)
+    applyWindowAction(state, 'window_undo')
+    applyWindowAction(state, mode === 'window_quick' ? 'window_layout_right' : 'window_split_right')
+    assert.equal(state.window.editRedo.length, 0)
+  }
+})
+
+test('initial reset crosses modes and remains undoable without arranging again', () => {
+  const state = createSimulatorState(); enterWindow(state)
+  const initial = structuredClone(state.window.windows)
+  applyWindowAction(state, 'window_right'); applyWindowAction(state, 'window_editor')
+  const arranged = JSON.parse(JSON.stringify(state.window.windows))
+  applyWindowAction(state, 'window_reset_initial')
+  assert.deepEqual(state.window.windows, initial)
+  assert.equal(state.mode, 'window_editor')
+  applyWindowAction(state, 'window_undo')
+  assert.deepEqual(state.window.windows, arranged)
+  applyWindowAction(state, 'window_redo')
+  assert.deepEqual(state.window.windows, initial)
+})
+
+
+test('shortcut captions and physical input share platform, ordinary and chained aliases', () => {
+  const config = { key_aliases: { Modifier: 'right_ctrl', Exit: 'f10', Leave: 'Exit', windows: { Modifier: 'left_alt' }, macos: { Modifier: 'left_cmd', Exit: 'k' } }, window_restore: { bindings: { 'Modifier+Leave': 'idle' } } }
+  for (const [mac, modifier, key, caption] of [[false, 'left_alt', 'f10', 'LEFT ALT+F10'], [true, 'left_cmd', 'k', 'LEFT CMD+K']] as const) {
+    assert.equal(shortcutCaption(config, 'Modifier+Leave', mac), caption)
+    assert.equal(resolvePhysicalBinding(config, 'window_restore', [modifier, key], key, mac)?.value, 'idle')
+  }
+  config.key_aliases.windows.Modifier = 'right_ctrl'
+  config.key_aliases.Exit = 'f8'
+  assert.equal(shortcutCaption(config, 'Modifier+Leave', false), 'RIGHT CTRL+F8')
+  assert.equal(resolvePhysicalBinding(config, 'window_restore', ['right_ctrl', 'f8'], 'f8', false)?.value, 'idle')
+})
+
+
+test('region splits reuse gaps across repeated deletion and preserve remaining labels', () => {
+  const tree = importTree([], null, { width: 1000, height: 800 })
+  for (let i = 0; i < 100; i++) {
+    assert.equal(splitSlot(tree, 'right'), true)
+    assert.deepEqual(treeSlots(tree).map(slot => slot.id), [1, 2])
+    tree.selected = 2
+    assert.equal(removeSlot(tree), true)
+    assert.equal(tree.selected, 1)
+  }
+})
+
+test('region size actions grow the selected side on either axis and preserve tiling', () => {
+  const area = { width: 1000, height: 800 }
+  for (const [split, grow, shrink] of [['right', 'right', 'left'], ['down', 'down', 'up']] as const) {
+    for (const selected of [1, 2]) {
+      const tree = importTree([], null, area); splitSlot(tree, split); tree.selected = selected
+      const size = () => { const slot = treeSlots(tree).find(slot => slot.id === selected)!; return split === 'right' ? slot.rect.width * area.width : slot.rect.height * area.height }
+      const initial = size()
+      resizeRegionBy(tree, grow, 40, area, [], 0)
+      assert(Math.abs(size() - initial - 40) < 1e-6)
+      assert(Math.abs(treeSlots(tree).reduce((sum, slot) => sum + slot.rect.width * slot.rect.height, 0) - 1) < 1e-9)
+      resizeRegionBy(tree, shrink, 40, area, [], 0)
+      assert(Math.abs(size() - initial) < 1e-6)
+    }
+  }
+})
+
+test('region sizing can borrow from another ancestor when the nearest neighbor is constrained', () => {
+  const area = { width: 1000, height: 800 }
+  const tree = { root: { kind: 'split' as const, axis: 'x' as const, ratio: .6,
+    first: { kind: 'split' as const, axis: 'x' as const, ratio: .5, first: { kind: 'slot' as const, id: 1, window: 1 }, second: { kind: 'slot' as const, id: 2, window: 2 } },
+    second: { kind: 'slot' as const, id: 3, window: 3 } }, selected: 1, nextSlot: 4 }
+  const windows = [280, 300, 100].map((minWidth, i) => ({ id: i + 1, minWidth, minHeight: 100, x: 0, y: 0, width: minWidth, height: 800 }))
+  resizeRegionBy(tree, 'right', 40, area, windows, 0)
+  assert(Math.abs(treeSlots(tree)[0].rect.width * area.width - 340) < 1e-6)
+  for (const slot of treeSlots(tree)) assert(slot.rect.width * area.width >= windows[slot.window! - 1].minWidth - 1e-6)
+})
+
+test('ordinary close removes only the target and undo does not reopen it', () => {
+  const state = createSimulatorState()
+  enterWindow(state)
+  const id = state.window.target
+  const remaining = state.window.windows.filter(w => w.id !== id).map(w => w.id)
+  assert.equal(applyWindowAction(state, 'window_close'), true)
+  assert.deepEqual(state.window.windows.map(w => w.id), remaining)
+  assert.equal(state.window.target, null)
+  applyWindowAction(state, 'window_undo')
+  assert.deepEqual(state.window.windows.map(w => w.id), remaining)
+})
+
+test('ordinary close targets the active tab and dissolves a one-member group', () => {
+  const state = createSimulatorState()
+  enterWindow(state)
+  const [first, second, third] = state.window.windows
+  state.window.tabs.groups = [{ id: 1, members: [first.id, second.id, third.id], active: third.id }]
+  state.window.target = first.id
+  applyWindowAction(state, 'window_close')
+  assert.deepEqual(state.window.tabs.groups[0].members, [first.id, second.id])
+  state.window.target = first.id
+  applyWindowAction(state, 'window_close')
+  assert.equal(state.window.tabs.groups.length, 0)
+  assert.ok(state.window.windows.some(w => w.id === first.id))
+  assert.ok(!state.window.windows.some(w => w.id === second.id || w.id === third.id))
 })

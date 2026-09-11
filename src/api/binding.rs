@@ -200,7 +200,7 @@ impl Binding {
         let replacement = match text {
             "window_layout" => Some("window_quick"),
             "window_edit" => Some("window_editor"),
-            "window_saved_layouts" => Some("window_restore"),
+            "window_saved_presets" => Some("window_restore"),
             "window_cancel" | "window_exit" => Some("a destination mode such as window or idle"),
             _ => None,
         };

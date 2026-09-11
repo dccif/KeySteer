@@ -455,6 +455,7 @@ fn shape_matches_local(
                 stroke_width: cached_stroke_width,
                 corner_radius: cached_corner_radius,
                 z_index: cached_z_index,
+                ..
             },
         ) => {
             rect_relative_to_area(*rect, area) == rect_relative_to_area(*cached_rect, cached_area)
@@ -471,6 +472,7 @@ fn shape_matches_local(
                 color,
                 width,
                 z_index,
+                ..
             },
             OverlayShape::Line {
                 from: cached_from,
@@ -478,6 +480,7 @@ fn shape_matches_local(
                 color: cached_color,
                 width: cached_width,
                 z_index: cached_z_index,
+                ..
             },
         ) => {
             point_relative_to_area(*from, area) == point_relative_to_area(*cached_from, cached_area)

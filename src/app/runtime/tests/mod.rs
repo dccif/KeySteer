@@ -59,6 +59,7 @@ struct Recorder {
     timeline: Vec<&'static str>,
     dispositions: Vec<KeyDisposition>,
     scans: usize,
+    scan_requests: Vec<crate::api::UiScanRequest>,
     cancelled_scans: Vec<u64>,
     opened_urls: Vec<String>,
     shutdowns: usize,
@@ -256,8 +257,9 @@ impl Backend for FakeBackend {
         self.log.lock().unwrap().dismissals += 1;
         Ok(())
     }
-    fn request_ui_scan(&mut self, _request: crate::api::UiScanRequest) -> Result<(), String> {
+    fn request_ui_scan(&mut self, request: crate::api::UiScanRequest) -> Result<(), String> {
         self.log.lock().unwrap().scans += 1;
+        self.log.lock().unwrap().scan_requests.push(request);
         Ok(())
     }
     fn cancel_ui_scan(&mut self, id: u64) -> Result<(), String> {
@@ -333,7 +335,7 @@ impl Mode for ProbeMode {
             ModeEvent::PointerMoved(_) => "pointer",
             ModeEvent::Frame { .. } => "frame",
             ModeEvent::FocusChanged(_) => "focus",
-            ModeEvent::WindowLayouts(_) => "window-layouts",
+            ModeEvent::WindowPresets(_) => "window-presets",
             ModeEvent::WindowResult(_) => "window",
             ModeEvent::TemporaryModeChanged { .. } => "temporary",
         };

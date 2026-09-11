@@ -34,6 +34,7 @@ impl GridView<'_> {
         for column in 1..cols {
             let x = area.x + column as f64 * cell_width;
             scene.push_shape(OverlayShape::Line {
+                placement_group: None,
                 from: Point::new(x, area.top()),
                 to: Point::new(x, area.bottom()),
                 color,
@@ -44,6 +45,7 @@ impl GridView<'_> {
         for row in 1..rows {
             let y = area.y + row as f64 * cell_height;
             scene.push_shape(OverlayShape::Line {
+                placement_group: None,
                 from: Point::new(area.left(), y),
                 to: Point::new(area.right(), y),
                 color,
@@ -81,6 +83,7 @@ impl GridView<'_> {
                 }
                 let x = area.x + column as f64 * cell_width;
                 scene.push_shape(OverlayShape::Line {
+                    placement_group: None,
                     from: Point::new(x, area.top()),
                     to: Point::new(x, area.bottom()),
                     color: line_color,
@@ -94,6 +97,7 @@ impl GridView<'_> {
                 }
                 let y = area.y + row as f64 * cell_height;
                 scene.push_shape(OverlayShape::Line {
+                    placement_group: None,
                     from: Point::new(area.left(), y),
                     to: Point::new(area.right(), y),
                     color: line_color,

@@ -24,12 +24,12 @@ fn simulator_menu_uses_the_active_config_source() {
 }
 
 #[test]
-fn simulator_menu_includes_current_saved_layouts_without_manual_import() {
+fn simulator_menu_includes_current_saved_presets_without_manual_import() {
     let config = Config::default(); let source = config.to_toml().unwrap();
     let mut engine = Engine::new(config, Appearance::Dark);
-    engine.attach_layout_store(Box::new(crate::app::layout_store::LayoutStore::default()));
-    engine.window_layouts.store.save(crate::api::window_presets::RegionTemplate::Slot { id: 1 }, 1, "Coding".into()).unwrap();
-    let expected = config_handoff::url_for_workspace(&source, engine.window_layouts.store.export_file());
+    engine.attach_preset_store(Box::new(crate::app::preset_store::PresetStore::default()));
+    engine.window_presets.store.save(crate::api::window_presets::RegionTemplate::Slot { id: 1 }.into(), 1, "Coding".into()).unwrap();
+    let expected = config_handoff::url_for_workspace(&source, engine.window_presets.store.export_file());
     let (mut backend, log) = FakeBackend::new(vec![BackendEvent::OpenConfigSimulator]);
     engine.run(&mut backend).unwrap();
     assert_eq!(log.lock().unwrap().opened_urls, [expected]);

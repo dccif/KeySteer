@@ -24,6 +24,7 @@ pub mod theme;
 pub mod window;
 pub mod window_layout;
 pub mod window_presets;
+pub mod window_tabs;
 
 pub use autostart::Autostart;
 pub use backend::{
@@ -35,7 +36,8 @@ pub use binding::{
 };
 pub use command::{
     ButtonAction, Command, CommandBatch, FinishCause, FocusedApp, HostContext, Mode, ModeEvent,
-    MouseButton, UiScanRequest, UiScanResult, UiScanStatus, UiScanStrategy, VisionOptions,
+    MouseButton, UiScanRequest, UiScanResult, UiScanScope, UiScanStatus, UiScanStrategy,
+    VisionOptions,
 };
 pub use geometry::{Point, Rect, Screen, UiTarget};
 pub use hint::LabelDirection;

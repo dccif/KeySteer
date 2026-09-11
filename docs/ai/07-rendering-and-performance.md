@@ -1,7 +1,14 @@
 # 覆盖层、帧同步与性能约束
 
+Window 卡片、区域编号（`1、`2）和组编号（~1、~2）统一由 `presentation/label_placement.rs` 按屏幕避让。`OverlayLabel::placement` 显式记录组身份与 Background/Fixed/Flexible/Standalone 角色，引线也带同一组身份，不依赖 z_index 或数组相邻顺序。key_help 得到最终物理面板矩形后调用同一算法，完整移动背景、编号、应用名、标题及引线。先寻找最近空位，空间碎片不足时按可用空区重新排列；仅收窄 Flexible 标题并省略文字，固定编号与字号保持。实际 footprint 使用对应后端 DPI 几何。该工作仅发生在场景生成／帮助缓存失效时，不进入鼠标位置缓存命中路径。
 
 ## 统一场景构建
+
+Window 分组卡片为每个成员显示独立一行（编号、程序、标题和活动标记），成员较多时按工作区高度分列，布局中的组仍只占一个区域。Windows 独立栏滚动只更新局部视口；布局边界包括栏高，绘制不得另把栏移到底部覆盖应用内容。
+
+Windows 标签栏随活动应用的堆叠顺序排列，不使用全局置顶。原生拖拽只重画现有栏的插入提示；应用透明度切换不分配截图或全屏纹理，原有分层绘制应用走显隐回退。位置更新仍直接响应窗口事件，不增加帧时钟或 20ms 定时器。
+
+Tab 组的应用保持独立顶层窗口，只显示活动成员；拖动只移动活动应用，切换时再调整隐藏成员。Windows 原生位置事件直接移动独立标签栏，复用 HWND、字体、画刷和栏大小的后备位图；仅位置改变不重画内容，也不写其他成员的位置。Window 覆盖层只给活动标签绘制窗口卡片，树布局保留每组一个代表；其余编号仍可从标签栏和数字输入访问。
 
 `src/presentation/` 统一负责 Grid、Recursive Grid、UI Hint、Window、屏幕选择器、按键帮助、
 模式徽标和光标标记的布局、样式解析与场景原语构造。该层只依赖 `api`，不读取 Mode 实例、
@@ -31,6 +38,8 @@ Windows OCR 不属于预热常驻集。Backend ready 后首次事件轮询派发
 热路径使用 inline storage：`CommandBatch` 的 0/1/2 命令不分配，Normal held-key map inline 4 项，Grid/Recursive stack/path inline 12 项，继承 visited inline 8 项。
 
 ## 提交模型
+
+T 的窗口编号和组输入高亮仍由统一 presentation 构造；持久可点击标签栏使用独立 `TabBar` 原生消息，不借用模式覆盖层寿命。切到无关应用不隐藏标签栏；成员最小化或原生全屏时隐藏，解散和 shutdown 才释放。Windows worker 用消息队列同时等待 WinEvent、标签栏点击和命令唤醒，正常态无限等待事件，不以 20ms 或显示帧率轮询。位置回调通过同线程 Weak 引用立即移动活动成员的自有标签栏，关闭、成员选择、标题及尺寸/DPI 更新仍排队串行处理；回调不操作任何应用窗口，也不跨入 Mode/Engine。只有显隐失败的恢复路径保留有界重试 deadline。禁止将这种小面积栏改成每帧全屏图像。
 
 Window 的中心编号、区域描边只在状态变化时重新提交；500ms 库存结果相同时不重绘。库存结果以所有权交付，未变化条目直接复用；编号前缀索引只在可见成员、屏幕或区域数量改变时重建，数字输入复用缓冲区和 inline 输出。派生方向表仅在配置变化时重建。Window 的操作提示和 A 单个比例预览共用 key_help 的一个圆角背景、字体和键帽。Mode 只提供 `help_anchor` / `help_previews`，Host 根据有效绑定生成文字；面板优先按目标窗口的可见内部空间排版并贴近内底部，窗口过小时回退到工作区约束。帮助面板不重复列举窗口数字，窗口编号与中央下方的分区编号共用 `window.ui.font_size`（默认 28）。缓存比较锁定矩形、状态文字和缩略图选择；普通鼠标移动不会带走面板。Window 不再额外绘制浮动模式 badge。
 
@@ -239,8 +248,8 @@ macOS 原生探针使用固定 AppKit fixture 子进程，运行：
 # Overlay allocation rules
 
 - API v8 uses inline UTF-8 `OverlayText` and COW `SharedLabelStyle` for labels.
-  The wire format remains unchanged. On supported 64-bit targets their layout
-  gates are 24 bytes, 8 bytes, and at most 80 bytes for `OverlayLabel`.
+  Unregistered labels keep their wire representation; registered annotations add optional placement metadata. On supported 64-bit targets their layout
+  gates are 24 bytes, 8 bytes, and at most 88 bytes for `OverlayLabel` (including eight bytes of optional annotation metadata).
 - Hint resolves one shared label style per scene. Windows DPI scaling interns
   scaled styles by source identity and scale instead of detaching every label.
 - Scene sorting first performs an O(n) ordered check and only runs the stable
@@ -255,6 +264,16 @@ macOS 原生探针使用固定 AppKit fixture 子进程，运行：
   unified logger instead of being swallowed or retried on every pointer event.
 
 ## 实时按键提示
+
+Window、Quick、Editor、Restore、Tabs 的固定快捷键表只在进入模式或绑定表重建后生成一次，保存在 `OverlayCoordinator::window_help_plan`，以 Arc 共享给后续场景合成。普通按键、后台结果、标题变化和场景缓存失效均不重新枚举、解析或检查整张绑定表；离开、重新进入、配置重载或应用绑定配置变化会清除该表。Restore / Delete 仅附加当前页的最多两个分页提示，不重建固定表。文档模拟器的固定条目 computed 也只依赖配置和模式，不依赖 Window 的逐键状态。
+
+生成固定表时用独立候选键和稳定模式能力解析，不受启动键尚未松开、临时层待重新激活或事务尚未就绪的影响。`Mode::window_action_supported` 用于固定展示能力，`window_action_available` 仍控制实际输入的即时执行条件；保存、确认等键位固定展示，未就绪时原有状态机仍可拒绝动作。Window 常驻表不随组合键前缀过滤；其他模式的动态帮助与实际输入路由保持原有逻辑。
+
+Tabs 的继承 `move_left/down/up/right` 在帮助中作为完整四方向族展示，保留单独的 Tab / Shift+Tab 绑定；其他模式不套用该语义。顶部 Window 标题、子模式徽标、返回键帽和返回目标共享同一个标题行高度并垂直居中。
+
+Window 帮助由 `presentation/key_help/window.rs` 按动作语义分组，原始动作 ID 保留到分组之后：当前操作在左，共用操作在右，模式入口按 Quick / Edit / Restore / Tabs 顺序等距排列在底部。Host 从当前模式本地生效的 Mode 绑定选取返回目标，优先非 Idle 的上级入口；右上角显示实际按键和 Back → Window、Back → Normal 或 Exit → Idle 等去向。继承的启动键不会替代本地配置的返回目标。同一目标的生效键位合并展示。完整同修饰键的方向族合并为一个键帽，不加括号；缺少方向、混合修饰键或多个绑定时保留准确的独立条目，未知动作也保留。
+
+Window 每列键帽在前且右对齐，说明在后且左对齐；双栏各自累加行高。列宽按完整文字计算，键位和说明不截断、不换行，键帽左右内边距为 2 逻辑像素。文字框保留额外字形余量，避免 COMMON 等粗体末字被裁切。工作区容不下双栏时先改为单栏；极窄屏幕才统一缩放整套字体，不单独压缩某条文字。底部模式入口按可用宽度分行，入口内部仍完整单行。顶部较长的子模式说明移入状态区。该布局仅在原有帮助缓存失效时合成，不增加后台刷新或原生窗口分配。文档模拟器的 `window-help.ts` 保持相同分组规则。
 
 `Binding::KeyHelp` 通过普通按键 resolver 和 apply_binding 切换面板；通过 `"?" = "key_help"` 显式启用，省略或注释该绑定即禁用，没有独立输入拦截。OverlayCoordinator 保存显示开关及缓存，沿用离散动作的 repeat 与 Up 配对消费。Idle 不显示面板，进入 Idle 关闭。关闭提示从当前有效 key_help 绑定生成。
 
@@ -286,10 +305,12 @@ macOS 原生探针使用固定 AppKit fixture 子进程，运行：
 
 性能探针位于 runtime/tests/overlay.rs：release 下单线程运行 `key_help_decoration_probe`、`key_help_cache_close_cycles_release_allocations`、`key_help_cache_position_updates_allocate_nothing`，每项 20k 次；前两项分别验证缓存命中零分配、反复开关分配与释放平衡，第三项验证开启帮助后的鼠标位置路径零分配。功能测试覆盖标签存储共享、键输入/流式结果失效、路由/主题更新和跨屏动态居中。
 
-帮助面板关闭时，`handle_key` 直接进入既有输入处理，不追加提示刷新收尾。注册表查询复用已有的活动模式槽位缓存，取用前验证槽位中的 ModeId，避免按键路由重复搜索模式索引；切换模式、重载和其他模式查询仍安全回退到索引表。没有字符数据的输入直接走物理键解析；仅有带修饰键的组合前缀时，单个普通键跳过前缀仲裁。上述优化均位于公共运行时。
+非 Window 模式且帮助面板关闭时，`handle_key` 直接进入既有输入处理，不追加提示刷新收尾。注册表查询复用已有的活动模式槽位缓存，取用前验证槽位中的 ModeId，避免按键路由重复搜索模式索引；切换模式、重载和其他模式查询仍安全回退到索引表。没有字符数据的输入直接走物理键解析；仅有带修饰键的组合前缀时，单个普通键跳过前缀仲裁。上述优化均位于公共运行时。
 
-Window compositor 统一生成大编号、加粗应用名与更长标题卡片；背景保持最终物理矩形，文字使用同一精确 DPI 布局规则，避免背景与文字缩放不一致。按完整 footprint 避让，偏移卡片绘制 3px 逻辑引线。编辑区域使用网格遮罩、深浅边界与区域中央编号；区域编号不依赖窗口卡片位置。帮助面板只用目标矩形决定位置，始终保持配置字号，小窗口放不下时移到工作区内；模式状态用独立键帽，应用名与标题各占一行。长按分割线复用现有帧时钟与布局事务的 latest-desired 合并，不新增定时器或原生绘制窗口。
+Window compositor 统一生成大编号、加粗应用名与更长标题卡片；背景保持最终物理矩形，文字使用同一精确 DPI 布局规则，避免背景与文字缩放不一致。按完整 footprint 避让，偏移卡片绘制 3px 逻辑引线。编辑区域使用网格遮罩、深浅边界与区域中央编号；区域编号优先锚定区域中心，冲突时与窗口卡片共用避让及引线。帮助面板只用目标矩形决定位置，始终保持配置字号，小窗口放不下时移到工作区内；模式状态用独立键帽，应用名与标题各占一行。长按分割线复用现有帧时钟与布局事务的 latest-desired 合并，不新增定时器或原生绘制窗口。
 
 ## 独立窗口模式的共享面板
 
-Window、Quick、Editor、Restore、Delete 均复用 key_help 场景合成，当前模式的独立绑定表决定可用说明。Restore／Delete 列表和删除确认都位于单个底部面板，保持固定字号；Quick 缩略图仅出现在 Quick。共享会话转移 owner 后，旧实例不得再提交场景；迟到的结束反馈不能覆盖新模式面板。原生多 DPI 测试检查确认文字和所有标签位于同一个背景内。
+Window、Quick、Editor、Restore 均复用 key_help 场景合成，当前模式的独立绑定表决定可用说明。Restore／Delete 列表和删除确认都位于单个底部面板，保持固定字号；Quick 缩略图仅出现在 Quick。共享会话转移 owner 后，旧实例不得再提交场景；迟到的结束反馈不能覆盖新模式面板。原生多 DPI 测试检查确认文字和所有标签位于同一个背景内。
+
+Window 家族的常驻提示独立于可选 `?` 开关：物理按键按下／松开立即使提示缓存失效并刷新，不能等待库存轮询补全快捷键。快捷键来自已解析全部用户别名的编译绑定表，沿用实际路由的继承、遮蔽和临时层判断；窗口库存和预设列表只影响内容及动作可用性。网页按键提示与物理输入共用 `resolvedChordKeys`，平台覆盖和链式别名同样适用于普通键。

@@ -1,5 +1,7 @@
 # Windows 与 macOS 原生后端
 
+Grouped 按 WindowScope 筛选逻辑快照；活动组的隐藏成员仍继承活动成员的屏幕与最小化状态。编号在同一会话／范围内按窗口身份保留：最小化或暂时未进入候选库存不释放号码，恢复后沿用；仅明确关闭才删除，Acquire 或范围配置变化才清空并从 1 重建。可选数字仍只来自当前库存。持久组不随范围切换解散，范围外原生标签栏仍保留所有标题与点击目标，仅省略无效编号（TabBar 数字 0）。Windows ordinary_window_target 允许最小化库存，scannable_target 继续排除最小化 UI 扫描；最小化的屏幕归属从还原矩形确定。macOS 开启包含最小化时额外检查运行应用 AXWindows，普通窗口仍通过当前可见 Quartz 元数据匹配。
+
 ## Native safety boundary（2026-08）
 
 - Windows DIB/GPU/window 尺寸先通过 `NativeDimensions`；i32 narrowing、BGRA 长度和 `isize::MAX` 约束均在 FFI 前完成。
@@ -7,10 +9,34 @@
 - Vision result 由 Rust RAII owner 释放，读取 slice 前验证 count<=2000 和非空指针。
 - COM apartment 显式 `!Send/!Sync`，确保 `CoUninitialize` 回到初始化线程。
 - 两个平台入口不放行 undocumented unsafe；每个最小块记录 `SAFETY` 契约。机械门禁当前为
-  预算以 `tests/safety_budget.rs` 为准；Window Mover 增加四个 Win32 调用和六个 AX 操作（含保留窗口的 messaging timeout），并同时禁止 `transmute`/`transmute_copy`；`domain` 与其余 portable 层使用编译期
+  预算以 `tests/safety_budget.rs` 为准；Window Mover 增加四个 Win32 调用和五个 AX 操作（含保留窗口的 messaging timeout），并同时禁止 `transmute`/`transmute_copy`；`domain` 与其余 portable 层使用编译期
   `forbid(unsafe_code)`/测试门禁保持零 unsafe。
 
 ## Window 原生会话
+
+活动成员的原生最小化通知会通过 `tab_minimize` 同步收起组内其他成员。Windows 仅提交最小化，不先还原或移动隐藏成员；macOS 直接写逐窗口 AXMinimized。处理同批旧焦点通知时不允许它重开组，最小化组关闭成员也不主动激活剩余成员。恢复仍只显示选中的活动成员，其他成员保持收起，组不解散。
+
+首次编号按程序分批，已锁定程序的已有编号使同程序的新窗口优先获得相邻编号；后续刷新保留已有号码，只追加新窗口。`api::window::application_number_order` 是公共纯排序规则，后台组协调器与 Window 的库存编号共用；不为已有号码连续性而重新洗牌。
+
+标签栏占用独立的顶部空间：Windows 为 `round(30 * scale)` 物理像素，macOS 为 30 逻辑点。共享协调器向布局层暴露含栏外框，向原生层提交扣除栏高的内容框；普通拖动仍只移动活动成员。顶部不足时不再把栏放到底部覆盖内容。Windows 最大化保留 show state，以实际 DWM 边框作一次有界几何修正；解散／退出归还最大化窗口的栏空间。外部几何事件在原有 worker 中校正头部空间，不新增定时器或帧调度。
+
+Windows 栏使用可滚动的标签视口，保留最小可读宽度；纵向滚轮和 WM_MOUSEHWHEEL 都改变水平偏移，保留高分辨率滚轮余量。绘制、点击和拖拽插入共享同一偏移；活动项变化自动进入视口，纯标题更新不重置用户滚动。裁剪复用既有栏缓冲区。
+
+组标签分配最小空闲编号，不重排仍存在的组；全部解散后新组从 `~1` 开始，重入不会重复组合同一成员。组的标签栏不以键盘焦点决定可见性；普通后台窗口的标签栏仍可点击。
+
+切换按“隐藏状态准备新成员 → 显示新成员 → 转移焦点 → 隐藏旧成员”执行，避免先隐藏前台窗口导致系统临时激活第三个窗口。不覆盖外部应用的 DWM transition 属性：该属性不支持读取原值，无法可靠恢复。位置通知直接更新自有栏的位置，后台消息等待同时响应原生事件与命令，不用显示帧率或固定轮询间隔控制移动。完整绘制复用栏大小的后备位图，仅移动不重绘。
+
+窗口分组在 Windows 与 macOS 共用 `common/window_tabs.rs` 的活动成员模型，应用始终保持独立顶层窗口。每组只显示活动成员；拖动、缩放、布局、跨屏与状态切换只写活动窗口，不向隐藏成员发送跟随移动。切换编号或 Tab 时，先取得前一活动成员的最新矩形，在隐藏状态准备新成员，然后显示新成员并收起旧成员。追加以当前活动成员作为几何基准，不能使用尚未跟随移动的首成员旧坐标。
+
+后台组合寿命独立于 Window 模式。后台屏幕上下文只随有效请求更新；取消模式的空屏幕唤醒不能覆盖它。所有原生操作在串行窗口 worker 中执行。库存保留隐藏成员的稳定身份，对外几何投影为活动成员的矩形；布局将整组折叠成一个代表，写入再路由到实际活动成员。活动成员选择与前台权限分开，系统拒绝焦点不能回滚已经完成的可见性切换。
+
+Windows `window_tabs.rs` 拥有 WinEvent hook，`window_tabs/strip.rs` 拥有独立标签栏及缓存字体/画刷。标签栏使用活动应用作为自身 popup owner，切换前转移 owner，不设全局 TOPMOST，不修改应用父级或嵌入样式。栏的类和鼠标消息明确设置箭头；鼠标拖拽使用原生 capture、拖动阈值和插入提示，拖动标签转移单窗口，拖动组编号合并整组；无有效落点、取消或失去 capture 不提交。只有明确鼠标按下才请求应用焦点。
+
+对原本没有 `WS_EX_LAYERED` 的应用，adapter 借用该合成标志，以 alpha 0/255 收起／显示成员，保持 `WS_VISIBLE`，减少重复显示导致的内容重建。已使用分层绘制或不支持该操作的应用保留有界 `ShowWindowAsync` 回退，不覆盖其透明度。移出、解散和退出时移除本实例添加的标志。最大化／最小化成员在透明状态提交正常位置并有界验证，再恢复不透明；普通拖动仍只移动活动应用。位置跟踪没有帧调度或固定间隔轮询；有界原生确认等待分派自身消息，避免 owned popup 的跨线程同步消息死锁。隐藏成员不做跟随几何写入，旧位置通知不改变选择；焦点事件校验真实前台，标题按事件缓存。
+
+macOS `accessibility/window_tabs.rs` 拥有 AX observer 和 worker run-loop source，回调只排队身份；`macos/window_tabs.rs` 的 mailbox 将标签栏数据交给主线程，由 AppKit 拥有独立 NSPanel/按钮。公开 AX 使用逐窗口最小化收起非活动成员，系统可能显示最小化/恢复动画；不隐藏整个应用、不改变其他未分组窗口。窗口几何与组选择逻辑仍共用跨平台协调器。Mac 原生 UI、动画和第三方应用兼容性需要实机验证，交叉编译只能验证构建。
+
+移出、解散或正常 shutdown 恢复被本实例收起的窗口；关闭标签栏仅发送 `Dissolve`，不会关闭应用。应用窗口关闭会清理历史身份并显示相邻成员，剩一个时解除分组；原生全屏成员退出组合。失败恢复保留必要的隐藏租约供清理重试。分组历史按原生窗口快照恢复成员、顺序和各自位置；常规窗口历史只恢复组的逻辑几何，不拆组。
 
 备注框为原生 modeless 控件，支持系统输入法。Windows `text_prompt.rs` 通过无指针 WM_APP 消息唤醒已有托盘线程，由其创建工作区底部无标题栏的 EDIT/Save/Cancel 输入条、调用 IsDialogMessage 并在 shutdown 销毁；不新建 detached worker。macOS `status_item.rs` 的可获取键盘焦点的 borderless retained NSPanel 子类/NSTextField 由主线程状态目标持有，Save/Cancel 返回带 id 的 BackendEvent，关闭状态栏时一并清理。macOS 窗口枚举在按应用收集 AX 后恢复 Quartz 全局前后顺序，供模板填充使用；顺序是当前系统堆叠顺序，不宣称拥有未观察到的历史焦点记录。
 
@@ -24,7 +50,7 @@ Windows adapter 持有 HWND、PID/TID 和独有窗口 property 标记；窗口�
 
 macOS adapter 保留 AX 元素，以公开 Quartz on-screen 元数据匹配当前 Space 的普通 AXStandardWindow；无法唯一匹配的重叠候选跳过，所有 AX messaging 有有限超时。AXSize 写入后读取实际尺寸再定位中心；普通最大化以工作区尺寸实现并保留还原矩形。原生全屏跨屏复用既有 WindowMove 状态机，在 worker 中轮询并检查取消；其等待不占用主事件循环。
 
-Tab 每次按需枚举，维护稳定 ID 顺序，再激活下一个目标并返回其中心鼠标位置。显式 window_tile 只处理目标所在屏幕，跳过不可缩放/原生全屏窗口，整个批次不逐个 warp。单窗及撤销使用原生快照回读，窗口拒绝或关闭时保留实际改变/跳过计数。共享几何不调用平台 API。
+Window 的 Tab / Shift+Tab 按需枚举，沿同一稳定 ID 顺序向前／向后激活并返回中心鼠标位置，库存包含普通窗口及每个隐藏的分组成员。数字保持同样的逐窗口身份。成员显示成功但系统拒绝焦点时仍提交活动成员状态；旧焦点或成员几何通知不能覆盖明确选窗。显式 window_tile 只处理目标所在屏幕，跳过不可缩放/原生全屏窗口，整个批次不逐个 warp。单窗及撤销使用原生快照回读，窗口拒绝或关闭时保留实际改变/跳过计数。共享几何不调用平台 API。
 
 Windows 显式 Tab 先调用 SetForegroundWindow，被拒绝后使用 SwitchToThisWindow 的键盘切换路径，并在 worker 中有界回读前台。不得用 AttachThreadInput 连接外部输入队列造成无界同步等待。最终拒绝焦点时仍锁定下一窗口、返回其中心坐标并提示。
 
@@ -340,3 +366,9 @@ Windows Hook 将 XBUTTON1/2 的 down/up、macOS Hook 将 OtherMouse 的按钮 3/
 Windows 窗口布局的异步恢复等待同时核对最大化样式与目标几何，不能把旧最大化帧短暂稳定误认为恢复完成。严格布局拒绝时，未变化或仍最大化的几何不能提升缓存的最小尺寸。保留原生 checkpoint 的 show state，撤销可恢复最大化。
 
 `size_cycle`依据窗口状态循环最大化→最小化→恢复普通大小。Windows 保留可见原始矩形并核对 IsIconic；macOS 保留恢复矩形并写入/回读 AXMinimized。最小化不释放身份或目标，不移动指针、不绘制目标边框/编号；checkpoint 包含 minimized 状态供撤销使用。退出会话仍遵守原有身份释放规则。
+
+窗口 worker 在首次 Acquire/库存发现/编辑入口保存原生初始快照，后续相同库存不重复读取。撤销历史最多 32 组；初始快照独立保存到会话结束，重置仅触及本会话实际改过的窗口。Undo/Redo 回读恢复结果，为实际发生的变化保存逆快照；取消保留未处理项，拒绝恢复可重试，明确关闭同时清理初始记录及双向历史。ResetInitial 本身保存一组逆快照，不把新建/关闭窗口或未修改应用当作可还原的窗口内容。
+
+Window 入口复用 worker 的 activate_window（Windows 前台激活、macOS 应用激活与 AXRaise），在呈现目标边框之前完成。Close 经 Grouped 转发到原生目标：Windows 异步 PostMessageW(WM_CLOSE)，macOS 对 AXCloseButton 执行 AXPress；不终止进程，不绕过应用的保存/取消流程。
+
+Grouped::close 将组内任意代表解析为活动成员，只向它发正常关闭请求；确认关闭后由既有 close_member/forget 清理成员，剩一个自动解散、撤下标签栏并显示剩余窗口。请求阶段不修改成员表，取消保存不会丢失分组。

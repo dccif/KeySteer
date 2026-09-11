@@ -452,7 +452,7 @@ enum ModeName {
     WindowQuick,
     WindowEditor,
     WindowRestore,
-    WindowDelete,
+    WindowTab,
     Shared(Arc<str>),
 }
 
@@ -478,7 +478,7 @@ impl ModeId {
                 "window_quick" => ModeName::WindowQuick,
                 "window_editor" => ModeName::WindowEditor,
                 "window_restore" => ModeName::WindowRestore,
-                "window_delete" => ModeName::WindowDelete,
+                "window_tab" => ModeName::WindowTab,
                 _ => ModeName::Shared(Arc::from(value)),
             };
             Ok(Self(name))
@@ -498,7 +498,7 @@ impl ModeId {
         "window_quick",
         "window_editor",
         "window_restore",
-        "window_delete",
+        "window_tab",
     ];
 
     /// Whether `name` could name a mode in configuration.
@@ -538,8 +538,8 @@ impl ModeId {
     pub fn window_restore() -> Self {
         Self(ModeName::WindowRestore)
     }
-    pub fn window_delete() -> Self {
-        Self(ModeName::WindowDelete)
+    pub fn window_tab() -> Self {
+        Self(ModeName::WindowTab)
     }
     pub fn is_window(&self) -> bool {
         matches!(
@@ -548,7 +548,7 @@ impl ModeId {
                 | ModeName::WindowQuick
                 | ModeName::WindowEditor
                 | ModeName::WindowRestore
-                | ModeName::WindowDelete
+                | ModeName::WindowTab
         )
     }
     pub fn as_str(&self) -> &str {
@@ -562,7 +562,7 @@ impl ModeId {
             ModeName::WindowQuick => "window_quick",
             ModeName::WindowEditor => "window_editor",
             ModeName::WindowRestore => "window_restore",
-            ModeName::WindowDelete => "window_delete",
+            ModeName::WindowTab => "window_tab",
             ModeName::Shared(name) => name,
         }
     }

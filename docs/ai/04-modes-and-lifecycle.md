@@ -2,6 +2,8 @@
 
 ## Mode 契约
 
+Tabs 的 `move_left/right` 消费为活动标签排序，`move_up/down` 消费为前后选择，默认 H/L 与 K/J；没有帧时钟和指针移动。Alt+W 的分组卡片列出所有成员编号、程序和标题并标识活动项，编辑布局仍每组只保留一个代表。
+
 所有内置模式和插件都实现 `api::Mode`：
 
 ```rust
@@ -18,7 +20,7 @@ settings；不能注入输入、创建窗口或直接扫描 UI。
 只有需要消费 `UiScanned` 大型载荷的 Mode 才覆盖 `handle_owned`；Frame、指针和按键仍直接走
 `handle`，默认实现保证已有插件源码兼容。
 
-## 十个内置 Mode
+## 内置 Mode
 
 ### Idle (`src/modes/idle.rs`)
 
@@ -110,14 +112,19 @@ finished/active 标志的唯一 owner；`labeling.rs` 保持纯标签分配，`p
 
 ### Window 模式组 (`src/modes/window.rs` / `window/mode.rs`)
 
-- `mode.rs`：Window、Quick、Editor、Restore、Delete 分别注册，独立 Settings 与普通绑定路由，共享 `Arc<Mutex<WindowSession>>`。只在同步处理纯状态事件时短暂持锁，命令交给 Host 前释放锁。prepare_transition 等待最新修订／EndEdit，再交接 owner；不得阻塞原生异步结果。
-- `presets.rs`：Restore 列表独立编号索引，每页 6 项；Ctrl+S 仅就绪的 Tree 编辑可用。恢复先结束已有编辑，再用新 BeginEdit 的前后顺序重新分配窗口到按编号排列的区域；超出的窗口不出现在 placement 中，不足时保留空区域。只有 Tree 的 Started 消费 pending 模板，Quick 的迟到 Started 不能抢走它。恢复沿用约束、实时编辑及撤销事务；仅匹配且成功的 Applied 发 FinishMode，失败保留 Restore。Delete 复用列表，输入编号只选中完整记录，Confirm 发 Delete 请求，返回普通 Mode 绑定取消选择。
+Tab 在 Windows 和 macOS 注册。数字与 Tab / Shift+Tab 在 Window 模式统一选择普通窗口及分组成员；模式外保持应用正常键盘输入。分组只显示活动成员，拖动时只移动活动窗口，切换时才对齐新成员。Restore/Delete 在两端都支持 Tab 模板。
+
+- `tabs.rs`：T 进入自动整理同应用未分组窗口并清空手动起点。数字沿用窗口身份，组编号前缀切换独立数字索引。第二个编号即时组合；T 刷新有效待完成编号后清空本轮，空 T 不产生历史。原生请求未完成时输入顺序排队，Q/Esc 等交接等待已提交操作完成，进入 T 的激活键不重复作为分组结束键处理。
+- 退出 T 保留后台组。D 只移出活动成员，X 解散不改窗口几何，编号选中既有目标成员只激活。T 的 Undo/Redo 属于后台组管理器，普通窗口 Undo/Redo/ResetInitial 仅恢复整组几何与状态。模板恢复期间仅收集选择，满员后一次原子应用；取消不移动窗口。
+
+- `mode.rs`：Window、Quick、Editor、Restore、Tab 分别注册，独立 Settings 与普通绑定路由，共享 `Arc<Mutex<WindowSession>>`。只在同步处理纯状态事件时短暂持锁，命令交给 Host 前释放锁。prepare_transition 等待最新修订／EndEdit，再交接 owner；不得阻塞原生异步结果。
+- `presets.rs`：Restore 列表独立编号索引，每页 6 项；Ctrl+S 仅就绪的 Tree 编辑可用。恢复先结束已有编辑，再用新 BeginEdit 的前后顺序重新分配窗口到按编号排列的区域；超出的窗口不出现在 placement 中，不足时保留空区域。只有 Tree 的 Started 消费 pending 模板，Quick 的迟到 Started 不能抢走它。恢复沿用约束、实时编辑及撤销事务；仅匹配且成功的 Applied 发 FinishMode，失败保留 Restore。删除是 Restore 内部状态，默认 X=`window_delete` 动作来回切换，保留页码、清除数字及待确认选择；输入编号只选中完整记录，Confirm 发 Delete 请求，删除后保留删除状态。不增加独立模式、配置或生命周期，重新进入 Restore 回到恢复状态。
 
 - 会话保存稳定窗口编号，中心标签包含被遮挡的普通窗口。`numbering.rs` 缓存有效编号的前缀索引，仅歧义前缀启动一次性计时；完整编号才选窗／交换。反引号仅在 Editor 切换区域编号输入。
 - `inventory.rs` 接收拥有所有权的结果，复用未变化库存与可见编号索引；明确关闭通知回收编号与布局引用，取消查询不丢关闭通知。
-- `editing.rs` 持有 QuickPlacement/BSP 模型、上一成功布局、32 步本地历史和单个在途修订；连续输入只保留最新目标。进入树编辑后等待异步约束与完整库存，首次按最小尺寸尝试均衡行列布局；已验证且仍匹配实际几何的缓存树保留。
-- `interaction.rs` 路由快速布局、树导航、分割、祖先比例、交换与撤销。Editor 激活自动提交一次布局；模式切换不再编码为 WindowAction。
-- 树的 Ctrl＋方向通过已有 FrameClock 连续移动最近同轴祖先分割线：短按 `resize_step`，长按 `resize_speed × elapsed`，屏幕像素位移换算为该祖先比例，再按子树最小尺寸约束；一次手势保留一个编辑撤销检查点，in-flight 期间只保留最新 desired tree。
+- `editing.rs` 持有 QuickPlacement/BSP 模型、上一成功布局、32 步本地撤销/重做历史和单个在途修订；连续输入只保留最新目标。进入树编辑后等待异步约束与完整库存，首次按最小尺寸尝试均衡行列布局；已验证且仍匹配实际几何的缓存树保留。
+- `interaction.rs` 路由快速布局、树导航、分割、祖先比例、交换、撤销、重做与初始状态恢复。Editor 激活自动提交一次布局；模式切换不再编码为 WindowAction。
+- 区域尺寸调整仅响应配置解析后的 `WindowAction::Ratio`，不判断具体物理键；默认绑定来自 Editor 配置。left/right 表示缩小/增大选中区域宽度，up/down 表示缩小/增大高度，使用独立 `resize_step` / `resize_speed`。候选按相关祖先分割检查，优先分担两侧变化并减少中心偏移；最近边界受限时尝试其他祖先。每个候选通过整树最小尺寸拟合，保持平铺；一次长按一个撤销检查点，in-flight 仅保留最新 desired tree。
 - `view.rs` 借用窗口库存和布局树，`presentation/window.rs` 构造编号和稳定区域描边，复用锚定窗口内底部的单个 key_help 面板。方向来自当前模式自己的有效绑定表，临时模式消费激活键，明确配置的完整组合键优先。
 - 500ms 可见态计时合并后台库存请求，原生查询异步且可被布局／选窗抢占；相同结果不重绘，不在按键或 Frame 枚举。关闭窗口保留空区域和其余编号。
 - worker 拥有约束快照与原生事务；修改即时生效，无需 Enter。Q 通过普通 Binding::Mode 选择目标，行为与入口无关。离开编辑前发送最新布局并将整轮记为一步撤销；强制退出／重载只释放检查点，保留已应用几何。临时 Normal 保留编辑、停止新布局提交并隐藏覆盖层。
@@ -171,4 +178,10 @@ double-click 成功后生成。普通 click 仍在物理键按下沿原子执行
 
 普通 Window 的 E 直接发 BeginEdit；Started 生成并约束均衡行列树，可行时自动提交 ApplyLayout 并留在树编辑；不可行时保留实际窗口并展示错误以便修改。entry_layout 记录入口布局的撤销基线：Z 先撤销后续编辑，再通过 TreeReset 回滚原生事务并重新导入，恢复真实进入几何及最大化状态；重入的 entry_layout 为 false，避免撤销后再次自动布局。AA 的 Instant、deadline 查询和运行时按键优先级均已删除。
 
-反引号可从普通 Window 或 Quick 转入自动布局及树编辑。异步 Started 前的数字暂存，库存与稳定区域索引建立后再解析；输入显示独立于解析缓冲，完成后仍可显示。无交换源时区域编号激活占用窗口，空区域 WarpPointer 到中心；有源时维持原移动／交换语义。X 删除当前叶、提升兄弟，窗口本身不关闭；保留至少一叶，稳定 ID 不复用，叶数量独立于 next_slot。
+反引号可从普通 Window 或 Quick 转入自动布局及树编辑。异步 Started 前的数字暂存，库存与稳定区域索引建立后再解析；输入显示独立于解析缓冲，完成后仍可显示。无交换源时区域编号激活占用窗口，空区域 WarpPointer 到中心；有源时维持原移动／交换语义。X 删除当前叶、提升兄弟，窗口本身不关闭；保留至少一叶；现有区域 ID 保持，新切分实时查找并复用最小空闲 ID，不保留单调递增计数器。
+
+Quick/Editor 的新编辑清空本地 redo；撤销到编辑入口时通过原生 EndEdit(false) 恢复完整状态，并将 redo 转交给重建的编辑。多按 Z 到历史开头不会丢弃 redo。Shift+C 等待最新 ApplyLayout 和 EndEdit(true) 后请求 ResetInitial；收到结果后重新导入实际几何且 entry_layout=false，不自动重排。此时 Z/Shift+Z 可访问后台历史以撤销/重做重置。普通态历史按移动手势或已结束的一轮编辑分组；窗口编辑内部仍逐步撤销。
+
+保存与恢复通过 `PresetLibraryOperation` / `SavedPreset` 共用异步流程；`WindowTemplate` 只在捕获与具体应用时区分 Layout/Tabs。共享编号、简短默认名称、备注输入、列表及删除校验不分别维护。Tabs 恢复收集足量手动选择的窗口后应用，未完成前可取消。
+
+普通 Window 从组外进入时激活鼠标下目标，组内切换保留目标。默认 X=window_close，可在 window.bindings 改键；Editor 的 X 仍为 window_remove_region。关闭只发送一次离散请求，窗口是否退出由应用决定，后续库存更新编号。

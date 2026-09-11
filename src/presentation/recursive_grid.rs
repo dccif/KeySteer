@@ -101,6 +101,7 @@ impl RecursiveGridView<'_> {
         for c in 1..layout.cols {
             let x = area.x + c as f64 * cell_w;
             scene.push_shape(OverlayShape::Line {
+                placement_group: None,
                 from: Point::new(x, area.top()),
                 to: Point::new(x, area.bottom()),
                 color: line_color,
@@ -111,6 +112,7 @@ impl RecursiveGridView<'_> {
         for r in 1..layout.rows {
             let y = area.y + r as f64 * cell_h;
             scene.push_shape(OverlayShape::Line {
+                placement_group: None,
                 from: Point::new(area.left(), y),
                 to: Point::new(area.right(), y),
                 color: line_color,

@@ -10,3 +10,7 @@ pub(crate) mod update;
 pub(crate) mod window_geometry;
 pub(crate) mod window_placement;
 pub(crate) mod window_session;
+mod window_tab_model;
+mod window_tabs;
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) use window_tabs::Grouped as WindowGroupsProbe;

@@ -37,11 +37,13 @@ impl WindowSession {
         self.group += 1;
         let transaction = self.group;
         self.edit = Some(LiveEdit {
+            additional_trees: BTreeMap::new(),
             transaction,
             screen: self.screen,
             accepted: model.clone(),
             model,
             history: Vec::new(),
+            redo: Vec::new(),
             divider_gesture: false,
             entry_layout: tree,
             minimums: BTreeMap::new(),
@@ -97,6 +99,18 @@ impl WindowSession {
             edit.in_flight = Some((edit.revision, edit.model.clone()));
             edit.dirty = false;
             let operation = WindowOperation::ApplyLayout {
+                additional_screens: edit
+                    .additional_trees
+                    .iter()
+                    .map(|(screen, tree)| crate::api::window::WindowScreenLayout {
+                        screen: *screen,
+                        placements: tree
+                            .slots()
+                            .into_iter()
+                            .filter_map(|s| s.window.map(|id| (id, s.rect)))
+                            .collect(),
+                    })
+                    .collect(),
                 transaction: edit.transaction,
                 revision: edit.revision,
                 screen: edit.screen,
@@ -149,6 +163,31 @@ impl WindowSession {
         }
     }
 
+    pub(super) fn request_history(&mut self, redo: bool, reopen: bool, out: &mut CommandBatch) {
+        self.group += 1;
+        self.trees.clear();
+        self.request(
+            if redo {
+                WindowOperation::Redo
+            } else {
+                WindowOperation::Undo
+            },
+            out,
+        );
+        if reopen {
+            self.reopen_edit = Some(self.request);
+        }
+    }
+
+    pub(super) fn request_initial(&mut self, reopen: bool, out: &mut CommandBatch) {
+        self.group += 1;
+        self.trees.clear();
+        self.request(WindowOperation::ResetInitial { group: self.group }, out);
+        if reopen {
+            self.reopen_edit = Some(self.request);
+        }
+    }
+
     pub(super) fn tile(&mut self, out: &mut CommandBatch) {
         self.trees.remove(&self.screen);
         self.group += 1;
@@ -198,10 +237,12 @@ impl WindowSession {
                     tree.split(direction);
                 } else if ratio {
                     if let Some(screen) = ctx.screens.get(edit.screen) {
-                        tree.resize_by(
+                        tree.resize_region_by(
                             direction,
                             self.settings.resize_step * edit.gap_scale,
                             screen.work_area,
+                            &edit.minimums,
+                            self.settings.gap * edit.gap_scale,
                         );
                     }
                 } else {
@@ -222,10 +263,7 @@ impl WindowSession {
             }
         }
         if edit.model != before && (split || ratio || matches!(edit.model, EditModel::Quick(_))) {
-            if edit.history.len() == 32 {
-                edit.history.remove(0);
-            }
-            edit.history.push(before);
+            edit.remember(before);
             edit.dirty = true;
             self.flush_edit(out);
         }
@@ -266,7 +304,7 @@ impl WindowSession {
         }
         let mut found = false;
         if dx != 0.0 {
-            found |= tree.resize_by(
+            found |= tree.resize_region_by(
                 if dx < 0.0 {
                     Direction::Left
                 } else {
@@ -274,10 +312,12 @@ impl WindowSession {
                 },
                 amount,
                 screen.work_area,
+                &edit.minimums,
+                self.settings.gap * edit.gap_scale,
             );
         }
         if dy != 0.0 {
-            found |= tree.resize_by(
+            found |= tree.resize_region_by(
                 if dy < 0.0 {
                     Direction::Up
                 } else {
@@ -285,6 +325,8 @@ impl WindowSession {
                 },
                 amount,
                 screen.work_area,
+                &edit.minimums,
+                self.settings.gap * edit.gap_scale,
             );
         }
         if let Err(error) = tree.fit(
@@ -300,9 +342,9 @@ impl WindowSession {
             if dx != 0.0 || dy != 0.0 {
                 self.status = Some(
                     if found {
-                        "Divider reached the minimum-size limit"
+                        "Region reached the neighboring-window size limit"
                     } else {
-                        "No divider in this direction"
+                        "Region spans the screen on this axis"
                     }
                     .into(),
                 );
@@ -310,10 +352,7 @@ impl WindowSession {
             return;
         }
         if !edit.divider_gesture {
-            if edit.history.len() == 32 {
-                edit.history.remove(0);
-            }
-            edit.history.push(EditModel::Tree(before));
+            edit.remember(EditModel::Tree(before));
             edit.divider_gesture = true;
         }
         self.status = None;
@@ -345,10 +384,7 @@ impl WindowSession {
             self.status = Some(error);
             return;
         }
-        if edit.history.len() == 32 {
-            edit.history.remove(0);
-        }
-        edit.history.push(EditModel::Tree(before));
+        edit.remember(EditModel::Tree(before));
         edit.dirty = true;
         self.numbered_slots = 0;
         self.rebuild_numbers();
@@ -366,6 +402,7 @@ impl WindowSession {
             .visible_windows()
             .find(|w| self.numbers.get(&w.id) == Some(&number))
             .map(|w| w.id);
+        let layout_id = id.map(|id| self.tabs.state.representative(id));
         if let Some(edit) = &mut self.edit
             && let EditModel::Tree(tree) = &mut edit.model
         {
@@ -404,14 +441,15 @@ impl WindowSession {
                     return;
                 }
             } else if let Some(id) = id {
+                let representative = layout_id.unwrap_or(id);
                 if let Some(source) = self.swap_source.take() {
-                    if source == id {
+                    if source == representative {
                         false
                     } else {
-                        tree.swap_windows(source, id)
+                        tree.swap_windows(source, representative)
                     }
-                } else if tree.focus_window(id) {
-                    self.swap_source = Some(id);
+                } else if tree.focus_window(representative) {
+                    self.swap_source = Some(representative);
                     self.request(WindowOperation::Select(id), out);
                     return;
                 } else {
@@ -435,10 +473,7 @@ impl WindowSession {
                     self.status = Some(error);
                     return;
                 }
-                if edit.history.len() == 32 {
-                    edit.history.remove(0);
-                }
-                edit.history.push(before);
+                edit.remember(before);
                 edit.dirty = true;
                 self.flush_edit(out);
             }
@@ -489,7 +524,7 @@ impl WindowSession {
                         .filter(|w| w.screen == self.screen)
                         .cloned()
                         .collect();
-                    match saved.regions.instantiate(&windows) {
+                    match saved.instantiate_layout(&windows) {
                         Ok(tree) => Some(tree),
                         Err(error) => {
                             self.status = Some(error);
@@ -505,6 +540,7 @@ impl WindowSession {
                     ctx.screens.get(self.screen).map(|screen| {
                         let windows: Vec<_> = self
                             .visible_windows()
+                            .filter(|w| w.screen == self.screen)
                             .filter(|w| minimums.iter().any(|(id, _)| *id == w.id))
                             .cloned()
                             .collect();
@@ -531,10 +567,21 @@ impl WindowSession {
                                 cached = None;
                             }
                         }
+                        if self.edit.as_ref().is_some_and(|edit| !edit.entry_layout) {
+                            return LayoutTree::import(
+                                &windows,
+                                self.target
+                                    .as_ref()
+                                    .map(|w| self.tabs.state.representative(w.id)),
+                                screen.work_area,
+                            );
+                        }
                         cached.unwrap_or_else(|| {
                             LayoutTree::automatic(
                                 &windows,
-                                self.target.as_ref().map(|w| w.id),
+                                self.target
+                                    .as_ref()
+                                    .map(|w| self.tabs.state.representative(w.id)),
                                 screen.work_area,
                                 &minimums.iter().copied().collect(),
                                 self.settings.gap * *gap_scale,
@@ -542,7 +589,9 @@ impl WindowSession {
                             .unwrap_or_else(|_| {
                                 LayoutTree::import(
                                     &windows,
-                                    self.target.as_ref().map(|w| w.id),
+                                    self.target
+                                        .as_ref()
+                                        .map(|w| self.tabs.state.representative(w.id)),
                                     screen.work_area,
                                 )
                             })
@@ -551,7 +600,68 @@ impl WindowSession {
                 } else {
                     None
                 };
+                let mut additional_trees = BTreeMap::new();
+                let mut additional_error = None;
+                if self.settings.all_screens
+                    && self
+                        .edit
+                        .as_ref()
+                        .is_some_and(|e| e.entry_layout && matches!(e.model, EditModel::Tree(_)))
+                {
+                    for (index, screen) in ctx.screens.iter().enumerate() {
+                        if index == self.screen {
+                            continue;
+                        }
+                        let windows: Vec<_> = self
+                            .visible_windows()
+                            .filter(|w| {
+                                w.screen == index && minimums.iter().any(|(id, _)| *id == w.id)
+                            })
+                            .cloned()
+                            .collect();
+                        if windows.is_empty() {
+                            continue;
+                        }
+                        let layout = saved
+                            .as_ref()
+                            .map_or_else(
+                                || {
+                                    LayoutTree::automatic(
+                                        &windows,
+                                        None,
+                                        screen.work_area,
+                                        &minimums.iter().copied().collect(),
+                                        self.settings.gap * self.screen_scale(screen.scale),
+                                    )
+                                },
+                                |saved| saved.instantiate_layout(&windows),
+                            )
+                            .and_then(|mut tree| {
+                                tree.fit(
+                                    &minimums.iter().copied().collect(),
+                                    screen.work_area,
+                                    self.settings.gap * self.screen_scale(screen.scale),
+                                )?;
+                                Ok(tree)
+                            });
+                        match layout {
+                            Ok(tree) => {
+                                additional_trees.insert(index, tree);
+                            }
+                            Err(error) => {
+                                additional_error = Some(error);
+                                self.restore_pending = false;
+                                if let Some(edit) = &mut self.edit {
+                                    edit.entry_layout = false;
+                                }
+                                additional_trees.clear();
+                                break;
+                            }
+                        }
+                    }
+                }
                 let Some(edit) = &mut self.edit else { return };
+                edit.additional_trees = additional_trees;
                 if edit.transaction != *transaction || edit.ending {
                     return;
                 }
@@ -574,9 +684,10 @@ impl WindowSession {
                                 self.settings.gap * edit.gap_scale,
                             )
                         });
-                    let fit_error = fit.err();
+                    let fit_error = fit.err().or(additional_error);
                     if fit_error.is_some() {
                         self.restore_pending = false;
+                        edit.additional_trees.clear();
                     }
                     edit.accepted = edit.model.clone();
                     edit.entry_layout &=
@@ -647,10 +758,13 @@ impl WindowSession {
                 }
                 if *accepted {
                     edit.accepted = model;
+                    self.trees.append(&mut edit.additional_trees);
                 } else {
+                    edit.additional_trees.clear();
                     edit.model = edit.accepted.clone();
                     edit.dirty = false;
                     edit.history.clear();
+                    edit.redo.clear();
                     self.status.get_or_insert_with(|| {
                         "Layout could not be applied; choose a layout to retry".into()
                     });
@@ -699,8 +813,10 @@ impl WindowSession {
                         Finish::Tree
                             | Finish::Tile
                             | Finish::Select(_)
-                            | Finish::Cycle
+                            | Finish::Cycle { .. }
                             | Finish::Commit
+                            | Finish::History { .. }
+                            | Finish::ResetInitial
                     )
                 {
                     self.restore_pending = false;
@@ -710,22 +826,38 @@ impl WindowSession {
                 }
                 match finish {
                     Finish::Tree => self.start_edit(true, ctx, out),
-                    Finish::QuickReset => self.start_edit(false, ctx, out),
+                    Finish::QuickReset => {
+                        self.start_edit(false, ctx, out);
+                        if let Some(next) = &mut self.edit {
+                            next.redo = edit.redo;
+                        }
+                    }
                     Finish::TreeReset => {
+                        let reset_redo = edit.redo;
                         self.start_edit(true, ctx, out);
                         if let Some(edit) = &mut self.edit {
                             edit.entry_layout = false;
+                            edit.redo = reset_redo;
                         }
                     }
                     Finish::Select(id) => {
                         self.resume_quick = true;
                         self.request(WindowOperation::Select(id), out);
                     }
-                    Finish::Cycle => {
+                    Finish::Cycle { backwards } => {
                         self.resume_quick = true;
-                        self.request(WindowOperation::Cycle, out);
+                        self.request(
+                            if backwards {
+                                WindowOperation::CyclePrevious
+                            } else {
+                                WindowOperation::Cycle
+                            },
+                            out,
+                        );
                     }
                     Finish::Tile => self.tile(out),
+                    Finish::History { redo } => self.request_history(redo, true, out),
+                    Finish::ResetInitial => self.request_initial(true, out),
                     Finish::Transition => {
                         if let Some(target) = self.pending_transition.take() {
                             out.push(Command::SwitchMode(target));

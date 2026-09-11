@@ -113,28 +113,68 @@ impl RegionTemplate {
     }
 }
 
+/// A typed workspace item. Native identities never cross this persistence boundary.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "data",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum WindowTemplate {
+    Layout(RegionTemplate),
+    Tabs(TabTemplate),
+}
+impl WindowTemplate {
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Layout(_) => "Layout",
+            Self::Tabs(_) => "Tabs",
+        }
+    }
+    pub fn validate(&self, window_count: usize) -> Result<(), String> {
+        match self {
+            Self::Layout(regions) if window_count > regions.validate()? => {
+                Err("Saved preset has an invalid window count".into())
+            }
+            Self::Layout(_) => Ok(()),
+            Self::Tabs(tabs) => tabs.validate(window_count),
+        }
+    }
+}
+impl From<RegionTemplate> for WindowTemplate {
+    fn from(value: RegionTemplate) -> Self {
+        Self::Layout(value)
+    }
+}
+impl From<TabTemplate> for WindowTemplate {
+    fn from(value: TabTemplate) -> Self {
+        Self::Tabs(value)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SavedLayout {
+pub struct SavedPreset {
     pub id: u32,
     #[serde(default)]
     pub note: String,
     pub window_count: usize,
-    pub regions: RegionTemplate,
+    pub template: WindowTemplate,
 }
-impl SavedLayout {
+impl SavedPreset {
     pub fn name(&self) -> String {
-        if !self.note.trim().is_empty() {
-            return self.note.clone();
-        }
-        let regions = self.regions.validate().unwrap_or(0);
-        if regions == self.window_count {
-            format!("Layout {} · {} windows", self.id, self.window_count)
+        let note = self.note.trim();
+        if note.is_empty() {
+            format!("{} {}", self.template.kind_name(), self.id)
         } else {
-            format!(
-                "Layout {} · {} windows / {} regions",
-                self.id, self.window_count, regions
-            )
+            note.to_string()
+        }
+    }
+    pub fn instantiate_layout(&self, windows: &[WindowInfo]) -> Result<LayoutTree, String> {
+        match &self.template {
+            WindowTemplate::Layout(regions) => regions.instantiate(windows),
+            WindowTemplate::Tabs(_) => Err("Select windows in order to restore Tabs".into()),
         }
     }
     pub fn validate(&self) -> Result<(), String> {
@@ -143,35 +183,58 @@ impl SavedLayout {
             || self.note.chars().count() > MAX_NOTE_CHARS
             || self.note.chars().any(char::is_control)
         {
-            return Err("Saved layout has invalid metadata".into());
+            return Err("Saved preset has invalid metadata".into());
         }
-        if self.window_count > self.regions.validate()? {
-            return Err("Saved layout has an invalid window count".into());
+        self.template.validate(self.window_count)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TabTemplate {
+    pub region: crate::api::Rect,
+    /// Position in the manually selected, ordered member list, never an identity.
+    pub active: usize,
+}
+impl TabTemplate {
+    pub fn validate(&self, count: usize) -> Result<(), String> {
+        let r = self.region;
+        if !(2..=256).contains(&count)
+            || self.active >= count
+            || ![r.x, r.y, r.width, r.height].iter().all(|v| v.is_finite())
+            || r.x < 0.0
+            || r.y < 0.0
+            || r.width <= 0.0
+            || r.height <= 0.0
+            || r.right() > 1.0 + 1e-9
+            || r.bottom() > 1.0 + 1e-9
+        {
+            return Err("Tab template has invalid geometry, member count or active tab".into());
         }
         Ok(())
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct LayoutLibraryRequest {
+pub struct PresetLibraryRequest {
     pub session: u64,
-    pub operation: LayoutLibraryOperation,
+    pub operation: PresetLibraryOperation,
 }
 #[derive(Clone, Debug, PartialEq)]
-pub enum LayoutLibraryOperation {
+pub enum PresetLibraryOperation {
     List,
     Delete {
-        expected: SavedLayout,
+        expected: SavedPreset,
     },
     Save {
-        regions: RegionTemplate,
+        template: WindowTemplate,
         window_count: usize,
     },
 }
 #[derive(Clone, Debug, PartialEq)]
-pub struct LayoutLibraryResult {
+pub struct PresetLibraryResult {
     pub session: u64,
-    pub layouts: Vec<SavedLayout>,
+    pub presets: Vec<SavedPreset>,
     pub saved: Option<u32>,
     pub message: Option<String>,
 }
@@ -253,15 +316,15 @@ mod tests {
     #[test]
     fn save_names_and_round_trip_contain_no_window_identity() {
         let tree = regions(9).instantiate(&windows(4)).unwrap();
-        let mut layout = SavedLayout {
+        let mut layout = SavedPreset {
             id: 1,
             note: String::new(),
             window_count: 4,
-            regions: RegionTemplate::from_tree(&tree),
+            template: WindowTemplate::Layout(RegionTemplate::from_tree(&tree)),
         };
-        assert_eq!(layout.name(), "Layout 1 · 4 windows / 9 regions");
+        assert_eq!(layout.name(), "Layout 1");
         layout.window_count = 9;
-        assert_eq!(layout.name(), "Layout 1 · 9 windows");
+        assert_eq!(layout.name(), "Layout 1");
         layout.note = "写代码 🦀".into();
         assert_eq!(layout.name(), "写代码 🦀");
         let json = serde_json::to_string(&layout).unwrap();
@@ -271,7 +334,7 @@ mod tests {
                 && !json.contains("app")
                 && !json.contains("\"window\":")
         );
-        assert_eq!(serde_json::from_str::<SavedLayout>(&json).unwrap(), layout);
+        assert_eq!(serde_json::from_str::<SavedPreset>(&json).unwrap(), layout);
     }
     #[test]
     fn restore_filters_fixed_fullscreen_and_duplicate_windows() {
@@ -313,21 +376,21 @@ mod tests {
         }
         assert!(invalid.validate().is_err());
         assert!(
-            SavedLayout {
+            SavedPreset {
                 id: 1,
                 note: "bad\nnote".into(),
                 window_count: 1,
-                regions: regions(1)
+                template: WindowTemplate::Layout(regions(1))
             }
             .validate()
             .is_err()
         );
         assert!(
-            SavedLayout {
+            SavedPreset {
                 id: 1,
                 note: String::new(),
                 window_count: 2,
-                regions: regions(1)
+                template: WindowTemplate::Layout(regions(1))
             }
             .validate()
             .is_err()

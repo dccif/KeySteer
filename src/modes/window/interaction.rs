@@ -11,6 +11,12 @@ impl WindowSession {
         ctx: &HostContext<'_>,
         out: &mut CommandBatch,
     ) {
+        if self.kind == WindowKind::Tab {
+            if state == KeyState::Down {
+                self.tab_input(tabs::Input::Action(action), ctx, out);
+            }
+            return;
+        }
         if action.is_held() {
             if state == KeyState::Up {
                 self.held.remove(key);
@@ -23,7 +29,8 @@ impl WindowSession {
             } else if (self.edit.is_none()
                 || matches!((&self.edit, action), (Some(edit), W::Ratio(_)) if matches!(edit.model, EditModel::Tree(_))))
                 && !self.temporary
-                && self.target.is_some()
+                && (self.target.is_some()
+                    || matches!((&self.edit, action), (Some(edit), W::Ratio(_)) if matches!(edit.model, EditModel::Tree(_))))
                 && !self.held.contains_key(key)
             {
                 if self.held.is_empty() {
@@ -59,7 +66,8 @@ impl WindowSession {
             W::Navigate(direction) => self.edit_direction(direction, false, false, ctx, out),
             W::Split(direction) => self.edit_direction(direction, true, false, ctx, out),
             W::Ratio(direction) => self.edit_direction(direction, false, true, ctx, out),
-            W::Select => {
+            W::Select | W::SelectPrevious => {
+                let backwards = action == W::SelectPrevious;
                 if let Some(edit) = &self.edit
                     && let EditModel::Tree(tree) = &edit.model
                 {
@@ -72,26 +80,43 @@ impl WindowSession {
                     });
                     let next = current
                         .and_then(|id| windows.iter().position(|w| w.id == id))
-                        .map_or(0, |i| (i + 1) % windows.len().max(1));
+                        .map_or(0, |i| {
+                            if backwards {
+                                (i + windows.len() - 1) % windows.len().max(1)
+                            } else {
+                                (i + 1) % windows.len().max(1)
+                            }
+                        });
                     if let Some(window) = windows.get(next) {
                         let id = window.id;
                         if let Some(edit) = &mut self.edit
                             && let EditModel::Tree(tree) = &mut edit.model
                         {
-                            tree.focus_window(id);
+                            tree.focus_window(self.tabs.state.representative(id));
                         }
                         self.request(WindowOperation::Select(id), out);
                     }
                 } else if self.edit.is_some() {
-                    self.finish_edit(Finish::Cycle, out);
+                    self.finish_edit(Finish::Cycle { backwards }, out);
                 } else {
-                    self.request(WindowOperation::Cycle, out);
+                    self.request(
+                        if backwards {
+                            WindowOperation::CyclePrevious
+                        } else {
+                            WindowOperation::Cycle
+                        },
+                        out,
+                    );
                 }
             }
             W::Undo => {
                 self.numbered_slots = 0;
                 if let Some(edit) = &mut self.edit {
+                    if edit.finishing.is_some() {
+                        return;
+                    }
                     if let Some(previous) = edit.history.pop() {
+                        edit.redo.push(edit.model.clone());
                         if edit.history.is_empty()
                             && !edit.entry_layout
                             && matches!(previous, EditModel::Tree(_))
@@ -108,13 +133,46 @@ impl WindowSession {
                         self.flush_edit(out);
                         self.rebuild_numbers();
                     } else if edit.entry_layout && matches!(edit.model, EditModel::Tree(_)) {
+                        edit.redo.push(edit.model.clone());
                         self.finish_edit(Finish::TreeReset, out);
-                    } else {
+                    } else if !edit.redo.is_empty() {
                         self.status = Some("Nothing to undo in this edit".into());
+                    } else {
+                        self.finish_edit(Finish::History { redo: false }, out);
                     }
                 } else {
-                    self.request(WindowOperation::Undo, out);
-                    self.trees.clear();
+                    self.request_history(false, false, out);
+                }
+            }
+            W::Redo => {
+                self.numbered_slots = 0;
+                if let Some(edit) = &mut self.edit {
+                    if edit.finishing.is_some() {
+                        return;
+                    }
+                    if let Some(next) = edit.redo.pop() {
+                        if edit.history.len() == 32 {
+                            edit.history.remove(0);
+                        }
+                        edit.history.push(edit.model.clone());
+                        edit.model = next;
+                        edit.dirty = true;
+                        self.flush_edit(out);
+                        self.rebuild_numbers();
+                    } else if edit.history.is_empty() && !edit.entry_layout {
+                        self.finish_edit(Finish::History { redo: true }, out);
+                    } else {
+                        self.status = Some("Nothing to redo in this edit".into());
+                    }
+                } else {
+                    self.request_history(true, false, out);
+                }
+            }
+            W::ResetInitial => {
+                if self.edit.is_some() {
+                    self.finish_edit(Finish::ResetInitial, out);
+                } else {
+                    self.request_initial(false, out);
                 }
             }
             W::Tile => {
@@ -126,6 +184,11 @@ impl WindowSession {
             }
             _ if self.edit.is_some() => {}
             W::Size => self.size = !self.size,
+            W::Close if self.kind == WindowKind::Move => {
+                if let Some(target) = &self.target {
+                    self.request(WindowOperation::Close(target.id), out);
+                }
+            }
             W::NextScreen | W::PreviousScreen | W::CycleState | W::Center => {
                 self.group += 1;
                 let change = match action {

@@ -4,86 +4,48 @@ use crate::api::presentation::WindowView;
 use crate::api::window_layout::placed_rect;
 use crate::api::{HostContext, OverlayScene, OverlayShape, Point, Rect};
 
-// Test physical footprints before accepting a candidate. Clamping afterwards
-// would collapse displaced cards back onto the same bottom-edge position.
-fn card_position(center: Point, width: f64, height: f64, area: Rect, occupied: &[Rect]) -> Rect {
-    let candidate = |x: f64, y: f64| {
-        Rect::new(
-            x.clamp(area.x, (area.right() - width).max(area.x)),
-            y.clamp(area.y, (area.bottom() - height).max(area.y)),
-            width,
-            height,
-        )
-    };
-    let initial = candidate(center.x - width / 2.0, center.y - height / 2.0);
-    let free = |rect: &Rect| !occupied.iter().any(|old| old.intersect(rect).is_some());
-    if free(&initial) {
-        return initial;
-    }
-    let columns = (area.width / (width + 6.0)).floor().max(1.0) as usize;
-    let rows = (area.height / (height + 6.0)).floor().max(1.0) as usize;
-    let mut best = None;
-    let mut distance = f64::INFINITY;
-    for row in 0..rows {
-        for col in 0..columns {
-            let rect = candidate(
-                area.x + col as f64 * (width + 6.0),
-                area.y + row as f64 * (height + 6.0),
-            );
-            let d = (rect.center().x - center.x).powi(2) + (rect.center().y - center.y).powi(2);
-            if free(&rect) && d < distance {
-                best = Some(rect);
-                distance = d;
-            }
-        }
-    }
-    best.unwrap_or(initial)
-}
-fn card_positions(
-    centers: &[Point],
-    desired_width: f64,
-    height: f64,
-    area: Rect,
-) -> (f64, Vec<Rect>) {
-    let rows = (area.height / (height + 6.0)).floor().max(1.0) as usize;
-    let columns = centers.len().div_ceil(rows).max(1);
-    let width =
-        desired_width.min(((area.width - (columns - 1) as f64 * 6.0) / columns as f64).max(1.0));
-    let mut positions = Vec::with_capacity(centers.len());
-    for center in centers {
-        let rect = card_position(*center, width, height, area, &positions);
-        if positions
-            .iter()
-            .any(|old: &Rect| old.intersect(&rect).is_some())
-        {
-            // Arbitrary center anchors can fragment otherwise sufficient space.
-            // Repack the whole set deterministically instead of overlapping.
-            positions.clear();
-            for index in 0..centers.len() {
-                positions.push(Rect::new(
-                    area.x + (index / rows) as f64 * (width + 6.0),
-                    area.y + (index % rows) as f64 * (height + 6.0),
-                    width,
-                    height,
-                ));
-            }
-            return (width, positions);
-        }
-        positions.push(rect);
-    }
-    (width, positions)
+use super::label_placement::{card_positions, logical};
+use crate::api::overlay::LabelPlacementRole as Role;
+
+fn app_name(window: &crate::api::window::WindowInfo) -> &str {
+    window
+        .app
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&window.app)
+        .trim_end_matches(".exe")
 }
 
-fn logical(rect: Rect, scale: f64) -> Rect {
-    Rect::new(
-        rect.center().x - rect.width / scale / 2.0,
-        rect.center().y - rect.height / scale / 2.0,
-        rect.width / scale,
-        rect.height / scale,
-    )
-}
 impl WindowView<'_> {
     pub(crate) fn scene(&self, ctx: &HostContext<'_>) -> OverlayScene {
+        let mut next_group = 0;
+        let mut scene = self.screen_scene(ctx, &mut next_group);
+        scene.clip = ctx.screens.get(self.screen).map(|s| s.bounds);
+        if self.tree.is_none() {
+            for screen in 0..ctx.screens.len() {
+                if screen != self.screen
+                    && self
+                        .visible
+                        .iter()
+                        .any(|id| self.inventory.get(id).is_some_and(|w| w.screen == screen))
+                {
+                    let other = Self {
+                        screen,
+                        target: None,
+                        ..*self
+                    }
+                    .screen_scene(ctx, &mut next_group);
+                    scene.clip = Some(scene.clip.map_or(ctx.screens[screen].bounds, |clip| {
+                        clip.union(&ctx.screens[screen].bounds)
+                    }));
+                    scene.labels.extend(other.labels.iter().cloned());
+                    scene.shapes.extend(other.shapes.iter().cloned());
+                }
+            }
+        }
+        scene
+    }
+    fn screen_scene(&self, ctx: &HostContext<'_>, next_group: &mut u32) -> OverlayScene {
         let mut scene = OverlayScene::new();
         let style: SharedLabelStyle = self
             .ui
@@ -154,7 +116,16 @@ impl WindowView<'_> {
             .visible
             .iter()
             .filter_map(|id| self.inventory.get(id))
-            .filter(|w| !w.minimized && self.numbers.contains_key(&w.id))
+            .filter(|w| w.screen == self.screen && self.numbers.contains_key(&w.id))
+            .filter(|w| {
+                if self.tree.is_some() {
+                    self.tabs.representative(w.id) == w.id
+                } else {
+                    self.tabs
+                        .containing(w.id)
+                        .is_none_or(|group| group.active == w.id)
+                }
+            })
             .collect();
         let centers: Vec<_> = windows
             .iter()
@@ -180,27 +151,77 @@ impl WindowView<'_> {
         let height = (style.font_size * 1.4 + style.padding_y * 2.0)
             .max(small.font_size * 1.4 * 2.0 + 8.0)
             .max(44.0);
-        let group_height = height;
+        let lines: Vec<Vec<String>> = windows
+            .iter()
+            .map(|window| {
+                if let Some(group) = self.tabs.containing(window.id) {
+                    std::iter::once(format!("~{} · {} windows", group.id.0, group.members.len()))
+                        .chain(group.members.iter().map(|id| {
+                            let number = self.numbers.get(id).copied().unwrap_or(0);
+                            let selected = if *id == group.active { "●" } else { "○" };
+                            self.inventory.get(id).map_or_else(
+                                || format!("{selected} {number} · Window"),
+                                |member| {
+                                    format!(
+                                        "{selected} {number} · {} — {}",
+                                        app_name(member),
+                                        member.title
+                                    )
+                                },
+                            )
+                        }))
+                        .collect()
+                } else {
+                    vec![app_name(window).to_string(), window.title.clone()]
+                }
+            })
+            .collect();
+        let row_height = small.font_size * 1.4;
+        let max_rows = ((screen.work_area.height / scale - 14.0) / row_height)
+            .floor()
+            .max(2.0) as usize;
+        let columns = lines
+            .iter()
+            .map(|lines| lines.len().div_ceil(max_rows))
+            .max()
+            .unwrap_or(1);
+        let group_height = lines
+            .iter()
+            .map(|lines| {
+                (lines.len().div_ceil(lines.len().div_ceil(max_rows)) as f64 * row_height + 8.0)
+                    .max(height)
+            })
+            .fold(height, f64::max);
         let (physical_width, positions) = card_positions(
             &centers,
-            (number_width + 260.0) * scale,
+            (number_width + 18.0 + 260.0 * columns as f64) * scale,
             group_height * scale,
             screen.work_area.inset(3.0 * scale, 3.0 * scale),
         );
         let width = physical_width / scale;
-        for (window, footprint) in windows.iter().zip(&positions) {
+        for ((window, footprint), lines) in windows.iter().zip(&positions).zip(&lines) {
+            *next_group += 1;
+            let group = *next_group;
             let text = self.numbers[&window.id].to_string();
-            let card = Rect::new(footprint.x, footprint.y, width * scale, height * scale);
+            let columns = lines.len().div_ceil(max_rows);
+            let rows = lines.len().div_ceil(columns);
+            let card = Rect::new(
+                footprint.x,
+                footprint.y,
+                width * scale,
+                (rows as f64 * row_height + 8.0).max(height) * scale,
+            );
 
             if self.tree.is_none()
                 && ((card.center().x - window.bounds.center().x).abs() > 5.0
                     || (card.center().y - window.bounds.center().y).abs() > height * scale)
             {
-                scene.push_shape(OverlayShape::line(
+                scene.push_shape(OverlayShape::label_connector(
                     window.bounds.center(),
                     card.center(),
                     style.border_color,
                     3.0 * scale,
+                    group,
                 ));
             }
             scene.push_label(
@@ -212,28 +233,23 @@ impl WindowView<'_> {
                         ..(*style).clone()
                     },
                 )
-                .with_z_index(19),
+                .with_z_index(19)
+                .with_placement(group, Role::Background),
             );
             let number_rect = Rect::new(card.x, card.y, number_width * scale, card.height);
             scene.push_label(
                 OverlayLabel::new(text, logical(number_rect, scale), style.clone())
-                    .with_z_index(20),
+                    .with_z_index(20)
+                    .with_placement(group, Role::Fixed),
             );
-            let app = window
-                .app
-                .rsplit(['/', '\\'])
-                .next()
-                .unwrap_or(&window.app)
-                .trim_end_matches(".exe");
-            let content_width = (width - number_width - 18.0).max(1.0);
-            for (line, text, label_style) in
-                [(0, app, &small), (1, window.title.as_str(), &title_style)]
-            {
+            let content_width = ((width - number_width - 18.0) / columns as f64).max(1.0);
+            for (line, text) in lines.iter().enumerate() {
+                let label_style = if line == 0 { &small } else { &title_style };
                 let rect = Rect::new(
-                    card.x + (number_width + 9.0) * scale,
-                    card.y + 4.0 * scale + line as f64 * (card.height - 8.0 * scale) / 2.0,
+                    card.x + (number_width + 9.0 + (line / rows) as f64 * content_width) * scale,
+                    card.y + (4.0 + (line % rows) as f64 * row_height) * scale,
                     content_width * scale,
-                    (card.height - 8.0 * scale) / 2.0,
+                    row_height * scale,
                 );
                 crate::presentation::key_help::push_sized_help_text(
                     &mut scene,
@@ -244,10 +260,15 @@ impl WindowView<'_> {
                 );
                 if let Some(label) = scene.labels.last_mut() {
                     label.z_index = 21;
+                    label.placement = Some(crate::api::overlay::LabelPlacement {
+                        group,
+                        role: Role::Flexible,
+                    });
                 }
             }
         }
         for slot in slots {
+            *next_group += 1;
             let text = format!("`{}", slot.id);
             let width = (style.font_size * 0.75 * text.len() as f64 + style.padding_x * 2.0)
                 .max(38.0)
@@ -261,9 +282,43 @@ impl WindowView<'_> {
                 height.min(area.height),
             );
             scene.push_label(
-                OverlayLabel::new(text, logical(rect, scale), style.clone()).with_z_index(22),
+                OverlayLabel::new(text, logical(rect, scale), style.clone())
+                    .with_z_index(22)
+                    .with_placement(*next_group, Role::Standalone),
             );
         }
+        if self.group_input {
+            for group in &self.tabs.groups {
+                let Some(window) = self
+                    .inventory
+                    .get(&group.active)
+                    .filter(|w| w.screen == self.screen)
+                else {
+                    continue;
+                };
+                *next_group += 1;
+                let width = (style.font_size * 0.75 * (group.id.0.to_string().len() + 1) as f64
+                    + style.padding_x * 2.0)
+                    .max(38.0)
+                    * scale;
+                let rect = Rect::new(
+                    window.bounds.center().x - width / 2.0,
+                    window.bounds.y + 5.0 * scale,
+                    width,
+                    (style.font_size * 1.4 + style.padding_y * 2.0).max(44.0) * scale,
+                );
+                scene.push_label(
+                    OverlayLabel::new(
+                        format!("~{}", group.id.0),
+                        logical(rect, scale),
+                        style.clone(),
+                    )
+                    .with_z_index(25)
+                    .with_placement(*next_group, Role::Standalone),
+                );
+            }
+        }
+        super::label_placement::avoid_overlaps(&mut scene, screen, &[]);
         scene
     }
 }
@@ -271,6 +326,148 @@ impl WindowView<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dense_cards_repack_above_help_without_detaching_numbers_or_titles() {
+        let scale = 2.0;
+        let screen = crate::api::Screen {
+            bounds: Rect::new(0.0, 0.0, 1920.0, 1080.0),
+            work_area: Rect::new(0.0, 30.0, 1920.0, 1010.0),
+            name: None,
+            scale,
+            is_primary: true,
+        };
+        let panel = Rect::new(380.0, 650.0, 1160.0, 390.0);
+        let (_, cards) = card_positions(
+            &[Point::new(900.0, 850.0); 24],
+            600.0,
+            120.0,
+            screen.work_area,
+        );
+        let mut scene = OverlayScene::new();
+        for (number, card) in cards.into_iter().enumerate() {
+            let group = number as u32 + 1;
+            scene.push_label(
+                OverlayLabel::new("", card, crate::api::overlay::LabelStyle::default())
+                    .with_z_index(19)
+                    .with_placement(group, Role::Background),
+            );
+            scene.push_label(
+                OverlayLabel::new(
+                    number.to_string(),
+                    logical(Rect::new(card.x, card.y, 120.0, card.height), scale),
+                    crate::api::overlay::LabelStyle::default(),
+                )
+                .with_z_index(20)
+                .with_placement(group, Role::Fixed),
+            );
+            scene.push_label(
+                OverlayLabel::new(
+                    "Application title",
+                    logical(
+                        Rect::new(card.x + 138.0, card.y + 30.0, card.width - 156.0, 40.0),
+                        scale,
+                    ),
+                    crate::api::overlay::LabelStyle::default(),
+                )
+                .with_z_index(21)
+                .with_placement(group, Role::Flexible),
+            );
+        }
+        scene.sort_in_place();
+        super::super::label_placement::avoid_overlaps(&mut scene, &screen, &[panel]);
+        let cards: Vec<_> = scene
+            .labels
+            .iter()
+            .filter(|l| l.z_index == 19)
+            .map(|l| l.rect)
+            .collect();
+        assert_eq!(cards.len(), 24);
+        assert!(cards.iter().any(|card| card.width < 600.0));
+        for (index, card) in cards.iter().enumerate() {
+            assert!(card.intersect(&panel).is_none());
+            assert!(
+                cards[..index]
+                    .iter()
+                    .all(|old| old.intersect(card).is_none())
+            );
+            let number = scene
+                .labels
+                .iter()
+                .find(|l| l.text == index.to_string().as_str())
+                .unwrap();
+            assert!(card.contains(&number.rect.center()));
+        }
+        for title in scene.labels.iter().filter(|l| l.z_index == 21) {
+            assert_eq!(
+                cards
+                    .iter()
+                    .filter(|card| card.contains(&title.rect.center()))
+                    .count(),
+                1
+            );
+            assert!(!panel.contains(&title.rect.center()));
+        }
+    }
+    #[test]
+    fn overlapping_cards_avoid_final_help_panel_and_keep_text_together() {
+        for scale in [1.0, 1.5, 2.0] {
+            let screen = crate::api::Screen {
+                bounds: Rect::new(-1920.0, 0.0, 1920.0, 1080.0),
+                work_area: Rect::new(-1920.0, 30.0, 1920.0, 1010.0),
+                name: None,
+                scale,
+                is_primary: true,
+            };
+            let panel = Rect::new(-1450.0, 650.0, 1000.0, 390.0);
+            let mut scene = OverlayScene::new();
+            let (_, positions) = card_positions(
+                &[Point::new(-850.0, 700.0); 2],
+                300.0 * scale,
+                70.0 * scale,
+                screen.work_area,
+            );
+            for (n, card) in positions.into_iter().enumerate() {
+                let group = n as u32 + 1;
+                scene.push_label(
+                    OverlayLabel::new("", card, crate::api::overlay::LabelStyle::default())
+                        .with_z_index(19)
+                        .with_placement(group, Role::Background),
+                );
+                scene.push_label(
+                    OverlayLabel::new(
+                        n.to_string(),
+                        logical(card, scale),
+                        crate::api::overlay::LabelStyle::default(),
+                    )
+                    .with_z_index(20)
+                    .with_placement(group, Role::Fixed),
+                );
+            }
+            scene.sort_in_place();
+            super::super::label_placement::avoid_overlaps(&mut scene, &screen, &[panel]);
+            let cards: Vec<_> = scene
+                .labels
+                .iter()
+                .filter(|l| l.z_index == 19)
+                .map(|l| l.rect)
+                .collect();
+            assert!(cards[0].intersect(&cards[1]).is_none());
+            for (index, card) in cards.iter().enumerate() {
+                assert!(card.intersect(&panel).is_none());
+                assert!(screen.work_area.contains(&card.center()));
+                assert_eq!(
+                    card.center(),
+                    scene
+                        .labels
+                        .iter()
+                        .find(|label| label.text == index.to_string().as_str())
+                        .unwrap()
+                        .rect
+                        .center()
+                );
+            }
+        }
+    }
     #[test]
     fn crowded_cards_are_clamped_before_collision_tests_at_multiple_scales() {
         for scale in [1.0, 1.5, 2.0] {

@@ -364,7 +364,7 @@ impl ConfigFile {
             ("window_quick", &self.window_quick.temporary_mode_keys),
             ("window_editor", &self.window_editor.temporary_mode_keys),
             ("window_restore", &self.window_restore.temporary_mode_keys),
-            ("window_delete", &self.window_delete.temporary_mode_keys),
+            ("window_tab", &self.window_tab.temporary_mode_keys),
         ] {
             for key in keys {
                 let key = Key::new(key).map_err(|error| {
@@ -466,7 +466,7 @@ impl ConfigFile {
             ("window_quick", &self.window_quick.lifecycle),
             ("window_editor", &self.window_editor.lifecycle),
             ("window_restore", &self.window_restore.lifecycle),
-            ("window_delete", &self.window_delete.lifecycle),
+            ("window_tab", &self.window_tab.lifecycle),
             ("grid", &self.grid.lifecycle),
             ("recursive_grid", &self.recursive_grid.lifecycle),
             ("ui_hint", &self.ui_hint.lifecycle),
@@ -647,10 +647,7 @@ fn validate_inheritance(config: &Config) -> Result<(), String> {
             "window_restore",
             config.window_restore.temporary_mode.as_deref(),
         ),
-        (
-            "window_delete",
-            config.window_delete.temporary_mode.as_deref(),
-        ),
+        ("window_tab", config.window_tab.temporary_mode.as_deref()),
         (
             "recursive_grid",
             config.recursive_grid.temporary_mode.as_deref(),

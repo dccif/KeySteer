@@ -93,6 +93,7 @@ pub(crate) fn recursive_grid_settings(config: &Config) -> modes::recursive_grid:
 pub(crate) fn hint_settings(config: &Config) -> modes::hint::Settings {
     modes::hint::Settings {
         strategy: config.ui_hint.strategy,
+        scan_scope: config.ui_hint.scan_scope,
         vision: config.ui_hint.vision.clone(),
         hint_characters: config.ui_hint.hint_characters.clone(),
         label_direction: config.ui_hint.label_direction,
@@ -172,9 +173,11 @@ fn window_settings(config: &Config, kind: modes::window::WindowKind) -> modes::w
         K::Quick => &config.window_quick.common,
         K::Editor => &config.window_editor.common,
         K::Restore => &config.window_restore.common,
-        K::Delete => &config.window_delete.common,
+        K::Tab => &config.window_tab.common,
     };
     modes::window::Settings {
+        all_screens: common.screens == crate::config::WindowScreens::All,
+        include_minimized: common.include_minimized,
         lifecycle: common.lifecycle.clone(),
         split_ratios: config
             .window_quick
@@ -210,7 +213,7 @@ fn window_settings(config: &Config, kind: modes::window::WindowKind) -> modes::w
 fn window_family(config: &Config) -> Vec<modes::window::WindowMode> {
     use modes::window::WindowKind as K;
     modes::window::WindowMode::family(
-        [K::Move, K::Quick, K::Editor, K::Restore, K::Delete]
+        [K::Move, K::Quick, K::Editor, K::Restore, K::Tab]
             .into_iter()
             .zip(config.window_modes())
             .filter(|(_, (_, mode))| mode.enabled)
@@ -399,6 +402,15 @@ mod tests {
     use std::collections::BTreeSet;
 
     #[test]
+    fn tabs_are_available_on_supported_platforms() {
+        assert!(
+            built_in(&Config::default())
+                .iter()
+                .any(|mode| mode.id() == ModeId::window_tab())
+        );
+    }
+
+    #[test]
     fn default_catalog_has_unique_ids_and_all_built_ins() {
         let modes = built_in(&Config::default());
         let ids: Vec<_> = modes.iter().map(|mode| mode.id()).collect();
@@ -425,7 +437,7 @@ mod tests {
         config.window_quick.enabled = false;
         config.window_editor.enabled = false;
         config.window_restore.enabled = false;
-        config.window_delete.enabled = false;
+        config.window_tab.enabled = false;
         let ids: Vec<_> = built_in(&config).iter().map(|mode| mode.id()).collect();
         assert_eq!(ids, vec![ModeId::idle(), ModeId::normal()]);
     }

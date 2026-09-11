@@ -34,6 +34,30 @@ pub struct WindowInfo {
     pub fullscreen: bool,
 }
 
+/// Allocate new numbers in application batches while preserving every existing
+/// number. The acquired application's existing number keeps its batch first.
+pub(crate) fn application_number_order<'a>(
+    windows: impl IntoIterator<Item = &'a WindowInfo>,
+    numbers: impl IntoIterator<Item = (WindowId, u32)>,
+) -> Vec<&'a WindowInfo> {
+    let mut windows: Vec<_> = windows.into_iter().collect();
+    let numbers: std::collections::BTreeMap<_, _> = numbers.into_iter().collect();
+    let mut first = std::collections::BTreeMap::<String, u32>::new();
+    for window in &windows {
+        if let Some(number) = numbers.get(&window.id) {
+            first
+                .entry(window.app.to_lowercase())
+                .and_modify(|value| *value = (*value).min(*number))
+                .or_insert(*number);
+        }
+    }
+    windows.sort_by_cached_key(|window| {
+        let app = window.app.to_lowercase();
+        (first.get(&app).copied().unwrap_or(u32::MAX), app)
+    });
+    windows
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowAction {
     Left,
@@ -49,11 +73,25 @@ pub enum WindowAction {
     PreviousScreen,
     CycleState,
     Center,
+    Close,
     Select,
+    SelectPrevious,
     Undo,
+    Redo,
+    ResetInitial,
     RemoveRegion,
     SaveLayout,
+    DeletePreset,
     Confirm,
+    TabEnd,
+    TabPrefix,
+    TabSeparator,
+    TabRemove,
+    TabDissolve,
+    TabNext,
+    TabPrevious,
+    TabMoveLeft,
+    TabMoveRight,
 }
 
 impl WindowAction {
@@ -88,11 +126,25 @@ impl WindowAction {
             Self::PreviousScreen => "window_screen_previous",
             Self::CycleState => "size_cycle",
             Self::Center => "window_center",
+            Self::Close => "window_close",
             Self::Select => "window_select",
+            Self::SelectPrevious => "window_select_previous",
             Self::Undo => "window_undo",
+            Self::Redo => "window_redo",
+            Self::ResetInitial => "window_reset_initial",
             Self::RemoveRegion => "window_remove_region",
             Self::SaveLayout => "window_save_layout",
+            Self::DeletePreset => "window_delete",
             Self::Confirm => "window_confirm",
+            Self::TabEnd => "window_tab_end",
+            Self::TabPrefix => "window_tab_group",
+            Self::TabSeparator => "window_number_end",
+            Self::TabRemove => "window_tab_remove",
+            Self::TabDissolve => "window_tab_dissolve",
+            Self::TabNext => "window_tab_next",
+            Self::TabPrevious => "window_tab_previous",
+            Self::TabMoveLeft => "window_tab_move_left",
+            Self::TabMoveRight => "window_tab_move_right",
         }
     }
 
@@ -120,11 +172,25 @@ impl WindowAction {
             Self::PreviousScreen,
             Self::CycleState,
             Self::Center,
+            Self::Close,
             Self::Select,
+            Self::SelectPrevious,
             Self::Undo,
+            Self::Redo,
+            Self::ResetInitial,
             Self::RemoveRegion,
             Self::SaveLayout,
+            Self::DeletePreset,
             Self::Confirm,
+            Self::TabEnd,
+            Self::TabPrefix,
+            Self::TabSeparator,
+            Self::TabRemove,
+            Self::TabDissolve,
+            Self::TabNext,
+            Self::TabPrevious,
+            Self::TabMoveLeft,
+            Self::TabMoveRight,
         ]
         .into_iter()
         .find(|action| action.name() == value)
@@ -143,14 +209,18 @@ pub enum WindowChange {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum WindowOperation {
-    /// Lock the ordinary window under the physical pointer for this session.
+    Tabs(super::window_tabs::TabOperation),
+    /// Lock and activate the ordinary window under the physical pointer.
     Acquire(Point),
     /// Cancel older queued/in-flight operations while preserving target/history.
     CancelPending,
     Enumerate,
     Select(WindowId),
+    /// Ask the application to close this window, preserving save/cancel dialogs.
+    Close(WindowId),
     /// Query eligible windows and immediately lock/activate the next one.
     Cycle,
+    CyclePrevious,
     /// Capture native restore state and constraints before a live edit.
     BeginEdit {
         transaction: u64,
@@ -162,6 +232,7 @@ pub enum WindowOperation {
     },
     /// Latest absolute geometry, in normalized screen work-area coordinates.
     ApplyLayout {
+        additional_screens: Vec<WindowScreenLayout>,
         transaction: u64,
         revision: u64,
         screen: usize,
@@ -184,31 +255,63 @@ pub enum WindowOperation {
         group: u64,
     },
     Undo,
+    Redo,
+    /// Restore windows changed in this session to their first observed native state.
+    ResetInitial {
+        group: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowScreenLayout {
+    pub screen: usize,
+    pub placements: Vec<(WindowId, Rect)>,
 }
 
 impl WindowOperation {
     pub fn precedes_inventory(&self) -> bool {
         matches!(
             self,
-            Self::BeginEdit { .. }
+            Self::Tabs(_)
+                | Self::BeginEdit { .. }
                 | Self::ApplyLayout { .. }
                 | Self::EndEdit { .. }
                 | Self::Select(_)
+                | Self::Close(_)
                 | Self::Cycle
+                | Self::CyclePrevious
                 | Self::Tile { .. }
+                | Self::Undo
+                | Self::Redo
+                | Self::ResetInitial { .. }
         )
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowRequest {
+    pub scope: Option<WindowScope>,
     pub session: u64,
     pub id: u64,
     pub operation: WindowOperation,
 }
 
+/// Inventory selection shared by numbering, cycling and layout operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowScope {
+    pub screen: Option<usize>,
+    pub include_minimized: bool,
+}
+impl WindowScope {
+    pub fn contains(self, window: &WindowInfo) -> bool {
+        self.screen.is_none_or(|screen| screen == window.screen)
+            && (self.include_minimized || !window.minimized)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowResult {
+    pub tabs: Option<super::window_tabs::TabState>,
     pub session: u64,
     pub id: u64,
     pub target: Option<WindowInfo>,

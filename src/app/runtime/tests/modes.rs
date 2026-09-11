@@ -519,3 +519,67 @@ fn follow_binding_is_dispatched_once_to_the_active_mode() {
         "follow must be a single mode binding, got {log:?}"
     );
 }
+
+
+#[test]
+fn launch_modifiers_do_not_activate_destination_temporary_layers() {
+    for target in ["window", "grid", "recursive_grid", "ui_hint"] {
+        for modifier_first in [false, true] {
+            let mut config = Config::default();
+            config.hotkeys.insert("alt+w".into(), Binding::Mode(ModeId::new(target).unwrap()));
+            let mut engine = Engine::new(config.clone(), Appearance::Dark);
+            for mode in crate::app::mode_catalog::built_in(&config) { engine.register(mode); }
+            let (mut backend, log) = FakeBackend::new(Vec::new());
+            for event in [key_down("left_alt"), key_down("w")] {
+                engine.handle_backend_event(event, &mut backend).unwrap();
+            }
+            assert_eq!(engine.active_mode().as_str(), target);
+            assert_eq!(engine.display_mode().as_str(), target);
+            let release = if modifier_first { ["left_alt", "w"] } else { ["w", "left_alt"] };
+            for key in release {
+                engine.handle_backend_event(key_up(key), &mut backend).unwrap();
+                assert_eq!(engine.display_mode().as_str(), target, "{target}: releasing {key}");
+            }
+            assert!(log.lock().unwrap().scenes.iter().all(|scene| {
+                scene.indicator.as_ref().is_none_or(|indicator| indicator.text != "Normal")
+            }), "{target}: activation submitted a Normal badge");
+            engine.handle_backend_event(key_down("left_alt"), &mut backend).unwrap();
+            assert_eq!(engine.display_mode(), ModeId::normal());
+            engine.handle_backend_event(key_up("left_alt"), &mut backend).unwrap();
+            assert_eq!(engine.display_mode().as_str(), target);
+        }
+    }
+}
+
+#[test]
+fn ui_hint_screen_shortcut_rescans_without_a_native_pointer_callback() {
+    for scope in [crate::api::UiScanScope::Window, crate::api::UiScanScope::Screen] {
+        let mut config = Config::default();
+        config.ui_hint.scan_scope = scope;
+        config.ui_hint.temporary_mode_keys = vec!["alt".into()];
+        config.ui_hint.bindings.insert("alt+s".into(), Binding::parse("screen next").unwrap());
+        let mut engine = Engine::new(config.clone(), Appearance::Dark);
+        for mode in crate::app::mode_catalog::built_in(&config) { engine.register(mode); }
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+        for plugin in crate::app::mode_catalog::bundled_plugins(&config).unwrap() {
+            engine.register_plugin_dyn(plugin).unwrap();
+        }
+        engine.screens = backend.screens().unwrap();
+        let mut second = engine.screens[0].clone();
+        second.bounds.x = 1000.0;
+        second.work_area.x = 1000.0;
+        second.is_primary = false;
+        engine.screens.push(second.clone());
+        engine.cursor = Point::new(100.0, 100.0);
+        engine.activate(ModeId::ui_hint(), Some(ModeId::normal()), &mut backend).unwrap();
+        let primary = Key::new("left_alt").unwrap();
+        // Explicit Alt+S, including temporary Normal routing.
+        engine.handle_backend_event(key_down(primary.as_str()), &mut backend).unwrap();
+        engine.handle_backend_event(key_down("s"), &mut backend).unwrap();
+        let recorded = log.lock().unwrap();
+        assert_eq!(recorded.scan_requests.len(), 2, "warps={:?} cursor={:?} mode={} display={} lookup={:?}", recorded.warps, engine.cursor, engine.active_mode(), engine.display_mode(), engine.lookup(&Key::new("s").unwrap()));
+        assert_eq!(recorded.scan_requests[1].bounds, Some(second.bounds));
+        assert_eq!(recorded.scan_requests[1].scope, scope);
+        assert!(recorded.cancelled_scans.contains(&recorded.scan_requests[0].id));
+    }
+}

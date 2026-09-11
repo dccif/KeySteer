@@ -93,6 +93,7 @@ pub(super) struct DynamicOverlayState {
 #[derive(Default)]
 pub(super) struct OverlayCoordinator {
     pub(super) key_help_visible: bool,
+    pub(super) window_help_plan: Option<super::key_help::WindowKeyHelpPlan>,
     pub(super) key_help_cache: Option<Box<super::key_help::KeyHelpCache>>,
     pub(super) last_scene: Option<Arc<OverlayScene>>,
     pub(super) content: Option<Arc<OverlayScene>>,
@@ -118,6 +119,7 @@ impl OverlayCoordinator {
         self.speed_toggle = None;
         self.key_help_visible = false;
         self.key_help_cache = None;
+        self.window_help_plan = None;
     }
 }
 impl Engine {
@@ -274,7 +276,7 @@ impl Engine {
 
     fn hide_overlay_now(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
         self.overlay.content = None;
-        if self.registry.active != ModeId::idle() && self.window_layouts.pending.is_none() {
+        if self.registry.active != ModeId::idle() && self.window_presets.pending.is_none() {
             return self.present_overlay(OverlayScene::new(), backend);
         }
         if self.overlay.visible {

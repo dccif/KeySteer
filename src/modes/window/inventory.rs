@@ -13,6 +13,14 @@ impl WindowSession {
             return out;
         }
         self.result = result.id;
+        if let Some(tabs) = result.tabs.take() {
+            if self.tabs.state != tabs {
+                self.numbers = tabs.numbers.iter().copied().collect();
+                self.next_number = tabs.numbers.iter().map(|(_, n)| *n).max().unwrap_or(0) + 1;
+                self.inventory_dirty = true;
+            }
+            self.tabs.state = tabs;
+        }
         let had_target = self.target.is_some();
         let had_inventory = result.windows.is_some();
         let mut changed = false;
@@ -83,7 +91,10 @@ impl WindowSession {
         }
         // Polling must not erase operation errors or the pending selection hint.
         let ended = matches!(result.edit.as_deref(), Some(WindowEditResult::Ended { .. }));
-        if (result.message.is_some() || !had_inventory || result.edit.is_some())
+        if (result.message.is_some()
+            || !had_inventory
+            || result.edit.is_some()
+            || self.tabs.in_flight == Some(result.id))
             && !(ended && result.message.is_none())
         {
             if self.status != result.message {
@@ -107,6 +118,7 @@ impl WindowSession {
                     .chain(std::iter::once(&mut edit.accepted))
                     .chain(edit.in_flight.iter_mut().map(|(_, model)| model))
                     .chain(edit.history.iter_mut())
+                    .chain(edit.redo.iter_mut())
                 {
                     if let EditModel::Tree(tree) = model {
                         tree.retain_windows(&live);
@@ -130,6 +142,16 @@ impl WindowSession {
                 WindowEditResult::Applied { accepted: true, .. }
             );
             self.edit_result(feedback, ctx, &mut out);
+        }
+        if self.reopen_edit == Some(result.id) {
+            self.reopen_edit = None;
+            if self.edit.is_none() && matches!(self.kind, WindowKind::Quick | WindowKind::Editor) {
+                self.start_edit(self.kind == WindowKind::Editor, ctx, &mut out);
+                if let Some(edit) = &mut self.edit {
+                    edit.entry_layout = false;
+                }
+                changed = true;
+            }
         }
         if result.edit.is_none()
             && self.target.is_some()
@@ -157,6 +179,10 @@ impl WindowSession {
             }
         }
         self.rebuild_numbers();
+        if self.kind == WindowKind::Tab {
+            self.tab_result(result.id, ctx, &mut out);
+            changed = true;
+        }
         if result.id == 1 && !had_inventory {
             self.refresh(&mut out);
         }

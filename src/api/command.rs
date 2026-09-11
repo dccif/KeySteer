@@ -54,7 +54,7 @@ pub enum FinishCause {
 pub enum Command {
     WindowRequest(Box<super::window::WindowRequest>),
     CancelWindowSession(u64),
-    WindowLayouts(Box<super::window_presets::LayoutLibraryRequest>),
+    WindowPresets(Box<super::window_presets::PresetLibraryRequest>),
     /// Move the window and physical pointer together, preserving relative position.
     MoveWindowToScreen(WindowScreenTarget),
     /// Dispatch high-level actions through the same path used by config.
@@ -437,7 +437,7 @@ impl<'a> IntoIterator for &'a CommandBatch {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModeEvent {
     WindowResult(Box<super::window::WindowResult>),
-    WindowLayouts(Box<super::window_presets::LayoutLibraryResult>),
+    WindowPresets(Box<super::window_presets::PresetLibraryResult>),
     /// Temporary binding inheritance started/stopped without suspending the mode.
     TemporaryModeChanged {
         active: bool,
@@ -618,8 +618,18 @@ impl Default for VisionOptions {
     }
 }
 
+/// Whether UI hints inspect the pointer window or its complete display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiScanScope {
+    #[default]
+    Window,
+    Screen,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct UiScanRequest {
+    pub scope: UiScanScope,
     pub id: u64,
     /// Soft accessibility traversal budget. Platform providers may spend up
     /// to this long in one native transaction before returning control.
@@ -754,6 +764,11 @@ pub trait Mode: Send {
     }
 
     /// Whether a window operation is meaningful in the current interaction.
+    /// Stable capability used when building a mode's shortcut reference.
+    /// Runtime readiness continues to use window_action_available.
+    fn window_action_supported(&self, action: &super::window::WindowAction) -> bool {
+        self.window_action_available(action)
+    }
     fn window_action_available(&self, _action: &super::window::WindowAction) -> bool {
         true
     }

@@ -4,11 +4,15 @@ use crate::api::style::KeyHelp;
 use crate::api::{OverlayScene, Palette, Rect, Screen};
 use std::collections::BTreeMap;
 
+mod window;
+
 pub(crate) struct KeyHelpView<'a> {
     pub screen: &'a Screen,
     pub ui: &'a KeyHelp,
     pub palette: &'a Palette,
-    pub entries: Vec<String>,
+    pub entries: std::sync::Arc<[String]>,
+    pub extra_entries: Vec<String>,
+    pub return_target: Option<String>,
     pub window_help: bool,
     pub display_name: String,
     pub previews: Vec<(String, String, Rect, bool)>,
@@ -18,6 +22,10 @@ pub(crate) struct KeyHelpView<'a> {
 }
 
 pub(crate) fn compose(scene: &mut OverlayScene, input: KeyHelpView<'_>) {
+    compose_columns(scene, input, 2);
+}
+
+fn compose_columns(scene: &mut OverlayScene, input: KeyHelpView<'_>, max_columns: usize) {
     let screen = input.screen;
     let palette = input.palette;
     let window_help = input.window_help;
@@ -28,31 +36,50 @@ pub(crate) fn compose(scene: &mut OverlayScene, input: KeyHelpView<'_>) {
     );
     // Group equivalent actions instead of repeating a badge for every key.
     let mut grouped = BTreeMap::<String, Vec<String>>::new();
-    for entry in input.entries {
+    for entry in input.entries.iter().chain(&input.extra_entries) {
         if let Some((keys, action)) = entry.split_once("  ·  ") {
-            let action = if window_help {
-                if let Some(label) = window_action_label(action) {
-                    label
-                } else {
-                    if action == "Window number" {
-                        continue;
-                    }
-                    action
-                }
-            } else {
-                action
-            };
+            if window_help && action == "Window number" {
+                continue;
+            }
             grouped
                 .entry(action.into())
                 .or_default()
                 .push(keys.replace('_', " ").to_uppercase());
         }
     }
-    let mut entries: Vec<_> = grouped
-        .into_iter()
-        .map(|(action, keys)| (keys.join(" / "), action))
-        .collect();
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let (mut entries, sections) = if window_help {
+        (
+            Vec::new(),
+            Some(window::sections(
+                grouped,
+                &input.display_name,
+                input.return_target.as_deref(),
+                input
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.starts_with("Resize")),
+            )),
+        )
+    } else {
+        let mut entries: Vec<_> = grouped
+            .into_iter()
+            .map(|(action, keys)| (keys.join(" / "), action))
+            .collect();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        (entries, None)
+    };
+    let exit_action = sections
+        .as_ref()
+        .map(|s| s.exit_label.clone())
+        .unwrap_or_default();
+    let mode_entries = sections
+        .as_ref()
+        .map(|s| s.modes.clone())
+        .unwrap_or_default();
+    let exit_keys = sections
+        .as_ref()
+        .map(|s| s.exit.clone())
+        .unwrap_or_default();
     #[cfg(target_os = "windows")]
     let scale = crate::api::overlay::normalized_label_scale(screen.scale);
     #[cfg(not(target_os = "windows"))]
@@ -71,45 +98,29 @@ pub(crate) fn compose(scene: &mut OverlayScene, input: KeyHelpView<'_>) {
     };
     // An anchor affects placement only. Font size must not depend on target size.
     let area = screen.work_area;
-    let available_width = (area.width - 12.0 * 2.0 * scale)
-        .max(1.0)
-        .min(if window_help { 760.0 * scale } else { f64::MAX });
+    let available_width = (area.width - 12.0 * 2.0 * scale).max(1.0);
     let padding = (ui.padding_x * scale).min(available_width / 4.0);
     let vertical_padding = ui.padding_y * scale;
-    let column_gap = 6.0 * scale;
+    let column_gap = if window_help { 20.0 } else { 6.0 } * scale;
     let key_gap = 8.0 * scale;
-    let mut columns = if available_width >= (if window_help { 340.0 } else { 560.0 }) * scale
-        && entries.len() > 8
-    {
-        2_usize.min(entries.len()).max(1)
+    let key_padding = if window_help { 2.0 } else { 5.0 };
+    let columns = if let Some(sections) = sections {
+        let count = if max_columns > 1
+            && available_width >= 620.0 * scale
+            && !sections.left.is_empty()
+            && !sections.right.is_empty()
+        {
+            2
+        } else {
+            1
+        };
+        entries = sections.entries(count);
+        count
+    } else if available_width >= 560.0 * scale && entries.len() > 8 {
+        2
     } else {
         1
     };
-    if window_help && columns == 2 {
-        let rows = entries.len().div_ceil(columns);
-        let needed = entries
-            .chunks(rows)
-            .map(|chunk| {
-                let keys = chunk
-                    .iter()
-                    .map(|(key, _)| key.chars().count())
-                    .max()
-                    .unwrap_or(1) as f64;
-                let actions = chunk
-                    .iter()
-                    .map(|(_, action)| super::text_units(action))
-                    .fold(1.0, f64::max);
-                (keys * ui.font_size * 0.75 + 10.0 + actions * ui.font_size + ui.font_size / 3.0)
-                    * scale
-                    + key_gap
-            })
-            .sum::<f64>()
-            + column_gap
-            + padding * 2.0;
-        if needed > available_width {
-            columns = 1;
-        }
-    }
     let rows = entries.len().div_ceil(columns).max(1);
     // Size each column from its own longest key and action, rather than
     // reserving half of a fixed-width panel for each side of every row.
@@ -123,28 +134,88 @@ pub(crate) fn compose(scene: &mut OverlayScene, input: KeyHelpView<'_>) {
             )
         });
         widths.push((
-            (key_chars as f64 * ui.font_size * 0.75 + 5.0 * 2.0) * scale,
-            (action_chars as f64 * ui.font_size * 0.75 + ui.font_size / 3.0) * scale,
+            (key_chars as f64 * ui.font_size * 0.75 + key_padding * 2.0) * scale,
+            (action_chars as f64 * ui.font_size * 0.75 + ui.font_size * 0.5) * scale,
         ));
     }
+    let detail = &input.detail;
+    let (detail_title, detail_status) = detail
+        .as_deref()
+        .unwrap_or("")
+        .split_once('\n')
+        .unwrap_or((detail.as_deref().unwrap_or(""), ""));
+    let mut detail_status = detail_status.to_owned();
+    if window_help
+        && matches!(
+            input.display_name.as_str(),
+            "window" | "window_quick" | "window_editor"
+        )
+    {
+        let lines: Vec<_> = detail_status.lines().collect();
+        if lines.len() >= 2 {
+            detail_status = std::iter::once(format!("{}  \u{b7}  {}", lines[0], lines[1]))
+                .chain(lines[2..].iter().map(|line| (*line).to_owned()))
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+    }
+    let detail_title = if let Some((title, instruction)) = detail_title.split_once(" \u{b7} ") {
+        detail_status = format!("{instruction}\n{detail_status}");
+        title
+    } else {
+        detail_title
+    };
     let content_width: f64 = widths
         .iter()
         .map(|(keys, actions)| keys + key_gap + actions)
         .sum::<f64>()
         + (columns - 1) as f64 * column_gap;
-    let width = (content_width + padding * 2.0)
-        .max(
-            if window_help
-                && input.detail.as_deref().is_some_and(|detail| {
-                    detail.starts_with("Restore\n") || detail.starts_with("Delete layouts\n")
-                })
-            {
-                560.0 * scale
-            } else {
-                340.0 * scale
+    let header_width = (ui.font_size * 1.75 * 5.0
+        + detail_title.chars().count() as f64 * ui.font_size * 0.75
+        + 16.0
+        + exit_keys.chars().count() as f64 * ui.font_size * 0.75
+        + key_padding * 2.0
+        + super::text_units(&exit_action) * ui.font_size
+        + 2.0)
+        * scale
+        + key_gap * 3.0;
+    let status_width = detail_status
+        .lines()
+        .map(super::text_units)
+        .fold(0.0, f64::max)
+        * ui.font_size
+        * scale;
+    let natural_width = (if window_help {
+        content_width.max(header_width).max(status_width)
+    } else {
+        content_width
+    } + padding * 2.0)
+        .max(if window_help && columns == 2 {
+            620.0 * scale
+        } else {
+            340.0 * scale
+        });
+    if window_help && natural_width > available_width && columns > 1 {
+        return compose_columns(scene, input, 1);
+    }
+    // A single font ratio is the last resort on a screen too narrow for the
+    // complete rows; never truncate a key or wrap half of a chord.
+    if window_help && natural_width > available_width && ui.font_size > 0.5 {
+        let mut fitted_ui = ui.clone();
+        fitted_ui.font_size = (ui.font_size * (available_width - padding * 2.0).max(1.0)
+            / (natural_width - padding * 2.0).max(1.0)
+            * 0.98)
+            .max(0.5);
+        return compose_columns(
+            scene,
+            KeyHelpView {
+                ui: &fitted_ui,
+                ..input
             },
-        )
-        .min(available_width);
+            max_columns,
+        );
+    }
+    let width = natural_width.min(available_width);
     let squeeze =
         ((width - padding * 2.0 - (columns - 1) as f64 * column_gap - columns as f64 * key_gap)
             / widths
@@ -154,34 +225,41 @@ pub(crate) fn compose(scene: &mut OverlayScene, input: KeyHelpView<'_>) {
         .clamp(0.01, 1.0);
     for (keys, actions) in &mut widths {
         if window_help {
-            *actions = (*actions - (*keys + *actions) * (1.0 - squeeze)).max(ui.font_size * scale);
+            // Natural column widths preserve every row on one line.
         } else {
             *keys *= squeeze;
             *actions *= squeeze;
         }
     }
-    let action_lines: Vec<Vec<String>> = entries
+    let entry_widths: Vec<_> = entries
         .iter()
         .enumerate()
-        .map(|(index, (_, action))| {
-            if window_help {
-                wrap_action(action, widths[index / rows].1 / (ui.font_size * scale))
-            } else {
-                vec![action.clone()]
-            }
-        })
+        .map(|(index, _)| widths[index / rows])
+        .collect();
+    let key_lines: Vec<Vec<String>> = entries.iter().map(|(keys, _)| vec![keys.clone()]).collect();
+    let action_lines: Vec<Vec<String>> = entries
+        .iter()
+        .map(|(_, action)| vec![action.clone()])
         .collect();
     let previews = input.previews;
     let preview_rows = previews.len().div_ceil(3);
     let preview_height = (preview_rows as f64 * 56.0 * scale).min(area.height * 0.35);
-    let detail = input.detail;
-    let (detail_title, detail_status) = detail
-        .as_deref()
-        .unwrap_or("")
-        .split_once('\n')
-        .unwrap_or((detail.as_deref().unwrap_or(""), ""));
     let title_font = ui.font_size * if window_help { 1.75 } else { 1.25 };
-    let title_height = (ui.font_size * 7.0 / 3.0).max(title_font * 1.4) * scale;
+    let exit_width = if exit_keys.is_empty() {
+        0.0
+    } else {
+        (exit_keys.chars().count() as f64 * ui.font_size * 0.75 + key_padding * 2.0)
+            .min(width / scale * 0.42)
+            * scale
+    };
+    let exit_lines = [exit_keys.clone()];
+    let title_height = (ui.font_size * 7.0 / 3.0).max(title_font * 1.4).max(
+        if window_help && !exit_keys.is_empty() {
+            exit_lines.len() as f64 * (ui.font_size * 1.4 + 4.0)
+        } else {
+            0.0
+        },
+    ) * scale;
     let status_lines = detail_status.lines().count();
     let status_height = ui.font_size * 1.8 * scale;
     let header_height = title_height + status_lines as f64 * status_height;
@@ -200,7 +278,50 @@ pub(crate) fn compose(scene: &mut OverlayScene, input: KeyHelpView<'_>) {
                 .max(8.0),
         )
     };
-    let height = header_height + preview_height + rows as f64 * row_height + vertical_padding * 2.0;
+    let row_heights: Vec<_> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, (keys, action))| {
+            if !window_help {
+                return row_height;
+            }
+            if keys.is_empty() && action.is_empty() {
+                return 0.0;
+            }
+            let lines = action_lines[index].len().max(key_lines[index].len());
+            (ui.font_size * (1.4 * lines as f64 + 0.6) + 4.0 * lines.saturating_sub(1) as f64)
+                * scale
+        })
+        .collect();
+    let body_height = row_heights
+        .chunks(rows)
+        .map(|column| column.iter().sum::<f64>())
+        .fold(0.0, f64::max);
+    let footer_line_height = ui.font_size * 2.2 * scale;
+    let mut footer = Vec::new();
+    let mut footer_x = 0.0;
+    let mut footer_y = 0.0;
+    let footer_columns = mode_entries.len().clamp(1, 4);
+    let footer_cell_width = (width - padding * 2.0) / footer_columns as f64;
+    for (keys, action) in mode_entries {
+        let key_width =
+            (keys.chars().count() as f64 * ui.font_size * 0.75 + key_padding * 2.0) * scale;
+        let action_width = (super::text_units(&action) * ui.font_size + 4.0) * scale;
+        let item_width = key_width + key_gap + action_width;
+        if footer_x > 0.0 && footer_x + item_width > width - padding * 2.0 {
+            footer_x = 0.0;
+            footer_y += footer_line_height;
+        }
+        footer.push((keys, action, footer_x, footer_y, key_width, action_width));
+        footer_x += footer_cell_width.max(item_width + 16.0 * scale);
+    }
+    let footer_height = if footer.is_empty() {
+        0.0
+    } else {
+        footer_y + footer_line_height + 4.0 * scale
+    };
+    let height =
+        header_height + preview_height + body_height + footer_height + vertical_padding * 2.0;
     let mut panel = Rect::new(
         area.x + (area.width - width) / 2.0,
         area.bottom() - 12.0 * scale - height,
@@ -220,6 +341,9 @@ pub(crate) fn compose(scene: &mut OverlayScene, input: KeyHelpView<'_>) {
             screen.work_area.y,
             (screen.work_area.bottom() - height).max(screen.work_area.y),
         );
+    }
+    if window_help {
+        super::label_placement::avoid_overlaps(scene, screen, &[panel]);
     }
     let indicator_style = input.indicator_style;
     let derived_background = indicator_style
@@ -283,8 +407,16 @@ pub(crate) fn compose(scene: &mut OverlayScene, input: KeyHelpView<'_>) {
     } else {
         format!("{}  Close", close_keys.join(" / "))
     };
-    let close_width = (close_hint.chars().count() as f64 * (ui.font_size * 1.25) * 0.75 * scale)
-        .min(width * 0.45);
+    let exit_action_width = (super::text_units(&exit_action) * ui.font_size + 2.0) * scale;
+    let close_width = if window_help {
+        if exit_keys.is_empty() {
+            0.0
+        } else {
+            exit_width + key_gap + exit_action_width
+        }
+    } else {
+        (close_hint.chars().count() as f64 * (ui.font_size * 1.25) * 0.75 * scale).min(width * 0.45)
+    };
     if window_help {
         let capacity = ((width - padding * 2.0 - close_width - key_gap)
             / (title_font * 0.75 * scale))
@@ -311,7 +443,7 @@ pub(crate) fn compose(scene: &mut OverlayScene, input: KeyHelpView<'_>) {
     if window_help {
         let left = panel.x + padding + title_font * 5.0 * scale;
         let badge_width = (detail_title.chars().count() as f64 * ui.font_size * 0.75 + 16.0)
-            .min((panel.right() - padding - left) / scale)
+            .min((panel.right() - padding - close_width - key_gap - left) / scale)
             .max(1.0)
             * scale;
         push_panel_text(
@@ -337,7 +469,11 @@ pub(crate) fn compose(scene: &mut OverlayScene, input: KeyHelpView<'_>) {
     for (index, status) in detail_status.lines().enumerate() {
         push_panel_text(
             scene,
-            super::elide_width(status, (width - padding * 2.0) / (ui.font_size * scale)),
+            if window_help {
+                status.into()
+            } else {
+                super::elide_width(status, (width - padding * 2.0) / (ui.font_size * scale))
+            },
             Rect::new(
                 panel.x + padding,
                 panel.y + vertical_padding + title_height + index as f64 * status_height,
@@ -351,23 +487,25 @@ pub(crate) fn compose(scene: &mut OverlayScene, input: KeyHelpView<'_>) {
             scale,
         );
     }
-    push_panel_text(
-        scene,
-        close_hint,
-        Rect::new(
-            panel.right() - padding - close_width,
-            panel.y + vertical_padding,
-            close_width,
-            header_height,
-        ),
-        &LabelStyle {
-            font_size: (ui.font_size * 1.25),
-            text_color: foreground,
-            bold: true,
-            ..base.clone()
-        },
-        scale,
-    );
+    if !window_help {
+        push_panel_text(
+            scene,
+            close_hint,
+            Rect::new(
+                panel.right() - padding - close_width,
+                panel.y + vertical_padding,
+                close_width,
+                header_height,
+            ),
+            &LabelStyle {
+                font_size: (ui.font_size * 1.25),
+                text_color: foreground,
+                bold: true,
+                ..base.clone()
+            },
+            scale,
+        );
+    }
     // One font scale for the entire body, including both keycaps and
     // descriptions. Never shrink individual rows according to text length.
     let body_scale = if window_help {
@@ -385,12 +523,40 @@ pub(crate) fn compose(scene: &mut OverlayScene, input: KeyHelpView<'_>) {
         border_color: Color::rgb(196, 201, 211),
         border_width: 1.0,
         border_radius: 3.0,
-        padding_x: 5.0,
+        padding_x: key_padding,
         padding_y: 1.0,
         bold: true,
         ..base.clone()
     }
     .scaled(body_scale);
+    if window_help && !exit_keys.is_empty() {
+        push_sized_help_text(
+            scene,
+            exit_action,
+            Rect::new(
+                panel.right() - padding - exit_action_width,
+                panel.y + vertical_padding,
+                exit_action_width,
+                title_height,
+            ),
+            &base,
+            scale,
+        );
+        for (index, line) in exit_lines.iter().enumerate() {
+            push_sized_help_text(
+                scene,
+                line.clone(),
+                Rect::new(
+                    panel.right() - padding - close_width,
+                    panel.y + vertical_padding + index as f64 * (ui.font_size * 1.4 + 4.0) * scale,
+                    exit_width,
+                    title_height,
+                ),
+                &key_style,
+                scale,
+            );
+        }
+    }
     let action_style = LabelStyle {
         font_size: ui.font_size,
         text_color: foreground.with_opacity(0.85),
@@ -468,7 +634,7 @@ pub(crate) fn compose(scene: &mut OverlayScene, input: KeyHelpView<'_>) {
     for (index, (keys, _action)) in entries.into_iter().enumerate() {
         // Read down each column, with one consistent left edge per column.
         let column = index / rows;
-        let (key_width, action_width) = widths[column];
+        let (key_width, action_width) = entry_widths[index];
         let column_offset: f64 = widths
             .iter()
             .take(column)
@@ -480,24 +646,49 @@ pub(crate) fn compose(scene: &mut OverlayScene, input: KeyHelpView<'_>) {
                 + vertical_padding
                 + header_height
                 + preview_height
-                + (index % rows) as f64 * row_height,
+                + row_heights[column * rows..index].iter().sum::<f64>(),
             key_width + key_gap + action_width,
-            (row_height - 2.0 * scale).max(1.0),
+            (row_heights[index] - 2.0 * scale).max(1.0),
         );
-        push_sized_help_text(
-            scene,
-            if window_help {
-                super::elide(
-                    &keys,
-                    ((key_width / scale - 10.0) / (ui.font_size * 0.75)).max(1.0) as usize,
-                )
-            } else {
-                keys
-            },
-            Rect::new(cell.x, cell.y, key_width, cell.height),
-            &key_style,
-            scale,
-        );
+        if window_help && keys.is_empty() {
+            if !_action.is_empty() {
+                for (line_index, line) in action_lines[index].iter().enumerate() {
+                    push_sized_help_text(
+                        scene,
+                        line.clone(),
+                        Rect::new(
+                            cell.x,
+                            cell.y + line_index as f64 * ui.font_size * 1.4 * scale,
+                            cell.width,
+                            ui.font_size * 1.8 * scale,
+                        ),
+                        &LabelStyle {
+                            bold: true,
+                            text_color: foreground.with_opacity(0.65),
+                            ..action_style.clone()
+                        },
+                        scale,
+                    );
+                }
+            }
+            continue;
+        }
+        for (line_index, line) in key_lines[index].iter().enumerate() {
+            let line_height = (ui.font_size * 1.4 + 4.0) * scale;
+            push_sized_help_text(
+                scene,
+                line.clone(),
+                Rect::new(
+                    cell.x,
+                    cell.center().y - key_lines[index].len() as f64 * line_height / 2.0
+                        + line_index as f64 * line_height,
+                    key_width,
+                    line_height,
+                ),
+                &key_style,
+                scale,
+            );
+        }
         for (line_index, line) in action_lines[index].iter().enumerate() {
             push_sized_help_text(
                 scene,
@@ -505,47 +696,67 @@ pub(crate) fn compose(scene: &mut OverlayScene, input: KeyHelpView<'_>) {
                 Rect::new(
                     cell.x + key_width + key_gap,
                     cell.center().y
-                        - action_lines[index].len() as f64 * action_style.font_size * 1.4 * scale
+                        - action_lines[index].len() as f64
+                            * (action_style.font_size * 1.4 + 1.0)
+                            * scale
                             / 2.0
-                        + line_index as f64 * action_style.font_size * 1.4 * scale,
+                        + line_index as f64 * (action_style.font_size * 1.4 + 1.0) * scale,
                     action_width,
-                    action_style.font_size * 1.4 * scale,
+                    (action_style.font_size * 1.4 + 1.0) * scale,
                 ),
                 &action_style,
                 scale,
             );
         }
     }
+    if !footer.is_empty() {
+        scene.labels.push(
+            OverlayLabel::new(
+                "",
+                Rect::new(
+                    panel.x + padding,
+                    panel.y + vertical_padding + header_height + preview_height + body_height,
+                    width - padding * 2.0,
+                    scale,
+                ),
+                LabelStyle {
+                    background: foreground.with_opacity(0.18),
+                    font_size: 1.0,
+                    ..base.clone()
+                },
+            )
+            .with_z_index(i32::MAX),
+        );
+    }
+    for (keys, action, x, y, key_width, action_width) in footer {
+        let y = panel.y
+            + vertical_padding
+            + header_height
+            + preview_height
+            + body_height
+            + 4.0 * scale
+            + y;
+        push_sized_help_text(
+            scene,
+            keys,
+            Rect::new(panel.x + padding + x, y, key_width, footer_line_height),
+            &key_style,
+            scale,
+        );
+        push_sized_help_text(
+            scene,
+            action,
+            Rect::new(
+                panel.x + padding + x + key_width + key_gap,
+                y,
+                action_width,
+                footer_line_height,
+            ),
+            &action_style,
+            scale,
+        );
+    }
     scene.sort_in_place();
-}
-
-fn wrap_action(text: &str, capacity: f64) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    for word in text.split_whitespace() {
-        if !line.is_empty() && super::text_units(&format!("{line}{word}")) > capacity {
-            lines.push(std::mem::take(&mut line));
-        }
-        for ch in word.chars() {
-            if !line.is_empty()
-                && super::text_units(&line) + super::text_units(&ch.to_string()) > capacity
-            {
-                lines.push(std::mem::take(&mut line));
-            }
-            line.push(ch);
-        }
-        line.push(' ');
-    }
-    if !line.is_empty() {
-        lines.push(line.trim_end().into());
-    }
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    for line in &mut lines {
-        *line = line.trim_end().into();
-    }
-    lines
 }
 
 fn window_action_label(action: &str) -> Option<&'static str> {
@@ -558,7 +769,8 @@ fn window_action_label(action: &str) -> Option<&'static str> {
         "window_editor" => "Edit layout tree",
         "window_quick" => "Quick layout",
         "window_restore" => "Restore layout",
-        "window_delete" => "Delete layouts",
+        "window_delete" => "Restore / delete",
+        "window_tab" => "Group windows as tabs",
         "window" => "Window",
         "idle" => "Idle",
         "normal" => "Normal",
@@ -573,19 +785,32 @@ fn window_action_label(action: &str) -> Option<&'static str> {
         "window_split_right" => "Split right",
         "window_split_up" => "Split up",
         "window_split_down" => "Split down",
-        "window_ratio_left" => "Move divider left",
-        "window_ratio_right" => "Move divider right",
-        "window_ratio_up" => "Move divider up",
-        "window_ratio_down" => "Move divider down",
+        "window_ratio_left" => "Shrink region width",
+        "window_ratio_right" => "Grow region width",
+        "window_ratio_up" => "Shrink region height",
+        "window_ratio_down" => "Grow region height",
         "window_tile" => "Tile windows",
         "window_screen_next" => "Next screen",
         "window_screen_previous" => "Previous screen",
         "size_cycle" => "Maximize / minimize / restore",
         "window_center" => "Center window",
+        "window_close" => "Close window",
         "window_select" => "Next window",
+        "window_select_previous" => "Previous window",
         "window_undo" => "Undo",
+        "window_redo" => "Redo",
+        "window_reset_initial" => "Restore initial state",
         "window_remove_region" => "Delete region",
         "window_confirm" => "Confirm",
+        "window_tab_end" => "Next group",
+        "window_tab_group" => "Group number",
+        "window_number_end" => "End number",
+        "window_tab_remove" => "Remove current tab",
+        "window_tab_dissolve" => "Dissolve group",
+        "window_tab_next" => "Next tab",
+        "window_tab_previous" => "Previous tab",
+        "window_tab_move_left" => "Move tab left",
+        "window_tab_move_right" => "Move tab right",
         _ => return None,
     })
 }
@@ -621,7 +846,7 @@ pub(crate) fn push_sized_help_text(
     // Left-aligned prose uses its column's text box, without reserving the
     // wider keycap character estimate as invisible space on the right.
     let width = if style.text_alignment == TextAlignment::Left {
-        estimated_width.min(cell.width / scale)
+        (estimated_width + style.font_size * 0.5).min(cell.width / scale)
     } else {
         estimated_width
     };
@@ -669,7 +894,10 @@ mod tests {
                         screen: &screen,
                         ui: &KeyHelp::default(),
                         palette: &Palette::default(),
-                        entries: vec!["H  ·  window_left".into(), "1  ·  Window number".into()],
+                        return_target: None,
+                        extra_entries: Vec::new(),
+                        entries: vec!["H  ·  window_left".into(), "1  ·  Window number".into()]
+                            .into(),
                         window_help: true,
                         display_name: "window".into(),
                         previews: Vec::new(),

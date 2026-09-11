@@ -37,10 +37,17 @@ keysteer/
 
 ## 程序入口
 
-- `src/api/window_presets.rs`：无原生身份的区域模板、布局库请求和异步文本输入契约。
-- `src/app/layout_store.rs` / `layout_store/codec.rs`：有界二进制布局文件、版本检查、原子替换；`runtime/window_presets.rs` 持有备注请求和会话取消。
+- `src/api/window_presets.rs`：无原生身份的 Layout/Tabs 类型化模板、共享预设库请求和异步文本输入契约。
+- `src/app/preset_store.rs` / `preset_store/codec.rs`：有界二进制布局文件、版本检查、原子替换；`runtime/window_presets.rs` 持有备注请求和会话取消。
 - `src/modes/window/mode.rs`：五个独立 Window Mode 及共享会话交接；`config/window.rs` 分别定义配置 DTO。
+- `src/api/window_tabs.rs`：不透明组身份、明确的窗口／组目标、组操作和原生标签栏消息。
+- `src/modes/window/tabs.rs`：连续编号分组、异步确认前的输入队列、组编号前缀和手动模板恢复。
+- `src/platform/common/window_tab_model.rs` / `window_tabs.rs`：纯成员转换、独立于 Mode 会话的组管理、原生事务及分组历史。
+- `src/platform/windows/window_tabs.rs` / `window_tabs/strip.rs`：WinEvent 监听与独立浮动标签栏；应用可见性租约在 `window_manager.rs`，应用保持顶层窗口。
+- `src/platform/macos/accessibility/window_tabs.rs` / `macos/window_tabs.rs`：worker 的 AX observer 与主线程 AppKit 标签栏，mailbox 只传 API 数据。
+- `docs/.vitepress/simulator/window-tabs.ts`：与原生模式同步的浏览器组合模型，退出预览模式仍保留组合。
 - `src/modes/window/presets.rs` / `view.rs`：恢复／删除编号布局列表与状态数据，由 `presentation/key_help.rs` 在底部面板统一展示；不读文件或调用原生 UI。
+- `src/presentation/key_help/window.rs`：Window 帮助的动作语义分组、方向族和返回目标展示；有效返回绑定由 Host 提供，原生绘制与缓存边界不变。
 - `src/platform/windows/text_prompt.rs`：已有托盘线程拥有的 modeless EDIT 对话框；macOS 备注面板由 `status_item.rs` 在主线程持有。
 
 - `src/main.rs`：Windows 使用 GUI subsystem；只调用 `app::prepare_console_for_cli()` 和
@@ -69,6 +76,7 @@ keysteer/
 | `geometry.rs` | `Point`、`Rect`、`Screen`、`UiTarget` |
 | `window_layout.rs` | 纯 QuickPlacement 与受最小尺寸约束的 BSP LayoutTree |
 | `window.rs` | 不透明 `WindowId`、窗口能力/结果、会话请求、窗口动作与带修订号的编辑事务 |
+| `window_tabs.rs` | `TabGroupId`、`WindowTarget`、持久组快照与后台标签栏事件 |
 | `presentation.rs` | 借用式 View、Presenter 端口和会话级 Hint 分层缓存 |
 | `overlay.rs` | RGBA `Color`、标签/形状、光标标记、模式徽章、`OverlayScene` |
 | `plugin.rs` | 插件 `Manifest` 和 `Plugin: Mode` |
@@ -115,3 +123,5 @@ macOS：
 - `tools/benchmark-windows-dist.ps1`：Windows 整进程启动与资源采样入口；启用
   `perf-probe` 时读取插桩后的 `backend_started` marker 供因果诊断，否则只将 `--check` 计为配置检查耗时；两者均不会冒充未插桩 ready 延迟。
   采样期间先保存在内存中，结束后才写 JSON，避免磁盘 I/O 污染测量区间。
+
+- `src/presentation/label_placement.rs`：按显式组身份统一摆放窗口卡片、区域和组编号，避让实际面板并保持引线。

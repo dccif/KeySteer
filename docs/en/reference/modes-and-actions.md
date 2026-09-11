@@ -27,7 +27,6 @@ Array entries run in written order. Empty arrays are invalid. Arrays do not bloc
 | `window_quick` | Quick ratio layout. |
 | `window_editor` | Automatic arrangement and region editing. |
 | `window_restore` | Restore saved layouts. |
-| `window_delete` | Confirm deletion of saved layouts. |
 | `plugin:<id>` | A plugin Mode, for example `plugin:screen-selector`. |
 
 ```toml
@@ -46,6 +45,16 @@ f = "recursive_grid"
 
 ## Window mode
 
+Window, Quick, Editor, Restore and Tabs each have two independent settings:
+
+```toml
+[window]
+screens = "current"       # "current" or "all"
+include_minimized = false
+```
+
+Use the same keys in `[window_quick]`, `[window_editor]`, `[window_restore]` and `[window_tab]`. Defaults select non-minimized windows on the current display. With `screens = "all"`, numbering includes all displays; automatic layouts and groups stay on each window’s own display. Enabling `include_minimized` also makes minimized windows eligible for selection and layout. Re-entering a fresh Window session numbers the current candidates from 1, releasing old numbers held by closed or excluded windows; refreshes within a session keep surviving numbers stable. Identity cards avoid each other and the bottom help panel.
+
 Window operations use five independently registered modes. Each has its own bindings, inheritance, application overrides, temporary mode and style. H/J/K/L are explicit defaults and do not follow Normal remapping.
 
 | Mode | Default entry | Default Q destination |
@@ -54,21 +63,65 @@ Window operations use five independently registered modes. Each has its own bind
 | `window_quick` | A in Window | `window` |
 | `window_editor` | E in Window | `window` |
 | `window_restore` | R in Window | `window` |
-| `window_delete` | X in Restore | `window_restore` |
+| `window_tab` | T in Window | `window` |
 
 Q is an ordinary mode binding and behaves identically regardless of the entry path. Launching Editor directly from Idle still makes its default Q enter Window. Rebinding Q selects another destination; activating the current mode follows the normal toggle-to-Idle rule.
 
-Alt+W locks the window under the pointer. Visible-screen windows receive stable numbers; closing one does not renumber the others. A complete number focuses and locks its window and centers the pointer; only ambiguous prefixes wait, for 250ms by default. Tab cycles windows, S switches movement/centered resizing, H/J/K/L adjusts, D changes display, F cycles maximize → minimize → restore, C centers, and Z undoes.
+Alt+W locks the window under the pointer. By default, non-minimized windows on the current display receive stable numbers; closing one does not renumber the others. A complete number focuses and locks its window and centers the pointer; only ambiguous prefixes wait, for 250ms by default. Tab / Shift+Tab cycles within the current tab group, or through ordinary windows when outside a group; number selection can leave a group, S switches movement/centered resizing, H/J/K/L adjusts, D changes display, F cycles maximize → minimize → restore, C centers, Z undoes one step, Shift+Z redoes, and Shift+C restores the initial state of the current window session.
 
 Quick adjusts each axis independently with H/J/K/L. The first direction chooses the configured ratio nearest one half; the same direction shrinks and the opposite expands. `window_quick.split_ratios` defaults to 1/4, 1/3, 1/2, 2/3 and 3/4, with full size appended automatically. Tab changes target and resets ratios; Z undoes.
 
-Editor automatically arranges windows on entry. H/J/K/L navigates regions, Shift+direction splits, Ctrl+direction moves the divider using Editor's own `resize_step`/`resize_speed`, X removes a region and Z undoes. Select two window numbers to swap them, or use backtick followed by a region number to select or fill an empty region. Changes apply immediately. Pending transactions finish before handoff; window modes preserve the target and stable numbers.
+Editor automatically arranges windows on entry. H/J/K/L navigates regions, Shift+direction splits, the default Ctrl+H/L shrinks/grows the selected region's width and Ctrl+K/J shrinks/grows its height using Editor's own `resize_step`/`resize_speed`. Neighboring regions adjust to preserve tiling. All keys are configurable. X removes a region and Z undoes. Select two window numbers to swap them, or use backtick followed by a region number to select or fill an empty region. Changes apply immediately. Pending transactions finish before handoff; window modes preserve the target and stable numbers. New splits reuse the lowest available region number without renumbering survivors.
 
 Ctrl+S in Editor opens the bottom note field and saves a layout. Notes are optional and limited to 80 characters. In Restore, type a layout number; PageUp/PageDown changes pages. Only successful application triggers `window_restore.lifecycle.after_finish`, which defaults to Editor. Failure stays in Restore with an error. Layouts store geometry, window count and notes without application or native window identity. Restoration fills regions in recent-activity order, leaves extra windows untouched and retains empty regions when there are fewer windows.
 
-X in Restore enters Delete. Type a number to see the selected name, then Enter to delete. Q returns to Restore and cancels the pending choice. Deletion stays in Delete, refreshes pages and preserves all other IDs. Deleting the final item writes a valid empty library. The record is reread before submission; external changes require selection again, and failed writes preserve the original file.
+X toggles restore/delete inside Restore, preserving the page and cancelling any pending choice. In delete state, type a number to see the selected name, then Enter to delete. X returns to restore; Q follows Restore’s binding back to Window. Deletion stays in delete state, refreshes pages and preserves all other IDs. Deleting the final item writes a valid empty library. The record is reread before submission; external changes require selection again, and failed writes preserve the original file.
 
-`window-layouts.kslayout` uses the same application-data directory policy as logs. The format is unchanged and interoperates with the [web simulator](/en/simulator). Browser edits affect demo windows and browser storage; download and replace the program's layout file, then enter Restore to read it.
+Layouts and Tabs templates share `workspace.ksw` in the same application-data directory as logs. Default names are `Layout N` and `Tabs N`; a nonempty note becomes the name. Both types share saving, the Restore list and deletion. It interoperates with the [web simulator](/en/simulator). Browser edits affect demo windows and browser storage; download and replace the program’s workspace file, then enter Restore to read it.
+
+### T: persistent tab groups
+
+Initial numbering keeps windows from the same application together where possible; later refreshes preserve existing numbers. Minimizing the active application window minimizes the whole group. Restoring a member shows that member while the others remain tucked away.
+
+The strip reserves space at the top of the group's layout rectangle, including maximized and tiled layouts. Alt+W lists every member's number, application and title, with the active member marked. On Windows, vertical or horizontal scrolling browses overflowing tabs; selecting a member scrolls it into view.
+
+On Windows, drag tabs even after leaving Window mode: reorder within a strip or move a window onto another group's strip. Drag the `~group number` to merge the whole group. An insertion line shows the destination; release outside a strip or right-click to cancel. Strips follow their application's stacking order. Switching preserves window content where supported to reduce redisplay flicker; applications that already use layered drawing retain the compatible show/hide path.
+
+Windows and macOS share the same grouping workflow. Alt+W then T groups compatible ungrouped windows from the same application within each selected display, preserving existing groups. Each group shows its active member with an independent clickable tab strip. Groups persist after leaving the mode until dissolved or KeySteer exits.
+
+New groups use the smallest available group number without renumbering existing groups; after all groups dissolve, numbering starts at `~1` again. Tab strips remain visible when another application gains focus. On Windows, native window-position events move the strip directly, without a fixed polling interval or display-frame schedule.
+
+Digits always identify individual windows. Groups use `~1`, `~2`, and so on. The first item establishes the starting window or group; the second immediately groups, and later items append. T ends this batch and starts the next; no Enter is required and T creates no undo record.
+
+| Input | Result |
+| --- | --- |
+| `12t34t` | Group windows 1–2, then 3–4, when those numbers are unambiguous |
+| `123t` | Group windows 1, 2 and 3 |
+| `~1` | Select group 1 |
+| `~1 4t` | Append window 4 to group 1 |
+| `~1 ~2t` | Merge all of group 2 into group 1, retaining group 1's number |
+| `1 Space 2 t` / `12 Space t` | Explicitly choose windows 1 and 2 / window 12 |
+
+The configurable `~` action immediately highlights group numbers; a complete group number returns to window input. Existing ambiguous multi-digit parsing is preserved; Space explicitly ends a number, and T processes a pending valid number before ending the batch. Invalid numbers explain the failure without redirecting the target. A window number transfers only that member from its previous group; a group number transfers the entire group. Selecting an existing target member only activates it.
+
+| Key | Operation |
+| --- | --- |
+| T | End this batch; an empty batch or single independent window only clears selection |
+| D / X | Remove the active member, retaining the old group target / dissolve and end the batch |
+| Tab / Shift+Tab | Next / previous tab |
+| H / L (`move_left` / `move_right`) | Reorder the active tab |
+| K / J (`move_up` / `move_down`) | Previous / next tab |
+| Z / Shift+Z | Undo / redo membership and order changes |
+| Ctrl+S | Save a Tab template and optional note |
+| Q / Esc | Return to Window / exit, preserving completed groups |
+
+All bindings live in `[window_tab.bindings]`, including `window_tab_group` for the prefix and `window_number_end` for the separator. Grouping edits apply inside T. Window mode retains number selection, Tab for next and Shift+Tab for previous across ordinary windows and every group member. Configure these as `window_select` / `window_select_previous` in `[window.bindings]`. Outside Window mode, application Tab and number input remains untouched; mouse tab switching is still available.
+
+Applications remain independent windows. Only the active member is shown; dragging and resizing move that window alone. Selecting another tab first aligns the new member to the current group position, then shows it. Window/Quick/Editor layouts treat a group as one target. Closing the tab strip dissolves the group and reveals its members. Closing an application removes that member and selects an adjacent one; a single survivor becomes an ordinary window. Window history restores group geometry, while T has separate membership/order history.
+
+Tab templates appear in the existing Restore/Delete list with a Tabs label. They store member count, selection order, active position, normalized area and note, without native window identities. Restoring enters T to collect windows in order and applies automatically when the count is reached. Incomplete selection changes no windows and Q/Esc cancels it. Deleting a template leaves running groups intact.
+
+Supported members are ordinary resizable windows on the current desktop; native fullscreen and incompatible windows are rejected. Windows hides inactive members without changing their parent or embedding styles. macOS uses per-window minimization through Accessibility, so system minimize/restore animations may still appear. Dissolving or normal shutdown reveals the windows hidden by KeySteer. Tab templates are available on both platforms.
 
 ## Movement, scrolling, and speed
 
@@ -230,3 +283,22 @@ Toggle the available-key panel without restarting the active mode or clearing it
 Window cards emphasize application names above longer window titles and use thicker leader lines when displaced. Editing uses a shaded grid with region numbers centered in their regions. The help panel keeps the configured font size and falls back to the screen when the target is too small. Move / Resize / Quick / Edit appear as separate keycap badges; the application and window title each get their own line. Backtick plus a region number also opens the tree editor from ordinary Window or Quick, selects that region, and activates its window; empty regions move the pointer to their center.
 
 The default is `f = "size_cycle"`. After minimizing, press F to restore the same window to its original position and size, then press F again to repeat.
+
+Window, Quick, and Editor bind Z to `window_undo`, Shift+Z to `window_redo`, and Shift+C to `window_reset_initial`. C remains `window_center` in Window. Rebind these actions in each mode’s existing bindings table while keeping other bindings. A new adjustment clears redo. Continuous movement/resizing is one undo group; edits undo step by step while editing, then become one group on leaving the editor.
+
+Reset restores positions, sizes, and maximized/minimized states of windows modified in the current window-mode session. Its baseline survives switches among the six window modes and is renewed after leaving the group and entering again. Reset itself is undoable and redoable. It does not reopen closed windows, restore application content, or modify untouched windows. The initial baseline is retained independently of the 32-group history limit.
+
+## UI Hint scan scope
+
+```toml
+[ui_hint]
+scan_scope = "screen" # window: pointer window (default); screen: complete pointer display
+```
+
+Works with Hybrid, Accessibility Tree, and Vision. Screen scope covers visible content on the display
+containing the pointer. Moving to another display, including a custom `Alt+S` binding to `screen next`,
+clears old hints and starts a new scan automatically. `Primary+R` manually refreshes the scan.
+
+Entering ordinary Window mode (Alt+W by default) activates and raises the window under the pointer without moving the pointer. X invokes `window_close`, requesting normal closure of the selected window; the application handles save/cancel dialogs. Rebind it in `[window.bindings]`, for example `"f9" = "window_close"`, and remove or disable the original X binding. X in the layout editor still deletes a region.
+
+For a tab group in ordinary Window mode, X closes only its active member. Once closure is confirmed, a group with one remaining member dissolves automatically and reveals that window. A/E/T and other modes retain their own X bindings.

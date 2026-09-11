@@ -57,6 +57,7 @@ pub struct AppStrategyOverride {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     pub strategy: UiScanStrategy,
+    pub scan_scope: crate::api::UiScanScope,
     pub vision: VisionOptions,
     pub hint_characters: String,
     pub label_direction: LabelDirection,
@@ -192,6 +193,7 @@ impl HintMode {
             .min(MAX_SCAN_TIMEOUT_MS);
         Command::scan_ui(UiScanRequest {
             id: self.session.scan_id,
+            scope: self.config.scan_scope,
             timeout_ms,
             bounds: Some(bounds),
             roles: self.config.clickable_roles.clone(),

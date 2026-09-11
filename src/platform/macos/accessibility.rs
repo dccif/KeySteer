@@ -19,6 +19,7 @@ use crate::api::geometry::{Rect, UiTarget};
 use super::native::OwnedCf;
 use super::window_move::WriteError;
 pub(super) mod window_manager;
+mod window_tabs;
 
 const AX_OK: i32 = 0;
 const AX_CANNOT_COMPLETE: i32 = -25204;
@@ -345,12 +346,83 @@ pub(crate) fn scan_process_stream(
         on_batch: &mut on_batch,
         is_current: &is_current,
         seen: HashSet::with_capacity(128),
+        occluders: Vec::new(),
     };
     scan.visit(root.cast(), 0);
     if (scan.is_current)() {
         scan.flush();
     }
 
+    Ok(())
+}
+
+/// Inspect only on-screen AX windows, in Quartz front-to-back order, under one budget.
+pub(crate) fn scan_screen_stream(
+    request: &UiScanRequest,
+    is_current: impl Fn() -> bool,
+    mut on_batch: impl FnMut(Vec<UiTarget>),
+) -> Result<(), String> {
+    let bounds = request
+        .bounds
+        .ok_or("screen scan requires display bounds")?;
+    let visible = window_manager::visible_windows()?;
+    let deadline = Instant::now() + Duration::from_millis(request.timeout_ms.clamp(1, 30_000));
+    let mut scan = Scan {
+        request,
+        scan_bounds: Some(bounds),
+        attributes: AxAttributes::new(),
+        allowed_roles: ax_roles_for(&request.roles).into_iter().collect(),
+        deadline,
+        batch: Vec::with_capacity(24),
+        target_count: 0,
+        on_batch: &mut on_batch,
+        is_current: &is_current,
+        seen: HashSet::with_capacity(128),
+        occluders: Vec::new(),
+    };
+    let windows_key = CFString::new("AXWindows");
+    let minimized_key = CFString::new("AXMinimized");
+    for item in visible
+        .iter()
+        .filter(|w| w.bounds.intersect(&bounds).is_some())
+        .take(64)
+    {
+        if !is_current() || Instant::now() >= deadline || scan.target_count >= MAX_TARGETS {
+            break;
+        }
+        if item.pid as u32 != std::process::id()
+            && let Ok(app) = AxApplication::new(item.pid)
+            && let Some(windows) = copy_array_attribute(app.as_ptr(), &windows_key)
+        {
+            for raw in windows.iter() {
+                if !is_current() || Instant::now() >= deadline {
+                    break;
+                }
+                if !is_ax_element(*raw) || copy_bool_attribute(*raw, &minimized_key) == Some(true) {
+                    continue;
+                }
+                let Some(frame) = element_rect(*raw, &scan.attributes) else {
+                    continue;
+                };
+                if (frame.x - item.bounds.x).abs() > 2.0
+                    || (frame.y - item.bounds.y).abs() > 2.0
+                    || (frame.width - item.bounds.width).abs() > 2.0
+                    || (frame.height - item.bounds.height).abs() > 2.0
+                {
+                    continue;
+                }
+                scan.scan_bounds = frame.intersect(&bounds);
+                scan.visit((*raw).cast(), 0);
+                break;
+            }
+        }
+        if item.pid as u32 != std::process::id() {
+            scan.occluders.push(item.bounds);
+        }
+    }
+    if is_current() {
+        scan.flush();
+    }
     Ok(())
 }
 
@@ -365,6 +437,7 @@ struct Scan<'a> {
     on_batch: &'a mut dyn FnMut(Vec<UiTarget>),
     is_current: &'a dyn Fn() -> bool,
     seen: HashSet<(i64, i64, i64, i64)>,
+    occluders: Vec<Rect>,
 }
 
 impl Scan<'_> {
@@ -396,6 +469,10 @@ impl Scan<'_> {
         let in_bounds = rect.is_some_and(|rect| {
             self.scan_bounds
                 .is_none_or(|bounds| bounds.contains(&rect.center()))
+                && !self
+                    .occluders
+                    .iter()
+                    .any(|bounds| bounds.contains(&rect.center()))
         });
         let enabled =
             role_allowed && copy_bool_attribute(element, &self.attributes.enabled).unwrap_or(true);

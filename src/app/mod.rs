@@ -5,9 +5,9 @@
 mod bootstrap;
 mod cli;
 pub(crate) mod configuration;
-mod layout_store;
 pub(crate) mod mode_catalog;
 pub(crate) mod paths;
+mod preset_store;
 #[allow(dead_code, unused_imports)]
 pub(crate) mod runtime;
 

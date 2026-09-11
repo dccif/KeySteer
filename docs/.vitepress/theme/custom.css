@@ -1334,3 +1334,12 @@
 .ks-layout-file-tools { display: flex; gap: 6px; padding: 0 18px 10px; }
 .ks-layout-file-tools button { background: var(--vp-c-bg); color: var(--vp-c-text-1); border: 1px solid var(--vp-c-divider); border-radius: 5px; padding: 3px 8px; font-size: 11px; }
 .ks-layout-library { top: 14%; }
+.ks-demo-tab-bar { position: absolute; display: flex; overflow-x: auto; z-index: 6; pointer-events: auto; background: #192538; color: #ddd; height: 28px; border-radius: 5px 5px 0 0; } .ks-demo-tab-bar button { white-space: nowrap; padding: 2px 10px; border-right: 1px solid #536178; font-size: 11px; } .ks-demo-tab-bar button.selected { background: #426db0; color: white; }
+/* The app retains its own title bar; the independent selector sits above it. */
+.ks-demo-tabbed-window { overflow: visible; pointer-events: auto; padding-top: 30px; }
+.ks-demo-tabbed-window .ks-demo-tab-bar { position: absolute; top: 0; width: 100%; height: 30px; background: #1b1f25; }
+.ks-demo-tabbed-window .ks-demo-tab-bar button { flex: 0 0 auto; min-width: 100px; }
+.ks-demo-tabbed-window .ks-demo-tab-bar button:first-child { min-width: 40px; }
+.ks-window-number span { max-height: 220px; overflow-y: auto; }
+.ks-demo-tabbed-window .ks-demo-tab-bar button { border: 0; }
+.ks-demo-tabbed-window .ks-demo-tab-bar button.selected { background: #364658; }

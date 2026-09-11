@@ -101,6 +101,7 @@ fn default_normal_bindings() -> Bindings {
 pub struct UiHint {
     pub enabled: bool,
     pub strategy: UiScanStrategy,
+    pub scan_scope: crate::api::UiScanScope,
     pub vision: VisionOptions,
     /// Characters used to build hint labels.
     pub hint_characters: String,
@@ -184,6 +185,7 @@ impl Default for UiHint {
         Self {
             enabled: true,
             strategy: UiScanStrategy::Hybrid,
+            scan_scope: crate::api::UiScanScope::Window,
             vision: VisionOptions::default(),
             hint_characters: "asdfghjkl".into(),
             label_direction: LabelDirection::Normal,

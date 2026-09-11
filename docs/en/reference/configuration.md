@@ -244,14 +244,14 @@ macOS supports Accessibility Tree, Vision, and Hybrid. Windows defaults to `hybr
 
 ## Window configuration
 
-Use the five top-level sections `[window]`, `[window_quick]`, `[window_editor]`, `[window_restore]` and `[window_delete]`. Each supports its own `enabled`, `bindings`, `inherits`, `app_configs`, `temporary_mode`, `temporary_mode_keys`, `number_timeout_ms`, `border_width`, `ui` and `lifecycle`. Defaults inherit hotkeys and temporarily use Normal while Primary is held.
+Use the five top-level sections `[window]`, `[window_quick]`, `[window_editor]`, `[window_restore]` and `[window_tab]`. Each supports its own `enabled`, `bindings`, `inherits`, `app_configs`, `temporary_mode`, `temporary_mode_keys`, `number_timeout_ms`, `border_width`, `ui` and `lifecycle`. Defaults inherit hotkeys and temporarily use Normal while Primary is held.
 
 | Parameter | Section | Default |
 | --- | --- | --- |
 | `move_step` / `move_speed` | Window | 20 / 600 |
 | `resize_step` / `resize_speed` | Window and Editor, independently | 20 / 500 |
 | `split_ratios` | Quick | `["1/4", "1/3", "1/2", "2/3", "3/4"]` |
-| `gap` | Quick, Editor and Restore, independently | 8 |
+| `gap` | Quick, Editor and Restore, independently | 0 |
 | `number_timeout_ms` | All five | 250, range 100–2000 |
 | `border_width` | All five | 3 |
 | `lifecycle.after_finish` | Restore | `"window_editor"` |
@@ -266,7 +266,6 @@ Merge these launchers into the existing hotkeys table:
 "alt+a" = "window_quick"
 "alt+e" = "window_editor"
 "alt+r" = "window_restore"
-"alt+x" = "window_delete"
 
 [window_quick]
 split_ratios = ["1/5", "2/5", "3/5", "4/5"]
@@ -279,6 +278,8 @@ gap = 12.0
 [window_restore.lifecycle]
 after_finish = "window_editor"
 ```
+
+`window_delete` is an action that toggles restore/delete inside Restore (X by default), not a mode. Remove the old `[window_delete]` section and configure `[window_restore]` instead.
 
 Setting parameters alone preserves default bindings. An explicit `[mode.bindings]` replaces that mode's whole default map. Copy the keys you need before changing one; Editor's `q = "grid"`, for example, always enters Grid regardless of entry path. Use `[[window_editor.app_configs]]` for app overrides and `inherits` to share bindings explicitly.
 

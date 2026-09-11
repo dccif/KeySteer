@@ -21,7 +21,7 @@ const replacementTables = new Set([
   'mode_indicator.modes',
   'normal.bindings',
   'window.bindings',
-  'window_quick.bindings', 'window_editor.bindings', 'window_restore.bindings', 'window_delete.bindings',
+  'window_quick.bindings', 'window_editor.bindings', 'window_restore.bindings', 'window_tab.bindings',
   'grid.bindings',
   'recursive_grid.bindings',
   'ui_hint.bindings',

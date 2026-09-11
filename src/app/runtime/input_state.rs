@@ -299,6 +299,7 @@ pub(super) struct InputState {
     window_temporary_transition: Option<bool>,
     pub(super) pending_chords: SmallVec<[super::prefix_chords::PendingChord; 2]>,
     pub(super) pressed: PressedKeys,
+    pub(super) temporary_entry_keys: SmallVec<[Key; 8]>,
     pub(super) key_dispositions: KeyMap<KeyDisposition>,
     pub(super) active_gestures: KeyMap<ActiveGesture>,
     pub(super) active_click_indicators: ActiveClickIndicators,
@@ -324,6 +325,7 @@ impl InputState {
     pub(super) fn forget_physical_capture(&mut self) {
         self.pending_chords.clear();
         self.pressed.clear();
+        self.temporary_entry_keys.clear();
         self.key_dispositions.clear();
     }
 }
@@ -509,7 +511,9 @@ impl Engine {
         input: crate::api::input::InputEvent,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
-        if !self.overlay.key_help_visible {
+        // Window's help is always visible, independently of the optional `?`
+        // panel. Its effective bindings must also refresh on key releases.
+        if !self.overlay.key_help_visible && !self.registry.active.is_window() {
             return self.handle_key_inner(input, backend);
         }
         let refresh = !input.injected && !input.repeat;
@@ -517,7 +521,7 @@ impl Engine {
             self.overlay.key_help_cache = None;
         }
         self.handle_key_inner(input, backend)?;
-        if refresh && self.overlay.key_help_visible {
+        if refresh && (self.overlay.key_help_visible || self.registry.active.is_window()) {
             self.refresh_overlay(backend)?;
         }
         Ok(())
@@ -547,6 +551,9 @@ impl Engine {
             }
             KeyState::Up => {
                 let changed = self.input.pressed.remove(&input.key);
+                self.input
+                    .temporary_entry_keys
+                    .retain(|key| key != &input.key);
                 (
                     self.input.active_default_toggles.remove(&input.key),
                     changed,
@@ -584,7 +591,7 @@ impl Engine {
                 Some(self.temporary_mode_is_active(&self.registry.active));
         }
 
-        if !self.enabled || self.is_excluded_app() || self.window_layouts.pending.is_some() {
+        if !self.enabled || self.is_excluded_app() || self.window_presets.pending.is_some() {
             self.input.pending_chords.clear();
             if let Some(pending) = completed_long_press
                 && let Err(error) = self.cancel_pending_long_press(pending, backend)
@@ -1462,12 +1469,40 @@ impl Engine {
         self.temporary_mode_is_active_for_pressed(mode, &self.input.pressed)
     }
 
+    fn temporary_chord_armed(&self, chord: &KeyChord) -> bool {
+        !self.input.temporary_entry_keys.iter().any(|physical| {
+            chord
+                .keys()
+                .iter()
+                .any(|configured| Self::keys_match(configured, physical))
+        })
+    }
+
     fn temporary_mode_is_active_for_pressed(&self, mode: &ModeId, pressed: &[Key]) -> bool {
+        self.temporary_mode_is_active_for_reference::<false>(mode, pressed)
+    }
+
+    fn temporary_mode_is_active_for_reference<const HELP: bool>(
+        &self,
+        mode: &ModeId,
+        pressed: &[Key],
+    ) -> bool {
         // An explicit multi-key binding wins over a temporary modifier in every mode.
         if pressed.iter().any(|key| {
             self.lookup_with_specificity_for_pressed(mode, key, pressed)
                 .is_some_and(|(binding, specificity)| {
-                    specificity > 1 && self.binding_available(mode, &binding)
+                    specificity > 1
+                        && if HELP {
+                            match binding.as_ref() {
+                                Binding::Window(action) => self
+                                    .registry
+                                    .get(mode)
+                                    .is_none_or(|mode| mode.window_action_supported(action)),
+                                _ => true,
+                            }
+                        } else {
+                            self.binding_available(mode, &binding)
+                        }
                 })
         }) {
             return false;
@@ -1476,7 +1511,9 @@ impl Engine {
             chords.iter().any(|entry| {
                 let reserved_for_overlap = self.registry.active == ModeId::ui_hint()
                     && entry.conflicts_with_ui_hint_overlap;
-                !reserved_for_overlap && entry.chord.matches_pressed(pressed)
+                !reserved_for_overlap
+                    && (HELP || self.temporary_chord_armed(&entry.chord))
+                    && entry.chord.matches_pressed(pressed)
             })
         })
     }
@@ -1556,6 +1593,31 @@ impl Engine {
     }
 
     pub(super) fn lookup_for_pressed(&self, key: &Key, pressed: &[Key]) -> Option<ResolvedBinding> {
+        self.lookup_for_reference::<false>(key, pressed)
+    }
+
+    pub(super) fn lookup_for_help(&self, key: &Key, pressed: &[Key]) -> Option<ResolvedBinding> {
+        self.lookup_for_reference::<true>(key, pressed)
+    }
+
+    fn lookup_for_reference<const HELP: bool>(
+        &self,
+        key: &Key,
+        pressed: &[Key],
+    ) -> Option<ResolvedBinding> {
+        let available = |binding: &Binding| {
+            if HELP {
+                match binding {
+                    Binding::Window(action) => self
+                        .registry
+                        .get(&self.registry.active)
+                        .is_none_or(|mode| mode.window_action_supported(action)),
+                    _ => true,
+                }
+            } else {
+                self.binding_available(&self.registry.active, binding)
+            }
+        };
         let active_match =
             self.lookup_with_specificity_for_pressed(&self.registry.active, key, pressed);
         if self.registry.active == ModeId::idle() {
@@ -1575,7 +1637,7 @@ impl Engine {
             });
         };
         let temporary_active =
-            self.temporary_mode_is_active_for_pressed(&self.registry.active, pressed);
+            self.temporary_mode_is_active_for_reference::<HELP>(&self.registry.active, pressed);
         if temporary_active && let Some(owner) = route.temporary_mode.as_ref() {
             // Explicit bindings of the targeting mode retain their physical
             // chord, including `none`. The temporary layer consumes its
@@ -1595,6 +1657,7 @@ impl Engine {
                     !chords.iter().any(|entry| {
                         !(self.registry.active == ModeId::ui_hint()
                             && entry.conflicts_with_ui_hint_overlap)
+                            && (HELP || self.temporary_chord_armed(&entry.chord))
                             && entry.chord.matches_pressed(pressed)
                             && entry
                                 .chord
@@ -1636,7 +1699,7 @@ impl Engine {
         }
 
         if let Some((binding, _)) = &active_match
-            && !self.binding_available(&self.registry.active, binding)
+            && !available(binding)
         {
             return None;
         }
@@ -1653,9 +1716,7 @@ impl Engine {
                     return None;
                 }
                 self.lookup_inherited(owner, key, pressed, &mut SmallVec::new())
-                    .filter(|resolved| {
-                        self.binding_available(&self.registry.active, &resolved.binding)
-                    })
+                    .filter(|resolved| available(&resolved.binding))
             }),
         }
     }

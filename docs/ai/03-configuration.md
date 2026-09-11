@@ -1,5 +1,19 @@
 # 配置、按键和持久化
 
+## UI Hint 范围
+
+`[ui_hint].scan_scope = "window" | "screen"`，默认 `window`。`screen` 仅指鼠标所在显示器的完整范围，
+适用于所有扫描 strategy。配置经 mode_catalog 编译到 Hint Settings 和公共 UiScanScope，不由模式读取 TOML。
+
+
+五个 Window 家族配置均独立支持 `screens = "current" | "all"` 与 `include_minimized = false | true`，默认当前屏幕且排除最小化窗口。`screens` 是候选范围，不表示把窗口搬到某个屏幕；全部屏幕的自动布局和自动分组分别在每块屏幕内部执行。配置工作室提供相同选择，浏览器模拟器同步筛选、重入编号和多屏布局撤销。
+
+## 持久标签组合配置和格式版本
+
+`window_tab` 是 Windows/macOS 共用的独立模式配置，Window 默认 `t = "window_tab"`。其本地默认绑定为 T 结束本轮，`~` 输入组编号，Space 结束编号，D 移出，X 解散，Tab/Shift+Tab 切换，H/L 排序，K/J 切换，Z/Shift+Z 分组撤销／重做，Ctrl+S 保存，Q 返回 Window，Esc 退出。方向直接使用可重绑的 `move_left/right/up/down`，由 Tabs 消费为排序／切换，不移动指针、不启用帧时钟；不再默认绑定物理箭头。前缀和分隔符是 `window_tab_group` / `window_number_end` 普通动作；不硬编码物理键，也不隐式继承 Window 绑定。两端都注册分组模式、绑定和 Tab 模板入口；网页模拟器使用相同入口与按键语义。
+
+工作区预设用 `SavedPreset { id, note, window_count, template }` 表示。`WindowTemplate` 显式区分 Layout 区域树与 Tabs 模板，共用保存、列表、删除、备注输入和编号分配。默认名统一为 `Layout N` / `Tabs N`，非空备注直接作为名称。新格式不读取或迁移旧布局文件。Tabs 保存 2..256 个成员的数量、归一化区域和活动成员位置，不保存应用、窗口句柄或 WindowId；恢复时手动选择的次序决定标签次序。
+
 窗口操作拆成五个独立配置段，所有入口和 Q 都是普通 Mode 绑定；不存在专用退出字段或路径相关返回栈。详见下方配置边界。
 
 ## 配置模型
@@ -17,7 +31,7 @@
 - `general`、`debug`、`platform`
 - `theme.dark` / `theme.light`
 - `hotkeys`
-- `normal`、`window`、`window_quick`、`window_editor`、`window_restore`、`window_delete`、`grid`、`recursive_grid`、`ui_hint`
+- `normal`、`window`、`window_quick`、`window_editor`、`window_restore`、`grid`、`recursive_grid`、`ui_hint`
 - `pointer`、`scroll`、`mode_indicator`
 - `plugin_modes`、根级和 Mode 级 `app_configs`
 
@@ -44,13 +58,13 @@ Mode 的 cursor override 可单独覆盖这些值。普通反馈由物理按键�
 
 ## Window 配置边界
 
-布局收藏独立于 TOML：`window-layouts.kslayout` 使用与日志相同的目录规则（Windows/portable 在运行程序同目录，packaged macOS 在 Application Support）。格式为 `KSLAYOUT` magic、版本字节、布局数量、定长小整数/UTF-8 备注长度和先序区域树；分割比例按 little-endian f64 保存。读取限 1 MiB、99 个布局、每树 256 叶/深度 32、备注 80 字符，拒绝未知版本、重复编号、非法比例和尾随字节。写入前验证已有文件，再用同目录 create_new 临时文件、sync_all 和平台 atomic_replace；不在读取失败时覆盖旧文件。布局只保存几何、原窗口数量和备注，不保存应用或原生窗口身份。
+工作区预设独立于 TOML：`workspace.ksw` 使用与日志相同的目录规则（Windows/portable 在运行程序同目录，packaged macOS 在 Application Support）。格式为 `KSWORKSP` magic、版本 1、预设数量；各记录含编号、窗口数、UTF-8 备注及类型字节：0 接先序区域树，1 接归一化矩形的四个 little-endian f64 和 u16 活动成员位置。读取限 1 MiB、99 个预设、每树 256 叶/深度 32、备注 80 字符；拒绝未知类型/版本、重复编号、非法比例和尾随字节。写入先验证已有文件，再用同目录 create_new 临时文件、sync_all 和平台 atomic_replace；读取失败不覆盖已有文件。Rust 与浏览器共享 `tests/fixtures/workspace.ksw` 进行混合类型的逐字节往返验证。
 
 `config/window.rs` 定义五个独立 DTO，共用字段 schema，不隐式继承绑定。`app/mode_catalog.rs` 分别编译 Settings 和路由，并创建共享 WindowSession 的五个实例。反序列化平面文档必须使用各模式自己的缺省值，不能让 flatten 的空 bindings 覆盖 Editor/Restore 等默认值；显式 bindings 表仍整体替换，稀疏 lifecycle 保留该模式的默认完成目标。
 
 `window_quick.split_ratios` 支持分数／小数、排序去重，进入 Quick 时传给 Settings，自动附加满屏比例。Editor 独立持有 resize_step、resize_speed、gap；Restore 有独立 gap。移除的旧 window 参数和入口动作必须明确报错，不保留派生 Normal 方向或旧动作回退。HJKL 是各模式的普通显式绑定；继承、别名、应用覆盖和临时键走统一编译路径。
 
-`number_timeout_ms` 仅消歧数字前缀，步长、速度、间距、描边有范围检查。Restore 的 after_finish 默认为 window_editor，仅成功应用触发；Q 目的地由各自 bindings 指定。Delete 输入编号后等待 Confirm，取消只靠普通模式切换；存储提交前重新读取并比较整条记录，原子替换，保留其他 ID 和有效空库，文件格式不变。
+`number_timeout_ms` 仅消歧数字前缀，步长、速度、间距、描边有范围检查。Restore 的 after_finish 默认为 window_editor，仅成功应用触发；Q 目的地由各自 bindings 指定。Restore 内 `window_delete` 动作切换恢复／删除状态（默认 X），保留页码并清除待确认编号；删除状态输入编号后等待 Confirm，X 切回恢复可取消，也可用普通模式绑定离开；存储提交前重新读取并比较整条记录，原子替换，保留其他 ID 和有效空库，文件格式不变。
 
 ## 加载与发现
 
@@ -212,3 +226,11 @@ Settings，不存在 `ConfigReloaded` 广播。
 时侧键保持透传。示例见 [配置参考](/reference/configuration#鼠标侧键)。
 
 普通 Window 默认 `f = "size_cycle"`：最大化→最小化→恢复原位置和尺寸→循环，不提供旧动作名称的兼容别名。
+
+模式切换在公共输入层记录进入时已按住的物理键。涉及这些键的 temporary_mode_keys 必须等对应键松开后重新按下才生效，避免 Alt+W 等启动组合键在释放过程中误激活目标模式的临时 Normal；显式组合绑定仍使用完整物理按键状态，keep 不重新设门槛。
+
+Window、Quick、Editor 默认 Z=`window_undo`、Shift+Z=`window_redo`、Shift+C=`window_reset_initial`；Window 的 C=`window_center` 保留。均为普通可重绑动作。原始状态指同一次窗口模式组会话中首次观察到的位置、尺寸及最大化/最小化状态；退出到组外后重新进入，建立新基准。
+
+窗口布局间隔由 `[window_quick]`、`[window_editor]`、`[window_restore]` 各自的 `gap` 控制，默认 `0.0`，允许设为非零值；用户已有配置中的显式值优先。
+
+普通 Window 默认 x="window_close"；此动作和启动热键均通过配置编译、别名及有效按键提示链解析，未硬编码物理 X 或 Alt+W。Editor 默认 X 不变。

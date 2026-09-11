@@ -305,14 +305,14 @@ macOS 支持 Accessibility tree、Vision 和 Hybrid。Windows 默认使用 `hybr
 
 ## Window 配置
 
-五个顶层配置段分别为 `[window]`、`[window_quick]`、`[window_editor]`、`[window_restore]`、`[window_delete]`。它们都支持 `enabled`、`bindings`、`inherits`、`app_configs`、`temporary_mode`、`temporary_mode_keys`、`number_timeout_ms`、`border_width`、`ui` 和 `lifecycle`。默认仅继承 hotkeys，按住 Primary 临时使用 Normal。
+五个顶层配置段分别为 `[window]`、`[window_quick]`、`[window_editor]`、`[window_restore]`、`[window_tab]`。它们都支持 `enabled`、`bindings`、`inherits`、`app_configs`、`temporary_mode`、`temporary_mode_keys`、`number_timeout_ms`、`border_width`、`ui` 和 `lifecycle`。默认仅继承 hotkeys，按住 Primary 临时使用 Normal。
 
 | 参数 | 所属配置 | 默认值 |
 | --- | --- | --- |
 | `move_step` / `move_speed` | `window` | 20 / 600 |
 | `resize_step` / `resize_speed` | `window`、`window_editor`，各自独立 | 20 / 500 |
 | `split_ratios` | `window_quick` | `["1/4", "1/3", "1/2", "2/3", "3/4"]` |
-| `gap` | Quick、Editor、Restore，各自独立 | 8 |
+| `gap` | Quick、Editor、Restore，各自独立 | 0 |
 | `number_timeout_ms` | 五个模式 | 250，允许 100–2000 |
 | `border_width` | 五个模式 | 3 |
 | `lifecycle.after_finish` | Restore | `"window_editor"` |
@@ -327,7 +327,6 @@ macOS 支持 Accessibility tree、Vision 和 Hybrid。Windows 默认使用 `hybr
 "alt+a" = "window_quick"
 "alt+e" = "window_editor"
 "alt+r" = "window_restore"
-"alt+x" = "window_delete"
 
 [window_quick]
 split_ratios = ["1/5", "2/5", "3/5", "4/5"]
@@ -340,6 +339,8 @@ gap = 12.0
 [window_restore.lifecycle]
 after_finish = "window_editor"
 ```
+
+`window_delete` 仅为 Restore 内切换恢复／删除状态的动作（默认 X），不再是模式；删除旧 `[window_delete]` 配置段，相关设置统一放在 `[window_restore]`。
 
 只写参数时保留该模式的默认绑定。写入 `[模式.bindings]` 会整体替换该模式的默认表，应复制需要保留的键后修改；例如 Editor 的 `q = "grid"` 总是进入 Grid，与进入 Editor 的路径无关。应用覆盖如 `[[window_editor.app_configs]]`，共享键通过 `inherits` 明确继承。
 

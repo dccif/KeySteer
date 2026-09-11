@@ -46,14 +46,17 @@ impl crate::platform::macos::window_move::WindowAccess for &MovableWindow {
 
 #[derive(Default)]
 pub(in crate::platform::macos) struct MacWindows {
+    include_minimized: bool,
     next: u64,
     entries: BTreeMap<WindowId, Entry>,
     closed: Vec<WindowId>,
+    hidden: std::collections::BTreeSet<WindowId>,
+    monitor: super::window_tabs::Monitor,
 }
 
-struct Visible {
-    pid: i32,
-    bounds: Rect,
+pub(super) struct Visible {
+    pub(super) pid: i32,
+    pub(super) bounds: Rect,
     title: Option<String>,
 }
 
@@ -64,7 +67,7 @@ fn dictionary(value: &CFType) -> Option<CFDictionary<CFString, CFType>> {
     Some(unsafe { CFDictionary::wrap_under_get_rule(dict.as_concrete_TypeRef()) })
 }
 
-fn visible_windows() -> Result<Vec<Visible>, String> {
+pub(super) fn visible_windows() -> Result<Vec<Visible>, String> {
     let list = copy_window_info(
         kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
         0,
@@ -268,7 +271,88 @@ impl MacWindows {
     }
 }
 
+impl MacWindows {
+    fn focused_window_id(&self) -> Option<WindowId> {
+        let pid = NSWorkspace::sharedWorkspace()
+            .frontmostApplication()?
+            .processIdentifier();
+        if !self.entries.values().any(|entry| entry.pid == pid) {
+            return None;
+        }
+        let app = AxApplication::new(pid).ok()?;
+        let focused = copy_attribute(app.as_ptr(), &CFString::new("AXFocusedWindow"))?;
+        self.entries.iter().find_map(|(id, entry)| {
+            // SAFETY: both retained AX elements remain live throughout this local comparison.
+            (entry.pid == pid
+                && unsafe { CFEqual(entry.window.window.as_ptr(), focused.as_ptr()) != 0 })
+            .then_some(*id)
+        })
+    }
+}
+
 impl WindowAccess for MacWindows {
+    fn set_scope(&mut self, scope: Option<crate::api::window::WindowScope>, _reset: bool) {
+        self.include_minimized = scope.is_some_and(|scope| scope.include_minimized);
+    }
+    fn tab_minimize(
+        &mut self,
+        id: WindowId,
+        _: &[Screen],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), String> {
+        self.set_minimized(id, true, cancelled)
+    }
+    fn tab_bar_height(&self, _screen: &Screen) -> f64 {
+        30.0
+    }
+    fn tab_set_hidden(&mut self, id: WindowId, hidden: bool) -> Result<(), String> {
+        if !hidden && !self.hidden.contains(&id) {
+            return Ok(());
+        }
+        if self.entries.contains_key(&id) {
+            // Public AX supports per-window minimization, not arbitrary per-window hiding.
+            self.set_minimized(id, hidden, &|| false)?;
+        }
+        if hidden {
+            self.hidden.insert(id);
+        } else {
+            self.hidden.remove(&id);
+        }
+        Ok(())
+    }
+    fn tab_watch(&mut self, ids: &[WindowId]) -> Result<(), String> {
+        let windows = ids
+            .iter()
+            .map(|id| {
+                self.entry(*id)
+                    .map(|entry| (*id, entry.pid, entry.window.window.as_ptr()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.monitor.watch(&windows)
+    }
+    fn tab_bars(&mut self, bars: &[crate::api::window_tabs::TabBar]) -> Result<(), String> {
+        crate::platform::macos::window_tabs::publish(bars);
+        Ok(())
+    }
+    fn tab_selected(&self, id: WindowId) -> bool {
+        self.focused_window_id() == Some(id)
+    }
+    fn tab_visible(&self, id: WindowId) -> bool {
+        self.entry(id).is_ok_and(|entry| {
+            NSRunningApplication::runningApplicationWithProcessIdentifier(entry.pid)
+                .is_some_and(|app| !app.isHidden())
+        })
+    }
+    fn tab_events(&mut self) -> Vec<crate::api::window_tabs::TabNativeEvent> {
+        self.monitor.pump();
+        let mut events = crate::platform::macos::window_tabs::take_events();
+        if events.contains(&crate::api::window_tabs::TabNativeEvent::VisibilityChanged)
+            && let Some(id) = self.focused_window_id()
+        {
+            events.push(crate::api::window_tabs::TabNativeEvent::Focused(id));
+        }
+        events
+    }
     fn acquire(&mut self, point: Point, screens: &[Screen]) -> Result<Option<WindowInfo>, String> {
         let Some(window) = window_under_pointer(point)? else {
             return Ok(None);
@@ -295,14 +379,23 @@ impl WindowAccess for MacWindows {
         let visible = visible_windows()?;
         let mut result = Vec::new();
         let mut visited = std::collections::BTreeSet::new();
-        for record in &visible {
+        let mut processes: Vec<_> = visible.iter().map(|record| record.pid).collect();
+        if self.include_minimized {
+            processes.extend(
+                NSWorkspace::sharedWorkspace()
+                    .runningApplications()
+                    .iter()
+                    .map(|app| app.processIdentifier()),
+            );
+        }
+        for pid in processes {
             if cancelled() {
                 break;
             }
-            if !visited.insert(record.pid) {
+            if pid <= 0 || pid as u32 == std::process::id() || !visited.insert(pid) {
                 continue;
             }
-            let Ok(app) = AxApplication::new(record.pid) else {
+            let Ok(app) = AxApplication::new(pid) else {
                 continue;
             };
             let Some(windows) = copy_array_attribute(app.as_ptr(), &CFString::new("AXWindows"))
@@ -330,8 +423,6 @@ impl WindowAccess for MacWindows {
                 }
                 if copy_string_attribute(owned.as_ptr(), &CFString::new("AXSubrole")).as_deref()
                     != Some("AXStandardWindow")
-                    || copy_bool_attribute(owned.as_ptr(), &CFString::new("AXMinimized"))
-                        == Some(true)
                 {
                     continue;
                 }
@@ -340,6 +431,16 @@ impl WindowAccess for MacWindows {
                     attributes: AxAttributes::new(),
                     fullscreen: CFString::new("AXFullScreen"),
                 };
+                if copy_bool_attribute(window.window.as_ptr(), &CFString::new("AXMinimized"))
+                    == Some(true)
+                {
+                    if self.include_minimized
+                        && let Ok(info) = self.retain(window, pid, screens)
+                    {
+                        result.push((usize::MAX, info));
+                    }
+                    continue;
+                }
                 let Some(bounds) = element_rect(window.window.as_ptr(), &window.attributes) else {
                     continue;
                 };
@@ -349,11 +450,7 @@ impl WindowAccess for MacWindows {
             }
             // Do not guess among identical windows in different Spaces. Match
             // public on-screen metadata only when one AX candidate is possible.
-            for (rank, shown) in visible
-                .iter()
-                .enumerate()
-                .filter(|(_, v)| v.pid == record.pid)
-            {
+            for (rank, shown) in visible.iter().enumerate().filter(|(_, v)| v.pid == pid) {
                 if cancelled() {
                     break;
                 }
@@ -374,14 +471,21 @@ impl WindowAccess for MacWindows {
                 };
                 if let Some(index) = unique {
                     let (window, _, _) = candidates.remove(index);
-                    if let Ok(info) = self.retain(window, record.pid, screens) {
+                    if let Ok(info) = self.retain(window, pid, screens) {
                         result.push((rank, info));
                     }
                 }
             }
         }
         result.sort_by_key(|(rank, _)| *rank);
-        let result: Vec<_> = result.into_iter().map(|(_, info)| info).collect();
+        let mut result: Vec<_> = result.into_iter().map(|(_, info)| info).collect();
+        for id in &self.hidden {
+            if !result.iter().any(|w| w.id == *id)
+                && let Ok(snapshot) = self.snapshot(*id, screens)
+            {
+                result.push(snapshot.info);
+            }
+        }
         if !cancelled() {
             self.prune_closed(&result, cancelled);
         }
@@ -436,7 +540,7 @@ impl WindowAccess for MacWindows {
         if before.info.fullscreen {
             return Err("Exit native fullscreen before adjusting this window".into());
         }
-        if before.info.minimized {
+        if before.info.minimized && !self.hidden.contains(&id) {
             self.set_minimized(id, false, cancelled)?;
         }
         let window = &self.entry(id)?.window;
@@ -562,6 +666,33 @@ impl WindowAccess for MacWindows {
     fn pointer(&self) -> Result<Point, String> {
         crate::platform::macos::input::cursor_position()
     }
+    fn close(&self, id: WindowId) -> Result<(), String> {
+        let entry = self.entry(id)?;
+        let button = copy_attribute(
+            entry.window.window.as_ptr(),
+            &CFString::new("AXCloseButton"),
+        )
+        .ok_or("Window has no accessible close button")?;
+        if !is_ax_element(button.as_ptr()) {
+            return Err("Window close button is not an accessibility element".into());
+        }
+        // SAFETY: both retained AX objects remain live during the bounded action.
+        let error = unsafe {
+            let timeout = AXUIElementSetMessagingTimeout(button.as_ptr(), NODE_TIMEOUT_SECONDS);
+            if timeout != AX_OK {
+                timeout
+            } else {
+                AXUIElementPerformAction(
+                    button.as_ptr(),
+                    CFString::new("AXPress").as_concrete_TypeRef(),
+                )
+            }
+        };
+        if error != AX_OK {
+            return Err(format!("Cannot request window close: AXError {error}"));
+        }
+        Ok(())
+    }
     fn move_fullscreen(
         &mut self,
         id: WindowId,
@@ -593,10 +724,24 @@ impl WindowAccess for MacWindows {
         }
     }
     fn reset(&mut self) {
+        for id in self.hidden.iter().copied().collect::<Vec<_>>() {
+            if let Err(error) = self.tab_set_hidden(id, false) {
+                crate::report_error!("window-tabs", "restore hidden window: {error}");
+                return;
+            }
+        }
+        crate::platform::macos::window_tabs::publish(&[]);
+        self.monitor = Default::default();
         self.entries.clear();
         self.closed.clear();
     }
     fn take_closed(&mut self) -> Vec<WindowId> {
         std::mem::take(&mut self.closed)
+    }
+}
+
+impl Drop for MacWindows {
+    fn drop(&mut self) {
+        self.reset();
     }
 }

@@ -352,6 +352,15 @@ fn scan_sources(strategy: UiScanStrategy) -> (bool, bool) {
 }
 
 fn stream_ax(job: &ScanJob, pid: libc::pid_t, publisher: &PartialPublisher<'_>) -> UiScanStatus {
+    if job.request.scope == crate::api::UiScanScope::Screen {
+        return accessibility::scan_screen_stream(
+            &job.request,
+            || scan_id_is_current(job.generation),
+            |batch| publisher.push(batch),
+        )
+        .map(|_| UiScanStatus::Success)
+        .unwrap_or_else(UiScanStatus::Failed);
+    }
     accessibility::scan_process_stream(
         pid,
         &job.request,
@@ -428,6 +437,15 @@ fn scan_vision(
     generation: u64,
     request: &UiScanRequest,
 ) -> (Vec<crate::api::UiTarget>, UiScanStatus) {
+    if request.scope == crate::api::UiScanScope::Screen {
+        return match request.bounds {
+            Some(bounds) => vision::detect(generation, bounds, &request.vision),
+            None => (
+                Vec::new(),
+                UiScanStatus::Failed("screen scan requires display bounds".into()),
+            ),
+        };
+    }
     let window_bounds = match accessibility::focused_window_bounds(pid) {
         Ok(bounds) => bounds,
         Err(error) => return (Vec::new(), UiScanStatus::Failed(error)),
@@ -448,6 +466,7 @@ mod tests {
 
     fn request(id: u64) -> UiScanRequest {
         UiScanRequest {
+            scope: crate::api::UiScanScope::Window,
             id,
             timeout_ms: 2_500,
             bounds: None,

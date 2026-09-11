@@ -143,10 +143,9 @@ text = "#17327AFF"
 # Idle does nothing but wait, and never swallows a keystroke, so the program is
 # invisible until you ask for it. Keep this table to just the launchers.
 #
-# `primary` is Cmd on macOS and Ctrl on Windows/Linux, so this section is
-# portable as written. `primary+shift` is used rather than a bare modifier
-# because Option+<letter> composes text on macOS and Ctrl+Shift+C/V are taken
-# by terminals.
+# All chord keys resolve through key_aliases (including platform overrides).
+# This file maps Primary to left Alt on Windows. On macOS, the built-in
+# Primary fallback is Command; configure key_aliases.macos to override it.
 # ---------------------------------------------------------------------------
 
 [hotkeys]
@@ -262,6 +261,8 @@ y = "end"
 # "alt+e" = "window_editor"
 # "alt+r" = "window_restore"
 [window]
+screens = "current"
+include_minimized = false
 enabled = true
 inherits = ["hotkeys"]
 temporary_mode = "normal"
@@ -281,25 +282,32 @@ l = "window_right"
 s = "window_size"
 a = "window_quick"
 e = "window_editor"
+t = "window_tab"
 r = "window_restore"
 d = "window_screen_next"
 f = "size_cycle" # Maximize → minimize → restore
 c = "window_center"
+x = "window_close"
 tab = "window_select"
+"shift+tab" = "window_select_previous"
 z = "window_undo"
+"shift+z" = "window_redo"
+"shift+c" = "window_reset_initial"
 q = "idle"
 "primary+q" = "idle"
 [window.ui]
 font_size = 28
 
 [window_quick]
+screens = "current"
+include_minimized = false
 enabled = true
 inherits = ["hotkeys"]
 temporary_mode = "normal"
 temporary_mode_keys = ["primary"]
 number_timeout_ms = 250
 split_ratios = ["1/4", "1/3", "1/2", "2/3", "3/4"]
-gap = 8.0
+gap = 0.0
 border_width = 3.0
 [window_quick.bindings]
 h = "window_layout_left"
@@ -309,13 +317,18 @@ l = "window_layout_right"
 e = "window_editor"
 r = "window_restore"
 tab = "window_select"
+"shift+tab" = "window_select_previous"
 z = "window_undo"
+"shift+z" = "window_redo"
+"shift+c" = "window_reset_initial"
 q = "window"
 "primary+q" = "idle"
 [window_quick.ui]
 font_size = 28
 
 [window_editor]
+screens = "current"
+include_minimized = false
 enabled = true
 inherits = ["hotkeys"]
 temporary_mode = "normal"
@@ -323,7 +336,7 @@ temporary_mode_keys = ["primary"]
 number_timeout_ms = 250
 resize_step = 20.0
 resize_speed = 500.0
-gap = 8.0
+gap = 0.0
 border_width = 3.0
 [window_editor.bindings]
 h = "window_layout_left"
@@ -339,7 +352,10 @@ l = "window_layout_right"
 "ctrl+k" = "window_ratio_up"
 "ctrl+l" = "window_ratio_right"
 tab = "window_select"
+"shift+tab" = "window_select_previous"
 z = "window_undo"
+"shift+z" = "window_redo"
+"shift+c" = "window_reset_initial"
 x = "window_remove_region"
 "ctrl+s" = "window_save_layout"
 r = "window_restore"
@@ -349,36 +365,59 @@ q = "window"
 font_size = 28
 
 [window_restore]
+screens = "current"
+include_minimized = false
 enabled = true
 inherits = ["hotkeys"]
 temporary_mode = "normal"
 temporary_mode_keys = ["primary"]
 number_timeout_ms = 250
-gap = 8.0
+gap = 0.0
 border_width = 3.0
 [window_restore.lifecycle]
 after_finish = "window_editor"
 after_click = "keep"
 [window_restore.bindings]
-x = "window_delete"
+x = "window_delete" # Toggle restore/delete within this list
 enter = "window_confirm"
 q = "window"
 "primary+q" = "idle"
 [window_restore.ui]
 font_size = 28
 
-[window_delete]
+# Active-member window groups: 12t34t creates two groups; ~ selects a group number.
+# Ordinary digits keep their window identities. Space ends an ambiguous number.
+[window_tab]
+screens = "current"
+include_minimized = false
 enabled = true
 inherits = ["hotkeys"]
 temporary_mode = "normal"
 temporary_mode_keys = ["primary"]
 number_timeout_ms = 250
-border_width = 3.0
-[window_delete.bindings]
-enter = "window_confirm"
-q = "window_restore"
+border_width = 3
+
+[window_tab.bindings]
+t = "window_tab_end"
+"~" = "window_tab_group"
+space = "window_number_end"
+d = "window_tab_remove"
+x = "window_tab_dissolve"
+tab = "window_tab_next"
+"shift+tab" = "window_tab_previous"
+h = "move_left"
+j = "move_down"
+k = "move_up"
+l = "move_right"
+z = "window_undo"
+"shift+z" = "window_redo"
+"ctrl+s" = "window_save_layout"
+r = "window_restore"
+q = "window"
 "primary+q" = "idle"
-[window_delete.ui]
+esc = "idle"
+
+[window_tab.ui]
 font_size = 28
 
 # ---------------------------------------------------------------------------
@@ -386,6 +425,8 @@ font_size = 28
 # Type a label to click it. `/` filters elements by name instead.
 # ---------------------------------------------------------------------------
 [ui_hint]
+# window: pointer window; screen: complete display containing the pointer.
+scan_scope = "window"
 enabled = true
 # Element detection: both macOS and Windows support "axtree", "vision", and
 # "hybrid". The default runs the accessibility tree and visual pipeline in

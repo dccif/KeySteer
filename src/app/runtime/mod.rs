@@ -21,7 +21,7 @@ mod prefix_chords;
 mod registry;
 mod scheduler;
 mod window_presets;
-pub(crate) use window_presets::LayoutRepository;
+pub(crate) use window_presets::PresetRepository;
 
 pub use plan::{
     AppRouteOverride, ConfigurationCandidate, ConfigurationRepository, DebugSettings,
@@ -142,7 +142,7 @@ pub struct Engine {
     pending_runtime_error: Option<RuntimeError>,
     should_quit: bool,
     configuration: Option<Box<dyn ConfigurationRepository>>,
-    window_layouts: window_presets::LayoutController,
+    window_presets: window_presets::PresetController,
     /// Prevent rapid status-menu clicks from opening duplicate browser tabs.
     last_config_simulator_open: Option<Instant>,
     started_at: Instant,
@@ -189,7 +189,7 @@ impl Engine {
             pending_runtime_error: None,
             should_quit: false,
             configuration: None,
-            window_layouts: window_presets::LayoutController::default(),
+            window_presets: window_presets::PresetController::default(),
             last_config_simulator_open: None,
             started_at: Instant::now(),
         };
@@ -766,9 +766,9 @@ impl Engine {
                     .as_ref()
                     .ok_or_else(|| "no configuration source is attached".to_string())?
                     .source_text()?;
-                let layouts = self.window_layouts.store.export_file();
+                let layouts = self.window_presets.store.export_file();
                 if let Err(error) = &layouts {
-                    crate::report_error!("window-layouts", "{error}");
+                    crate::report_error!("window-presets", "{error}");
                 }
                 let url = config_handoff::url_for_workspace(&source, layouts);
                 if let Err(error) = backend.open_url(&url) {
@@ -968,11 +968,11 @@ impl Engine {
             // Native text entry belongs to the outgoing interaction, even when
             // its final layout acknowledgement defers the actual mode switch.
             if self
-                .window_layouts
+                .window_presets
                 .pending
                 .as_ref()
                 .is_some_and(|pending| pending.owner == self.registry.active)
-                && let Some(pending) = self.window_layouts.pending.take()
+                && let Some(pending) = self.window_presets.pending.take()
             {
                 backend.cancel_text_prompt(pending.id);
             }
@@ -1245,8 +1245,8 @@ impl Engine {
                 )
             });
             match command {
-                Command::WindowLayouts(request) => {
-                    self.request_window_layouts(owner, *request, backend)?
+                Command::WindowPresets(request) => {
+                    self.request_window_presets(owner, *request, backend)?
                 }
                 Command::WindowRequest(request) => {
                     self.scheduler
@@ -1274,6 +1274,7 @@ impl Engine {
                         self.dispatch_to(
                             owner,
                             ModeEvent::WindowResult(Box::new(crate::api::window::WindowResult {
+                                tabs: None,
                                 closed: Vec::new(),
                                 session,
                                 id,
@@ -1291,11 +1292,11 @@ impl Engine {
                 }
                 Command::CancelWindowSession(session) => {
                     if self
-                        .window_layouts
+                        .window_presets
                         .pending
                         .as_ref()
                         .is_some_and(|p| p.session == session)
-                        && let Some(prompt) = self.window_layouts.pending.take()
+                        && let Some(prompt) = self.window_presets.pending.take()
                     {
                         backend.cancel_text_prompt(prompt.id);
                     }
@@ -1345,7 +1346,11 @@ impl Engine {
                     });
                     // Synthetic movement is not guaranteed to re-enter the
                     // input hook. Store the constrained position actually sent.
+                    let previous_bounds = self.context().active_bounds();
                     self.cursor = to;
+                    if previous_bounds != self.context().active_bounds() {
+                        self.dispatch(ModeEvent::PointerMoved(to), backend)?;
+                    }
                     self.note_drag_pointer_moved();
                     self.refresh_overlay_positions(backend)?;
                 }
@@ -1365,7 +1370,11 @@ impl Engine {
                     self.trace_lazy(self.settings.debug.motion, "backend", || {
                         format!("warp_pointer x={:.3} y={:.3}: ok", to.x, to.y)
                     });
+                    let previous_bounds = self.context().active_bounds();
                     self.cursor = to;
+                    if previous_bounds != self.context().active_bounds() {
+                        self.dispatch(ModeEvent::PointerMoved(to), backend)?;
+                    }
                     if changed {
                         self.note_drag_pointer_moved();
                     }

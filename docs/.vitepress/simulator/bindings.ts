@@ -85,13 +85,26 @@ function keyMatches(configured: string, physical: string): boolean {
   return configured === physical || ['shift', 'ctrl', 'alt', 'cmd', 'win'].includes(configured) && physical.endsWith(`_${configured}`)
 }
 
+/** Shared by physical input and shortcut captions; resolves every configured alias. */
+export function resolvedChordKeys(document: BindingDocument, chord: string, isMac: boolean): string[] {
+  return chordKeys(chord, aliasesFor(document, isMac))
+}
+
+function chordKeys(chord: string, aliases: Record<string, string>): string[] {
+  return chord === '+' ? ['+'] : chord.split('+').map(key => physicalName(key.trim(), aliases))
+}
+
+export function shortcutCaption(document: BindingDocument, chord: string, isMac: boolean): string {
+  return resolvedChordKeys(document, chord, isMac).join('+').replaceAll('_', ' ').toUpperCase()
+}
+
 /** Physical matching used by Window's independently configurable bindings. */
 export function resolvePhysicalBinding(document: BindingDocument, mode: string, pressed: string[], key: string, isMac: boolean, localOnly = false): ResolvedBinding | undefined {
   const aliases = aliasesFor(document, isMac)
   let best: ResolvedBinding | undefined, specificity = 0
   const table = localOnly ? collectBindings({ [mode]: { bindings: bindingTable(document, mode) } }, mode, new Set()) : collectBindings(document, mode, new Set())
   for (const [chord, binding] of table) {
-    const keys = chord === '+' ? ['+'] : chord.split('+').map(v => physicalName(v, aliases))
+    const keys = chordKeys(chord, aliases)
     if (!keys.some(k => keyMatches(k, key)) || !keys.every(k => pressed.some(p => keyMatches(k, p)))) continue
     if (pressed.some(p => /^(left_|right_)?(shift|ctrl|alt|cmd|win)$/.test(p) && !keys.some(k => keyMatches(k, p)))) continue
     if (keys.length > specificity) { specificity = keys.length; best = binding }
@@ -99,13 +112,14 @@ export function resolvePhysicalBinding(document: BindingDocument, mode: string, 
   return best
 }
 
-export function temporaryPhysicalKeys(document: BindingDocument, mode: string, pressed: string[], isMac: boolean): string[] {
+export function temporaryPhysicalKeys(document: BindingDocument, mode: string, pressed: string[], isMac: boolean, entryKeys: ReadonlySet<string> = new Set()): string[] {
   const settings = asRecord(document[mode])
   if (!settings.temporary_mode) return []
   const aliases = aliasesFor(document, isMac)
   const active = new Set<string>()
   for (const chord of Array.isArray(settings.temporary_mode_keys) ? settings.temporary_mode_keys : []) {
-    const keys = String(chord).split('+').map(k => physicalName(k, aliases))
+    const keys = chordKeys(String(chord), aliases)
+    if ([...entryKeys].some(p => keys.some(k => keyMatches(k, p)))) continue
     if (keys.every(k => pressed.some(p => keyMatches(k, p)))) {
       pressed.filter(p => keys.some(k => keyMatches(k, p))).forEach(p => active.add(p))
     }

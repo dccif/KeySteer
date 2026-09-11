@@ -4,32 +4,35 @@ use crate::api::presentation::{View, WindowView};
 
 impl WindowSession {
     pub(super) fn detail(&self) -> String {
+        if self.kind == WindowKind::Tab {
+            return self.tab_detail();
+        }
         if self.library_open {
             let mut detail = format!(
                 "{}\nType a layout number · page {} / {}",
-                if self.kind == WindowKind::Delete {
+                if self.deleting_presets {
                     "Delete layouts"
                 } else {
                     "Restore"
                 },
                 self.library_page + 1,
-                self.saved_layouts
+                self.saved_presets
                     .len()
                     .div_ceil(super::presets::PAGE_SIZE)
                     .max(1)
             );
             if let Some(layout) = &self.delete_selection {
                 return format!(
-                    "Delete layouts\nDelete {}   {}?\nConfirm deletion or use the configured mode key to leave",
+                    "Delete layouts\nDelete {}   {}?\nConfirm deletion or toggle back to Restore to cancel",
                     layout.id,
                     layout.name()
                 );
             }
-            if self.saved_layouts.is_empty() {
+            if self.saved_presets.is_empty() {
                 detail.push_str("\nNo saved layouts · save a layout in the editor");
             }
             for layout in self
-                .saved_layouts
+                .saved_presets
                 .iter()
                 .skip(self.library_page * super::presets::PAGE_SIZE)
                 .take(super::presets::PAGE_SIZE)
@@ -104,6 +107,8 @@ impl WindowSession {
                 _ => None,
             });
         View::Window(WindowView {
+            tabs: &self.tabs.state,
+            group_input: self.kind == WindowKind::Tab && self.number.slot,
             ui: &self.settings.ui,
             border_width: self.settings.border_width,
             target: self.target.as_ref().filter(|w| !w.minimized),
