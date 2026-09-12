@@ -15,7 +15,15 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-static PENDING: Mutex<Option<Vec<TabBar>>> = Mutex::new(None);
+#[derive(Default)]
+struct PendingBars {
+    full: Option<Vec<TabBar>>,
+    updates: BTreeMap<u32, TabBar>,
+}
+static PENDING: Mutex<PendingBars> = Mutex::new(PendingBars {
+    full: None,
+    updates: BTreeMap::new(),
+});
 static EVENTS: Mutex<Vec<TabNativeEvent>> = Mutex::new(Vec::new());
 thread_local! { static STRIPS: RefCell<BTreeMap<u32, Strip>> = const { RefCell::new(BTreeMap::new()) }; }
 
@@ -37,6 +45,8 @@ struct Strip {
     targets: Vec<Retained<Target>>,
     buttons: Vec<Retained<NSButton>>,
     tabs: Vec<(WindowId, u32, String)>,
+    layout_width: f64,
+    active: Option<WindowId>,
 }
 impl Drop for Strip {
     fn drop(&mut self) {
@@ -51,9 +61,25 @@ pub(super) fn enqueue(event: TabNativeEvent) {
 }
 pub(super) fn publish(bars: &[TabBar]) {
     if let Ok(mut pending) = PENDING.lock() {
-        *pending = Some(bars.to_vec());
+        pending.full = Some(bars.to_vec());
+        pending.updates.clear();
         super::workspace::wake_main_run_loop();
     }
+}
+pub(super) fn publish_one(bar: &TabBar) -> Result<(), String> {
+    let mut pending = PENDING
+        .lock()
+        .map_err(|_| "Tab publication queue poisoned")?;
+    if let Some(full) = &mut pending.full {
+        if let Some(current) = full.iter_mut().find(|current| current.group == bar.group) {
+            current.clone_from(bar);
+        }
+    } else {
+        pending.updates.insert(bar.group.0, bar.clone());
+    }
+    drop(pending);
+    super::workspace::wake_main_run_loop();
+    Ok(())
 }
 pub(super) fn take_events() -> Vec<TabNativeEvent> {
     EVENTS
@@ -75,17 +101,29 @@ pub(super) fn refresh(mtm: MainThreadMarker, screens: &[Screen]) {
             enqueue(TabNativeEvent::VisibilityChanged);
         }
     });
-    let Some(bars) = PENDING.lock().ok().and_then(|mut p| p.take()) else {
+    let Some(pending) = PENDING.lock().ok().map(|mut p| std::mem::take(&mut *p)) else {
         return;
     };
+    let structural = pending.full.is_some();
+    let bars = pending
+        .full
+        .unwrap_or_else(|| pending.updates.into_values().collect());
+    if bars.is_empty() && !structural {
+        return;
+    }
     let top = screens
         .iter()
         .find(|s| s.is_primary)
         .map_or(0.0, |s| s.bounds.bottom());
     STRIPS.with(|strips| {
         let mut strips = strips.borrow_mut();
-        strips.retain(|id, _| bars.iter().any(|bar| bar.group.0 == *id));
+        if structural {
+            strips.retain(|id, _| bars.iter().any(|bar| bar.group.0 == *id));
+        }
         for bar in bars {
+            if !structural && !strips.contains_key(&bar.group.0) {
+                continue;
+            }
             let strip = strips.entry(bar.group.0).or_insert_with(|| {
                 let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
                     NSPanel::alloc(mtm),
@@ -103,8 +141,12 @@ pub(super) fn refresh(mtm: MainThreadMarker, screens: &[Screen]) {
                     targets: Vec::new(),
                     buttons: Vec::new(),
                     tabs: Vec::new(),
+                    layout_width: 0.0,
+                    active: None,
                 }
             });
+            let layout_changed = strip.layout_width != bar.bounds.width || strip.tabs != bar.tabs;
+            let selection_changed = strip.active != Some(bar.active) || strip.tabs != bar.tabs;
             if strip.tabs != bar.tabs {
                 let content = NSView::initWithFrame(
                     NSView::alloc(mtm),
@@ -161,25 +203,31 @@ pub(super) fn refresh(mtm: MainThreadMarker, screens: &[Screen]) {
             let width = (bar.bounds.width - 74.0).max(1.0) / bar.tabs.len().max(1) as f64;
             for (i, button) in strip.buttons.iter().enumerate() {
                 let close = i == bar.tabs.len();
-                button.setFrame(NSRect::new(
-                    NSPoint::new(
-                        if close {
-                            bar.bounds.width - 30.0
+                if layout_changed {
+                    button.setFrame(NSRect::new(
+                        NSPoint::new(
+                            if close {
+                                bar.bounds.width - 30.0
+                            } else {
+                                44.0 + i as f64 * width
+                            },
+                            0.0,
+                        ),
+                        NSSize::new(if close { 30.0 } else { width }, 30.0),
+                    ));
+                }
+                if selection_changed {
+                    button.setState(
+                        if bar.tabs.get(i).is_some_and(|(id, _, _)| *id == bar.active) {
+                            1
                         } else {
-                            44.0 + i as f64 * width
+                            0
                         },
-                        0.0,
-                    ),
-                    NSSize::new(if close { 30.0 } else { width }, 30.0),
-                ));
-                button.setState(
-                    if bar.tabs.get(i).is_some_and(|(id, _, _)| *id == bar.active) {
-                        1
-                    } else {
-                        0
-                    },
-                );
+                    );
+                }
             }
+            strip.layout_width = bar.bounds.width;
+            strip.active = Some(bar.active);
             let above = bar.bounds.y - 30.0;
             let y = above;
             strip.panel.setFrame_display(
@@ -187,7 +235,7 @@ pub(super) fn refresh(mtm: MainThreadMarker, screens: &[Screen]) {
                     NSPoint::new(bar.bounds.x, top - y - 30.0),
                     NSSize::new(bar.bounds.width, 30.0),
                 ),
-                true,
+                layout_changed || selection_changed,
             );
             if bar.visible
                 && screens

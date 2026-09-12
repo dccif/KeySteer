@@ -78,6 +78,8 @@ unsafe extern "C" fn callback(
     if let Some(id) = id {
         crate::platform::macos::window_tabs::enqueue(if name == "AXUIElementDestroyed" {
             TabNativeEvent::Closed(id)
+        } else if name == "AXMoved" || name == "AXResized" {
+            TabNativeEvent::GeometryChanged(id)
         } else {
             TabNativeEvent::Changed(id)
         });

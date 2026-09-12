@@ -1380,3 +1380,40 @@ fn restore_owns_delete_action_without_a_separate_mode_or_config() {
     assert!(!ModeId::BUILT_IN.contains(&"window_delete"));
     assert!(Config::parse("[window_delete]\nenabled = true").is_err());
 }
+
+#[test]
+fn exported_window_audio_bindings_preserve_defaults_and_custom_system_mute() {
+    use crate::api::window::WindowAction as W;
+    let mut config = Config::default();
+    for bindings in [
+        &mut config.window.bindings,
+        &mut config.window_quick.bindings,
+        &mut config.window_editor.bindings,
+    ] {
+        assert_eq!(
+            bindings.get("shift+v+m"),
+            Some(&Binding::Window(W::SystemVolumeMute))
+        );
+        bindings.remove("shift+v+m");
+        bindings.insert("f9".into(), Binding::Window(W::SystemVolumeMute));
+    }
+    let exported = config.to_toml().unwrap();
+    let restored = Config::parse(&exported).unwrap();
+    restored.validate().unwrap();
+    for bindings in [
+        &restored.window.bindings,
+        &restored.window_quick.bindings,
+        &restored.window_editor.bindings,
+    ] {
+        assert_eq!(
+            bindings.get("f9"),
+            Some(&Binding::Window(W::SystemVolumeMute))
+        );
+        assert!(!bindings.contains_key("shift+v+m"));
+        assert_eq!(bindings.get("v+m"), Some(&Binding::Window(W::VolumeMute)));
+        assert_eq!(
+            bindings.get("shift+v+k"),
+            Some(&Binding::Window(W::SystemVolumeUp))
+        );
+    }
+}

@@ -308,3 +308,12 @@ Quick 比例尺验收覆盖混合 1/2、1/3、0.3、0.45 和相近比例：原�
 音频请求回归验证独立结果通道、无需 Window Acquire 的系统请求、按调用者取消队列、忽略取消后的迟到反馈，以及音频错误不生成窗口/布局请求。构建 macOS 应用需 macOS 14.2+ SDK，链接 CoreAudio、AudioToolbox、AVFoundation；运行时仍允许 macOS 14.0。
 
 Windows 主机只能交叉检查 macOS Rust（`cargo check --target aarch64-apple-darwin --lib --bins --tests`，Intel 同理），不能验证 Objective-C 编译、权限与真实音频。Mac 原生验收应使用打包的 .app：拒绝/授予系统音频权限；应用及系统每步 1%、按住重复、松开 V/Shift 停止；独立应用与系统输出；多进程浏览器；拔插输出；休眠/唤醒；退出后声音恢复。原有 `examples/macos_native_probe.rs` 引用了私有 crate 模块，尚不属于上述交叉检查范围。
+
+
+Tabs 优化验收：`cargo test --release tabs_geometry_baseline -- --ignored --nocapture`，可用 KEYSTEER_TABS_BENCH_OUTPUT 保存 CSV；每次涵盖 2/10/30 成员、各三轮 1000 次几何事件，记录 p50/p95/p99、快照读取和应用写入。它是模拟后端 CPU 基准，不是显示帧率或 compositor 延迟。回归覆盖单组更新、失败重试、手势结束校正，以及阻塞音频下的异步提交、队列上限和取消。Windows ignored 原生探针验证活动成员直接移动/缩放跟随、切换/解散、最大化恢复和标签拖放；实机跨屏 DPI 与高刷新率抖动仍需视觉验收。本轮不运行 macOS 测试。
+
+
+音频安全检查复用现有 unsafe 总预算（未增加），将 Toolhelp 的一个块从音频调用层迁入 native 所有权封装；portable 安全门禁覆盖 platform/common。回归验证真实只读进程快照包含自身，以及音频失败后 worker 可继续处理下一项。测试断言可继续使用 unwrap。
+
+
+音频配置同步回归：Rust 验证 Config::to_toml 自定义系统静音绑定往返；网页 config-document.test.ts 验证十个音频默认绑定、重绑、原样比例标签与布局间距往返，window.test.ts 验证应用/系统静音独立，window-help.test.ts 验证 Shift 合并及自定义键提示。

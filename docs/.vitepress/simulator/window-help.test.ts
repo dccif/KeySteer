@@ -74,3 +74,15 @@ test('Quick screen preview keeps configured labels and screen aspect', async () 
     assert.ok(Math.abs(plan.selection.x + plan.selection.width - plan.frame.x - plan.frame.width) < 1e-9)
   }
 })
+
+
+test('mute help merges actual Shift bindings and preserves custom bindings', () => {
+  for (const mode of ['window', 'window_quick', 'window_editor']) {
+    assert.equal(windowHelpActionSupported(mode, 'window_system_volume_mute'), true)
+    const plan = windowHelpSections(entries([['window_volume_mute', 'V+M'], ['window_system_volume_mute', 'SHIFT+V+M']]), mode)
+    assert.ok(plan.right.some(e => e.keys === 'V+M' && e.action === 'Mute / unmute · Shift: system'))
+    const custom = windowHelpSections(entries([['window_volume_mute', 'F8'], ['window_system_volume_mute', 'F9']]), mode)
+    assert.ok(custom.right.some(e => e.keys === 'F8 / F9' && e.action === 'App / system Mute / unmute'))
+  }
+  assert.equal(windowHelpActionSupported('window_tab', 'window_system_volume_mute'), false)
+})

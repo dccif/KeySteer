@@ -158,6 +158,23 @@ impl Strip {
         self.position.set(None);
         Ok(())
     }
+    fn update_scale(&self, scale: f64) {
+        if self.scale.get() != scale {
+            let font = LOGFONTW {
+                lfHeight: -(14.0 * scale).round() as i32,
+                lfWeight: 400,
+                ..Default::default()
+            };
+            // SAFETY: initialized font descriptor; replace and release the owned font.
+            unsafe {
+                let previous = self.font.replace(CreateFontIndirectW(&font));
+                if !previous.0.is_null() {
+                    let _ = DeleteObject(previous.into());
+                }
+            }
+            self.scale.set(scale);
+        }
+    }
     pub fn update(&self, data: &TabBar, screen: Option<&Screen>) -> Result<(), String> {
         let scale = screen.map_or(1.0, |screen| screen.scale);
         let reveal_active = {
@@ -180,21 +197,7 @@ impl Strip {
                 || current.active != data.active
                 || current.bounds.width != data.bounds.width
         };
-        if self.scale.get() != scale {
-            let font = LOGFONTW {
-                lfHeight: -(14.0 * scale).round() as i32,
-                lfWeight: 400,
-                ..Default::default()
-            };
-            // SAFETY: initialized font descriptor; replace and release the owned font.
-            unsafe {
-                let previous = self.font.replace(CreateFontIndirectW(&font));
-                if !previous.0.is_null() {
-                    let _ = DeleteObject(previous.into());
-                }
-            }
-            self.scale.set(scale);
-        }
+        self.update_scale(scale);
         {
             let mut current = self.data.borrow_mut();
             if current.tabs != data.tabs || self.titles.borrow().is_empty() {
@@ -315,33 +318,49 @@ impl Strip {
             let _ = InvalidateRect(Some(self.hwnd.get()), None, false);
         }
     }
-    /// Position-only native callback path. No model snapshot, title allocation,
-    /// painting or inactive-window writes; resize/DPI changes use the normal update.
-    pub fn follow(&self, hwnd: HWND, screens: &[Screen]) {
+    /// Native geometry path: no model snapshots, title allocation or inactive
+    /// application writes. Resize repaints only the small existing strip.
+    pub fn follow(&self, hwnd: HWND, screens: &[Screen]) -> bool {
         if !super::super::window_manager::tab_window_visible(hwnd) {
-            return;
+            return false;
         }
         let Some(bounds) = super::super::accessibility::window_bounds(hwnd) else {
-            return;
+            return false;
         };
         let index = crate::platform::common::window_geometry::screen_index(screens, bounds);
         let screen = index.and_then(|index| screens.get(index));
+        let scale = screen.map_or(1.0, |s| s.scale);
         let Ok(mut data) = self.data.try_borrow_mut() else {
-            return;
+            return false;
         };
-        if !data.visible
-            || data.bounds.width != bounds.width
-            || screen.map_or(1.0, |s| s.scale) != self.scale.get()
-        {
-            return;
+        if !data.visible {
+            return false;
         }
+        let repaint = data.bounds.width != bounds.width || self.scale.get() != scale;
         data.bounds = bounds;
         if let Some(index) = index {
             data.screen = index;
         }
         drop(data);
-        // A failure is retried/reported by the queued normal geometry update.
-        let _ = self.position(bounds, true, screen, false);
+        self.update_scale(scale);
+        if repaint {
+            let (heading, end, width) = self.tab_layout(bounds.width.round() as i32);
+            let viewport = (end - heading).max(1);
+            let data = self.data.borrow();
+            let maximum = (width * data.tabs.len() as i32 - viewport).max(0);
+            let mut scroll = self.scroll.get().min(maximum);
+            if let Some(index) = data.tabs.iter().position(|(id, _, _)| *id == data.active) {
+                let left = index as i32 * width;
+                if left < scroll {
+                    scroll = left;
+                }
+                if left + width > scroll + viewport {
+                    scroll = left + width - viewport;
+                }
+            }
+            self.scroll.set(scroll.clamp(0, maximum));
+        }
+        self.position(bounds, true, screen, repaint).is_ok()
     }
     fn position(
         &self,
@@ -363,6 +382,9 @@ impl Strip {
             height,
             visible,
         };
+        if repaint {
+            self.dirty.set(true);
+        }
         // SAFETY: only the owned strip is moved or hidden; no foreign ownership changes.
         unsafe {
             if self.position.get() != Some(position) {
@@ -404,8 +426,16 @@ impl Strip {
             if self.canvas.get().0.is_null() {
                 self.canvas.set(CreateCompatibleDC(Some(target)));
             }
-            if !self.canvas.get().0.is_null() && self.canvas_size.get() != size {
-                let bitmap = CreateCompatibleBitmap(target, size.0, size.1);
+            if !self.canvas.get().0.is_null()
+                && (self.canvas_size.get().0 < size.0 || self.canvas_size.get().1 < size.1)
+            {
+                // Capacity grows in small width buckets; shrinking reuses the
+                // buffer, bounded by the largest strip seen during its lifetime.
+                let capacity = (
+                    size.0.saturating_add(255) / 256 * 256,
+                    size.1.saturating_add(15) / 16 * 16,
+                );
+                let bitmap = CreateCompatibleBitmap(target, capacity.0, capacity.1);
                 if !bitmap.0.is_null() {
                     let previous = SelectObject(self.canvas.get(), bitmap.into());
                     if self.bitmap.get().0.is_null() {
@@ -414,11 +444,11 @@ impl Strip {
                         let _ = DeleteObject(self.bitmap.get().into());
                     }
                     self.bitmap.set(bitmap);
-                    self.canvas_size.set(size);
+                    self.canvas_size.set(capacity);
                     self.dirty.set(true);
                 }
             }
-            let dc = if self.canvas_size.get() == size {
+            let dc = if self.canvas_size.get().0 >= size.0 && self.canvas_size.get().1 >= size.1 {
                 self.canvas.get()
             } else {
                 target

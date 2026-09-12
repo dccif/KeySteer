@@ -497,6 +497,7 @@ impl WindowSession {
                 transaction,
                 minimums,
                 gap_scale,
+                screen_scales,
                 ..
             } => {
                 if self
@@ -631,7 +632,8 @@ impl WindowSession {
                                         None,
                                         screen.work_area,
                                         &minimums.iter().copied().collect(),
-                                        self.settings.gap * self.screen_scale(screen.scale),
+                                        self.settings.gap
+                                            * screen_scales.get(index).copied().unwrap_or(1.0),
                                     )
                                 },
                                 |saved| saved.instantiate_layout(&windows),
@@ -640,7 +642,8 @@ impl WindowSession {
                                 tree.fit(
                                     &minimums.iter().copied().collect(),
                                     screen.work_area,
-                                    self.settings.gap * self.screen_scale(screen.scale),
+                                    self.settings.gap
+                                        * screen_scales.get(index).copied().unwrap_or(1.0),
                                 )?;
                                 Ok(tree)
                             });

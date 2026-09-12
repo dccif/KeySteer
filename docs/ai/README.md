@@ -74,3 +74,12 @@ Window 音频控制区分应用与系统：V+J/K、V+H/L 和 Shift+V+J/K、Shift
 
 
 独立跨平台音频请求（按键 → Command::AudioRequest → Engine → Backend）及 macOS 系统音频/应用 Tap 见 [API](02-runtime-and-api.md)、[原生后端](06-platform-backends.md)、[项目地图](01-project-map.md) 和 [构建验收](08-build-docs-and-tests.md)。
+
+
+Tabs 几何/内容分离、原生手势跟随、音频独立 worker 与逐屏布局度量见 [项目地图](01-project-map.md)、[API](02-runtime-and-api.md)、[后端](06-platform-backends.md)、[性能](07-rendering-and-performance.md) 和 [验证](08-build-docs-and-tests.md)。
+
+
+音频原生资源所有权、共享协调层安全限制与统一错误日志见 [后端](06-platform-backends.md) 和 [验证](08-build-docs-and-tests.md)。
+
+
+Shift+V+M 系统静音默认绑定与合并提示见 [配置](03-configuration.md)。

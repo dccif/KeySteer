@@ -2,7 +2,7 @@
   "name": "keysteer-docs",
   "private": true,
   "type": "module",
-  "packageManager": "pnpm@12.3.4",
+  "packageManager": "pnpm@12.4.1",
   "engines": {
     "node": ">=24"
   },

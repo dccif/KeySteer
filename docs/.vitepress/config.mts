@@ -2,6 +2,17 @@ import vueJsx from '@vitejs/plugin-vue-jsx'
 import { withMermaid } from 'vitepress-plugin-mermaid'
 
 const base = process.env.KEYSTEER_DOCS_BASE || '/'
+const windowSidebar = (prefix = '', english = false) => ({
+  text: english ? 'Window management' : '窗口管理',
+  items: [
+    { text: english ? 'Overview' : '窗口管理总览', link: `${prefix}/window-management/` },
+    { text: english ? 'Window · Move and control' : 'Window 窗口操作', link: `${prefix}/window-management/window` },
+    { text: english ? 'Quick · Split layouts' : 'Quick 快捷分屏', link: `${prefix}/window-management/quick` },
+    { text: english ? 'Editor · Tile and edit' : 'Editor 平铺与编辑', link: `${prefix}/window-management/editor` },
+    { text: english ? 'Tabs · Window groups' : 'Tabs 标签分组', link: `${prefix}/window-management/tabs` },
+    { text: english ? 'Restore · Saved workspaces' : 'Restore 保存与恢复', link: `${prefix}/window-management/restore` },
+  ],
+})
 const englishTheme = {
   nav: [
     { text: 'Get started', link: '/en/guide/getting-started' },
@@ -16,6 +27,7 @@ const englishTheme = {
       { text: 'Grid', link: '/en/modes/grid' }, { text: 'Recursive Grid', link: '/en/modes/recursive-grid' },
       { text: 'UI Hint', link: '/en/modes/ui-hint' },
     ] },
+    windowSidebar('/en', true),
     { text: 'Reference', items: [
       { text: 'Configuration', link: '/en/reference/configuration' },
       { text: 'Modes and actions', link: '/en/reference/modes-and-actions' }, { text: 'Release notes', link: '/en/releases/' },
@@ -43,8 +55,10 @@ const languageStateScript = `(() => {
   const key = 'keysteer-docs-language'
   const englishPages = new Set([
     '', 'guide/getting-started', 'guide/macos', 'modes/', 'modes/grid',
-    'modes/normal', 'modes/recursive-grid', 'modes/ui-hint', 'reference/configuration',
+    'modes/window', 'modes/normal', 'modes/recursive-grid', 'modes/ui-hint', 'reference/configuration',
     'reference/modes-and-actions', 'editor/', 'simulator', 'releases/',
+    'window-management/', 'window-management/window', 'window-management/quick',
+    'window-management/editor', 'window-management/tabs', 'window-management/restore',
   ])
   const relativePath = () => decodeURIComponent(location.pathname.startsWith(base)
     ? location.pathname.slice(base.length) : location.pathname.slice(1))
@@ -83,12 +97,12 @@ export default withMermaid({
       label: 'English',
       lang: 'en-US',
       title: 'KeySteer',
-      description: 'A fast, lightweight, native keyboard mouse-control tool.',
+      description: 'Native keyboard control for your pointer, windows, and workspace.',
       themeConfig: englishTheme,
     },
   },
   title: 'KeySteer',
-  description: '用键盘操控鼠标的原生小工具：快、轻量、可定制。',
+  description: '用键盘完成鼠标操作、窗口分屏与标签分组，搭建可复用的工作区。',
   cleanUrls: true,
   ignoreDeadLinks: [/^\/generated\//],
   head: [
@@ -129,6 +143,7 @@ export default withMermaid({
           { text: 'UI 标签模式', link: '/modes/ui-hint' },
         ],
       },
+      windowSidebar(),
       {
         text: '参考',
         items: [
@@ -236,6 +251,7 @@ export default withMermaid({
               { text: 'UI Hint', link: '/en/modes/ui-hint' },
             ],
           },
+          windowSidebar('/en', true),
           {
             text: 'Reference',
             items: [

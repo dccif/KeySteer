@@ -127,10 +127,13 @@ macOS：
 - `src/presentation/label_placement.rs`：按显式组身份统一摆放窗口卡片、区域和组编号，避让实际面板并保持引线。
 
 
-`src/platform/windows/window_audio.rs` 在窗口 worker 上枚举 Core Audio 会话，只调整目标 PID 与同可执行文件子进程的应用音量。
+`src/platform/windows/window_audio.rs` 在独立音频 worker 上枚举 Core Audio 会话，只调整目标 PID 与同可执行文件子进程的应用音量。
 
 
 `src/platform/windows/audio_policy.rs` 隔离 Windows 音频策略的版本化 COM/WinRT ABI；`window_audio.rs` 负责端点枚举、应用输出策略、系统默认输出与系统音量。
 
 
 `src/api/audio.rs` 是独立跨平台音频请求/结果词汇。`src/platform/macos/window_audio.rs` 拥有后台线程的音频控制器，`audio_bridge.m` 封装 Core Audio 系统控制与进程 Tap 的本地增益/输出路由；音频实现不进入模式模块。
+
+
+`src/platform/common/audio_worker.rs`：懒启动的独立音频 worker，64 项有界队列、会话取消标记和有界退出。窗口 worker 只解析活动成员与进程创建身份，音频线程重新验证身份后执行原生调用。

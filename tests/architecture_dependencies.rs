@@ -100,7 +100,32 @@ fn modes_and_compiled_plugins_only_consume_the_api() -> std::io::Result<()> {
         "presentation",
     ];
     assert_forbidden("src/modes", &forbidden)?;
-    assert_forbidden("src/plugins", &forbidden)
+    assert_forbidden("src/plugins", &forbidden)?;
+    for root in ["src/modes", "src/plugins"] {
+        let mut files = Vec::new();
+        rust_files(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join(root),
+            &mut files,
+        )?;
+        for path in files {
+            let source = production_source(&path)?;
+            for token in [
+                "target_os",
+                "cfg!(windows)",
+                "cfg(windows)",
+                "extern \"C\"",
+                "std::thread::sleep",
+                "std::thread::spawn",
+            ] {
+                assert!(
+                    !source.contains(token),
+                    "portable layer contains {token}: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 #[test]

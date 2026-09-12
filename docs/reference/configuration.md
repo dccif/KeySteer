@@ -305,6 +305,8 @@ macOS 支持 Accessibility tree、Vision 和 Hybrid。Windows 默认使用 `hybr
 
 ## Window 配置
 
+第一次使用？先看 [Window 操作指南](/modes/window)，按场景练习并查阅默认键位。
+
 五个顶层配置段分别为 `[window]`、`[window_quick]`、`[window_editor]`、`[window_restore]`、`[window_tab]`。它们都支持 `enabled`、`bindings`、`inherits`、`app_configs`、`temporary_mode`、`temporary_mode_keys`、`number_timeout_ms`、`border_width`、`ui` 和 `lifecycle`。默认仅继承 hotkeys，按住 Primary 临时使用 Normal。
 
 | 参数 | 所属配置 | 默认值 |

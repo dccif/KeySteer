@@ -1,6 +1,7 @@
 # Getting started
 
 <script setup>
+import ModeVideo from '../../.vitepress/components/ModeVideo'
 import KeyLayout from '../../.vitepress/components/KeyLayout'
 </script>
 
@@ -41,11 +42,33 @@ Grant Accessibility permission first; see [macOS installation and permissions](/
 
 Add `"?" = "key_help"` under `[normal.bindings]`, then press `?` (`Shift+/` on a US keyboard) to show the available keys and actions in a rounded panel centered at the bottom of the current screen. Press it again to close the panel. Omit or comment out this binding to disable it.
 
-## Adjust windows with the keyboard
+<ModeVideo file="help.mp4" title="Available key hints" description="Preview the panel, then bind key_help to a key of your choice." />
 
-Place the pointer over a window and press `Alt+W` to enter Window and lock that target. Normal movement keys (H/J/K/L by default) move it; `S` switches to resizing around its centre. Hold `Primary` to use your actual Normal bindings for pointer movement and clicks, then release it to continue adjusting the same window.
+## Your first window adjustment
 
-`A` enters Quick, `E` enters Editor with automatic arrangement, and `R` enters Restore; X in Restore enters Delete. H/J/K/L are explicit defaults in each mode. Editor uses Shift+direction to split, Ctrl+direction to move dividers, X to remove a region and Ctrl+S to save. Numbers select windows; only ambiguous prefixes wait 250ms. Q in Quick/Editor/Restore defaults to Window, and Window Q defaults to Idle. Configure Q independently in each binding table. Tab cycles windows and Z undoes.
+<ModeVideo file="window.mp4" title="Your first Window session" description="Move, resize, centre and control audio with the keyboard." />
+
+1. Place the pointer over an ordinary window.
+2. Press `Alt+W` (Option+W on macOS), then release the entry keys.
+3. Use `H/J/K/L` to move it. Press `S` to switch to centred resizing, then use the same keys.
+4. Press `Z` to undo an adjustment, or `Q` to finish and keep it.
+
+Want a split screen? Press `A` from Window, then `H` for the left half. Want to arrange several windows? Press `E`; arrangement takes effect immediately and `Z` undoes it. `T` groups windows into tabs and `R` opens saved presets.
+
+Quick, Editor, Tabs, and Restore use `Q` to return to Window; another `Q` returns to Idle. Hold `Primary` to temporarily use Normal pointer controls.
+
+Follow the [Window guide](/en/window-management/) for side-by-side layouts, tab groups, saved workspaces, audio controls, and a mode-specific key reference.
+
+## Choose your next window task
+
+| Key in Window | What happens | Learn more |
+| --- | --- | --- |
+| `A` | Choose placement and ratios with direction keys. | [Quick: fast split layouts](/en/window-management/quick) |
+| `E` | Tile immediately; swap numbered windows and adjust regions. | [Editor: tile and edit regions](/en/window-management/editor) |
+| `T` | Group compatible windows by application. | [Tabs: group windows](/en/window-management/tabs) |
+| `R` | Save an arrangement, then fill it with the windows you need today. | [Restore: saved layouts and tab templates](/en/window-management/restore) |
+
+Save from Editor or Tabs with `Ctrl+S` → optional note → `Enter`. An empty note uses an automatic name.
 
 ## The operating model at a glance
 
@@ -62,6 +85,20 @@ flowchart LR
 ```
 
 Most of the time you only switch between Idle and Normal. The three targeting modes are optional; there is no need to learn them all at once.
+
+```mermaid
+flowchart LR
+    idle["Idle<br/>normal typing"]
+    window["Window<br/>move, resize, volume"]
+    arrange["Window arrangement<br/>Quick<br/>Editor<br/>Tabs"]
+
+    idle -->|"Alt+W"| window
+    window -->|"enter when needed"| arrange
+    arrange -->|"Q"| window
+    window -->|"Q"| idle
+```
+
+Window is the starting point for window management. Quick, Editor, and Tabs are optional ways to arrange your windows.
 
 ## When the pointer needs to travel farther
 
@@ -108,7 +145,7 @@ Press `Esc` in a targeting mode to return to Normal; press it again to return to
 | `n` | Toggle a held left button for dragging |
 | `t` / `y` / `i` / `u` | Send `Home` / `End` / `Page Up` / `Page Down` |
 | `g` / `f` / `Primary+F` | `Grid` / `Recursive Grid` / `UI Hint` |
-| `Primary+S` / `Primary+S+D` | Switch the pointer display / move the window under the pointer to the next display, keeping the pointer's relative position within it |
+| `Primary+S` / `Primary+D` | Switch the pointer display / move the window under the pointer to the next display, keeping the pointer's relative position within it |
 | `q` or `Esc` | Return to Idle |
 
 </details>
@@ -141,3 +178,9 @@ keysteer --dump-config
 You can [download](/generated/keysteer.default.toml) the complete default configuration. See [Configuration](/en/reference/configuration) and [Modes and actions](/en/reference/modes-and-actions) for more.
 
 </details>
+
+## Edit bindings in your browser
+
+Open **Configuration & Simulator...** from the tray menu. It opens your browser and requires network access. The simulator is an editor and preview; native app behavior is authoritative.
+
+<ModeVideo file="config.mp4" title="Edit W and A bindings" description="Choose a key on the full keyboard, then choose its action." />

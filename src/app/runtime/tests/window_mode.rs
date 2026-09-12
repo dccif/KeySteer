@@ -309,7 +309,7 @@ fn window_all_screen_editor_submits_separate_display_layouts() {
         changed: 0, skipped: 0, message: None,
         edit: Some(Box::new(WindowEditResult::Started { transaction,
             minimums: vec![(WindowId(77), Point::new(100.0, 80.0)), (WindowId(88), Point::new(100.0, 80.0))],
-            gap_scale: 1.0, full_inventory: true })),
+            gap_scale: 1.0, screen_scales: vec![1.0], full_inventory: true })),
     })), &mut backend).unwrap();
     let log = log.lock().unwrap();
     let WindowOperation::ApplyLayout { screen, placements, additional_screens, .. } = &log.window_requests.last().unwrap().operation else { panic!("missing layout") };
@@ -548,7 +548,7 @@ fn acknowledge_window_edit_with_acceptance(engine: &mut Engine, backend: &mut Fa
             bounds: Rect::new(100.0, 100.0, 400.0, 300.0), screen: 0,
             resizable: true, maximized: false, minimized: false, fullscreen: false };
         let edit = match request.operation {
-            O::BeginEdit { transaction, targets, screen, .. } => E::Started { transaction, minimums: if screen.is_some() { vec![(target.id, Point::new(100.0, 80.0))] } else { targets.iter().map(|id| (*id, Point::new(100.0, 80.0))).collect() }, gap_scale: 1.0, full_inventory: screen.is_some() },
+            O::BeginEdit { transaction, targets, screen, .. } => E::Started { transaction, minimums: if screen.is_some() { vec![(target.id, Point::new(100.0, 80.0))] } else { targets.iter().map(|id| (*id, Point::new(100.0, 80.0))).collect() }, gap_scale: 1.0, screen_scales: vec![1.0], full_inventory: screen.is_some() },
             O::ApplyLayout { transaction, revision, ref placements, gap, .. } => {
                 if let Some((_, rect)) = placements.iter().find(|(id, _)| *id == target.id) {
                     target.bounds = crate::api::window_layout::placed_rect(engine.screens[0].work_area, *rect, gap);
@@ -1395,7 +1395,7 @@ fn window_volume_chords_repeat_direction_but_not_mute_and_release_prefix() {
             }
             let labels = log.lock().unwrap().scenes.last().unwrap().labels.clone();
             assert!(labels.iter().any(|l| l.text == "Next / previous window"));
-            assert!(labels.iter().any(|l| l.text == "Mute / unmute app"));
+            assert!(labels.iter().any(|l| l.text == "Mute / unmute · Shift: system"));
             assert!(labels.iter().any(|l| l.text == if custom { "App / system Volume − / +" } else { "Volume − / + · Shift: system" }), "volume rows: {:?}", labels.iter().map(|l| &l.text).collect::<Vec<_>>());
             let before = log.lock().unwrap().audio_requests.len();
             let window_before = log.lock().unwrap().window_requests.len();
@@ -1444,7 +1444,7 @@ fn window_audio_device_and_shift_chords_keep_application_and_system_scopes_separ
             engine.handle_backend_event(key_up(key), &mut backend).unwrap();
         }
         engine.handle_backend_event(key_down("left_shift"), &mut backend).unwrap();
-        for key in ["j", "k", "h", "l"] {
+        for key in ["j", "k", "h", "l", "m"] {
             engine.handle_backend_event(key_down(key), &mut backend).unwrap();
             let mut repeat = key_down(key);
             if let BackendEvent::Input(input) = &mut repeat { input.repeat = true; }
@@ -1461,9 +1461,9 @@ fn window_audio_device_and_shift_chords_keep_application_and_system_scopes_separ
         let app: Vec<_> = requests[before..].iter().filter_map(|r| match r.target { T::Application(target) => { assert_eq!(target, WindowId(77)); Some(r.action) }, _ => None }).collect();
         let system: Vec<_> = requests[before..].iter().filter_map(|r| match r.target { T::System => Some(r.action), _ => None }).collect();
         assert_eq!(app, [V::DevicePrevious, V::DeviceNext]);
-        assert_eq!(system, [V::Down, V::Down, V::Up, V::Up, V::DevicePrevious, V::DeviceNext, V::Down]);
+        assert_eq!(system, [V::Down, V::Down, V::Up, V::Up, V::DevicePrevious, V::DeviceNext, V::ToggleMute, V::Down]);
         assert_eq!(log.lock().unwrap().window_requests.len(), window_before, "audio must not send window requests");
-        for caption in ["Volume − / + · Shift: system", "Output ← / → · Shift: system"] {
+        for caption in ["Volume − / + · Shift: system", "Output ← / → · Shift: system", "Mute / unmute · Shift: system"] {
             assert!(log.lock().unwrap().scenes.last().unwrap().labels.iter().any(|l| l.text == caption), "missing {caption}");
         }
     }

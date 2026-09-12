@@ -1,4 +1,5 @@
 //! Worker-owned persistent groups and transactional native placement.
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,8 @@ struct Checkpoint {
 }
 
 pub(crate) struct Grouped<A> {
+    pending_bars: BTreeSet<crate::api::window_tabs::TabGroupId>,
+    interacting: BTreeSet<WindowId>,
     numbers_dirty: bool,
     scope: Option<crate::api::window::WindowScope>,
     native: A,
@@ -48,6 +51,8 @@ fn same_state(a: &Snapshot, b: &Snapshot) -> bool {
 impl<A: WindowAccess> Grouped<A> {
     pub fn new(native: A) -> Self {
         Self {
+            pending_bars: BTreeSet::new(),
+            interacting: BTreeSet::new(),
             numbers_dirty: false,
             scope: None,
             native,
@@ -144,6 +149,8 @@ impl<A: WindowAccess> Grouped<A> {
             .collect();
         self.release_header_space(&keep)?;
         self.native.tab_bars(&keep)?;
+        self.pending_bars
+            .retain(|id| keep.iter().any(|bar| bar.group == *id));
         self.bars = keep;
         Ok(())
     }
@@ -210,6 +217,7 @@ impl<A: WindowAccess> Grouped<A> {
             .iter()
             .flat_map(|g| g.members.iter().copied())
             .collect();
+        self.interacting.retain(|id| watched.contains(id));
         if watched != self.watched {
             self.native.tab_watch(&watched)?;
             self.watched = watched;
@@ -250,10 +258,66 @@ impl<A: WindowAccess> Grouped<A> {
                 tabs,
             });
         }
-        if bars != self.bars {
+        if bars != self.bars || !self.pending_bars.is_empty() {
             self.release_header_space(&bars)?;
             self.native.tab_bars(&bars)?;
             self.bars = bars;
+            self.pending_bars.clear();
+        }
+        Ok(())
+    }
+
+    /// Cached membership and metadata are untouched for unrelated groups.
+    fn publish_changed(
+        &mut self,
+        dirty: &BTreeSet<WindowId>,
+        screens: &[Screen],
+    ) -> Result<(), String> {
+        let mut fallback = false;
+        for bar in &mut self.bars {
+            if !self.pending_bars.contains(&bar.group)
+                && !bar.tabs.iter().any(|(id, _, _)| dirty.contains(id))
+            {
+                continue;
+            }
+            let mut changed = self.pending_bars.contains(&bar.group);
+            if dirty.contains(&bar.active)
+                && let Some(active) = self.observed.get(&bar.active)
+            {
+                let visible = !active.info.minimized
+                    && !active.info.fullscreen
+                    && self.native.tab_visible(bar.active);
+                changed |= bar.bounds != active.info.bounds
+                    || bar.screen != active.info.screen
+                    || bar.visible != visible;
+                bar.bounds = active.info.bounds;
+                bar.screen = active.info.screen;
+                bar.visible = visible;
+            }
+            for (id, _, title) in &mut bar.tabs {
+                if dirty.contains(id)
+                    && let Some(window) = self.observed.get(id)
+                    && *title != window.info.title
+                {
+                    title.clone_from(&window.info.title);
+                    changed = true;
+                }
+            }
+            if changed {
+                self.pending_bars.insert(bar.group);
+                if self.native.tab_bar_update(bar)? {
+                    self.pending_bars.remove(&bar.group);
+                } else {
+                    fallback = true;
+                }
+            }
+        }
+        if fallback {
+            self.native.tab_bars(&self.bars)?;
+            self.pending_bars.clear();
+        }
+        if self.screens != screens {
+            self.screens = screens.to_vec();
         }
         Ok(())
     }
@@ -334,15 +398,29 @@ impl<A: WindowAccess> Grouped<A> {
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(), String> {
         let snapshot = self.native.snapshot(id, screens)?;
+        self.fit_header_snapshot(id, &snapshot, screens, cancelled)
+            .map(|_| ())
+    }
+    fn fit_header_snapshot(
+        &mut self,
+        id: WindowId,
+        snapshot: &Snapshot,
+        screens: &[Screen],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<WindowInfo>, String> {
+        if self.interacting.contains(&id) || self.native.tab_interacting(id) {
+            return Ok(None);
+        }
+
         if snapshot.info.minimized || snapshot.info.fullscreen {
-            return Ok(());
+            return Ok(None);
         }
         let screen = screens
             .get(snapshot.info.screen)
             .ok_or("Display is unavailable")?;
         let header = self.native.tab_bar_height(screen);
         if header <= 0.0 {
-            return Ok(());
+            return Ok(None);
         }
         let mut bounds = snapshot.info.bounds;
         let available = screen.work_area.height - header;
@@ -355,9 +433,12 @@ impl<A: WindowAccess> Grouped<A> {
             screen.work_area.bottom() - bounds.height,
         );
         if !same_frame(bounds, snapshot.info.bounds) {
-            self.native.tab_fit_frame(id, bounds, screens, cancelled)?;
+            return self
+                .native
+                .tab_fit_frame(id, bounds, screens, cancelled)
+                .map(Some);
         }
-        Ok(())
+        Ok(None)
     }
 
     fn minimize_group(
@@ -835,6 +916,9 @@ impl<A: WindowAccess> Grouped<A> {
         }
         let events = self.native.tab_events();
         if events.is_empty() {
+            if !self.pending_bars.is_empty() {
+                return self.publish_changed(&BTreeSet::new(), screens);
+            }
             // A failed unhide after closure/dissolution must remain retryable
             // even when no live group is left to produce native notifications.
             if self.hidden.iter().any(|id| {
@@ -847,15 +931,26 @@ impl<A: WindowAccess> Grouped<A> {
             }
             return Ok(());
         }
-        let mut changed = BTreeSet::new();
+        let mut changed = BTreeMap::new();
+        let mut full_publish = self.screens != screens;
         let mut focus = None;
         for event in events {
             if cancelled() {
                 return Ok(());
             }
             match event {
+                TabNativeEvent::GeometryChanged(id) => {
+                    changed.entry(id).or_insert(false);
+                }
+                TabNativeEvent::MoveResizeStarted(id) => {
+                    self.interacting.insert(id);
+                }
+                TabNativeEvent::MoveResizeEnded(id) => {
+                    self.interacting.remove(&id);
+                    changed.entry(id).or_insert(false);
+                }
                 TabNativeEvent::Changed(id) => {
-                    changed.insert(id);
+                    changed.insert(id, true);
                 }
                 TabNativeEvent::Focused(id) => {
                     if self.native.tab_selected(id) {
@@ -866,33 +961,49 @@ impl<A: WindowAccess> Grouped<A> {
                     // A click supersedes foreground notifications queued before
                     // it; otherwise that stale focus could select the old tab.
                     focus = None;
+                    full_publish = true;
                     self.activate_tab(id, screens, cancelled)?;
                 }
                 TabNativeEvent::Dissolve(group) => {
+                    full_publish = true;
                     if self.groups.state.group(group).is_some() {
                         self.groups.state.target = Some(WindowTarget::Group(group));
                         self.apply_tab(TabOperation::Dissolve, screens, cancelled)?;
                     }
                 }
                 TabNativeEvent::Drop(drop) => {
+                    full_publish = true;
                     focus = None;
                     self.drop_tabs(drop, screens, cancelled)?;
                 }
-                TabNativeEvent::Closed(id) => self.close_member(id, screens, cancelled)?,
-                TabNativeEvent::VisibilityChanged => {}
+                TabNativeEvent::Closed(id) => {
+                    self.interacting.remove(&id);
+                    full_publish = true;
+                    self.close_member(id, screens, cancelled)?;
+                }
+                TabNativeEvent::VisibilityChanged => {
+                    full_publish = true;
+                }
             }
         }
-        for id in changed {
+        let dirty: BTreeSet<_> = changed.keys().copied().collect();
+        for (id, metadata) in changed {
             if cancelled() {
                 return Ok(());
             }
             if self.groups.state.containing(id).is_none() {
                 continue;
             }
-            let Ok(now) = self.native.snapshot(id, screens) else {
+            let read = if !metadata && let Some(previous) = self.observed.get(&id) {
+                self.native.tab_geometry(id, previous, screens)
+            } else {
+                self.native.snapshot(id, screens)
+            };
+            let Ok(mut now) = read else {
                 continue;
             };
             if now.info.fullscreen {
+                full_publish = true;
                 self.groups.detach(id);
                 continue;
             }
@@ -903,6 +1014,7 @@ impl<A: WindowAccess> Grouped<A> {
                 .is_some_and(|g| g.active == id)
             {
                 if now.info.minimized {
+                    full_publish = true;
                     self.minimize_group(id, screens, cancelled)?;
                     // Minimize notifications can be accompanied by old focus
                     // notifications. Do not let them reopen a different member.
@@ -915,7 +1027,9 @@ impl<A: WindowAccess> Grouped<A> {
                         focus = None;
                     }
                 }
-                self.fit_header(id, screens, cancelled)?;
+                if let Some(info) = self.fit_header_snapshot(id, &now, screens, cancelled)? {
+                    now.info = info;
+                }
             }
             self.observed.insert(id, now);
             // Physical geometry changes never select or move another member.
@@ -929,9 +1043,14 @@ impl<A: WindowAccess> Grouped<A> {
                 .containing(id)
                 .is_some_and(|g| g.active != id)
         {
+            full_publish = true;
             self.activate_tab(id, screens, cancelled)?;
         }
-        self.publish(screens)
+        if full_publish {
+            self.publish(screens)
+        } else {
+            self.publish_changed(&dirty, screens)
+        }
     }
     fn close_member(
         &mut self,
@@ -1169,6 +1288,22 @@ impl<A: WindowAccess> WindowAccess for Grouped<A> {
     }
     fn select(&self, id: WindowId) -> Result<(), String> {
         self.native.select(id)
+    }
+    fn audio_factory(&self) -> Option<super::audio_worker::AudioFactory> {
+        self.native.audio_factory()
+    }
+    fn audio_process(
+        &self,
+        target: crate::api::audio::AudioTarget,
+    ) -> Result<Option<super::audio_worker::AudioProcess>, String> {
+        use crate::api::audio::AudioTarget;
+        let target = match target {
+            AudioTarget::Application(id) => {
+                AudioTarget::Application(self.groups.state.containing(id).map_or(id, |g| g.active))
+            }
+            AudioTarget::System => AudioTarget::System,
+        };
+        self.native.audio_process(target)
     }
     fn maintain_audio(&self) -> bool {
         self.native.maintain_audio()

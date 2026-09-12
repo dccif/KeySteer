@@ -106,6 +106,77 @@ pub(super) fn tab_window_visible(hwnd: HWND) -> bool {
 }
 
 impl Windows {
+    fn read_snapshot(
+        &self,
+        id: WindowId,
+        screens: &[Screen],
+        previous: Option<&WindowInfo>,
+    ) -> Result<Snapshot, String> {
+        let application = self.hwnd(id)?;
+        let hwnd = application;
+        let mut bounds =
+            super::accessibility::window_bounds(hwnd).ok_or("cannot read window bounds")?;
+        let p = self.placement(hwnd)?;
+        let minimized = super::native::is_window_iconic(hwnd);
+        let mut restored = rect(p.rcNormalPosition);
+        // Iconic window bounds may be the off-screen -32000 sentinel. Resolve
+        // the display from its restore placement before applying workspace offsets.
+        let screen =
+            window_geometry::screen_index(screens, if minimized { restored } else { bounds })
+                .ok_or("no displays")?;
+        if super::native::window_long(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW.0 == 0 {
+            restored.x += screens[screen].work_area.x - screens[screen].bounds.x;
+            restored.y += screens[screen].work_area.y - screens[screen].bounds.y;
+        }
+        if restored.width <= 0.0 || restored.height <= 0.0 {
+            restored = bounds;
+        }
+        if !minimized && let Ok(outer) = read_bounds(hwnd) {
+            restored.x += bounds.x - outer.x;
+            restored.y += bounds.y - outer.y;
+            restored.width += bounds.width - outer.width;
+            restored.height += bounds.height - outer.height;
+        }
+        if let Some(original) = self.windows[&id].cycle_restore {
+            restored = original;
+        }
+        if minimized {
+            bounds = restored;
+        }
+        let screen = window_geometry::screen_index(screens, bounds).ok_or("no displays")?;
+        let title = previous.map_or_else(
+            || super::native::window_title(application),
+            |info| info.title.clone(),
+        );
+        let app = self.windows[&id].app.clone();
+        let mut info = WindowInfo {
+            id,
+            title,
+            app,
+            bounds,
+            screen,
+            resizable: super::native::window_long(hwnd, GWL_STYLE) as u32 & WS_THICKFRAME.0 != 0,
+            maximized: p.showCmd == SW_SHOWMAXIMIZED.0 as u32,
+            minimized,
+            fullscreen: !minimized
+                && p.showCmd != SW_SHOWMAXIMIZED.0 as u32
+                && super::native::window_long(hwnd, GWL_STYLE) as u32
+                    & windows::Win32::UI::WindowsAndMessaging::WS_CAPTION.0
+                    == 0
+                && bounds.width >= screens[screen].bounds.width
+                && bounds.height >= screens[screen].bounds.height,
+        };
+        if let Some(prepared) = self.prepared.get(&id) {
+            info.bounds = prepared.bounds;
+            info.screen = window_geometry::screen_index(screens, prepared.bounds)
+                .ok_or("display unavailable")?;
+            info.maximized = false;
+            info.minimized = false;
+            restored = prepared.bounds;
+        }
+        Ok(Snapshot { info, restored })
+    }
+
     fn tab_opacity(&mut self, id: WindowId, hwnd: HWND, hidden: bool) -> Result<bool, String> {
         let owned = self.transparent.contains(&id);
         let style = super::native::window_long(hwnd, GWL_EXSTYLE);
@@ -606,6 +677,11 @@ impl WindowAccess for Windows {
         self.prune_closed();
         let mut windows = Vec::with_capacity(self.windows.len().min(256));
         for index in 0..self.handles.len() {
+            // A bounded slice yields to native location events so an inventory
+            // refresh cannot hold the independent tab strip behind the window.
+            if index.is_multiple_of(8) {
+                super::window_tabs::NativeTabs::dispatch_messages();
+            }
             let hwnd = self.handles[index];
             if cancelled() || windows.len() >= 256 {
                 break;
@@ -618,6 +694,9 @@ impl WindowAccess for Windows {
         }
         // Invisible members retain their stable identity and remain selectable.
         for id in &self.hidden {
+            if cancelled() {
+                break;
+            }
             if !windows.iter().any(|w| w.id == *id)
                 && let Ok(snapshot) = self.snapshot(*id, screens)
             {
@@ -627,66 +706,22 @@ impl WindowAccess for Windows {
         Ok(windows)
     }
     fn snapshot(&self, id: WindowId, screens: &[Screen]) -> Result<Snapshot, String> {
-        let application = self.hwnd(id)?;
-        let hwnd = application;
-        let mut bounds =
-            super::accessibility::window_bounds(hwnd).ok_or("cannot read window bounds")?;
-        let p = self.placement(hwnd)?;
-        let minimized = super::native::is_window_iconic(hwnd);
-        let mut restored = rect(p.rcNormalPosition);
-        // Iconic window bounds may be the off-screen -32000 sentinel. Resolve
-        // the display from its restore placement before applying workspace offsets.
-        let screen =
-            window_geometry::screen_index(screens, if minimized { restored } else { bounds })
-                .ok_or("no displays")?;
-        if super::native::window_long(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW.0 == 0 {
-            restored.x += screens[screen].work_area.x - screens[screen].bounds.x;
-            restored.y += screens[screen].work_area.y - screens[screen].bounds.y;
-        }
-        if restored.width <= 0.0 || restored.height <= 0.0 {
-            restored = bounds;
-        }
-        if !minimized && let Ok(outer) = read_bounds(hwnd) {
-            restored.x += bounds.x - outer.x;
-            restored.y += bounds.y - outer.y;
-            restored.width += bounds.width - outer.width;
-            restored.height += bounds.height - outer.height;
-        }
-        if let Some(original) = self.windows[&id].cycle_restore {
-            restored = original;
-        }
-        if minimized {
-            bounds = restored;
-        }
-        let screen = window_geometry::screen_index(screens, bounds).ok_or("no displays")?;
-        let title = super::native::window_title(application);
-        let app = self.windows[&id].app.clone();
-        let mut info = WindowInfo {
-            id,
-            title,
-            app,
-            bounds,
-            screen,
-            resizable: super::native::window_long(hwnd, GWL_STYLE) as u32 & WS_THICKFRAME.0 != 0,
-            maximized: p.showCmd == SW_SHOWMAXIMIZED.0 as u32,
-            minimized,
-            fullscreen: !minimized
-                && p.showCmd != SW_SHOWMAXIMIZED.0 as u32
-                && super::native::window_long(hwnd, GWL_STYLE) as u32
-                    & windows::Win32::UI::WindowsAndMessaging::WS_CAPTION.0
-                    == 0
-                && bounds.width >= screens[screen].bounds.width
-                && bounds.height >= screens[screen].bounds.height,
-        };
-        if let Some(prepared) = self.prepared.get(&id) {
-            info.bounds = prepared.bounds;
-            info.screen = window_geometry::screen_index(screens, prepared.bounds)
-                .ok_or("display unavailable")?;
-            info.maximized = false;
-            info.minimized = false;
-            restored = prepared.bounds;
-        }
-        Ok(Snapshot { info, restored })
+        self.read_snapshot(id, screens, None)
+    }
+    fn tab_geometry(
+        &self,
+        id: WindowId,
+        previous: &Snapshot,
+        screens: &[Screen],
+    ) -> Result<Snapshot, String> {
+        self.read_snapshot(id, screens, Some(&previous.info))
+    }
+    fn tab_interacting(&self, id: WindowId) -> bool {
+        super::window_tabs::interacting(id)
+    }
+    fn tab_bar_update(&mut self, bar: &crate::api::window_tabs::TabBar) -> Result<bool, String> {
+        self.tabs.update_bar(bar, &self.tab_screens)?;
+        Ok(true)
     }
     fn set_frame(
         &mut self,
@@ -902,20 +937,22 @@ impl WindowAccess for Windows {
     fn pointer(&self) -> Result<Point, String> {
         super::input::cursor_position()
     }
-    fn system_audio(&self, change: crate::api::audio::AudioAction) -> Result<String, String> {
-        super::window_audio::system(change)
+    fn audio_factory(&self) -> Option<crate::platform::common::audio_worker::AudioFactory> {
+        Some(super::window_audio::create_backend)
     }
-    fn volume(
+    fn audio_process(
         &self,
-        id: WindowId,
-        change: crate::api::audio::AudioAction,
-    ) -> Result<String, String> {
+        target: crate::api::audio::AudioTarget,
+    ) -> Result<Option<crate::platform::common::audio_worker::AudioProcess>, String> {
+        let crate::api::audio::AudioTarget::Application(id) = target else {
+            return Ok(None);
+        };
         self.hwnd(id)?;
         let identity = self
             .windows
             .get(&id)
             .ok_or("window is no longer available")?;
-        super::window_audio::change(identity.pid, change)
+        super::window_audio::process(identity.pid).map(Some)
     }
     fn close(&self, id: WindowId) -> Result<(), String> {
         let hwnd = self.hwnd(id)?;
@@ -2480,6 +2517,23 @@ mod tests {
                 }));
                 Ok(())
             }
+            fn tab_bar_update(
+                &mut self,
+                bar: &crate::api::window_tabs::TabBar,
+            ) -> Result<bool, String> {
+                self.native.tab_bar_update(bar)
+            }
+            fn tab_geometry(
+                &self,
+                id: WindowId,
+                previous: &Snapshot,
+                screens: &[Screen],
+            ) -> Result<Snapshot, String> {
+                self.native.tab_geometry(id, previous, screens)
+            }
+            fn tab_interacting(&self, id: WindowId) -> bool {
+                self.native.tab_interacting(id)
+            }
             fn tab_events(&mut self) -> Vec<TabNativeEvent> {
                 let mut events = std::mem::take(&mut *self.events.borrow_mut());
                 events.extend(self.native.tab_events());
@@ -2571,9 +2625,14 @@ mod tests {
         // strip must already be at the new location before the model is pumped.
         let mut raw = read_bounds(second.hwnd).unwrap();
         raw.x += 19.0;
+        raw.width -= 37.0;
+        raw.height -= 19.0;
         submit_frame(second.hwnd, raw).unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
-        while (read_bounds(second.hwnd).unwrap().x - raw.x).abs() > 1.0 {
+        while {
+            let actual = read_bounds(second.hwnd).unwrap();
+            (actual.x - raw.x).abs() > 1.0 || (actual.width - raw.width).abs() > 1.0
+        } {
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
         }
@@ -2581,6 +2640,7 @@ mod tests {
         super::super::window_tabs::handle_window_event(EVENT_OBJECT_LOCATIONCHANGE, second.hwnd, 0);
         let strip_bounds = read_bounds(strip_handle.get()).unwrap();
         assert!((strip_bounds.x - moved.x).abs() <= 1.0);
+        assert!((strip_bounds.width - moved.width).abs() <= 1.0);
         assert!((strip_bounds.bottom() - moved.y).abs() <= 1.0);
         assert_eq!(
             super::super::accessibility::window_bounds(first.hwnd).unwrap(),

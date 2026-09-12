@@ -389,12 +389,23 @@ bool KSMaintainAudio(void *value) {
         } @catch (NSException *exception) { return true; }
     }
 }
-bool KSChangeAudio(void *value, int32_t pid, uint32_t action, char *buffer, size_t capacity) {
+uint64_t KSAudioProcessIdentity(int32_t pid) {
+    @autoreleasepool {
+        @try {
+            NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+            if (!app || app.terminated || !app.launchDate) return 0;
+            double date = app.launchDate.timeIntervalSince1970;
+            uint64_t identity = 0; memcpy(&identity, &date, sizeof(identity)); return identity;
+        } @catch (NSException *exception) { return 0; }
+    }
+}
+bool KSChangeAudio(void *value, int32_t pid, uint64_t started, uint32_t action, char *buffer, size_t capacity) {
     @autoreleasepool {
         bool ok = false; NSString *message = @"Cannot create audio controller";
         @try {
             KSAudioController *owner = (__bridge KSAudioController *)value;
             if (owner && pid == 0) message = SystemChange(action, &ok);
+            else if (owner && (started == 0 || KSAudioProcessIdentity(pid) != started)) message = @"Application audio target has expired";
             else if (owner) {
                 if ([NSProcessInfo.processInfo isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){14, 2, 0}]) {
                     KSMaintainAudio(value);

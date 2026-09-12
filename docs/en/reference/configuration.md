@@ -244,6 +244,8 @@ macOS supports Accessibility Tree, Vision, and Hybrid. Windows defaults to `hybr
 
 ## Window configuration
 
+New to window control? Start with the [Window guide](/en/modes/window) for practical recipes and default keys.
+
 Use the five top-level sections `[window]`, `[window_quick]`, `[window_editor]`, `[window_restore]` and `[window_tab]`. Each supports its own `enabled`, `bindings`, `inherits`, `app_configs`, `temporary_mode`, `temporary_mode_keys`, `number_timeout_ms`, `border_width`, `ui` and `lifecycle`. Defaults inherit hotkeys and temporarily use Normal while Primary is held.
 
 | Parameter | Section | Default |

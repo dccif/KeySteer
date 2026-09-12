@@ -46,7 +46,6 @@ impl crate::platform::macos::window_move::WindowAccess for &MovableWindow {
 
 #[derive(Default)]
 pub(in crate::platform::macos) struct MacWindows {
-    audio: crate::platform::macos::window_audio::AudioController,
     include_minimized: bool,
     next: u64,
     entries: BTreeMap<WindowId, Entry>,
@@ -330,6 +329,10 @@ impl WindowAccess for MacWindows {
             })
             .collect::<Result<Vec<_>, _>>()?;
         self.monitor.watch(&windows)
+    }
+    fn tab_bar_update(&mut self, bar: &crate::api::window_tabs::TabBar) -> Result<bool, String> {
+        crate::platform::macos::window_tabs::publish_one(bar)?;
+        Ok(true)
     }
     fn tab_bars(&mut self, bars: &[crate::api::window_tabs::TabBar]) -> Result<(), String> {
         crate::platform::macos::window_tabs::publish(bars);
@@ -643,21 +646,19 @@ impl WindowAccess for MacWindows {
         )
     }
 
-    fn system_audio(&self, change: crate::api::audio::AudioAction) -> Result<String, String> {
-        self.audio.change(None, change)
+    fn audio_factory(&self) -> Option<crate::platform::common::audio_worker::AudioFactory> {
+        Some(crate::platform::macos::window_audio::create_backend)
     }
-    fn volume(
+    fn audio_process(
         &self,
-        id: WindowId,
-        change: crate::api::audio::AudioAction,
-    ) -> Result<String, String> {
+        target: crate::api::audio::AudioTarget,
+    ) -> Result<Option<crate::platform::common::audio_worker::AudioProcess>, String> {
+        let crate::api::audio::AudioTarget::Application(id) = target else {
+            return Ok(None);
+        };
         let entry = self.entry(id)?;
-        // Read the retained AX window before trusting its original process ID.
         crate::platform::macos::window_move::WindowAccess::snapshot(&entry.window)?;
-        self.audio.change(Some(entry.pid), change)
-    }
-    fn maintain_audio(&self) -> bool {
-        self.audio.maintain()
+        crate::platform::macos::window_audio::process(entry.pid).map(Some)
     }
     fn select(&self, id: WindowId) -> Result<(), String> {
         let entry = self.entry(id)?;

@@ -45,6 +45,8 @@ f = "recursive_grid"
 
 ## Window 模式
 
+第一次使用？先看 [Window 操作指南](/modes/window)，按场景练习并查阅默认键位。
+
 Window、Quick、Editor、Restore 和 Tabs 各自增加两项独立配置：
 
 ```toml
@@ -342,3 +344,6 @@ Window、Quick（A）、Editor（E）共同提供：
 
 
 macOS 的系统音频控制使用 Core Audio；应用独立音量、静音和输出要求 macOS 14.2 或更高版本，并需允许 KeySteer 的“系统音频录制”权限。请使用打包的 KeySteer.app。应用音频仅在内存中处理并重放，不录音保存或上传，但会增加少量播放延迟。旧版本或不支持音量调节的设备会显示原因。应用音频设置在模式退出后继续生效，退出 KeySteer 时恢复原始播放路径。权限要求参见 [Apple 的 Core Audio Tap 说明](https://developer.apple.com/documentation/CoreAudio/capturing-system-audio-with-core-audio-taps)。
+
+
+Window、Quick、Editor 中，`V+M` 切换当前应用静音，`Shift+V+M` 切换系统静音。按住不会反复切换；系统动作可重绑为 `window_system_volume_mute`。已有自定义绑定表需添加 `"shift+v+m" = "window_system_volume_mute"`。

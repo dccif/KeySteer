@@ -910,6 +910,7 @@ fn window_action_label(action: &str) -> Option<&'static str> {
         "window_volume_down" => "App volume down",
         "window_volume_up" => "App volume up",
         "window_volume_mute" => "Mute / unmute app",
+        "window_system_volume_mute" => "Mute / unmute system",
         "window_close" => "Close window",
         "window_select" => "Next window",
         "window_select_previous" => "Previous window",

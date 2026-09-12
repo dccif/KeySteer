@@ -4,7 +4,7 @@ use crate::api::Screen;
 use crate::api::window::WindowId;
 use crate::api::window_tabs::{TabBar, TabDrop, TabGroupId, TabNativeEvent, WindowTarget};
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::{Rc, Weak};
 use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
@@ -63,7 +63,11 @@ thread_local! {
     static WATCHED: RefCell<BTreeMap<isize, WindowId>> = const { RefCell::new(BTreeMap::new()) };
     static EVENTS: RefCell<Vec<TabNativeEvent>> = const { RefCell::new(Vec::new()) };
     static TRACKING: RefCell<BTreeMap<WindowId, Weak<strip::Strip>>> = const { RefCell::new(BTreeMap::new()) };
+    static INTERACTING: RefCell<BTreeSet<WindowId>> = const { RefCell::new(BTreeSet::new()) };
     static SCREENS: RefCell<Vec<Screen>> = const { RefCell::new(Vec::new()) };
+}
+pub(super) fn interacting(id: WindowId) -> bool {
+    INTERACTING.with(|ids| ids.borrow().contains(&id))
 }
 fn enqueue(event: TabNativeEvent) {
     EVENTS.with(|events| {
@@ -117,15 +121,40 @@ pub(super) fn handle_window_event(event: u32, hwnd: HWND, object: i32) {
     }
     let direct = WATCHED.with(|watched| watched.borrow().get(&(hwnd.0 as isize)).copied());
     if let Some(id) = direct {
+        if event == EVENT_SYSTEM_MOVESIZESTART {
+            INTERACTING.with(|ids| {
+                ids.borrow_mut().insert(id);
+            });
+            enqueue(TabNativeEvent::MoveResizeStarted(id));
+            return;
+        }
+        if event == EVENT_SYSTEM_MOVESIZEEND {
+            INTERACTING.with(|ids| {
+                ids.borrow_mut().remove(&id);
+            });
+            enqueue(TabNativeEvent::MoveResizeEnded(id));
+            return;
+        }
         if event == EVENT_OBJECT_LOCATIONCHANGE {
             let strip = TRACKING.with(|strips| strips.try_borrow().ok()?.get(&id)?.upgrade());
-            if let Some(strip) = strip {
+            let followed = strip.is_some_and(|strip| {
                 SCREENS.with(|screens| {
-                    if let Ok(screens) = screens.try_borrow() {
-                        strip.follow(hwnd, &screens);
-                    }
-                });
+                    screens
+                        .try_borrow()
+                        .is_ok_and(|screens| strip.follow(hwnd, &screens))
+                })
+            });
+            // Native move/size updates only the owned strip. The end event
+            // reconciles the model once, without fighting the application.
+            if !followed || !interacting(id) {
+                enqueue(TabNativeEvent::GeometryChanged(id));
             }
+            return;
+        }
+        if event == EVENT_OBJECT_DESTROY {
+            INTERACTING.with(|ids| {
+                ids.borrow_mut().remove(&id);
+            });
         }
         enqueue(match event {
             EVENT_OBJECT_DESTROY => TabNativeEvent::Closed(id),
@@ -158,6 +187,10 @@ impl NativeTabs {
                 .map(|(id, hwnd)| (hwnd.0 as isize, *id))
                 .collect()
         });
+        INTERACTING.with(|ids| {
+            ids.borrow_mut()
+                .retain(|id| identities.iter().any(|(current, _)| current == id))
+        });
         if identities.is_empty() {
             self.unhook();
             return Ok(());
@@ -165,6 +198,7 @@ impl NativeTabs {
         if self.hooks.is_empty() {
             for (first, last) in [
                 (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
+                (EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND),
                 (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
                 (EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE),
                 (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE),
@@ -218,6 +252,14 @@ impl NativeTabs {
         Self::dispatch_messages();
         EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
     }
+    pub fn update_bar(&mut self, bar: &TabBar, screens: &[Screen]) -> Result<(), String> {
+        // Membership and ownership cannot change on this path.
+        let strip = self
+            .strips
+            .get(&bar.group)
+            .ok_or("Tab strip is no longer available")?;
+        strip.update(bar, screens.get(bar.screen))
+    }
     pub fn show(&mut self, bars: &[TabBar], screens: &[Screen]) -> Result<(), String> {
         SCREENS.with(|current| {
             if *current.borrow() != screens {
@@ -258,6 +300,7 @@ impl NativeTabs {
 impl Drop for NativeTabs {
     fn drop(&mut self) {
         self.unhook();
+        INTERACTING.with(|w| w.borrow_mut().clear());
         WATCHED.with(|w| w.borrow_mut().clear());
         TRACKING.with(|w| w.borrow_mut().clear());
         SCREENS.with(|w| w.borrow_mut().clear());

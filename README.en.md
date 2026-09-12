@@ -4,17 +4,22 @@
   <img src="assets/brand/keysteer-wordmark.webp" alt="KeySteer" width="760">
 </p>
 
-<p align="center"><strong>Put your mouse in the hands of your keyboard: lightweight, native, and configurable.</strong></p>
+<p align="center"><strong>From clicks to split screens, put your workspace on your keyboard.</strong></p>
 
 <p align="center">
   <sub>Language / 语言 · <a href="README.md">简体中文</a> · <strong>English</strong></sub>
 </p>
 
-KeySteer is a keyboard-driven mouse-control tool for Windows and macOS.
+KeySteer brings native keyboard control to Windows and macOS. Move and click with `hjkl`, type labels to target controls, then move, tile, and group windows with Window mode. Keep your hands on the keys and your attention on the task.
 
-[Documentation](https://dccif.github.io/KeySteer/en/) · [中文文档](https://dccif.github.io/KeySteer/)
+[Download](https://github.com/dccif/KeySteer/releases/latest) · [Get started](https://dccif.github.io/KeySteer/en/guide/getting-started) · [Window guide](https://dccif.github.io/KeySteer/en/modes/window) · [Try the simulator](https://dccif.github.io/KeySteer/en/editor/)
 
 ## Features
+
+- **Window**: move, resize, centre, and move windows between displays with `Alt+W`.
+- **Quick & Editor**: place one window on half a screen or arrange several, then fine-tune their space.
+- **Tabs & workspaces**: group windows into persistent tabs; save layouts and tab templates for reuse.
+- **Audio controls**: adjust application or system volume and output devices from your layout. See the [Window guide](docs/en/modes/window.md) for platform requirements.
 
 - **Normal**: move the pointer with Vim-style `hjkl` keys.
 - **Hold and drag**: hold or toggle the left, middle, or right mouse button for dragging.
@@ -26,7 +31,65 @@ KeySteer is a keyboard-driven mouse-control tool for Windows and macOS.
 
 `Primary` is a cross-platform name: it is `Command` on macOS and `Alt` on Windows by default. Change it to a physical key you prefer in `[key_aliases]`.
 
+## Nanosecond-scale core response
+
+**151 ns on the core key-processing path** — developer-machine test for **0.9.21**. That is **0.151 μs / 0.000151 ms**. This is a core-path measurement, not total keyboard-to-screen latency; native input injection, rendering and display refresh add their own time.
+
+## Two ways to start
+
+| Try this | Default sequence |
+| --- | --- |
+| Move and click | `Primary+E` → `H/J/K/L` → `;` → `Esc` |
+| Move a window | Pointer over the window → `Alt+W` → release entry keys → `H/J/K/L` → `Q` |
+| Arrange several windows | `Alt+W` → `E` (applies immediately) → `Z` to undo |
+
+On macOS, the Window entry is **Option+W**, not Command+W. From Window, use `A` for Quick, `T` for Tabs, and `R` for saved presets. Start with the [step-by-step Window guide](docs/en/modes/window.md).
+
 ## Video demonstrations
+
+Seven short, silent simulator recordings: **keys and the current action centred together at the bottom**, with Chinese and English captions. Play the videos below directly on GitHub. All bindings shown are configurable.
+
+### Window: control your workspace
+
+Move with `H/J/K/L`, switch to resize with `S`, centre with `C`, and cycle maximize/minimize/restore with `F`. Use `V` chords for audio and `X` to close the selected window.
+
+https://github.com/user-attachments/assets/a1f38691-f6cf-45bf-b264-03a1a70cd104
+
+### Quick: press A for split layouts
+
+Press `A` from Window, then use direction keys to place the window. Repeat a direction to change its ratio; customise `split_ratios`, or press `Q` to return to Window.
+
+https://github.com/user-attachments/assets/e9a278cd-a05a-4931-80cc-d2f832142296
+
+### Editor: press E to tile and fine-tune
+
+`E` tiles immediately. Type `1`, then `2` to swap windows; use `Shift+direction` to split regions, `Ctrl+direction` to move dividers, and direction keys to adjust the layout.
+
+https://github.com/user-attachments/assets/e21b68e3-f970-4e47-b5a2-fec80720b43b
+
+### Tabs: group windows by application
+
+On first entry with `T` from Window, windows are grouped by application. Use `Tab` / `Shift+Tab` to cycle through members and direction keys to move the group.
+
+https://github.com/user-attachments/assets/2c1b894d-7402-4b57-9fd1-da03f5bd81a9
+
+### Save: keep layouts and tab groups
+
+Press `Ctrl+S` in Editor or Tabs, optionally enter a note, then press `Enter`. Leave the note empty for an automatic name. Saved presets describe layout and grouping arrangements, not a list of applications to launch.
+
+https://github.com/user-attachments/assets/9965dbb6-ed80-4071-b636-563563b83b7d
+
+### key_help: keep available actions in view
+
+The panel lists available keys and actions. Add `"?" = "key_help"` to the relevant mode’s bindings to toggle it with the question mark, or choose another key. A binding is required. This clip invokes the same action with the simulator’s preview button.
+
+https://github.com/user-attachments/assets/9c28c826-d465-4d47-b671-7a275c282a76
+
+### Configuration & Simulator: edit on a full keyboard
+
+Tray context menu → **Configuration & Simulator...** opens your browser (network access required). Click a key on the full keyboard and choose an action, e.g. `W → move_up` and `A → move_left`. The menu entry is illustrated; the binding editor is the actual project simulator. Native application behavior is authoritative.
+
+https://github.com/user-attachments/assets/fbb5f750-fcda-4d3f-92da-1f7667387927
 
 ### Normal
 
@@ -84,7 +147,7 @@ cargo run -- --dump-config
 cargo run -- --doctor
 ```
 
-See the [configuration reference](docs/reference/configuration.md) and [modes and actions](docs/reference/modes-and-actions.md). You can also edit bindings and styles in the [Configuration & Simulator](https://dccif.github.io/KeySteer/en/editor/).
+See the [configuration reference](docs/en/reference/configuration.md) and [modes and actions](docs/en/reference/modes-and-actions.md). You can also edit bindings and styles in the [Configuration & Simulator](https://dccif.github.io/KeySteer/en/editor/).
 
 ## Installation
 

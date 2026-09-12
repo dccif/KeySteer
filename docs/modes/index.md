@@ -31,10 +31,11 @@ flowchart LR
 | 快速到达屏幕某个区域       | [Grid](/modes/grid)                     | 不依赖应用无障碍信息 |
 | 精确到细小按钮或图标       | [Recursive Grid](/modes/recursive-grid) | 在当前区域反复细分           |
 | 找按钮、链接、菜单、输入框 | [UI Hint](/modes/ui-hint)               | 根据可访问性树或视觉识别显示标签          |
+| 移动分屏、组合标签、恢复工作区 | [Window](/modes/window) | 从单窗口调整到可复用的布局 |
 
 ## Idle：安静待机
 
-Idle 是启动时的默认状态，只监听 `[hotkeys]` 中的入口，不会拦截普通文字输入。通常入口是 `Primary+E`：macOS 为 `Command+E`，Windows/Linux 为 `Alt`；如果配置覆盖了 `Primary` 别名，则以你的配置为准。
+Idle 是启动时的默认状态，只监听 `[hotkeys]` 中的入口，不会拦截普通文字输入。通常入口是 `Primary+E`：macOS 为 `Command+E`，Windows 为 `Alt+E`；如果配置覆盖了 `Primary` 别名，则以你的配置为准。
 
 可以从 Idle 直接启动任意 Mode：
 

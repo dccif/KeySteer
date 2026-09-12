@@ -28,7 +28,7 @@ Windows 栏使用可滚动的标签视口，保留最小可读宽度；纵向滚
 
 窗口分组在 Windows 与 macOS 共用 `common/window_tabs.rs` 的活动成员模型，应用始终保持独立顶层窗口。每组只显示活动成员；拖动、缩放、布局、跨屏与状态切换只写活动窗口，不向隐藏成员发送跟随移动。切换编号或 Tab 时，先取得前一活动成员的最新矩形，在隐藏状态准备新成员，然后显示新成员并收起旧成员。追加以当前活动成员作为几何基准，不能使用尚未跟随移动的首成员旧坐标。
 
-后台组合寿命独立于 Window 模式。后台屏幕上下文只随有效请求更新；取消模式的空屏幕唤醒不能覆盖它。所有原生操作在串行窗口 worker 中执行。库存保留隐藏成员的稳定身份，对外几何投影为活动成员的矩形；布局将整组折叠成一个代表，写入再路由到实际活动成员。活动成员选择与前台权限分开，系统拒绝焦点不能回滚已经完成的可见性切换。
+后台组合寿命独立于 Window 模式。后台屏幕上下文只随有效请求更新；取消模式的空屏幕唤醒不能覆盖它。窗口原生操作在串行窗口 worker 中执行，音频原生执行使用独立 worker。库存保留隐藏成员的稳定身份，对外几何投影为活动成员的矩形；布局将整组折叠成一个代表，写入再路由到实际活动成员。活动成员选择与前台权限分开，系统拒绝焦点不能回滚已经完成的可见性切换。
 
 Windows `window_tabs.rs` 拥有 WinEvent hook，`window_tabs/strip.rs` 拥有独立标签栏及缓存字体/画刷。标签栏使用活动应用作为自身 popup owner，切换前转移 owner，不设全局 TOPMOST，不修改应用父级或嵌入样式。栏的类和鼠标消息明确设置箭头；鼠标拖拽使用原生 capture、拖动阈值和插入提示，拖动标签转移单窗口，拖动组编号合并整组；无有效落点、取消或失去 capture 不提交。只有明确鼠标按下才请求应用焦点。
 
@@ -374,16 +374,22 @@ Window 入口复用 worker 的 activate_window（Windows 前台激活、macOS �
 Grouped::close 将组内任意代表解析为活动成员，只向它发正常关闭请求；确认关闭后由既有 close_member/forget 清理成员，剩一个自动解散、撤下标签栏并显示剩余窗口。请求阶段不修改成员表，取消保存不会丢失分组。
 
 
-Windows 应用音量由 window_audio 在既有窗口 worker 初始化 MTA COM，枚举全部活动输出端点的应用会话。只选择目标 PID 与同可执行文件后代 PID，避免 Explorer 的其他子应用被纳入；应用音量不使用系统总音量；显式 Shift 音频动作通过 IAudioEndpointVolume 修改默认输出的系统音量。无会话明确返回提示。多窗口共用音频进程时音量共享。Windows 原生实现使用平台无关的 AudioAction。
+Windows 应用音量由 window_audio 在独立音频 worker 初始化 MTA COM，枚举全部活动输出端点的应用会话。只选择目标 PID 与同可执行文件后代 PID，避免 Explorer 的其他子应用被纳入；应用音量不使用系统总音量；显式 Shift 音频动作通过 IAudioEndpointVolume 修改默认输出的系统音量。无会话明确返回提示。多窗口共用音频进程时音量共享。Windows 原生实现使用平台无关的 AudioAction。
 
 
 输出切换按设备名称/ID 稳定排序并循环，只枚举活动 render 端点。应用偏好经 AudioPolicyConfig 的现代 IID、旧版 IID 依次激活，系统默认经 IPolicyConfig；接口不支持时返回错误，不跨音频范围降级。写入前保存旧偏好，任一写入失败尝试回滚并报告回滚结果。只在 Windows 原生模块封装经过核对的私有 ABI，不在模式中调用原生 API。应用能否立即迁移当前音频流取决于其自身是否响应系统路由变化。
 
 
-音频请求与窗口请求在后端共享有界 FIFO worker，以复用 HWND/AX 稳定身份与组活动成员解析；Audio 是独立队列项，在进入布局 Session 前分发，不受布局事务和库存合并影响。Backend::request_audio 可单独启动 worker（系统音量无需 Acquire），取消音频只移除该调用者的音频项。
+音频请求先在窗口 worker 解析 HWND/AX 稳定身份与组活动成员，再提交独立 audio worker，不占用原生标签跟随线程执行设备枚举或权限调用。Backend::request_audio 可独立启动这条链路（系统音量无需 Acquire）；会话取消标记同时覆盖解析前、排队和执行后的反馈。执行前验证进程创建身份，防止 PID 重用。
 
 macOS `window_audio.rs` 的线程所有者封装 `audio_bridge.m`。系统音量使用默认输出的 Core Audio 主控/声道控件，每步 1%；系统设备切换同时设置普通音频与提示音默认输出，失败尝试回滚。设备不支持软件音量时明确报错。
 
 应用独立音量/静音/输出使用 macOS 14.2+ 的私有进程 Tap、私有 aggregate、固定容量 stereo Float32 环形缓冲和 AVAudioEngine。本地增益与重放会增加音频延迟；不写文件、不联网。首次使用需要 System Audio Recording 权限；打包 Info.plist 包含 NSAudioCaptureUsageDescription。14.0/14.1 仍可执行系统音频，应用操作明确返回版本限制，不降级为系统音量。
 
 音频路由独立于模式退出持续生效，最多 32 个应用。worker 定期检查进程、输出与音频引擎；进程退出、设备丢失、格式改变或 Tap 更新失败释放路由、恢复应用原始输出。新音频子进程通过 Tap 描述更新纳入，匹配目标 PID 或目标 bundle ID/子 bundle，排除 KeySteer 自身以防反馈。退出后端按次序停止输出、注销 capture 回调、销毁 aggregate 和 Tap；驱动拒绝注销时隔离回调存储，避免释放仍可能使用的缓冲。
+
+
+Tabs 跟随保留独立顶层窗口和独立标签栏，不重新嵌入外部应用。Windows MOVESIZESTART/END 在后端记录原生手势：期间直接定位/缩放自有标签栏，不反向校正应用几何；结束后按当前快照执行一次必要的占位校正。隐藏成员仅在激活时同步。库存枚举每 8 项让出原生消息处理并检查取消，不为跟随新增轮询。macOS AX 几何通知与内容通知分离，主线程 mailbox 支持逐组更新；本轮未测试 macOS。
+
+
+音频安全收敛：Windows Toolhelp 快照在 native 模块复用 OwnedHandle，失败与 unwind 均释放；只把 ERROR_NO_MORE_FILES 视为正常枚举结束。macOS 控制器用 `Option<NonNull>` 表示唯一所有权，创建失败返回错误，销毁先 take；不在模式或共享协调器传递裸指针。platform/common 使用 forbid(unsafe_code)。保留测试断言等明确不变量中的 unwrap，不做机械替换。音频完成统一经过 publish_result，失败调用 report_error! 写入 support/logging.rs，包含 session/request 上下文；取消反馈不记录为错误，成功路径不格式化日志。

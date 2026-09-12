@@ -19,7 +19,11 @@ impl WindowSession {
         }
         if matches!(
             action,
-            W::SystemVolumeDown | W::SystemVolumeUp | W::SystemAudioPrevious | W::SystemAudioNext
+            W::SystemVolumeDown
+                | W::SystemVolumeUp
+                | W::SystemVolumeMute
+                | W::SystemAudioPrevious
+                | W::SystemAudioNext
         ) {
             if state == KeyState::Down {
                 use crate::api::audio::{AudioAction, AudioTarget};
@@ -27,6 +31,7 @@ impl WindowSession {
                 let change = match action {
                     W::SystemVolumeDown => AudioAction::Down,
                     W::SystemVolumeUp => AudioAction::Up,
+                    W::SystemVolumeMute => AudioAction::ToggleMute,
                     W::SystemAudioPrevious => AudioAction::DevicePrevious,
                     _ => AudioAction::DeviceNext,
                 };

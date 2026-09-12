@@ -15,30 +15,89 @@
 </p>
 
 <p align="center">
-  <strong>把鼠标交给键盘：轻量、原生、可配置。</strong>
+  <strong>从点击到分屏，把整个工作区交给键盘。</strong>
 </p>
 
 <p align="center">
   <sub>语言 / Language · <strong>简体中文</strong> · <a href="README.en.md">English</a></sub>
 </p>
 
-KeySteer 是 Windows 和 macOS 上使用键盘操控鼠标的工具。 
+KeySteer 是 Windows 和 macOS 上的原生键盘操控工具。用 `hjkl` 移动和点击，用标签定位界面，再用 Window 模式移动、分屏、组合窗口。少一些来回伸手，多一些连贯操作。
 
-[在线文档](https://dccif.github.io/KeySteer/)
+[下载体验](https://github.com/dccif/KeySteer/releases/latest) · [快速上手](https://dccif.github.io/KeySteer/guide/getting-started) · [Window 操作指南](https://dccif.github.io/KeySteer/modes/window) · [在线模拟器](https://dccif.github.io/KeySteer/editor/)
 
 ## 功能
+
+- **Window 窗口操控**：`Alt+W` 进入，移动、缩放、居中、跨屏都在键盘上完成。
+- **Quick 与 Editor 布局**：单窗口半屏定位，多窗口自动排列，再按需要分配空间。
+- **Tabs 与工作区预设**：把窗口收成持续存在的标签组，保存布局和标签模板，下次继续使用。
+- **音频控制**：整理窗口时顺手调节应用或系统音量、切换输出设备；平台要求见 [Window 指南](docs/modes/window.md)。
 
 - **Normal**：`hjkl` vim风格移动鼠标。
 - **长按,拖拽**：可将鼠标左/中/右键转为按下状态，适合拖拽。
 - **Grid**：快速定位二键组合。
 - **Recursive Grid**：区域持续递归细分。
-- **UI Hint**：为按钮、链接、菜单和输入框显示可键入标签；macOS 支持 Accessibility Tree、Vision 和 Hybrid，Windows 支持 UI Automation、双 OCR 视觉识别和 Hybrid。
+- **UI Hint**：辅助功能，OCR，并行异步扫描为按钮、链接、菜单和输入框显示可键入标签。
 - **多显示器**：`Primary+S` 切换到下一块显示器。
 - **外观与配置**：`Grid`/`Hint` 标签样式、指示器等可通过 TOML 调整。
 
 `Primary` 是跨平台写法：macOS 为 `Command`，Windows 为 `Alt`，为保持键盘位置的一致性。 它可以在 `[key_aliases]` 中改成你习惯的实体按键。
 
-## 视频演示
+## 性能
+
+**按键处理路径平均 151 ns**，来自 **0.9.21 开发机测试**，即 **0.151 μs / 0.000151 ms**。让每次操作更加无感
+
+## 两条路线，马上开始
+
+| 先试什么 | 默认操作顺序 |
+| --- | --- |
+| 移动与点击 | `Primary+E` → `H/J/K/L` → `;` → `Esc` |
+| 移动一个窗口 | `Primary+W` → 松开入口键 → `H/J/K/L` → `Q` |
+| 排列多个窗口 | `Primary+W` → `E`（立即排列）→ `Z` 可撤销 |
+
+`A` 快速分屏、`T` 组合标签、`R` 恢复预设。完整介绍见 [Window 操作指南](docs/modes/window.md)。
+
+### Window：窗口听键盘指挥
+
+`H/J/K/L` 移动，`S` 切换缩放，`C` 居中，`F` 循环最大化／最小化／恢复；`V` 组合键调音量，`X` 关闭当前窗口。
+
+https://github.com/user-attachments/assets/a1f38691-f6cf-45bf-b264-03a1a70cd104
+
+### Quick：按 A，快速分屏
+
+从 Window 按 `A` 进入，方向键安排窗口，再按同方向切换比例；`split_ratios` 可自定义，`Q` 返回 Window。
+
+https://github.com/user-attachments/assets/e9a278cd-a05a-4931-80cc-d2f832142296
+
+### Editor：按 E，自动平铺再微调
+
+`E` 立即平铺；输入 `1`、`2` 交换窗口，`Shift+方向` 切分区域，`Ctrl+方向` 移动分割线，方向键调整布局。
+
+https://github.com/user-attachments/assets/e21b68e3-f970-4e47-b5a2-fec80720b43b
+
+### Tabs：同名程序，自动收成一组
+
+从 Window 按 `T` 首次进入，按同名程序自动分组。`Tab` / `Shift+Tab` 切换组内窗口，方向键调整标签组位置。
+
+https://github.com/user-attachments/assets/2c1b894d-7402-4b57-9fd1-da03f5bd81a9
+
+### 保存：布局与标签组，都能记下来
+
+在 Editor 或 Tabs 中按 `Ctrl+S`，输入备注后按 `Enter` 保存；备注也可留空，自动生成名称。保存的是布局和分组安排，不是需要启动的应用名单。
+
+https://github.com/user-attachments/assets/9965dbb6-ed80-4071-b636-563563b83b7d
+
+### key_help：忘了快捷键？看一眼就好
+
+提示面板展示当前可用的按键和动作。在相应模式的 bindings 中配置 `"?" = "key_help"`，即可用问号切换显示；绑定存在才启用，示例也可换成其他键。视频通过模拟器的提示预览按钮执行同一动作。
+
+https://github.com/user-attachments/assets/9c28c826-d465-4d47-b671-7a275c282a76
+
+### 配置与模拟器：看着完整键盘改键
+
+托盘右键菜单 → **Configuration & Simulator...**，跳转浏览器打开（注意网络连接）。点击完整键盘中的按键，再选择动作；例如 `W → move_up`、`A → move_left`。入口菜单为操作示意，键位编辑使用实际项目模拟器；实际行为以程序为准。
+
+https://github.com/user-attachments/assets/fbb5f750-fcda-4d3f-92da-1f7667387927
 
 ### Normal
 

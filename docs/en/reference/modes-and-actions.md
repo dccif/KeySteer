@@ -45,6 +45,8 @@ f = "recursive_grid"
 
 ## Window mode
 
+New to window control? Start with the [Window guide](/en/modes/window) for practical recipes and default keys.
+
 Window, Quick, Editor, Restore and Tabs each have two independent settings:
 
 ```toml
@@ -327,3 +329,6 @@ Device selection cycles through active outputs sorted by name, once per press. A
 
 
 On macOS, system audio uses Core Audio. Per-application volume, mute, and output require macOS 14.2+ and System Audio Recording permission; use the packaged KeySteer.app. Audio is processed and replayed only in memory, with some added latency, and is never saved or uploaded. Unsupported systems/devices report a reason. App audio controls remain active after leaving the mode; quitting KeySteer restores the original playback path. See [Apple’s Core Audio Tap permission requirements](https://developer.apple.com/documentation/CoreAudio/capturing-system-audio-with-core-audio-taps).
+
+
+In Window, Quick and Editor, `V+M` toggles application mute and `Shift+V+M` toggles system mute. Holding either chord does not toggle repeatedly. The system action is `window_system_volume_mute`; add `"shift+v+m" = "window_system_volume_mute"` to existing custom binding tables.

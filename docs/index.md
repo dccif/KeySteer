@@ -3,29 +3,35 @@ layout: home
 title: KeySteer
 hero:
   name: KeySteer
-  text: 把鼠标交给键盘
-  tagline: 告别腱鞘炎，不用伸手找鼠标。快、轻量、原生Rust，按习惯定制一切。
+  text: 从点击到分屏，双手留在键盘
+  tagline: 移动鼠标、整理窗口、切换标签组。为 Windows 和 macOS 打造的原生键盘操控，让常用布局随时可复用。
   image:
     src: /generated/keysteer-icon.png
     alt: KeySteer
 
 features:
-  - icon: ⚡
-    title: 原生轻快，按下就动
-    details: 启动后安静待在托盘，CPU 和内存占用极低。
   - icon: 🎯
-    title: 多模式，总有一款适合
-    details: 日常移动与点击，屏幕切块快速跳转。
-  - icon: 🧩
-    title: 支持插件系统，未来无限扩展
-    details: 核心api共用，方便未来拓展。
+    title: 指到哪里，操作到哪里
+    details: hjkl 移动、网格跳转、输入标签定位控件，按任务选择顺手的方式。
+    link: /modes/normal
   - icon: 🖥️
-    title: 多显示器，一键切换
-    details: 在显示器间秒切，每个屏幕上模式独立运作，跨屏操作行云流水。
+    title: 给重要窗口留足空间
+    details: Quick 快速半屏定位，Editor 自动排列多个窗口，再微调主次比例。
+    link: /window-management/
+  - icon: 📂
+    title: 零散窗口，收成一组
+    details: 把不同窗口收成标签组，退出模式后依然可以切换，桌面更有条理。
+    link: /window-management/tabs
+  - icon: 💾
+    title: 好用的布局，下次接着用
+    details: 为编程、阅读、查资料保存布局与标签模板，用当前窗口恢复熟悉的工作区。
+    link: /window-management/restore
   - icon: 🎨
-    title: 外观任你打扮
-    details: 提示框颜色、字号、间距、标签位置可调。
+    title: 按你的习惯来
+    details: 在网页里调整键位、颜色和间距，用示例窗口练习，再导出自己的配置。
+    link: /editor/
   - icon: 🔒
-    title: 开源透明，数据留在本地
-    details: 输入、屏幕和使用数据仅在本地处理。
+    title: 原生、开源、本地运行
+    details: Rust 原生实现，支持 Windows 与 macOS；鼠标控制、界面识别和工作区预设在本地处理。
+    link: /guide/getting-started
 ---

@@ -39,13 +39,13 @@ use std::path::{Path, PathBuf};
 // apartment-scoped Core Audio interfaces. Explicit Shift audio actions add six
 // endpoint/property blocks and one non-disruptive native policy probe. The
 // versioned policy adapter adds three exact ABI slots and four scoped call blocks.
-const MAX_UNSAFE_EXPRESSIONS: usize = 365;
+const MAX_UNSAFE_EXPRESSIONS: usize = 367;
 const MAX_UNSAFE_FILES: usize = 31;
 const PER_FILE_BUDGET: &[(&str, usize)] = &[
     // macOS audio owns, changes, maintains and destroys native state,
     // with one bounded diagnostic callback into centralized logging.
-    ("src/platform/macos/window_audio.rs", 5),
-    ("src/platform/windows/window_audio.rs", 11),
+    ("src/platform/macos/window_audio.rs", 6),
+    ("src/platform/windows/window_audio.rs", 10),
     ("src/platform/windows/audio_policy.rs", 7),
     ("src/platform/macos/accessibility/window_tabs.rs", 12),
     ("src/platform/macos/window_tabs.rs", 2),
@@ -74,7 +74,7 @@ const PER_FILE_BUDGET: &[(&str, usize)] = &[
     ("src/platform/windows/update_installer/candidate.rs", 4),
     ("src/platform/windows/update_installer/mod.rs", 11),
     ("src/platform/windows/update_installer/signature.rs", 9),
-    ("src/platform/windows/native/mod.rs", 82),
+    ("src/platform/windows/native/mod.rs", 84),
 ];
 
 fn rust_files(directory: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
@@ -193,6 +193,7 @@ fn portable_layers_are_safe_rust() -> Result<(), Box<dyn std::error::Error>> {
         "plugins",
         "presentation",
         "support",
+        "platform/common",
     ] {
         let mut files = Vec::new();
         rust_files(&source_root.join(relative), &mut files)?;

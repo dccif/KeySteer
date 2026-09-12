@@ -81,6 +81,7 @@ pub enum WindowAction {
     AudioNext,
     SystemVolumeDown,
     SystemVolumeUp,
+    SystemVolumeMute,
     SystemAudioPrevious,
     SystemAudioNext,
     Select,
@@ -151,6 +152,7 @@ impl WindowAction {
             Self::AudioNext => "window_audio_next",
             Self::SystemVolumeDown => "window_system_volume_down",
             Self::SystemVolumeUp => "window_system_volume_up",
+            Self::SystemVolumeMute => "window_system_volume_mute",
             Self::SystemAudioPrevious => "window_system_audio_previous",
             Self::SystemAudioNext => "window_system_audio_next",
             Self::Select => "window_select",
@@ -206,6 +208,7 @@ impl WindowAction {
             Self::AudioNext,
             Self::SystemVolumeDown,
             Self::SystemVolumeUp,
+            Self::SystemVolumeMute,
             Self::SystemAudioPrevious,
             Self::SystemAudioNext,
             Self::Select,
@@ -366,6 +369,8 @@ pub enum WindowEditResult {
         transaction: u64,
         minimums: Vec<(WindowId, Point)>,
         gap_scale: f64,
+        /// Layout units per configured unit, indexed by the request screen list.
+        screen_scales: Vec<f64>,
         full_inventory: bool,
     },
     Applied {

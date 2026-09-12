@@ -92,6 +92,10 @@ pub struct TabDrop {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabNativeEvent {
+    /// Geometry only: reuse cached names and update only the affected group.
+    GeometryChanged(WindowId),
+    MoveResizeStarted(WindowId),
+    MoveResizeEnded(WindowId),
     Changed(WindowId),
     Focused(WindowId),
     Closed(WindowId),

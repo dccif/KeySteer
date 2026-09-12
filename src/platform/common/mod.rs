@@ -1,6 +1,8 @@
 //! Infrastructure shared by native backends.
+#![forbid(unsafe_code)]
 
 pub(crate) mod app_info;
+pub(crate) mod audio_worker;
 pub(crate) mod character_candidates;
 pub(crate) mod disposition_mailbox;
 pub(crate) mod partial_batcher;

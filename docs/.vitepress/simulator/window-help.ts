@@ -67,7 +67,7 @@ export function windowHelpSections(entries: HelpEntry[], mode: string, resizing 
   pair(['window_select', 'window_select_previous'], 'Next / previous window', common)
   audioScopes(['window_volume_down', 'window_volume_up'], ['window_system_volume_down', 'window_system_volume_up'], 'Volume', '− / +', common)
   audioScopes(['window_audio_previous', 'window_audio_next'], ['window_system_audio_previous', 'window_system_audio_next'], 'Output', '← / →', common)
-  take('window_volume_mute', common)
+  audioScopes(['window_volume_mute'], ['window_system_volume_mute'], 'Mute', '/ unmute', common)
   const undo = actions.get('window_undo'), redo = actions.get('window_redo')
   if (undo && redo && !undo.keys.includes(' / ') && !redo.keys.includes(' / ')) {
     common.push({ keys: `${undo.keys} / ${redo.keys}`, action: 'Undo / redo' })
@@ -95,7 +95,7 @@ export function windowHelpActionSupported(mode: string, action: string): boolean
   if (action === 'window_delete') return mode === 'window_restore'
   if (mode === 'window_restore') return action === 'window_confirm' || action === 'window_delete'
   if (mode === 'window_tab') return action.startsWith('window_tab_') || ['window_number_end', 'window_undo', 'window_redo', 'window_save_layout'].includes(action)
-  const common = ['window_audio_previous', 'window_audio_next', 'window_system_volume_down', 'window_system_volume_up', 'window_system_audio_previous', 'window_system_audio_next', 'window_volume_down', 'window_volume_up', 'window_volume_mute', 'window_select', 'window_select_previous', 'window_undo', 'window_redo', 'window_reset_initial']
+  const common = ['window_audio_previous', 'window_audio_next', 'window_system_volume_down', 'window_system_volume_up', 'window_system_volume_mute', 'window_system_audio_previous', 'window_system_audio_next', 'window_volume_down', 'window_volume_up', 'window_volume_mute', 'window_select', 'window_select_previous', 'window_undo', 'window_redo', 'window_reset_initial']
   if (mode === 'window_quick') return action.startsWith('window_layout_') || common.includes(action)
   if (mode === 'window_editor') return /^window_(layout_|split_|ratio_)/.test(action) || common.includes(action) || ['window_save_layout', 'window_remove_region'].includes(action)
   return common.includes(action) || ['window_tile', 'window_left', 'window_down', 'window_up', 'window_right', 'window_size', 'window_screen_next', 'window_screen_previous', 'size_cycle', 'window_center', 'window_close'].includes(action)

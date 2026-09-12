@@ -377,14 +377,6 @@ impl WindowSession {
             out,
         );
     }
-
-    fn screen_scale(&self, scale: f64) -> f64 {
-        if cfg!(target_os = "windows") {
-            scale
-        } else {
-            1.0
-        }
-    }
 }
 
 impl WindowKind {
@@ -398,6 +390,7 @@ impl WindowKind {
                 | W::AudioNext
                 | W::SystemVolumeDown
                 | W::SystemVolumeUp
+                | W::SystemVolumeMute
                 | W::SystemAudioPrevious
                 | W::SystemAudioNext
         ) {

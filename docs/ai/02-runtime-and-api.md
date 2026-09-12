@@ -302,3 +302,6 @@ Mode::quick_ruler 返回可选 QuickRuler（共享 RatioTick 数组＋当前归�
 
 
 音量增减接收系统重复键，runtime 每次验证完整配置组合键仍按住；静音和设备切换为离散动作。Command::CancelAudioSession 撤销排队请求并停止反馈路由，已执行的音量效果保留；已开始的原生请求可能完成。重启/退出/Reload 取消音频队列，Window 同组模式交接同时转移音频结果的接收者。保留现有 window_* 音频动作名称以兼容配置。
+
+
+Tabs 原生事件区分 GeometryChanged、MoveResizeStarted/Ended 与 Changed（元数据/状态）。共享协调器保留成员和标题缓存，几何通知只发布受影响组。WindowEditResult::Started.screen_scales 由后端按屏幕顺序提供逻辑单位换算，模式不再按操作系统分支。

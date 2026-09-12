@@ -242,3 +242,9 @@ Window、Quick、Editor 默认 V+J / V+K / V+M 分别绑定 window_volume_down /
 
 
 新增 `window_audio_previous/next`（V+H/L）、`window_system_volume_down/up`（Shift+V+J/K）、`window_system_audio_previous/next`（Shift+V+H/L），在 Window/Quick/Editor 各自绑定。系统音量同为每步 1%；设备切换不响应自动重复。
+
+
+Window/Quick/Editor 默认 Shift+V+M=`window_system_volume_mute`，切换系统静音；V+M 仍切换当前应用静音。两者仅按下触发一次，忽略长按重复，Common 合并显示 Shift: system。已有自定义 bindings 表需自行添加新绑定。
+
+
+内部 Config::to_toml 与网页 ConfigStudio 同步导出完整有效绑定，系统静音动作出现在可编辑动作列表。网页默认值由 docs:sync 从 keysteer.default.toml 生成；自定义绑定表继续整体替换默认表，不在导出时补回用户删除的快捷键。

@@ -25,7 +25,7 @@ export function isWindowMode(mode: string): mode is WindowMode { return ['window
 
 export interface WindowState {
   audio: Record<string, { volume: number; muted: boolean; output?: number }>
-  systemAudio: { volume: number; output: number }
+  systemAudio: { volume: number; output: number; muted: boolean }
   screens: 'current' | 'all'
   includeMinimized: boolean
   tabs: DemoTabs
@@ -79,7 +79,7 @@ export const WINDOW_MOTION = new Set(['window_left', 'window_down', 'window_up',
 
 export function createWindowState(): WindowState {
   return {
-    audio: {}, systemAudio: { volume: 1, output: 0 },
+    audio: {}, systemAudio: { volume: 1, output: 0, muted: false },
     screens: 'current', includeMinimized: false,
     tabs: createDemoTabs(),
     mode: 'window', deletingPresets: false, deleteSelection: null, presets: [], library: false, libraryPage: 0, libraryIndex: new Map(), noteOpen: false, recent: [], editingPresetId: null, savedEditSnapshot: '',
@@ -566,7 +566,7 @@ export function windowActionAvailable(w: WindowState, action: string): boolean {
   if (action === 'window_save_layout' || action === 'window_remove_region') return w.mode === 'window_editor' && w.panel === 'tree'
   if (/^window_(layout_|split_|ratio_)/.test(action)) return w.mode === 'window_editor' || w.mode === 'window_quick' && action.startsWith('window_layout_')
   if (w.mode === 'window') return !['window_save_layout', 'window_remove_region'].includes(action)
-  return ['window_audio_previous', 'window_audio_next', 'window_system_volume_down', 'window_system_volume_up', 'window_system_audio_previous', 'window_system_audio_next', 'window_volume_down', 'window_volume_up', 'window_volume_mute', 'window_select', 'window_select_previous', 'window_confirm', 'window_undo', 'window_redo', 'window_reset_initial'].includes(action)
+  return ['window_audio_previous', 'window_audio_next', 'window_system_volume_down', 'window_system_volume_up', 'window_system_volume_mute', 'window_system_audio_previous', 'window_system_audio_next', 'window_volume_down', 'window_volume_up', 'window_volume_mute', 'window_select', 'window_select_previous', 'window_confirm', 'window_undo', 'window_redo', 'window_reset_initial'].includes(action)
 }
 /** Dispatch configured actions, keeping Normal movement separate from window motion. */
 export function applyWindowAction(state: SimulatorState, action: string, settings: Record<string, any> = {}, now = Date.now(), seconds?: number): boolean {
@@ -692,6 +692,10 @@ export function applyWindowAction(state: SimulatorState, action: string, setting
       if (quick) startWindowEdit(state, false, settings)
       if (w.tree) w.tree.selected = treeSlots(w.tree).find(s => s.window === (containingTab(w, next.id)?.members[0] ?? next.id))?.id ?? w.tree.selected
       return true
+    }
+    case 'window_system_volume_mute': {
+      w.systemAudio.muted = !w.systemAudio.muted
+      state.lastEvent = w.systemAudio.muted ? '系统已静音' : '系统已取消静音'; return true
     }
     case 'window_system_volume_down': case 'window_system_volume_up': {
       w.systemAudio.volume = Math.max(0, Math.min(1, w.systemAudio.volume + (action.endsWith('_up') ? .01 : -.01)))

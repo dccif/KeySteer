@@ -29,10 +29,11 @@ All three targeting modes return to Normal with `Esc` or `Primary+Q`.
 | Reach a screen area quickly | [Grid](/en/modes/grid) | Does not rely on application accessibility information. |
 | Precisely target a small button or icon | [Recursive Grid](/en/modes/recursive-grid) | Keeps subdividing the current area. |
 | Find a button, link, menu, or input | [UI Hint](/en/modes/ui-hint) | Labels controls from the accessibility tree or visual recognition. |
+| Arrange windows, group tabs, or restore a workspace | [Window](/en/modes/window) | Move one window or build a reusable layout. |
 
 ## Idle: quiet waiting
 
-Idle is the startup state. It listens only for entries in `[hotkeys]` and does not intercept normal typing. The usual entry is `Primary+E`: `Command+E` on macOS and `Alt+E` on Windows/Linux unless you override the `Primary` alias.
+Idle is the startup state. It listens only for entries in `[hotkeys]` and does not intercept normal typing. The usual entry is `Primary+E`: `Command+E` on macOS and `Alt+E` on Windows unless you override the `Primary` alias.
 
 You can start any Mode directly from Idle:
 

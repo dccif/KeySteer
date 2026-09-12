@@ -69,3 +69,31 @@ test('a missing binding table still receives the built-in defaults', () => {
 
   assert.deepEqual(effective.normal.bindings, { h: 'move_left' })
 })
+
+
+test('shipped audio bindings and edited configuration survive browser export/import', async () => {
+  const { readFileSync } = await import('node:fs')
+  const { stringify } = await import('smol-toml')
+  const defaults = parseConfigDocument(readFileSync(new URL('../../../keysteer.default.toml', import.meta.url), 'utf8')).document
+  const expected = {
+    'v+j': 'window_volume_down', 'v+k': 'window_volume_up', 'v+m': 'window_volume_mute',
+    'v+h': 'window_audio_previous', 'v+l': 'window_audio_next',
+    'shift+v+j': 'window_system_volume_down', 'shift+v+k': 'window_system_volume_up',
+    'shift+v+m': 'window_system_volume_mute', 'shift+v+h': 'window_system_audio_previous', 'shift+v+l': 'window_system_audio_next',
+  }
+  for (const mode of ['window', 'window_quick', 'window_editor']) {
+    for (const [key, action] of Object.entries(expected)) assert.equal(defaults[mode].bindings[key], action)
+    delete defaults[mode].bindings['shift+v+m']
+    defaults[mode].bindings.f9 = 'window_system_volume_mute'
+  }
+  defaults.window_quick.split_ratios = ['1/3', '0.30', '0.45']
+  defaults.window_editor.gap = 7
+  const restored = parseConfigDocument(stringify(defaults)).document
+  for (const mode of ['window', 'window_quick', 'window_editor']) {
+    assert.equal(restored[mode].bindings.f9, 'window_system_volume_mute')
+    assert.equal(restored[mode].bindings['shift+v+m'], undefined)
+    assert.equal(restored[mode].bindings['v+m'], 'window_volume_mute')
+  }
+  assert.deepEqual(restored.window_quick.split_ratios, ['1/3', '0.30', '0.45'])
+  assert.equal(restored.window_editor.gap, 7)
+})

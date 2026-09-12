@@ -100,10 +100,10 @@ fn pair(
 }
 
 // Only abbreviate Shift when the effective bindings really have that relation.
-fn audio_scopes(
+fn audio_scopes<const N: usize>(
     actions: &mut BTreeMap<String, Vec<String>>,
-    app: [&str; 2],
-    system: [&str; 2],
+    app: [&str; N],
+    system: [&str; N],
     label: &str,
     arrows: &str,
     entries: &mut Vec<Entry>,
@@ -295,7 +295,14 @@ pub(super) fn sections(
         "← / →",
         &mut common,
     );
-    take(&mut actions, "window_volume_mute", &mut common);
+    audio_scopes(
+        &mut actions,
+        ["window_volume_mute"],
+        ["window_system_volume_mute"],
+        "Mute",
+        "/ unmute",
+        &mut common,
+    );
     let undo = actions.get("window_undo").filter(|keys| keys.len() == 1);
     let redo = actions.get("window_redo").filter(|keys| keys.len() == 1);
     if let (Some(undo), Some(redo)) = (undo, redo) {

@@ -7,3 +7,6 @@
 /docs/.vitepress/dist/
 /docs/public/generated/
 /docs/.vitepress/generated/
+assets/demos/
+output/
+videos/

@@ -1,5 +1,6 @@
 //! Lazy, bounded window-operation worker. Native references are created and
 //! released on its thread; only API values enter the engine's event queue.
+
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -52,6 +53,22 @@ pub(crate) trait WindowAccess {
         _cancelled: &dyn Fn() -> bool,
     ) -> Result<(), String> {
         Err("Window tab groups are unavailable on this backend".into())
+    }
+    /// Update one existing bar without changing group membership. False asks
+    /// the adapter to use the full-list compatibility path.
+    fn tab_bar_update(&mut self, _bar: &crate::api::window_tabs::TabBar) -> Result<bool, String> {
+        Ok(false)
+    }
+    fn tab_geometry(
+        &self,
+        id: WindowId,
+        _previous: &Snapshot,
+        screens: &[Screen],
+    ) -> Result<Snapshot, String> {
+        self.snapshot(id, screens)
+    }
+    fn tab_interacting(&self, _id: WindowId) -> bool {
+        false
     }
     fn tab_state(&self) -> Option<crate::api::window_tabs::TabState> {
         None
@@ -142,6 +159,18 @@ pub(crate) trait WindowAccess {
     fn maintain_audio(&self) -> bool {
         false
     }
+    fn audio_factory(&self) -> Option<super::audio_worker::AudioFactory> {
+        None
+    }
+    fn audio_process(
+        &self,
+        target: crate::api::audio::AudioTarget,
+    ) -> Result<Option<super::audio_worker::AudioProcess>, String> {
+        match target {
+            crate::api::audio::AudioTarget::System => Ok(None),
+            _ => Err("Application audio identity is unavailable".into()),
+        }
+    }
     fn system_audio(&self, _change: crate::api::audio::AudioAction) -> Result<String, String> {
         Err("System audio control is unavailable on this backend".into())
     }
@@ -182,13 +211,13 @@ enum Pending {
         request: WindowRequest,
         screens: Vec<Screen>,
     },
-    Audio(crate::api::audio::AudioRequest),
+    Audio(crate::api::audio::AudioRequest, Arc<AtomicBool>),
 }
 impl Pending {
     fn operation(&self) -> Option<&WindowOperation> {
         match self {
             Self::Window { request, .. } => Some(&request.operation),
-            Self::Audio(_) => None,
+            Self::Audio(..) => None,
         }
     }
 }
@@ -213,6 +242,7 @@ fn execute_audio(
 struct Mailbox {
     queue: Mutex<VecDeque<Pending>>,
     ready: Condvar,
+    audio_tokens: Mutex<std::collections::BTreeMap<u64, Arc<AtomicBool>>>,
     session: AtomicU64,
     cancel_before: AtomicU64,
     query_before: AtomicU64,
@@ -240,8 +270,9 @@ pub(crate) struct WindowWorker {
 impl WindowWorker {
     pub(crate) fn start<A: WindowAccess + 'static>(
         create: impl FnOnce() -> A + Send + 'static,
-        emit: impl Fn(BackendEvent) + Send + 'static,
+        emit: impl Fn(BackendEvent) + Send + Sync + 'static,
     ) -> Result<Self, String> {
+        let emit: super::audio_worker::EventSink = Arc::new(emit);
         let mailbox = Arc::new(Mailbox::default());
         let input = mailbox.clone();
         let worker = WorkerJoin::spawn(
@@ -253,6 +284,7 @@ impl WindowWorker {
                     let _ = input.native_waker.set(wake);
                 }
                 let mut access = super::window_tabs::Grouped::new(native);
+                let mut audio: Option<super::audio_worker::AudioWorker> = None;
                 let mut session = Session::default();
                 let mut displays = Vec::new();
                 loop {
@@ -307,10 +339,46 @@ impl WindowWorker {
                         continue;
                     };
                     let (request, screens) = match pending {
-                        Pending::Audio(request) => {
-                            emit(BackendEvent::AudioResult(Box::new(execute_audio(
-                                &access, request,
-                            ))));
+                        Pending::Audio(request, cancelled) => {
+                            if cancelled.load(Ordering::Acquire) {
+                                continue;
+                            }
+                            if let Some(factory) = access.audio_factory() {
+                                let (session, id) = (request.session, request.id);
+                                let submitted = (|| {
+                                    let process = access.audio_process(request.target)?;
+                                    if audio.is_none() {
+                                        audio = Some(super::audio_worker::AudioWorker::start(
+                                            factory,
+                                            emit.clone(),
+                                        )?);
+                                    }
+                                    audio.as_ref().ok_or("audio worker unavailable")?.submit(
+                                        request,
+                                        process,
+                                        cancelled.clone(),
+                                    )
+                                })();
+                                if let Err(error) = submitted
+                                    && !cancelled.load(Ordering::Acquire)
+                                {
+                                    super::audio_worker::publish_result(
+                                        &emit,
+                                        crate::api::audio::AudioResult {
+                                            session,
+                                            id,
+                                            outcome: Err(error),
+                                        },
+                                    );
+                                }
+                            } else {
+                                // Portable test/adaptor fallback; native platforms
+                                // always supply the independent audio factory.
+                                let result = execute_audio(&access, request);
+                                if !cancelled.load(Ordering::Acquire) {
+                                    super::audio_worker::publish_result(&emit, result);
+                                }
+                            }
                             continue;
                         }
                         Pending::Window { request, screens } => (request, screens),
@@ -382,7 +450,7 @@ impl WindowWorker {
                 .store(request.session, Ordering::Release);
             self.mailbox.cancel_before.store(0, Ordering::Release);
             self.mailbox.query_before.store(0, Ordering::Release);
-            queue.retain(|p| matches!(p, Pending::Audio(_)));
+            queue.retain(|p| matches!(p, Pending::Audio(..)));
         }
         if self.mailbox.session.load(Ordering::Acquire) != request.session {
             return Err("window session expired".into());
@@ -398,7 +466,7 @@ impl WindowWorker {
                 .cancel_before
                 .store(request.id, Ordering::Release);
             queue.retain(|p| {
-                matches!(p, Pending::Audio(_))
+                matches!(p, Pending::Audio(..))
                     || matches!(
                         p.operation(),
                         Some(
@@ -417,7 +485,7 @@ impl WindowWorker {
                 .cancel_before
                 .store(request.id, Ordering::Release);
             queue.retain(|p| {
-                matches!(p, Pending::Audio(_))
+                matches!(p, Pending::Audio(..))
                     || matches!(
                         p.operation(),
                         Some(WindowOperation::Acquire(_) | WindowOperation::BeginEdit { .. })
@@ -491,7 +559,7 @@ impl WindowWorker {
         Ok(())
     }
 
-    /// Audio shares native identity ownership and FIFO order with window work,
+    /// Resolve audio identity in window FIFO order, then execute independently,
     /// but never enters the layout session or its history/cancellation barriers.
     pub(crate) fn submit_audio(
         &self,
@@ -508,15 +576,38 @@ impl WindowWorker {
         if queue.len() >= 64 {
             return Err("audio operation queue is full".into());
         }
-        queue.push_back(Pending::Audio(request));
+        let token = self
+            .mailbox
+            .audio_tokens
+            .lock()
+            .map_err(|_| "audio cancellation map poisoned")?
+            .entry(request.session)
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone();
+        queue.push_back(Pending::Audio(request, token));
         drop(queue);
         self.mailbox.notify();
         Ok(())
     }
 
     pub(crate) fn cancel_audio(&self, session: u64) {
-        let mut queue = self.mailbox.queue.lock().unwrap_or_else(|e| e.into_inner());
-        queue.retain(|p| !matches!(p, Pending::Audio(r) if r.session == session));
+        let mut queue = self.mailbox.queue.lock().unwrap_or_else(|e| {
+            crate::report_error!("audio", "recovering a poisoned cancellation queue");
+            e.into_inner()
+        });
+        queue.retain(|p| !matches!(p, Pending::Audio(r, _) if r.session == session));
+        if let Some(token) = self
+            .mailbox
+            .audio_tokens
+            .lock()
+            .unwrap_or_else(|e| {
+                crate::report_error!("audio", "recovering a poisoned cancellation map");
+                e.into_inner()
+            })
+            .remove(&session)
+        {
+            token.store(true, Ordering::Release);
+        }
     }
 
     pub(crate) fn cancel(&self, session: u64) {
@@ -530,7 +621,7 @@ impl WindowWorker {
             .compare_exchange(session, 0, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            queue.retain(|p| matches!(p, Pending::Audio(_)));
+            queue.retain(|p| matches!(p, Pending::Audio(..)));
             // Wake the owner to release retained native references and undo
             // snapshots immediately, including when no operation is active.
             queue.push_back(Pending::Window {
@@ -1054,6 +1145,10 @@ impl Session {
                     transaction,
                     minimums: minimums.clone(),
                     gap_scale,
+                    screen_scales: screens
+                        .iter()
+                        .map(|screen| access.logical_scale(screen))
+                        .collect(),
                     full_inventory: screen.is_some(),
                 }));
                 self.edit = Some(EditTransaction {

@@ -2182,3 +2182,91 @@ mod tests {
         Ok(())
     }
 }
+
+/// Keep a process identity lease alive throughout the operation. Audio requests
+/// cross workers as PID + creation time, never as HWND/COM references.
+pub(crate) fn with_process_identity<T>(
+    pid: u32,
+    operation: impl FnOnce(u64) -> Result<T, String>,
+) -> Result<T, String> {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: a query-only owned handle is held until operation returns. All
+    // outputs are initialized and bounded; the existing RAII owner closes it.
+    let (process, started) = unsafe {
+        let process = OwnedHandle::new(
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+                .map_err(|e| e.to_string())?,
+        );
+        let (mut created, mut exited, mut kernel, mut user) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
+        GetProcessTimes(
+            process.raw(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+        .map_err(|e| e.to_string())?;
+        let mut code = 0;
+        GetExitCodeProcess(process.raw(), &mut code).map_err(|e| e.to_string())?;
+        if code != 259 {
+            return Err("Application has exited".into());
+        }
+        (
+            process,
+            (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime),
+        )
+    };
+    let result = operation(started);
+    drop(process);
+    result
+}
+
+/// Own the Toolhelp snapshot for the entire enumeration, including error/unwind
+/// paths. Callers receive values and cannot retain or close the native handle.
+pub(crate) fn audio_process_list() -> windows::core::Result<Vec<(u32, u32, String)>> {
+    use windows::Win32::Foundation::ERROR_NO_MORE_FILES;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    // SAFETY: the read-only snapshot is owned by the existing RAII handle. Each
+    // write targets an initialized, correctly sized stack entry. No native
+    // pointer or handle escapes; only ERROR_NO_MORE_FILES means normal EOF.
+    unsafe {
+        let snapshot = OwnedHandle::new(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)?);
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut result = Vec::new();
+        let mut next = Process32FirstW(snapshot.raw(), &mut entry);
+        loop {
+            match next {
+                Ok(()) => {}
+                Err(error) if error.code() == ERROR_NO_MORE_FILES.to_hresult() => {
+                    return Ok(result);
+                }
+                Err(error) => return Err(error),
+            }
+            let end = entry
+                .szExeFile
+                .iter()
+                .position(|c| *c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            result.push((
+                entry.th32ProcessID,
+                entry.th32ParentProcessID,
+                String::from_utf16_lossy(&entry.szExeFile[..end]),
+            ));
+            next = Process32NextW(snapshot.raw(), &mut entry);
+        }
+    }
+}

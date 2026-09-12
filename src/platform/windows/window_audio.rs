@@ -1,16 +1,14 @@
-//! Application audio sessions, accessed only on the existing window worker.
+//! Application audio sessions owned by the dedicated audio worker.
+
 use crate::api::audio::AudioAction;
 use std::collections::BTreeSet;
-use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Media::Audio::{
     DEVICE_STATE_ACTIVE, IAudioSessionControl2, IAudioSessionManager2, IMMDevice,
     IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator, eCommunications, eConsole,
     eMultimedia, eRender,
 };
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
-};
+
 use windows::core::Interface;
 
 fn application_pids(root: u32, processes: &[(u32, u32, String)]) -> BTreeSet<u32> {
@@ -33,35 +31,6 @@ fn application_pids(root: u32, processes: &[(u32, u32, String)]) -> BTreeSet<u32
     }
 }
 
-fn processes() -> windows::core::Result<Vec<(u32, u32, String)>> {
-    // SAFETY: the snapshot owns a read-only process list. Fixed-size entries have
-    // the required size; the handle is closed before any return after creation.
-    unsafe {
-        let handle = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)?;
-        let mut entry = PROCESSENTRY32W {
-            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-            ..Default::default()
-        };
-        let mut result = Vec::new();
-        let mut next = Process32FirstW(handle, &mut entry);
-        while next.is_ok() {
-            let end = entry
-                .szExeFile
-                .iter()
-                .position(|c| *c == 0)
-                .unwrap_or(entry.szExeFile.len());
-            result.push((
-                entry.th32ProcessID,
-                entry.th32ParentProcessID,
-                String::from_utf16_lossy(&entry.szExeFile[..end]),
-            ));
-            next = Process32NextW(handle, &mut entry);
-        }
-        let _ = CloseHandle(handle);
-        Ok(result)
-    }
-}
-
 fn level(current: f32, change: AudioAction) -> f32 {
     (current
         + if change == AudioAction::Up {
@@ -76,7 +45,8 @@ pub(super) fn change(pid: u32, change: AudioAction) -> Result<String, String> {
     let _apartment = super::native::ComApartment::initialise()?;
     let pids = application_pids(
         pid,
-        &processes().map_err(|e| format!("Cannot inspect application processes: {e}"))?,
+        &super::native::audio_process_list()
+            .map_err(|e| format!("Cannot inspect application processes: {e}"))?,
     );
     if matches!(
         change,
@@ -192,7 +162,9 @@ fn device_name(device: &IMMDevice) -> windows::core::Result<String> {
         };
         let mut value = store.GetValue(&key)?;
         let text = PropVariantToStringAlloc(&value);
-        let _ = PropVariantClear(&mut value);
+        if let Err(error) = PropVariantClear(&mut value) {
+            crate::report_error!("audio", "cannot release output name property: {error}");
+        }
         let text = text?;
         let result = text.to_string();
         CoTaskMemFree(Some(text.0.cast()));
@@ -370,8 +342,48 @@ pub(super) fn system(change: AudioAction) -> Result<String, String> {
     }
 }
 
+pub(super) fn process(
+    pid: u32,
+) -> Result<crate::platform::common::audio_worker::AudioProcess, String> {
+    super::native::with_process_identity(pid, |started| {
+        Ok(crate::platform::common::audio_worker::AudioProcess { pid, started })
+    })
+}
+pub(super) fn create_backend() -> Box<dyn crate::platform::common::audio_worker::AudioBackend> {
+    Box::new(WindowsAudio)
+}
+struct WindowsAudio;
+impl crate::platform::common::audio_worker::AudioBackend for WindowsAudio {
+    fn execute(
+        &mut self,
+        process: Option<crate::platform::common::audio_worker::AudioProcess>,
+        action: AudioAction,
+    ) -> Result<String, String> {
+        match process {
+            None => system(action),
+            Some(process) => super::native::with_process_identity(process.pid, |started| {
+                if started != process.started {
+                    return Err("Application audio target has expired".into());
+                }
+                change(process.pid, action)
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn process_snapshot_retains_current_process_identity() -> windows::core::Result<()> {
+        let processes = super::super::native::audio_process_list()?;
+        assert!(
+            processes
+                .iter()
+                .any(|(pid, _, name)| *pid == std::process::id() && !name.is_empty())
+        );
+        Ok(())
+    }
+
     use super::*;
     #[test]
     fn output_cycle_wraps_both_directions_and_handles_removed_devices() {

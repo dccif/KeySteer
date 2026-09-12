@@ -1,6 +1,7 @@
 # 快速上手
 
 <script setup>
+import ModeVideo from '../.vitepress/components/ModeVideo'
 import KeyLayout from '../.vitepress/components/KeyLayout'
 </script>
 
@@ -41,11 +42,33 @@ KeySteer 启动后默认安静地待在 Windows 托盘或 macOS 顶部状态栏�
 
 在 `[normal.bindings]` 中添加 `"?" = "key_help"` 后，按 `?`（Shift+/）在当前屏幕底部居中的圆角面板内展开可用按键和动作，再按一次关闭。省略或注释此绑定即禁用。
 
-## 用键盘调整窗口
+<ModeVideo file="help.mp4" title="查看当前快捷键提示" description="先预览提示面板，再给 key_help 配置喜欢的快捷键。" />
 
-把鼠标放在要调整的窗口上，按 `Alt+W` 进入 Window 并锁定它。Normal 的移动键（默认 H/J/K/L）移动窗口，`S` 切换到中心缩放；按住 `Primary` 可临时使用 Normal 的真实绑定移动鼠标和点击，松开后继续调整同一窗口。
+## 第一次用键盘调整窗口
 
-`A` 进入独立 Quick 模式，`E` 进入 Editor 自动布局，`R` 进入 Restore；Restore 中 `X` 进入 Delete。默认 H/J/K/L 明确配置在各模式，不随 Normal 改键。Editor 使用 Shift＋方向分区、Ctrl＋方向移动分割线、X 删除区域、Ctrl+S 保存。数字选窗，仅歧义前缀等待 250ms。Quick／Editor／Restore 的 Q 默认进入 Window，Window 的 Q 默认进入 Idle；Q 可在各自绑定表中修改。Tab 切窗，Z 撤销。
+<ModeVideo file="window.mp4" title="第一次用 Window 操控窗口" description="跟着视频练习移动、缩放、居中和声音控制。" />
+
+1. 把鼠标放到一个普通窗口上。
+2. 按 `Alt+W`（macOS 为 Option+W），然后松开入口键。
+3. 用 `H/J/K/L` 移动窗口；按 `S` 切换中心缩放，再用相同方向键调整。
+4. 按 `Z` 撤销一次调整，或按 `Q` 结束并保留结果。
+
+想分屏？在 Window 中按 `A`，再按 `H` 放到左半屏。想整理多个窗口？按 `E` 立即自动排列，`Z` 可撤销。`T` 把窗口收成标签组，`R` 打开已保存预设。
+
+Quick、Editor、Tabs、Restore 的 `Q` 返回 Window，再按一次 `Q` 回到待机。按住 `Primary` 可临时使用 Normal 的鼠标操作。
+
+跟着 [Window 操作指南](/window-management/) 练习并排布局、标签分组、保存工作区和音频控制，并按当前模式查阅键位。
+
+## 接着试试窗口管理
+
+| Window 中按 | 会发生什么 | 继续学习 |
+| --- | --- | --- |
+| `A` | 方向键安排窗口位置与分屏比例。 | [Quick：快捷分屏](/window-management/quick) |
+| `E` | 自动平铺，再交换窗口、切分与调整区域。 | [Editor：平铺与区域编辑](/window-management/editor) |
+| `T` | 自动整理同应用的兼容窗口，也可自由组合。 | [Tabs：窗口标签分组](/window-management/tabs) |
+| `R` | 保存的是空间和分组安排，恢复时用当前需要的窗口填入。 | [Restore：恢复布局与标签模板](/window-management/restore) |
+
+在 Editor 或 Tabs 中按 `Ctrl+S` → 填写备注或留空 → `Enter` 保存；留空时自动生成默认名称。
 
 ## 一张图记住工作方式
 
@@ -64,6 +87,20 @@ flowchart LR
 平时只需在“待机”和 “Normal” 之间切换。三种定位模式是可选的，不需要一开始全部记住。
 
 
+
+```mermaid
+flowchart LR
+    idle["待机<br/>正常打字"]
+    window["Window<br/>移动、大小、音量"]
+    arrange["窗口整理<br/>Quick<br/>Editor<br/>Tabs"]
+
+    idle -->|"Alt+W"| window
+    window -->|"需要时再进入"| arrange
+    arrange -->|"Q"| window
+    window -->|"Q"| idle
+```
+
+Window 是窗口管理的基础入口，Quick、Editor 和 Tabs 是按需选用的整理方式。
 
 ## 鼠标移动太远时
 
@@ -110,7 +147,7 @@ flowchart LR
 | `n` | 切换左键持续按下，用于拖拽 |
 | `t` / `y` / `i` / `u` | 发送 `Home` / `End` / `Page Up` / `Page Down` |
 | `g` / `f` / `Primary+F` | `Grid` / `Recursive Grid` / `UI Hint` |
-| `Primary+S` / `Primary+S+D` | 切换鼠标到下一块显示器／将鼠标下窗口移到下一块显示器，鼠标保持在窗口内的相对位置 |
+| `Primary+S` / `Primary+D` | 切换鼠标到下一块显示器／将鼠标下窗口移到下一块显示器，鼠标保持在窗口内的相对位置 |
 | `q` 或 `Esc` | 返回`Idle`待机 |
 
 </details>
@@ -140,3 +177,9 @@ keysteer --dump-config
 完整默认配置可 [下载](/generated/keysteer.default.toml)。更多内容见 [配置文件](/reference/configuration) 和 [模式与动作](/reference/modes-and-actions)。
 
 </details>
+
+## 在浏览器里图形化改键
+
+从托盘右键菜单打开 **Configuration & Simulator...**，跳转浏览器（注意网络连接）。模拟器供编辑和预览，实际行为以程序为准。
+
+<ModeVideo file="config.mp4" title="修改 W、A 按键绑定" description="点击完整键盘中的按键，再选择动作。" />

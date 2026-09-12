@@ -12,7 +12,10 @@ struct Fake {
     fail_visibility: Option<(WindowId, bool)>,
     fail: Option<WindowId>,
     bars: Vec<TabBar>,
+    updates: Vec<TabGroupId>,
+    fail_bar: bool,
     writes: usize,
+    snapshot_reads: Cell<usize>,
     hidden: BTreeSet<WindowId>,
     hidden_foreground: usize,
     header: f64,
@@ -330,7 +333,10 @@ fn setup() -> Grouped<Fake> {
         fail_visibility: None,
         fail: None,
         bars: Vec::new(),
+        updates: Vec::new(),
+        fail_bar: false,
         writes: 0,
+        snapshot_reads: Cell::new(0),
         hidden: BTreeSet::new(),
         hidden_foreground: 0,
         header: 0.0,
@@ -367,6 +373,7 @@ impl WindowAccess for Fake {
         Ok(self.windows.values().map(|s| s.info.clone()).collect())
     }
     fn snapshot(&self, id: WindowId, screens: &[Screen]) -> Result<Snapshot, String> {
+        self.snapshot_reads.set(self.snapshot_reads.get() + 1);
         if screens.is_empty() {
             return Err("no displays".into());
         }
@@ -441,6 +448,15 @@ impl WindowAccess for Fake {
     fn tab_bars(&mut self, bars: &[TabBar]) -> Result<(), String> {
         self.bars = bars.to_vec();
         Ok(())
+    }
+    fn tab_bar_update(&mut self, bar: &TabBar) -> Result<bool, String> {
+        if std::mem::take(&mut self.fail_bar) {
+            return Err("injected bar failure".into());
+        }
+        self.updates.push(bar.group);
+        let current = self.bars.iter_mut().find(|b| b.group == bar.group).unwrap();
+        *current = bar.clone();
+        Ok(true)
     }
     fn tab_visible(&self, id: WindowId) -> bool {
         self.windows.contains_key(&id) && !self.hidden.contains(&id)
@@ -1374,4 +1390,125 @@ fn window_close_resolves_active_tab_and_dissolves_only_after_confirmed_closure()
         access.native.windows.contains_key(&WindowId(4)),
         "unrelated window stays open"
     );
+}
+
+#[test]
+#[ignore = "explicit release-profile tab geometry baseline; uses only a simulated backend"]
+fn tabs_geometry_baseline() {
+    let mut rows = vec!["members,round,p50_ns,p95_ns,p99_ns,snapshots,writes".to_string()];
+    for members in [2, 10, 30] {
+        for round in 0..3 {
+            let mut access = setup();
+            let template = access.native.windows[&WindowId(1)].clone();
+            access.native.windows.clear();
+            for id in 1..=members {
+                let mut value = template.clone();
+                value.info.id = WindowId(id);
+                value.info.title = format!("Window {id}");
+                access.native.windows.insert(WindowId(id), value);
+            }
+            access.enumerate(&screens(), &|| false).unwrap();
+            for id in 1..=members {
+                choose(&mut access, id);
+            }
+            let active = access.groups.state.groups[0].active;
+            let displays = screens();
+            let mut samples = Vec::with_capacity(1000);
+            let before = access.native.snapshot_reads.get();
+            let writes = access.native.writes;
+            for step in 0..1000 {
+                let bounds = &mut access.native.windows.get_mut(&active).unwrap().info.bounds;
+                bounds.x = 100.0 + (step % 200) as f64;
+                bounds.width = 400.0 + (step % 100) as f64;
+                access
+                    .native
+                    .events
+                    .push(TabNativeEvent::GeometryChanged(active));
+                let started = Instant::now();
+                access.pump(&displays, &|| false).unwrap();
+                samples.push(started.elapsed().as_nanos());
+            }
+            samples.sort_unstable();
+            rows.push(format!(
+                "{members},{round},{},{},{},{},{}",
+                samples[500],
+                samples[950],
+                samples[990],
+                access.native.snapshot_reads.get() - before,
+                access.native.writes - writes
+            ));
+        }
+    }
+    let path =
+        std::env::var("KEYSTEER_TABS_BENCH_OUTPUT").expect("set an output path under target");
+    std::fs::write(path, rows.join("\n")).unwrap();
+}
+
+#[test]
+fn geometry_updates_only_affected_group_and_retries_failed_publication() {
+    let mut access = two_groups();
+    let active = access.groups.state.groups[0].active;
+    let group = access.groups.state.groups[0].id;
+    let other = access.native.bars[1].clone();
+    access.native.snapshot_reads.set(0);
+    access.native.updates.clear();
+    let writes = access.native.writes;
+    access
+        .native
+        .windows
+        .get_mut(&active)
+        .unwrap()
+        .info
+        .bounds
+        .x += 10.0;
+    access
+        .native
+        .events
+        .push(TabNativeEvent::GeometryChanged(active));
+    access.native.fail_bar = true;
+    assert!(access.pump(&screens(), &|| false).is_err());
+    access.pump(&screens(), &|| false).unwrap();
+    assert_eq!(access.native.snapshot_reads.get(), 1);
+    assert_eq!(access.native.updates, [group]);
+    assert_eq!(access.native.bars[1], other);
+    assert_eq!(access.native.writes, writes);
+}
+
+#[test]
+fn native_gesture_defers_header_correction_until_end() {
+    let mut access = setup();
+    access.native.header = 30.0;
+    choose(&mut access, 1);
+    choose(&mut access, 2);
+    let active = access.groups.state.groups[0].active;
+    let hidden = access.native.windows[&WindowId(1)].info.bounds;
+    let writes = access.native.writes;
+    access
+        .native
+        .events
+        .push(TabNativeEvent::MoveResizeStarted(active));
+    for x in 0..20 {
+        access.native.windows.get_mut(&active).unwrap().info.bounds =
+            Rect::new(x as f64, 0.0, 600.0, 400.0);
+        access
+            .native
+            .events
+            .push(TabNativeEvent::GeometryChanged(active));
+        access.pump(&screens(), &|| false).unwrap();
+    }
+    assert_eq!(access.native.writes, writes);
+    access
+        .native
+        .events
+        .push(TabNativeEvent::MoveResizeEnded(active));
+    access.pump(&screens(), &|| false).unwrap();
+    assert_eq!(access.native.writes, writes + 1);
+    assert_eq!(access.native.windows[&active].info.bounds.y, 30.0);
+    assert_eq!(access.native.windows[&WindowId(1)].info.bounds, hidden);
+    access
+        .native
+        .events
+        .push(TabNativeEvent::GeometryChanged(active));
+    access.pump(&screens(), &|| false).unwrap();
+    assert_eq!(access.native.writes, writes + 1);
 }

@@ -3,29 +3,35 @@ layout: home
 title: KeySteer
 hero:
   name: KeySteer
-  text: Put your mouse in the hands of your keyboard
-  tagline: Stop reaching for the mouse. Fast, lightweight, native Rust, and configurable around your habits.
+  text: Your workspace, on your keyboard
+  tagline: Move the pointer, arrange windows, and switch tab groups. Native keyboard control for Windows and macOS, with layouts you can save and reuse.
   image:
     src: /generated/keysteer-icon.png
     alt: KeySteer
 
 features:
-  - icon: ⚡
-    title: Native and responsive
-    details: Starts quietly in the Windows tray or macOS top status area with very low CPU and memory usage.
   - icon: 🎯
-    title: A mode for every task
-    details: Move and click day to day, or jump to a screen region in seconds.
-  - icon: 🧩
-    title: Extensible by design
-    details: A shared core API keeps future plugins straightforward.
+    title: Point, click, keep going
+    details: Move with hjkl, jump through grids, or type labels to target interface controls.
+    link: /en/modes/normal
   - icon: 🖥️
-    title: Multiple displays
-    details: Switch between displays instantly; each display keeps its own mode state.
+    title: Make room for your work
+    details: Snap one window into place with Quick, or arrange several in Editor and fine-tune their proportions.
+    link: /en/window-management/
+  - icon: 📂
+    title: Less clutter, more context
+    details: Combine windows into tab groups that remain available after leaving Window mode.
+    link: /en/window-management/tabs
+  - icon: 💾
+    title: Keep your favourite layouts
+    details: Save layout and tab templates for coding, reading, or research; restore them with your current windows.
+    link: /en/window-management/restore
   - icon: 🎨
-    title: Make it yours
-    details: Adjust hint colours, typography, spacing, and label placement.
+    title: Set up your own controls
+    details: Customise keys, colours, and spacing in the browser, and practise on sample windows before exporting.
+    link: /en/editor/
   - icon: 🔒
-    title: Open source and local
-    details: Input, screen, and usage data stay on your machine.
+    title: Native, open source, local
+    details: Built with Rust for Windows and macOS. Pointer control, UI recognition, and workspace presets are handled locally.
+    link: /en/guide/getting-started
 ---
