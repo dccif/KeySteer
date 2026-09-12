@@ -52,6 +52,8 @@ pub enum FinishCause {
 /// including drawing its own grid or full-screen overlay.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
+    AudioRequest(Box<super::audio::AudioRequest>),
+    CancelAudioSession(u64),
     WindowRequest(Box<super::window::WindowRequest>),
     CancelWindowSession(u64),
     WindowPresets(Box<super::window_presets::PresetLibraryRequest>),
@@ -436,6 +438,7 @@ impl<'a> IntoIterator for &'a CommandBatch {
 /// Everything the host tells a mode.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModeEvent {
+    AudioResult(Box<super::audio::AudioResult>),
     WindowResult(Box<super::window::WindowResult>),
     WindowPresets(Box<super::window_presets::PresetLibraryResult>),
     /// Temporary binding inheritance started/stopped without suspending the mode.
@@ -799,6 +802,11 @@ pub trait Mode: Send {
     /// Anchor for a persistent, host-rendered key-help panel. Coordinates use
     /// the same desktop space as overlay scenes; native handles stay private.
     fn help_anchor(&self) -> Option<Rect> {
+        None
+    }
+
+    /// Configured Quick proportions and the current two-axis selection.
+    fn quick_ruler(&self) -> Option<super::window_layout::QuickRuler> {
         None
     }
 

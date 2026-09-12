@@ -1450,14 +1450,14 @@ mod tests {
         );
         let mut moved = first.clone();
         moved.rect.x = 100.0;
-        moved.style.background = Color::rgb(1, 2, 3);
+        moved.style.make_mut().background = Color::rgb(1, 2, 3);
         assert!(label_text_content_eq(&first, &moved));
 
         moved.matched_prefix_len = 1;
         moved.z_index = 99;
         assert!(label_text_content_eq(&first, &moved));
 
-        moved.style.matched_text_color = Color::rgb(9, 8, 7);
+        moved.style.make_mut().matched_text_color = Color::rgb(9, 8, 7);
         assert!(!label_text_content_eq(&first, &moved));
     }
 

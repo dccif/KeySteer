@@ -121,7 +121,9 @@ fn window_card_text_stays_inside_its_background_at_each_dpi_without_font_shrinki
             assert!(rect.x >= card.x - 1.0 && rect.right() <= card.right() + 1.0, "{label:?} outside {card:?}");
             assert!(rect.y >= card.y - 1.0 && rect.bottom() <= card.bottom() + 1.0);
         }
-        let app = scene.labels.iter().find(|l| l.z_index == 21 && l.text == "test").unwrap();
+        // Collision avoidance may elide the flexible app name when the help
+        // panel grows; its font must remain unchanged even in that case.
+        let app = scene.labels.iter().find(|l| l.z_index == 21 && l.style.bold).unwrap();
         assert!((app.style.font_size - (f64::from(config.window.ui.font_size) * 0.6).max(14.0)).abs() < 0.001);
         let key = scene.labels.iter().find(|l| l.z_index == i32::MAX && l.text == "A").unwrap();
         assert_eq!(key.style.font_size, config.key_help.font_size);
@@ -814,7 +816,7 @@ fn backtick_opens_auto_layout_and_pending_region_input_focuses_window() {
         assert!(log.window_requests.iter().any(|r| matches!(r.operation, O::ApplyLayout { strict: true, .. })));
         assert!(!log.window_requests.iter().any(|r| matches!(r.operation, O::Tile { .. })));
         assert!(log.window_requests.iter().any(|r| matches!(r.operation, O::Select(WindowId(77)))));
-        assert!(log.scenes.last().unwrap().labels.iter().any(|l| l.text == "Input: `1"));
+        assert!(log.scenes.last().unwrap().labels.iter().any(|l| l.text == "> `1"));
     }
 }
 
@@ -1198,6 +1200,16 @@ fn grouped_window_help_keeps_two_semantic_columns_and_header_exit_at_each_dpi() 
                 }
                 assert!(panel.y >= -1.0 && panel.bottom() <= 800.0 * scale);
                 let common = labels.iter().find(|(l, _)| l.text == "COMMON").unwrap().1;
+                if entry.is_none() {
+                    let mut separators: Vec<_> = scene.labels.iter().filter(|l| l.text.is_empty() && l.z_index == i32::MAX && (l.rect.height - scale).abs() < 0.01 && l.rect.width > panel.width * 0.8).map(|l| l.rect).collect();
+                    separators.sort_by(|a, b| a.y.total_cmp(&b.y));
+                    let upper = separators[0]; let lower = separators[1];
+                    let content: Vec<_> = labels.iter().filter(|(_, r)| r.y > upper.bottom() && r.bottom() < lower.y).map(|(_, r)| *r).collect();
+                    let top = content.iter().map(|r| r.y).fold(f64::INFINITY, f64::min);
+                    let bottom = content.iter().map(|r| r.bottom()).fold(0.0, f64::max);
+                    assert!(((top - upper.bottom()) - (lower.y - bottom)).abs() <= scale, "unequal divider insets at scale={scale}, font={font}");
+                }
+
                 if entry != Some("r") {
                     let operation = labels.iter().find(|(l, _)| l.text.ends_with("ACTIONS") || matches!(l.text.as_str(), "EDIT LAYOUT" | "QUICK LAYOUT" | "TAB GROUPS")).unwrap().1;
                     assert!(operation.x < common.x, "mode actions stay in the left column");
@@ -1207,6 +1219,8 @@ fn grouped_window_help_keeps_two_semantic_columns_and_header_exit_at_each_dpi() 
                 assert!(exit.right() > panel.center().x && exit.y < common.y);
                 let title = labels.iter().find(|(l, _)| l.text == "Window").unwrap().1;
                 assert!((exit.center().y - title.center().y).abs() <= 1.0);
+                assert!(!labels.iter().any(|(l, _)| l.text.starts_with("Input:")));
+                assert!(scene.labels.iter().any(|l| l.text.is_empty() && l.z_index == i32::MAX && (l.rect.height - scale).abs() < 0.01 && l.rect.y > title.bottom() && l.rect.y < common.y));
                 for (label, bounds) in &labels {
                     if label.style.background.a > 0 && bounds.y < title.bottom() {
                         assert!((bounds.center().y - title.center().y).abs() <= 1.0,
@@ -1358,4 +1372,125 @@ fn restore_delete_toggle_is_rebindable_keeps_page_and_cached_help() {
     assert_eq!(engine.window_presets.store.list().unwrap().len(), 6);
     assert_eq!(engine.active_mode(), &ModeId::window_restore());
     assert!(!log.lock().unwrap().scenes.last().unwrap().labels.iter().any(|l| l.text.contains("Delete layouts")));
+}
+
+#[test]
+fn window_volume_chords_repeat_direction_but_not_mute_and_release_prefix() {
+    use crate::api::window::{WindowAction as W, WindowId};
+    use crate::api::audio::{AudioAction as V, AudioTarget as T};
+    for entry in [None, Some("a"), Some("e")] {
+        for custom in [false, true] {
+            let mut config = Config::default();
+            if custom {
+                for bindings in [&mut config.window.bindings, &mut config.window_quick.bindings, &mut config.window_editor.bindings] {
+                    bindings.remove("v+j");
+                    bindings.insert("v+n".into(), Binding::Window(W::VolumeDown));
+                }
+            }
+            let (mut engine, mut backend, log) = window_test_engine(&config);
+            enter_window(&mut engine, &mut backend, &log);
+            if let Some(key) = entry {
+                for event in [key_down(key), key_up(key)] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+                acknowledge_window_edit(&mut engine, &mut backend, &log);
+            }
+            let labels = log.lock().unwrap().scenes.last().unwrap().labels.clone();
+            assert!(labels.iter().any(|l| l.text == "Next / previous window"));
+            assert!(labels.iter().any(|l| l.text == "Mute / unmute app"));
+            assert!(labels.iter().any(|l| l.text == if custom { "App / system Volume − / +" } else { "Volume − / + · Shift: system" }), "volume rows: {:?}", labels.iter().map(|l| &l.text).collect::<Vec<_>>());
+            let before = log.lock().unwrap().audio_requests.len();
+            let window_before = log.lock().unwrap().window_requests.len();
+            let down = if custom { "n" } else { "j" };
+            engine.handle_backend_event(key_down("v"), &mut backend).unwrap();
+            for key in [down, "k", "m"] {
+                engine.handle_backend_event(key_down(key), &mut backend).unwrap();
+                let mut repeat = key_down(key);
+                if let BackendEvent::Input(input) = &mut repeat { input.repeat = true; }
+                engine.handle_backend_event(repeat, &mut backend).unwrap();
+                engine.handle_backend_event(key_up(key), &mut backend).unwrap();
+            }
+            engine.handle_backend_event(key_down(down), &mut backend).unwrap();
+            engine.handle_backend_event(key_up("v"), &mut backend).unwrap();
+            let mut repeat = key_down(down);
+            if let BackendEvent::Input(input) = &mut repeat { input.repeat = true; }
+            engine.handle_backend_event(repeat, &mut backend).unwrap();
+            engine.handle_backend_event(key_up(down), &mut backend).unwrap();
+            let requests = log.lock().unwrap().audio_requests.clone();
+            let changes: Vec<_> = requests[before..].iter().filter_map(|r| match r.target { T::Application(target) => { assert_eq!(target, WindowId(77)); Some(r.action) }, _ => None }).collect();
+            assert_eq!(changes, [V::Down, V::Down, V::Up, V::Up, V::ToggleMute, V::Down], "entry={entry:?} custom={custom}");
+            assert_eq!(log.lock().unwrap().window_requests.len(), window_before, "audio must not send window requests");
+        }
+    }
+}
+
+#[test]
+fn window_audio_device_and_shift_chords_keep_application_and_system_scopes_separate() {
+    use crate::api::window::{WindowId};
+    use crate::api::audio::{AudioAction as V, AudioTarget as T};
+    for entry in [None, Some("a"), Some("e")] {
+        let (mut engine, mut backend, log) = window_test_engine(&Config::default());
+        enter_window(&mut engine, &mut backend, &log);
+        if let Some(key) = entry {
+            for event in [key_down(key), key_up(key)] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+            acknowledge_window_edit(&mut engine, &mut backend, &log);
+        }
+        let before = log.lock().unwrap().audio_requests.len();
+            let window_before = log.lock().unwrap().window_requests.len();
+        engine.handle_backend_event(key_down("v"), &mut backend).unwrap();
+        for key in ["h", "l"] {
+            engine.handle_backend_event(key_down(key), &mut backend).unwrap();
+            let mut repeat = key_down(key);
+            if let BackendEvent::Input(input) = &mut repeat { input.repeat = true; }
+            engine.handle_backend_event(repeat, &mut backend).unwrap();
+            engine.handle_backend_event(key_up(key), &mut backend).unwrap();
+        }
+        engine.handle_backend_event(key_down("left_shift"), &mut backend).unwrap();
+        for key in ["j", "k", "h", "l"] {
+            engine.handle_backend_event(key_down(key), &mut backend).unwrap();
+            let mut repeat = key_down(key);
+            if let BackendEvent::Input(input) = &mut repeat { input.repeat = true; }
+            engine.handle_backend_event(repeat, &mut backend).unwrap();
+            engine.handle_backend_event(key_up(key), &mut backend).unwrap();
+        }
+        engine.handle_backend_event(key_down("j"), &mut backend).unwrap();
+        engine.handle_backend_event(key_up("left_shift"), &mut backend).unwrap();
+        let mut repeat = key_down("j");
+        if let BackendEvent::Input(input) = &mut repeat { input.repeat = true; }
+        engine.handle_backend_event(repeat, &mut backend).unwrap();
+        for event in [key_up("j"), key_up("v")] { engine.handle_backend_event(event, &mut backend).unwrap(); }
+        let requests = log.lock().unwrap().audio_requests.clone();
+        let app: Vec<_> = requests[before..].iter().filter_map(|r| match r.target { T::Application(target) => { assert_eq!(target, WindowId(77)); Some(r.action) }, _ => None }).collect();
+        let system: Vec<_> = requests[before..].iter().filter_map(|r| match r.target { T::System => Some(r.action), _ => None }).collect();
+        assert_eq!(app, [V::DevicePrevious, V::DeviceNext]);
+        assert_eq!(system, [V::Down, V::Down, V::Up, V::Up, V::DevicePrevious, V::DeviceNext, V::Down]);
+        assert_eq!(log.lock().unwrap().window_requests.len(), window_before, "audio must not send window requests");
+        for caption in ["Volume − / + · Shift: system", "Output ← / → · Shift: system"] {
+            assert!(log.lock().unwrap().scenes.last().unwrap().labels.iter().any(|l| l.text == caption), "missing {caption}");
+        }
+    }
+}
+
+#[test]
+fn audio_feedback_and_cancellation_are_independent_of_window_results() {
+    use crate::api::audio::AudioResult;
+    let (mut engine, mut backend, log) = window_test_engine(&Config::default());
+    enter_window(&mut engine, &mut backend, &log);
+    for event in [key_down("v"), key_down("j"), key_up("j"), key_up("v")] {
+        engine.handle_backend_event(event, &mut backend).unwrap();
+    }
+    let request = log.lock().unwrap().audio_requests.last().unwrap().clone();
+    let windows = log.lock().unwrap().window_requests.len();
+    engine.handle_backend_event(BackendEvent::AudioResult(Box::new(AudioResult {
+        session: request.session, id: request.id, outcome: Err("Audio permission denied".into()),
+    })), &mut backend).unwrap();
+    assert!(log.lock().unwrap().scenes.last().unwrap().labels.iter().any(|l| l.text.contains("Audio permission denied")));
+    assert_eq!(log.lock().unwrap().window_requests.len(), windows);
+    let owner = engine.registry.active.clone();
+    engine.execute_for(&owner, [Command::CancelAudioSession(request.session)], &mut backend).unwrap();
+    let scenes = log.lock().unwrap().scenes.len();
+    engine.handle_backend_event(BackendEvent::AudioResult(Box::new(AudioResult {
+        session: request.session, id: request.id, outcome: Ok("stale audio feedback".into()),
+    })), &mut backend).unwrap();
+    assert_eq!(log.lock().unwrap().scenes.len(), scenes);
+    assert!(log.lock().unwrap().cancelled_audio_sessions.contains(&request.session));
+    assert!(!log.lock().unwrap().cancelled_window_sessions.contains(&request.session));
 }

@@ -4,6 +4,7 @@ use crate::api::style::KeyHelp;
 use crate::api::{OverlayScene, Palette, Rect, Screen};
 use std::collections::BTreeMap;
 
+mod ruler;
 mod window;
 
 pub(crate) struct KeyHelpView<'a> {
@@ -15,6 +16,7 @@ pub(crate) struct KeyHelpView<'a> {
     pub return_target: Option<String>,
     pub window_help: bool,
     pub display_name: String,
+    pub ruler: Option<crate::api::window_layout::QuickRuler>,
     pub previews: Vec<(String, String, Rect, bool)>,
     pub detail: Option<String>,
     pub anchor: Option<Rect>,
@@ -165,6 +167,23 @@ fn compose_columns(scene: &mut OverlayScene, input: KeyHelpView<'_>, max_columns
     } else {
         detail_title
     };
+    // Keep the mode heading intact; show numeric input beneath it.
+    let mut prompt = String::from(">");
+    if window_help {
+        let mut notes = Vec::new();
+        for line in detail_status.lines().filter(|line| !line.is_empty()) {
+            if let Some(value) = line.strip_prefix("Input:") {
+                let (value, hint) = value.trim().split_once(" · ").unwrap_or((value.trim(), ""));
+                prompt = format!("> {value}");
+                if !hint.is_empty() {
+                    notes.push(hint);
+                }
+            } else {
+                notes.push(line);
+            }
+        }
+        detail_status = notes.join("\n");
+    }
     let content_width: f64 = widths
         .iter()
         .map(|(keys, actions)| keys + key_gap + actions)
@@ -186,7 +205,10 @@ fn compose_columns(scene: &mut OverlayScene, input: KeyHelpView<'_>, max_columns
         * ui.font_size
         * scale;
     let natural_width = (if window_help {
-        content_width.max(header_width).max(status_width)
+        content_width
+            .max(header_width)
+            .max(status_width)
+            .max(super::text_units(&prompt) * ui.font_size * 1.65 * scale)
     } else {
         content_width
     } + padding * 2.0)
@@ -262,7 +284,14 @@ fn compose_columns(scene: &mut OverlayScene, input: KeyHelpView<'_>, max_columns
     ) * scale;
     let status_lines = detail_status.lines().count();
     let status_height = ui.font_size * 1.8 * scale;
-    let header_height = title_height + status_lines as f64 * status_height;
+    let prompt_height = if window_help && prompt != ">" {
+        ui.font_size * 2.3 * scale
+    } else {
+        0.0
+    };
+    let header_gap = if window_help { 12.0 * scale } else { 0.0 };
+    let header_height =
+        title_height + prompt_height + status_lines as f64 * status_height + header_gap;
     let row_height = if window_help {
         ui.font_size
             * (1.4 * action_lines.iter().map(Vec::len).max().unwrap_or(1) as f64 + 0.6)
@@ -297,6 +326,26 @@ fn compose_columns(scene: &mut OverlayScene, input: KeyHelpView<'_>, max_columns
         .chunks(rows)
         .map(|column| column.iter().sum::<f64>())
         .fold(0.0, f64::max);
+    let ruler_y = row_heights.iter().take(rows).sum::<f64>() + 8.0 * scale;
+    let ruler_plan = input.ruler.as_ref().map(|r| {
+        ruler::plan(
+            r,
+            widths[0].0 + key_gap + widths[0].1,
+            (body_height - ruler_y).clamp(88.0 * scale, 150.0 * scale),
+            (screen.bounds.width / screen.bounds.height.max(1.0)).clamp(0.1, 10.0),
+            ui.font_size,
+            scale,
+        )
+    });
+    let body_height = body_height.max(ruler_plan.as_ref().map_or(0.0, |p| ruler_y + p.height));
+    // Match the visible section-heading inset above the rows, accounting for
+    // the final keycap's built-in row descent and the separator thickness.
+    let body_bottom_padding = if window_help {
+        (header_gap / 2.0 - scale - ui.font_size * 0.1 * scale).max(0.0)
+    } else {
+        0.0
+    };
+    let body_height = body_height + body_bottom_padding;
     let footer_line_height = ui.font_size * 2.2 * scale;
     let mut footer = Vec::new();
     let mut footer_x = 0.0;
@@ -392,6 +441,25 @@ fn compose_columns(scene: &mut OverlayScene, input: KeyHelpView<'_>, max_columns
         )
         .with_z_index(i32::MAX - 1),
     );
+    if window_help {
+        scene.labels.push(
+            OverlayLabel::new(
+                "",
+                Rect::new(
+                    panel.x + padding,
+                    panel.y + vertical_padding + header_height - header_gap / 2.0,
+                    width - padding * 2.0,
+                    scale,
+                ),
+                LabelStyle {
+                    background: foreground.with_opacity(0.18),
+                    font_size: 1.0,
+                    ..base.clone()
+                },
+            )
+            .with_z_index(i32::MAX),
+        );
+    }
     let mut title = if window_help {
         "Window".into()
     } else {
@@ -423,6 +491,7 @@ fn compose_columns(scene: &mut OverlayScene, input: KeyHelpView<'_>, max_columns
             .max(1.0) as usize;
         title = super::elide(&title, capacity);
     }
+    let title_units = super::text_units(&title);
     push_panel_text(
         scene,
         title,
@@ -441,7 +510,7 @@ fn compose_columns(scene: &mut OverlayScene, input: KeyHelpView<'_>, max_columns
         scale,
     );
     if window_help {
-        let left = panel.x + padding + title_font * 5.0 * scale;
+        let left = panel.x + padding + (title_font * title_units + 12.0) * scale;
         let badge_width = (detail_title.chars().count() as f64 * ui.font_size * 0.75 + 16.0)
             .min((panel.right() - padding - close_width - key_gap - left) / scale)
             .max(1.0)
@@ -466,6 +535,24 @@ fn compose_columns(scene: &mut OverlayScene, input: KeyHelpView<'_>, max_columns
             scale,
         );
     }
+    if prompt_height > 0.0 {
+        push_panel_text(
+            scene,
+            prompt,
+            Rect::new(
+                panel.x + padding,
+                panel.y + vertical_padding + title_height,
+                width - padding * 2.0,
+                prompt_height,
+            ),
+            &LabelStyle {
+                font_size: ui.font_size * 1.65,
+                bold: true,
+                ..base.clone()
+            },
+            scale,
+        );
+    }
     for (index, status) in detail_status.lines().enumerate() {
         push_panel_text(
             scene,
@@ -476,12 +563,21 @@ fn compose_columns(scene: &mut OverlayScene, input: KeyHelpView<'_>, max_columns
             },
             Rect::new(
                 panel.x + padding,
-                panel.y + vertical_padding + title_height + index as f64 * status_height,
+                panel.y
+                    + vertical_padding
+                    + title_height
+                    + prompt_height
+                    + index as f64 * status_height,
                 width - padding * 2.0,
                 status_height,
             ),
             &LabelStyle {
-                bold: status.starts_with("Input:") || (window_help && index == 0),
+                bold: window_help && index == 0,
+                text_color: foreground.with_opacity(if window_help && index > 0 {
+                    0.72
+                } else {
+                    0.9
+                }),
                 ..base.clone()
             },
             scale,
@@ -563,6 +659,17 @@ fn compose_columns(scene: &mut OverlayScene, input: KeyHelpView<'_>, max_columns
         ..base.clone()
     }
     .scaled(body_scale);
+    if let Some(plan) = ruler_plan {
+        ruler::draw(
+            scene,
+            plan,
+            panel.x + (panel.width - content_width) / 2.0,
+            panel.y + vertical_padding + header_height + preview_height + ruler_y,
+            &base,
+            foreground,
+            scale,
+        );
+    }
     let preview_area = Rect::new(
         panel.x + padding,
         panel.y + vertical_padding + header_height,
@@ -794,6 +901,15 @@ fn window_action_label(action: &str) -> Option<&'static str> {
         "window_screen_previous" => "Previous screen",
         "size_cycle" => "Maximize / minimize / restore",
         "window_center" => "Center window",
+        "window_audio_previous" => "Previous app output",
+        "window_audio_next" => "Next app output",
+        "window_system_volume_down" => "System volume down",
+        "window_system_volume_up" => "System volume up",
+        "window_system_audio_previous" => "Previous system output",
+        "window_system_audio_next" => "Next system output",
+        "window_volume_down" => "App volume down",
+        "window_volume_up" => "App volume up",
+        "window_volume_mute" => "Mute / unmute app",
         "window_close" => "Close window",
         "window_select" => "Next window",
         "window_select_previous" => "Previous window",
@@ -901,6 +1017,7 @@ mod tests {
                         window_help: true,
                         display_name: "window".into(),
                         previews: Vec::new(),
+                        ruler: None,
                         detail: None,
                         anchor: Some(anchor),
                         indicator_style: None,

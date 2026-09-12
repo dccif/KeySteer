@@ -179,6 +179,7 @@ fn window_settings(config: &Config, kind: modes::window::WindowKind) -> modes::w
         all_screens: common.screens == crate::config::WindowScreens::All,
         include_minimized: common.include_minimized,
         lifecycle: common.lifecycle.clone(),
+        ratio_ticks: config.window_quick.split_ratio_ticks().into(),
         split_ratios: config
             .window_quick
             .parsed_split_ratios()

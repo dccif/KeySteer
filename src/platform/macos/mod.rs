@@ -18,6 +18,7 @@ mod screens;
 mod status_item;
 mod ui_scan;
 mod vision;
+mod window_audio;
 mod window_move;
 mod window_tabs;
 mod workspace;
@@ -363,6 +364,28 @@ impl Backend for MacOsBackend {
     fn cancel_text_prompt(&mut self, id: u64) {
         if let Some(item) = &self.status_item {
             item.cancel_text_prompt(id);
+        }
+    }
+    fn request_audio(&mut self, request: crate::api::audio::AudioRequest) -> Result<(), String> {
+        if self.window_worker.is_none() {
+            let tx = self.event_tx.clone();
+            self.window_worker = Some(
+                crate::platform::common::window_session::WindowWorker::start(
+                    accessibility::window_manager::MacWindows::default,
+                    move |event| {
+                        let _ = tx.send(event);
+                    },
+                )?,
+            );
+        }
+        self.window_worker
+            .as_ref()
+            .ok_or("audio worker did not initialize")?
+            .submit_audio(request)
+    }
+    fn cancel_audio_session(&mut self, session: u64) {
+        if let Some(worker) = &self.window_worker {
+            worker.cancel_audio(session);
         }
     }
     fn request_window(&mut self, request: crate::api::window::WindowRequest) -> Result<(), String> {

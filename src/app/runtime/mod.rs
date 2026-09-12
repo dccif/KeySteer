@@ -324,6 +324,9 @@ impl Engine {
         }
         self.input.reset_for_plan_swap();
         self.registry.modal_stack.clear();
+        for session in std::mem::take(&mut self.scheduler.audio_sessions).into_keys() {
+            backend.cancel_audio_session(session);
+        }
         for session in std::mem::take(&mut self.scheduler.window_sessions).into_keys() {
             backend.cancel_window_session(session);
         }
@@ -567,6 +570,9 @@ impl Engine {
     ) -> Result<(), String> {
         let mut errors = crate::support::errors::ErrorBundle::default();
         errors.record("runtime", result);
+        for session in std::mem::take(&mut self.scheduler.audio_sessions).into_keys() {
+            backend.cancel_audio_session(session);
+        }
         for session in std::mem::take(&mut self.scheduler.window_sessions).into_keys() {
             backend.cancel_window_session(session);
         }
@@ -616,6 +622,11 @@ impl Engine {
         match event {
             BackendEvent::TextPromptResult { id, value } => {
                 self.finish_layout_note(id, value, backend)?
+            }
+            BackendEvent::AudioResult(result) => {
+                if let Some(owner) = self.scheduler.audio_sessions.get(&result.session).cloned() {
+                    self.dispatch_owned_to(&owner, ModeEvent::AudioResult(result), backend)?;
+                }
             }
             BackendEvent::WindowResult(result) => {
                 if let Some(owner) = self.scheduler.window_sessions.get(&result.session).cloned() {
@@ -910,6 +921,9 @@ impl Engine {
         if let Some(mode) = self.registry.get_mut(&previous) {
             let _ = mode.handle(&ModeEvent::Deactivated, &context);
         }
+        for session in std::mem::take(&mut self.scheduler.audio_sessions).into_keys() {
+            backend.cancel_audio_session(session);
+        }
         for session in std::mem::take(&mut self.scheduler.window_sessions).into_keys() {
             backend.cancel_window_session(session);
         }
@@ -1044,7 +1058,12 @@ impl Engine {
                         == Some(*group)
                 });
             if shared_group.is_some() {
-                for owner in self.scheduler.window_sessions.values_mut() {
+                for owner in self
+                    .scheduler
+                    .window_sessions
+                    .values_mut()
+                    .chain(self.scheduler.audio_sessions.values_mut())
+                {
                     if *owner == self.registry.active {
                         *owner = target.clone();
                     }
@@ -1247,6 +1266,27 @@ impl Engine {
             match command {
                 Command::WindowPresets(request) => {
                     self.request_window_presets(owner, *request, backend)?
+                }
+                Command::AudioRequest(request) => {
+                    self.scheduler
+                        .audio_sessions
+                        .insert(request.session, owner.clone());
+                    let (session, id) = (request.session, request.id);
+                    if let Err(error) = backend.request_audio(*request) {
+                        self.dispatch_to(
+                            owner,
+                            ModeEvent::AudioResult(Box::new(crate::api::audio::AudioResult {
+                                session,
+                                id,
+                                outcome: Err(error),
+                            })),
+                            backend,
+                        )?;
+                    }
+                }
+                Command::CancelAudioSession(session) => {
+                    self.scheduler.audio_sessions.remove(&session);
+                    backend.cancel_audio_session(session);
                 }
                 Command::WindowRequest(request) => {
                     self.scheduler

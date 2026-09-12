@@ -2,7 +2,7 @@ import type { SimulatorMode, SimulatorState } from './state'
 import { automaticTree, fitTree, importTree, layoutRect, moveToSlot, navigateSlot, quickCaption, quickRect, quickStep, resizeRegionBy, removeSlot, retainTreeWindows, splitSlot, treeSlots } from './window-layout.ts'
 import type { LayoutDirection, LayoutTree, QuickPlacement } from './window-layout.ts'
 import { instantiateLayout, regionTemplate, presetName } from './window-presets.ts'
-import { parseSplitRatios } from './window-ratios.ts'
+import { parseSplitRatios, splitRatioTicks } from './window-ratios.ts'
 import type { SavedWindowPreset, WindowTemplate } from './window-presets.ts'
 import { activateTab, autoGroupTabs, chooseTabTarget, containingTab, createDemoTabs, currentTabGroup, pruneTabGroups, selectTemplateMember, activeTabWindow, tabFrame, tabAction, tabDetail } from './window-tabs.ts'
 import type { DemoTabs } from './window-tabs.ts'
@@ -24,6 +24,8 @@ export type WindowMode = 'window' | 'window_quick' | 'window_editor' | 'window_r
 export function isWindowMode(mode: string): mode is WindowMode { return ['window', 'window_quick', 'window_editor', 'window_restore', 'window_tab'].includes(mode) }
 
 export interface WindowState {
+  audio: Record<string, { volume: number; muted: boolean; output?: number }>
+  systemAudio: { volume: number; output: number }
   screens: 'current' | 'all'
   includeMinimized: boolean
   tabs: DemoTabs
@@ -44,6 +46,7 @@ export interface WindowState {
   size: boolean
   temporary: boolean
   panel: 'none' | 'quick' | 'tree'
+  ratioLabels: readonly string[]
   ratios: readonly number[]
   quick: QuickPlacement
   tree: LayoutTree | null
@@ -76,6 +79,7 @@ export const WINDOW_MOTION = new Set(['window_left', 'window_down', 'window_up',
 
 export function createWindowState(): WindowState {
   return {
+    audio: {}, systemAudio: { volume: 1, output: 0 },
     screens: 'current', includeMinimized: false,
     tabs: createDemoTabs(),
     mode: 'window', deletingPresets: false, deleteSelection: null, presets: [], library: false, libraryPage: 0, libraryIndex: new Map(), noteOpen: false, recent: [], editingPresetId: null, savedEditSnapshot: '',
@@ -85,6 +89,7 @@ export function createWindowState(): WindowState {
       { id: 3, title: '文件', app: 'Files', screen: 0, x: 55, y: 340, width: 350, height: 250 },
       { id: 4, title: '终端', app: 'Terminal', screen: 1, x: 180, y: 130, width: 590, height: 380 },
     ], target: null, screen: 0, size: false, temporary: false, panel: 'none',
+    ratioLabels: ['1/4', '1/3', '1/2', '2/3', '3/4', '1'],
     ratios: [.25, 1/3, .5, 2/3, .75, 1], quick: { horizontal: null, vertical: null }, tree: null, trees: {}, editBefore: null, editHistory: [], editRedo: [], initial: [], changedWindows: [], redo: [],
     numbers: {}, nextNumber: 1, numberDisplay: '', numberPrefix: '', numberSlot: false, numberDeadline: null, windowIndex: new Map(), slotIndex: new Map(), swapSource: null,
     previous: 'normal', gesture: false, group: 0, history: [],
@@ -147,7 +152,7 @@ export function switchWindowMode(state: SimulatorState, mode: WindowMode, settin
   refreshWindowNumbers(w)
   const library = mode === 'window_restore'
   if (!library && !(mode === 'window_editor' && w.panel === 'tree') && w.panel !== 'none') endWindowEdit(state, true)
-  if (mode === 'window_quick') w.ratios = [...parseSplitRatios(settings.split_ratios), 1]
+  if (mode === 'window_quick') { w.ratios = [...parseSplitRatios(settings.split_ratios), 1]; w.ratioLabels = splitRatioTicks(settings.split_ratios).map(t => t.label) }
   state.mode = mode; w.mode = mode; w.library = library
   w.noteOpen = false; w.deleteSelection = null; w.deletingPresets = false; w.temporary = false; w.gesture = false
   cancelWindowNumber(w); w.swapSource = null
@@ -542,7 +547,7 @@ export function replaceWindowPresets(state: SimulatorState, layouts: SavedWindow
 export function windowDetail(w: WindowState): string {
   if (w.mode === 'window_tab') return tabDetail(w)
   if (w.library) return w.deletingPresets ? 'Delete layouts' : 'Restore'
-  const phase = w.panel === 'quick' ? `Quick · ${quickCaption(w.quick, w.ratios)}` : w.panel === 'tree' ? `Edit · 区域 \`${w.tree?.selected}` : w.mode === 'window_quick' ? 'Quick' : w.mode === 'window_editor' ? 'Edit' : w.size ? 'Resize' : 'Move'
+  const phase = w.panel === 'quick' ? `Quick · ${quickCaption(w.quick, w.ratios, w.ratioLabels)}` : w.panel === 'tree' ? `Edit · 区域 \`${w.tree?.selected}` : w.mode === 'window_quick' ? 'Quick' : w.mode === 'window_editor' ? 'Edit' : w.size ? 'Resize' : 'Move'
   return phase
 }
 export function windowInputStatus(w: WindowState): string {
@@ -561,7 +566,7 @@ export function windowActionAvailable(w: WindowState, action: string): boolean {
   if (action === 'window_save_layout' || action === 'window_remove_region') return w.mode === 'window_editor' && w.panel === 'tree'
   if (/^window_(layout_|split_|ratio_)/.test(action)) return w.mode === 'window_editor' || w.mode === 'window_quick' && action.startsWith('window_layout_')
   if (w.mode === 'window') return !['window_save_layout', 'window_remove_region'].includes(action)
-  return ['window_select', 'window_select_previous', 'window_confirm', 'window_undo', 'window_redo', 'window_reset_initial'].includes(action)
+  return ['window_audio_previous', 'window_audio_next', 'window_system_volume_down', 'window_system_volume_up', 'window_system_audio_previous', 'window_system_audio_next', 'window_volume_down', 'window_volume_up', 'window_volume_mute', 'window_select', 'window_select_previous', 'window_confirm', 'window_undo', 'window_redo', 'window_reset_initial'].includes(action)
 }
 /** Dispatch configured actions, keeping Normal movement separate from window motion. */
 export function applyWindowAction(state: SimulatorState, action: string, settings: Record<string, any> = {}, now = Date.now(), seconds?: number): boolean {
@@ -609,7 +614,7 @@ export function applyWindowAction(state: SimulatorState, action: string, setting
       rect.y = Math.max(0, Math.min(WINDOW_AREA.height - rect.height, cy - rect.height / 2))
       Object.assign(target, rect, { restored: undefined })
       if (JSON.stringify(before.quick) !== JSON.stringify(w.quick)) pushEdit(w, before)
-      state.lastEvent = quickCaption(w.quick, w.ratios)
+      state.lastEvent = quickCaption(w.quick, w.ratios, w.ratioLabels)
     } else if (w.panel === 'tree' && w.tree) {
       if (layoutAction[1] === 'layout') { navigateSlot(w.tree, direction); return true }
       if (layoutAction[1] === 'split') splitSlot(w.tree, direction); else resizeRegionBy(w.tree, direction, seconds === undefined ? settingsNumber(settings, 'resize_step', 20) : seconds * settingsNumber(settings, 'resize_speed', 500), WINDOW_AREA, layoutWindows(w), settingsNumber(settings, 'gap', 0))
@@ -686,6 +691,30 @@ export function applyWindowAction(state: SimulatorState, action: string, setting
       selectWindow(state, next.id)
       if (quick) startWindowEdit(state, false, settings)
       if (w.tree) w.tree.selected = treeSlots(w.tree).find(s => s.window === (containingTab(w, next.id)?.members[0] ?? next.id))?.id ?? w.tree.selected
+      return true
+    }
+    case 'window_system_volume_down': case 'window_system_volume_up': {
+      w.systemAudio.volume = Math.max(0, Math.min(1, w.systemAudio.volume + (action.endsWith('_up') ? .01 : -.01)))
+      state.lastEvent = `系统音量 ${Math.round(w.systemAudio.volume * 100)}%`; return true
+    }
+    case 'window_system_audio_previous': case 'window_system_audio_next': {
+      w.systemAudio.output = (w.systemAudio.output + (action.endsWith('_previous') ? 2 : 1)) % 3
+      state.lastEvent = `系统输出：${['扬声器', '耳机', '显示器'][w.systemAudio.output]}`; return true
+    }
+    case 'window_audio_previous': case 'window_audio_next': {
+      const target = w.target === null ? undefined : activeTabWindow(w, w.target)
+      if (!target) return true
+      const audio = w.audio[target.app] ??= { volume: 1, muted: false }
+      audio.output = ((audio.output ?? w.systemAudio.output) + (action.endsWith('_previous') ? 2 : 1)) % 3
+      state.lastEvent = `${target.app} 输出：${['扬声器', '耳机', '显示器'][audio.output]}`; return true
+    }
+    case 'window_volume_down': case 'window_volume_up': case 'window_volume_mute': {
+      const target = w.target === null ? undefined : activeTabWindow(w, w.target)
+      if (!target) return true
+      const audio = w.audio[target.app] ??= { volume: 1, muted: false }
+      if (action === 'window_volume_mute') audio.muted = !audio.muted
+      else audio.volume = Math.min(1, Math.max(0, audio.volume + (action === 'window_volume_up' ? .01 : -.01)))
+      state.lastEvent = `${target.app}：音量 ${Math.round(audio.volume * 100)}%${audio.muted ? ' · 静音' : ''}`
       return true
     }
     case 'window_close': {

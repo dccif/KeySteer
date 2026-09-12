@@ -234,3 +234,11 @@ Window、Quick、Editor 默认 Z=`window_undo`、Shift+Z=`window_redo`、Shift+C
 窗口布局间隔由 `[window_quick]`、`[window_editor]`、`[window_restore]` 各自的 `gap` 控制，默认 `0.0`，允许设为非零值；用户已有配置中的显式值优先。
 
 普通 Window 默认 x="window_close"；此动作和启动热键均通过配置编译、别名及有效按键提示链解析，未硬编码物理 X 或 Alt+W。Editor 默认 X 不变。
+
+Quick 比例尺的刻度来自 split_ratios：排序按数值，显示保留分数字符串／小数字符串原文，裸小数用数值字符串；可用 "0.30" 保留尾零。相同数值只走一步，但刻度合并列出配置中的标识。满屏端点自动补 1。配置编译时创建共享 RatioTick 数组，模式不读取 TOML。
+
+
+Window、Quick、Editor 默认 V+J / V+K / V+M 分别绑定 window_volume_down / window_volume_up / window_volume_mute；每步 1%，不自动解除静音。它们是各模式独立的可重绑动作；修改 Normal 的 move_down / move_up 不会隐式改写这些绑定。现有显式 bindings 表替换默认表，升级后需自行补入这三个动作。
+
+
+新增 `window_audio_previous/next`（V+H/L）、`window_system_volume_down/up`（Shift+V+J/K）、`window_system_audio_previous/next`（Shift+V+H/L），在 Window/Quick/Editor 各自绑定。系统音量同为每步 1%；设备切换不响应自动重复。

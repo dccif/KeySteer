@@ -48,8 +48,7 @@ test('Tabs groups all four inherited motion keys without absorbing Tab shortcuts
     ['window_tab_previous', 'SHIFT+TAB'], ['window_tab_next', 'TAB']])
   const plan = windowHelpSections(input, 'window_tab')
   assert.ok(plan.left.some(entry => entry.keys === 'B/N/M/V' && entry.action === 'Move / switch tab'))
-  assert.ok(plan.left.some(entry => entry.keys === 'SHIFT+TAB'))
-  assert.ok(plan.left.some(entry => entry.keys === 'TAB'))
+  assert.ok(plan.left.some(entry => entry.keys === 'TAB / SHIFT+TAB' && entry.action === 'Next / previous tab'))
   assert.ok(!plan.left.some(entry => entry.action.startsWith('move_')))
   const ordinary = windowHelpSections(input, 'window')
   assert.ok(!ordinary.left.some(entry => entry.keys === 'B/N/M/V'))
@@ -61,4 +60,17 @@ test('persistent help lists supported save and confirm keys without transient re
   assert.equal(windowHelpActionSupported('window_restore', 'window_delete'), true)
   assert.equal(windowHelpActionSupported('window', 'window_save_layout'), false)
   assert.equal(windowHelpActionSupported('window_quick', 'window_save_layout'), false)
+})
+
+
+test('Quick screen preview keeps configured labels and screen aspect', async () => {
+  const { splitRatioTicks, quickRulerPlan } = await import('./window-ratios.ts')
+  const ticks = splitRatioTicks(['1/2', '1/3', .3, '0.45', '0.4501'])
+  assert.deepEqual(ticks.map(t => t.label), ['0.3', '1/3', '0.45', '0.4501', '1/2', '1'])
+  for (const aspect of [16/9, 9/16]) {
+    const plan = quickRulerPlan(ticks.map(t => t.value), ticks.map(t => t.label), {x:.55, y:0, width:.45, height:.3}, 280, 12, 140, aspect)
+    assert.ok(Math.abs(plan.frame.width / plan.frame.height - aspect) < 1e-9)
+    assert.deepEqual(plan.captions.map(c => c.text), ['0.45', '0.3'])
+    assert.ok(Math.abs(plan.selection.x + plan.selection.width - plan.frame.x - plan.frame.width) < 1e-9)
+  }
 })

@@ -294,3 +294,11 @@ WindowInfo.minimized 在原生结果中传递最小化状态，Mode 保留目标
 WindowOperation::Undo/Redo 使用后台会话的双向原生快照历史；ResetInitial { group } 恢复本次会话写过的窗口，作为独立可撤销步骤。三者优先于库存查询，保持异步边界。模式仅发送命令/处理结果，不持有 HWND/AX 或执行原生恢复。
 
 WindowOperation::Acquire 在 worker 内获取鼠标下窗口并通过 activate_window 激活，完成后才返回目标供展示；不移动指针，激活失败通过 WindowResult.message 返回。WindowAction::Close（window_close）只在普通 Window 可用，发送 Close(WindowId)，由原生正常关闭请求处理，不创建撤销历史，不提前退役窗口身份；关闭取消/保存对话框保留目标，真实关闭后沿用库存和 closed 清理。
+
+Mode::quick_ruler 返回可选 QuickRuler（共享 RatioTick 数组＋当前归一化选区），Engine 将其纳入帮助缓存并传给 presentation。数值与显示原文在配置编译时配对，模式和绘制端均不反推分数或读取配置。
+
+
+`api::audio` 定义独立的 AudioRequest、AudioTarget、AudioAction 和 AudioResult。按键/模式只发 Command::AudioRequest；Engine 调用 Backend::request_audio，异步 BackendEvent::AudioResult 经独立的 audio_sessions 路由回 ModeEvent::AudioResult。此路径不使用 WindowOperation/WindowResult，不结束编辑、不写几何历史、不更新窗口库存。Application(WindowId) 由后端解析活动成员的进程；System 不要求任何窗口会话。
+
+
+音量增减接收系统重复键，runtime 每次验证完整配置组合键仍按住；静音和设备切换为离散动作。Command::CancelAudioSession 撤销排队请求并停止反馈路由，已执行的音量效果保留；已开始的原生请求可能完成。重启/退出/Reload 取消音频队列，Window 同组模式交接同时转移音频结果的接收者。保留现有 window_* 音频动作名称以兼容配置。

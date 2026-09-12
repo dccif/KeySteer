@@ -194,11 +194,11 @@ impl Mode for WindowMode {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .help_anchor()
     }
-    fn help_previews(&self) -> Vec<(String, String, Rect, bool)> {
+    fn quick_ruler(&self) -> Option<crate::api::window_layout::QuickRuler> {
         self.session
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .help_previews()
+            .quick_ruler()
     }
 }
 

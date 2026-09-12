@@ -13,6 +13,13 @@ export function windowHelpSections(entries: HelpEntry[], mode: string, resizing 
     const entry = actions.get(name)
     if (entry) { output.push(entry); actions.delete(name) }
   }
+  const pair = (names: string[], caption: string, output: HelpEntry[]) => {
+    const entries = names.map(name => actions.get(name))
+    if (entries.every(Boolean)) {
+      output.push({ keys: entries.map(entry => entry!.keys).join(' / '), action: caption })
+      names.forEach(name => actions.delete(name))
+    } else names.forEach(name => take(name, output))
+  }
   const family = (names: string[], caption: string, output: HelpEntry[]) => {
     const entries = names.map(name => actions.get(name))
     if (entries.every(entry => entry && !entry.keys.includes(' / '))) {
@@ -28,6 +35,20 @@ export function windowHelpSections(entries: HelpEntry[], mode: string, resizing 
     }
     names.forEach(name => take(name, output))
   }
+  const audioScopes = (app: string[], system: string[], label: string, arrows: string, output: HelpEntry[]) => {
+    const complete = [...app, ...system].every(name => actions.has(name))
+    const shifted = app.every((name, i) => {
+      const a = actions.get(name), b = actions.get(system[i])
+      return a && b && !a.keys.includes(' / ') && b.keys === `SHIFT+${a.keys}`
+    })
+    const local: HelpEntry[] = [], global: HelpEntry[] = []
+    family(app, `App ${label} ${arrows}`, local)
+    family(system, `System ${label} ${arrows}`, global)
+    if (complete && local.length === 1 && global.length === 1) {
+      output.push({ keys: shifted ? local[0].keys : `${local[0].keys} / ${global[0].keys}`,
+        action: shifted ? `${label} ${arrows} · Shift: system` : `App / system ${label} ${arrows}` })
+    } else output.push(...local, ...global)
+  }
   const operations: HelpEntry[] = []
   if (mode === 'window_tab') family(['move_left', 'move_down', 'move_up', 'move_right'], 'Move / switch tab', operations)
   family(['window_left', 'window_down', 'window_up', 'window_right'], resizing ? 'Resize ←↓↑→' : 'Move ←↓↑→', operations)
@@ -36,14 +57,17 @@ export function windowHelpSections(entries: HelpEntry[], mode: string, resizing 
   family(['window_ratio_left', 'window_ratio_right'], 'Width − / +', operations)
   family(['window_ratio_up', 'window_ratio_down'], 'Height − / +', operations)
   family(['window_tab_move_left', 'window_tab_move_right'], 'Move tab ← / →', operations)
-  family(['window_tab_previous', 'window_tab_next'], 'Previous / next tab', operations)
+  pair(['window_tab_next', 'window_tab_previous'], 'Next / previous tab', operations)
   for (const name of ['window_size', 'window_center', 'window_screen_next', 'window_screen_previous', 'size_cycle', 'window_close', 'window_remove_region', 'window_save_layout',
     'Area number', 'window_area_number', 'window_tab_end', 'window_tab_group', 'window_number_end', 'window_tab_remove', 'window_tab_dissolve', 'window_delete', 'window_confirm', 'Previous page', 'Next page']) take(name, operations)
   const modes: HelpEntry[] = [], common: HelpEntry[] = []
   for (const name of ['window_quick', 'window_editor', 'window_restore', 'window_tab']) take(name, modes)
   const captions: Record<string, string> = { window_quick: 'Quick', window_editor: 'Edit', window_restore: 'Restore', window_tab: 'Tabs' }
   modes.forEach(entry => { entry.action = captions[entry.id ?? ''] ?? entry.action })
-  for (const name of ['window_select', 'window_select_previous']) take(name, common)
+  pair(['window_select', 'window_select_previous'], 'Next / previous window', common)
+  audioScopes(['window_volume_down', 'window_volume_up'], ['window_system_volume_down', 'window_system_volume_up'], 'Volume', '− / +', common)
+  audioScopes(['window_audio_previous', 'window_audio_next'], ['window_system_audio_previous', 'window_system_audio_next'], 'Output', '← / →', common)
+  take('window_volume_mute', common)
   const undo = actions.get('window_undo'), redo = actions.get('window_redo')
   if (undo && redo && !undo.keys.includes(' / ') && !redo.keys.includes(' / ')) {
     common.push({ keys: `${undo.keys} / ${redo.keys}`, action: 'Undo / redo' })
@@ -71,7 +95,7 @@ export function windowHelpActionSupported(mode: string, action: string): boolean
   if (action === 'window_delete') return mode === 'window_restore'
   if (mode === 'window_restore') return action === 'window_confirm' || action === 'window_delete'
   if (mode === 'window_tab') return action.startsWith('window_tab_') || ['window_number_end', 'window_undo', 'window_redo', 'window_save_layout'].includes(action)
-  const common = ['window_select', 'window_select_previous', 'window_undo', 'window_redo', 'window_reset_initial']
+  const common = ['window_audio_previous', 'window_audio_next', 'window_system_volume_down', 'window_system_volume_up', 'window_system_audio_previous', 'window_system_audio_next', 'window_volume_down', 'window_volume_up', 'window_volume_mute', 'window_select', 'window_select_previous', 'window_undo', 'window_redo', 'window_reset_initial']
   if (mode === 'window_quick') return action.startsWith('window_layout_') || common.includes(action)
   if (mode === 'window_editor') return /^window_(layout_|split_|ratio_)/.test(action) || common.includes(action) || ['window_save_layout', 'window_remove_region'].includes(action)
   return common.includes(action) || ['window_tile', 'window_left', 'window_down', 'window_up', 'window_right', 'window_size', 'window_screen_next', 'window_screen_previous', 'size_cycle', 'window_center', 'window_close'].includes(action)

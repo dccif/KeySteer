@@ -494,6 +494,7 @@ dependencies = [
  "ureq",
  "windows",
  "windows-collections",
+ "windows-core",
  "windows-future",
  "windows-numerics",
  "winresource",

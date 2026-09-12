@@ -16,6 +16,7 @@ use std::time::Duration;
 /// Something that happened natively and must reach the engine.
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
+    AudioResult(Box<super::audio::AudioResult>),
     WindowResult(Box<super::window::WindowResult>),
     /// A key was pressed or released.
     Input(InputEvent),
@@ -106,6 +107,13 @@ pub enum KeyDisposition {
 /// A native backend. Implementations live in `src/platform/<os>.rs` and are
 /// selected by `cfg(target_os)` in `src/platform/mod.rs`.
 pub trait Backend {
+    /// Enqueue audio work; never block the engine on native audio execution.
+    fn request_audio(&mut self, _request: super::audio::AudioRequest) -> Result<(), String> {
+        Err("Audio control is unavailable on this backend".into())
+    }
+    /// Discard queued requests. An already executing native change may finish.
+    fn cancel_audio_session(&mut self, _session: u64) {}
+
     fn request_window(&mut self, _request: super::window::WindowRequest) -> Result<(), String> {
         Err("window management is not supported by this backend".into())
     }

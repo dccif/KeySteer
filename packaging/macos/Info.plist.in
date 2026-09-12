@@ -30,6 +30,8 @@
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>KeySteer processes application audio locally to adjust its volume, mute it, or send it to your chosen output device. Audio is not saved or transmitted.</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
 </dict>

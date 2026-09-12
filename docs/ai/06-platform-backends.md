@@ -372,3 +372,18 @@ Windows 窗口布局的异步恢复等待同时核对最大化样式与目标几
 Window 入口复用 worker 的 activate_window（Windows 前台激活、macOS 应用激活与 AXRaise），在呈现目标边框之前完成。Close 经 Grouped 转发到原生目标：Windows 异步 PostMessageW(WM_CLOSE)，macOS 对 AXCloseButton 执行 AXPress；不终止进程，不绕过应用的保存/取消流程。
 
 Grouped::close 将组内任意代表解析为活动成员，只向它发正常关闭请求；确认关闭后由既有 close_member/forget 清理成员，剩一个自动解散、撤下标签栏并显示剩余窗口。请求阶段不修改成员表，取消保存不会丢失分组。
+
+
+Windows 应用音量由 window_audio 在既有窗口 worker 初始化 MTA COM，枚举全部活动输出端点的应用会话。只选择目标 PID 与同可执行文件后代 PID，避免 Explorer 的其他子应用被纳入；应用音量不使用系统总音量；显式 Shift 音频动作通过 IAudioEndpointVolume 修改默认输出的系统音量。无会话明确返回提示。多窗口共用音频进程时音量共享。Windows 原生实现使用平台无关的 AudioAction。
+
+
+输出切换按设备名称/ID 稳定排序并循环，只枚举活动 render 端点。应用偏好经 AudioPolicyConfig 的现代 IID、旧版 IID 依次激活，系统默认经 IPolicyConfig；接口不支持时返回错误，不跨音频范围降级。写入前保存旧偏好，任一写入失败尝试回滚并报告回滚结果。只在 Windows 原生模块封装经过核对的私有 ABI，不在模式中调用原生 API。应用能否立即迁移当前音频流取决于其自身是否响应系统路由变化。
+
+
+音频请求与窗口请求在后端共享有界 FIFO worker，以复用 HWND/AX 稳定身份与组活动成员解析；Audio 是独立队列项，在进入布局 Session 前分发，不受布局事务和库存合并影响。Backend::request_audio 可单独启动 worker（系统音量无需 Acquire），取消音频只移除该调用者的音频项。
+
+macOS `window_audio.rs` 的线程所有者封装 `audio_bridge.m`。系统音量使用默认输出的 Core Audio 主控/声道控件，每步 1%；系统设备切换同时设置普通音频与提示音默认输出，失败尝试回滚。设备不支持软件音量时明确报错。
+
+应用独立音量/静音/输出使用 macOS 14.2+ 的私有进程 Tap、私有 aggregate、固定容量 stereo Float32 环形缓冲和 AVAudioEngine。本地增益与重放会增加音频延迟；不写文件、不联网。首次使用需要 System Audio Recording 权限；打包 Info.plist 包含 NSAudioCaptureUsageDescription。14.0/14.1 仍可执行系统音频，应用操作明确返回版本限制，不降级为系统音量。
+
+音频路由独立于模式退出持续生效，最多 32 个应用。worker 定期检查进程、输出与音频引擎；进程退出、设备丢失、格式改变或 Tap 更新失败释放路由、恢复应用原始输出。新音频子进程通过 Tap 描述更新纳入，匹配目标 PID 或目标 bundle ID/子 bundle，排除 KeySteer 自身以防反馈。退出后端按次序停止输出、注销 capture 回调、销毁 aggregate 和 Tap；驱动拒绝注销时隔离回调存储，避免释放仍可能使用的缓冲。

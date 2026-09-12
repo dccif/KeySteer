@@ -603,17 +603,22 @@ mod tests {
 
     #[test]
     fn movement_uses_dragged_event_for_the_held_button() {
-        assert_eq!(movement_event(0).event_type, CGEventType::MouseMoved as u32);
         assert_eq!(
-            movement_event(button_mask(MouseButton::Left)).event_type,
+            movement_event(0).event_type.0,
+            CGEventType::MouseMoved as u32
+        );
+        assert_eq!(
+            movement_event(button_mask(MouseButton::Left)).event_type.0,
             CGEventType::LeftMouseDragged as u32
         );
         assert_eq!(
-            movement_event(button_mask(MouseButton::Right)).event_type,
+            movement_event(button_mask(MouseButton::Right)).event_type.0,
             CGEventType::RightMouseDragged as u32
         );
         assert_eq!(
-            movement_event(button_mask(MouseButton::Middle)).event_type,
+            movement_event(button_mask(MouseButton::Middle))
+                .event_type
+                .0,
             CGEventType::OtherMouseDragged as u32
         );
     }
@@ -630,10 +635,10 @@ mod tests {
 
     #[test]
     fn extra_buttons_keep_their_native_button_numbers() {
-        assert_eq!(button_event(MouseButton::X1, true).button, 3);
-        assert_eq!(button_event(MouseButton::X2, false).button, 4);
+        assert_eq!(button_event(MouseButton::X1, true).button.0, 3);
+        assert_eq!(button_event(MouseButton::X2, false).button.0, 4);
         assert_eq!(
-            drag_event(MouseButton::X1).event_type,
+            drag_event(MouseButton::X1).event_type.0,
             CGEventType::OtherMouseDragged as u32
         );
     }

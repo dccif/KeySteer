@@ -17,6 +17,43 @@ impl WindowSession {
             }
             return;
         }
+        if matches!(
+            action,
+            W::SystemVolumeDown | W::SystemVolumeUp | W::SystemAudioPrevious | W::SystemAudioNext
+        ) {
+            if state == KeyState::Down {
+                use crate::api::audio::{AudioAction, AudioTarget};
+                self.stop_movement(out);
+                let change = match action {
+                    W::SystemVolumeDown => AudioAction::Down,
+                    W::SystemVolumeUp => AudioAction::Up,
+                    W::SystemAudioPrevious => AudioAction::DevicePrevious,
+                    _ => AudioAction::DeviceNext,
+                };
+                self.request_audio(AudioTarget::System, change, out);
+            }
+            return;
+        }
+        if matches!(
+            action,
+            W::VolumeDown | W::VolumeUp | W::VolumeMute | W::AudioPrevious | W::AudioNext
+        ) {
+            if state == KeyState::Down {
+                self.stop_movement(out);
+                if let Some(target) = &self.target {
+                    use crate::api::audio::{AudioAction, AudioTarget};
+                    let change = match action {
+                        W::VolumeDown => AudioAction::Down,
+                        W::VolumeUp => AudioAction::Up,
+                        W::AudioPrevious => AudioAction::DevicePrevious,
+                        W::AudioNext => AudioAction::DeviceNext,
+                        _ => AudioAction::ToggleMute,
+                    };
+                    self.request_audio(AudioTarget::Application(target.id), change, out);
+                }
+            }
+            return;
+        }
         if action.is_held() {
             if state == KeyState::Up {
                 self.held.remove(key);

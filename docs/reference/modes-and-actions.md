@@ -311,3 +311,34 @@ scan_scope = "screen" # window：鼠标下窗口（默认）；screen：鼠标�
 普通 Window 模式默认通过 Alt+W 进入，先激活并前置鼠标下窗口，鼠标位置不变。X 执行 `window_close`，请求关闭当前目标窗口；保存或取消由应用处理。在 `[window.bindings]` 中可改键，例如 `"f9" = "window_close"`（同时移除或禁用原 X 绑定）。编辑布局中的 X 仍然是删除区域。
 
 普通 Window 的目标属于 Tab 组时，X 仅请求关闭该组当前活动窗口；真实关闭后剩余一个成员时自动解散该组并显示剩余窗口。A/E/T 及其他模式保留各自的 X 绑定。
+
+
+### 当前窗口所属应用音量
+
+Window、Quick（A）、Editor（E）的 Common 支持按住 V 后用 J/K 降低／提高音量，每步 1%；V+M 切换静音。按住方向键可以连续调整，松开 V 即停止。共享音频进程的同应用窗口会一起变化；应用尚无音频会话时显示提示。Windows 和 macOS 共用同一组按键和请求接口。
+
+动作名为 `window_volume_down`、`window_volume_up`、`window_volume_mute`。各模式可以独立改绑；如果已自定义方向键，请同步修改音量组合键。已有显式 `[window.bindings]`、`[window_quick.bindings]`、`[window_editor.bindings]` 表需要各自补入：
+
+```toml
+"v+j" = "window_volume_down"
+"v+k" = "window_volume_up"
+"v+m" = "window_volume_mute"
+```
+
+
+### 应用输出与系统音频快捷键
+
+Window、Quick（A）、Editor（E）共同提供：
+
+| 快捷键 | 功能 |
+| --- | --- |
+| V+J / V+K | 当前应用音量 − / +，每步 1%，按住连续调节 |
+| V+M | 当前应用静音 / 取消静音 |
+| V+H / V+L | 当前应用上一个 / 下一个输出设备 |
+| Shift+V+J / Shift+V+K | 系统总音量 − / +，每步 1%，按住连续调节 |
+| Shift+V+H / Shift+V+L | 系统默认上一个 / 下一个输出设备 |
+
+设备按名称排序循环，按一下切换一个；Common 会显示应用/系统的区别，状态显示目标设备名称。应用输出偏好不更改系统默认设备；有些应用需重新开始播放才会采用新设备。自定义绑定表可添加 `window_audio_previous`、`window_audio_next`、`window_system_volume_down`、`window_system_volume_up`、`window_system_audio_previous`、`window_system_audio_next`。
+
+
+macOS 的系统音频控制使用 Core Audio；应用独立音量、静音和输出要求 macOS 14.2 或更高版本，并需允许 KeySteer 的“系统音频录制”权限。请使用打包的 KeySteer.app。应用音频仅在内存中处理并重放，不录音保存或上传，但会增加少量播放延迟。旧版本或不支持音量调节的设备会显示原因。应用音频设置在模式退出后继续生效，退出 KeySteer 时恢复原始播放路径。权限要求参见 [Apple 的 Core Audio Tap 说明](https://developer.apple.com/documentation/CoreAudio/capturing-system-audio-with-core-audio-taps)。

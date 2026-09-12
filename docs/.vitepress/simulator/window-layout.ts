@@ -29,8 +29,8 @@ export function quickRect(quick: QuickPlacement, ratios: readonly number[] = LAY
   const [x, width] = axis(quick.horizontal), [y, height] = axis(quick.vertical)
   return { x, y, width, height }
 }
-export function quickCaption(quick: QuickPlacement, ratios: readonly number[] = LAYOUT_RATIOS): string {
-  const axis = (v: AxisPlacement | null, a: string, b: string): string => v ? `${v.near ? a : b} ${ratioNames[LAYOUT_RATIOS.indexOf(ratios[v.ratio])] ?? Number(ratios[v.ratio].toFixed(3))}` : '1'
+export function quickCaption(quick: QuickPlacement, ratios: readonly number[] = LAYOUT_RATIOS, labels?: readonly string[]): string {
+  const axis = (v: AxisPlacement | null, a: string, b: string): string => v ? `${v.near ? a : b} ${labels?.[v.ratio] ?? ratioNames[LAYOUT_RATIOS.indexOf(ratios[v.ratio])] ?? Number(ratios[v.ratio].toFixed(3))}` : '1'
   return `${axis(quick.horizontal, '左', '右')} × ${axis(quick.vertical, '上', '下')}`
 }
 export function layoutRect(rect: WindowRect, area: { width: number; height: number }, gap: number): WindowRect {

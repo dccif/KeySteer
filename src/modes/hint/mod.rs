@@ -1703,7 +1703,7 @@ mod tests {
                 .map(|index| target(&format!("Layer {index}"), 100.0))
                 .collect(),
         );
-        let top_text = |output: &_| top_label(scene_of(output)).text.clone();
+        let top_text = |output: &[Command]| top_label(scene_of(output)).text.clone();
         let mut observed = vec![top_text(&initial)];
         for index in 0_usize..5 {
             let shift = if index.is_multiple_of(2) {
@@ -1734,7 +1734,7 @@ mod tests {
             &env,
             vec![target("One", 100.0), target("Two", 100.0)],
         );
-        let top_text = |output: &_| top_label(scene_of(output)).text.clone();
+        let top_text = |output: &[Command]| top_label(scene_of(output)).text.clone();
         let initial_top = top_text(&initial);
         let first_top = top_text(&press(&mut mode, &env, "left_shift"));
         assert_ne!(first_top, initial_top);
@@ -1761,7 +1761,7 @@ mod tests {
             ],
         );
         let shifted = press(&mut mode, &env, "left_shift");
-        let normalize = |output: &_| {
+        let normalize = |output: &[Command]| {
             let mut labels = scene_of(output)
                 .labels
                 .iter()

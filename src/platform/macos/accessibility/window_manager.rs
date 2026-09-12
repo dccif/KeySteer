@@ -46,6 +46,7 @@ impl crate::platform::macos::window_move::WindowAccess for &MovableWindow {
 
 #[derive(Default)]
 pub(in crate::platform::macos) struct MacWindows {
+    audio: crate::platform::macos::window_audio::AudioController,
     include_minimized: bool,
     next: u64,
     entries: BTreeMap<WindowId, Entry>,
@@ -642,6 +643,22 @@ impl WindowAccess for MacWindows {
         )
     }
 
+    fn system_audio(&self, change: crate::api::audio::AudioAction) -> Result<String, String> {
+        self.audio.change(None, change)
+    }
+    fn volume(
+        &self,
+        id: WindowId,
+        change: crate::api::audio::AudioAction,
+    ) -> Result<String, String> {
+        let entry = self.entry(id)?;
+        // Read the retained AX window before trusting its original process ID.
+        crate::platform::macos::window_move::WindowAccess::snapshot(&entry.window)?;
+        self.audio.change(Some(entry.pid), change)
+    }
+    fn maintain_audio(&self) -> bool {
+        self.audio.maintain()
+    }
     fn select(&self, id: WindowId) -> Result<(), String> {
         let entry = self.entry(id)?;
         let app = NSRunningApplication::runningApplicationWithProcessIdentifier(entry.pid)

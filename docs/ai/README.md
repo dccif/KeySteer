@@ -35,7 +35,7 @@ Window 组内优先切换、同程序编号和整组最小化见 [公共 API](02
 | 修改 Window 三态循环、库存、编号聚焦、约束布局、模式交接、跨平台活动成员标签组、模板保存/恢复/删除、底部备注输入、撤销/重做或初始状态恢复 | [模式状态机](04-modes-and-lifecycle.md)、[窗口请求 API](02-runtime-and-api.md)、[配置与工作区预设库](03-configuration.md)、[原生后端](06-platform-backends.md)、[验证](08-build-docs-and-tests.md) |
 | 修改 UIA、AX、OCR、Vision、扫描范围、跨屏重扫或扫描超时 | [UI Hint 扫描链路](05-ui-scanning.md) |
 | 修改原生平台能力、后台输入恢复、登录项或状态栏生命周期 | [Windows 与 macOS 后端](06-platform-backends.md) |
-| 修改 Window 固定快捷键缓存、语义分组提示、独立双栏、底部模式栏或退出键布局 | [覆盖层与按键提示](07-rendering-and-performance.md)、[运行时与 API](02-runtime-and-api.md)、[验证](08-build-docs-and-tests.md) |
+| 修改 Quick 配置比例尺、Window 顶部输入与分割线、固定快捷键缓存、语义分组提示、独立双栏、底部模式栏或退出键布局 | [覆盖层与按键提示](07-rendering-and-performance.md)、[运行时与 API](02-runtime-and-api.md)、[验证](08-build-docs-and-tests.md) |
 | 修改统一 presentation、视图端口、覆盖层、实时按键提示、Window 底部恢复列表与锚定面板、标签栏原生事件定位、缓存、帧时钟或性能 | [覆盖层、帧同步与性能](07-rendering-and-performance.md)、[原生后端](06-platform-backends.md) |
 | 修改跨平台字符需求/ASCII 过滤、Windows 布局候选过滤或输入延迟 | [核心运行时与公共 API](02-runtime-and-api.md)、[原生后端](06-platform-backends.md)、[构建与性能验收](08-build-docs-and-tests.md) |
 | 修改构建、打包、文档或测试 | [构建、打包、文档站与测试](08-build-docs-and-tests.md) |
@@ -65,3 +65,12 @@ TOML -> ConfigFile -> app::configuration -> RuntimePlan -> Engine
 - 完整默认值以 `keysteer.default.toml` 和 `Config::default()` 为准。
 - 文档应记录稳定的模块职责、数据流和不可破坏的约束；实现细节以源码为准。
 - 新增模块更新 `01-project-map.md`；改变数据流更新 `02`；改变配置语义更新 `03` 和用户参考；改变原生后端或构建方式更新 `06`/`08`。
+
+
+Window/Quick/Editor 的应用音量组合键与合并 Tab 提示见 [API](02-runtime-and-api.md)、[配置](03-configuration.md)、[原生后端](06-platform-backends.md) 和 [验证](08-build-docs-and-tests.md)。
+
+
+Window 音频控制区分应用与系统：V+J/K、V+H/L 和 Shift+V+J/K、Shift+V+H/L，见 [API](02-runtime-and-api.md)、[配置](03-configuration.md) 与 [原生后端](06-platform-backends.md)。
+
+
+独立跨平台音频请求（按键 → Command::AudioRequest → Engine → Backend）及 macOS 系统音频/应用 Tap 见 [API](02-runtime-and-api.md)、[原生后端](06-platform-backends.md)、[项目地图](01-project-map.md) 和 [构建验收](08-build-docs-and-tests.md)。

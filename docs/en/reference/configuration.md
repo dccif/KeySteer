@@ -428,3 +428,5 @@ button to a keyboard shortcut, bind the shortcut that the driver actually emits.
 
 
 Window and region labels use `[window.ui].font_size`, defaulting to 28. Region labels appear below the window-centre number. Help stays near the inside bottom edge when space permits and omits the redundant window-number key list.
+
+Quick rulers use the labels from split_ratios: mix "1/2", "1/3", 0.3 and 0.45. Use a quoted decimal such as "0.30" to preserve trailing zeros. A screen-proportioned preview below Actions labels the current width and height; other ratios appear as small ticks. The inner rectangle shows the current placement.

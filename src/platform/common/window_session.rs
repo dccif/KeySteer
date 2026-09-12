@@ -138,6 +138,20 @@ pub(crate) trait WindowAccess {
         cancelled: &dyn Fn() -> bool,
     ) -> Result<WindowInfo, String>;
     fn select(&self, id: WindowId) -> Result<(), String>;
+    /// Reap native audio routes; true requests a bounded maintenance wakeup.
+    fn maintain_audio(&self) -> bool {
+        false
+    }
+    fn system_audio(&self, _change: crate::api::audio::AudioAction) -> Result<String, String> {
+        Err("System audio control is unavailable on this backend".into())
+    }
+    fn volume(
+        &self,
+        _id: WindowId,
+        _change: crate::api::audio::AudioAction,
+    ) -> Result<String, String> {
+        Err("Application volume control is unavailable on this backend".into())
+    }
     fn close(&self, _id: WindowId) -> Result<(), String> {
         Err("Closing windows is unavailable on this backend".into())
     }
@@ -163,9 +177,36 @@ pub(crate) trait WindowAccess {
     }
 }
 
-struct Pending {
-    request: WindowRequest,
-    screens: Vec<Screen>,
+enum Pending {
+    Window {
+        request: WindowRequest,
+        screens: Vec<Screen>,
+    },
+    Audio(crate::api::audio::AudioRequest),
+}
+impl Pending {
+    fn operation(&self) -> Option<&WindowOperation> {
+        match self {
+            Self::Window { request, .. } => Some(&request.operation),
+            Self::Audio(_) => None,
+        }
+    }
+}
+
+fn execute_audio(
+    access: &impl WindowAccess,
+    request: crate::api::audio::AudioRequest,
+) -> crate::api::audio::AudioResult {
+    use crate::api::audio::AudioTarget;
+    let outcome = match request.target {
+        AudioTarget::Application(id) => access.volume(id, request.action),
+        AudioTarget::System => access.system_audio(request.action),
+    };
+    crate::api::audio::AudioResult {
+        session: request.session,
+        id: request.id,
+        outcome,
+    }
 }
 
 #[derive(Default)]
@@ -215,6 +256,7 @@ impl WindowWorker {
                 let mut session = Session::default();
                 let mut displays = Vec::new();
                 loop {
+                    let audio_active = access.maintain_audio();
                     if access.persistent()
                         && let Err(error) =
                             access.pump(&displays, &|| input.stop.load(Ordering::Acquire))
@@ -224,7 +266,7 @@ impl WindowWorker {
                     let pending = {
                         let mut queue = input.queue.lock().unwrap_or_else(|e| e.into_inner());
                         while queue.is_empty() && !input.stop.load(Ordering::Acquire) {
-                            if access.persistent() {
+                            if access.persistent() || audio_active {
                                 // Release the mailbox before native waiting. A
                                 // posted wake remains queued even if submission
                                 // races with entering the wait.
@@ -232,7 +274,9 @@ impl WindowWorker {
                                     input.native_waiting.store(true, Ordering::Release);
                                     drop(queue);
                                     if !input.stop.load(Ordering::Acquire) {
-                                        access.wait_for_events(None);
+                                        access.wait_for_events(
+                                            audio_active.then_some(Duration::from_millis(250)),
+                                        );
                                     }
                                     input.native_waiting.store(false, Ordering::Release);
                                     queue = input.queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -240,7 +284,14 @@ impl WindowWorker {
                                 }
                                 queue = input
                                     .ready
-                                    .wait_timeout(queue, Duration::from_millis(20))
+                                    .wait_timeout(
+                                        queue,
+                                        if audio_active && !access.persistent() {
+                                            Duration::from_millis(250)
+                                        } else {
+                                            Duration::from_millis(20)
+                                        },
+                                    )
                                     .unwrap_or_else(|e| e.into_inner())
                                     .0;
                                 break;
@@ -255,13 +306,22 @@ impl WindowWorker {
                     let Some(pending) = pending else {
                         continue;
                     };
-                    let id = pending.request.session;
+                    let (request, screens) = match pending {
+                        Pending::Audio(request) => {
+                            emit(BackendEvent::AudioResult(Box::new(execute_audio(
+                                &access, request,
+                            ))));
+                            continue;
+                        }
+                        Pending::Window { request, screens } => (request, screens),
+                    };
+                    let id = request.session;
                     let acquisition = matches!(
-                        pending.request.operation,
+                        request.operation,
                         WindowOperation::Acquire(_) | WindowOperation::EndEdit { .. }
                     );
-                    let query = matches!(pending.request.operation, WindowOperation::Enumerate);
-                    let request_id = pending.request.id;
+                    let query = matches!(request.operation, WindowOperation::Enumerate);
+                    let request_id = request.id;
                     let cancelled = || {
                         input.stop.load(Ordering::Acquire)
                             || input.session.load(Ordering::Acquire) != id
@@ -279,7 +339,7 @@ impl WindowWorker {
                     }
                     // Cancellation wakeups carry no displays. Only accepted
                     // requests may replace the persistent groups' geometry context.
-                    displays.clone_from(&pending.screens);
+                    displays.clone_from(&screens);
                     if session.id != id {
                         session.cleanup_edit(&mut access);
                         access.reset();
@@ -288,8 +348,7 @@ impl WindowWorker {
                             ..Session::default()
                         };
                     }
-                    let result =
-                        session.execute(&mut access, pending.request, &pending.screens, &cancelled);
+                    let result = session.execute(&mut access, request, &screens, &cancelled);
                     if !cancelled() {
                         emit(BackendEvent::WindowResult(Box::new(result)));
                     } else {
@@ -323,7 +382,7 @@ impl WindowWorker {
                 .store(request.session, Ordering::Release);
             self.mailbox.cancel_before.store(0, Ordering::Release);
             self.mailbox.query_before.store(0, Ordering::Release);
-            queue.clear();
+            queue.retain(|p| matches!(p, Pending::Audio(_)));
         }
         if self.mailbox.session.load(Ordering::Acquire) != request.session {
             return Err("window session expired".into());
@@ -332,19 +391,22 @@ impl WindowWorker {
             self.mailbox
                 .query_before
                 .store(request.id, Ordering::Release);
-            queue.retain(|p| !matches!(p.request.operation, WindowOperation::Enumerate));
+            queue.retain(|p| !matches!(p.operation(), Some(WindowOperation::Enumerate)));
         }
         if matches!(request.operation, WindowOperation::CancelPending) {
             self.mailbox
                 .cancel_before
                 .store(request.id, Ordering::Release);
             queue.retain(|p| {
-                matches!(
-                    p.request.operation,
-                    WindowOperation::Acquire(_)
-                        | WindowOperation::BeginEdit { .. }
-                        | WindowOperation::EndEdit { .. }
-                )
+                matches!(p, Pending::Audio(_))
+                    || matches!(
+                        p.operation(),
+                        Some(
+                            WindowOperation::Acquire(_)
+                                | WindowOperation::BeginEdit { .. }
+                                | WindowOperation::EndEdit { .. }
+                        )
+                    )
             });
         }
         if matches!(
@@ -355,28 +417,32 @@ impl WindowWorker {
                 .cancel_before
                 .store(request.id, Ordering::Release);
             queue.retain(|p| {
-                matches!(
-                    p.request.operation,
-                    WindowOperation::Acquire(_) | WindowOperation::BeginEdit { .. }
-                )
+                matches!(p, Pending::Audio(_))
+                    || matches!(
+                        p.operation(),
+                        Some(WindowOperation::Acquire(_) | WindowOperation::BeginEdit { .. })
+                    )
             });
         }
         // Absolute layouts replace pending revisions, rather than accumulating
         // intermediate native work. Transaction boundaries are never coalesced.
-        if let Some(last) = queue.back_mut()
+        if let Some(Pending::Window {
+            request: last,
+            screens: last_screens,
+        }) = queue.back_mut()
             && let (
                 WindowOperation::ApplyLayout { transaction: a, .. },
                 WindowOperation::ApplyLayout { transaction: b, .. },
-            ) = (&last.request.operation, &request.operation)
+            ) = (&last.operation, &request.operation)
             && a == b
         {
-            last.request = request;
-            last.screens = screens.to_vec();
+            *last = request;
+            *last_screens = screens.to_vec();
             return Ok(());
         }
         // Coalesce relative changes only within the same uninterrupted gesture.
-        if let Some(last) = queue.back_mut()
-            && last.request.session == request.session
+        if let Some(Pending::Window { request: last, .. }) = queue.back_mut()
+            && last.session == request.session
             && let (
                 WindowOperation::Adjust {
                     target: a,
@@ -388,7 +454,7 @@ impl WindowWorker {
                     change: cb,
                     group: gb,
                 },
-            ) = (&mut last.request.operation, &request.operation)
+            ) = (&mut last.operation, &request.operation)
             && a == b
             && ga == gb
         {
@@ -409,20 +475,48 @@ impl WindowWorker {
                 _ => false,
             };
             if merged {
-                last.request.id = request.id;
+                last.id = request.id;
                 return Ok(());
             }
         }
         if queue.len() >= 64 {
             return Err("window operation queue is full".into());
         }
-        queue.push_back(Pending {
+        queue.push_back(Pending::Window {
             request,
             screens: screens.to_vec(),
         });
         drop(queue);
         self.mailbox.notify();
         Ok(())
+    }
+
+    /// Audio shares native identity ownership and FIFO order with window work,
+    /// but never enters the layout session or its history/cancellation barriers.
+    pub(crate) fn submit_audio(
+        &self,
+        request: crate::api::audio::AudioRequest,
+    ) -> Result<(), String> {
+        let mut queue = self
+            .mailbox
+            .queue
+            .lock()
+            .map_err(|_| "audio queue poisoned")?;
+        if self.mailbox.stop.load(Ordering::Acquire) {
+            return Err("audio worker stopped".into());
+        }
+        if queue.len() >= 64 {
+            return Err("audio operation queue is full".into());
+        }
+        queue.push_back(Pending::Audio(request));
+        drop(queue);
+        self.mailbox.notify();
+        Ok(())
+    }
+
+    pub(crate) fn cancel_audio(&self, session: u64) {
+        let mut queue = self.mailbox.queue.lock().unwrap_or_else(|e| e.into_inner());
+        queue.retain(|p| !matches!(p, Pending::Audio(r) if r.session == session));
     }
 
     pub(crate) fn cancel(&self, session: u64) {
@@ -436,10 +530,10 @@ impl WindowWorker {
             .compare_exchange(session, 0, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            queue.clear();
+            queue.retain(|p| matches!(p, Pending::Audio(_)));
             // Wake the owner to release retained native references and undo
             // snapshots immediately, including when no operation is active.
-            queue.push_back(Pending {
+            queue.push_back(Pending::Window {
                 request: WindowRequest {
                     scope: None,
                     session,
@@ -1577,6 +1671,7 @@ mod tests {
         refuse_focus: bool,
         selected: std::cell::Cell<Option<WindowId>>,
         close_requests: std::cell::RefCell<Vec<WindowId>>,
+        volume_requests: std::cell::RefCell<Vec<(WindowId, crate::api::audio::AudioAction)>>,
         unchanged_ack: bool,
         snapshot_unavailable: bool,
         minimum: Point,
@@ -1634,6 +1729,7 @@ mod tests {
                 refuse_focus: false,
                 selected: std::cell::Cell::new(None),
                 close_requests: Default::default(),
+                volume_requests: Default::default(),
                 unchanged_ack: false,
                 snapshot_unavailable: false,
                 minimum: Point::new(100.0, 80.0),
@@ -1721,6 +1817,18 @@ mod tests {
                 s.info.maximized = true;
             }
             Ok(s.info.clone())
+        }
+        fn system_audio(&self, _change: crate::api::audio::AudioAction) -> Result<String, String> {
+            Err("System audio control is unavailable on this backend".into())
+        }
+        fn volume(
+            &self,
+            id: WindowId,
+            change: crate::api::audio::AudioAction,
+        ) -> Result<String, String> {
+            self.windows.get(&id).ok_or("closed")?;
+            self.volume_requests.borrow_mut().push((id, change));
+            Ok("App volume 45%".into())
         }
         fn close(&self, id: WindowId) -> Result<(), String> {
             self.close_requests.borrow_mut().push(id);
@@ -1816,6 +1924,96 @@ mod tests {
         assert!(result.target.is_none());
         assert_eq!(result.closed, vec![WindowId(1)]);
         assert_eq!(result.windows.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn audio_dispatch_does_not_enter_or_end_a_layout_transaction() {
+        use crate::api::audio::{AudioAction, AudioRequest, AudioTarget};
+        let mut access = Fake::new(2);
+        let mut session = Session::default();
+        run(
+            &mut session,
+            &mut access,
+            WindowOperation::Acquire(Point::default()),
+        );
+        run(
+            &mut session,
+            &mut access,
+            WindowOperation::BeginEdit {
+                transaction: 9,
+                targets: vec![WindowId(1)],
+                screen: None,
+                group: 1,
+            },
+        );
+        let request = AudioRequest {
+            session: 55,
+            id: 2,
+            target: AudioTarget::Application(WindowId(1)),
+            action: AudioAction::Down,
+        };
+        let result = execute_audio(&access, request.clone());
+        assert_eq!(result.outcome.as_deref(), Ok("App volume 45%"));
+        assert_eq!((result.session, result.id), (55, 2));
+        assert_eq!(
+            *access.volume_requests.borrow(),
+            [(WindowId(1), AudioAction::Down)]
+        );
+        assert!(session.edit.is_some());
+        assert!(session.history.is_empty());
+        assert!(access.writes.is_empty());
+        let result = execute_audio(
+            &access,
+            AudioRequest {
+                target: AudioTarget::Application(WindowId(99)),
+                ..request
+            },
+        );
+        assert_eq!(result.outcome.as_deref(), Err(&"closed".to_string()));
+        assert_eq!(access.volume_requests.borrow().len(), 1);
+    }
+
+    #[test]
+    fn audio_worker_needs_no_window_session_and_cancels_only_its_owner() {
+        use crate::api::audio::{AudioAction, AudioRequest, AudioTarget};
+        use std::sync::mpsc;
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (start_tx, start_rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
+        let mut worker = WindowWorker::start(
+            move || {
+                ready_tx.send(()).unwrap();
+                start_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                Fake::new(0)
+            },
+            move |event| {
+                tx.send(event).unwrap();
+            },
+        )
+        .unwrap();
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        for session in [17, 18] {
+            worker
+                .submit_audio(AudioRequest {
+                    session,
+                    id: 1,
+                    target: AudioTarget::System,
+                    action: AudioAction::Up,
+                })
+                .unwrap();
+        }
+        worker.cancel_audio(17);
+        start_tx.send(()).unwrap();
+        let BackendEvent::AudioResult(result) = rx.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("audio must have its own result channel");
+        };
+        assert_eq!(result.session, 18);
+        assert!(result.outcome.unwrap_err().contains("unavailable"));
+        worker
+            .stop_until(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        assert!(rx.try_recv().is_err());
     }
 
     fn adjust(group: u64, change: WindowChange) -> WindowOperation {

@@ -155,6 +155,15 @@ impl Default for Window {
                     ("x", W::Close),
                     ("tab", W::Select),
                     ("shift+tab", W::SelectPrevious),
+                    ("v+j", W::VolumeDown),
+                    ("v+k", W::VolumeUp),
+                    ("v+m", W::VolumeMute),
+                    ("v+h", W::AudioPrevious),
+                    ("v+l", W::AudioNext),
+                    ("shift+v+j", W::SystemVolumeDown),
+                    ("shift+v+k", W::SystemVolumeUp),
+                    ("shift+v+h", W::SystemAudioPrevious),
+                    ("shift+v+l", W::SystemAudioNext),
                     ("z", W::Undo),
                     ("shift+z", W::Redo),
                     ("shift+c", W::ResetInitial),
@@ -186,6 +195,15 @@ impl Default for WindowQuick {
                     ("l", W::Navigate(Right)),
                     ("tab", W::Select),
                     ("shift+tab", W::SelectPrevious),
+                    ("v+j", W::VolumeDown),
+                    ("v+k", W::VolumeUp),
+                    ("v+m", W::VolumeMute),
+                    ("v+h", W::AudioPrevious),
+                    ("v+l", W::AudioNext),
+                    ("shift+v+j", W::SystemVolumeDown),
+                    ("shift+v+k", W::SystemVolumeUp),
+                    ("shift+v+h", W::SystemAudioPrevious),
+                    ("shift+v+l", W::SystemAudioNext),
                     ("z", W::Undo),
                     ("shift+z", W::Redo),
                     ("shift+c", W::ResetInitial),
@@ -223,6 +241,15 @@ impl Default for WindowEditor {
                     ("ctrl+l", W::Ratio(Right)),
                     ("tab", W::Select),
                     ("shift+tab", W::SelectPrevious),
+                    ("v+j", W::VolumeDown),
+                    ("v+k", W::VolumeUp),
+                    ("v+m", W::VolumeMute),
+                    ("v+h", W::AudioPrevious),
+                    ("v+l", W::AudioNext),
+                    ("shift+v+j", W::SystemVolumeDown),
+                    ("shift+v+k", W::SystemVolumeUp),
+                    ("shift+v+h", W::SystemAudioPrevious),
+                    ("shift+v+l", W::SystemAudioNext),
                     ("z", W::Undo),
                     ("shift+z", W::Redo),
                     ("shift+c", W::ResetInitial),
@@ -279,6 +306,43 @@ impl Default for WindowTab {
 }
 
 impl WindowQuick {
+    pub(crate) fn split_ratio_ticks(&self) -> Vec<crate::api::window_layout::RatioTick> {
+        self.parsed_split_ratios()
+            .unwrap_or_else(|error| {
+                panic!("window settings require validated configuration: {error}")
+            })
+            .into_iter()
+            .map(|value| {
+                let labels = self
+                    .split_ratios
+                    .iter()
+                    .filter_map(|source| {
+                        let (number, label) = match source {
+                            SplitRatio::Decimal(number) => (*number, number.to_string()),
+                            SplitRatio::Fraction(label) => {
+                                let (a, b) =
+                                    label.trim().split_once('/').unwrap_or((label.trim(), "1"));
+                                (
+                                    a.trim().parse::<f64>().ok()? / b.trim().parse::<f64>().ok()?,
+                                    label.clone(),
+                                )
+                            }
+                        };
+                        (number == value).then_some(label)
+                    })
+                    .collect::<Vec<_>>();
+                crate::api::window_layout::RatioTick {
+                    value,
+                    label: labels.join(" / "),
+                }
+            })
+            .chain([crate::api::window_layout::RatioTick {
+                value: 1.0,
+                label: "1".into(),
+            }])
+            .collect()
+    }
+
     pub(crate) fn parsed_split_ratios(&self) -> Result<Vec<f64>, &'static str> {
         const ERROR: &str = "window_quick.split_ratios must be a non-empty array of fractions such as \"1/4\" or decimal numbers, each finite, greater than 0 and less than 1";
         let mut values = Vec::with_capacity(self.split_ratios.len());
@@ -286,7 +350,14 @@ impl WindowQuick {
             let value = match ratio {
                 SplitRatio::Decimal(value) => *value,
                 SplitRatio::Fraction(text) => {
-                    let (numerator, denominator) = text.trim().split_once('/').ok_or(ERROR)?;
+                    let Some((numerator, denominator)) = text.trim().split_once('/') else {
+                        let value = text.trim().parse::<f64>().map_err(|_| ERROR)?;
+                        if !value.is_finite() || value <= 0.0 || value >= 1.0 {
+                            return Err(ERROR);
+                        }
+                        values.push(value);
+                        continue;
+                    };
                     let numerator = numerator.trim().parse::<u32>().map_err(|_| ERROR)?;
                     let denominator = denominator.trim().parse::<u32>().map_err(|_| ERROR)?;
                     if numerator == 0 || numerator >= denominator {

@@ -8,6 +8,7 @@
 //! (`idle`, `normal`, `grid`, `recursive_grid`, `ui_hint`) ordinary consumers of
 //! this API and lets a plugin build a full-screen grid of its own.
 
+pub mod audio;
 pub mod autostart;
 pub mod backend;
 pub mod binding;

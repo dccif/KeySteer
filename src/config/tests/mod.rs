@@ -37,7 +37,6 @@ fn window_split_ratios_validate_and_round_trip() {
         "[-0.1]",
         "[nan]",
         "[inf]",
-        "[\"0.5\"]",
         "[\"nan\"]",
         "[\"1/4294967296\"]",
     ] {

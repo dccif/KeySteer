@@ -1170,6 +1170,24 @@ impl<A: WindowAccess> WindowAccess for Grouped<A> {
     fn select(&self, id: WindowId) -> Result<(), String> {
         self.native.select(id)
     }
+    fn maintain_audio(&self) -> bool {
+        self.native.maintain_audio()
+    }
+    fn system_audio(&self, change: crate::api::audio::AudioAction) -> Result<String, String> {
+        self.native.system_audio(change)
+    }
+    fn volume(
+        &self,
+        id: WindowId,
+        change: crate::api::audio::AudioAction,
+    ) -> Result<String, String> {
+        let active = self
+            .groups
+            .state
+            .containing(id)
+            .map_or(id, |group| group.active);
+        self.native.volume(active, change)
+    }
     fn close(&self, id: WindowId) -> Result<(), String> {
         let active = self
             .groups

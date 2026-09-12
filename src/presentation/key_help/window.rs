@@ -80,6 +80,68 @@ fn family(
     }
 }
 
+fn pair(
+    actions: &mut BTreeMap<String, Vec<String>>,
+    names: [&str; 2],
+    caption: &str,
+    entries: &mut Vec<Entry>,
+) {
+    if names.iter().all(|name| actions.contains_key(*name)) {
+        let keys = names
+            .into_iter()
+            .flat_map(|name| actions.remove(name).unwrap_or_default())
+            .collect::<Vec<_>>();
+        entries.push((keys.join(" / "), caption.into()));
+    } else {
+        for name in names {
+            take(actions, name, entries);
+        }
+    }
+}
+
+// Only abbreviate Shift when the effective bindings really have that relation.
+fn audio_scopes(
+    actions: &mut BTreeMap<String, Vec<String>>,
+    app: [&str; 2],
+    system: [&str; 2],
+    label: &str,
+    arrows: &str,
+    entries: &mut Vec<Entry>,
+) {
+    let complete = app
+        .iter()
+        .chain(system.iter())
+        .all(|name| actions.contains_key(*name));
+    let shifted = app.iter().zip(system).all(|(a, b)| {
+        matches!((actions.get(*a), actions.get(b)), (Some(a), Some(b)) if a.len() == 1 && b.len() == 1 && b[0] == format!("SHIFT+{}", a[0]))
+    });
+    let mut local = Vec::new();
+    let mut global = Vec::new();
+    family(actions, &app, &format!("App {label} {arrows}"), &mut local);
+    family(
+        actions,
+        &system,
+        &format!("System {label} {arrows}"),
+        &mut global,
+    );
+    if complete && local.len() == 1 && global.len() == 1 {
+        let keys = if shifted {
+            local[0].0.clone()
+        } else {
+            format!("{} / {}", local[0].0, global[0].0)
+        };
+        let caption = if shifted {
+            format!("{label} {arrows} · Shift: system")
+        } else {
+            format!("App / system {label} {arrows}")
+        };
+        entries.push((keys, caption));
+    } else {
+        entries.extend(local);
+        entries.extend(global);
+    }
+}
+
 fn section(entries: &mut Vec<Entry>, title: &str, mut content: Vec<Entry>) {
     if !content.is_empty() {
         entries.push((String::new(), title.into()));
@@ -158,13 +220,15 @@ pub(super) fn sections(
             &["window_tab_move_left", "window_tab_move_right"][..],
             "Move tab ← / →",
         ),
-        (
-            &["window_tab_previous", "window_tab_next"][..],
-            "Previous / next tab",
-        ),
     ] {
         family(&mut actions, names, caption, &mut operations);
     }
+    pair(
+        &mut actions,
+        ["window_tab_next", "window_tab_previous"],
+        "Next / previous tab",
+        &mut operations,
+    );
     for name in [
         "window_size",
         "window_center",
@@ -209,9 +273,29 @@ pub(super) fn sections(
         .into();
     }
     let mut common = Vec::new();
-    for name in ["window_select", "window_select_previous"] {
-        take(&mut actions, name, &mut common);
-    }
+    pair(
+        &mut actions,
+        ["window_select", "window_select_previous"],
+        "Next / previous window",
+        &mut common,
+    );
+    audio_scopes(
+        &mut actions,
+        ["window_volume_down", "window_volume_up"],
+        ["window_system_volume_down", "window_system_volume_up"],
+        "Volume",
+        "− / +",
+        &mut common,
+    );
+    audio_scopes(
+        &mut actions,
+        ["window_audio_previous", "window_audio_next"],
+        ["window_system_audio_previous", "window_system_audio_next"],
+        "Output",
+        "← / →",
+        &mut common,
+    );
+    take(&mut actions, "window_volume_mute", &mut common);
     let undo = actions.get("window_undo").filter(|keys| keys.len() == 1);
     let redo = actions.get("window_redo").filter(|keys| keys.len() == 1);
     if let (Some(undo), Some(redo)) = (undo, redo) {
@@ -261,6 +345,43 @@ pub(super) fn sections(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pairs_navigation_even_with_different_modifiers_and_multiple_bindings() {
+        for (next, previous, mode, caption) in [
+            (
+                "window_select",
+                "window_select_previous",
+                "window",
+                "Next / previous window",
+            ),
+            (
+                "window_tab_next",
+                "window_tab_previous",
+                "window_tab",
+                "Next / previous tab",
+            ),
+        ] {
+            let mut actions = BTreeMap::new();
+            actions.insert(next.into(), vec!["TAB".into(), "F9".into()]);
+            actions.insert(previous.into(), vec!["SHIFT+TAB".into()]);
+            let plan = sections(actions.clone(), mode, None, false);
+            assert!(
+                plan.left
+                    .iter()
+                    .chain(&plan.right)
+                    .any(|e| e == &("TAB / F9 / SHIFT+TAB".into(), caption.into()))
+            );
+            actions.remove(previous);
+            let plan = sections(actions, mode, None, false);
+            assert!(
+                plan.left
+                    .iter()
+                    .chain(&plan.right)
+                    .any(|(key, _)| key == "TAB / F9")
+            );
+        }
+    }
 
     #[test]
     fn groups_actions_independently_of_configured_key_order() {

@@ -27,6 +27,17 @@ fn negative(direction: Direction) -> bool {
     matches!(direction, Direction::Left | Direction::Up)
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct RatioTick {
+    pub value: f64,
+    pub label: String,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuickRuler {
+    pub ticks: std::sync::Arc<[RatioTick]>,
+    pub selected: Rect,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AxisPlacement {
     pub near: bool,
@@ -86,6 +97,25 @@ impl QuickPlacement {
         self.caption_with(&RATIOS)
     }
 
+    pub fn caption_with_ticks(self, ticks: &[RatioTick]) -> String {
+        let axis = |value: Option<AxisPlacement>, near: &str, far: &str| {
+            value.map_or_else(
+                || "1".into(),
+                |v| {
+                    format!(
+                        "{} {}",
+                        if v.near { near } else { far },
+                        ticks.get(v.ratio).map_or("1", |t| t.label.as_str())
+                    )
+                },
+            )
+        };
+        format!(
+            "{} × {}",
+            axis(self.horizontal, "Left", "Right"),
+            axis(self.vertical, "Top", "Bottom")
+        )
+    }
     pub fn caption_with(self, ratios: &[f64]) -> String {
         const NAMES: [&str; 6] = ["1/4", "1/3", "1/2", "2/3", "3/4", "1"];
         let axis = |value: Option<AxisPlacement>, near: &str, far: &str| {

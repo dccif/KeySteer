@@ -15,7 +15,8 @@ import { decodeWorkspaceFile, encodeWorkspaceFile, WORKSPACE_FILE_NAME, WORKSPAC
 import type { WindowState } from '../simulator/window'
 import { availableWindowPresets } from '../simulator/window'
 import { activateTab, chooseTabTarget, containingTab, activeTabWindow, tabFrame } from '../simulator/window-tabs'
-import { layoutRect, quickCaption, quickRect, treeSlots } from '../simulator/window-layout'
+import { layoutRect, quickRect, treeSlots } from '../simulator/window-layout'
+import { quickRulerPlan } from '../simulator/window-ratios'
 import { windowHelpSections, windowHelpGrid, windowHelpActionSupported, type HelpEntry } from '../simulator/window-help'
 import { consumeConfigHandoff } from '../simulator/config-handoff'
 import CommonConfigControls from '../config-studio/CommonConfigControls'
@@ -77,7 +78,7 @@ const actionGroups: ActionGroup[] = [
     ['window_left', '窗口向左'], ['window_down', '窗口向下'], ['window_up', '窗口向上'], ['window_right', '窗口向右'],
     ['window_size', '移动／缩放'], ['window_quick', '快速布局'], ['window_editor', '编辑布局树'], ['window_tile', '直接平铺'],
     ['window_screen_next', '循环切屏'],
-    ['size_cycle', '最大化／最小化／还原'], ['window_center', '窗口居中'], ['window_close', '关闭窗口'], ['window_select', '切换下一个窗口'], ['window_select_previous', '切换上一个窗口'],
+    ['size_cycle', '最大化／最小化／还原'], ['window_center', '窗口居中'], ['window_close', '关闭窗口'], ['window_volume_down', '降低应用音量'], ['window_volume_up', '提高应用音量'], ['window_volume_mute', '切换应用静音'], ['window_audio_previous', '上一个应用输出设备'], ['window_audio_next', '下一个应用输出设备'], ['window_system_volume_down', '降低系统音量'], ['window_system_volume_up', '提高系统音量'], ['window_system_audio_previous', '上一个系统输出设备'], ['window_system_audio_next', '下一个系统输出设备'], ['window_select', '切换下一个窗口'], ['window_select_previous', '切换上一个窗口'],
     ['window_undo', '撤销窗口调整'], ['window_redo', '重做窗口调整'], ['window_reset_initial', '恢复原始状态'], ['window_remove_region', '删除当前区域'], ['window_restore', '保存的布局'], ['window_save_layout', '保存布局'], ['window_confirm', '确认'],
   ].map(([value, label]) => ({ value, label })) },
   { name: '窗口布局方向', actions: ['left', 'down', 'up', 'right'].flatMap(direction => [
@@ -464,7 +465,18 @@ export default defineComponent({
 
     function onSimulatorKeyDown(event: KeyboardEvent): void {
       if (simulator.window.noteOpen) return
-      if (!simulatorArmed.value || event.repeat) return
+      if (!simulatorArmed.value) return
+      if (event.repeat) {
+        const document = effectiveDocument.value
+        if (document && isWindowMode(simulator.mode)) {
+          const resolved = resolvePhysicalBinding(document, simulator.mode, currentPhysicalKeys(event), physicalKey(event), isMac.value)
+          const action = String(resolved?.value)
+          if (['window_volume_down', 'window_volume_up', 'window_system_volume_down', 'window_system_volume_up'].includes(action) && windowActionAvailable(simulator.window, action)) {
+            event.preventDefault(); executeAction(action)
+          }
+        }
+        return
+      }
       const physical = physicalKey(event)
       physicalKeys.add(physical)
       updateTemporaryWindow(event)
@@ -1370,8 +1382,8 @@ const KeyHelpPreview = defineComponent({
       const ui = keyHelpStyle(props.document.key_help)
       const isWindow = isWindowMode(props.mode)
       if (isWindow) ui.title_font_size = ui.font_size * 1.75
-      const preview = props.mode === 'window_quick' && props.windowState?.panel === 'quick' ? quickRect(props.windowState.quick, props.windowState.ratios) : null
-      const previewHeight = preview ? Math.min(84, size.value.height * .18) : 0
+      const preview = props.mode === 'window_quick' && props.windowState ? quickRect(props.windowState.quick, props.windowState.ratios) : null
+      const previewHeight = 0
       const target = props.windowState ? windowTarget(props.windowState) : null
       const library = props.windowState?.library ? props.windowState : undefined
       const presets = library ? availableWindowPresets(library).slice(library.libraryPage * 6, library.libraryPage * 6 + 6) : []
@@ -1385,7 +1397,12 @@ const KeyHelpPreview = defineComponent({
       const detailParts = props.detail.split(' · ')
       const detailBadge = detailParts[0]
       if (isWindow && detailParts.length > 1) info.unshift(detailParts.slice(1).join(' · '))
-      const statusHeight = (info.length + (props.status ? 1 : 0)) * ui.font_size * 1.8
+      const inputValue = isWindow ? props.status.match(/^(?:Input:|输入：)\s*(.*)$/)?.[1] : undefined
+      const prompt = inputValue === undefined ? '>' : `> ${inputValue}`
+      const promptHeight = isWindow && inputValue !== undefined ? ui.font_size * 2.3 : 0
+      const headerGap = isWindow ? 12 : 0
+      const statusLines = [...info, ...(props.status && inputValue === undefined ? [props.status] : [])]
+      const statusHeight = statusLines.length * ui.font_size * 1.8 + promptHeight + headerGap
       const anchorWidth = props.anchor ? props.anchor.width / WINDOW_AREA.width * size.value.width : size.value.width
       const anchorHeight = props.anchor ? props.anchor.height / WINDOW_AREA.height * size.value.height : size.value.height
       const inside = false // Anchors affect placement, never font sizing.
@@ -1399,13 +1416,27 @@ const KeyHelpPreview = defineComponent({
       const grid = sections ? windowHelpGrid(sections, helpWidth - ui.screen_margin * 2) : null
       const bodyEntries = grid?.entries ?? entries.value
       const textUnits = (text: string) => [...text].reduce((sum, ch) => sum + (ch.codePointAt(0)! < 128 ? .75 : 1), 0)
-      const minimumContentWidth = isWindow ? Math.max(
-        ...[...info, props.status].map(text => textUnits(text ?? '') * ui.font_size),
+      const minimumContentWidth = isWindow ? Math.max(textUnits(prompt) * ui.font_size * 1.65,
+        ...statusLines.map(text => textUnits(text ?? '') * ui.font_size),
         ui.font_size * 1.75 * 5 + [...detailBadge].length * ui.font_size * .75 + 16
           + [...(sections?.exit ?? '')].length * ui.font_size * .75 + 4
           + textUnits(sections?.exitLabel ?? '') * ui.font_size + 2 + ui.key_gap * 3,
       ) : 0
-      const layout = keyHelpLayout(ui, bodyEntries, helpWidth, inside ? anchorHeight : size.value.height, previewHeight + statusHeight, isWindow, grid?.columns, sections?.exit ?? '', sections?.modes ?? [], minimumContentWidth)
+      let layout = keyHelpLayout(ui, bodyEntries, helpWidth, inside ? anchorHeight : size.value.height, previewHeight + statusHeight, isWindow, grid?.columns, sections?.exit ?? '', sections?.modes ?? [], minimumContentWidth)
+      const rulerY = layout.rowHeights.slice(0, layout.rows).reduce((a, b) => a + b, 0) + 8
+      const ruler = preview && props.windowState ? quickRulerPlan(props.windowState.ratios, props.windowState.ratioLabels, preview,
+        layout.widths[0].key + ui.key_gap + layout.widths[0].action, ui.font_size,
+        Math.max(88, Math.min(150, layout.bodyHeight - rulerY)), WINDOW_AREA.width / WINDOW_AREA.height) : null
+      if (ruler) {
+        const extra = Math.max(0, rulerY + ruler.height - layout.bodyHeight)
+        layout.bodyHeight += extra; layout.height += extra
+        layout.displayScale = Math.min(1, (helpWidth - ui.screen_margin * 2) / layout.width, (size.value.height - ui.bottom_margin) / layout.height)
+      }
+      if (isWindow) {
+        const bottomPadding = Math.max(0, headerGap / 2 - 1 - ui.font_size * .1)
+        layout.bodyHeight += bottomPadding; layout.height += bottomPadding
+        layout.displayScale = Math.min(1, (helpWidth - ui.screen_margin * 2) / layout.width, (size.value.height - ui.bottom_margin) / layout.height)
+      }
       const theme = props.document.theme?.[props.appearance] ?? {}
       const indicator = { ...props.document.mode_indicator?.ui, ...props.document.mode_indicator?.modes?.[props.mode]?.ui }
       const color = (value: unknown, fallback: string): string => {
@@ -1432,12 +1463,18 @@ const KeyHelpPreview = defineComponent({
             width: `${layout.width}px`, height: `${layout.height}px`, transform: `scale(${layout.displayScale})`, transformOrigin: 'center bottom', background, borderRadius: `${ui.border_radius}px`,
             boxShadow: `inset 0 0 0 ${ui.border_width}px ${color(ui.border_color, '#00000000')}`,
             fontFamily: ui.font_family || indicator.font_family || 'system-ui, sans-serif', lineHeight: 1.4, color: foreground }}>
+            {isWindow && <>
+
+              <div style={{ position: 'absolute', left: `${layout.padding}px`, top: `${ui.padding_y + layout.headerHeight + statusHeight - headerGap / 2}px`, width: `${layout.width - layout.padding * 2}px`, height: '1px', background: foreground, opacity: .18 }} />
+            </>}
             <div style={{ ...titleStyle, position: 'absolute', gap: '12px', left: `${layout.padding}px`, top: `${ui.padding_y}px`, width: `${Math.max(1, layout.width - layout.padding * 2 - closeWidth - ui.key_gap)}px` }}>{isWindow ? <><span>Window</span><span style={{ fontSize: `${ui.font_size}px`, padding: '2px 6px', background: '#ebedf2', color: '#1e222b', border: '1px solid #c4c9d3', borderRadius: '3px' }}>{detailBadge}</span></> : `${props.mode} · Available keys`}</div>
             <div style={{ ...titleStyle, position: 'absolute', right: `${layout.padding}px`, top: `${ui.padding_y}px`, width: `${closeWidth}px`, justifyContent: 'flex-end', fontSize: `${isWindow ? ui.font_size : ui.title_font_size}px` }}>{isWindow ? <><span aria-label={sections?.exitLabel} style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>{layout.exitLines.map(line => <span style={{ padding: '1px 2px', background: '#ebedf2', color: '#1e222b', border: '1px solid #c4c9d3', borderRadius: '3px', margin: '1px 0' }}>{line}</span>)}</span><span style={{ marginLeft: `${ui.key_gap}px` }}>{sections?.exitLabel}</span></> : closeText}</div>
-            {[...info, ...(props.status ? [props.status] : [])].map((text, index) => <div onMousedown={e => e.preventDefault()} onClick={() => { if (library && presets[index - 1]) emit('restore', presets[index - 1].id) }} style={{ position: 'absolute', left: `${layout.padding}px`, top: `${ui.padding_y + layout.headerHeight + index * ui.font_size * 1.8}px`, width: `${layout.width - layout.padding * 2}px`, height: `${ui.font_size * 1.8}px`, fontSize: `${ui.font_size}px`, fontWeight: index === 0 && info.length ? '700' : '400', overflow: 'hidden', textOverflow: isWindow ? undefined : 'ellipsis', whiteSpace: 'nowrap', opacity: .9, pointerEvents: library && presets[index - 1] ? 'auto' : undefined, cursor: library && presets[index - 1] ? 'pointer' : undefined }}>{text}</div>)}
-            {preview && <div class="ks-window-quick-preview" aria-label="Window 快速布局" style={{ left: `${layout.padding}px`, top: `${ui.padding_y + layout.headerHeight + statusHeight}px`, width: `${layout.width - layout.padding * 2}px`, height: `${previewHeight}px` }}>
-              <span class="ks-help-layout-mini"><i style={{ left: `${preview.x * 100}%`, top: `${preview.y * 100}%`, width: `${preview.width * 100}%`, height: `${preview.height * 100}%` }} /></span>
-              <span>{quickCaption(props.windowState!.quick, props.windowState!.ratios)}</span>
+            {promptHeight > 0 && <div style={{ position: 'absolute', left: `${layout.padding}px`, top: `${ui.padding_y + layout.headerHeight}px`, width: `${layout.width - layout.padding * 2}px`, height: `${promptHeight}px`, display: 'flex', alignItems: 'center', fontSize: `${ui.font_size * 1.65}px`, fontWeight: 700, whiteSpace: 'nowrap' }}>{prompt}</div>}
+            {statusLines.map((text, index) => <div onMousedown={e => e.preventDefault()} onClick={() => { if (library && presets[index - 1]) emit('restore', presets[index - 1].id) }} style={{ position: 'absolute', left: `${layout.padding}px`, top: `${ui.padding_y + layout.headerHeight + promptHeight + index * ui.font_size * 1.8}px`, width: `${layout.width - layout.padding * 2}px`, height: `${ui.font_size * 1.8}px`, fontSize: `${ui.font_size}px`, fontWeight: index === 0 && info.length ? '700' : '400', overflow: 'hidden', textOverflow: isWindow ? undefined : 'ellipsis', whiteSpace: 'nowrap', opacity: index === 0 ? .9 : .72, pointerEvents: library && presets[index - 1] ? 'auto' : undefined, cursor: library && presets[index - 1] ? 'pointer' : undefined }}>{text}</div>)}
+            {ruler && <div aria-label="Quick 屏幕布局预览" style={{ position: 'absolute', left: `${layout.bodyLeft}px`, top: `${ui.padding_y + layout.headerHeight + statusHeight + rulerY}px`, width: `${layout.widths[0].key + ui.key_gap + layout.widths[0].action}px`, height: `${ruler.height}px`, fontSize: `${ruler.font}px` }}>
+              {[ruler.frame, ruler.selection].map((rect, index) => <span style={{ position: 'absolute', left: `${rect.x}px`, top: `${rect.y}px`, width: `${rect.width}px`, height: `${rect.height}px`, boxShadow: `inset 0 0 0 ${index ? 1.5 : 1}px ${foreground}`, opacity: index ? .9 : .4 }}><span style={{ position: 'absolute', inset: 0, background: foreground, opacity: index ? .2 : .075 }} /></span>)}
+              {ruler.ticks.map(tick => <span style={{ position: 'absolute', left: `${tick.x}px`, top: `${tick.y}px`, width: `${tick.width}px`, height: `${tick.height}px`, background: foreground, opacity: tick.active ? .9 : .35 }} />)}
+              {ruler.captions.map(caption => <span style={{ position: 'absolute', left: `${caption.x}px`, top: `${caption.y}px`, fontWeight: 700, whiteSpace: 'nowrap' }}>{caption.text}</span>)}
             </div>}
             {!!layout.footer.length && <div style={{ position: 'absolute', left: `${layout.padding}px`, top: `${ui.padding_y + layout.headerHeight + statusHeight + previewHeight + layout.bodyHeight}px`, width: `${layout.width - layout.padding * 2}px`, height: '1px', background: foreground, opacity: .18 }} />}
             {layout.footer.map(item => <div style={{ position: 'absolute', left: `${layout.padding + item.x}px`, top: `${ui.padding_y + layout.headerHeight + statusHeight + previewHeight + layout.bodyHeight + 4 + item.y}px`, height: `${layout.footerLineHeight}px`, display: 'flex', alignItems: 'center', gap: `${ui.key_gap}px`, fontSize: `${ui.font_size}px` }}>
@@ -1527,7 +1564,7 @@ function keyHelpEntries(document: ConfigDocument, mode: string, isMac = false): 
         window_tab_remove: 'Remove active tab', window_tab_dissolve: 'Dissolve group', window_tab_next: 'Next tab', window_tab_previous: 'Previous tab',
         window_tab_move_left: 'Move tab left', window_tab_move_right: 'Move tab right',
         window_screen_next: 'Next screen', window_screen_previous: 'Previous screen', size_cycle: 'Maximize / minimize / restore',
-        window_center: 'Center window', window_close: 'Close window', window_select: 'Next window', window_select_previous: 'Previous window', window_undo: 'Undo', window_redo: 'Redo', window_reset_initial: 'Restore initial state', window_remove_region: 'Delete region', window_saved_layouts: 'Restore layout', window_save_layout: 'Save layout',
+        window_center: 'Center window', window_close: 'Close window', window_volume_down: 'App volume down', window_volume_up: 'App volume up', window_volume_mute: 'Mute / unmute app', window_audio_previous: 'Previous app output', window_audio_next: 'Next app output', window_system_volume_down: 'System volume down', window_system_volume_up: 'System volume up', window_system_audio_previous: 'Previous system output', window_system_audio_next: 'Next system output', window_select: 'Next window', window_select_previous: 'Previous window', window_undo: 'Undo', window_redo: 'Redo', window_reset_initial: 'Restore initial state', window_remove_region: 'Delete region', window_saved_layouts: 'Restore layout', window_save_layout: 'Save layout',
         window_confirm: 'Confirm', window: 'Window', window_quick: 'Quick layout', window_editor: 'Editor', window_restore: 'Restore', window_delete: 'Restore / delete', window_tab: 'Tabs', idle: 'Exit', normal: 'Normal', grid: 'Grid', recursive_grid: 'Recursive Grid', ui_hint: 'UI Hint',
       }
       for (const direction of ['left', 'right', 'up', 'down']) {

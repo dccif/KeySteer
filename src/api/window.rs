@@ -74,6 +74,15 @@ pub enum WindowAction {
     CycleState,
     Center,
     Close,
+    VolumeDown,
+    VolumeUp,
+    VolumeMute,
+    AudioPrevious,
+    AudioNext,
+    SystemVolumeDown,
+    SystemVolumeUp,
+    SystemAudioPrevious,
+    SystemAudioNext,
     Select,
     SelectPrevious,
     Undo,
@@ -98,7 +107,15 @@ impl WindowAction {
     pub const fn is_held(self) -> bool {
         matches!(
             self,
-            Self::Left | Self::Down | Self::Up | Self::Right | Self::Ratio(_)
+            Self::Left
+                | Self::Down
+                | Self::Up
+                | Self::Right
+                | Self::Ratio(_)
+                | Self::VolumeDown
+                | Self::VolumeUp
+                | Self::SystemVolumeDown
+                | Self::SystemVolumeUp
         )
     }
 
@@ -127,6 +144,15 @@ impl WindowAction {
             Self::CycleState => "size_cycle",
             Self::Center => "window_center",
             Self::Close => "window_close",
+            Self::VolumeDown => "window_volume_down",
+            Self::VolumeUp => "window_volume_up",
+            Self::VolumeMute => "window_volume_mute",
+            Self::AudioPrevious => "window_audio_previous",
+            Self::AudioNext => "window_audio_next",
+            Self::SystemVolumeDown => "window_system_volume_down",
+            Self::SystemVolumeUp => "window_system_volume_up",
+            Self::SystemAudioPrevious => "window_system_audio_previous",
+            Self::SystemAudioNext => "window_system_audio_next",
             Self::Select => "window_select",
             Self::SelectPrevious => "window_select_previous",
             Self::Undo => "window_undo",
@@ -173,6 +199,15 @@ impl WindowAction {
             Self::CycleState,
             Self::Center,
             Self::Close,
+            Self::VolumeDown,
+            Self::VolumeUp,
+            Self::VolumeMute,
+            Self::AudioPrevious,
+            Self::AudioNext,
+            Self::SystemVolumeDown,
+            Self::SystemVolumeUp,
+            Self::SystemAudioPrevious,
+            Self::SystemAudioNext,
             Self::Select,
             Self::SelectPrevious,
             Self::Undo,

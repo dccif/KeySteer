@@ -185,3 +185,9 @@ Quick/Editor 的新编辑清空本地 redo；撤销到编辑入口时通过原�
 保存与恢复通过 `PresetLibraryOperation` / `SavedPreset` 共用异步流程；`WindowTemplate` 只在捕获与具体应用时区分 Layout/Tabs。共享编号、简短默认名称、备注输入、列表及删除校验不分别维护。Tabs 恢复收集足量手动选择的窗口后应用，未完成前可取消。
 
 普通 Window 从组外进入时激活鼠标下目标，组内切换保留目标。默认 X=window_close，可在 window.bindings 改键；Editor 的 X 仍为 window_remove_region。关闭只发送一次离散请求，窗口是否退出由应用决定，后续库存更新编号。
+
+
+Window、Quick、Editor 支持应用音量动作，保持当前目标、区域选择与编辑事务；Restore 和 Tab 不加入音量默认绑定。
+
+
+应用输出和系统音频动作沿用 Window/Quick/Editor 的稳定支持集合，保留编辑事务；SystemAudio 即使没有目标窗口也可发出。

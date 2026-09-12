@@ -302,3 +302,28 @@ clears old hints and starts a new scan automatically. `Primary+R` manually refre
 Entering ordinary Window mode (Alt+W by default) activates and raises the window under the pointer without moving the pointer. X invokes `window_close`, requesting normal closure of the selected window; the application handles save/cancel dialogs. Rebind it in `[window.bindings]`, for example `"f9" = "window_close"`, and remove or disable the original X binding. X in the layout editor still deletes a region.
 
 For a tab group in ordinary Window mode, X closes only its active member. Once closure is confirmed, a group with one remaining member dissolves automatically and reveals that window. A/E/T and other modes retain their own X bindings.
+
+
+### Target application audio
+
+In Window, Quick (A), and Editor (E), hold V and press J/K to lower/raise the target application volume by 1%. V+M toggles mute. Direction keys repeat while the whole chord stays held; mute toggles once per press. Windows sharing an audio process share volume. An application without an audio session reports that status; Windows and macOS share the same bindings and request interface.
+
+The configurable actions are `window_volume_down`, `window_volume_up`, and `window_volume_mute`. Bindings are independent per mode: update the volume chords too when changing direction keys. Existing explicit binding tables replace defaults; add `"v+j" = "window_volume_down"`, `"v+k" = "window_volume_up"`, and `"v+m" = "window_volume_mute"` to each of the three modes.
+
+
+### Application output and system audio
+
+Window, Quick (A), and Editor (E) share these defaults:
+
+| Shortcut | Action |
+| --- | --- |
+| V+J / V+K | Application volume down / up, 1% per step, repeats while held |
+| V+M | Toggle application mute |
+| V+H / V+L | Previous / next application output device |
+| Shift+V+J / Shift+V+K | System volume down / up, 1% per step, repeats while held |
+| Shift+V+H / Shift+V+L | Previous / next system default output device |
+
+Device selection cycles through active outputs sorted by name, once per press. Application routing does not change system defaults; some applications need playback restarted to adopt a new output. The configurable actions are `window_audio_previous`, `window_audio_next`, `window_system_volume_down`, `window_system_volume_up`, `window_system_audio_previous`, and `window_system_audio_next`.
+
+
+On macOS, system audio uses Core Audio. Per-application volume, mute, and output require macOS 14.2+ and System Audio Recording permission; use the packaged KeySteer.app. Audio is processed and replayed only in memory, with some added latency, and is never saved or uploaded. Unsupported systems/devices report a reason. App audio controls remain active after leaving the mode; quitting KeySteer restores the original playback path. See [Apple’s Core Audio Tap permission requirements](https://developer.apple.com/documentation/CoreAudio/capturing-system-audio-with-core-audio-taps).

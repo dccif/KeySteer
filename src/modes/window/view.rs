@@ -50,7 +50,7 @@ impl WindowSession {
         let state = match self.edit.as_ref().map(|e| &e.model) {
             Some(EditModel::Quick(quick)) => format!(
                 "Quick · {}",
-                quick.caption_with(&self.settings.split_ratios)
+                quick.caption_with_ticks(&self.settings.ratio_ticks)
             ),
             Some(EditModel::Tree(tree)) => format!("Edit · area `{}", tree.selected),
             None => match self.kind {

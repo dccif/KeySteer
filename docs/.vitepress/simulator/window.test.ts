@@ -516,3 +516,46 @@ test('ordinary close targets the active tab and dissolves a one-member group', (
   assert.ok(state.window.windows.some(w => w.id === first.id))
   assert.ok(!state.window.windows.some(w => w.id === second.id || w.id === third.id))
 })
+
+
+test('application audio preserves Quick and Editor transactions and geometry history', () => {
+  for (const mode of ['window', 'window_quick', 'window_editor']) {
+    const state = createSimulatorState()
+    enterWindow(state)
+    if (mode !== 'window') applyWindowAction(state, mode)
+    const before = JSON.stringify({ windows: state.window.windows, tree: state.window.tree, panel: state.window.panel, history: state.window.history, edit: state.window.editHistory })
+    const app = windowTarget(state.window)!.app
+    applyWindowAction(state, 'window_volume_down')
+    assert.equal(state.window.audio[app].volume, .99)
+    applyWindowAction(state, 'window_volume_mute')
+    assert.equal(state.window.audio[app].muted, true)
+    applyWindowAction(state, 'window_volume_mute')
+    assert.equal(state.window.audio[app].muted, false)
+    assert.equal(JSON.stringify({ windows: state.window.windows, tree: state.window.tree, panel: state.window.panel, history: state.window.history, edit: state.window.editHistory }), before)
+  }
+})
+
+
+test('application and system audio controls are separate and default-device cycling wraps', () => {
+  for (const mode of ['window', 'window_quick', 'window_editor']) {
+    const state = createSimulatorState(); enterWindow(state)
+    if (mode !== 'window') applyWindowAction(state, mode)
+    const app = windowTarget(state.window)!.app
+    const geometry = JSON.stringify(state.window.windows)
+    applyWindowAction(state, 'window_audio_previous')
+    assert.equal(state.window.audio[app].output, 2)
+    assert.equal(state.window.systemAudio.output, 0)
+    applyWindowAction(state, 'window_audio_next')
+    assert.equal(state.window.audio[app].output, 0)
+    applyWindowAction(state, 'window_system_audio_next')
+    assert.equal(state.window.systemAudio.output, 1)
+    assert.equal(state.window.audio[app].output, 0)
+    applyWindowAction(state, 'window_system_volume_down')
+    assert.equal(state.window.systemAudio.volume, .99)
+    assert.equal(state.window.audio[app].volume, 1)
+    state.window.target = null
+    applyWindowAction(state, 'window_system_volume_down')
+    assert.equal(state.window.systemAudio.volume, .98)
+    assert.equal(JSON.stringify(state.window.windows), geometry)
+  }
+})

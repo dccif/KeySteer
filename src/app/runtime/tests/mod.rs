@@ -44,6 +44,8 @@ fn active_config(engine: &Engine) -> Config {
 struct Recorder {
     text_prompts: Vec<crate::api::window_presets::TextPrompt>,
     cancelled_text_prompts: Vec<u64>,
+    audio_requests: Vec<crate::api::audio::AudioRequest>,
+    cancelled_audio_sessions: Vec<u64>,
     window_requests: Vec<crate::api::window::WindowRequest>,
     cancelled_window_sessions: Vec<u64>,
     character_bindings: Vec<Vec<String>>,
@@ -118,6 +120,17 @@ impl Backend for FakeBackend {
     }
     fn cancel_text_prompt(&mut self, id: u64) {
         self.log.lock().unwrap().cancelled_text_prompts.push(id);
+    }
+    fn request_audio(&mut self, request: crate::api::audio::AudioRequest) -> Result<(), String> {
+        self.log.lock().unwrap().audio_requests.push(request);
+        Ok(())
+    }
+    fn cancel_audio_session(&mut self, session: u64) {
+        self.log
+            .lock()
+            .unwrap()
+            .cancelled_audio_sessions
+            .push(session);
     }
     fn request_window(&mut self, request: crate::api::window::WindowRequest) -> Result<(), String> {
         let mut log = self.log.lock().unwrap();
@@ -337,6 +350,7 @@ impl Mode for ProbeMode {
             ModeEvent::FocusChanged(_) => "focus",
             ModeEvent::WindowPresets(_) => "window-presets",
             ModeEvent::WindowResult(_) => "window",
+            ModeEvent::AudioResult(_) => "audio",
             ModeEvent::TemporaryModeChanged { .. } => "temporary",
         };
         self.seen

@@ -902,6 +902,21 @@ impl WindowAccess for Windows {
     fn pointer(&self) -> Result<Point, String> {
         super::input::cursor_position()
     }
+    fn system_audio(&self, change: crate::api::audio::AudioAction) -> Result<String, String> {
+        super::window_audio::system(change)
+    }
+    fn volume(
+        &self,
+        id: WindowId,
+        change: crate::api::audio::AudioAction,
+    ) -> Result<String, String> {
+        self.hwnd(id)?;
+        let identity = self
+            .windows
+            .get(&id)
+            .ok_or("window is no longer available")?;
+        super::window_audio::change(identity.pid, change)
+    }
     fn close(&self, id: WindowId) -> Result<(), String> {
         let hwnd = self.hwnd(id)?;
         // SAFETY: post a pointer-free standard close request to the validated

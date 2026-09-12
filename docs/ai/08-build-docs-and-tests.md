@@ -295,3 +295,16 @@ Window 回归应覆盖：E/反引号入口自动布局、撤销入口不再自�
 Window 入口回归测试 acquire_activates_pointer_target_without_warp_or_geometry_change 验证激活、无鼠标移动及拒绝反馈；close_requests_only_the_target_and_preserves_it_until_application_closes 验证只关闭目标且不提前退役。runtime window_close_uses_default_or_configured_alias_and_editor_keeps_remove_region 覆盖默认 X、自定义 F9 别名、即时提示及 Editor X 隔离。
 
 window_close_resolves_active_tab_and_dissolves_only_after_confirmed_closure 覆盖关闭组代表时实际关闭活动成员、3→2 保留组、2→1 解散/撤栏/显示剩余成员，以及保存取消前成员不变。native_close_request_only_closes_owned_target 已在 Windows 显式执行，只创建/关闭自有临时窗口并验证其他窗口与过期身份。
+
+Quick 比例尺验收覆盖混合 1/2、1/3、0.3、0.45 和相近比例：原标识保留、按实际比例定位、宽高当前值、横竖屏比例、高 DPI 的文字边界。共享 workspace.ksw 测试样本应随测试源码保留。
+
+
+音量回归覆盖三个模式、改绑、重复按键、松开前缀即停止、静音不重复、编辑与历史不变、取消与关闭身份。Windows 显式 native_application_audio_session_volume_and_mute 只创建本测试进程的无声会话，验证真实音量与静音往返，不触碰其他应用。
+
+
+系统音频测试覆盖应用/系统路由隔离、Shift 松开后的重复抑制、设备循环与无设备边界。显式 native_audio_policy_routing_and_system_interfaces 对系统仅重设已有默认值、只读系统音量；应用策略只针对测试进程并恢复原偏好。
+
+
+音频请求回归验证独立结果通道、无需 Window Acquire 的系统请求、按调用者取消队列、忽略取消后的迟到反馈，以及音频错误不生成窗口/布局请求。构建 macOS 应用需 macOS 14.2+ SDK，链接 CoreAudio、AudioToolbox、AVFoundation；运行时仍允许 macOS 14.0。
+
+Windows 主机只能交叉检查 macOS Rust（`cargo check --target aarch64-apple-darwin --lib --bins --tests`，Intel 同理），不能验证 Objective-C 编译、权限与真实音频。Mac 原生验收应使用打包的 .app：拒绝/授予系统音频权限；应用及系统每步 1%、按住重复、松开 V/Shift 停止；独立应用与系统输出；多进程浏览器；拔插输出；休眠/唤醒；退出后声音恢复。原有 `examples/macos_native_probe.rs` 引用了私有 crate 模块，尚不属于上述交叉检查范围。

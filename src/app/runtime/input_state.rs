@@ -680,6 +680,21 @@ impl Engine {
                 .input
                 .active_gestures
                 .get(&input.key)
+                // Volume repeats require the complete configured chord to stay
+                // pressed. Releasing V must not continue changing app audio.
+                .filter(|gesture| {
+                    !matches!(
+                        gesture.binding.as_ref(),
+                        Binding::Window(
+                            crate::api::window::WindowAction::VolumeDown
+                                | crate::api::window::WindowAction::VolumeUp
+                                | crate::api::window::WindowAction::SystemVolumeDown
+                                | crate::api::window::WindowAction::SystemVolumeUp
+                        )
+                    ) || self
+                        .lookup(&input.key)
+                        .is_some_and(|resolved| resolved.binding == gesture.binding)
+                })
                 .cloned()
                 .map(|gesture| ResolvedBinding {
                     binding: gesture.binding,

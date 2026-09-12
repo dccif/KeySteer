@@ -155,6 +155,11 @@ features = [
     "Win32_System_LibraryLoader",
     "Win32_System_JobObjects",
     "Win32_System_Com",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Ole",
     "Win32_System_Variant",
     "Win32_System_Console",
@@ -171,6 +176,9 @@ features = [
     "Win32_UI_WindowsAndMessaging",
 ]
 
+[target.'cfg(target_os = "windows")'.dependencies.windows-core]
+version = "0.62.2"
+
 [target.'cfg(target_os = "windows")'.dependencies.windows-numerics]
 version = "0.3.1"
 
@@ -186,7 +194,7 @@ cc = "1.2"
 [target.'cfg(windows)'.build-dependencies]
 winresource = { version = "0.1.31", default-features = false }
 
-[target.'cfg(windows)'.dev-dependencies]
+[target.'cfg(any(windows, target_os = "macos"))'.dev-dependencies]
 loom = "0.7.2"
 
 [dev-dependencies]

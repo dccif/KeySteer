@@ -36,6 +36,7 @@ pub struct Settings {
     pub include_minimized: bool,
     pub lifecycle: crate::api::TargetingLifecycle,
     pub split_ratios: Vec<f64>,
+    pub ratio_ticks: std::sync::Arc<[crate::api::window_layout::RatioTick]>,
     pub number_timeout_ms: u64,
     pub move_step: f64,
     pub move_speed: f64,
@@ -216,6 +217,23 @@ impl WindowSession {
         })));
     }
 
+    fn request_audio(
+        &mut self,
+        target: crate::api::audio::AudioTarget,
+        action: crate::api::audio::AudioAction,
+        out: &mut CommandBatch,
+    ) {
+        self.request += 1;
+        out.push(Command::AudioRequest(Box::new(
+            crate::api::audio::AudioRequest {
+                session: self.session,
+                id: self.request,
+                target,
+                action,
+            },
+        )));
+    }
+
     fn stop_movement(&mut self, out: &mut CommandBatch) {
         if let Some(edit) = &mut self.edit {
             edit.divider_gesture = false;
@@ -371,6 +389,20 @@ impl WindowSession {
 
 impl WindowKind {
     fn supports_action(self, action: &W) -> bool {
+        if matches!(
+            action,
+            W::VolumeDown
+                | W::VolumeUp
+                | W::VolumeMute
+                | W::AudioPrevious
+                | W::AudioNext
+                | W::SystemVolumeDown
+                | W::SystemVolumeUp
+                | W::SystemAudioPrevious
+                | W::SystemAudioNext
+        ) {
+            return matches!(self, Self::Move | Self::Quick | Self::Editor);
+        }
         match self {
             WindowKind::Tab => matches!(
                 action,
@@ -460,21 +492,18 @@ impl WindowSession {
         }
         self.target.as_ref().map(|w| w.bounds)
     }
-    fn help_previews(&self) -> Vec<(String, String, Rect, bool)> {
-        if self.temporary || self.library_open {
-            return Vec::new();
+    fn quick_ruler(&self) -> Option<crate::api::window_layout::QuickRuler> {
+        if self.temporary || self.kind != WindowKind::Quick {
+            return None;
         }
-        match self.edit.as_ref().map(|e| &e.model) {
-            Some(EditModel::Quick(quick)) => {
-                vec![(
-                    String::new(),
-                    quick.caption_with(&self.settings.split_ratios),
-                    quick.rect_with(&self.settings.split_ratios),
-                    true,
-                )]
-            }
-            _ => Vec::new(),
-        }
+        let selected = match self.edit.as_ref().map(|e| &e.model) {
+            Some(EditModel::Quick(quick)) => quick.rect_with(&self.settings.split_ratios),
+            _ => Rect::new(0.0, 0.0, 1.0, 1.0),
+        };
+        Some(crate::api::window_layout::QuickRuler {
+            ticks: self.settings.ratio_ticks.clone(),
+            selected,
+        })
     }
     fn claims_key(&self, key: &Key) -> bool {
         if self.library_open {
@@ -548,6 +577,7 @@ impl WindowSession {
                 }
                 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
                 if self.session != 0 {
+                    out.push(Command::CancelAudioSession(self.session));
                     out.push(Command::CancelWindowSession(self.session));
                 }
                 self.session = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
@@ -614,6 +644,7 @@ impl WindowSession {
                 out.push(Command::CancelTimer {
                     id: INVENTORY_TIMER.into(),
                 });
+                out.push(Command::CancelAudioSession(self.session));
                 out.push(Command::CancelWindowSession(self.session));
                 self.session = 0;
                 self.reopen_edit = None;
@@ -683,6 +714,14 @@ impl WindowSession {
                         });
                     }
                 }
+            }
+            ModeEvent::AudioResult(result) => {
+                if result.session != self.session {
+                    return out;
+                }
+                self.status = Some(match &result.outcome {
+                    Ok(message) | Err(message) => message.clone(),
+                });
             }
             ModeEvent::WindowResult(result) => return self.window_result((**result).clone(), ctx),
             ModeEvent::WindowPresets(result) => {

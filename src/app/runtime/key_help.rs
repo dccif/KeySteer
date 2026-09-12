@@ -19,6 +19,7 @@ pub(super) struct KeyHelpCache {
     anchor: Option<Rect>,
     detail: Option<String>,
     previews: Vec<(String, String, Rect, bool)>,
+    ruler: Option<crate::api::window_layout::QuickRuler>,
 }
 
 pub(super) struct WindowKeyHelpPlan {
@@ -202,6 +203,7 @@ impl Engine {
         let mode = self.registry.get(&display);
         let anchor = mode.and_then(|m| m.help_anchor());
         let detail = mode.and_then(|m| m.indicator_detail());
+        let ruler = mode.and_then(|m| m.quick_ruler());
         let previews = mode.map_or_else(Vec::new, |m| m.help_previews());
         if let Some(cache) = &self.overlay.key_help_cache
             && cache.active == self.registry.active
@@ -210,6 +212,7 @@ impl Engine {
             && cache.anchor == anchor
             && cache.detail == detail
             && cache.previews == previews
+            && cache.ruler == ruler
             && cache.matches_screen(screen)
             && cache.source_clip == scene.clip
             && (cache.source_labels.shares_storage_with(&scene.labels)
@@ -237,6 +240,7 @@ impl Engine {
             anchor,
             detail,
             previews,
+            ruler,
         }));
     }
 
@@ -309,6 +313,7 @@ impl Engine {
                 window_help,
                 display_name: mode
                     .map_or_else(|| display_mode.to_string(), |mode| mode.display_name()),
+                ruler: mode.and_then(|mode| mode.quick_ruler()),
                 previews: mode.map_or_else(Vec::new, |mode| mode.help_previews()),
                 detail: if window_help {
                     mode.and_then(|mode| mode.indicator_detail())

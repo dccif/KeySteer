@@ -35,9 +35,18 @@ use std::path::{Path, PathBuf};
 // A disposable child-process probe reads its own show-event counter.
 // One bounded disposable-strip probe verifies mouse drop and cancellation.
 // A disposable-window minimize message verifies native group synchronization.
-const MAX_UNSAFE_EXPRESSIONS: usize = 342;
-const MAX_UNSAFE_FILES: usize = 28;
+// Application audio adds two worker-owned blocks and one owned-session test: a closed process snapshot and
+// apartment-scoped Core Audio interfaces. Explicit Shift audio actions add six
+// endpoint/property blocks and one non-disruptive native policy probe. The
+// versioned policy adapter adds three exact ABI slots and four scoped call blocks.
+const MAX_UNSAFE_EXPRESSIONS: usize = 365;
+const MAX_UNSAFE_FILES: usize = 31;
 const PER_FILE_BUDGET: &[(&str, usize)] = &[
+    // macOS audio owns, changes, maintains and destroys native state,
+    // with one bounded diagnostic callback into centralized logging.
+    ("src/platform/macos/window_audio.rs", 5),
+    ("src/platform/windows/window_audio.rs", 11),
+    ("src/platform/windows/audio_policy.rs", 7),
     ("src/platform/macos/accessibility/window_tabs.rs", 12),
     ("src/platform/macos/window_tabs.rs", 2),
     ("src/platform/windows/window_tabs/strip.rs", 11),

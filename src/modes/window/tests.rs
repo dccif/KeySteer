@@ -215,6 +215,9 @@ fn window_idle_inventory_and_number_input_do_not_allocate() {
         include_minimized: w.include_minimized,
         lifecycle: crate::api::TargetingLifecycle::default(),
         split_ratios: crate::api::window_layout::RATIOS.to_vec(),
+        ratio_ticks: crate::config::WindowQuick::default()
+            .split_ratio_ticks()
+            .into(),
         number_timeout_ms: w.number_timeout_ms,
         move_step: w.move_step,
         move_speed: w.move_speed,
