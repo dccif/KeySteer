@@ -1,5 +1,19 @@
 # Release notes
 
+## 0.10.0
+
+**Major feature update: from pointer control to a complete keyboard-driven workspace.** KeySteer now includes a full window-management workflow for moving, splitting, tiling, grouping, and reusing layouts.
+
+- **Window management**: press `Alt+W` (Option+W on macOS) to move, resize, center, maximize/minimize, move between displays, or close windows. Control application and system volume, mute, and audio output devices too.
+- **Choose how to arrange your workspace**: Quick provides split layouts; Editor automatically tiles windows and lets you swap, split, and resize regions; Tabs groups windows from the same application or combines your own selection. Restore reuses saved layouts and tab templates. Notes are optional when saving; templates preserve arrangements, not application identities. Every mode's bindings and entry points are configurable.
+
+For users upgrading from older versions, two configuration features available since 0.9.20 are also worth trying:
+
+- **Live `key_help` hints**: open a panel to see the current mode's keys and actions. Add `"?" = "key_help"` to your existing `[normal.bindings]`, reload the configuration, then press `?` to toggle it.
+- **Shift-layer symbol bindings**: bind characters such as `?`, `!`, and `+` directly. Bindings match the character you type, giving frequently used actions more convenient shortcuts.
+
+See the [window management guide](https://dccif.github.io/KeySteer/en/window-management/) for instructions and videos, and the [configuration reference](/en/reference/configuration) for hints and symbol bindings. If you use custom binding tables, compare them with the latest defaults and add the new bindings you want.
+
 ## 0.9.21
 
 Added keyboard-triggered mouse side-button clicks on Windows and macOS. Add these bindings to your existing `[normal.bindings]`, reload the configuration, then tap `T` / `Y` in Normal mode:

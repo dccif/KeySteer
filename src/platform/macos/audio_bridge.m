@@ -82,6 +82,8 @@ static NSArray<NSDictionary *> *Outputs(void) {
 static NSDictionary *NextOutput(NSArray<NSDictionary *> *outputs, NSString *current, bool previous) {
     if (!outputs.count) return nil;
     NSUInteger index = [outputs indexOfObjectPassingTest:^BOOL(NSDictionary *value, NSUInteger i, BOOL *stop) {
+        (void)i;
+        (void)stop;
         return [value[@"uid"] isEqualToString:current];
     }];
     if (index == NSNotFound) index = previous ? outputs.count - 1 : 0;
@@ -164,6 +166,11 @@ typedef struct {
 static OSStatus Capture(AudioDeviceID device, const AudioTimeStamp *now,
                         const AudioBufferList *input, const AudioTimeStamp *inputTime,
                         AudioBufferList *output, const AudioTimeStamp *outputTime, void *context) {
+    (void)device;
+    (void)now;
+    (void)inputTime;
+    (void)output;
+    (void)outputTime;
     KSAudioRing *ring = context;
     if (!input || !input->mNumberBuffers) return noErr;
     bool interleaved = input->mNumberBuffers == 1 && input->mBuffers[0].mNumberChannels == 2;
@@ -283,6 +290,7 @@ static NSString *StartApp(KSAppAudio *route, NSArray<NSNumber *> *processes, NSD
     AVAudioFormat *format = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatFloat32 sampleRate:stream.mSampleRate channels:2 interleaved:NO];
     KSAudioRing *ring = route->ring;
     route.source = [[AVAudioSourceNode alloc] initWithFormat:format renderBlock:^OSStatus(BOOL *silence, const AudioTimeStamp *time, AVAudioFrameCount frames, AudioBufferList *data) {
+        (void)time;
         uint32_t read = atomic_load_explicit(&ring->read, memory_order_relaxed);
         uint32_t write = atomic_load_explicit(&ring->write, memory_order_acquire);
         // A device clock change must not accumulate seconds of stale audio.

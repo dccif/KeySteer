@@ -1,5 +1,21 @@
 # 更新日志 / Release Notes
 
+## 0.10.0
+
+**重要功能更新：从操控鼠标，到安排整个工作区。** KeySteer 新增完整的窗口管理模式，移动、分屏、平铺、标签分组与布局复用，都可以留在键盘上完成。
+
+- **Window 窗口管理**：按 `Alt+W` 进入（macOS 为 Option+W），移动、调整大小、居中、最大化／最小化、跨屏移动或关闭窗口，也能调整应用与系统的音量、静音和音频输出设备。
+- **按任务选择整理方式**：Quick 快捷分屏；Editor 自动平铺、交换窗口、切分和调整区域；Tabs 自动整理同应用窗口，也能自由组合标签组。通过 Restore 复用已保存的布局和标签模板；保存时备注可留空，模板记住的是安排，不绑定应用名单。所有模式的按键与入口均可自定义。
+
+同时，面向从旧版本升级的用户，回顾两项自 0.9.20 起提供的配置能力：
+
+- **`key_help` 实时快捷键提示**：忘记按键时，打开面板查看当前模式的按键与动作。在现有 `[normal.bindings]` 中加入 `"?" = "key_help"`，重载配置后即可按 `?` 切换显示。
+- **Shift 层符号绑定**：`?`、`!`、`+` 等符号可以直接写成绑定键，按实际输入的字符匹配，让常用动作有更多顺手的入口。
+
+详细操作与视频请看 [窗口管理总览](https://dccif.github.io/KeySteer/window-management/)；提示面板与符号绑定见 [配置参考](/reference/configuration)。已有自定义绑定表的用户，请对照最新默认配置补入需要的新绑定。
+
+**Major feature update: from pointer control to a complete keyboard-driven workspace.** Window adds movement, resizing, window-state and audio controls; Quick, Editor, and Tabs provide split layouts, tiling, and tab groups. Restore reuses saved arrangements with your current windows. All mode bindings and entry points are configurable. Also highlighted for users upgrading from older versions: live `key_help` hints and direct Shift-layer symbol bindings, available since 0.9.20. See the [window management guide](https://dccif.github.io/KeySteer/en/window-management/) for instructions and demos.
+
 ## 0.9.21
 
 新增键盘模拟鼠标侧键点击，支持 Windows 和 macOS。在现有 `[normal.bindings]` 中加入以下配置，重载后进入 Normal 模式，点按 `T` / `Y` 即可模拟两个侧键：
