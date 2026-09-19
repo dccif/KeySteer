@@ -1508,3 +1508,36 @@ fn exported_window_audio_bindings_preserve_defaults_and_custom_system_mute() {
         );
     }
 }
+
+#[test]
+fn temporary_passthrough_chords_round_trip_and_resolve_aliases() {
+    let config = Config::parse(
+        r#"
+        [key_aliases]
+        shield = "right_ctrl"
+        [grid]
+        temporary_mode_passthrough_keys = ["q", "shield+x"]
+        [window]
+        temporary_mode_passthrough_keys = ["q"]
+        [plugin_modes."plugin:screen-selector"]
+        temporary_mode_passthrough_keys = ["shield+x"]
+    "#,
+    )
+    .unwrap();
+    assert_eq!(
+        config.grid.temporary_mode_passthrough_keys,
+        ["q", "right_ctrl+x"]
+    );
+    assert_eq!(config.window.temporary_mode_passthrough_keys, ["q"]);
+    let restored = Config::parse(&config.to_toml().unwrap()).unwrap();
+    assert_eq!(
+        restored.grid.temporary_mode_passthrough_keys,
+        config.grid.temporary_mode_passthrough_keys
+    );
+    assert_eq!(
+        restored.window.temporary_mode_passthrough_keys,
+        config.window.temporary_mode_passthrough_keys
+    );
+    assert_eq!(restored.plugin_modes, config.plugin_modes);
+    assert!(Config::parse("[grid]\ntemporary_mode_passthrough_keys = [\"q+q\"]").is_err());
+}

@@ -74,6 +74,7 @@ pub struct ModeRoute {
     pub inherits: Vec<ModeId>,
     pub temporary_mode: Option<ModeId>,
     pub temporary_keys: Vec<String>,
+    pub temporary_passthrough: Vec<crate::api::KeyChord>,
     pub app_overrides: Vec<AppRouteOverride>,
 }
 

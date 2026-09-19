@@ -585,3 +585,79 @@ fn ui_hint_screen_shortcut_rescans_without_a_native_pointer_callback() {
         assert!(recorded.cancelled_scans.contains(&recorded.scan_requests[0].id));
     }
 }
+
+#[test]
+fn temporary_layers_resolve_full_chords_then_stripped_keys_and_passthrough() {
+    let mut config = Config::default();
+    config.grid.temporary_mode_keys = vec!["alt".into()];
+    config.grid.inherits.clear();
+    config.normal.inherits.clear();
+    config.grid.bindings.clear();
+    config.normal.bindings.clear();
+    for (key, action) in [("s", "window"), ("alt+q", "normal"), ("alt+x", "grid")] {
+        config
+            .grid
+            .bindings
+            .insert(key.into(), Binding::parse(action).unwrap());
+    }
+    for (key, action) in [
+        ("s", "screen next"),
+        ("q", "idle"),
+        ("alt+x", "window"),
+        ("z", "none"),
+    ] {
+        config
+            .normal
+            .bindings
+            .insert(key.into(), Binding::parse(action).unwrap());
+    }
+    config
+        .grid
+        .bindings
+        .insert("z".into(), Binding::parse("normal").unwrap());
+    let mut engine = Engine::new(config.clone(), Appearance::Dark);
+    for mode in crate::app::mode_catalog::built_in(&config) {
+        engine.register(mode);
+    }
+    engine.registry.active = ModeId::grid();
+    let resolve = |engine: &Engine, name: &str| {
+        let key = Key::new(name).unwrap();
+        engine
+            .lookup_for_pressed(&key, &[Key::new("left_alt").unwrap(), key.clone()])
+            .map(|r| (*r.binding).clone())
+    };
+    assert_eq!(
+        resolve(&engine, "s"),
+        Some(Binding::parse("screen next").unwrap())
+    );
+    assert_eq!(
+        resolve(&engine, "q"),
+        Some(Binding::parse("normal").unwrap())
+    );
+    assert_eq!(
+        resolve(&engine, "x"),
+        Some(Binding::parse("window").unwrap())
+    );
+    assert_eq!(resolve(&engine, "z"), None); // `none` is terminal, not transparent.
+    config.grid.bindings.remove("alt+q");
+    config
+        .grid
+        .bindings
+        .insert("q".into(), Binding::parse("normal").unwrap());
+    engine
+        .apply_plan(crate::app::configuration::compile(&config).unwrap())
+        .unwrap();
+    assert_eq!(resolve(&engine, "q"), Some(Binding::parse("idle").unwrap()));
+    config.grid.temporary_mode_passthrough_keys = vec!["q".into()];
+    engine
+        .apply_plan(crate::app::configuration::compile(&config).unwrap())
+        .unwrap();
+    assert_eq!(
+        resolve(&engine, "q"),
+        Some(Binding::parse("normal").unwrap())
+    );
+    assert_eq!(
+        resolve(&engine, "s"),
+        Some(Binding::parse("screen next").unwrap())
+    );
+}

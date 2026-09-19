@@ -12,7 +12,7 @@
 
 Windows 托盘线程在 WM_QUERYENDSESSION 发出 SaveWorkspace 并有界等待确认；取消关机不会让 Engine 退出。macOS applicationShouldTerminate 返回 TerminateLater、发出 Quit，Engine 保存后由后端回复退出。不能保证强制结束或断电时未保存计数不丢失。
 
-QuickSwitcher 只接管操作模式中单独按下的配置键，默认 Q；短按在松键时执行原绑定，长按复用现有 poll deadline，Q+数字可立即选择。Idle、暂停、排除应用和原生备注输入不启用。面板打开时固定前 9 个模式的计数降序／id 同分排序；选择当前模式保持状态。按键 release 继续消费，捕获丢失清理候选与 captured 键。黑名单不参与普通快捷键路由。几何经 Backend::focused_window_bounds，样式在配置编译时解析，面板文本只在打开时构建。
+QuickSwitcher 观察操作模式中单独按下的配置键，默认 Q；Down/repeat/Up 立即进入正常输入路由，不保存或补发短按动作。长按复用现有 poll deadline，Q+数字可立即选择。首次动作导致模式切换（包括 Idle）不取消本次候选；从 Idle 开始按键不创建候选。Idle、暂停、排除应用和原生备注输入不启用。面板打开时固定前 9 个模式的计数降序／id 同分排序；选择当前模式保持状态。仅面板选择键的 release 配对消费；触发键 release 继续正常释放手势并收起面板，捕获丢失清理候选与 captured 键。黑名单不参与普通快捷键路由。几何经 Backend::focused_window_bounds，样式在配置编译时解析，面板文本只在打开时构建。
 
 `Mode::window_action_supported` 描述模式稳定支持的 Window 动作，用于模式进入时构建固定快捷键表；`window_action_available` 描述当前能否执行，仍保留编辑事务、恢复输入和确认状态的检查。两者共享 WindowKind 的动作集合，帮助表不会因瞬时未就绪而丢失保存或确认键。Host 的帮助解析使用独立候选状态，实际输入解析仍使用真实按键状态。
 

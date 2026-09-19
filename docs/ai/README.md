@@ -163,3 +163,6 @@ Window 退出后的跨平台库存回收、macOS 窗口 worker／标签栏局部
 引导线开关在配置编译选择专用渲染入口、开启时共享场景样式与单次扫描更新见 [配置](03-configuration.md)、[性能](07-rendering-and-performance.md) 和 [验证](08-build-docs-and-tests.md)。
 
 优化前 c7bff963 场景一致性、连线与帮助缓存同步、解散组跨会话撤销保留见 [渲染](07-rendering-and-performance.md)、[后端](06-platform-backends.md) 和 [基准验证](08-build-docs-and-tests.md)。
+
+
+临时模式完整组合键优先、临时层穿透键与 Quick Switch 无等待输入见 [配置](03-configuration.md) 和 [运行时](02-runtime-and-api.md)；macOS 跨屏覆盖层 frame 保持见 [后端](06-platform-backends.md)。

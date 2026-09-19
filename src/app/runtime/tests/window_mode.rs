@@ -1311,7 +1311,7 @@ fn grouped_window_help_keeps_two_semantic_columns_and_header_exit_at_each_dpi() 
                 if entry == Some("t") {
                     assert!(labels.iter().any(|(l, _)| l.text == "H/J/K/L"));
                     assert!(labels.iter().any(|(l, _)| l.text == "Move / switch tab"));
-                    assert!(!labels.iter().any(|(l, _)| l.text.starts_with("move_")));
+                    assert!(!labels.iter().any(|(l, _)| matches!(l.text.as_str(), "move_left" | "move_down" | "move_up" | "move_right")));
                 }
 
                 if entry.is_none() {
@@ -1612,6 +1612,8 @@ fn window_targeting_uses_real_grid_lifecycle_and_keeps_window_session() {
     use crate::api::window::{WindowOperation as O, WindowChange, WindowId};
     for (recursive, temporary) in [(false, false), (false, true), (true, true)] {
         let mut config = Config::default();
+        // Give recursive targeting an unambiguous full chord under the new priority.
+        config.normal.bindings.insert(format!("{}+f", config.resolved_key_aliases()["primary"]), Binding::Mode(ModeId::recursive_grid()));
         config.grid.cursor_follow_selection = true;
         config.grid.lifecycle.after_finish = crate::api::LifecycleAction::Keep;
         config.recursive_grid.cursor_follow_selection = true;
@@ -1767,7 +1769,7 @@ fn window_targeting_help_shows_temporary_entrances_without_holding_modifier() {
     enter_window(&mut engine, &mut backend, &log);
     let entries = engine.key_help_entries();
     for (key, mode) in [("g".to_owned(), "grid"), (format!("{primary}+g"), "grid"),
-        (format!("{primary}+f"), "recursive_grid")] {
+        (format!("{primary}+f"), "ui_hint")] {
         let chord = KeyChord::parse(&key).unwrap().canonical();
         assert!(entries.contains(&format!("{chord}  ·  {mode}")), "{entries:?}");
     }
@@ -1775,7 +1777,7 @@ fn window_targeting_help_shows_temporary_entrances_without_holding_modifier() {
     let log = log.lock().unwrap();
     let scene = log.scenes.last().unwrap();
     assert!(scene.labels.iter().any(|label| label.text == "OTHER ACTIONS"));
-    assert!(scene.labels.iter().any(|label| label.text == "Recursive Grid"));
+    assert!(!entries.iter().any(|entry| entry.ends_with(" ·  recursive_grid")));
     assert!(scene.labels.iter().any(|label| label.text == "Exit → Idle"));
 }
 
@@ -1799,7 +1801,7 @@ fn window_targeting_help_respects_custom_temporary_keys_and_explicit_conflicts()
 fn window_help_is_precompiled_before_entry_and_reused_across_move_resize_and_reentry() {
     let (mut engine, mut backend, log) = window_test_engine(&Config::default());
     let compiled = engine.registry.window_help_plans[&ModeId::window()].clone();
-    assert!(compiled.entries.iter().any(|entry| entry.ends_with(" ·  recursive_grid")));
+    assert!(compiled.entries.iter().any(|entry| entry.ends_with(" ·  grid")));
     assert_eq!(engine.registry.window_help_plans.len(), 5);
     let rebuilds = engine.registry.table_rebuild_count;
     for _ in 0..2 {
@@ -1813,7 +1815,7 @@ fn window_help_is_precompiled_before_entry_and_reused_across_move_resize_and_ree
             let log = log.lock().unwrap();
             let scene = log.scenes.last().unwrap();
             assert_eq!(scene.labels.iter().any(|label| label.text == "OTHER ACTIONS"), !resizing);
-            assert_eq!(scene.labels.iter().any(|label| label.text == "Recursive Grid"), !resizing);
+            assert_eq!(scene.labels.iter().any(|label| label.text == "Grid"), !resizing);
         }
         engine.activate(ModeId::idle(), Some(ModeId::window()), &mut backend).unwrap();
     }

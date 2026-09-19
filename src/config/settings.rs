@@ -132,6 +132,7 @@ pub struct UiHint {
     pub inherits: Vec<String>,
     pub temporary_mode: Option<String>,
     pub temporary_mode_keys: Vec<String>,
+    pub temporary_mode_passthrough_keys: Vec<String>,
     pub lifecycle: TargetingLifecycle,
     /// Modifier held to expose the next label in each overlapping group.
     pub overlap_cycle_key: String,
@@ -206,6 +207,7 @@ impl Default for UiHint {
             inherits: vec!["hotkeys".into(), "normal".into()],
             temporary_mode: Some("normal".into()),
             temporary_mode_keys: vec!["primary".into()],
+            temporary_mode_passthrough_keys: Vec::new(),
             lifecycle: TargetingLifecycle {
                 after_finish: LifecycleAction::Mode(ModeId::normal()),
                 after_click: LifecycleAction::Mode(ModeId::normal()),
@@ -267,6 +269,7 @@ pub struct Grid {
     pub inherits: Vec<String>,
     pub temporary_mode: Option<String>,
     pub temporary_mode_keys: Vec<String>,
+    pub temporary_mode_passthrough_keys: Vec<String>,
     pub lifecycle: TargetingLifecycle,
     pub ui: GridUi,
     pub bindings: Bindings,
@@ -292,6 +295,7 @@ impl Default for Grid {
             inherits: vec!["hotkeys".into(), "normal".into()],
             temporary_mode: Some("normal".into()),
             temporary_mode_keys: vec!["primary".into()],
+            temporary_mode_passthrough_keys: Vec::new(),
             lifecycle: TargetingLifecycle {
                 after_finish: LifecycleAction::Mode(ModeId::normal()),
                 after_click: LifecycleAction::Finish,
@@ -336,6 +340,7 @@ pub struct RecursiveGrid {
     pub inherits: Vec<String>,
     pub temporary_mode: Option<String>,
     pub temporary_mode_keys: Vec<String>,
+    pub temporary_mode_passthrough_keys: Vec<String>,
     pub lifecycle: TargetingLifecycle,
     /// Per-depth layout overrides.
     pub layers: Vec<GridLayer>,
@@ -359,6 +364,7 @@ impl Default for RecursiveGrid {
             inherits: vec!["hotkeys".into(), "normal".into()],
             temporary_mode: Some("normal".into()),
             temporary_mode_keys: vec!["primary".into()],
+            temporary_mode_passthrough_keys: Vec::new(),
             lifecycle: TargetingLifecycle::default(),
             layers: Vec::new(),
             ui,

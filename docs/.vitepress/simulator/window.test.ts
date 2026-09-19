@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { createSimulatorState, applyModeAction } from './state.ts'
 import { applyWindowAction, chooseWindowNumber, enterWindow, finishWindowNumber, refreshWindowNumbers, temporaryWindow, tileWindows, windowSelectionKey, windowTarget, WINDOW_AREA } from './window.ts'
-import { resolvePhysicalBinding, shortcutCaption, temporaryPhysicalKeys } from './bindings.ts'
+import { resolveLayeredPhysicalBinding, resolvePhysicalBinding, shortcutCaption, temporaryPhysicalKeys } from './bindings.ts'
 import { automaticTree, importTree, fitTree, treeSlots, splitSlot, removeSlot, resizeRegionBy } from './window-layout.ts'
 import { parseSplitRatios } from './window-ratios.ts'
 
@@ -596,4 +596,20 @@ test('closing a window compacts numbers without changing survivor order', () => 
   assert.equal(state.window.numbers[ordered[1]], undefined)
   const survivors = ordered.filter(id => id !== ordered[1])
   assert.deepEqual(survivors.map(id => state.window.numbers[id]), survivors.map((_, i) => i + 1))
+})
+
+
+test('temporary input uses full chords first and configurable passthrough', () => {
+  const document = { key_aliases: { primary: 'alt' }, normal: { bindings: { s: 'screen next', q: 'idle', 'primary+x': 'grid' } },
+    window: { temporary_mode: 'normal', temporary_mode_keys: ['primary'], temporary_mode_passthrough_keys: [] as string[],
+      bindings: { s: 'window_size', q: 'normal', 'primary+q': 'normal', 'primary+x': 'window_quick' } } }
+  const resolve = (key: string) => resolveLayeredPhysicalBinding(document, 'window', ['right_alt', key], key, false)?.value
+  assert.equal(resolve('s'), 'screen next')
+  assert.equal(resolve('q'), 'normal')
+  assert.equal(resolve('x'), 'grid')
+  delete (document.window.bindings as Record<string, string>)['primary+q']
+  assert.equal(resolve('q'), 'idle')
+  document.window.temporary_mode_passthrough_keys = ['q']
+  assert.equal(resolve('q'), 'normal')
+  assert.equal(resolve('s'), 'screen next')
 })

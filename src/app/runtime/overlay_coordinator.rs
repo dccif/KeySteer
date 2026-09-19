@@ -305,7 +305,15 @@ impl Engine {
 
     fn refresh_overlay_now(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
         if self.registry.active == ModeId::idle() {
-            return Ok(());
+            if self
+                .quick_switch
+                .pending
+                .as_ref()
+                .is_some_and(|p| p.visible)
+            {
+                return self.present_overlay(OverlayScene::new(), backend);
+            }
+            return self.hide_overlay_now(backend);
         }
         let scene = self.overlay.content.as_deref().cloned().unwrap_or_default();
         self.present_overlay(scene, backend)

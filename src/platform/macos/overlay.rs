@@ -11,12 +11,12 @@ use std::sync::Arc;
 
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::AnyObject;
-use objc2::{AnyThread, MainThreadMarker, MainThreadOnly};
+use objc2::{AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSAttributedStringNSStringDrawing, NSBackingStoreType, NSBaselineOffsetAttributeName, NSColor,
     NSFont, NSFontAttributeName, NSForegroundColorAttributeName, NSKernAttributeName,
-    NSLigatureAttributeName, NSPanel, NSScreenSaverWindowLevel, NSView, NSWindowCollectionBehavior,
-    NSWindowStyleMask,
+    NSLigatureAttributeName, NSPanel, NSScreen, NSScreenSaverWindowLevel, NSView,
+    NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_core_foundation::{CFRetained, CFString};
 use objc2_core_graphics::{CGColor, CGMutablePath};
@@ -36,6 +36,21 @@ use crate::api::overlay::{
 
 const MAX_CACHED_COLORS: usize = 64;
 
+// The overlay is positioned in virtual-desktop coordinates, including frames
+// larger than one display. AppKit must not move it to fit a single screen.
+define_class!(
+    #[unsafe(super(NSPanel))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "KeySteerOverlayPanel"]
+    struct OverlayPanel;
+    impl OverlayPanel {
+        #[unsafe(method(constrainFrameRect:toScreen:))]
+        fn constrain_frame(&self, frame: NSRect, _screen: Option<&NSScreen>) -> NSRect {
+            frame
+        }
+    }
+);
+
 /// A main-thread-only transparent overlay. Native objects are created lazily,
 /// which keeps unit tests independent of a WindowServer session.
 pub struct Overlay {
@@ -47,7 +62,7 @@ pub struct Overlay {
 }
 
 struct WindowContent {
-    window: Retained<NSPanel>,
+    window: Retained<OverlayPanel>,
     root_view: Retained<NSView>,
     root_layer: Retained<CALayer>,
     shapes: Vec<Retained<CAShapeLayer>>,
@@ -308,13 +323,17 @@ impl Overlay {
         let view_frame = NSRect::new(NSPoint::new(0.0, 0.0), frame.size);
         let mtm = MainThreadMarker::new()
             .ok_or_else(|| "macOS overlay must be created on the main thread".to_string())?;
-        let window = NSPanel::initWithContentRect_styleMask_backing_defer(
-            NSPanel::alloc(mtm),
-            frame,
-            NSWindowStyleMask::NonactivatingPanel,
-            NSBackingStoreType::Buffered,
-            false,
-        );
+        let allocated = OverlayPanel::alloc(mtm).set_ivars(());
+        // SAFETY: initializes our retained NSPanel subclass on the AppKit main
+        // thread with the exact superclass initializer signature and owned frame.
+        let window: Retained<OverlayPanel> = unsafe {
+            msg_send![super(allocated), initWithContentRect: frame,
+                styleMask: NSWindowStyleMask::NonactivatingPanel,
+                backing: NSBackingStoreType::Buffered, defer: false]
+        };
+        // Initial placement may be adjusted by AppKit. Reapply the virtual
+        // desktop frame after initialization before installing local layers.
+        window.setFrame_display(frame, false);
         if window.isReleasedWhenClosed() {
             return Err(
                 "macOS overlay NSPanel unexpectedly releases itself when closed; refusing ambiguous ownership"

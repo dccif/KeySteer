@@ -256,10 +256,10 @@ fn normal_alt_d_invokes_window_mover_with_wasd_bindings() {
 }
 
 #[test]
-fn temporary_activation_keys_do_not_shadow_wasd_or_defer_movement() {
+fn temporary_unbound_full_chords_move_immediately_without_deferral() {
     for target in [ModeId::grid(), ModeId::recursive_grid(), ModeId::ui_hint()] {
         for window_chord in ["primary+d", "primary+s+d"] {
-            let config = Config::parse(&format!(
+            let mut config = Config::parse(&format!(
                 r#"
                 [key_aliases]
                 primary = "left_alt"
@@ -273,6 +273,10 @@ fn temporary_activation_keys_do_not_shadow_wasd_or_defer_movement() {
             "#
             ))
             .unwrap();
+            // Full chords intentionally win now. Remove them here to isolate
+            // the stripped-key movement path; precedence is covered separately.
+            config.hotkeys.clear();
+            config.normal.bindings.retain(|key, _| !key.contains('+'));
             for key in ["w", "a", "s", "d"] {
                 let mut engine = chord_test_engine(&config);
                 engine.rebuild_tables();
@@ -350,7 +354,7 @@ fn temporary_layer_preserves_local_bindings_other_modifiers_and_normal_shortcuts
         &config.normal.bindings["left_alt+s"]
     );
     engine.set_active(ModeId::grid());
-    assert!(engine.lookup_for_pressed(&s, &alt_s).is_none());
+    assert_eq!(engine.lookup_for_pressed(&s, &alt_s).unwrap().binding.as_ref(), &config.normal.bindings["left_alt+s"]);
     let q = Key::new("q").unwrap();
     assert_eq!(
         engine
@@ -366,7 +370,7 @@ fn temporary_layer_preserves_local_bindings_other_modifiers_and_normal_shortcuts
             .unwrap()
             .binding
             .as_ref(),
-        &Binding::Move(Direction::Down)
+        &config.normal.bindings["left_alt+s"]
     );
     assert_eq!(
         engine

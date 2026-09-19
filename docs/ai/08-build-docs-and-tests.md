@@ -408,3 +408,6 @@ Window 卡片渲染回归额外从 TOML 分别编译 true／false／true，验�
 # Window 上层定位回归
 
 runtime 的 window_targeting 测试覆盖无修饰和临时 Normal 入口、冲突/none/改键、原 Grid/Recursive Grid 的 Tab/Space、跨屏路径保留、自然完成返回、同窗口会话和迟到结果不覆盖上层。共享后端 targeting_move 测试覆盖不同 DPI 的跨屏绝对定位、不回放鼠标和整轮一次撤销。原生窗口的视觉跟随仍需 Windows/macOS 桌面验收。
+
+
+临时层回归覆盖完整层冲突、当前完整组合键优先于临时裸键、去激活键后的临时优先、`none`、穿透键和别名导出往返；网页模拟器同步同一顺序。Quick Switch 覆盖原动作即时执行、原始 Grid/Recursive Grid 选择、重复发送、松开无补发、即时进入 Idle 后长按面板、数字边沿配对与捕获丢失恢复。macOS Overlay 交叉编译不替代实机多屏验证：内屏/外屏分别为主屏，左右/上下/负坐标排列，混合 Retina 比例，`screens=current/all` 切换及逐屏编号、应用名、标题与原窗口对齐。

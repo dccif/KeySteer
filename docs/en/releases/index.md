@@ -1,5 +1,11 @@
 # Release notes
 
+## 0.10.17
+
+- Temporary modes now resolve full chords first and support `temporary_mode_passthrough_keys` so selected keys can fall through to the active mode, reducing shortcut conflicts.
+- Quick Switch triggers now execute their original binding immediately and show the switcher only after being held for `hold_ms`, keeping normal key response fast.
+- Fixed macOS multi-display overlay positioning so panels and window indicators are no longer incorrectly constrained to a single screen.
+
 ## 0.10.16
 
 - Improved overlapping-window switching (`window_overlap_next` / `window_overlap_previous`) with less repeated work.

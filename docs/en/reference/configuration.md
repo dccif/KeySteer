@@ -489,3 +489,12 @@ guide_line_width = 3.0 # 0–32; 0 also hides lines
 # Light/dark themed colors are also supported.
 # guide_line_color = "#6E82D680"
 ```
+
+
+## Temporary input layers
+
+While a temporary trigger is held, resolve full chords in the temporary mode first, then the current mode. Only if neither matches, remove the trigger keys and try the temporary mode followed by the current mode again. Each layer includes its inherited bindings. Full matching requires all held keys. This also means Normal's explicit Primary+F opens UI Hint before its bare F can open Recursive Grid.
+
+Set `temporary_mode_passthrough_keys = ["q"]` on Grid, Recursive Grid, UI Hint, a Window mode, or a plugin mode to skip the temporary layer for Q. The list defaults to `[]`, accepts aliases and chords, and matches either the full or trigger-stripped input. It routes to the current mode, without injecting keys into other applications.
+
+The Quick Switch trigger now runs its original action immediately on key-down. Repeats and key-up continue through normal input routing. Holding the same press to `hold_ms` opens the switcher, even when its immediate action changed mode or entered Idle; release closes it without replaying the action. A press that starts in Idle does not arm the switcher.

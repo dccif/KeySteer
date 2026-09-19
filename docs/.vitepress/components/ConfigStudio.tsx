@@ -11,7 +11,7 @@ import {
   movePointer,
   toggleButton,
 } from '../simulator/state'
-import { effectiveBindings, resolveBinding, resolvePhysicalBinding, shortcutCaption, temporaryPhysicalKeys } from '../simulator/bindings'
+import { effectiveBindings, resolveBinding, resolveLayeredPhysicalBinding, resolvePhysicalBinding, shortcutCaption, temporaryPhysicalKeys } from '../simulator/bindings'
 import { applyWindowAction, chooseWindowNumber, switchWindowMode, isWindowMode, finishWindowNumber, hasWindowPresetChanges, replaceWindowPresets, restoreWindowPreset, saveWindowPreset, setDemoWindowCount, temporaryWindow, windowActionAvailable, windowDetail, windowInputStatus, windowSelectionKey, windowTarget, WINDOW_AREA, WINDOW_MOTION } from '../simulator/window'
 import { decodeWorkspaceDocument, encodeWorkspaceFile, WORKSPACE_FILE_NAME, WORKSPACE_STORAGE_KEY, readSavedPresets, presetName, type ModeUsage } from '../simulator/window-presets'
 import type { WindowState } from '../simulator/window'
@@ -546,11 +546,8 @@ export default defineComponent({
       if (document) {
         const pressed = currentPhysicalKeys(event)
         if (isWindowMode(simulator.mode)) {
-          const local = resolvePhysicalBinding(document, simulator.mode, pressed, physical, isMac.value, true)
           const temporary = simulator.window.temporary ? temporaryPhysicalKeys(document, simulator.mode, pressed, isMac.value, temporaryEntryKeys) : []
-          let resolved = (temporary.length ? undefined : local) ?? (temporary.length
-            ? resolvePhysicalBinding(document, String(document[simulator.mode]?.temporary_mode ?? 'normal'), pressed.filter(k => !temporary.includes(k)), physical, isMac.value)
-            : resolvePhysicalBinding(document, simulator.mode, pressed, physical, isMac.value))
+          let resolved = resolveLayeredPhysicalBinding(document, simulator.mode, pressed, physical, isMac.value, temporaryEntryKeys)
           // Shift-generated literals (notably ~) still reach character bindings
           // after physical chords, just as the native input router does.
           if (!resolved && !temporary.length && !event.ctrlKey && !event.altKey && !event.metaKey && [...event.key].length === 1) {
@@ -625,9 +622,8 @@ export default defineComponent({
     function updateTemporaryWindow(event: KeyboardEvent): void {
       if (!isWindowMode(simulator.mode) || !effectiveDocument.value) return
       const pressed = currentPhysicalKeys(event), physical = physicalKey(event)
-      const local = resolvePhysicalBinding(effectiveDocument.value, simulator.mode, pressed, physical, isMac.value, true)
-      const ownChord = pressed.length > 1 && !!local && windowActionAvailable(simulator.window, String(local.value))
-      const active = !ownChord && temporaryPhysicalKeys(effectiveDocument.value, simulator.mode, pressed, isMac.value, temporaryEntryKeys).length > 0
+      const resolved = resolveLayeredPhysicalBinding(effectiveDocument.value, simulator.mode, pressed, physical, isMac.value, temporaryEntryKeys)
+      const active = resolved?.source !== simulator.mode && temporaryPhysicalKeys(effectiveDocument.value, simulator.mode, pressed, isMac.value, temporaryEntryKeys).length > 0
       if (active !== simulator.window.temporary) heldActions.clear()
       temporaryWindow(simulator.window, active, effectiveDocument.value[simulator.mode] ?? {})
     }

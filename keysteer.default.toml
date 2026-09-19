@@ -267,6 +267,8 @@ enabled = true
 inherits = ["hotkeys"]
 temporary_mode = "normal"
 temporary_mode_keys = ["primary"]
+# Skip the temporary layer for these full or trigger-stripped chords.
+temporary_mode_passthrough_keys = []
 number_timeout_ms = 250
 move_step = 20.0
 move_speed = 600.0
@@ -346,6 +348,8 @@ enabled = true
 inherits = ["hotkeys"]
 temporary_mode = "normal"
 temporary_mode_keys = ["primary"]
+# Skip the temporary layer for these full or trigger-stripped chords.
+temporary_mode_passthrough_keys = []
 number_timeout_ms = 250
 split_ratios = ["1/4", "1/3", "1/2", "2/3", "3/4"]
 gap = 0.0
@@ -385,6 +389,8 @@ enabled = true
 inherits = ["hotkeys"]
 temporary_mode = "normal"
 temporary_mode_keys = ["primary"]
+# Skip the temporary layer for these full or trigger-stripped chords.
+temporary_mode_passthrough_keys = []
 number_timeout_ms = 250
 resize_step = 20.0
 resize_speed = 500.0
@@ -438,6 +444,8 @@ enabled = true
 inherits = ["hotkeys"]
 temporary_mode = "normal"
 temporary_mode_keys = ["primary"]
+# Skip the temporary layer for these full or trigger-stripped chords.
+temporary_mode_passthrough_keys = []
 number_timeout_ms = 250
 gap = 0.0
 border_width = 3.0
@@ -462,6 +470,8 @@ enabled = true
 inherits = ["hotkeys"]
 temporary_mode = "normal"
 temporary_mode_keys = ["primary"]
+# Skip the temporary layer for these full or trigger-stripped chords.
+temporary_mode_passthrough_keys = []
 number_timeout_ms = 250
 border_width = 3
 
@@ -508,6 +518,8 @@ hint_characters = "asdfghjkl"
 inherits = ["hotkeys", "normal"]
 temporary_mode = "normal"
 temporary_mode_keys = ["primary"]
+# Skip the temporary layer for these full or trigger-stripped chords.
+temporary_mode_passthrough_keys = []
 # Hold to raise the next label in every overlapping group; release to restore.
 # If this is also listed in temporary_mode_keys, overlap cycling wins in UI Hint.
 overlap_cycle_key = "shift"
@@ -634,6 +646,8 @@ max_depth = 3
 inherits = ["hotkeys", "normal"]
 temporary_mode = "normal"
 temporary_mode_keys = ["primary"]
+# Skip the temporary layer for these full or trigger-stripped chords.
+temporary_mode_passthrough_keys = []
 # Move to each selected cell centre while narrowing the grid.
 cursor_follow_selection = true
 
@@ -682,6 +696,8 @@ cursor_follow_selection = true
 inherits = ["hotkeys", "normal"]
 temporary_mode = "normal"
 temporary_mode_keys = ["primary"]
+# Skip the temporary layer for these full or trigger-stripped chords.
+temporary_mode_passthrough_keys = []
 
 # A click keeps the current recursive grid live, so more letters can continue
 # subdividing it. Natural endpoints and explicit Finish keep their final state.

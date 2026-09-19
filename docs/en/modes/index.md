@@ -49,7 +49,7 @@ Keep at least one entry key.
 
 Grid, Recursive Grid, and UI Hint inherit Normal by default and use `Primary` as a temporary-mode modifier. Hold it to use Normal's movement, scrolling, and click bindings while keeping the current targeting session; release it to resume targeting.
 
-Temporary activation keys are excluded when matching Normal bindings. For example, with Primary mapped to Alt, temporary Alt+S uses Normal's `s` binding, while Alt+S in ordinary Normal still uses `primary+s`. Explicit bindings in the current targeting mode, including `primary+q` and `none`, take precedence. Other modifiers still participate in matching.
+Full chords are matched first, temporary mode before current mode. If neither matches, activation keys are removed and the same layer order is used. Thus an explicit `primary+s` precedes bare `s`, and Grid’s `primary+q` precedes Normal’s bare `q`. Set `temporary_mode_passthrough_keys = ["q"]` to skip the temporary layer for Q. Other modifiers still participate in matching.
 
 ```toml
 [grid]

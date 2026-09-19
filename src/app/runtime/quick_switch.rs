@@ -13,7 +13,6 @@ pub(super) struct QuickSwitcher {
 pub(super) struct Pending {
     owner: ModeId,
     input: InputEvent,
-    short: Option<ResolvedBinding>,
     pub(super) deadline: Instant,
     pub(super) visible: bool,
     used: bool,
@@ -38,59 +37,31 @@ impl Engine {
         if input.injected {
             return Ok(false);
         }
-        if self
-            .quick_switch
-            .pending
-            .as_ref()
-            .is_some_and(|p| p.owner != self.registry.active)
-            || !self.enabled
-            || self.is_excluded_app()
-            || self.window_presets.pending.is_some()
-        {
+        if !self.enabled || self.is_excluded_app() || self.window_presets.pending.is_some() {
             self.quick_switch.pending = None;
         }
-        if input.state == KeyState::Up && self.quick_switch.captured.remove(&input.key) {
-            self.input.pressed.remove(&input.key);
-            self.input
-                .temporary_entry_keys
-                .retain(|key| key != &input.key);
-            let outcome = self.complete_key_disposition(input, KeyOutcome::Consumed);
-            self.dispose_input(input, outcome, false, backend)?;
+        // The trigger belongs to normal input routing on both edges, even if
+        // its immediate action switches modes. Only panel choices are captured.
+        if input.state == KeyState::Up {
             if self
                 .quick_switch
                 .pending
                 .as_ref()
                 .is_some_and(|p| p.input.key == input.key)
-                && let Some(pending) = self.quick_switch.pending.take()
             {
-                if !pending.visible && !pending.used && Instant::now() < pending.deadline {
-                    if let Some(short) = pending.short {
-                        self.apply_binding(short.clone(), &pending.input, backend)?;
-                        self.apply_binding(short, input, backend)?;
-                    } else {
-                        self.dispatch_to(
-                            &pending.owner,
-                            ModeEvent::Key {
-                                key: pending.input.key,
-                                state: KeyState::Down,
-                                repeat: false,
-                            },
-                            backend,
-                        )?;
-                        self.dispatch_to(
-                            &pending.owner,
-                            ModeEvent::Key {
-                                key: input.key.clone(),
-                                state: KeyState::Up,
-                                repeat: false,
-                            },
-                            backend,
-                        )?;
-                    }
-                }
+                self.quick_switch.pending = None;
                 self.refresh_overlay(backend)?;
             }
-            return Ok(true);
+            if self.quick_switch.captured.remove(&input.key) {
+                self.input.pressed.remove(&input.key);
+                self.input
+                    .temporary_entry_keys
+                    .retain(|key| key != &input.key);
+                let outcome = self.complete_key_disposition(input, KeyOutcome::Consumed);
+                self.dispose_input(input, outcome, false, backend)?;
+                return Ok(true);
+            }
+            return Ok(false);
         }
         if input.state != KeyState::Down {
             return Ok(false);
@@ -109,12 +80,9 @@ impl Engine {
             && input.key == self.settings.quick_switch.key
             && self.input.pressed.is_empty();
         if starts {
-            let short = self.lookup_for_pressed(&input.key, std::slice::from_ref(&input.key));
-            self.consume_switch_key(input, backend)?;
             self.quick_switch.pending = Some(Pending {
                 owner: self.registry.active.clone(),
                 input: input.clone(),
-                short,
                 deadline: Instant::now()
                     + Duration::from_millis(self.settings.quick_switch.hold_ms),
                 visible: false,
@@ -124,7 +92,15 @@ impl Engine {
                 rows: Vec::new(),
                 text_metrics: Default::default(),
             });
-            return Ok(true);
+            return Ok(false);
+        }
+        if self
+            .quick_switch
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.input.key == input.key)
+        {
+            return Ok(false);
         }
         if self.quick_switch.pending.is_some()
             && !input.repeat
@@ -246,11 +222,7 @@ impl Engine {
     }
 
     pub(super) fn fire_quick_switch(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
-        let cancel = self
-            .quick_switch
-            .pending
-            .as_ref()
-            .is_some_and(|p| p.owner != self.registry.active || p.used)
+        let cancel = self.quick_switch.pending.as_ref().is_some_and(|p| p.used)
             || !self.enabled
             || self.is_excluded_app()
             || self.window_presets.pending.is_some();
@@ -275,12 +247,7 @@ impl Engine {
     }
 
     pub(super) fn decorate_quick_switch(&self, scene: &mut OverlayScene) {
-        let Some(pending) = self
-            .quick_switch
-            .pending
-            .as_ref()
-            .filter(|p| p.visible && p.owner == self.registry.active)
-        else {
+        let Some(pending) = self.quick_switch.pending.as_ref().filter(|p| p.visible) else {
             return;
         };
         let Some(screen) = Screen::containing(&self.screens, &self.cursor) else {

@@ -99,12 +99,13 @@ export function shortcutCaption(document: BindingDocument, chord: string, isMac:
 }
 
 /** Physical matching used by Window's independently configurable bindings. */
-export function resolvePhysicalBinding(document: BindingDocument, mode: string, pressed: string[], key: string, isMac: boolean, localOnly = false): ResolvedBinding | undefined {
+export function resolvePhysicalBinding(document: BindingDocument, mode: string, pressed: string[], key: string, isMac: boolean, localOnly = false, exact = false): ResolvedBinding | undefined {
   const aliases = aliasesFor(document, isMac)
   let best: ResolvedBinding | undefined, specificity = 0
   const table = localOnly ? collectBindings({ [mode]: { bindings: bindingTable(document, mode) } }, mode, new Set()) : collectBindings(document, mode, new Set())
   for (const [chord, binding] of table) {
     const keys = chordKeys(chord, aliases)
+    if (exact && keys.length !== pressed.length) continue
     if (!keys.some(k => keyMatches(k, key)) || !keys.every(k => pressed.some(p => keyMatches(k, p)))) continue
     if (pressed.some(p => /^(left_|right_)?(shift|ctrl|alt|cmd|win)$/.test(p) && !keys.some(k => keyMatches(k, p)))) continue
     if (keys.length > specificity) { specificity = keys.length; best = binding }
@@ -125,4 +126,24 @@ export function temporaryPhysicalKeys(document: BindingDocument, mode: string, p
     }
   }
   return [...active]
+}
+
+/** Full chords precede trigger-stripped chords; the temporary layer wins ties. */
+export function resolveLayeredPhysicalBinding(document: BindingDocument, mode: string, pressed: string[], key: string, isMac: boolean, entryKeys: ReadonlySet<string> = new Set()): ResolvedBinding | undefined {
+  const triggers = temporaryPhysicalKeys(document, mode, pressed, isMac, entryKeys)
+  if (!triggers.length) return resolvePhysicalBinding(document, mode, pressed, key, isMac)
+  const remaining = pressed.filter(k => !triggers.includes(k))
+  if (!remaining.includes(key)) return undefined
+  const settings = asRecord(document[mode]), aliases = aliasesFor(document, isMac)
+  const passthrough = (Array.isArray(settings.temporary_mode_passthrough_keys) ? settings.temporary_mode_passthrough_keys : []).some(chord => {
+    const keys = chordKeys(String(chord), aliases)
+    return keys.some(k => keyMatches(k, key)) && [pressed, remaining].some(input => keys.length === input.length && keys.every(k => input.some(p => keyMatches(k, p))))
+  })
+  for (const [input, exact] of [[pressed, true], [remaining, false]] as const) {
+    for (const source of passthrough ? [mode] : [String(settings.temporary_mode), mode]) {
+      const resolved = resolvePhysicalBinding(document, source, input, key, isMac, false, exact)
+      if (resolved) return resolved
+    }
+  }
+  return undefined
 }

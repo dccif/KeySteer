@@ -264,6 +264,7 @@ pub(crate) fn built_in_specs(config: &Config) -> Result<Vec<ModeSpec>, String> {
             &[],
             None,
             &[],
+            &[],
             app_overrides(&config.app_configs),
         )?,
     ));
@@ -273,6 +274,7 @@ pub(crate) fn built_in_specs(config: &Config) -> Result<Vec<ModeSpec>, String> {
             &config.normal.bindings,
             &config.normal.inherits,
             None,
+            &[],
             &[],
             app_overrides(&config.normal.app_configs),
         )?,
@@ -285,6 +287,7 @@ pub(crate) fn built_in_specs(config: &Config) -> Result<Vec<ModeSpec>, String> {
                 &config.grid.inherits,
                 config.grid.temporary_mode.as_deref(),
                 &config.grid.temporary_mode_keys,
+                &config.grid.temporary_mode_passthrough_keys,
                 app_overrides(&config.grid.app_configs),
             )?,
         ));
@@ -297,6 +300,7 @@ pub(crate) fn built_in_specs(config: &Config) -> Result<Vec<ModeSpec>, String> {
                 &config.recursive_grid.inherits,
                 config.recursive_grid.temporary_mode.as_deref(),
                 &config.recursive_grid.temporary_mode_keys,
+                &config.recursive_grid.temporary_mode_passthrough_keys,
                 app_overrides(&config.recursive_grid.app_configs),
             )?,
         ));
@@ -309,6 +313,7 @@ pub(crate) fn built_in_specs(config: &Config) -> Result<Vec<ModeSpec>, String> {
                 &config.ui_hint.inherits,
                 config.ui_hint.temporary_mode.as_deref(),
                 &config.ui_hint.temporary_mode_keys,
+                &config.ui_hint.temporary_mode_passthrough_keys,
                 ui_hint_overrides(&config.ui_hint.app_configs),
             )?,
         ));
@@ -326,6 +331,7 @@ pub(crate) fn built_in_specs(config: &Config) -> Result<Vec<ModeSpec>, String> {
                 &section.inherits,
                 section.temporary_mode.as_deref(),
                 &section.temporary_mode_keys,
+                &section.temporary_mode_passthrough_keys,
                 app_overrides(&section.app_configs),
             )?,
         ));
@@ -344,6 +350,7 @@ pub(crate) fn bundled_specs(config: &Config) -> Result<Vec<ModeSpec>, String> {
                     &section.inherits,
                     section.temporary_mode.as_deref(),
                     &section.temporary_mode_keys,
+                    &section.temporary_mode_passthrough_keys,
                     app_overrides(&section.app_configs),
                 )?,
                 None => empty_route(),
@@ -358,6 +365,7 @@ fn compile_route(
     inherits: &[String],
     temporary_mode: Option<&str>,
     temporary_keys: &[String],
+    temporary_passthrough: &[String],
     app_overrides: Vec<AppRouteOverride>,
 ) -> Result<ModeRoute, String> {
     Ok(ModeRoute {
@@ -374,6 +382,10 @@ fn compile_route(
             .collect::<Result<Vec<_>, _>>()?,
         temporary_mode: temporary_mode.map(ModeId::parse_borrowed).transpose()?,
         temporary_keys: temporary_keys.to_vec(),
+        temporary_passthrough: temporary_passthrough
+            .iter()
+            .map(|key| crate::api::KeyChord::parse(key))
+            .collect::<Result<_, _>>()?,
         app_overrides,
     })
 }
@@ -384,6 +396,7 @@ fn empty_route() -> ModeRoute {
         inherits: Vec::new(),
         temporary_mode: None,
         temporary_keys: Vec::new(),
+        temporary_passthrough: Vec::new(),
         app_overrides: Vec::new(),
     }
 }

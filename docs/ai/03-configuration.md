@@ -197,10 +197,9 @@ Engine 为每个 Mode 编译有效 keymap：
 
 `temporary_mode`/`temporary_mode_keys` 允许 targeting mode 暂时使用另一个 Mode（默认为
 Normal）的绑定，而不销毁当前选择路径。
-临时层查询前会内部消费已匹配的激活 chord 成员（包括别名和左右修饰键），其余修饰键保留。
-当前 targeting Mode 的本地显式绑定（含 `none`）先按物理 chord 匹配；否则只用剩余按键查询
-临时目标及其继承链，不回退到含激活键的原始继承查询。UI Hint 的 overlap 键仍优先保留给标签循环。
-前缀候选复用同一 resolver，因此被消费激活键的组合不会阻塞临时移动；普通 Normal 的组合键不变。
+解析保留原始和去掉已匹配激活键的两份输入：完整临时层 → 完整当前层 → 去激活键临时层 → 去激活键当前层，各层包含继承链。完整匹配必须覆盖所有按住键，不能让裸键抢占组合键。`none` 终止该绑定查询，UI Hint overlap 键仍保留给标签循环。
+`temporary_mode_passthrough_keys = ["q"]` 在使用临时模式的配置段声明例外，匹配完整或去激活键后的 chord 时跳过临时层；支持别名、左右修饰键和组合键，默认空列表，不依赖动作或目的模式。加载时规范化并编译，不在按键热路径解析字符串。help 和 prefix 使用相同 resolver。
+显式组合键可能改变旧临时层行为，例如默认 Primary+F 现在执行 ui_hint，而不是剥离 Primary 后执行 recursive_grid。
 
 DTO 到强类型 Mode `Settings`、enable/disable、继承、temporary keys、app override 和插件
 默认绑定的汇合点统一是 `app/mode_catalog.rs`。`configuration::compile` 只验证 catalog ID

@@ -28,6 +28,7 @@ pub struct WindowModeConfig {
     pub inherits: Vec<String>,
     pub temporary_mode: Option<String>,
     pub temporary_mode_keys: Vec<String>,
+    pub temporary_mode_passthrough_keys: Vec<String>,
     pub number_timeout_ms: u64,
     pub border_width: f64,
     pub ui: LabelUi,
@@ -44,6 +45,7 @@ impl Default for WindowModeConfig {
             inherits: vec!["hotkeys".into()],
             temporary_mode: Some("normal".into()),
             temporary_mode_keys: vec!["primary".into()],
+            temporary_mode_passthrough_keys: Vec::new(),
             number_timeout_ms: 250,
             border_width: 3.0,
             ui: LabelUi {
@@ -73,7 +75,7 @@ macro_rules! window_config {
                 struct Document {
                     screens: WindowScreens, include_minimized: bool,
                     enabled: bool, inherits: Vec<String>, temporary_mode: Option<String>,
-                    temporary_mode_keys: Vec<String>, number_timeout_ms: u64, border_width: f64,
+                    temporary_mode_keys: Vec<String>, temporary_mode_passthrough_keys: Vec<String>, number_timeout_ms: u64, border_width: f64,
                     ui: LabelUi,
                     #[serde(deserialize_with = "read_lifecycle")]
                     lifecycle: TargetingLifecycle, bindings: Bindings,
@@ -91,14 +93,14 @@ macro_rules! window_config {
                     fn default() -> Self {
                         let mode = $name::default(); let common = mode.common;
                         Self { screens: common.screens, include_minimized: common.include_minimized, enabled: common.enabled, inherits: common.inherits, temporary_mode: common.temporary_mode,
-                            temporary_mode_keys: common.temporary_mode_keys, number_timeout_ms: common.number_timeout_ms,
+                            temporary_mode_keys: common.temporary_mode_keys, temporary_mode_passthrough_keys: common.temporary_mode_passthrough_keys, number_timeout_ms: common.number_timeout_ms,
                             border_width: common.border_width, ui: common.ui, lifecycle: common.lifecycle,
                             bindings: common.bindings, app_configs: common.app_configs, $($field: mode.$field,)* }
                     }
                 }
                 let doc = Document::deserialize(deserializer)?;
                 Ok(Self { common: WindowModeConfig { screens: doc.screens, include_minimized: doc.include_minimized, enabled: doc.enabled, inherits: doc.inherits,
-                    temporary_mode: doc.temporary_mode, temporary_mode_keys: doc.temporary_mode_keys,
+                    temporary_mode: doc.temporary_mode, temporary_mode_keys: doc.temporary_mode_keys, temporary_mode_passthrough_keys: doc.temporary_mode_passthrough_keys,
                     number_timeout_ms: doc.number_timeout_ms, border_width: doc.border_width, ui: doc.ui,
                     lifecycle: doc.lifecycle, bindings: doc.bindings, app_configs: doc.app_configs }, $($field: doc.$field,)* })
             }

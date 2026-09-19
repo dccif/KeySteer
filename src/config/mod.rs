@@ -269,6 +269,7 @@ pub struct PluginModeConfig {
     pub inherits: Vec<String>,
     pub temporary_mode: Option<String>,
     pub temporary_mode_keys: Vec<String>,
+    pub temporary_mode_passthrough_keys: Vec<String>,
     /// Plugin-owned values exposed through the host settings snapshot.
     pub settings: BTreeMap<String, toml::Value>,
     pub bindings: Bindings,
@@ -545,6 +546,7 @@ impl ConfigFile {
                 )?;
             }
             normalize_key_list(&mut mode.temporary_mode_keys, &aliases)?;
+            normalize_passthrough_keys(&mut mode.temporary_mode_passthrough_keys, &aliases)?;
         }
         normalize_binding_keys(&mut self.grid.bindings, "[grid.bindings]", &aliases)?;
         normalize_binding_keys(
@@ -599,8 +601,16 @@ impl ConfigFile {
         ] {
             normalize_key_list(keys, &aliases)?;
         }
+        for keys in [
+            &mut self.grid.temporary_mode_passthrough_keys,
+            &mut self.recursive_grid.temporary_mode_passthrough_keys,
+            &mut self.ui_hint.temporary_mode_passthrough_keys,
+        ] {
+            normalize_passthrough_keys(keys, &aliases)?;
+        }
         for mode in self.plugin_modes.values_mut() {
             normalize_key_list(&mut mode.temporary_mode_keys, &aliases)?;
+            normalize_passthrough_keys(&mut mode.temporary_mode_passthrough_keys, &aliases)?;
         }
         Ok(())
     }
@@ -702,4 +712,16 @@ impl ConfigFile {
             ("window_tab", &mut self.window_tab.common),
         ]
     }
+}
+
+fn normalize_passthrough_keys(
+    keys: &mut [String],
+    aliases: &BTreeMap<String, String>,
+) -> Result<(), ConfigError> {
+    for key in keys {
+        *key = crate::api::KeyChord::parse_with_aliases(key, aliases)
+            .map_err(ConfigError::Parse)?
+            .canonical();
+    }
+    Ok(())
 }

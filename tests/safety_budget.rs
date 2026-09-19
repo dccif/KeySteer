@@ -41,7 +41,8 @@ use std::path::{Path, PathBuf};
 // versioned policy adapter adds three exact ABI slots and four scoped call blocks.
 // Two audited Objective-C protocol conformances for deferred system termination.
 // One test-only INPUT_KEYBOARD union read verifies mapped-chord restoration.
-const MAX_UNSAFE_EXPRESSIONS: usize = 369;
+// Overlay adds one main-thread, retained NSPanel subclass initializer.
+const MAX_UNSAFE_EXPRESSIONS: usize = 370;
 const MAX_UNSAFE_FILES: usize = 31;
 const PER_FILE_BUDGET: &[(&str, usize)] = &[
     // macOS audio owns, changes, maintains and destroys native state,
@@ -57,7 +58,7 @@ const PER_FILE_BUDGET: &[(&str, usize)] = &[
     ("src/platform/macos/autostart.rs", 5),
     ("src/platform/macos/display_link.rs", 4),
     ("src/platform/macos/native.rs", 7),
-    ("src/platform/macos/overlay.rs", 6),
+    ("src/platform/macos/overlay.rs", 7),
     ("src/platform/macos/permissions.rs", 5),
     // Shutdown adds only NSObjectProtocol / NSApplicationDelegate conformance on
     // the retained main-thread status target; no new raw native calls or Send/Sync.

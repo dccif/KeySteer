@@ -15,7 +15,7 @@ fn quick_switch_freezes_ranking_and_consumes_both_chord_edges() {
     engine
         .handle_backend_event(key_down("q"), &mut backend)
         .unwrap();
-    assert_eq!(engine.active_mode(), &ModeId::normal());
+    assert_eq!(engine.active_mode(), &ModeId::idle());
     engine.quick_switch.pending.as_mut().unwrap().deadline = Instant::now();
     engine.fire_quick_switch(&mut backend).unwrap();
     assert!(engine.quick_switch.pending.as_ref().unwrap().visible);
@@ -78,7 +78,7 @@ fn quick_switch_idle_blacklist_and_same_mode_count_semantics() {
     for event in [key_down("q"), key_down("1"), key_up("1"), key_up("q")] {
         engine.handle_backend_event(event, &mut backend).unwrap();
     }
-    assert_eq!(engine.active_mode(), &ModeId::normal());
+    assert_eq!(engine.active_mode(), &ModeId::idle());
     assert!(
         !log.lock()
             .unwrap()
@@ -103,6 +103,7 @@ fn quick_switch_cancelled_by_capture_loss_can_be_used_again() {
         .unwrap();
     engine.cancel_quick_switch(true);
     engine.input.forget_physical_capture();
+    engine.activate(ModeId::normal(), None, &mut backend).unwrap();
     engine
         .handle_backend_event(key_down("q"), &mut backend)
         .unwrap();
@@ -147,4 +148,77 @@ fn system_checkpoint_acknowledges_after_saving_below_threshold() {
     assert_eq!(restored.mode_usage()["normal"], 1);
     assert!(!engine.should_quit()); // A cancelled system shutdown must not terminate the engine.
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn quick_switch_trigger_delivers_down_repeat_and_up_without_waiting_or_replay() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut engine = engine_with_normal_probes(&seen, "q", "send left");
+    let (mut backend, log) = FakeBackend::new(vec![]);
+    engine
+        .activate(ModeId::normal(), None, &mut backend)
+        .unwrap();
+    engine
+        .handle_backend_event(key_down("q"), &mut backend)
+        .unwrap();
+    assert!(engine.quick_switch.pending.is_some());
+    let expected = vec![
+        ("arrow_left".to_string(), KeyState::Down),
+        ("arrow_left".to_string(), KeyState::Up),
+    ];
+    assert_eq!(log.lock().unwrap().sent, expected);
+    let mut repeated = match key_down("q") {
+        BackendEvent::Input(input) => input,
+        _ => unreachable!(),
+    };
+    repeated.repeat = true;
+    engine
+        .handle_backend_event(BackendEvent::Input(repeated), &mut backend)
+        .unwrap();
+    assert_eq!(
+        log.lock().unwrap().sent,
+        [expected.clone(), expected.clone()].concat()
+    );
+    engine
+        .handle_backend_event(key_up("q"), &mut backend)
+        .unwrap();
+    assert_eq!(
+        log.lock().unwrap().sent,
+        [expected.clone(), expected.clone()].concat()
+    );
+    assert!(engine.quick_switch.pending.is_none());
+}
+
+#[test]
+fn quick_switch_observes_raw_grid_selection_without_delaying_or_replaying_it() {
+    for mode in [ModeId::grid(), ModeId::recursive_grid()] {
+        let mut config = Config::default();
+        config.grid.cursor_follow_selection = true;
+        config.recursive_grid.cursor_follow_selection = true;
+        let mut engine = Engine::new(config.clone(), Appearance::Dark);
+        for mode in crate::app::mode_catalog::built_in(&config) {
+            engine.register(mode);
+        }
+        let (mut backend, log) = FakeBackend::new(vec![]);
+        engine.start_runtime(&mut backend).unwrap();
+        engine.activate(mode.clone(), None, &mut backend).unwrap();
+        let before = log.lock().unwrap().warps.len();
+        engine
+            .handle_backend_event(key_down("q"), &mut backend)
+            .unwrap();
+        let selected = log.lock().unwrap().warps.len();
+        assert!(
+            selected > before,
+            "{mode} must select on Down before hold_ms"
+        );
+        assert!(engine.quick_switch.pending.is_some());
+        engine
+            .handle_backend_event(key_up("q"), &mut backend)
+            .unwrap();
+        assert_eq!(
+            log.lock().unwrap().warps.len(),
+            selected,
+            "Up must not repeat selection"
+        );
+    }
 }

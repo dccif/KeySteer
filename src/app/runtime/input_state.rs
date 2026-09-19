@@ -1656,26 +1656,20 @@ impl Engine {
         mode: &ModeId,
         pressed: &[Key],
     ) -> bool {
-        // An explicit multi-key binding wins over a temporary modifier in every mode.
-        if pressed.iter().any(|key| {
-            self.lookup_reference_match::<HELP>(mode, mode, key, pressed)
-                .is_some_and(|(binding, specificity)| {
-                    specificity > 1
-                        && if HELP {
-                            match binding.as_ref() {
-                                Binding::Window(action) => self
-                                    .registry
-                                    .get(mode)
-                                    .is_none_or(|mode| mode.window_action_supported(action)),
-                                _ => true,
-                            }
-                        } else {
-                            self.binding_available(mode, &binding)
-                        }
-                })
-        }) {
+        if !self.temporary_trigger_active::<HELP>(mode, pressed) {
             return false;
         }
+        // Keep the base Window state available when its binding wins, while
+        // lookup itself always considers the held trigger and both layers.
+        !pressed.iter().any(|key| {
+            !key.is_modifier()
+                && self
+                    .lookup_for_reference::<HELP>(mode, key, pressed)
+                    .is_some_and(|resolved| resolved.owner == *mode)
+        })
+    }
+
+    fn temporary_trigger_active<const HELP: bool>(&self, mode: &ModeId, pressed: &[Key]) -> bool {
         self.registry.temporary_chords(mode).is_some_and(|chords| {
             chords.iter().any(|entry| {
                 let reserved_for_overlap =
@@ -1814,19 +1808,8 @@ impl Engine {
                 owner: active.clone(),
             });
         };
-        let temporary_active = self.temporary_mode_is_active_for_reference::<HELP>(active, pressed);
+        let temporary_active = self.temporary_trigger_active::<HELP>(active, pressed);
         if temporary_active && let Some(owner) = route.temporary_mode.as_ref() {
-            // Explicit bindings of the targeting mode retain their physical
-            // chord, including `none`. The temporary layer consumes its
-            // activation keys before looking up the target and its parents.
-            if let Some((binding, specificity)) = &active_match
-                && *specificity == pressed.len()
-            {
-                return (binding.as_ref() != &Binding::Disabled).then(|| ResolvedBinding {
-                    binding: Arc::clone(binding),
-                    owner: active.clone(),
-                });
-            }
             let chords = self.registry.temporary_chords(active)?;
             let remaining: SmallVec<[Key; 8]> = pressed
                 .iter()
@@ -1847,35 +1830,44 @@ impl Engine {
             if !remaining.contains(key) {
                 return None;
             }
-            // Do not fall back to the original pressed set: that would
-            // resurrect shortcuts containing the consumed activation keys.
-            let temporary = self.lookup_inherited_reference::<HELP>(
-                active,
-                owner,
-                key,
-                &remaining,
-                &mut SmallVec::new(),
-            );
-            if temporary.is_some()
-                || self
-                    .lookup_reference_match::<HELP>(active, owner, key, &remaining)
-                    .is_some()
-            {
-                return temporary;
-            }
-            // A global mode launcher may share the temporary modifier. Resolve
-            // its full chord only when the temporary layer has no binding.
-            if route.inherits.contains(&ModeId::idle())
-                && let Some((binding, specificity)) =
-                    self.lookup_reference_match::<HELP>(active, &ModeId::idle(), key, pressed)
-                && specificity > 1
-                && specificity == pressed.len()
-                && matches!(binding.as_ref(), Binding::Mode(_))
-            {
-                return Some(ResolvedBinding {
-                    binding,
-                    owner: ModeId::idle(),
-                });
+            let passthrough = route.temporary_passthrough.iter().any(|chord| {
+                chord.activation_matches(key)
+                    && [pressed, remaining.as_slice()]
+                        .into_iter()
+                        .any(|keys| chord.keys().len() == keys.len() && chord.matches_pressed(keys))
+            });
+            // Full physical chords outrank stripped chords. Within each tier,
+            // the temporary layer wins unless this input explicitly passes through.
+            for (keys, exact) in [(pressed, true), (remaining.as_slice(), false)] {
+                for (temporary, source) in [(true, owner), (false, active)] {
+                    if passthrough && temporary {
+                        continue;
+                    }
+                    if let Some(resolved) = self.lookup_layer_reference::<HELP>(
+                        active,
+                        source,
+                        key,
+                        keys,
+                        exact,
+                        &mut SmallVec::new(),
+                    ) {
+                        return (resolved.binding.as_ref() != &Binding::Disabled
+                            && available(&resolved.binding))
+                        .then_some(resolved);
+                    }
+                    if !exact
+                        && source == active
+                        && self.registry.get(active).is_some_and(|mode| {
+                            if HELP {
+                                mode.claims_key_for_help(key)
+                            } else {
+                                mode.claims_key(key)
+                            }
+                        })
+                    {
+                        return None;
+                    }
+                }
             }
             return None;
         }
@@ -1916,6 +1908,51 @@ impl Engine {
                 .filter(|resolved| available(&resolved.binding))
             }),
         }
+    }
+
+    /// Resolve a layer including inheritance, retaining `none` as a terminal match.
+    fn lookup_layer_reference<const HELP: bool>(
+        &self,
+        active: &ModeId,
+        owner: &ModeId,
+        key: &Key,
+        pressed: &[Key],
+        exact: bool,
+        visited: &mut SmallVec<[ModeId; 8]>,
+    ) -> Option<ResolvedBinding> {
+        if visited.contains(owner) {
+            return None;
+        }
+        visited.push(owner.clone());
+        if let Some((binding, specificity)) =
+            self.lookup_reference_match::<HELP>(active, owner, key, pressed)
+            && (!exact || specificity == pressed.len())
+        {
+            return Some(ResolvedBinding {
+                binding,
+                owner: owner.clone(),
+            });
+        }
+        if !exact
+            && owner == active
+            && self.registry.get(active).is_some_and(|mode| {
+                if HELP {
+                    mode.claims_key_for_help(key)
+                } else {
+                    mode.claims_key(key)
+                }
+            })
+        {
+            return None;
+        }
+        self.registry
+            .routes
+            .get(owner)?
+            .inherits
+            .iter()
+            .find_map(|source| {
+                self.lookup_layer_reference::<HELP>(active, source, key, pressed, exact, visited)
+            })
     }
 
     pub(super) fn lookup_inherited(

@@ -462,3 +462,6 @@ is retained for explicit size_cycle bindings. Modes send API requests only.
 # 网格定位窗口
 
 共享 window_session 执行 WindowChange::MoveTo：使用绝对屏幕坐标，将窗口中心放到目标点并约束到目标屏幕 work_area，保持尺寸，不乘源屏 DPI，不返回 pointer。连续绝对请求在同 session/target/group 内只保留最新位置，一轮定位共用撤销组；Windows/macOS 继续使用各自 NativeAccess::set_frame。
+
+
+macOS Overlay 使用保留的 OverlayPanel 子类，`constrainFrameRect:toScreen:` 返回虚拟桌面原始 frame，创建后重新设置 frame，避免跨屏 clip 被 AppKit 单屏约束移动。Quartz 顶左坐标到 AppKit 底左坐标仍以主屏高度转换，CALayer 使用该虚拟矩形的局部坐标；窗口、字体和图层继续复用，不增加逐帧全屏分配。当前 Windows 环境只能交叉检查；不同相对位置、Retina/非 Retina 和独立 Spaces 的真实双屏效果仍需 Mac 验证。

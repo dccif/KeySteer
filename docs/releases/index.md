@@ -1,5 +1,15 @@
 # 更新日志 / Release Notes
 
+## 0.10.17
+
+- 临时模式现在优先匹配完整组合键，并支持 `temporary_mode_passthrough_keys` 让指定按键交给当前模式处理，减少临时层快捷键冲突。
+- Quick Switch 的触发键会先立即执行原有绑定，只有持续按住达到 `hold_ms` 才显示切换面板，不再拖慢普通按键响应。
+- 修复 macOS 多屏覆盖层定位，跨屏显示时面板和窗口标识不再被错误限制到单个屏幕。
+
+- Temporary modes now resolve full chords first and support `temporary_mode_passthrough_keys` so selected keys can fall through to the active mode, reducing shortcut conflicts.
+- Quick Switch triggers now execute their original binding immediately and show the switcher only after being held for `hold_ms`, keeping normal key response fast.
+- Fixed macOS multi-display overlay positioning so panels and window indicators are no longer incorrectly constrained to a single screen.
+
 ## 0.10.16
 
 - 优化相交窗口切换（`window_overlap_next` / `window_overlap_previous`），减少重复计算。
