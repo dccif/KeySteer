@@ -1742,7 +1742,29 @@ impl Engine {
         // A produced character is already the result of the OS layout. Its
         // producer modifiers are not part of a literal character binding.
         // Keep the real input.key for disposition and held-action release.
-        self.lookup_for_pressed(symbol, std::slice::from_ref(symbol))
+        let mut literal: SmallVec<[Key; 8]> = self
+            .input
+            .pressed
+            .iter()
+            .filter(|key| {
+                self.registry
+                    .temporary_chords(&self.registry.active)
+                    .is_some_and(|chords| {
+                        chords.iter().any(|entry| {
+                            self.temporary_chord_armed(&entry.chord)
+                                && entry.chord.matches_pressed(&self.input.pressed)
+                                && entry
+                                    .chord
+                                    .keys()
+                                    .iter()
+                                    .any(|configured| Self::keys_match(configured, key))
+                        })
+                    })
+            })
+            .cloned()
+            .collect();
+        literal.push(symbol.clone());
+        self.lookup_for_pressed(symbol, &literal)
     }
 
     fn binding_available(&self, mode: &ModeId, binding: &Binding) -> bool {
@@ -1840,7 +1862,9 @@ impl Engine {
             // the temporary layer wins unless this input explicitly passes through.
             for (keys, exact) in [(pressed, true), (remaining.as_slice(), false)] {
                 for (temporary, source) in [(true, owner), (false, active)] {
-                    if passthrough && temporary {
+                    // Window borrows the temporary mode with activation keys
+                    // consumed; its own explicit full chords remain available.
+                    if temporary && (passthrough || exact && active.is_window()) {
                         continue;
                     }
                     if let Some(resolved) = self.lookup_layer_reference::<HELP>(
@@ -1911,7 +1935,7 @@ impl Engine {
     }
 
     /// Resolve a layer including inheritance, retaining `none` as a terminal match.
-    fn lookup_layer_reference<const HELP: bool>(
+    pub(super) fn lookup_layer_reference<const HELP: bool>(
         &self,
         active: &ModeId,
         owner: &ModeId,

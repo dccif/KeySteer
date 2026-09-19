@@ -9,6 +9,8 @@ use std::collections::BTreeSet;
 pub(super) struct QuickSwitcher {
     pub(super) pending: Option<Pending>,
     captured: BTreeSet<Key>,
+    // Survives panel selection/cancellation until the physical trigger is released.
+    blocked_trigger: Option<Key>,
 }
 pub(super) struct Pending {
     owner: ModeId,
@@ -27,6 +29,7 @@ impl Engine {
         self.quick_switch.pending = None;
         if capture_lost {
             self.quick_switch.captured.clear();
+            self.quick_switch.blocked_trigger = None;
         }
     }
     pub(super) fn quick_switch_key(
@@ -41,8 +44,12 @@ impl Engine {
             self.quick_switch.pending = None;
         }
         // The trigger belongs to normal input routing on both edges, even if
-        // its immediate action switches modes. Only panel choices are captured.
+        // its immediate action switches modes. After takeover, only repeated
+        // Downs are blocked; the original gesture must still receive its Up.
         if input.state == KeyState::Up {
+            if self.quick_switch.blocked_trigger.as_ref() == Some(&input.key) {
+                self.quick_switch.blocked_trigger = None;
+            }
             if self
                 .quick_switch
                 .pending
@@ -65,6 +72,14 @@ impl Engine {
         }
         if input.state != KeyState::Down {
             return Ok(false);
+        }
+        let hold_elapsed = self.quick_switch.pending.as_ref().is_some_and(|pending| {
+            !pending.used && pending.input.key == input.key && Instant::now() >= pending.deadline
+        });
+        if self.quick_switch.blocked_trigger.as_ref() == Some(&input.key) || hold_elapsed {
+            self.quick_switch.blocked_trigger = Some(input.key.clone());
+            self.dispose_input(input, KeyOutcome::Consumed, false, backend)?;
+            return Ok(true);
         }
         if self.quick_switch.captured.contains(&input.key) {
             self.dispose_input(input, KeyOutcome::Consumed, false, backend)?;
@@ -173,6 +188,7 @@ impl Engine {
         let Some(pending) = &mut self.quick_switch.pending else {
             return Ok(());
         };
+        self.quick_switch.blocked_trigger = Some(pending.input.key.clone());
         if pending.visible {
             return Ok(());
         }

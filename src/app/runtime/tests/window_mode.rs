@@ -1612,8 +1612,6 @@ fn window_targeting_uses_real_grid_lifecycle_and_keeps_window_session() {
     use crate::api::window::{WindowOperation as O, WindowChange, WindowId};
     for (recursive, temporary) in [(false, false), (false, true), (true, true)] {
         let mut config = Config::default();
-        // Give recursive targeting an unambiguous full chord under the new priority.
-        config.normal.bindings.insert(format!("{}+f", config.resolved_key_aliases()["primary"]), Binding::Mode(ModeId::recursive_grid()));
         config.grid.cursor_follow_selection = true;
         config.grid.lifecycle.after_finish = crate::api::LifecycleAction::Keep;
         config.recursive_grid.cursor_follow_selection = true;
@@ -1769,7 +1767,7 @@ fn window_targeting_help_shows_temporary_entrances_without_holding_modifier() {
     enter_window(&mut engine, &mut backend, &log);
     let entries = engine.key_help_entries();
     for (key, mode) in [("g".to_owned(), "grid"), (format!("{primary}+g"), "grid"),
-        (format!("{primary}+f"), "ui_hint")] {
+        (format!("{primary}+f"), "recursive_grid")] {
         let chord = KeyChord::parse(&key).unwrap().canonical();
         assert!(entries.contains(&format!("{chord}  ·  {mode}")), "{entries:?}");
     }
@@ -1777,7 +1775,8 @@ fn window_targeting_help_shows_temporary_entrances_without_holding_modifier() {
     let log = log.lock().unwrap();
     let scene = log.scenes.last().unwrap();
     assert!(scene.labels.iter().any(|label| label.text == "OTHER ACTIONS"));
-    assert!(!entries.iter().any(|entry| entry.ends_with(" ·  recursive_grid")));
+    assert!(entries.iter().any(|entry| entry.ends_with(" ·  recursive_grid")));
+    assert!(!entries.iter().any(|entry| entry.contains("send ") || entry.contains("move_window ") || entry.ends_with(" ·  ui_hint")));
     assert!(scene.labels.iter().any(|label| label.text == "Exit → Idle"));
 }
 
@@ -1820,4 +1819,68 @@ fn window_help_is_precompiled_before_entry_and_reused_across_move_resize_and_ree
         engine.activate(ModeId::idle(), Some(ModeId::window()), &mut backend).unwrap();
     }
     assert_eq!(engine.registry.table_rebuild_count, rebuilds);
+}
+
+#[test]
+fn window_temporary_normal_screen_binding_beats_size_and_keeps_session() {
+    for literal in [false, true] {
+        let mut config = Config::default();
+        config
+            .normal
+            .bindings
+            .insert("s".into(), Binding::parse("screen next").unwrap());
+        let (mut engine, mut backend, log) = window_test_engine(&config);
+        let session = enter_window(&mut engine, &mut backend, &log).session;
+        engine.screens.push(Screen {
+            bounds: Rect::new(1000.0, 0.0, 1000.0, 800.0),
+            work_area: Rect::new(1000.0, 0.0, 1000.0, 800.0),
+            is_primary: false,
+            scale: 1.0,
+            name: None,
+        });
+        log.lock().unwrap().warps.clear();
+        let primary = config.resolved_key_aliases()["primary"].clone();
+        engine
+            .handle_backend_event(key_down(&primary), &mut backend)
+            .unwrap();
+        assert_eq!(engine.display_mode(), ModeId::normal());
+        let event = if literal {
+            character_down("x", 's')
+        } else {
+            key_down("s")
+        };
+        engine.handle_backend_event(event, &mut backend).unwrap();
+        assert_eq!(engine.active_mode(), &ModeId::window());
+        assert!(
+            engine.cursor.x >= 1000.0,
+            "literal={literal}: temporary S must switch screens, cursor={:?}",
+            engine.cursor
+        );
+        assert!(!log.lock().unwrap().warps.is_empty());
+        for event in [key_up(if literal { "x" } else { "s" }), key_up(&primary)] {
+            engine.handle_backend_event(event, &mut backend).unwrap();
+        }
+        assert_eq!(engine.display_mode(), ModeId::window());
+        assert!(
+            !log.lock()
+                .unwrap()
+                .cancelled_window_sessions
+                .contains(&session)
+        );
+        engine
+            .handle_backend_event(key_down("s"), &mut backend)
+            .unwrap();
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .scenes
+                .last()
+                .unwrap()
+                .indicator
+                .as_ref()
+                .unwrap()
+                .text,
+            "Window Resize"
+        );
+    }
 }

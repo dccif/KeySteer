@@ -199,7 +199,7 @@ Engine 为每个 Mode 编译有效 keymap：
 Normal）的绑定，而不销毁当前选择路径。
 解析保留原始和去掉已匹配激活键的两份输入：完整临时层 → 完整当前层 → 去激活键临时层 → 去激活键当前层，各层包含继承链。完整匹配必须覆盖所有按住键，不能让裸键抢占组合键。`none` 终止该绑定查询，UI Hint overlap 键仍保留给标签循环。
 `temporary_mode_passthrough_keys = ["q"]` 在使用临时模式的配置段声明例外，匹配完整或去激活键后的 chord 时跳过临时层；支持别名、左右修饰键和组合键，默认空列表，不依赖动作或目的模式。加载时规范化并编译，不在按键热路径解析字符串。help 和 prefix 使用相同 resolver。
-显式组合键可能改变旧临时层行为，例如默认 Primary+F 现在执行 ui_hint，而不是剥离 Primary 后执行 recursive_grid。
+Window 家族以外，显式组合键可能改变旧临时层行为，例如默认 Primary+F 执行 ui_hint，而不是剥离 Primary 后执行 recursive_grid；Window 的临时借用规则见下文。
 
 DTO 到强类型 Mode `Settings`、enable/disable、继承、temporary keys、app override 和插件
 默认绑定的汇合点统一是 `app/mode_catalog.rs`。`configuration::compile` 只验证 catalog ID
@@ -298,3 +298,5 @@ WindowStyles 编译边界进一步收敛：不再保存原始 WindowCardUi，仅
 持有的修饰键保留其状态，未匹配的组合继续按原规则透传。
 
 `window.card.guide_line_enabled` 与零宽度在 WindowStyles 配置编译时选择宿主提供的 plain／with_guides 渲染入口。关闭时两套主题都不解析／保存引导线样式；运行时样式没有 enabled 字段。重载重新编译入口，Mode 不引用具体 presentation 实现。开启时每种主题只编译一份样式，整张场景共用，不按窗口复制样式条目。
+
+Window 家族的临时层使用已去掉激活键的输入借用目标模式：当前层完整组合键 → 去激活键临时层 → 去激活键当前层；激活键不再同时匹配临时 Normal 的 Primary+组合。因此默认临时 F 进入 Recursive Grid。其他 targeting 模式保留上述四阶段优先级。字符输入保留已激活的临时触发键，其他产生字符的修饰键仍剥离。

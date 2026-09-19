@@ -166,3 +166,7 @@ Window 退出后的跨平台库存回收、macOS 窗口 worker／标签栏局部
 
 
 临时模式完整组合键优先、临时层穿透键与 Quick Switch 无等待输入见 [配置](03-configuration.md) 和 [运行时](02-runtime-and-api.md)；macOS 跨屏覆盖层 frame 保持见 [后端](06-platform-backends.md)。
+
+Window 固定提示隔离临时绑定、临时 F/S 借用及跨屏事件处理见 [配置](03-configuration.md)、[运行时](02-runtime-and-api.md) 和 [覆盖层](07-rendering-and-performance.md)。
+
+Quick Switch 长按接管后的触发键重复隔离、选择/取消后保持到松键及捕获丢失清理见 [运行时](02-runtime-and-api.md)。

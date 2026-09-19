@@ -277,14 +277,28 @@ impl Engine {
                         if matches!(entry.binding.as_ref(), Binding::Disabled) {
                             continue;
                         }
+                        // Fixed help is the Window layer, not a preview of
+                        // every binding reachable through its temporary mode.
                         if self
-                            .lookup_for_help_in(
+                            .lookup_layer_reference::<true>(
+                                id,
                                 id,
                                 entry.chord.activation_key(),
                                 entry.chord.keys(),
+                                true,
+                                &mut smallvec::SmallVec::new(),
                             )
                             .is_some_and(|resolved| {
-                                resolved.owner == *owner && resolved.binding == entry.binding
+                                resolved.owner == *owner
+                                    && resolved.binding == entry.binding
+                                    && self.registry.get(id).is_none_or(|mode| {
+                                        match resolved.binding.as_ref() {
+                                            Binding::Window(action) => {
+                                                mode.window_action_supported(action)
+                                            }
+                                            _ => true,
+                                        }
+                                    })
                             })
                         {
                             entries.insert(format!(

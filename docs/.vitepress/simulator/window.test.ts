@@ -606,7 +606,7 @@ test('temporary input uses full chords first and configurable passthrough', () =
   const resolve = (key: string) => resolveLayeredPhysicalBinding(document, 'window', ['right_alt', key], key, false)?.value
   assert.equal(resolve('s'), 'screen next')
   assert.equal(resolve('q'), 'normal')
-  assert.equal(resolve('x'), 'grid')
+  assert.equal(resolve('x'), 'window_quick')
   delete (document.window.bindings as Record<string, string>)['primary+q']
   assert.equal(resolve('q'), 'idle')
   document.window.temporary_mode_passthrough_keys = ['q']

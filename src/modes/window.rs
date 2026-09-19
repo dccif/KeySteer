@@ -832,6 +832,12 @@ impl WindowSession {
                 self.motion(Some(elapsed.as_secs_f64().min(0.1)), ctx, &mut out);
                 redraw = false;
             }
+            ModeEvent::ScreenRetargeted { screen, .. } => {
+                // Borrowed screen commands move the pointer without replacing
+                // this Window session or changing the target's size/state.
+                out.push(Command::warp_to(screen.bounds.center()));
+                redraw = false;
+            }
             ModeEvent::ScreensChanged(_) => {
                 self.stop_movement(&mut out);
                 if self.edit.is_some() {

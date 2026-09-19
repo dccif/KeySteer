@@ -140,7 +140,7 @@ export function resolveLayeredPhysicalBinding(document: BindingDocument, mode: s
     return keys.some(k => keyMatches(k, key)) && [pressed, remaining].some(input => keys.length === input.length && keys.every(k => input.some(p => keyMatches(k, p))))
   })
   for (const [input, exact] of [[pressed, true], [remaining, false]] as const) {
-    for (const source of passthrough ? [mode] : [String(settings.temporary_mode), mode]) {
+    for (const source of passthrough || exact && (mode === 'window' || mode.startsWith('window_')) ? [mode] : [String(settings.temporary_mode), mode]) {
       const resolved = resolvePhysicalBinding(document, source, input, key, isMac, false, exact)
       if (resolved) return resolved
     }

@@ -101,6 +101,8 @@ fn quick_switch_cancelled_by_capture_loss_can_be_used_again() {
     engine
         .handle_backend_event(key_down("q"), &mut backend)
         .unwrap();
+    engine.quick_switch.pending.as_mut().unwrap().deadline = Instant::now();
+    engine.fire_quick_switch(&mut backend).unwrap();
     engine.cancel_quick_switch(true);
     engine.input.forget_physical_capture();
     engine.activate(ModeId::normal(), None, &mut backend).unwrap();
@@ -221,4 +223,110 @@ fn quick_switch_observes_raw_grid_selection_without_delaying_or_replaying_it() {
             "Up must not repeat selection"
         );
     }
+}
+
+#[test]
+fn quick_switch_blocks_trigger_repeats_after_hold_and_cancel_until_release() {
+    for mode in [ModeId::grid(), ModeId::recursive_grid()] {
+        for trigger in ["q", "a"] {
+            let mut config = Config::default();
+            config.quick_switch.key = trigger.into();
+            config.grid.cursor_follow_selection = true;
+            config.recursive_grid.cursor_follow_selection = true;
+            let mut engine = Engine::from_plan(
+                crate::app::configuration::compile(&config).unwrap(),
+                Appearance::Dark,
+            )
+            .unwrap();
+            let (mut backend, log) = FakeBackend::new(vec![]);
+            engine.start_runtime(&mut backend).unwrap();
+            engine.activate(mode.clone(), None, &mut backend).unwrap();
+            let before = log.lock().unwrap().warps.len();
+            engine
+                .handle_backend_event(key_down(trigger), &mut backend)
+                .unwrap();
+            let selected = log.lock().unwrap().warps.len();
+            assert!(selected > before);
+            let repeat = || {
+                let BackendEvent::Input(mut event) = key_down(trigger) else {
+                    unreachable!()
+                };
+                event.repeat = true;
+                BackendEvent::Input(event)
+            };
+            engine.quick_switch.pending.as_mut().unwrap().deadline = Instant::now();
+            // A repeat may arrive before the scheduler delivers the deadline.
+            engine.handle_backend_event(repeat(), &mut backend).unwrap();
+            assert_eq!(log.lock().unwrap().warps.len(), selected);
+            engine.fire_quick_switch(&mut backend).unwrap();
+            assert!(engine.quick_switch.pending.as_ref().unwrap().visible);
+            for _ in 0..20 {
+                engine.handle_backend_event(repeat(), &mut backend).unwrap();
+            }
+            assert_eq!(engine.active_mode(), &mode);
+            assert_eq!(log.lock().unwrap().warps.len(), selected);
+            for event in [key_down("esc"), key_up("esc")] {
+                engine.handle_backend_event(event, &mut backend).unwrap();
+            }
+            assert!(engine.quick_switch.pending.is_none());
+            for _ in 0..20 {
+                engine.handle_backend_event(repeat(), &mut backend).unwrap();
+            }
+            assert_eq!(log.lock().unwrap().warps.len(), selected);
+            engine
+                .handle_backend_event(key_up(trigger), &mut backend)
+                .unwrap();
+            assert!(engine.input.pressed.is_empty());
+            engine
+                .handle_backend_event(key_down(trigger), &mut backend)
+                .unwrap();
+            assert!(
+                log.lock().unwrap().warps.len() > selected,
+                "fresh Down must work"
+            );
+        }
+    }
+}
+
+#[test]
+fn quick_switch_selection_blocks_held_trigger_in_destination_mode() {
+    let mut engine = Engine::from_plan(
+        crate::app::configuration::compile(&Config::default()).unwrap(),
+        Appearance::Dark,
+    )
+    .unwrap();
+    let mut store = crate::app::preset_store::PresetStore::default();
+    for _ in 0..10 {
+        store.record_mode_entry("grid", 100);
+    }
+    engine.attach_preset_store(Box::new(store));
+    let (mut backend, log) = FakeBackend::new(vec![]);
+    engine.start_runtime(&mut backend).unwrap();
+    engine
+        .activate(ModeId::normal(), None, &mut backend)
+        .unwrap();
+    for event in [key_down("q"), key_down("1"), key_up("1")] {
+        engine.handle_backend_event(event, &mut backend).unwrap();
+    }
+    assert_eq!(engine.active_mode(), &ModeId::grid());
+    let before = log.lock().unwrap().warps.len();
+    for _ in 0..20 {
+        let BackendEvent::Input(mut input) = key_down("q") else {
+            unreachable!()
+        };
+        input.repeat = true;
+        engine
+            .handle_backend_event(BackendEvent::Input(input), &mut backend)
+            .unwrap();
+    }
+    assert_eq!(log.lock().unwrap().warps.len(), before);
+    assert_eq!(engine.active_mode(), &ModeId::grid());
+    engine
+        .handle_backend_event(key_up("q"), &mut backend)
+        .unwrap();
+    assert!(engine.input.pressed.is_empty());
+    engine
+        .handle_backend_event(key_down("q"), &mut backend)
+        .unwrap();
+    assert!(log.lock().unwrap().warps.len() > before);
 }
