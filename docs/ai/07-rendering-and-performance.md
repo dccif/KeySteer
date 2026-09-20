@@ -142,6 +142,8 @@ working set、private bytes、handle 和 thread 数。
 
 ## macOS typed Core Animation
 
+多屏场景由每屏独立 Surface/NSPanel 承载，使用 scene.clip 与屏幕的交集作为局部坐标原点和裁剪边界。各屏使用自己的 backing scale，共享输入场景 Arc 并保留各自图层缓存。移除屏幕或缩小范围时释放对应 surface；位置快路径只更新各屏已有动态图层，不重建静态标签。display link 跟随光标所在 panel，切换 source 保留待消费的 elapsed。
+
 - 覆盖层 `NSPanel` 在创建和每次复用时都重新断言 `ignoresMouseEvents`，点击穿透由
   WindowServer 属性保证，不依赖主线程及时处理 hit-test；图层更新通过禁用隐式动画的
   `CATransaction` 提交，不调用 `displayIfNeeded` 强制同步绘制。

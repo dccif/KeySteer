@@ -1,8 +1,8 @@
 //! AppKit display-synchronised frame delivery for continuous pointer movement.
 //!
 //! macOS 14's `NSView.displayLinkWithTarget:selector:` tracks the display that
-//! contains the view. Moving the cursor layer across screens therefore changes
-//! cadence automatically without querying display IDs or refresh rates. The
+//! contains the view. The backend rebinds it to the cursor's display panel when
+//! the cursor crosses screens, without querying refresh rates. The
 //! callback uses display timestamps and accumulates elapsed time, so a delayed
 //! main-loop turn or a screen transition cannot silently discard travel time.
 
@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use objc2::rc::{Allocated, Retained, autoreleasepool};
 use objc2::runtime::NSObject;
-use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send, sel};
 use objc2_app_kit::NSView;
 use objc2_foundation::{NSDate, NSRunLoop, NSRunLoopCommonModes};
 use objc2_quartz_core::CADisplayLink;
@@ -80,6 +80,7 @@ impl FrameTarget {
 pub struct DisplayFrameClock {
     target: Retained<FrameTarget>,
     link: Option<Retained<CADisplayLink>>,
+    source: Option<Retained<NSView>>,
 }
 
 impl DisplayFrameClock {
@@ -87,6 +88,7 @@ impl DisplayFrameClock {
         Self {
             target: FrameTarget::new(mtm),
             link: None,
+            source: None,
         }
     }
 
@@ -95,10 +97,20 @@ impl DisplayFrameClock {
     }
 
     pub fn start(&mut self, source: &NSView) {
-        if self.is_running() {
+        if self
+            .source
+            .as_deref()
+            .is_some_and(|current| std::ptr::eq(current, source))
+        {
             return;
         }
-        self.target.reset();
+        if let Some(link) = self.link.take() {
+            // Preserve accumulated elapsed time while changing display cadence.
+            link.invalidate();
+        } else {
+            self.target.reset();
+        }
+        self.source = Some(source.retain());
         // SAFETY: `displayFrame:` has the required `(CADisplayLink *)`
         // callback signature, and both target and source stay retained.
         let link =
@@ -118,6 +130,7 @@ impl DisplayFrameClock {
             link.invalidate();
             self.target.reset();
         }
+        self.source = None;
     }
 
     /// Run the main run loop until AppKit delivers a display frame or the

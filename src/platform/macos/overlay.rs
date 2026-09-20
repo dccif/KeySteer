@@ -1,6 +1,6 @@
 //! Typed AppKit/Core Animation overlay renderer.
 //!
-//! The main thread owns an `NSPanel`, `NSView` and a reusable CALayer tree.
+//! The main thread owns a panel and reusable CALayer tree per display.
 //! There are no raw Objective-C object pointers or manual retain/release calls
 //! in this module; `Retained<T>` and Core Foundation retained wrappers encode
 //! every native lifetime.
@@ -36,8 +36,8 @@ use crate::api::overlay::{
 
 const MAX_CACHED_COLORS: usize = 64;
 
-// The overlay is positioned in virtual-desktop coordinates, including frames
-// larger than one display. AppKit must not move it to fit a single screen.
+// Panels use exact display intersections, including negative desktop coordinates.
+// AppKit must not constrain them to the work area (menu bar / Dock).
 define_class!(
     #[unsafe(super(NSPanel))]
     #[thread_kind = MainThreadOnly]
@@ -51,9 +51,120 @@ define_class!(
     }
 );
 
-/// A main-thread-only transparent overlay. Native objects are created lazily,
-/// which keeps unit tests independent of a WindowServer session.
+/// A separate panel on every intersecting display also works when displays have
+/// separate Spaces. A single virtual-desktop panel cannot provide that guarantee.
+#[derive(Default)]
 pub struct Overlay {
+    surfaces: Vec<Surface>,
+    source_point: Option<Point>,
+}
+
+impl Overlay {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn present(&mut self, scene: Arc<OverlayScene>) -> Result<(), String> {
+        autoreleasepool(|_| {
+            let screens = super::screens::list_screens()?;
+            self.present_on_screens(scene, &screens)
+        })
+    }
+
+    fn present_on_screens(
+        &mut self,
+        scene: Arc<OverlayScene>,
+        screens: &[Screen],
+    ) -> Result<(), String> {
+        let areas = display_areas(scene.clip, screens);
+        if areas.is_empty() {
+            self.dismiss()?;
+            return Ok(());
+        }
+        // Retain unchanged panels and their text/shape caches across submissions.
+        for surface in &mut self.surfaces {
+            if !surface.area.is_some_and(|area| areas.contains(&area)) {
+                surface.dismiss()?;
+            }
+        }
+        self.surfaces.retain(|surface| surface.visible);
+        for area in areas {
+            if let Some(surface) = self.surfaces.iter_mut().find(|s| s.area == Some(area)) {
+                surface.present_inner(scene.clone(), area)?;
+            } else {
+                let mut surface = Surface::new();
+                surface.present_inner(scene.clone(), area)?;
+                self.surfaces.push(surface);
+            }
+        }
+        self.source_point = scene
+            .cursor_marker
+            .as_ref()
+            .map(|m| m.center)
+            .or_else(|| scene.indicator.as_ref().map(|i| i.position));
+        Ok(())
+    }
+
+    pub fn update_positions(
+        &mut self,
+        cursor: Option<Point>,
+        indicator: Option<Point>,
+    ) -> Result<bool, String> {
+        if self.surfaces.is_empty() {
+            return Ok(false);
+        }
+        for surface in &mut self.surfaces {
+            if !surface.update_positions(cursor, indicator)? {
+                return Ok(false);
+            }
+        }
+        self.source_point = cursor.or(indicator).or(self.source_point);
+        Ok(true)
+    }
+
+    pub fn dismiss(&mut self) -> Result<(), String> {
+        for surface in &mut self.surfaces {
+            surface.dismiss()?;
+        }
+        self.surfaces.clear();
+        self.source_point = None;
+        Ok(())
+    }
+
+    pub fn display_link_source(&self) -> Result<&NSView, String> {
+        self.surfaces
+            .iter()
+            .find(|surface| {
+                self.source_point
+                    .zip(surface.area)
+                    .is_some_and(|(point, area)| area.contains(&point))
+            })
+            .or_else(|| self.surfaces.first())
+            .ok_or("macOS overlay has no display surface")?
+            .display_link_source()
+    }
+
+    #[cfg(test)]
+    pub fn is_visible(&self) -> bool {
+        self.surfaces.iter().any(|surface| surface.visible)
+    }
+}
+
+fn display_areas(clip: Option<Rect>, screens: &[Screen]) -> SmallVec<[Rect; 4]> {
+    screens
+        .iter()
+        .filter_map(|screen| {
+            let area = match clip.filter(|clip| !clip.is_empty()) {
+                Some(clip) => screen.bounds.intersect(&clip)?,
+                None => screen.bounds,
+            };
+            (!area.is_empty()).then_some(area)
+        })
+        .collect()
+}
+
+/// Native objects are created lazily, keeping logic tests independent of AppKit.
+struct Surface {
     scene: Option<Arc<OverlayScene>>,
     area: Option<Rect>,
     visible: bool,
@@ -148,7 +259,7 @@ struct SceneChanges {
     indicator_position: bool,
 }
 
-impl Overlay {
+impl Surface {
     pub fn new() -> Self {
         Self {
             scene: None,
@@ -157,10 +268,6 @@ impl Overlay {
             content: None,
             static_updates: 0,
         }
-    }
-
-    pub fn present(&mut self, scene: Arc<OverlayScene>) -> Result<(), String> {
-        autoreleasepool(|_| self.present_inner(scene))
     }
 
     /// Move existing dynamic layers without rebuilding text, paths or colors.
@@ -218,15 +325,10 @@ impl Overlay {
         Ok(true)
     }
 
-    fn present_inner(&mut self, scene: Arc<OverlayScene>) -> Result<(), String> {
-        if self.visible && self.scene.as_ref() == Some(&scene) {
+    fn present_inner(&mut self, scene: Arc<OverlayScene>, area: Rect) -> Result<(), String> {
+        if self.visible && self.scene.as_ref() == Some(&scene) && self.area == Some(area) {
             return Ok(());
         }
-        let area = match scene.clip {
-            Some(area) if !area.is_empty() => area,
-            _ if cfg!(test) => Rect::new(0.0, 0.0, 1920.0, 1080.0),
-            _ => render_area()?,
-        };
         let mut changes = scene_changes(self.scene.as_deref(), scene.as_ref());
         let area_changed = self.area != Some(area);
         changes.static_content |= area_changed;
@@ -343,6 +445,7 @@ impl Overlay {
         let root_view = NSView::initWithFrame(NSView::alloc(mtm), view_frame);
         let root_layer = CALayer::new();
         root_layer.setFrame(view_frame);
+        root_layer.setMasksToBounds(true);
         root_view.setWantsLayer(true);
         root_view.setLayer(Some(&root_layer));
 
@@ -391,7 +494,7 @@ impl Overlay {
     }
 }
 
-impl Default for Overlay {
+impl Default for Surface {
     fn default() -> Self {
         Self::new()
     }
@@ -1247,26 +1350,22 @@ fn indicator_layout(indicator: &Indicator) -> (f64, f64, Rect, Option<Rect>) {
     (width, height, main, held)
 }
 
-fn render_area() -> Result<Rect, String> {
-    let screens = super::screens::list_screens()?;
-    let area = Screen::virtual_bounds(&screens);
-    (!area.is_empty())
-        .then_some(area)
-        .ok_or_else(|| "macOS reports no usable display for overlay rendering".into())
-}
-
 /// Convert top-left virtual desktop coordinates into AppKit's bottom-left
 /// global window coordinates.
 fn cocoa_frame(area: Rect) -> Result<NSRect, String> {
     let screens = super::screens::list_screens()?;
     let primary = Screen::primary(&screens)
         .ok_or_else(|| "macOS reports no primary display for overlay rendering".to_string())?;
-    Ok(rect(
+    Ok(cocoa_frame_at(area, primary.bounds.bottom()))
+}
+
+fn cocoa_frame_at(area: Rect, primary_bottom: f64) -> NSRect {
+    rect(
         area.x,
-        primary.bounds.bottom() - area.bottom(),
+        primary_bottom - area.bottom(),
         area.width,
         area.height,
-    ))
+    )
 }
 
 fn to_window_rect(value: Rect, area: Rect) -> NSRect {
@@ -1293,15 +1392,108 @@ fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
 mod tests {
     use super::*;
 
+    fn displays() -> [Screen; 3] {
+        [
+            (Rect::new(0.0, 0.0, 1512.0, 982.0), 2.0),
+            (Rect::new(-1920.0, -200.0, 1920.0, 1080.0), 1.0),
+            (Rect::new(200.0, -1200.0, 1920.0, 1080.0), 1.5),
+        ]
+        .map(|(bounds, scale)| Screen {
+            bounds,
+            work_area: bounds,
+            scale,
+            is_primary: bounds.x == 0.0,
+            name: None,
+        })
+    }
+
+    #[test]
+    fn all_displays_have_separate_local_origins_without_retina_coordinate_scaling() {
+        let screens = displays();
+        let areas = display_areas(Some(Screen::virtual_bounds(&screens)), &screens);
+        assert_eq!(
+            areas.as_slice(),
+            screens.each_ref().map(|screen| screen.bounds)
+        );
+        for (area, screen) in areas.iter().zip(&screens) {
+            let global = Rect::new(screen.bounds.x + 100.0, screen.bounds.y + 80.0, 90.0, 30.0);
+            let local = to_window_rect(global, *area);
+            assert_eq!(local.origin.x, 100.0);
+            assert_eq!(local.origin.y, area.height - 110.0);
+            assert_eq!(local.size.width, 90.0);
+            // Converting the local label back through the panel's global frame
+            // must recover the original window, for every display arrangement.
+            let frame = cocoa_frame_at(*area, screens[0].bounds.bottom());
+            assert_eq!(frame.origin.x + local.origin.x, global.x);
+            assert_eq!(
+                screens[0].bounds.bottom() - frame.origin.y - local.origin.y - local.size.height,
+                global.y
+            );
+        }
+    }
+
+    #[test]
+    fn display_panels_follow_all_current_and_unplug_without_rebuilding_retained_content() {
+        let screens = displays();
+        let mut scene = OverlayScene::new();
+        scene.clip = Some(Screen::virtual_bounds(&screens));
+        let mut overlay = Overlay::new();
+        overlay
+            .present_on_screens(Arc::new(scene.clone()), &screens)
+            .unwrap();
+        assert!(overlay.is_visible());
+        assert_eq!(overlay.surfaces.len(), 3);
+        overlay
+            .present_on_screens(Arc::new(scene.clone()), &screens)
+            .unwrap();
+        assert!(
+            overlay
+                .surfaces
+                .iter()
+                .all(|surface| surface.static_updates == 1)
+        );
+        // Same scene after unplugging a display still removes its native panel.
+        overlay
+            .present_on_screens(Arc::new(scene.clone()), &screens[..2])
+            .unwrap();
+        assert_eq!(overlay.surfaces.len(), 2);
+        scene.clip = Some(screens[1].bounds);
+        overlay
+            .present_on_screens(Arc::new(scene), &screens)
+            .unwrap();
+        assert_eq!(overlay.surfaces.len(), 1);
+        assert_eq!(overlay.surfaces[0].area, Some(screens[1].bounds));
+        overlay.dismiss().unwrap();
+        assert!(!overlay.is_visible());
+        assert!(overlay.surfaces.is_empty());
+    }
+
+    #[test]
+    fn clipped_scene_uses_only_each_display_intersection() {
+        let screens = displays();
+        assert_eq!(display_areas(None, &screens).len(), 3);
+        let clip = Rect::new(-100.0, 100.0, 200.0, 100.0);
+        assert_eq!(
+            display_areas(Some(clip), &screens).as_slice(),
+            [
+                Rect::new(0.0, 100.0, 100.0, 100.0),
+                Rect::new(-100.0, 100.0, 100.0, 100.0),
+            ]
+        );
+        assert!(display_areas(Some(Rect::new(8000.0, 8000.0, 100.0, 100.0)), &screens).is_empty());
+    }
+
     fn scene() -> Arc<OverlayScene> {
         Arc::new(OverlayScene::new())
     }
 
     #[test]
     fn tracks_visibility_across_present_and_dismiss() {
-        let mut overlay = Overlay::new();
+        let mut overlay = Surface::new();
         assert!(!overlay.is_visible());
-        overlay.present(scene()).unwrap();
+        overlay
+            .present_inner(scene(), Rect::new(0.0, 0.0, 1920.0, 1080.0))
+            .unwrap();
         assert!(overlay.is_visible());
         overlay.dismiss().unwrap();
         assert!(!overlay.is_visible());
@@ -1342,7 +1534,7 @@ mod tests {
 
     #[test]
     fn pointer_only_changes_do_not_rebuild_static_layers() {
-        let mut overlay = Overlay::new();
+        let mut overlay = Surface::new();
         let mut first = OverlayScene::new();
         first.shapes.push(OverlayShape::fill(
             Rect::new(0.0, 0.0, 100.0, 100.0),
@@ -1357,8 +1549,12 @@ mod tests {
         });
         let mut second = first.clone();
         second.cursor_marker.as_mut().unwrap().center = Point::new(30.0, 40.0);
-        overlay.present(Arc::new(first)).unwrap();
-        overlay.present(Arc::new(second)).unwrap();
+        overlay
+            .present_inner(Arc::new(first), Rect::new(0.0, 0.0, 1920.0, 1080.0))
+            .unwrap();
+        overlay
+            .present_inner(Arc::new(second), Rect::new(0.0, 0.0, 1920.0, 1080.0))
+            .unwrap();
         assert_eq!(overlay.static_updates, 1);
     }
 

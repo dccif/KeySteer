@@ -251,7 +251,7 @@ item、window 和 display link 都有线程亲和性。
   与静态 `NSString` 直接比较。
 - `ui_scan.rs` 有一个持久扫描 worker；Hybrid 内部只在本次 job scope 并发 AX。
 - worker/menu event 通过 hook queue 或 channel 发送，并显式唤醒主 run loop。
-- frame clock 绑定 overlay cursor view，跨屏后 AppKit 自动跟踪目标显示器 cadence。
+- frame clock 绑定光标所在屏幕的 overlay view；跨屏或 panel 更换时重新绑定并保留累计 elapsed，dismiss 停止旧 link。
 - 高频 Pointer 位置使用原子 seqlock latest-point mailbox；队列忙时只覆盖旧位置，按键和
   capture-loss 仍走各自可靠路径，因此 EventTap callback 不再竞争 `Mutex<Point>`。
 - EventTap 还把当前物理 Shift/Ctrl/Option/Command 压缩为一个 `AtomicU8`；只有 Backend 已持有
@@ -464,4 +464,4 @@ is retained for explicit size_cycle bindings. Modes send API requests only.
 共享 window_session 执行 WindowChange::MoveTo：使用绝对屏幕坐标，将窗口中心放到目标点并约束到目标屏幕 work_area，保持尺寸，不乘源屏 DPI，不返回 pointer。连续绝对请求在同 session/target/group 内只保留最新位置，一轮定位共用撤销组；Windows/macOS 继续使用各自 NativeAccess::set_frame。
 
 
-macOS Overlay 使用保留的 OverlayPanel 子类，`constrainFrameRect:toScreen:` 返回虚拟桌面原始 frame，创建后重新设置 frame，避免跨屏 clip 被 AppKit 单屏约束移动。Quartz 顶左坐标到 AppKit 底左坐标仍以主屏高度转换，CALayer 使用该虚拟矩形的局部坐标；窗口、字体和图层继续复用，不增加逐帧全屏分配。当前 Windows 环境只能交叉检查；不同相对位置、Retina/非 Retina 和独立 Spaces 的真实双屏效果仍需 Mac 验证。
+macOS Overlay 按 scene.clip 与每块屏幕 bounds 的交集维护独立 OverlayPanel/Surface，不能用单个虚拟桌面大窗口承载多屏标记（独立 Spaces 下尤其如此）。每个 panel 的 AppKit frame 以主屏高度转换，CALayer 以自己的交集矩形为原点并在 root layer 裁剪，backing scale 仅用于本屏栅格化。相同交集复用窗口、字体和图层；范围缩小、拔屏和 dismiss 释放不再使用的 panel。OverlayPanel 的 constrainFrameRect 保留精确 frame，防止菜单栏/Dock 工作区约束移动。场景共享 Arc，不增加逐帧全屏分配。Windows 交叉检查不能代替真实多屏验收。

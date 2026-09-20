@@ -170,3 +170,5 @@ Window 退出后的跨平台库存回收、macOS 窗口 worker／标签栏局部
 Window 固定提示隔离临时绑定、临时 F/S 借用及跨屏事件处理见 [配置](03-configuration.md)、[运行时](02-runtime-and-api.md) 和 [覆盖层](07-rendering-and-performance.md)。
 
 Quick Switch 长按接管后的触发键重复隔离、选择/取消后保持到松键及捕获丢失清理见 [运行时](02-runtime-and-api.md)。
+
+macOS Window 全屏幕标记的逐屏 Panel、独立坐标与裁剪、混合 Retina 及帧时钟换源见 [原生后端](06-platform-backends.md)、[渲染](07-rendering-and-performance.md) 和 [验证](08-build-docs-and-tests.md)。

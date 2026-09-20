@@ -585,6 +585,13 @@ impl Backend for MacOsBackend {
 
     fn present(&mut self, scene: Arc<OverlayScene>) -> Result<(), String> {
         self.overlay.present(scene)?;
+        if self.frame_clock.is_running() {
+            if let Ok(source) = self.overlay.display_link_source() {
+                self.frame_clock.start(source);
+            } else {
+                self.frame_clock.stop();
+            }
+        }
         crate::support::perf_probe::mark("native_presented");
         Ok(())
     }
@@ -596,12 +603,16 @@ impl Backend for MacOsBackend {
     ) -> Result<bool, String> {
         let updated = self.overlay.update_positions(cursor, indicator)?;
         if updated {
+            if self.frame_clock.is_running() {
+                self.frame_clock.start(self.overlay.display_link_source()?);
+            }
             crate::support::perf_probe::mark("native_presented");
         }
         Ok(updated)
     }
 
     fn dismiss(&mut self) -> Result<(), String> {
+        self.frame_clock.stop();
         self.overlay.dismiss()
     }
 

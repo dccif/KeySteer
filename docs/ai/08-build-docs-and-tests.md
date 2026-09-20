@@ -411,3 +411,5 @@ runtime 的 window_targeting 测试覆盖无修饰和临时 Normal 入口、冲�
 
 
 临时层回归覆盖完整层冲突、当前完整组合键优先于临时裸键、去激活键后的临时优先、`none`、穿透键和别名导出往返；网页模拟器同步同一顺序。Quick Switch 覆盖原动作即时执行、原始 Grid/Recursive Grid 选择、重复发送、松开无补发、即时进入 Idle 后长按面板、数字边沿配对与捕获丢失恢复。macOS Overlay 交叉编译不替代实机多屏验证：内屏/外屏分别为主屏，左右/上下/负坐标排列，混合 Retina 比例，`screens=current/all` 切换及逐屏编号、应用名、标题与原窗口对齐。
+
+macOS overlay 回归 ll_displays_have_separate_local_origins_without_retina_coordinate_scaling、display_panels_follow_all_current_and_unplug_without_rebuilding_retained_content、clipped_scene_uses_only_each_display_intersection 验证逐屏原点、负坐标/上下屏、Retina 不影响逻辑坐标、all/current 切换、拔屏和图层缓存复用。这些测试在 macOS target 下执行；Windows 只交叉编译。实机需开启 Displays have separate Spaces，内外屏分别放置窗口，在两块屏幕分别进入 Window，核对所有编号/标题和窗口对应；切换 current/all，交换主屏、上下/左右排列及混合 Retina，再检查跨屏光标移动。
