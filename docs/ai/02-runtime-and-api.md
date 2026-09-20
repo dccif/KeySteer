@@ -360,3 +360,5 @@ Engine 直接执行 `Command::CycleWindow`，经 `Backend::request_window` 提�
 成功结果 `WindowCycleCompleted` 只带中心点，复用标准 warp 路径同步权威鼠标位置；失败仅记录错误。
 
 Window Session 处理 ScreenRetargeted 时仅通过 Command::warp_to 移动指针到目标屏幕中心，不结束窗口会话、不切换 Move/Resize、不改动所选窗口几何；临时 Normal 的 screen next/previous/编号动作因此可正常执行。
+
+Quick Switch 松开触发键时先清理候选并走普通 Up 路由回复 native disposition，handle_key 完成后才收起面板；禁止在同步 macOS EventTap 等待期间提前重绘。debug.enabled + debug.keys 输出 quick-switch 的 arm 条件（配置/排除/备注/held）、取消来源和 takeover，用于区分未计时与原生显示失败。

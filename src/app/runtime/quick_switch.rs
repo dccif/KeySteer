@@ -57,7 +57,8 @@ impl Engine {
                 .is_some_and(|p| p.input.key == input.key)
             {
                 self.quick_switch.pending = None;
-                self.refresh_overlay(backend)?;
+                // handle_key refreshes after normal routing acknowledges Up.
+                // AppKit drawing must not delay the synchronous event tap.
             }
             if self.quick_switch.captured.remove(&input.key) {
                 self.input.pressed.remove(&input.key);
@@ -94,6 +95,17 @@ impl Engine {
             && !input.repeat
             && input.key == self.settings.quick_switch.key
             && self.input.pressed.is_empty();
+        if input.key == self.settings.quick_switch.key && !input.repeat {
+            self.trace_lazy(self.settings.debug.keys, "quick-switch", || {
+                format!(
+                    "trigger={} arm={starts} mode={} enabled={} configured={} excluded={} prompt={} pending={} held={:?}",
+                    input.key, self.registry.active, self.enabled,
+                    self.settings.quick_switch.enabled, self.is_excluded_app(),
+                    self.window_presets.pending.is_some(), self.quick_switch.pending.is_some(),
+                    self.input.pressed.iter().map(Key::as_str).collect::<Vec<_>>()
+                )
+            });
+        }
         if starts {
             self.quick_switch.pending = Some(Pending {
                 owner: self.registry.active.clone(),
@@ -158,6 +170,19 @@ impl Engine {
             }
             return Ok(true);
         }
+        if self
+            .quick_switch
+            .pending
+            .as_ref()
+            .is_some_and(|p| !p.visible && !p.used)
+        {
+            self.trace_lazy(self.settings.debug.keys, "quick-switch", || {
+                format!(
+                    "hold cancelled by key={} repeat={}",
+                    input.key, input.repeat
+                )
+            });
+        }
         if let Some(pending) = &mut self.quick_switch.pending {
             if pending.visible {
                 let cancel = input.key.as_str() == "esc";
@@ -185,6 +210,9 @@ impl Engine {
     }
 
     fn open_quick_switch(&mut self, backend: &mut dyn Backend, show: bool) -> Result<(), String> {
+        self.trace_lazy(self.settings.debug.keys, "quick-switch", || {
+            format!("takeover show={show} mode={}", self.registry.active)
+        });
         let Some(pending) = &mut self.quick_switch.pending else {
             return Ok(());
         };

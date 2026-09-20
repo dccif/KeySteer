@@ -1,4 +1,33 @@
 #[test]
+fn quick_switch_release_acknowledges_before_redrawing_grid() {
+    for mode in [ModeId::grid(), ModeId::recursive_grid()] {
+        let mut engine = Engine::from_plan(
+            crate::app::configuration::compile(&Config::default()).unwrap(),
+            Appearance::Dark,
+        )
+        .unwrap();
+        let (mut backend, log) = FakeBackend::new(vec![]);
+        engine.start_runtime(&mut backend).unwrap();
+        engine.activate(mode, None, &mut backend).unwrap();
+        engine
+            .handle_backend_event(key_down("q"), &mut backend)
+            .unwrap();
+        engine.quick_switch.pending.as_mut().unwrap().deadline = Instant::now();
+        engine.fire_quick_switch(&mut backend).unwrap();
+        assert!(engine.quick_switch.pending.as_ref().unwrap().visible);
+        log.lock().unwrap().timeline.clear();
+        engine
+            .handle_backend_event(key_up("q"), &mut backend)
+            .unwrap();
+        let log = log.lock().unwrap();
+        assert_eq!(log.timeline.first(), Some(&"dispose"));
+        assert!(log.timeline.contains(&"present"));
+        assert!(engine.quick_switch.pending.is_none());
+        assert!(engine.input.pressed.is_empty());
+    }
+}
+
+#[test]
 fn quick_switch_freezes_ranking_and_consumes_both_chord_edges() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let mut engine = engine_with_probes(&seen, &["grid", "scroll", "plugin:screen-selector", "plugin:window-mover"]);

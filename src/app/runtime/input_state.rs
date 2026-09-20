@@ -529,17 +529,28 @@ impl Engine {
         input: crate::api::input::InputEvent,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
+        let switch_was_visible = self
+            .quick_switch
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.visible);
         // Window's help is always visible, independently of the optional `?`
         // panel. Its effective bindings must also refresh on key releases.
         if !self.overlay.key_help_visible && !self.registry.active.is_window() {
-            return self.handle_key_inner(input, backend);
+            self.handle_key_inner(input, backend)?;
+            if switch_was_visible && self.quick_switch.pending.is_none() {
+                self.refresh_overlay(backend)?;
+            }
+            return Ok(());
         }
         let refresh = !input.injected && !input.repeat;
         if refresh {
             self.overlay.key_help_cache = None;
         }
         self.handle_key_inner(input, backend)?;
-        if refresh && (self.overlay.key_help_visible || self.registry.active.is_window()) {
+        if (refresh && (self.overlay.key_help_visible || self.registry.active.is_window()))
+            || (switch_was_visible && self.quick_switch.pending.is_none())
+        {
             self.refresh_overlay(backend)?;
         }
         Ok(())
