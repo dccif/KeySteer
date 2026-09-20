@@ -357,6 +357,53 @@ fn enter_window(engine: &mut Engine, backend: &mut FakeBackend, log: &Arc<Mutex<
 }
 
 #[test]
+fn window_cross_screen_selection_warp_does_not_move_or_restore_windows() {
+    use crate::api::window::{WindowId, WindowInfo, WindowOperation as O, WindowResult};
+    let mut config = Config::default();
+    config.window.screens = crate::config::WindowScreens::All;
+    let (mut engine, mut backend, log) = window_test_engine(&config);
+    let mut second = engine.screens[0].clone();
+    second.bounds.x += second.bounds.width;
+    second.work_area.x += second.bounds.width;
+    second.is_primary = false;
+    second.scale = 1.5;
+    engine.screens.push(second);
+    enter_window(&mut engine, &mut backend, &log);
+    let windows: Vec<_> = [0, 1].into_iter().map(|screen| WindowInfo {
+        id: WindowId(77 + screen as u64), title: format!("Window {screen}"), app: "browser".into(),
+        bounds: engine.screens[screen].work_area, screen, resizable: true,
+        maximized: true, minimized: false, fullscreen: false,
+    }).collect();
+    engine.dispatch_to(&ModeId::window(), ModeEvent::Timer {
+        id: "window_inventory".into(), elapsed: Duration::from_millis(500),
+    }, &mut backend).unwrap();
+    let request = log.lock().unwrap().window_requests.last().unwrap().clone();
+    engine.handle_backend_event(BackendEvent::WindowResult(Box::new(WindowResult {
+        session: request.session, id: request.id, target: Some(windows[0].clone()),
+        windows: Some(windows.clone()), pointer: None, closed: Vec::new(), changed: 0,
+        skipped: 0, message: None, edit: None, tabs: None,
+    })), &mut backend).unwrap();
+    for (key, index) in [("2", 1), ("1", 0), ("tab", 1), ("tab", 0)] {
+        for event in [key_down(key), key_up(key)] {
+            engine.handle_backend_event(event, &mut backend).unwrap();
+        }
+        let request = log.lock().unwrap().window_requests.last().unwrap().clone();
+        assert!(matches!(request.operation, O::Select(_) | O::Cycle));
+        let count = log.lock().unwrap().window_requests.len();
+        let selected = &windows[index];
+        engine.handle_backend_event(BackendEvent::WindowResult(Box::new(WindowResult {
+            session: request.session, id: request.id, target: Some(selected.clone()),
+            windows: None, pointer: Some(selected.bounds.center()), closed: Vec::new(), changed: 0,
+            skipped: 0, message: None, edit: None, tabs: None,
+        })), &mut backend).unwrap();
+        assert_eq!(engine.cursor, selected.bounds.center());
+        assert_eq!(log.lock().unwrap().window_requests.len(), count,
+            "selection feedback must not generate a geometry request for {key}");
+    }
+    assert!(!log.lock().unwrap().window_requests.iter().any(|r| matches!(r.operation, O::Adjust { .. })));
+}
+
+#[test]
 fn window_all_screen_editor_submits_separate_display_layouts() {
     use crate::api::window::{WindowEditResult, WindowId, WindowInfo, WindowOperation, WindowResult};
     let mut config = Config::default();

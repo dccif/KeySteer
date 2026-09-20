@@ -18,8 +18,11 @@ QuickSwitcher 观察操作模式中单独按下的配置键，默认 Q；首次 
 
 ## 合成指针跨屏通知
 
-MovePointer / WarpPointer 成功更新权威 cursor 后，若 active_bounds 改变，立即向当前模式派发
-PointerMoved，使 UI Hint 重扫新屏幕；不依赖可能被原生 Hook 忽略的合成事件。同屏移动不增加该派发。
+MovePointer / WarpPointer 成功更新权威 cursor 后，若 active_bounds 改变，仅在当前模式订阅
+wants_pointer_events 时派发 PointerMoved，使 UI Hint 重扫新屏幕；与物理指针事件使用相同订阅规则。
+Window 未订阅普通指针事件，数字或 Tab 选窗后的跨屏 warp 不得转化为 MoveTo、还原最大化窗口。
+modal_stack 中的 Window 网格定位仍走单独的显式派发，不受此订阅限制。
+不依赖可能被原生 Hook 忽略的合成事件。同屏移动不增加跨屏派发。
 
 
 WindowRequest 的 scope 统一约束库存、数字选择与循环候选；模式编译为当前屏幕或全部屏幕及 include_minimized。同一会话内，暂时最小化或退出候选范围不删除编号；明确关闭才释放，进入新会话时重建编号，跨 Window 家族切换采用目的模式自身配置；范围变化立即刷新库存。BeginEdit 在全部屏幕范围捕获各屏候选；ApplyLayout.additional_screens 在各屏工作区分别映射归一化矩形，合成一个原生事务，失败整体回滚、退出后一次撤销覆盖全部参与窗口。Quick 仍只操作所选窗口。

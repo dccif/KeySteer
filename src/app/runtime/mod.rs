@@ -633,7 +633,15 @@ impl Engine {
         self.finish_runtime(backend, result)
     }
 
-    /// How long we may block before a timer needs servicing.
+    fn active_wants_pointer_events(&self) -> bool {
+        self.registry
+            .active_slot
+            .filter(|&index| self.registry.id_at(index) == Some(&self.registry.active))
+            .or_else(|| self.registry.index_of(&self.registry.active))
+            .and_then(|index| self.registry.wants_pointer_events_at(index))
+            .unwrap_or(true)
+    }
+
     fn handle_backend_event(
         &mut self,
         event: BackendEvent,
@@ -689,15 +697,7 @@ impl Engine {
                         format!("position=({:.1},{:.1})", p.x, p.y)
                     });
                 }
-                let active_slot = self
-                    .registry
-                    .active_slot
-                    .filter(|&index| self.registry.id_at(index) == Some(&self.registry.active))
-                    .or_else(|| self.registry.index_of(&self.registry.active));
-                if active_slot
-                    .and_then(|index| self.registry.wants_pointer_events_at(index))
-                    .unwrap_or(true)
-                {
+                if self.active_wants_pointer_events() {
                     self.dispatch(ModeEvent::PointerMoved(p), backend)?;
                 }
                 if changed {
@@ -1459,7 +1459,9 @@ impl Engine {
                     if self.registry.modal_stack.contains(&ModeId::window()) {
                         self.dispatch_to(&ModeId::window(), ModeEvent::PointerMoved(to), backend)?;
                     }
-                    if previous_bounds != self.context().active_bounds() {
+                    if previous_bounds != self.context().active_bounds()
+                        && self.active_wants_pointer_events()
+                    {
                         self.dispatch(ModeEvent::PointerMoved(to), backend)?;
                     }
                     self.note_drag_pointer_moved();
@@ -1486,7 +1488,12 @@ impl Engine {
                     if self.registry.modal_stack.contains(&ModeId::window()) {
                         self.dispatch_to(&ModeId::window(), ModeEvent::PointerMoved(to), backend)?;
                     }
-                    if previous_bounds != self.context().active_bounds() {
+                    // Respect the same subscription as physical pointer events.
+                    // Window selection warps must not become MoveTo requests;
+                    // explicit modal targeting is delivered separately above.
+                    if previous_bounds != self.context().active_bounds()
+                        && self.active_wants_pointer_events()
+                    {
                         self.dispatch(ModeEvent::PointerMoved(to), backend)?;
                     }
                     if changed {

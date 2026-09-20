@@ -4,6 +4,8 @@ Window 入口激活鼠标下窗口、可配置关闭动作见 [公共 API](02-ru
 
 # KeySteer 项目手册
 
+Window 跨屏选窗后的鼠标跳转遵守指针事件订阅，避免误触发窗口移动／还原，见 [运行时](02-runtime-and-api.md) 和 [验证](08-build-docs-and-tests.md)。
+
 Windows 隐藏／cloaked owner 的可见顶层回退、子控件命中归一化见 [UI 扫描](05-ui-scanning.md) 和 [原生后端](06-platform-backends.md)。
 
 macOS 缺失／无效 AXWindow 的有界顶层与父链回退、AXSubrole 缺失兼容，以及可跨平台测试的 `common/accessibility_window.rs` 见 [UI 扫描](05-ui-scanning.md) 和 [原生后端](06-platform-backends.md)。

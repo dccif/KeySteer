@@ -12,9 +12,9 @@ use windows::Win32::Foundation::{COLORREF, GetLastError, SetLastError, WIN32_ERR
 use windows::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GWL_STYLE, GetPropW, MINMAXINFO, RemovePropW, SMTO_ABORTIFHUNG, SMTO_BLOCK,
     SW_MINIMIZE, SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SendMessageTimeoutW,
-    SetForegroundWindow, SetPropW, ShowWindowAsync, SwitchToThisWindow, WINDOWPLACEMENT,
-    WM_GETMINMAXINFO, WPF_ASYNCWINDOWPLACEMENT, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_MAXIMIZE, WS_THICKFRAME,
+    SetForegroundWindow, SetPropW, ShowWindowAsync, WINDOWPLACEMENT, WM_GETMINMAXINFO,
+    WPF_ASYNCWINDOWPLACEMENT, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_MAXIMIZE,
+    WS_THICKFRAME,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetLayeredWindowAttributes, LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA,
@@ -932,11 +932,11 @@ impl WindowAccess for Windows {
         if !unsafe { SetForegroundWindow(hwnd) }.as_bool() {
             super::input::unlock_foreground()?;
             let hwnd = self.hwnd(id)?;
+            // SwitchToThisWindow may send SC_RESTORE. Selecting a visible
+            // window must never change its placement or maximized state.
             // SAFETY: the retained identity was revalidated after input injection.
             unsafe {
-                if !SetForegroundWindow(hwnd).as_bool() {
-                    SwitchToThisWindow(hwnd, true);
-                }
+                let _ = SetForegroundWindow(hwnd);
             }
         }
         let deadline = Instant::now() + Duration::from_millis(150);
@@ -1292,6 +1292,60 @@ mod tests {
         assert_eq!(super::super::native::foreground_window(), second.hwnd);
         access.select(first_id).unwrap();
         assert_eq!(super::super::native::foreground_window(), first.hwnd);
+    }
+
+    #[test]
+    #[ignore = "selects disposable maximized windows on the interactive desktop"]
+    fn native_selection_preserves_maximized_window_on_each_display() {
+        use crate::api::window::WindowOperation as O;
+        use crate::platform::common::{WindowGroupsProbe, window_session::WindowSessionProbe};
+        struct RestoreFocus(Windows, Option<WindowId>);
+        impl Drop for RestoreFocus {
+            fn drop(&mut self) {
+                if let Some(id) = self.1 {
+                    let _ = self.0.select(id);
+                }
+            }
+        }
+        let _ = super::super::screens::enable_dpi_awareness();
+        let screens = super::super::screens::list_screens().unwrap();
+        let mut original = Windows::default();
+        let original_id = original
+            .retain(super::super::native::foreground_window(), &screens)
+            .ok()
+            .map(|w| w.id);
+        let _restore = RestoreFocus(original, original_id);
+        for screen in &screens {
+            let first = Probe::create(
+                screens[0].work_area.inset(180.0, 160.0),
+                Default::default(),
+                true,
+            );
+            let second = Probe::create(
+                screen.work_area.inset(200.0, 170.0),
+                Default::default(),
+                true,
+            );
+            let mut access = Windows::default();
+            let first_id = access.retain(first.hwnd, &screens).unwrap().id;
+            let second_id = access.retain(second.hwnd, &screens).unwrap().id;
+            access
+                .toggle_state(second_id, false, &screens, &|| false)
+                .unwrap();
+            let before = access.snapshot(second_id, &screens).unwrap();
+            assert!(before.info.maximized);
+            let mut grouped = WindowGroupsProbe::new(access);
+            let mut session = WindowSessionProbe::new(first_id);
+            for (id, hwnd) in [(first_id, first.hwnd), (second_id, second.hwnd)] {
+                let selected = session.execute(&mut grouped, O::Select(id), &screens);
+                assert_eq!(selected.target.as_ref().map(|w| w.id), Some(id));
+                assert_eq!(super::super::native::foreground_window(), hwnd);
+                let after = grouped.snapshot(second_id, &screens).unwrap();
+                assert!(after.info.maximized);
+                assert_eq!(after.info.bounds, before.info.bounds);
+                assert_eq!(after.restored, before.restored);
+            }
+        }
     }
 
     #[test]

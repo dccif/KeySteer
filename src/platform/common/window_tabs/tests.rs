@@ -32,6 +32,55 @@ fn screens() -> Vec<Screen> {
 }
 
 #[test]
+fn selecting_ungrouped_windows_across_screens_preserves_maximized_and_fullscreen_state() {
+    use crate::api::window::{WindowOperation as O, WindowScope};
+    use crate::platform::common::window_session::WindowSessionProbe;
+    let mut displays = screens();
+    displays.push(Screen {
+        name: Some("External".into()),
+        bounds: Rect::new(-1920.0, -200.0, 1920.0, 1080.0),
+        work_area: Rect::new(-1920.0, -170.0, 1920.0, 1050.0),
+        scale: 2.0,
+        is_primary: false,
+    });
+    for fullscreen in [false, true] {
+        let mut access = setup();
+        access.native.windows.retain(|id, _| id.0 <= 2);
+        access.set_scope(
+            Some(WindowScope {
+                screen: None,
+                include_minimized: false,
+            }),
+            true,
+        );
+        let target = access.native.windows.get_mut(&WindowId(2)).unwrap();
+        target.info.screen = 1;
+        target.info.bounds = if fullscreen {
+            displays[1].bounds
+        } else {
+            displays[1].work_area
+        };
+        target.info.maximized = !fullscreen;
+        target.info.fullscreen = fullscreen;
+        let before = target.clone();
+        let mut session = WindowSessionProbe::new(WindowId(1));
+        for _ in 0..3 {
+            for operation in [O::Select(WindowId(2)), O::Cycle, O::CyclePrevious] {
+                session.execute(&mut access, O::Select(WindowId(1)), &displays);
+                let selected = session.execute(&mut access, operation, &displays);
+                assert_eq!(selected.target.as_ref(), Some(&before.info));
+                assert_eq!(access.native.focus.get(), Some(WindowId(2)));
+                assert_eq!(
+                    access.native.windows[&WindowId(2)].restored,
+                    before.restored
+                );
+                assert_eq!(access.native.writes, 0, "selection must not write geometry");
+            }
+        }
+    }
+}
+
+#[test]
 fn scope_filters_inventory_and_reentry_reclaims_numbers_without_dissolving_groups() {
     use crate::api::window::WindowScope;
     let mut access = setup();
