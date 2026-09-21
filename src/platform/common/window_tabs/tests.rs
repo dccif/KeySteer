@@ -81,6 +81,44 @@ fn selecting_ungrouped_windows_across_screens_preserves_maximized_and_fullscreen
 }
 
 #[test]
+fn all_screen_inventory_numbers_every_window_without_pointer_acquisition() {
+    use crate::api::window::WindowScope;
+    let mut access = setup();
+    let template = access.native.windows[&WindowId(1)].clone();
+    access.native.windows.clear();
+    for id in 1..=300 {
+        let mut window = template.clone();
+        window.info.id = WindowId(id);
+        window.info.screen = id as usize % 2;
+        // Same or missing titles cannot be used as an identity/selection filter.
+        window.info.title.clear();
+        access.native.windows.insert(window.info.id, window);
+    }
+    access.set_scope(
+        Some(WindowScope {
+            screen: None,
+            include_minimized: false,
+        }),
+        true,
+    );
+    let windows = access.enumerate(&screens(), &|| false).unwrap();
+    assert_eq!(windows.len(), 300);
+    assert_eq!(access.groups.state.numbers.len(), 300);
+    assert_eq!(access.native.focus.get(), None);
+    assert_eq!(access.native.writes, 0);
+    access.set_scope(
+        Some(WindowScope {
+            screen: Some(0),
+            include_minimized: false,
+        }),
+        true,
+    );
+    let windows = access.enumerate(&screens(), &|| false).unwrap();
+    assert_eq!(windows.len(), 150);
+    assert!(windows.iter().all(|window| window.screen == 0));
+}
+
+#[test]
 fn scope_filters_inventory_and_reentry_reclaims_numbers_without_dissolving_groups() {
     use crate::api::window::WindowScope;
     let mut access = setup();

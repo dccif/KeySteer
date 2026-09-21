@@ -4,6 +4,7 @@ use crate::api::window::{WindowId, WindowInfo};
 use crate::api::{Point, Screen};
 use crate::platform::common::window_geometry;
 use crate::platform::common::window_session::{Snapshot, WindowAccess};
+use crate::platform::common::window_visibility::{Visible, visible_candidates};
 use core_foundation::base::{CFEqual, CFRetain};
 use core_foundation::boolean::CFBoolean;
 use core_foundation::dictionary::CFDictionary;
@@ -60,56 +61,6 @@ pub(in crate::platform::macos) struct MacWindows {
     hidden: std::collections::BTreeSet<WindowId>,
     monitor: super::window_tabs::Monitor,
     dragging: std::collections::BTreeSet<WindowId>,
-}
-
-pub(super) struct Visible {
-    pub(super) pid: i32,
-    pub(super) bounds: Rect,
-    title: Option<String>,
-    number: Option<isize>,
-}
-
-fn visible_candidates(
-    candidates: &[(Rect, &str)],
-    shown: &Visible,
-    remaining: &[Visible],
-) -> Vec<usize> {
-    let matches: Vec<_> = candidates
-        .iter()
-        .enumerate()
-        .filter(|(_, (bounds, title))| {
-            same_rect(*bounds, shown.bounds)
-                && shown
-                    .title
-                    .as_ref()
-                    .is_none_or(|t| t.is_empty() || t == title)
-        })
-        .map(|(index, _)| index)
-        .collect();
-    if matches.len() <= 1 {
-        return matches;
-    }
-    // Require enough on-screen records that each could describe every AX
-    // candidate. Otherwise an indistinguishable window may be on another Space.
-    let count = remaining
-        .iter()
-        .filter(|record| {
-            record.pid == shown.pid
-                && matches.iter().all(|index| {
-                    let (bounds, title) = candidates[*index];
-                    same_rect(bounds, record.bounds)
-                        && record
-                            .title
-                            .as_ref()
-                            .is_none_or(|t| t.is_empty() || t == title)
-                })
-        })
-        .count();
-    if count == matches.len() {
-        matches
-    } else {
-        Vec::new()
-    }
 }
 
 fn dictionary(value: &CFType) -> Option<CFDictionary<CFString, CFType>> {
@@ -187,9 +138,6 @@ pub(super) fn visible_windows() -> Result<Vec<Visible>, String> {
             title,
             number: number(&keys[8]).and_then(|n| isize::try_from(n).ok()),
         });
-        if result.len() == 256 {
-            break;
-        }
     }
     Ok(result)
 }
@@ -1079,30 +1027,6 @@ impl Drop for MacWindows {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn coincident_windows_are_kept_only_when_the_entire_cohort_is_on_screen() {
-        let bounds = Rect::new(100.0, 100.0, 400.0, 300.0);
-        let candidates = [(bounds, "First"), (bounds, "Second")];
-        let records = [0, 1].map(|number| Visible {
-            pid: 10,
-            bounds,
-            title: None,
-            number: Some(number),
-        });
-        assert_eq!(
-            visible_candidates(&candidates, &records[0], &records),
-            vec![0, 1]
-        );
-        assert!(visible_candidates(&candidates, &records[0], &records[..1]).is_empty());
-        let named = Visible {
-            pid: 10,
-            bounds,
-            title: Some("Second".into()),
-            number: Some(1),
-        };
-        assert_eq!(visible_candidates(&candidates, &named, &records), vec![1]);
-    }
 
     #[test]
     fn constrained_splits_stay_inside_the_target_work_area() {

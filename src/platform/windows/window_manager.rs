@@ -673,18 +673,14 @@ impl WindowAccess for Windows {
             // SAFETY: EnumWindows is synchronous; data points to the live Vec
             // owned by enumerate, and callbacks run serially on this thread.
             let handles = unsafe { &mut *(data.0 as *mut Vec<HWND>) };
-            if handles.len() < 4096 {
-                handles.push(hwnd);
-            }
-            BOOL::from(handles.len() < 4096)
+            handles.push(hwnd);
+            BOOL::from(true)
         }
         let enumeration = super::native::enum_windows(
             Some(collect),
             LPARAM((&mut self.handles as *mut Vec<HWND>) as isize),
         );
-        if self.handles.len() < 4096 {
-            enumeration.map_err(|e| format!("cannot enumerate windows: {e}"))?;
-        }
+        enumeration.map_err(|e| format!("cannot enumerate windows: {e}"))?;
         self.prune_closed();
         let mut windows = Vec::with_capacity(self.windows.len().min(256));
         for index in 0..self.handles.len() {
@@ -694,7 +690,7 @@ impl WindowAccess for Windows {
                 super::window_tabs::NativeTabs::dispatch_messages();
             }
             let hwnd = self.handles[index];
-            if cancelled() || windows.len() >= 256 {
+            if cancelled() {
                 break;
             }
             if eligible(hwnd)

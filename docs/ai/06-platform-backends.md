@@ -62,7 +62,7 @@ Windows 复用枚举缓冲区，property 标记直接查找稳定身份，几何
 
 Window 首次使用时启动 `common/window_session::WindowWorker`，原生 adapter 在线程内部创建和释放；backend 仅提交 API 请求并转发事件。队列上限 64，同一手势的相对位移/尺寸增量合并。查询、批量写入和全屏过渡均检查会话及请求取消水位，不能在 Engine 中等待。取消保留会话历史的操作与结束整个会话分开；shutdown 使用现有有界 WorkerJoin。
 
-Windows adapter 持有 HWND、PID/TID 和独有窗口 property 标记；窗口销毁后即使 HWND 被同进程重用，也不能通过旧 WindowId 操作它。重用已有普通窗口过滤（含 cloaked/minimized/self/tool 排除），按需枚举最多 256 个候选，包含普通被遮挡窗口。placement 的读取/异步提交与旧 `window_mover.rs` 共用；读写区分 DWM 可见矩形、原生 resize border 和 workspace 还原坐标。尺寸下限查询使用 50ms SendMessageTimeout，异步移动只在 worker 中进行有界回读。逻辑步长、速度和布局间距按目标 Screen.scale 换算。
+Windows adapter 持有 HWND、PID/TID 和独有窗口 property 标记；窗口销毁后即使 HWND 被同进程重用，也不能通过旧 WindowId 操作它。重用已有普通窗口过滤（含 cloaked/minimized/self/tool 排除），枚举全部顶层句柄并逐项检查取消，不以 256 个候选或 4096 个句柄截断，包含普通被遮挡窗口。placement 的读取/异步提交与旧 `window_mover.rs` 共用；读写区分 DWM 可见矩形、原生 resize border 和 workspace 还原坐标。尺寸下限查询使用 50ms SendMessageTimeout，异步移动只在 worker 中进行有界回读。逻辑步长、速度和布局间距按目标 Screen.scale 换算。
 
 macOS adapter 保留 AX 元素，以公开 Quartz on-screen 元数据匹配当前 Space 的普通 AXStandardWindow；无法唯一匹配的重叠候选跳过，所有 AX messaging 有有限超时。AXSize 写入后读取实际尺寸再定位中心；普通最大化以工作区尺寸实现并保留还原矩形。原生全屏跨屏复用既有 WindowMove 状态机，在 worker 中轮询并检查取消；其等待不占用主事件循环。
 
@@ -465,3 +465,6 @@ is retained for explicit size_cycle bindings. Modes send API requests only.
 
 
 macOS Overlay 按 scene.clip 与每块屏幕 bounds 的交集维护独立 OverlayPanel/Surface，不能用单个虚拟桌面大窗口承载多屏标记（独立 Spaces 下尤其如此）。每个 panel 的 AppKit frame 以主屏高度转换，CALayer 以自己的交集矩形为原点并在 root layer 裁剪，backing scale 仅用于本屏栅格化。相同交集复用窗口、字体和图层；范围缩小、拔屏和 dismiss 释放不再使用的 panel。OverlayPanel 的 constrainFrameRect 保留精确 frame，防止菜单栏/Dock 工作区约束移动。场景共享 Arc，不增加逐帧全屏分配。Windows 交叉检查不能代替真实多屏验收。
+
+
+macOS AX／Quartz 可见性匹配位于 common/window_visibility.rs，可在两端测试：先按同进程矩形匹配，唯一候选不要求异步标题相等；标题仅用于重叠候选消歧。缺标题或标题不同的重叠集合必须有完整的同进程可见记录，否则仍跳过，避免误选其他 Space。Quartz 不再截断前 256 项。Windows 直接使用 HWND 库存，不引入 AX 元数据匹配；两端继续共用 Grouped 的 WindowScope 过滤和编号。

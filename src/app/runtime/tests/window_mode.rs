@@ -357,6 +357,28 @@ fn enter_window(engine: &mut Engine, backend: &mut FakeBackend, log: &Arc<Mutex<
 }
 
 #[test]
+fn window_temporary_normal_hotkey_enters_normal_once_and_exits_with_one_q() {
+    let config = Config::default();
+    let primary = config.resolved_key_aliases()["primary"].clone();
+    let (mut engine, mut backend, log) = window_test_engine(&config);
+    let session = enter_window(&mut engine, &mut backend, &log).session;
+    engine.handle_backend_event(key_down(&primary), &mut backend).unwrap();
+    assert_eq!(engine.display_mode(), ModeId::normal());
+    engine.handle_backend_event(key_down("e"), &mut backend).unwrap();
+    assert_eq!(engine.active_mode(), &ModeId::normal());
+    assert!(engine.registry.modal_stack.is_empty());
+    for event in [key_up("e"), key_up(&primary)] {
+        engine.handle_backend_event(event, &mut backend).unwrap();
+    }
+    assert_eq!(engine.display_mode(), ModeId::normal());
+    assert!(log.lock().unwrap().cancelled_window_sessions.contains(&session));
+    for event in [key_down("q"), key_up("q")] {
+        engine.handle_backend_event(event, &mut backend).unwrap();
+    }
+    assert_eq!(engine.active_mode(), &ModeId::idle());
+}
+
+#[test]
 fn window_cross_screen_selection_warp_does_not_move_or_restore_windows() {
     use crate::api::window::{WindowId, WindowInfo, WindowOperation as O, WindowResult};
     let mut config = Config::default();

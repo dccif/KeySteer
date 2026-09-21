@@ -418,3 +418,6 @@ macOS overlay 回归 ll_displays_have_separate_local_origins_without_retina_coo
 选窗状态保持：selecting_ungrouped_windows_across_screens_preserves_maximized_and_fullscreen_state 覆盖跨屏未分组窗口的直接选择、正反循环，断言最大化／全屏状态及还原矩形不变、无几何写入。Windows ignored native_selection_preserves_maximized_window_on_each_display 在各可用屏幕创建临时窗口，验证实际前台切换和最大化矩形保持，结束恢复原前台；不能替代第三方浏览器和 Mac 实机验收。
 
 运行时 window_cross_screen_selection_warp_does_not_move_or_restore_windows 覆盖 screens=all、不同缩放的双屏、数字与 Tab 跨屏往返选择，消费真实 WindowResult 后验证鼠标到目标中心且不增加几何请求。该层回归覆盖原生激活测试未包含的 WarpPointer → PointerMoved 路由；window_targeting_* 继续验证 Grid/Recursive Grid 的显式窗口定位不受影响。
+
+
+窗口枚举回归：window_visibility 测试跨屏窗口标题不同／缺失、完整重叠集合和其他进程／Space 歧义；all_screen_inventory_numbers_every_window_without_pointer_acquisition 验证 300 个跨屏窗口无需鼠标命中即可全部编号，current 范围仍正确过滤，且不改变焦点或几何。

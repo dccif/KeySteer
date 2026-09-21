@@ -4,6 +4,9 @@
 #[cfg(any(target_os = "macos", test))]
 pub(crate) mod accessibility_window;
 
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod window_visibility;
+
 pub(crate) mod app_info;
 pub(crate) mod audio_worker;
 pub(crate) mod character_candidates;

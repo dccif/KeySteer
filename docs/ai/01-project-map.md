@@ -146,3 +146,6 @@ macOS：
 ## AX 所属窗口查找
 
 `src/platform/common/accessibility_window.rs`：不依赖原生 API 的有界关系遍历和普通窗口角色规则。macOS 提供保留的 AX 对象、超时和几何校验；可跨平台执行的测试覆盖直接关系缺失／无效、父链回退、循环和遍历预算。
+
+
+窗口可见元数据匹配：src/platform/common/window_visibility.rs 提供可跨平台测试的矩形／标题消歧，macOS AX 与 Quartz 枚举使用；范围与编号仍由 window_tabs 的公共协调层负责。

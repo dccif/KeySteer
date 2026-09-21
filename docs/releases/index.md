@@ -1,5 +1,11 @@
 # 更新日志 / Release Notes
 
+## 0.10.18
+
+- 改进 Windows 和 macOS 的跨屏窗口识别与切换，支持更多窗口并减少多屏、标题变化或鼠标跳转导致的选窗错误和窗口误移动。
+
+- Improved cross-display window detection and switching on Windows and macOS, supporting more windows while reducing wrong selections and unintended window moves caused by multiple displays, title changes, or pointer warps.
+
 ## 0.10.17
 
 - 临时模式现在优先匹配完整组合键，并支持 `temporary_mode_passthrough_keys` 让指定按键交给当前模式处理，减少临时层快捷键冲突。

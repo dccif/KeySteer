@@ -1,5 +1,9 @@
 # Release notes
 
+## 0.10.18
+
+- Improved cross-display window detection and switching on Windows and macOS, supporting more windows while reducing wrong selections and unintended window moves caused by multiple displays, title changes, or pointer warps.
+
 ## 0.10.17
 
 - Temporary modes now resolve full chords first and support `temporary_mode_passthrough_keys` so selected keys can fall through to the active mode, reducing shortcut conflicts.
