@@ -1,11 +1,32 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { fetchLatestRelease, LATEST_RELEASE_URL, parseLatestRelease } from '../latest-release.ts'
+import { fetchLatestRelease, loadLatestRelease, LATEST_RELEASE_URL, parseLatestRelease } from '../latest-release.ts'
 
 const targets = [
   'x86_64-pc-windows-msvc',
   'aarch64-apple-darwin',
 ] as const
+
+test('local preview survives forbidden, offline, timeout and invalid release responses', async (context) => {
+  context.mock.method(console, 'warn', () => {})
+  const request = context.mock.method(globalThis, 'fetch', async () => new Response(null, { status: 403 }))
+  const fallback = { tag: 'Release unavailable · 本地预览', url: LATEST_RELEASE_URL, assets: {} }
+  assert.deepEqual(await loadLatestRelease('serve'), fallback)
+  request.mock.mockImplementation(async () => { throw new TypeError('offline') })
+  assert.deepEqual(await loadLatestRelease('serve'), fallback)
+  request.mock.mockImplementation(async () => { throw new DOMException('timed out', 'TimeoutError') })
+  assert.deepEqual(await loadLatestRelease('serve'), fallback)
+  request.mock.mockImplementation(async () => Response.json({ assets: [] }))
+  assert.deepEqual(await loadLatestRelease('serve'), fallback)
+})
+
+test('production remains strict while development uses fresh metadata when available', async (context) => {
+  const request = context.mock.method(globalThis, 'fetch', async () => new Response(null, { status: 403 }))
+  await assert.rejects(loadLatestRelease('build'), /HTTP 403/)
+  request.mock.mockImplementation(async () => Response.json({ tag_name: 'v9.8.7', assets: [] }))
+  assert.equal((await loadLatestRelease('serve')).tag, 'v9.8.7')
+  assert.equal((await loadLatestRelease('build')).tag, 'v9.8.7')
+})
 
 test('build fetch uses the supplied signal and token and resolves fresh release metadata', async (context) => {
   const signal = new AbortController().signal

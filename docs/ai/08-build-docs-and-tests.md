@@ -206,6 +206,22 @@ GitHub Pages。需要更新线上文档时，在 Actions 页面运行 `Deploy do
 
 ## VitePress 文档与模拟器
 
+配置工作台按鼠标控制、目标定位、窗口管理、全局设置和配置文件分类；分类是展示元数据，不改变独立模式或 TOML 路径。`config-studio/navigation.ts` 维护页面、页签及字段归属，`fields.ts` 维护现有控件和中文搜索标签。搜索结果打开对应页面、页签和折叠区后定位控件；`settings-navigation.test.ts` 检查字段入口覆盖、共享样式归属及搜索。
+
+`ConfigStudio` 持有唯一配置文档及示例工作区，编辑目标与模拟运行模式独立。分类切换只切预览模式，不重建文档；预览快捷键不切换表单。窗口卡片共用字段在 `window_card` 展示页编辑，Editor 位置覆盖仍属于自身外观。复用原有 TOML 读写和模拟逻辑，不新增 Rust runtime API。
+
+工作区在 1200px 起为分类、设置、预览三栏；768–1199px 为两级选择与双栏；手机通过设置／预览切换保留状态。设置与预览分别滚动。预览使用固定逻辑画布和 ResizeObserver 缩放，指针坐标反算到同一逻辑空间。只有预览画布获得焦点时捕获按键，失焦、切页和关闭放大时释放按键；放大预览约束 Tab 焦点并在关闭后恢复原焦点。
+
+桌面工作区可扩展至 2400px；`PaneDivider.tsx` 用 Pointer Capture 调整导航宽度及设置／预览比例，支持方向键、Home/End 和双击恢复。宽度只保存在页面展示状态，不写入 TOML；分栏收窄时设置行按容器宽度重排，手机隐藏分隔条。拖动开始释放模拟器按键状态，预览继续通过同一 ResizeObserver 缩放。
+
+默认进入按键页。映射编辑器提供主键区／完整键盘、动作搜索与分类、当前绑定来源和折叠的高级命令。点击键帽再选动作、先选动作再点键帽、Pointer Capture 拖动动作到键帽都复用 `selectKey`/`setAction`，组合键和字符键保持原绑定语义。动作拖动达到阈值后才开始，松开在键帽外或捕获取消不写配置；浏览动作库时键盘在设置面板内吸顶。浏览器验收需检查点击、拖放、分组别名拆分、继承显示和导出绑定表，不能只检查视觉状态。
+
+完整键盘默认显示，由 `FittedKeyboard` 的 ResizeObserver 根据可用宽度缩放；切换页签销毁观察器，再进入时重新测量。动作库随设置面板统一滚动，不再设置独立最大高度。导入导出、工作区文件和统计页使用同一 utility card 样式及 VitePress 主题颜色，禁止复用固定浅色文字／深色输入背景；文件选择按钮也需保持一致。统计页直接展示内容，无需再展开整页折叠区。
+
+组合键工具栏可切换 Windows／macOS 预览，切换时释放按键状态但不写配置。Primary 标注必须通过现有 `shortcutCaption` 解析当前文档的平台别名（例如发布配置的 Windows Primary 为左 Alt），不能硬编码为 Ctrl／Command。物理键帽使用平台名称与符号，原始键名和 `primary+…` 绑定保持不变。
+
+网页验收覆盖 1440×900、1280×720、1024×768、手机宽度、浅深主题、搜索高级项、焦点恢复、表单输入不触发模拟快捷键及滚动到设置末尾时预览可见。配置兼容性继续由局部 TOML、未知字段、绑定替换和工作区往返测试覆盖。
+
 用户文档以中文根路径和英文 `/en/` 路径并行发布：中文源文件保留在 `docs/`，英文源文件在
 `docs/en/`，不要把 `docs/ai/` 的维护者资料复制到任一面向用户的侧栏。`docs/.vitepress/config.mts`
 在 `locales` 与 `themeConfig.locales` 中维护两种语言的导航、侧栏、搜索、页内目录和上下页文案；
@@ -223,11 +239,11 @@ GitHub Pages。需要更新线上文档时，在 Actions 页面运行 `Deploy do
 - `pnpm docs:build`：同步静态资源后生产构建。
 
 `scripts/sync-doc-assets.mjs` 只复制文档站需要的 default TOML/icon。VitePress 配置在每次
-构建/开发服务器启动时查询 GitHub latest release API（15 秒超时），从 `tag_name`、Release URL
+构建/开发服务器启动时查询 GitHub latest release API（构建 15 秒、开发 3 秒超时），从 `tag_name`、Release URL
 和真实 `browser_download_url` 获取最新正式发布信息，通过 Vite define 同时注入 SSR 和浏览器包。
 DownloadSection 首屏直接包含版本和下载地址，浏览器不再请求版本 API；缺失的平台资产链接到
 本轮 Release 页面，不推测文件名或使用 Cargo 中尚未发布的版本。Pages 构建使用 github.token，
-本地可设置 GITHUB_TOKEN；token 仅用于构建请求，不进入注入数据。API 失败或元数据无效时构建失败，
+本地可设置 GITHUB_TOKEN；token 仅用于请求，不进入注入数据。配置工厂使用 Vite 传入的 `command` 区分 `serve` 和 `build`。开发模式遇到 API 错误、断网、超时或无效元数据时打印警告并继续启动，版本标记为本地预览不可用，下载入口指向 GitHub latest Release 页面，不推测版本或资产名。生产构建遇到上述错误仍失败，
 不发布空版本或过期回退。Pages 仍按 workflow_dispatch 手动部署，每次运行自动解析当时最新正式版，
 无需修改组件或 workflow 中的版本号；后续新 Release 需要重新运行 Pages 才更新已部署静态页面。
 

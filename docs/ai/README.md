@@ -4,6 +4,8 @@ Window 入口激活鼠标下窗口、可配置关闭动作见 [公共 API](02-ru
 
 # KeySteer 项目手册
 
+网页配置分类、字段归属、独立滚动预览与焦点管理见 [构建与文档站](08-build-docs-and-tests.md)，模块入口见 [项目地图](01-project-map.md)。
+
 Window 跨屏选窗后的鼠标跳转遵守指针事件订阅，避免误触发窗口移动／还原，见 [运行时](02-runtime-and-api.md) 和 [验证](08-build-docs-and-tests.md)。
 
 Windows 隐藏／cloaked owner 的可见顶层回退、子控件命中归一化见 [UI 扫描](05-ui-scanning.md) 和 [原生后端](06-platform-backends.md)。
@@ -14,7 +16,7 @@ macOS 缺失／无效 AXWindow 的有界顶层与父链回退、AXSubrole 缺失
 
 Normal 独立切换窗口的内置动作 `window_activate_next` / `window_activate_previous`、标签组优先与同程序归组规则复用见 [运行时/API](02-runtime-and-api.md) 和 [原生后端](06-platform-backends.md)。
 
-首页下载版本及资产链接在每次文档构建时从 GitHub 最新正式 Release 注入，见 [构建与文档站](08-build-docs-and-tests.md)。
+首页下载版本及资产链接在每次文档构建时从 GitHub 最新正式 Release 注入；本地开发允许 Release 请求失败后继续预览，生产构建仍严格校验，见 [构建与文档站](08-build-docs-and-tests.md)。
 
 窗口固定帮助预编译、Move/Resize 双版本及跨会话共享见 [运行时/API](02-runtime-and-api.md) 和 [渲染性能](07-rendering-and-performance.md)。
 

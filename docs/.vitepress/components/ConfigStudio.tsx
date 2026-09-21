@@ -1,3 +1,8 @@
+import SettingsNavigation from '../config-studio/SettingsNavigation'
+import PaneDivider from '../config-studio/PaneDivider'
+import FittedKeyboard from '../config-studio/FittedKeyboard'
+import { commonSearchFields, styleSearchFields } from '../config-studio/fields'
+import { pages, tabLabels, searchSettings, utilitySearchFields, type SettingsTab, type SearchEntry } from '../config-studio/navigation'
 import { cardPositionRatios, packedCardCenters } from '../simulator/window-card-position.ts'
 import QuickSwitchPreview from '../config-studio/QuickSwitchPreview'
 import { computed, defineComponent, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
@@ -199,10 +204,116 @@ export default defineComponent({
     const sourceName = ref('generated/keysteer.default.toml')
     const sourceStats = ref({ bytes: 0, sections: 0, values: 0 })
     const activeMode = ref<EditorMode>('normal')
+    const pageId = ref('normal')
+    const navigationWidth = ref(240)
+    const settingsShare = ref(55)
+    const selectedTab = ref<SettingsTab>('keys')
+    const currentPage = computed(() => pages.find(page => page.id === pageId.value)!)
+    const searchQuery = ref('')
+    const mobileView = ref('settings')
+    const expanded = ref(false)
+    const settingsPane = ref<HTMLElement | null>(null)
+    const previewPane = ref<HTMLElement | null>(null)
+    let previewReturnFocus: HTMLElement | null = null
+    const searchEntries = [...new Map([...commonSearchFields, ...styleSearchFields,
+      ...pages.map(page => ({ path: page.mode ? `${page.mode}.bindings` : page.id, label: page.label, page: page.id, tab: page.tabs[0] ?? 'behavior' as SettingsTab })),
+      ...utilitySearchFields,
+    ].map(field => [field.path, field])).values()]
+    const searchResults = computed(() => searchSettings(searchEntries, searchQuery.value))
+    function releasePreview(): void {
+      quickStarted = 0; quickVisible.value = false; simulatorArmed.value = false
+      heldActions.clear(); heldCharacterActions.clear(); physicalKeys.clear(); temporaryEntryKeys.clear()
+      simulator.window.gesture = false
+      temporaryWindow(simulator.window, false)
+    }
+    function selectPage(id: string, tab?: SettingsTab): void {
+      releasePreview()
+      pageId.value = id
+      selectedTab.value = tab ?? (currentPage.value.tabs.includes(selectedTab.value) ? selectedTab.value : currentPage.value.tabs[0] ?? 'behavior')
+      const mode = currentPage.value.mode
+      if (mode) activeMode.value = mode as EditorMode
+      selectedChord.value = ''
+      pendingAction.value = ''
+      actionQuery.value = ''
+      actionCategory.value = ''
+      if (mode && mode !== 'hotkeys') setPreviewMode(mode as Exclude<EditorMode, 'hotkeys'>)
+      if (id === 'window_card') setPreviewMode('window')
+      mobileView.value = 'settings'
+      nextTick(() => settingsPane.value?.scrollTo({ top: 0 }))
+    }
+    async function locateField(entry: SearchEntry): Promise<void> {
+      selectPage(entry.page, entry.tab); searchQuery.value = ''
+      await nextTick()
+      const field = settingsPane.value?.querySelector<HTMLElement>(`[data-config-path="${entry.path}"]`)
+      for (let node = field?.parentElement; node && node !== settingsPane.value; node = node.parentElement) {
+        if (node instanceof HTMLDetailsElement) node.open = true
+      }
+      field?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+      ;(field?.querySelector<HTMLElement>('input,select,button') ?? settingsPane.value)?.focus({ preventScroll: true })
+    }
+    async function toggleExpanded(): Promise<void> {
+      releasePreview()
+      if (!expanded.value) previewReturnFocus = globalThis.document.activeElement as HTMLElement
+      expanded.value = !expanded.value
+      await nextTick()
+      if (expanded.value) previewPane.value?.querySelector<HTMLElement>('.ks-simulator-card button')?.focus()
+      else previewReturnFocus?.focus({ preventScroll: true })
+    }
+    function previewDialogKey(event: KeyboardEvent): void {
+      if (!expanded.value) return
+      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); void toggleExpanded(); return }
+      if (event.key === 'Tab' && event.target !== screen.value) {
+        const items = Array.from(previewPane.value?.querySelectorAll<HTMLElement>('button,input,select,[tabindex="0"]') ?? []).filter(item => item.offsetParent !== null)
+        const first = items[0], last = items.at(-1)
+        if (event.shiftKey && event.target === first) { event.preventDefault(); last?.focus() }
+        else if (!event.shiftKey && event.target === last) { event.preventDefault(); first?.focus() }
+      }
+    }
     const appearance = ref<Appearance>('light')
-    const editKeyHelp = ref(false)
     const modifiers = reactive<Record<Modifier, boolean>>({ primary: false, shift: false, alt: false })
     const selectedChord = ref('')
+    const pendingAction = ref('')
+    const draggedAction = ref('')
+    const dragTarget = ref('')
+    const actionQuery = ref('')
+    const actionCategory = ref('')
+    const fullKeyboard = ref(true)
+    let actionDragStart: { x: number; y: number; action: string } | undefined
+    let suppressActionClick = false
+    function actionPointerDown(event: PointerEvent, action: string): void {
+      if (event.button !== 0) return
+      suppressActionClick = false
+      actionDragStart = { x: event.clientX, y: event.clientY, action }
+      ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
+    }
+    function actionPointerMove(event: PointerEvent): void {
+      if (!actionDragStart || Math.hypot(event.clientX - actionDragStart.x, event.clientY - actionDragStart.y) < 6) return
+      draggedAction.value = actionDragStart.action
+      const target = (event.currentTarget as HTMLElement).ownerDocument.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>('[data-map-key]')
+      dragTarget.value = target?.dataset.mapKey ?? ''
+    }
+    function actionPointerUp(event: PointerEvent): void {
+      if (draggedAction.value) {
+        suppressActionClick = true
+        const target = (event.currentTarget as HTMLElement).ownerDocument.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>('[data-map-key]')
+        if (target) {
+          pendingAction.value = ''
+          selectKey({ key: target.dataset.mapKey!, label: target.dataset.mapKey!, literal: target.dataset.literal === 'true' })
+          setAction(draggedAction.value)
+        }
+      }
+      actionDragStart = undefined
+      draggedAction.value = ''; dragTarget.value = ''
+    }
+    const filteredActionGroups = computed(() => actionGroups
+      .filter(group => !actionCategory.value || group.name === actionCategory.value)
+      .toSorted((a, b) => {
+        const priority = activeMode.value.startsWith('window') ? ['Window', '窗口布局方向', 'Tabs', '模式'] : ['移动', '点击', '滚动', '模式', '按键状态']
+        const rank = (name: string) => priority.includes(name) ? priority.indexOf(name) : priority.length
+        return rank(a.name) - rank(b.name)
+      })
+      .map(group => ({ ...group, actions: group.actions.filter(action => `${action.label} ${action.value}`.toLowerCase().includes(actionQuery.value.trim().toLowerCase())) }))
+      .filter(group => group.actions.length))
     const customAction = ref('')
     const windowScreen = ref('1')
     const validWindowScreen = computed(() => /^\d+$/.test(windowScreen.value)
@@ -212,6 +323,8 @@ export default defineComponent({
     const simulator = reactive(createSimulatorState())
     const screen = ref<HTMLElement | null>(null)
     const simulatorArmed = ref(false)
+    const canvasScale = ref(1)
+    let previewObserver: ResizeObserver | undefined
     const layoutNote = ref('')
     const layoutNoteInput = ref<HTMLInputElement>()
     const layoutStorageError = ref('')
@@ -227,7 +340,8 @@ export default defineComponent({
     }).slice(0, 9))
     function previewQuickSwitch(): void {
       quickRows.value = [...quickCandidates.value]; quickVisible.value = true
-      screen.value?.focus()
+      mobileView.value = 'preview'
+      nextTick(() => screen.value?.focus())
     }
     function chooseQuickMode(mode: string): void {
       quickUsed = true; quickVisible.value = false
@@ -286,6 +400,23 @@ export default defineComponent({
     const clickPulse = ref(0)
     const scrollPulse = ref('')
     const isMac = ref(false)
+    const primaryCaption = computed(() => shortcutCaption(effectiveDocument.value ?? {}, 'primary', isMac.value)
+      .replaceAll('LEFT ', '左 ').replaceAll('RIGHT ', '右 ')
+      .replaceAll('CMD', '⌘ Cmd').replaceAll('CTRL', isMac.value ? '⌃ Ctrl' : 'Ctrl')
+      .replaceAll('ALT', isMac.value ? '⌥ Option' : 'Alt').replaceAll('SHIFT', '⇧ Shift'))
+    function platformKey(spec: KeySpec): KeySpec {
+      if (spec.literal) return spec
+      const physical = spec.key.replace(/^(left|right)_/, '')
+      const label = physical === 'cmd' ? (isMac.value ? '⌘ Cmd' : '⊞ Win')
+        : physical === 'alt' ? (isMac.value ? '⌥ Opt' : 'Alt')
+        : physical === 'ctrl' ? (isMac.value ? '⌃ Ctrl' : 'Ctrl')
+        : physical === 'shift' ? '⇧ Shift' : spec.label
+      return { ...spec, label }
+    }
+    function selectPlatform(mac: boolean): void {
+      releasePreview()
+      isMac.value = mac
+    }
     let animationFrame = 0
     let previousFrame = 0
 
@@ -387,6 +518,10 @@ export default defineComponent({
       const parts: string[] = spec.literal ? [] : (Object.keys(modifiers) as Modifier[]).filter((modifier) => modifiers[modifier])
       if (!parts.includes(spec.key)) parts.push(spec.key)
       selectedChord.value = parts.join('+')
+      if (pendingAction.value) {
+        setAction(pendingAction.value)
+        pendingAction.value = ''
+      }
       customAction.value = selectedAction.value
       const target = /^move_window\s+(\d+)$/.exec(selectedAction.value)
       if (target) windowScreen.value = target[1]
@@ -408,8 +543,11 @@ export default defineComponent({
       expandConfiguredBinding(table, selectedChord.value)
       delete table[selectedChord.value]
       document.value = { ...document.value }
-      customAction.value = ''
-      message.value = `已移除 ${selectedChord.value}`
+      pendingAction.value = ''
+      customAction.value = selectedAction.value
+      message.value = selectedAction.value
+        ? `已移除当前模式绑定，${selectedChord.value} 恢复继承：${selectedAction.value}`
+        : `已移除 ${selectedChord.value}，此键未绑定`
     }
 
     function keyBindingInfo(spec: KeySpec): KeyBindingInfo | undefined {
@@ -700,53 +838,60 @@ export default defineComponent({
       } catch (error) { layoutStorageError.value = formatError(error) }
       void initialize()
       animationFrame = requestAnimationFrame(animate)
+      previewObserver = new ResizeObserver(entries => {
+        const rect = entries[0]?.contentRect
+        if (rect && rect.width && rect.height) canvasScale.value = Math.min(rect.width / 960, rect.height / 600)
+      })
+      if (screen.value) previewObserver.observe(screen.value)
     })
     onBeforeUnmount(() => {
+      previewObserver?.disconnect()
       cancelAnimationFrame(animationFrame)
     })
 
     const keyboard = () => (
-      <div class="ks-keyboard-scroll" aria-label="ANSI 104 键盘">
+      <div class={{ 'ks-keyboard-scroll': true, 'ks-main-keyboard': !fullKeyboard.value }} aria-label={fullKeyboard.value ? 'ANSI 104 键盘' : '键盘主键区'}>
+        <FittedKeyboard>
         <div class="ks-keyboard">
-          <KeyboardRows rows={[functionRow]} selected={selectedChord.value} onKey={selectKey} bindingInfo={keyBindingInfo} />
+          {fullKeyboard.value && <KeyboardRows rows={[functionRow.map(platformKey)]} selected={selectedChord.value} onKey={selectKey} bindingInfo={keyBindingInfo} />}
           <div class="ks-keyboard-body">
-            <KeyboardRows rows={mainRows} selected={selectedChord.value} onKey={selectKey} bindingInfo={keyBindingInfo} />
-            <KeyboardRows rows={navigationRows} selected={selectedChord.value} onKey={selectKey} bindingInfo={keyBindingInfo} compact />
-            <Numpad keys={numpadKeys} selected={selectedChord.value} onKey={selectKey} bindingInfo={keyBindingInfo} />
+            <KeyboardRows rows={mainRows.map(row => row.map(platformKey))} selected={selectedChord.value} onKey={selectKey} bindingInfo={keyBindingInfo} />
+            {fullKeyboard.value && <KeyboardRows rows={navigationRows} selected={selectedChord.value} onKey={selectKey} bindingInfo={keyBindingInfo} compact />}
+            {fullKeyboard.value && <Numpad keys={numpadKeys} selected={selectedChord.value} onKey={selectKey} bindingInfo={keyBindingInfo} />}
           </div>
         </div>
+        </FittedKeyboard>
       </div>
     )
 
-    return () => (
-      <div class="ks-studio">
+    const renderKeyboard = () => (
         <section class="ks-card ks-keyboard-card" style={editorVisual.value as any}>
           <div class="ks-toolbar ks-compact-toolbar">
             <div>
-              <h2>键位编辑器</h2>
-              <p>{message.value}</p>
+              <h2>按键映射</h2>
+              <p>先选按键再选动作，也可以把动作拖到键帽上。</p>
             </div>
+            <button class="ks-button" aria-pressed={fullKeyboard.value} onClick={() => fullKeyboard.value = !fullKeyboard.value}>{fullKeyboard.value ? '切换主键区' : '显示完整键盘'}</button>
           </div>
           <div class="ks-keyboard-tools">
-            <div class="ks-mode-tabs" role="tablist">
-              {modes.map((mode) => (
-                <button class={{ active: activeMode.value === mode.id }} onClick={() => { activeMode.value = mode.id; selectedChord.value = '' }}>
-                  {mode.label}
-                </button>
-              ))}
+            <div class="ks-platform-picker" role="group" aria-label="预览平台">
+              <button aria-pressed={!isMac.value} onClick={() => selectPlatform(false)}><span aria-hidden="true">⊞</span> Windows</button>
+              <button aria-pressed={isMac.value} onClick={() => selectPlatform(true)}><span aria-hidden="true">⌘</span> macOS</button>
+              <small>Primary → {primaryCaption.value}</small>
             </div>
             <div class="ks-modifiers">
               <span>组合键</span>
               {(Object.keys(modifiers) as Modifier[]).map((modifier) => (
-                <button class={{ active: modifiers[modifier] }} aria-pressed={modifiers[modifier]} onClick={() => { modifiers[modifier] = !modifiers[modifier] }}>
-                  {modifier === 'primary' ? 'Primary' : modifier === 'shift' ? 'Shift' : 'Alt'}
+                <button class={{ active: modifiers[modifier] }} aria-pressed={modifiers[modifier]} title={modifier === 'primary' ? `跨平台别名，当前解析为 ${primaryCaption.value}；绑定仍保存为 primary` : undefined} onClick={() => { modifiers[modifier] = !modifiers[modifier] }}>
+                  {modifier === 'primary' ? 'Primary' : modifier === 'shift' ? '⇧ Shift' : isMac.value ? '⌥ Option' : 'Alt'}
                 </button>
               ))}
               <input aria-label="绑定按键或符号" placeholder="点击键盘或输入符号，如 ?" value={selectedChord.value} onInput={(event) => { selectedChord.value = (event.target as HTMLInputElement).value }} />
             </div>
           </div>
           {keyboard()}
-          <p class="ks-keyboard-hint">点击键帽内的上层符号可按字符绑定（如 ?）；下层按键可搭配上方组合键。彩色圆点表示已有绑定，悬停可查看动作。</p>
+          {draggedAction.value && <p class="ks-pending-action">拖动 {draggedAction.value}{dragTarget.value ? ` → ${dragTarget.value}，松开替换绑定` : ' 到目标键帽'}</p>}
+          <details class="ks-keyboard-guide"><summary>符号绑定与颜色说明</summary><p class="ks-keyboard-hint">点击键帽内的上层符号可按字符绑定（如 ?）；下层按键可搭配上方组合键。彩色圆点表示已有绑定，悬停可查看动作。</p>
           <div class="ks-key-legend" aria-label="按键颜色分类">
             <span class="tone-move"><i />方向移动</span>
             <span class="tone-click"><i />鼠标点击</span>
@@ -756,22 +901,43 @@ export default defineComponent({
             <span class="tone-mode"><i />模式切换</span>
             <span class="tone-utility"><i />其他</span>
           </div>
-          <details class="ks-binding-details" open={Boolean(selectedChord.value)}>
-            <summary>
-              <span>{selectedChord.value || '选择键位后编辑绑定'}</span>
-              <code>{selectedAction.value || '未绑定'}</code>
-            </summary>
+          </details>
+          <section class="ks-binding-details ks-mapping-editor">
+            <div class="ks-mapping-selection" aria-live="polite">
+              <div><small>当前按键 · {activeMode.value}</small><strong>{selectedChord.value || '请选择键帽'}</strong></div>
+              <div><small>当前动作</small><code>{selectedAction.value === 'none' ? '已取消绑定（none）' : selectedAction.value || '未绑定'}</code>
+                {selectedAction.value && <small>{resolveBinding(effectiveDocument.value!, activeMode.value, selectedChord.value)?.source === activeMode.value ? '当前模式绑定' : `继承自 ${resolveBinding(effectiveDocument.value!, activeMode.value, selectedChord.value)?.source}`} · 选择新动作将覆盖此键</small>}
+              </div>
+              {selectedChord.value && <div class="ks-binding-actions">
+                <div>
+                  <button disabled={!selectedAction.value || selectedAction.value === 'none'} onClick={() => { pendingAction.value = ''; setAction('none'); message.value = `已取消 ${selectedChord.value} 的绑定，不再执行本模式或继承的绑定动作` }}>取消绑定</button>
+                  <button disabled={resolveBinding(effectiveDocument.value!, activeMode.value, selectedChord.value)?.source !== activeMode.value} onClick={removeBinding}>移除当前模式绑定</button>
+                </div>
+                <small>取消绑定会禁用此键的绑定动作；移除当前模式绑定后，若有继承动作则恢复继承。</small>
+              </div>}
+            </div>
+            {pendingAction.value && <p class="ks-pending-action">已选择 {pendingAction.value}，请点击目标键帽。<button onClick={() => pendingAction.value = ''}>取消</button></p>}
             <div class="ks-binding-panel">
+              <div class="ks-action-search"><input aria-label="搜索映射动作" placeholder="搜索动作，例如 点击、屏幕、move_left" value={actionQuery.value} onInput={event => actionQuery.value = (event.target as HTMLInputElement).value} />
+                <select aria-label="动作分类" value={actionCategory.value} onChange={event => actionCategory.value = (event.target as HTMLSelectElement).value}><option value="">全部动作</option>{actionGroups.map(group => <option value={group.name}>{group.name}</option>)}</select>
+              </div>
               <div class="ks-action-groups">
-                {actionGroups.filter(group => !isMac.value || group.name !== 'Tabs').map((group) => (
+                {filteredActionGroups.value.map((group) => (
                   <div class="ks-action-group">
                     <strong>{group.name}</strong>
                     <div>{group.actions.map((action) => (
-                      <button class={{ active: selectedAction.value === action.value }} disabled={!selectedChord.value} onClick={() => setAction(action.value)}>{action.label}</button>
+                      <button class={{ active: selectedAction.value === action.value || pendingAction.value === action.value }}
+                        title={`${action.value} · 点击设置或拖到键帽`}
+                        onPointerdown={event => actionPointerDown(event, action.value)} onPointermove={actionPointerMove} onPointerup={actionPointerUp}
+                        onPointercancel={() => { actionDragStart = undefined; draggedAction.value = ''; dragTarget.value = '' }}
+                        onLostpointercapture={() => { actionDragStart = undefined; draggedAction.value = ''; dragTarget.value = '' }}
+                        onClick={event => { if (suppressActionClick && event.detail !== 0) { suppressActionClick = false; return }; if (selectedChord.value) setAction(action.value); else pendingAction.value = action.value }}><span>{action.label}</span><code>{action.value}</code></button>
                     ))}</div>
                   </div>
                 ))}
+                {!filteredActionGroups.value.length && <p>没有匹配的动作，可在下方高级映射中输入自定义命令。</p>}
               </div>
+              <details class="ks-mapping-advanced"><summary>高级映射 · 自定义命令与指定屏幕</summary>
               <div class="ks-custom-action">
                 <label for="ks-window-screen">窗口目标屏幕（从 1 开始）</label>
                 <input id="ks-window-screen" type="number" min="1" step="1" value={windowScreen.value} onInput={(event) => { windowScreen.value = (event.target as HTMLInputElement).value }} />
@@ -781,23 +947,18 @@ export default defineComponent({
               <div class="ks-custom-action">
                 <input value={customAction.value} placeholder="自定义动作，例如 press shift" onInput={(event) => { customAction.value = (event.target as HTMLInputElement).value }} onKeydown={(event) => { if (event.key === 'Enter') setAction(customAction.value.trim()) }} />
                 <button disabled={!selectedChord.value || !customAction.value.trim()} onClick={() => setAction(customAction.value.trim())}>应用</button>
-                <button disabled={!selectedChord.value} onClick={removeBinding}>移除</button>
               </div>
+              </details>
             </div>
-          </details>
+          </section>
         </section>
-
-        <div class="ks-studio-workbench">
-          <div class="ks-visual-column">
+    )
+    const renderPreview = () => (
             <section class="ks-card ks-simulator-card">
               <div class="ks-toolbar ks-compact-toolbar">
-                <div><h2>样式预览</h2><p>切换模式后调整颜色、网格和字体。</p></div>
+                <div><h2>实时预览</h2><p>运行模式：{simulator.mode}</p></div>
+                <button class="ks-button" onClick={toggleExpanded}>{expanded.value ? '关闭放大' : '放大预览'}</button>
                 <span class={{ 'ks-status': true, armed: simulatorArmed.value }}>{simulatorArmed.value ? '键盘已捕获' : '点击预览可试按键'}</span>
-              </div>
-              <div class="ks-simulator-modes" aria-label="预览模式">
-                {(['normal', 'grid', 'recursive_grid', 'ui_hint', 'window', 'window_quick', 'window_editor', 'window_restore', 'window_tab'] as const).map((mode) => (
-                  <button class={{ active: simulator.mode === mode }} onClick={() => setPreviewMode(mode)}>{mode}</button>
-                ))}
               </div>
               {isWindowMode(simulator.mode) && <div class="ks-layout-file-tools"><input ref={layoutFileInput} type="file" accept=".ksw,application/octet-stream" aria-label="导入工作区文件" hidden onChange={importLayoutFile} />
                     <button onClick={() => layoutFileInput.value?.click()}>导入工作区文件</button><button onClick={downloadLayouts}>{hasWindowPresetChanges(simulator.window) ? '保存并下载工作区' : '下载工作区文件'}</button>
@@ -808,10 +969,11 @@ export default defineComponent({
                 style={targetingVisual.value as any}
                 tabindex="0"
                 onFocus={() => { simulatorArmed.value = true }}
-                onBlur={() => { quickStarted = 0; quickVisible.value = false; simulatorArmed.value = false; heldActions.clear(); heldCharacterActions.clear(); physicalKeys.clear(); temporaryEntryKeys.clear(); temporaryWindow(simulator.window, false) }}
-                onKeydown={onSimulatorKeyDown}
-                onKeyup={onSimulatorKeyUp}
+                onBlur={releasePreview}
+                onKeydown={event => { if (event.target === screen.value) onSimulatorKeyDown(event) }}
+                onKeyup={event => { if (event.target === screen.value) onSimulatorKeyUp(event) }}
               >
+                <div class="ks-preview-canvas" style={{ transform: `translate(-50%, -50%) scale(${canvasScale.value})` }}>
                 <div class="ks-screen-grid" />
                 {!isWindowMode(simulator.mode) && <DesktopBackdrop />}
                 {(!isWindowMode(simulator.mode) || simulator.window.temporary) && <div class="ks-mode-badge">{isWindowMode(simulator.mode) ? temporaryMode.value : simulator.mode}</div>}
@@ -881,30 +1043,66 @@ export default defineComponent({
                 )}
                 {!isWindowMode(simulator.mode) && <div class="ks-event-log">{simulator.lastEvent}</div>}
               </div>
-              <div class="ks-toolbar ks-compact-toolbar">
-                <button class="ks-button" onClick={() => executeAction('key_help')}>切换按键提示预览</button>
-                <button class={{ 'ks-button': true, active: editKeyHelp.value }} onClick={() => { editKeyHelp.value = !editKeyHelp.value; if (editKeyHelp.value && !simulator.keyHelpVisible) executeAction('key_help') }}>编辑按键提示样式</button>
               </div>
-              {document.value && effectiveDocument.value && editKeyHelp.value && (
-                <ModeStyleControls document={document.value} effectiveDocument={effectiveDocument.value} mode="key_help" appearance={appearance.value}
-                  onChange={(next) => { document.value = next }} onAppearanceChange={(next) => { appearance.value = next }} />
-              )}
-              {simulator.mode === 'window_tab' ? <p class="ks-window-instructions">进入时自动组合同应用窗口；输入 12t34t 连续分组，~ 选择整组，空格明确结束编号。T 开始下一组，D 移出成员，X 解散，Z / Shift+Z 撤销和重做；Ctrl+S 保存模板。退出模式后组合保留，标签栏仍可点击。这里只调整示例窗口。</p> : isWindowMode(simulator.mode) && <p class="ks-window-instructions">数字选窗；A 快速布局，使用独立方向绑定调整比例，E 自动布局并进入编辑：Shift＋方向分区，Ctrl＋方向连续移动分割线，X 删除分区。T 进入标签组合；Q 按当前模式绑定切换，Z 撤销；按住 Primary 临时使用 Normal。这里只调整示例窗口。</p>}
-              {document.value && effectiveDocument.value && !editKeyHelp.value && (simulator.mode === 'grid' || simulator.mode === 'recursive_grid' || simulator.mode === 'ui_hint' || isWindowMode(simulator.mode)) && (
-                <ModeStyleControls
-                  document={document.value}
-                  effectiveDocument={effectiveDocument.value}
-                  mode={simulator.mode}
-                  appearance={appearance.value}
-                  onChange={(next) => { document.value = next }}
-                  onAppearanceChange={(next) => { appearance.value = next }}
-                />
-              )}
-              {(simulator.mode === 'normal' || simulator.mode === 'idle') && <p class="ks-normal-note">可预览按键提示，或选择 Grid、Recursive Grid、UI Hint 调整覆盖层样式。</p>}
+              <details class="ks-preview-help"><summary>试用说明</summary><p>点击画面后试用快捷键；离开画面即释放按键。模拟操作只影响示例窗口。编辑设置不会控制桌面上的实际窗口。</p><button onClick={() => executeAction('key_help')}>切换按键提示</button></details>
             </section>
-          </div>
+    )
+    const renderQuickSwitch = () => (
+            <details class="ks-toml-details ks-quick-settings" open>
+              <summary>快速模式切换</summary>
+              <div class="ks-settings-body">
+              <p>操作模式中长按 {String(effectiveDocument.value?.quick_switch?.key ?? 'q').toUpperCase()} 展开，配合 1…9 选择；松开收起。Idle 不接管，黑名单仅限制快速切换。</p>
+              <button class="ks-button" disabled={!document.value} onClick={previewQuickSwitch}>在模拟器中预览</button>
+              <div class="ks-settings-grid">
+              <label hidden={selectedTab.value !== 'behavior'} data-config-path="quick_switch.key">触发键<input value={effectiveDocument.value?.quick_switch?.key ?? 'q'} onChange={event => {
+                const value = (event.target as HTMLInputElement).value.trim().toLowerCase()
+                if (document.value && /^[a-z]$/.test(value)) { document.value.quick_switch ??= {}; document.value.quick_switch.key = value }
+              }} /></label>
+              <label hidden={selectedTab.value !== 'behavior'} data-config-path="quick_switch.enabled">启用 <input type="checkbox" checked={effectiveDocument.value?.quick_switch?.enabled !== false}
+                onChange={event => { if (document.value) { document.value.quick_switch ??= {}; document.value.quick_switch.enabled = (event.target as HTMLInputElement).checked } }} /></label>
+              <label hidden={selectedTab.value !== 'behavior'} data-config-path="quick_switch.hold_ms">长按毫秒 <input type="number" min="1" max="10000" value={effectiveDocument.value?.quick_switch?.hold_ms ?? 350}
+                onChange={event => { const value = Number((event.target as HTMLInputElement).value); if (document.value && value >= 1 && value <= 10000 && Number.isInteger(value)) { document.value.quick_switch ??= {}; document.value.quick_switch.hold_ms = value } }} /></label>
+              <label hidden={selectedTab.value !== 'behavior'} data-config-path="quick_switch.position">位置 <select value={effectiveDocument.value?.quick_switch?.position ?? 'mouse'} onChange={event => {
+                if (document.value) { document.value.quick_switch ??= {}; document.value.quick_switch.position = (event.target as HTMLSelectElement).value }
+              }}><option value="screen">当前屏幕中心</option><option value="window">当前窗口中心</option><option value="mouse">鼠标模式提示下方</option></select></label>
+              <label hidden={selectedTab.value !== 'behavior'} data-config-path="quick_switch.blacklist">面板黑名单（逗号分隔）<input value={(effectiveDocument.value?.quick_switch?.blacklist ?? ['idle']).join(', ')}
+                onChange={event => { if (document.value) { document.value.quick_switch ??= {}; document.value.quick_switch.blacklist = (event.target as HTMLInputElement).value.split(',').map(value => value.trim()).filter(Boolean) } }} /></label>
+              {(['font_size', 'border_width', 'border_radius', 'padding_x', 'padding_y'] as const).map(field => <label hidden={selectedTab.value !== 'appearance'} data-config-path={`quick_switch.ui.${field}`} key={field}>{{ font_size: '字号', border_width: '边框宽度', border_radius: '圆角（-1 自动）', padding_x: '左右内边距', padding_y: '上下内边距' }[field]}
+                <input type="number" min={field === 'font_size' ? 1 : field === 'border_width' ? 0 : -1} max="200"
+                  value={effectiveDocument.value?.quick_switch?.ui?.[field] ?? (field === 'font_size' ? 28 : field === 'border_width' ? 1 : field === 'padding_x' ? 10 : -1)}
+                  onChange={event => { const value = Number((event.target as HTMLInputElement).value); if (document.value && Number.isInteger(value)) { document.value.quick_switch ??= {}; document.value.quick_switch.ui ??= {}; document.value.quick_switch.ui[field] = value } }} />
+              </label>)}
+              {(['background_color', 'text_color', 'border_color'] as const).map(field => <label hidden={selectedTab.value !== 'appearance'} data-config-path={`quick_switch.ui.${field}`} key={field}>{{ background_color: '背景颜色', text_color: '文字颜色', border_color: '边框颜色' }[field]}
+                <input placeholder="#RRGGBBAA · 留空继承主题" value={typeof effectiveDocument.value?.quick_switch?.ui?.[field] === 'string' ? effectiveDocument.value.quick_switch.ui[field] : ''}
+                  onChange={event => { const value = (event.target as HTMLInputElement).value.trim(); if (document.value && (!value || /^#[0-9a-f]{8}$/i.test(value))) { document.value.quick_switch ??= {}; document.value.quick_switch.ui ??= {}; if (value) document.value.quick_switch.ui[field] = value; else delete document.value.quick_switch.ui[field] } }} />
+              </label>)}
+              </div></div>
+            </details>
 
-          <section class="ks-card ks-preview-card">
+    )
+    const renderUsage = () => (
+            <section class="ks-utility-card ks-usage-settings">
+              <header class="ks-utility-heading"><h2>模式使用统计</h2><span>{usageRanking.value.length} 个模式</span></header>
+              <div class="ks-settings-body">
+              <p>来自导入的 workspace.ksw，按进入次数排序；模拟操作不会改变实际使用统计。</p>
+              <label data-config-path="mode_usage.save_after_entries">累计进入次数后保存 <input type="number" min="1" max="4294967295"
+                value={Number(effectiveDocument.value?.mode_usage?.save_after_entries ?? 100)}
+                onChange={(event) => {
+                  const count = Number((event.target as HTMLInputElement).value)
+                  if (document.value && Number.isInteger(count) && count >= 1 && count <= 4294967295) {
+                    document.value.mode_usage = { save_after_entries: count }
+                  }
+                }} /></label>
+              {!usageRanking.value.length && <div class="ks-usage-empty"><strong>暂无使用记录</strong><span>导入 workspace.ksw 后，在这里查看常用模式排名。</span></div>}
+              <table class="ks-usage-table" hidden={!usageRanking.value.length}><thead><tr><th>常用模式</th><th>进入次数</th></tr></thead><tbody>
+                {usageRanking.value.map(([mode, count], index) => <tr key={mode}><td><span class="ks-usage-rank">{index + 1}</span>{mode}<progress max="100" value={Number(BigInt(count) * 100n / (BigInt(usageRanking.value[0]?.[1] ?? '1') || 1n))} /></td><td>{BigInt(count).toLocaleString()}</td></tr>)}
+              </tbody></table>
+              </div>
+            </section>
+
+    )
+    const renderFiles = () => (<div class="ks-file-settings">
+            <section class="ks-utility-card">
             <div class="ks-toolbar ks-compact-toolbar ks-preview-toolbar">
               <div class="ks-toml-source">
                 <span class="ks-source-kicker">配置源</span>
@@ -921,7 +1119,7 @@ export default defineComponent({
                 <button class="ks-button" onClick={downloadDefault}>默认配置</button>
                 <button class="ks-button ks-button-primary" onClick={downloadConfig}>下载用户配置</button>
                 <button class="ks-button" onClick={copyToml}>复制</button>
-                <input ref={importInput} class="ks-file-input" type="file" accept=".toml,text/plain" onChange={onImport} />
+
               </div>
             </div>
             <div class="ks-toml-sync-note">
@@ -929,67 +1127,45 @@ export default defineComponent({
               <p>页面构建前会从仓库根目录复制 <code>keysteer.default.toml</code>。导入局部配置时，预览按 Rust 缺省规则补全，下载仍保持局部文件。</p>
               <small>浏览器会验证 TOML 结构，但不会替代 <code>keysteer --check</code>；解析后注释不会保留。</small>
             </div>
-            <details class="ks-toml-details ks-quick-settings" open>
-              <summary>快速模式切换</summary>
-              <div class="ks-settings-body">
-              <p>操作模式中长按 {String(effectiveDocument.value?.quick_switch?.key ?? 'q').toUpperCase()} 展开，配合 1…9 选择；松开收起。Idle 不接管，黑名单仅限制快速切换。</p>
-              <button class="ks-button" disabled={!document.value} onClick={previewQuickSwitch}>在模拟器中预览</button>
-              <div class="ks-settings-grid">
-              <label>触发键<input value={effectiveDocument.value?.quick_switch?.key ?? 'q'} onChange={event => {
-                const value = (event.target as HTMLInputElement).value.trim().toLowerCase()
-                if (document.value && /^[a-z]$/.test(value)) { document.value.quick_switch ??= {}; document.value.quick_switch.key = value }
-              }} /></label>
-              <label>启用 <input type="checkbox" checked={effectiveDocument.value?.quick_switch?.enabled !== false}
-                onChange={event => { if (document.value) { document.value.quick_switch ??= {}; document.value.quick_switch.enabled = (event.target as HTMLInputElement).checked } }} /></label>
-              <label>长按毫秒 <input type="number" min="1" max="10000" value={effectiveDocument.value?.quick_switch?.hold_ms ?? 350}
-                onChange={event => { const value = Number((event.target as HTMLInputElement).value); if (document.value && value >= 1 && value <= 10000 && Number.isInteger(value)) { document.value.quick_switch ??= {}; document.value.quick_switch.hold_ms = value } }} /></label>
-              <label>位置 <select value={effectiveDocument.value?.quick_switch?.position ?? 'mouse'} onChange={event => {
-                if (document.value) { document.value.quick_switch ??= {}; document.value.quick_switch.position = (event.target as HTMLSelectElement).value }
-              }}><option value="screen">当前屏幕中心</option><option value="window">当前窗口中心</option><option value="mouse">鼠标模式提示下方</option></select></label>
-              <label>面板黑名单（逗号分隔）<input value={(effectiveDocument.value?.quick_switch?.blacklist ?? ['idle']).join(', ')}
-                onChange={event => { if (document.value) { document.value.quick_switch ??= {}; document.value.quick_switch.blacklist = (event.target as HTMLInputElement).value.split(',').map(value => value.trim()).filter(Boolean) } }} /></label>
-              {(['font_size', 'border_width', 'border_radius', 'padding_x', 'padding_y'] as const).map(field => <label key={field}>{{ font_size: '字号', border_width: '边框宽度', border_radius: '圆角（-1 自动）', padding_x: '左右内边距', padding_y: '上下内边距' }[field]}
-                <input type="number" min={field === 'font_size' ? 1 : field === 'border_width' ? 0 : -1} max="200"
-                  value={effectiveDocument.value?.quick_switch?.ui?.[field] ?? (field === 'font_size' ? 28 : field === 'border_width' ? 1 : field === 'padding_x' ? 10 : -1)}
-                  onChange={event => { const value = Number((event.target as HTMLInputElement).value); if (document.value && Number.isInteger(value)) { document.value.quick_switch ??= {}; document.value.quick_switch.ui ??= {}; document.value.quick_switch.ui[field] = value } }} />
-              </label>)}
-              {(['background_color', 'text_color', 'border_color'] as const).map(field => <label key={field}>{{ background_color: '背景颜色', text_color: '文字颜色', border_color: '边框颜色' }[field]}
-                <input placeholder="#RRGGBBAA · 留空继承主题" value={typeof effectiveDocument.value?.quick_switch?.ui?.[field] === 'string' ? effectiveDocument.value.quick_switch.ui[field] : ''}
-                  onChange={event => { const value = (event.target as HTMLInputElement).value.trim(); if (document.value && (!value || /^#[0-9a-f]{8}$/i.test(value))) { document.value.quick_switch ??= {}; document.value.quick_switch.ui ??= {}; if (value) document.value.quick_switch.ui[field] = value; else delete document.value.quick_switch.ui[field] } }} />
-              </label>)}
-              </div></div>
-            </details>
-            <details class="ks-toml-details ks-usage-settings" open>
-              <summary>模式使用统计 · {usageRanking.value.length} 个模式</summary>
-              <div class="ks-settings-body">
-              <p>来自导入的 workspace.ksw，按进入次数排序；模拟操作不会改变实际使用统计。</p>
-              <label>累计进入次数后保存 <input type="number" min="1" max="4294967295"
-                value={Number(effectiveDocument.value?.mode_usage?.save_after_entries ?? 100)}
-                onChange={(event) => {
-                  const count = Number((event.target as HTMLInputElement).value)
-                  if (document.value && Number.isInteger(count) && count >= 1 && count <= 4294967295) {
-                    document.value.mode_usage = { save_after_entries: count }
-                  }
-                }} /></label>
-              {!usageRanking.value.length && <div class="ks-usage-empty"><strong>暂无使用记录</strong><span>导入 workspace.ksw 后，在这里查看常用模式排名。</span></div>}
-              <table class="ks-usage-table" hidden={!usageRanking.value.length}><thead><tr><th>常用模式</th><th>进入次数</th></tr></thead><tbody>
-                {usageRanking.value.map(([mode, count], index) => <tr key={mode}><td><span class="ks-usage-rank">{index + 1}</span>{mode}<progress max="100" value={Number(BigInt(count) * 100n / (BigInt(usageRanking.value[0]?.[1] ?? '1') || 1n))} /></td><td>{BigInt(count).toLocaleString()}</td></tr>)}
-              </tbody></table>
-              </div>
-            </details>
-            <details class="ks-toml-details">
-              <summary>查看并检查生成的 TOML</summary>
-              <pre class="ks-toml"><code innerHTML={highlightToml(tomlPreview.value)} /></pre>
-            </details>
+            </section>
+            <section class="ks-utility-card ks-workspace-files"><header class="ks-utility-heading"><h2>工作区文件</h2><code>workspace.ksw</code></header><div class="ks-settings-body"><p>导入或导出布局、标签分组与使用统计。</p><div class="ks-file-actions"><input aria-label="导入工作区文件" type="file" accept=".ksw,application/octet-stream" onChange={importLayoutFile} /><button class="ks-button" onClick={downloadLayouts}>下载工作区文件</button></div></div></section></div>)
+    return () => (
+      <div class="ks-studio ks-classified" style={{ '--ks-navigation-width': `${navigationWidth.value}px`, '--ks-settings-share': `${settingsShare.value}fr`, '--ks-preview-share': `${100 - settingsShare.value}fr` }}>
+        <header class="ks-studio-topbar" inert={expanded.value}>
+          <div><strong>配置工作台</strong><small role="status" aria-live="polite" title={message.value}>{message.value || sourceName.value}</small></div>
+          <div class="ks-settings-search"><input aria-label="搜索设置" placeholder="搜索设置、模式或 TOML 路径…" value={searchQuery.value} onInput={e => searchQuery.value = (e.target as HTMLInputElement).value} />
+            {searchQuery.value.trim() && <div class="ks-search-results">{searchResults.value.map(entry => <button onClick={() => locateField(entry)}><strong>{entry.label}</strong><small>{entry.path}</small></button>)}{!searchResults.value.length && <p>没有匹配设置</p>}</div>}
+          </div>
+          <button onClick={() => importInput.value?.click()}>导入 TOML</button><button class="ks-button-primary" onClick={downloadConfig}>下载用户配置</button>
+          <input ref={importInput} type="file" hidden accept=".toml,text/plain" onChange={onImport} />
+        </header>
+        <SettingsNavigation mobile page={pageId.value} disabled={expanded.value} onSelect={selectPage} />
+        <div inert={expanded.value} class="ks-mobile-view">{['settings', 'preview'].map(view => <button aria-pressed={mobileView.value === view} onClick={() => { releasePreview(); mobileView.value = view }}>{view === 'settings' ? '设置' : '预览'}</button>)}</div>
+        <div class="ks-workspace" data-mobile-view={mobileView.value}>
+          <SettingsNavigation page={pageId.value} disabled={expanded.value} onSelect={selectPage} />
+          <PaneDivider navigation value={navigationWidth.value} disabled={expanded.value} onStart={releasePreview} onChange={value => navigationWidth.value = value} />
+          <section class="ks-settings-pane" ref={settingsPane} tabindex="-1" aria-label="设置编辑区" inert={expanded.value}>
+            <div class="ks-settings-heading"><h1>{currentPage.value.label}</h1>{currentPage.value.mode && <code>{currentPage.value.mode}</code>}
+              {currentPage.value.tabs.length > 0 && <div class="ks-settings-tabs" aria-label="设置类型">{currentPage.value.tabs.map(tab => <button aria-pressed={selectedTab.value === tab} onClick={() => { releasePreview(); selectedTab.value = tab }}>{tabLabels[tab]}</button>)}</div>}
+            </div>
+            {selectedTab.value === 'keys' && currentPage.value.mode && renderKeyboard()}
+            {document.value && effectiveDocument.value && selectedTab.value !== 'keys' && <>
+              {['normal', 'grid', 'recursive_grid', 'ui_hint'].includes(pageId.value) && <CommonConfigControls page={pageId.value} tab={selectedTab.value} document={document.value} effectiveDocument={effectiveDocument.value} onChange={next => document.value = next} />}
+              {(pageId.value.startsWith('window') || ['grid', 'recursive_grid', 'ui_hint', 'key_help'].includes(pageId.value)) && <ModeStyleControls page={pageId.value} tab={selectedTab.value} mode={(pageId.value === 'window_card' ? 'window' : pageId.value) as any} appearance={appearance.value} document={document.value} effectiveDocument={effectiveDocument.value} onChange={next => document.value = next} onAppearanceChange={next => appearance.value = next} />}
+            </>}
+            {pageId.value === 'quick_switch' && renderQuickSwitch()}
+            {pageId.value === 'mode_usage' && renderUsage()}
+            {pageId.value === 'files' && renderFiles()}
+            {pageId.value === 'toml' && <div><button onClick={copyToml}>复制 TOML</button><p>下载保持局部配置；解析后不保留注释。</p><pre class="ks-toml"><code innerHTML={highlightToml(tomlPreview.value)} /></pre></div>}
           </section>
+          <PaneDivider value={settingsShare.value} disabled={expanded.value} onStart={releasePreview} onChange={value => settingsShare.value = value} />
+          <aside ref={previewPane} class={{ 'ks-preview-pane': true, 'is-expanded': expanded.value }} role={expanded.value ? 'dialog' : 'complementary'} aria-modal={expanded.value ? true : undefined} aria-label="实时预览" {...{ onKeydownCapture: previewDialogKey }}>
+            <div class="ks-preview-context"><span>编辑：{currentPage.value.label}</span><button onClick={() => { releasePreview(); setPreviewMode((pageId.value === 'window_card' ? 'window' : currentPage.value.mode && currentPage.value.mode !== 'hotkeys' ? currentPage.value.mode : 'normal') as any) }}>返回当前编辑模式</button>
+              <select aria-label="预览主题" value={appearance.value} onChange={e => appearance.value = (e.target as HTMLSelectElement).value as Appearance}><option value="light">浅色</option><option value="dark">深色</option></select>
+            </div>
+            {renderPreview()}
+          </aside>
         </div>
-        {document.value && effectiveDocument.value && (
-          <CommonConfigControls
-            document={document.value}
-            effectiveDocument={effectiveDocument.value}
-            onChange={(next) => { document.value = next }}
-          />
-        )}
       </div>
     )
   },
@@ -1153,6 +1329,7 @@ const KeyboardRows = defineComponent({
                     [`tone-${binding?.tone ?? 'none'}`]: Boolean(binding),
                   }}
                   aria-label={layer.literal ? `符号 ${layer.label}` : `按键 ${layer.label}`}
+                  data-map-key={layer.key} data-literal={Boolean(layer.literal)}
                   title={binding ? `${layer.key}: ${binding.text}` : layer.key}
                   onClick={() => props.onKey(layer)}
                 >
@@ -1198,6 +1375,7 @@ const Numpad = defineComponent({
                 [`tone-${binding?.tone ?? 'none'}`]: Boolean(binding),
               }}
               title={binding ? `${spec.key}: ${binding.text}` : spec.key}
+              data-map-key={spec.key} aria-label={`按键 ${spec.label}`}
               onClick={() => props.onKey(spec)}
             >
               <span>{spec.label}</span>

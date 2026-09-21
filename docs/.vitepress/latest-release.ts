@@ -85,3 +85,18 @@ export async function fetchLatestRelease(
   if (!release) throw new Error('GitHub latest release response has no valid release tag')
   return release
 }
+
+/** Development can run offline; publishing must use verified release metadata. */
+export async function loadLatestRelease(command: string, token?: string): Promise<LatestRelease> {
+  try {
+    return await fetchLatestRelease(
+      DOWNLOAD_TARGETS,
+      AbortSignal.timeout(command === 'serve' ? 3_000 : 15_000),
+      token,
+    )
+  } catch (error) {
+    if (command !== 'serve') throw error
+    console.warn('[docs] 无法获取最新 Release，本地预览继续启动；下载入口将指向 GitHub Releases。')
+    return { tag: 'Release unavailable · 本地预览', url: LATEST_RELEASE_URL, assets: {} }
+  }
+}

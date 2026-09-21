@@ -1,4 +1,5 @@
-import { computed, defineComponent } from 'vue'
+import { fieldLocation, type SettingsTab } from './navigation'
+import { defineComponent } from 'vue'
 import {
   cloneConfigDocument,
   deleteConfigPath,
@@ -7,60 +8,12 @@ import {
   type ConfigDocument,
 } from './document'
 
-type FieldKind = 'number' | 'boolean' | 'select' | 'text'
-
-interface ConfigField {
-  path: string
-  label: string
-  description: string
-  kind: FieldKind
-  min?: number
-  max?: number
-  step?: number
-  options?: Array<{ value: string; label: string }>
-}
-
-const frequentFields: ConfigField[] = [
-  { path: 'pointer.initial_speed', label: '起始速度', description: '方向键刚按下时的像素/秒', kind: 'number', min: 0, max: 10000, step: 50 },
-  { path: 'pointer.max_speed', label: '最高速度', description: '持续移动达到的像素/秒', kind: 'number', min: 0, max: 20000, step: 50 },
-  { path: 'pointer.acceleration', label: '加速度', description: '每秒增加的速度；0 表示保持初速', kind: 'number', min: 0, max: 30000, step: 100 },
-  { path: 'pointer.smooth_acceleration', label: '平滑加速', description: '开启 smootherstep S 曲线；关闭为线性', kind: 'boolean' },
-  { path: 'normal.passthrough_unbound_keys', label: '未绑定键透传', description: '仅接管完整命中的 KeySteer 绑定；关闭后 Normal 键盘独占', kind: 'boolean' },
-  { path: 'normal.long_press_toggle_ms', label: '长按切换', description: '点击键长按多少毫秒后切换持续按下；0 为关闭', kind: 'number', min: 0, max: 5000, step: 50 },
-  { path: 'normal.auto_release_ms', label: '停止拖动后释放', description: '长按点击键并按住物理修饰键拖动；停止多少毫秒后释放；0 为关闭', kind: 'number', min: 0, max: 60000, step: 50 },
-  { path: 'grid.max_depth', label: 'Grid 层数', description: '确认目标前需要输入的网格层数', kind: 'number', min: 1, max: 20, step: 1 },
-  { path: 'recursive_grid.max_depth', label: '递归上限', description: 'Recursive Grid 最大递归次数', kind: 'number', min: 1, max: 20, step: 1 },
-  { path: 'ui_hint.scan_scope', label: '扫描范围', description: '鼠标下窗口或鼠标所在的整块屏幕；跨屏自动重扫', kind: 'select', options: [
-    { value: 'window', label: '鼠标下窗口（默认）' },
-    { value: 'screen', label: '当前整屏' },
-  ] },
-  { path: 'ui_hint.strategy', label: 'UI 扫描', description: '视觉、辅助功能树，或两者并行合并', kind: 'select', options: [
-    { value: 'vision', label: 'Vision' },
-    { value: 'hybrid', label: 'Hybrid（默认）' },
-    { value: 'axtree', label: 'Accessibility Tree' },
-  ] },
-]
-
-const advancedFields: ConfigField[] = [
-  { path: 'pointer.tap_distance', label: '短按距离', description: '极短方向键操作仍移动的像素', kind: 'number', min: 0, max: 50, step: 0.1 },
-  { path: 'pointer.precision_multiplier', label: 'Precision 倍率', description: 'precision 修饰键的速度倍率', kind: 'number', min: 0.01, max: 2, step: 0.01 },
-  { path: 'pointer.slow_multiplier', label: 'Slow 倍率', description: 'slow 修饰键的速度倍率', kind: 'number', min: 0.01, max: 4, step: 0.05 },
-  { path: 'pointer.fast_multiplier', label: 'Fast 倍率', description: 'fast 修饰键的速度倍率', kind: 'number', min: 0.1, max: 10, step: 0.1 },
-  { path: 'scroll.scroll_step', label: '滚动步长', description: '普通滚动一次的像素距离', kind: 'number', min: 1, max: 5000, step: 10 },
-  { path: 'scroll.scroll_step_half', label: '半页滚动', description: 'scroll_half_* 的像素距离', kind: 'number', min: 1, max: 50000, step: 50 },
-  { path: 'grid.cursor_follow_selection', label: 'Grid 光标跟随', description: '每次选中后移到当前单元格中心', kind: 'boolean' },
-  { path: 'recursive_grid.cursor_follow_selection', label: '递归光标跟随', description: '每次选中后移到当前单元格中心', kind: 'boolean' },
-  { path: 'ui_hint.hint_characters', label: '提示字符', description: '用于生成 UI Hint 标签的字符集合', kind: 'text' },
-  { path: 'ui_hint.placement', label: '标签位置', description: '标签相对目标元素的位置', kind: 'select', options: [
-    { value: 'top', label: '上方' },
-    { value: 'center', label: '居中' },
-    { value: 'bottom', label: '下方' },
-  ] },
-]
-
+import { frequentFields, advancedFields, type ConfigField } from './fields'
 export default defineComponent({
   name: 'CommonConfigControls',
   props: {
+    tab: { type: String as () => SettingsTab, required: true },
+    page: { type: String, required: true },
     document: { type: Object as () => ConfigDocument, required: true },
     effectiveDocument: { type: Object as () => ConfigDocument, required: true },
   },
@@ -68,8 +21,6 @@ export default defineComponent({
     change: (_document: ConfigDocument) => true,
   },
   setup(props, { emit }) {
-    const inheritedCount = computed(() => frequentFields
-      .filter((field) => getConfigPath(props.document, field.path) === undefined).length)
 
     function update(path: string, value: unknown): void {
       const next = cloneConfigDocument(props.document)
@@ -85,7 +36,7 @@ export default defineComponent({
 
     const renderFields = (fields: ConfigField[]) => (
       <div class="ks-common-grid">
-        {fields.map((field) => (
+        {fields.filter(field => fieldLocation(field.path).page === props.page && fieldLocation(field.path).tab === props.tab).map((field) => (
           <ConfigControl
             field={field}
             value={getConfigPath(props.effectiveDocument, field.path)}
@@ -101,14 +52,14 @@ export default defineComponent({
       <section class="ks-card ks-common-card">
         <div class="ks-toolbar ks-compact-toolbar">
           <div>
-            <h2>常用设置</h2>
-            <p>优先保留会频繁调整的移动、点击与定位参数；{inheritedCount.value} 项正在继承内置默认值。</p>
+            <h2>{props.tab === 'appearance' ? '常用外观' : '常用参数'}</h2>
+            <p>调整当前功能的行为；未修改的参数继续继承内置默认值。</p>
           </div>
         </div>
         <div class="ks-common-body">
           {renderFields(frequentFields)}
           <details class="ks-advanced-settings">
-            <summary>速度倍率、滚动与定位细节</summary>
+            <summary>高级设置</summary>
             <p>这些设置通常无需修改；展开后仍会写回同一份 TOML。</p>
             {renderFields(advancedFields)}
           </details>
@@ -150,7 +101,7 @@ const ConfigControl = defineComponent({
         />
       )
       return (
-        <label class="ks-common-control" title={field.path}>
+        <label class="ks-common-control" title={field.path} data-config-path={field.path}>
           <span class="ks-common-copy">
             <strong>{field.label}</strong>
             <small>{field.description}</small>

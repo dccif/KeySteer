@@ -2,7 +2,7 @@
   "name": "keysteer-docs",
   "private": true,
   "type": "module",
-  "packageManager": "pnpm@12.4.1",
+  "packageManager": "pnpm@12.5.1",
   "engines": {
     "node": ">=24"
   },
@@ -26,6 +26,6 @@
     "typescript": "7.0.2",
     "vitepress": "1.6.4",
     "vitepress-plugin-mermaid": "^2.0.17",
-    "vue": "3.5.42"
+    "vue": "3.5.43"
   }
 }

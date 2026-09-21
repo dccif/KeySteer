@@ -115,7 +115,11 @@ macOS：
 ## 文档站
 
 - `docs/.vitepress/components/ConfigStudio.tsx`：键盘绑定编辑器、屏幕预览、TOML 导入/下载。
-- `docs/.vitepress/config-studio/ModeStyleControls.tsx`：三种 targeting mode 的轻量样式编辑。
+- `docs/.vitepress/config-studio/navigation.ts`：展示分类、模式名称、页签、字段归属与搜索；不参与 TOML 序列化。
+- `docs/.vitepress/config-studio/fields.ts`：现有可视化字段及搜索标签；`SettingsNavigation.tsx` 提供桌面分类和窄屏两级选择。
+- `docs/.vitepress/config-studio/PaneDivider.tsx`：可拖动和键盘调整的工作区分隔条，仅改变展示宽度。
+- `docs/.vitepress/config-studio/FittedKeyboard.tsx`：观察容器和完整键盘尺寸，等比缩放并保留正确点击／拖放坐标，避免键帽裁切和嵌套滚动。
+- `docs/.vitepress/config-studio/ModeStyleControls.tsx`、`CommonConfigControls.tsx`：按当前页面和页签筛选字段，共用窗口卡片样式只在共用外观编辑。
 - `docs/.vitepress/simulator/`：浏览器端配置交接、绑定继承和鼠标状态模型及测试。
 - `docs/.vitepress/theme/custom.css`：独立模拟器与文档主题样式。
 - 文档站只模拟和可视化配置，不加载 Rust/WASM 校验器；真实校验仍由程序和 Rust 测试完成。
