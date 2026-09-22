@@ -12,6 +12,7 @@
 //! [`ModeEvent::Binding`].
 
 mod config_handoff;
+mod configuration_work;
 mod input_router;
 mod input_state;
 mod key_help;
@@ -143,6 +144,7 @@ pub struct Engine {
     pending_runtime_error: Option<RuntimeError>,
     should_quit: bool,
     configuration: Option<Box<dyn ConfigurationRepository>>,
+    configuration_work: configuration_work::ConfigurationWork,
     window_presets: window_presets::PresetController,
     quick_switch: quick_switch::QuickSwitcher,
     /// Prevent rapid status-menu clicks from opening duplicate browser tabs.
@@ -193,6 +195,7 @@ impl Engine {
             pending_runtime_error: None,
             should_quit: false,
             configuration: None,
+            configuration_work: Default::default(),
             window_presets: window_presets::PresetController::default(),
             quick_switch: Default::default(),
             last_config_simulator_open: None,
@@ -281,14 +284,11 @@ impl Engine {
         errors.into_result()
     }
 
-    fn recover_from_input_error(&mut self, error: &str, backend: &mut dyn Backend) -> bool {
+    fn recover_from_input_error(&mut self, backend: &mut dyn Backend) -> bool {
         let Some(RuntimeError::RecoverableInput(message)) = self.pending_runtime_error.take()
         else {
             return false;
         };
-        if message != error {
-            return false;
-        }
         self.reset_runtime_input_state(&message, false, backend);
         true
     }
@@ -300,19 +300,8 @@ impl Engine {
         backend: &mut dyn Backend,
     ) {
         self.cancel_quick_switch(capture_lost);
-        if !self.input_failure_active {
-            crate::support::logging::report_error(
-                "input",
-                if capture_lost {
-                    format!(
-                        "{message}; stale physical input was discarded and runtime input state was reset"
-                    )
-                } else {
-                    format!("{message}; this action was rejected and runtime input state was reset")
-                },
-            );
-            self.input_failure_active = true;
-        }
+        self.retire_workspace_requests(None);
+        let mut recovery_errors = crate::support::errors::ErrorBundle::default();
 
         if capture_lost {
             // The native capture source has stopped, so the matching physical
@@ -323,12 +312,13 @@ impl Engine {
 
         let previous = self.registry.active.clone();
         if let Err(cancel_error) = self.cancel_transient_clicks(backend) {
-            crate::support::logging::report_error(
-                "input",
-                format!("cannot cancel pending mouse presses during recovery: {cancel_error}"),
-            );
+            recovery_errors.push("cancel pending mouse presses", cancel_error);
         }
         self.input.reset_for_plan_swap();
+        if let Err(release_error) = self.release_latched(backend) {
+            recovery_errors.push("release held inputs", release_error);
+        }
+
         for owner in self.registry.modal_stack.clone() {
             let context = HostContext {
                 presenter: &crate::presentation::COMPOSER,
@@ -350,22 +340,10 @@ impl Engine {
         }
         self.scheduler.reset();
         if let Err(cancel_error) = self.cancel_all_scans(backend) {
-            crate::support::logging::report_error(
-                "ui-scan",
-                format!("cannot cancel scans during input recovery: {cancel_error}"),
-            );
+            recovery_errors.push("cancel scans", cancel_error);
         }
         if let Err(clock_error) = backend.set_frame_clock(false) {
-            self.trace_lazy(self.settings.debug.backend, "backend", || {
-                format!("cannot stop frame clock during input recovery: {clock_error}")
-            });
-        }
-
-        if let Err(release_error) = self.release_latched(backend) {
-            crate::support::logging::report_error(
-                "input",
-                format!("cannot release every held input during recovery: {release_error}"),
-            );
+            recovery_errors.push("stop frame clock", clock_error);
         }
 
         if previous != ModeId::idle() {
@@ -400,16 +378,31 @@ impl Engine {
         }
 
         if let Err(dismiss_error) = backend.dismiss() {
-            crate::support::logging::report_error(
-                "overlay",
-                format!("cannot dismiss overlay during input recovery: {dismiss_error}"),
-            );
+            recovery_errors.push("dismiss overlay", dismiss_error);
         }
         // Keep the logical state clean even if the native window was already
         // unavailable. A later scene must be rebuilt from scratch.
         self.overlay.content = None;
         self.overlay.last_scene = None;
         self.overlay.visible = false;
+        // Input and UI recovery must complete before any diagnostic I/O.
+        if !self.input_failure_active {
+            crate::support::logging::report_error(
+                "input",
+                if capture_lost {
+                    format!(
+                        "{message}; stale physical input was discarded and runtime input state was reset"
+                    )
+                } else {
+                    format!("{message}; this action was rejected and runtime input state was reset")
+                },
+            );
+            self.input_failure_active = true;
+        }
+
+        if let Err(error) = recovery_errors.into_result() {
+            crate::report_error!("input-recovery", "operation=cleanup: {error}");
+        }
     }
 
     fn recoverable_input_succeeded(&mut self) {
@@ -417,7 +410,7 @@ impl Engine {
     }
 
     fn report_action_error(&mut self, error: String, backend: &mut dyn Backend) {
-        if !self.recover_from_input_error(&error, backend) {
+        if !self.recover_from_input_error(backend) {
             crate::support::logging::report_error("action", format!("action failed: {error}"));
         }
     }
@@ -548,7 +541,7 @@ impl Engine {
         if let Some(event) = backend.poll(timeout)? {
             let event_result = self.handle_backend_event(event, backend);
             if let Err(error) = event_result
-                && !self.recover_from_input_error(&error, backend)
+                && !self.recover_from_input_error(backend)
             {
                 return Err(error);
             }
@@ -556,25 +549,25 @@ impl Engine {
         let long_press_result = self.fire_due_long_press_toggles(backend);
         self.fire_quick_switch(backend)?;
         if let Err(error) = long_press_result
-            && !self.recover_from_input_error(&error, backend)
+            && !self.recover_from_input_error(backend)
         {
             return Err(error);
         }
         let drag_release_result = self.fire_due_drag_auto_release(backend);
         if let Err(error) = drag_release_result
-            && !self.recover_from_input_error(&error, backend)
+            && !self.recover_from_input_error(backend)
         {
             return Err(error);
         }
         let timer_result = self.fire_due_timers(backend);
         if let Err(error) = timer_result
-            && !self.recover_from_input_error(&error, backend)
+            && !self.recover_from_input_error(backend)
         {
             return Err(error);
         }
         let sequence_result = self.fire_due_sequences(backend);
         if let Err(error) = sequence_result
-            && !self.recover_from_input_error(&error, backend)
+            && !self.recover_from_input_error(backend)
         {
             return Err(error);
         }
@@ -589,7 +582,6 @@ impl Engine {
     ) -> Result<(), String> {
         let mut errors = crate::support::errors::ErrorBundle::default();
         errors.record("runtime", result);
-        errors.record("save mode usage", self.window_presets.store.flush_usage());
         for session in std::mem::take(&mut self.scheduler.audio_sessions).into_keys() {
             backend.cancel_audio_session(session);
         }
@@ -606,6 +598,8 @@ impl Engine {
         errors.record("release held inputs", self.release_latched(backend));
         errors.record("dismiss overlay", backend.dismiss());
         self.overlay.reset();
+        errors.record("finish configuration", self.configuration_work.shutdown());
+        errors.record("save workspace", self.window_presets.store.flush_usage());
         let shutdown = backend.shutdown();
         let shutdown_succeeded = shutdown.is_ok();
         errors.record("backend shutdown", shutdown);
@@ -804,16 +798,7 @@ impl Engine {
                     .as_ref()
                     .ok_or_else(|| "no configuration source is attached".to_string())?
                     .source_text()?;
-                let layouts = self.window_presets.store.export_file();
-                if let Err(error) = &layouts {
-                    crate::report_error!("window-presets", "{error}");
-                }
-                let url = config_handoff::url_for_workspace(&source, layouts);
-                if let Err(error) = backend.open_url(&url) {
-                    crate::support::logging::report_error("config-simulator", error);
-                } else {
-                    self.last_config_simulator_open = Some(now);
-                }
+                self.export_workspace(source, backend)?;
             }
             BackendEvent::ToggleEnabled => {
                 self.enabled = !self.enabled;
@@ -852,11 +837,10 @@ impl Engine {
                 }
             }
             BackendEvent::Quit => self.should_quit = true,
-            BackendEvent::SaveWorkspace(reply) => {
-                if let Err(error) = self.window_presets.store.flush_usage() {
-                    crate::report_error!("mode-usage", "{error}");
-                }
-                let _ = reply.send(());
+            BackendEvent::ConfigurationReady => self.finish_configuration(backend)?,
+            BackendEvent::SaveWorkspace(reply) => self.checkpoint_workspace(reply, backend)?,
+            BackendEvent::WorkspaceCompleted(completed) => {
+                self.finish_workspace(*completed, backend)?
             }
             BackendEvent::Warning(message) => {
                 crate::report_warning!("backend", "{message}")
@@ -866,39 +850,7 @@ impl Engine {
     }
 
     fn reload_config(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
-        // The adapter parses, validates and compiles into a detached candidate.
-        // Nothing owned by the active runtime is touched on failure.
-        let candidate = self
-            .configuration
-            .as_ref()
-            .ok_or_else(|| "no configuration source is attached".to_string())?
-            .reload_candidate()
-            .map_err(|error| {
-                format!(
-                    "configuration reload rejected; keeping the last valid configuration: {error}"
-                )
-            })?;
-        let ConfigurationCandidate {
-            plan,
-            repository,
-            source_path,
-        } = candidate;
-        self.apply_runtime_plan(plan, backend)?;
-        self.configuration = Some(repository);
-        let discovered_path = source_path;
-        if let Some(path) = discovered_path {
-            crate::log_info!(
-                "config",
-                "configuration reloaded successfully from {}",
-                path.display()
-            );
-        } else {
-            crate::log_info!(
-                "config",
-                "no configuration file found during reload; using built-in defaults"
-            );
-        }
-        Ok(())
+        self.request_configuration(configuration_work::Operation::Reload, backend)
     }
 
     /// Swap in a precompiled plan without restarting runtime-owned tasks.
@@ -942,6 +894,7 @@ impl Engine {
             .map(|spec| (spec.id(), spec.route.clone()))
             .collect();
 
+        self.retire_workspace_requests(None);
         // Keep physical pressed/disposition pairs until their real KeyUp, but
         // retire every task and every synthetic input owned by the old plan.
         let previous = self.registry.active.clone();
@@ -1036,6 +989,7 @@ impl Engine {
         }
 
         if target != self.registry.active {
+            self.retire_workspace_requests(Some(&self.registry.active.clone()));
             // Native text entry belongs to the outgoing interaction, even when
             // its final layout acknowledgement defers the actual mode switch.
             if self
@@ -1645,27 +1599,10 @@ impl Engine {
                 }
 
                 Command::SetConfigValue { path, value } => {
-                    let update = self
-                        .configuration
-                        .as_ref()
-                        .ok_or_else(|| "no writable configuration source is attached".to_string())
-                        .and_then(|repository| repository.set_candidate(&path, &value));
-                    match update {
-                        Ok(candidate) => {
-                            let ConfigurationCandidate {
-                                plan,
-                                repository,
-                                source_path: _,
-                            } = candidate;
-                            self.apply_runtime_plan(plan, backend)?;
-                            self.configuration = Some(repository);
-                        }
-                        Err(error) => {
-                            return Err(format!(
-                                "set_config {path} rejected; keeping the last valid configuration: {error}"
-                            ));
-                        }
-                    }
+                    self.request_configuration(
+                        configuration_work::Operation::Set { path, value },
+                        backend,
+                    )?;
                 }
                 Command::ReloadConfig => self.reload_config(backend)?,
 

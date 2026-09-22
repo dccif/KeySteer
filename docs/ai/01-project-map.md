@@ -114,11 +114,16 @@ macOS：
 
 ## 文档站
 
+- `docs/.vitepress/release-history.ts`：为启用 `releaseHistory` 的 Markdown 页面折叠首个版本之后的更新说明，保留原始标题和锚点。
+
+- `docs/.vitepress/config-studio/i18n.ts`、`messages.ts`：实例级中英文语言状态与集中显示文案，供页面、控件及双语搜索复用，不修改配置数据。
+
 - `docs/.vitepress/components/ConfigStudio.tsx`：键盘绑定编辑器、屏幕预览、TOML 导入/下载。
 - `docs/.vitepress/config-studio/navigation.ts`：展示分类、模式名称、页签、字段归属与搜索；不参与 TOML 序列化。
 - `docs/.vitepress/config-studio/fields.ts`：现有可视化字段及搜索标签；`SettingsNavigation.tsx` 提供桌面分类和窄屏两级选择。
 - `docs/.vitepress/config-studio/PaneDivider.tsx`：可拖动和键盘调整的工作区分隔条，仅改变展示宽度。
 - `docs/.vitepress/config-studio/FittedKeyboard.tsx`：观察容器和完整键盘尺寸，等比缩放并保留正确点击／拖放坐标，避免键帽裁切和嵌套滚动。
+- `docs/.vitepress/simulator/grid-region.ts`：Grid／Recursive Grid 选键路径到百分比区域的公共计算，供网格预览和模拟指针复用。
 - `docs/.vitepress/config-studio/ModeStyleControls.tsx`、`CommonConfigControls.tsx`：按当前页面和页签筛选字段，共用窗口卡片样式只在共用外观编辑。
 - `docs/.vitepress/simulator/`：浏览器端配置交接、绑定继承和鼠标状态模型及测试。
 - `docs/.vitepress/theme/custom.css`：独立模拟器与文档主题样式。
@@ -153,3 +158,11 @@ macOS：
 
 
 窗口可见元数据匹配：src/platform/common/window_visibility.rs 提供可跨平台测试的矩形／标题消歧，macOS AX 与 Quartz 枚举使用；范围与编号仍由 window_tabs 的公共协调层负责。
+
+
+## 响应路径的职责拆分
+
+`platform/common/window_session/` 的 `access` 定义原生能力端口，`worker` 管理有界队列和唤醒，`confirmation` 管理普通几何的提交／读回，`history` 管理紧凑撤销快照，`overlap` 管理相交缓存；父模块保留会话状态与事务协调。Windows 的 `native/gdi.rs` 和 `native/uia_cache.rs` 分别封装字体／选入 DC 的生命周期与 UIA 缓存属性读取。`app/preset_store/usage.rs` 复用单个惰性 workspace-io worker，串行处理布局库操作和使用次数落盘。
+
+- `app/runtime/configuration_work.rs`：按序运行配置读取、编译与持久化；Engine 接受候选后才启动下一项。
+- `platform/common/window_session/layout_confirmation.rs`：布局提交、独立确认、失败回滚与取消编辑恢复；复用 confirmation 的原生状态／几何状态机。

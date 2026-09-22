@@ -16,6 +16,10 @@ use std::time::Duration;
 /// Something that happened natively and must reach the engine.
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
+    /// Wake only; the application retains the compiled candidate and ownership.
+    ConfigurationReady,
+    /// Completed application-owned persistence work. Native backends only route it.
+    WorkspaceCompleted(Box<super::window_presets::WorkspaceCompletion>),
     AudioResult(Box<super::audio::AudioResult>),
     WindowResult(Box<super::window::WindowResult>),
     /// A key was pressed or released.
@@ -110,6 +114,11 @@ pub enum KeyDisposition {
 /// A native backend. Implementations live in `src/platform/<os>.rs` and are
 /// selected by `cfg(target_os)` in `src/platform/mod.rs`.
 pub trait Backend {
+    /// Thread-safe event delivery including the platform event-loop wakeup.
+    /// Headless backends may omit it and use synchronous in-memory repositories.
+    fn event_sink(&self) -> Option<Arc<dyn Fn(BackendEvent) + Send + Sync>> {
+        None
+    }
     /// Optional foreground geometry, queried only when opening a window-centered panel.
     fn focused_window_bounds(&self) -> Result<Option<super::geometry::Rect>, String> {
         Ok(None)

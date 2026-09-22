@@ -147,7 +147,12 @@ fn window_scenes_match_pre_optimization_baseline() {
             }
         }
     }
-    let expected: Vec<_> = include_str!("../../../tests/fixtures/window-scenes-c7bff963.txt")
+    let fixture = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/window-scenes-c7bff963.txt"
+    ))
+    .expect("the independently captured c7bff963 scene fixture must be installed");
+    let expected: Vec<_> = fixture
         .lines()
         .filter(|line| !line.starts_with('#'))
         .collect();

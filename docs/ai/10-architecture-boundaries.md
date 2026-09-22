@@ -37,3 +37,12 @@ modal stack 和生命周期；其他三个协作者分别独占输入配对、de
 释放 KeySteer 拥有的合成输入，替换完整 Mode/Plugin 集和路由，再进入新计划的 Idle。物理按键
 的 pressed/disposition 记录保留到真实 KeyUp，因此不会吞 Down 却放行 Up。Mode 不接收
 `ConfigReloaded`，`HostContext` 也不暴露配置。
+
+
+## 工作区与原生资源的所有权
+
+PresetRepository 增加异步提交端口，具体仓库拥有磁盘 worker 和有界 mailbox；Runtime 只拥有请求的完成归属，不持有文件锁或工作线程。完成消息使用 api 类型并经 Backend 已有事件发送端唤醒 Engine。模式结束可以撤销完成路由，但不回滚已提交写入；持久化写操作仍串行，退出等待由仓库统一负责。
+
+窗口会话的状态、排队策略、确认状态机、历史和相交缓存分模块高内聚，仍在同一 crate，不增加动态分发层或每操作分配的策略对象。原生 handle 的 owning wrapper 与 borrowing guard 放在 platform/windows/native，portable 层继续禁止 unsafe。
+
+配置 I/O 的实现仍在应用层 repository，runtime 的配置 worker 只经 ConfigurationRepository 端口执行；ConfigurationReady 事件不携带应用层类型。窗口布局确认与失败回滚集中在公共 window_session，不让 Mode / Engine 获取原生句柄。

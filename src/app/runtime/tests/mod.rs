@@ -78,6 +78,7 @@ struct Recorder {
 }
 
 struct FakeBackend {
+    event_sender: Option<std::sync::mpsc::Sender<BackendEvent>>,
     fail_next_disposition: bool,
     window_move_pointer: Option<Point>,
     fail_window_move: bool,
@@ -95,6 +96,7 @@ impl FakeBackend {
         let log = Arc::new(Mutex::new(Recorder::default()));
         (
             Self {
+                event_sender: None,
                 fail_next_disposition: false,
                 window_move_pointer: None,
                 fail_window_move: false,
@@ -112,6 +114,14 @@ impl FakeBackend {
 }
 
 impl Backend for FakeBackend {
+    fn event_sink(&self) -> Option<Arc<dyn Fn(BackendEvent) + Send + Sync>> {
+        self.event_sender.clone().map(|sender| {
+            Arc::new(move |event| {
+                let _ = sender.send(event);
+            }) as _
+        })
+    }
+
     fn request_text_prompt(
         &mut self,
         prompt: crate::api::window_presets::TextPrompt,
@@ -556,3 +566,5 @@ include!("reload_scheduler.rs");
 include!("window_mover.rs");
 include!("window_mode.rs");
 include!("quick_switch.rs");
+
+include!("configuration_async.rs");

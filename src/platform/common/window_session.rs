@@ -1,10 +1,23 @@
 //! Lazy, bounded window-operation worker. Native references are created and
 //! released on its thread; only API values enter the engine's event queue.
 
+mod access;
+mod confirmation;
+mod history;
+mod layout_confirmation;
+mod overlap;
+mod worker;
+pub(crate) use access::WindowAccess;
+use confirmation::PendingAdjustment;
+use history::PlacementSnapshot;
+use overlap::OverlapCache;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+pub(crate) use worker::WindowWorker;
+#[cfg(test)]
+use worker::execute_audio;
 
 use super::{window_geometry as geometry, window_placement};
 use crate::api::window::{
@@ -20,828 +33,22 @@ pub(crate) struct Snapshot {
     pub restored: Rect,
 }
 
-/// Cache only geometry and identity: activation's Z-order changes do not alter
-/// connectivity. All scratch storage survives successive worker requests.
-#[derive(Default)]
-struct OverlapCache {
-    inventory: Vec<(WindowId, Rect)>,
-    members: Vec<WindowId>,
-    queue: Vec<usize>,
-    #[cfg(test)]
-    comparisons: usize,
-}
-
-impl OverlapCache {
-    fn contains(&self, id: WindowId) -> bool {
-        self.members.binary_search(&id).is_ok()
-    }
-
-    fn prepare(
-        &mut self,
-        windows: &[WindowInfo],
-        anchor: Option<WindowId>,
-        cancelled: &dyn Fn() -> bool,
-    ) {
-        // Validate every live rectangle, including windows outside the cached
-        // component: moving one of those can create a new connecting bridge.
-        let changed = windows.len() != self.inventory.len()
-            || windows.iter().any(|window| {
-                self.inventory
-                    .binary_search_by_key(&window.id, |&(id, _)| id)
-                    .ok()
-                    .is_none_or(|index| self.inventory[index].1 != window.bounds)
-            });
-        if changed {
-            self.inventory.clear();
-            self.inventory
-                .extend(windows.iter().map(|w| (w.id, w.bounds)));
-            self.inventory.sort_unstable_by_key(|&(id, _)| id);
-            self.members.clear();
-            self.queue.clear();
-            // Do not retain a historic peak after most windows have closed.
-            // Hysteresis avoids reallocating for ordinary small fluctuations.
-            fn trim<T>(buffer: &mut Vec<T>, count: usize) {
-                if buffer.capacity() > count.saturating_mul(4).max(64) {
-                    buffer.shrink_to(count.saturating_mul(2));
-                }
-            }
-            trim(&mut self.inventory, windows.len());
-            trim(&mut self.members, windows.len());
-            trim(&mut self.queue, windows.len());
-        }
-        if anchor.is_some_and(|id| self.contains(id)) {
-            return;
-        }
-        self.members.clear();
-        let Some(start) =
-            anchor.and_then(|id| self.inventory.binary_search_by_key(&id, |&(id, _)| id).ok())
-        else {
-            return;
-        };
-        self.queue.clear();
-        self.queue.extend(0..self.inventory.len());
-        self.queue.swap(0, start);
-        // One array holds both the discovered prefix and the unvisited suffix.
-        let mut discovered = 1;
-        let mut head = 0;
-        while head < discovered && discovered < self.queue.len() {
-            if cancelled() {
-                // Never publish a partial component as a reusable cache hit.
-                return;
-            }
-            let bounds = self.inventory[self.queue[head]].1;
-            head += 1;
-            let unvisited_start = discovered;
-            for i in unvisited_start..self.queue.len() {
-                let index = self.queue[i];
-                #[cfg(test)]
-                {
-                    self.comparisons += 1;
-                }
-                if bounds.intersect(&self.inventory[index].1).is_some() {
-                    self.queue.swap(i, discovered);
-                    discovered += 1;
-                }
-            }
-        }
-        self.members.extend(
-            self.queue[..discovered]
-                .iter()
-                .map(|&i| self.inventory[i].0),
-        );
-        self.members.sort_unstable();
-    }
-}
-
-pub(crate) trait WindowAccess {
-    /// Bound temporary native objects to a work batch, never to the idle wait.
-    fn native_batch<R>(work: impl FnOnce() -> R) -> R {
-        work()
-    }
-
-    fn set_scope(&mut self, _scope: Option<crate::api::window::WindowScope>, _reset: bool) {}
-    /// Optional native message-loop wakeup, created on the worker thread.
-    fn event_waker(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
-        None
-    }
-    /// Wait for native events or the mailbox wakeup. False uses the portable condvar.
-    fn wait_for_events(&self, _timeout: Option<Duration>) -> bool {
-        false
-    }
-    /// Hide a single application window without changing its parent.
-    fn tab_set_hidden(&mut self, _id: WindowId, _hidden: bool) -> Result<(), String> {
-        Ok(())
-    }
-    /// Validate queued focus notifications against the current foreground window.
-    fn tab_selected(&self, _id: WindowId) -> bool {
-        true
-    }
-    fn activate_window(
-        &mut self,
-        id: WindowId,
-        _screens: &[Screen],
-        _cancelled: &dyn Fn() -> bool,
-    ) -> Result<(), String> {
-        self.select(id)
-    }
-    fn tab_operation(
-        &mut self,
-        _operation: crate::api::window_tabs::TabOperation,
-        _screens: &[Screen],
-        _cancelled: &dyn Fn() -> bool,
-    ) -> Result<(), String> {
-        Err("Window tab groups are unavailable on this backend".into())
-    }
-    /// Update one existing bar without changing group membership. False asks
-    /// the adapter to use the full-list compatibility path.
-    fn tab_bar_update(&mut self, _bar: &crate::api::window_tabs::TabBar) -> Result<bool, String> {
-        Ok(false)
-    }
-    fn tab_geometry(
-        &self,
-        id: WindowId,
-        _previous: &Snapshot,
-        screens: &[Screen],
-    ) -> Result<Snapshot, String> {
-        self.snapshot(id, screens)
-    }
-    fn tab_interacting(&self, _id: WindowId) -> bool {
-        false
-    }
-    fn tab_state(&self) -> Option<crate::api::window_tabs::TabState> {
-        None
-    }
-    fn tab_eligible(&self, id: WindowId, screens: &[Screen]) -> Result<(), String> {
-        let window = self.snapshot(id, screens)?.info;
-        if !window.resizable || window.fullscreen {
-            return Err("Only ordinary resizable windows can join a tab group".into());
-        }
-        Ok(())
-    }
-    fn tab_events(&mut self) -> Vec<crate::api::window_tabs::TabNativeEvent> {
-        Vec::new()
-    }
-    fn tab_watch(&mut self, _ids: &[WindowId]) -> Result<(), String> {
-        Ok(())
-    }
-    fn tab_bars(&mut self, _bars: &[crate::api::window_tabs::TabBar]) -> Result<(), String> {
-        Ok(())
-    }
-    fn tab_visible(&self, _id: WindowId) -> bool {
-        true
-    }
-    /// Occupied header height in this backend's screen coordinate system.
-    /// Headless adapters have no native strip.
-    fn tab_bar_height(&self, _screen: &Screen) -> f64 {
-        0.0
-    }
-    /// Minimize a member without restoring or moving an inactive window first.
-    fn tab_minimize(
-        &mut self,
-        id: WindowId,
-        screens: &[Screen],
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<(), String> {
-        let mut snapshot = self.snapshot(id, screens)?;
-        if !snapshot.info.minimized {
-            snapshot.info.minimized = true;
-            self.restore(&snapshot, screens, cancelled)?;
-        }
-        Ok(())
-    }
-    /// Reserve strip space after an external move/maximize, preserving state
-    /// where the platform supports resizing a maximized window in place.
-    fn tab_fit_frame(
-        &mut self,
-        id: WindowId,
-        bounds: Rect,
-        screens: &[Screen],
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<WindowInfo, String> {
-        self.set_frame(id, bounds, screens, cancelled)
-    }
-    fn layout_representative(&self, id: WindowId) -> WindowId {
-        id
-    }
-    fn acquire(&mut self, point: Point, screens: &[Screen]) -> Result<Option<WindowInfo>, String>;
-    fn enumerate(
-        &mut self,
-        screens: &[Screen],
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<Vec<WindowInfo>, String>;
-    fn snapshot(&self, id: WindowId, screens: &[Screen]) -> Result<Snapshot, String>;
-    fn set_frame(
-        &mut self,
-        id: WindowId,
-        rect: Rect,
-        screens: &[Screen],
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<WindowInfo, String>;
-    fn restore(
-        &mut self,
-        snapshot: &Snapshot,
-        screens: &[Screen],
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<WindowInfo, String>;
-    fn cycle_state(
-        &mut self,
-        id: WindowId,
-        screens: &[Screen],
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<WindowInfo, String>;
-    fn toggle_state(
-        &mut self,
-        id: WindowId,
-        minimize: bool,
-        screens: &[Screen],
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<WindowInfo, String> {
-        let before = self.snapshot(id, screens)?;
-        if cancelled() {
-            return Ok(before.info);
-        }
-        if before.info.minimized || (!minimize && before.info.maximized) {
-            self.set_frame(id, before.restored, screens, cancelled)
-        } else if minimize {
-            self.tab_minimize(id, screens, cancelled)?;
-            self.snapshot(id, screens).map(|s| s.info)
-        } else {
-            self.cycle_state(id, screens, cancelled)
-        }
-    }
-    fn select(&self, id: WindowId) -> Result<(), String>;
-    /// Resolve native foreground identity after refreshing the inventory.
-    fn focused_window(&self, _windows: &[WindowInfo]) -> Option<WindowId> {
-        None
-    }
-    /// Hit-test without activating, assigning numbers or changing tab selection.
-    fn pointer_window(&mut self, screens: &[Screen]) -> Result<Option<WindowId>, String> {
-        let point = self.pointer()?;
-        Ok(self.acquire(point, screens)?.map(|window| window.id))
-    }
-    /// Reap native audio routes; true requests a bounded maintenance wakeup.
-    fn maintain_audio(&self) -> bool {
-        false
-    }
-    fn audio_factory(&self) -> Option<super::audio_worker::AudioFactory> {
-        None
-    }
-    fn audio_process(
-        &self,
-        target: crate::api::audio::AudioTarget,
-    ) -> Result<Option<super::audio_worker::AudioProcess>, String> {
-        match target {
-            crate::api::audio::AudioTarget::System => Ok(None),
-            _ => Err("Application audio identity is unavailable".into()),
-        }
-    }
-    fn system_audio(&self, _change: crate::api::audio::AudioAction) -> Result<String, String> {
-        Err("System audio control is unavailable on this backend".into())
-    }
-    fn volume(
-        &self,
-        _id: WindowId,
-        _change: crate::api::audio::AudioAction,
-    ) -> Result<String, String> {
-        Err("Application volume control is unavailable on this backend".into())
-    }
-    fn close(&self, _id: WindowId) -> Result<(), String> {
-        Err("Closing windows is unavailable on this backend".into())
-    }
-    fn pointer(&self) -> Result<Point, String>;
-    fn minimum_size(&self, _id: WindowId) -> Point {
-        Point::new(100.0, 80.0)
-    }
-    fn logical_scale(&self, _screen: &Screen) -> f64 {
-        1.0
-    }
-    fn move_fullscreen(
-        &mut self,
-        _id: WindowId,
-        _destination: crate::api::command::WindowScreenTarget,
-        _screens: &[Screen],
-        _cancelled: &dyn Fn() -> bool,
-    ) -> Result<(WindowInfo, Option<Point>), String> {
-        Err("moving native fullscreen windows is not supported".into())
-    }
-    fn reset(&mut self);
-    fn take_closed(&mut self) -> Vec<WindowId> {
-        Vec::new()
-    }
-}
-
-enum Pending {
-    ClearOverlap,
-    Window {
-        request: WindowRequest,
-        screens: Vec<Screen>,
-    },
-    Audio(crate::api::audio::AudioRequest, Arc<AtomicBool>),
-}
-impl Pending {
-    fn operation(&self) -> Option<&WindowOperation> {
-        match self {
-            Self::Window { request, .. } => Some(&request.operation),
-            Self::Audio(..) | Self::ClearOverlap => None,
-        }
-    }
-}
-
-fn execute_audio(
-    access: &impl WindowAccess,
-    request: crate::api::audio::AudioRequest,
-) -> crate::api::audio::AudioResult {
-    use crate::api::audio::AudioTarget;
-    let outcome = match request.target {
-        AudioTarget::Application(id) => access.volume(id, request.action),
-        AudioTarget::System => access.system_audio(request.action),
-    };
-    crate::api::audio::AudioResult {
-        session: request.session,
-        id: request.id,
-        outcome,
-    }
-}
-
-#[derive(Default)]
-struct Mailbox {
-    queue: Mutex<VecDeque<Pending>>,
-    ready: Condvar,
-    audio_tokens: Mutex<std::collections::BTreeMap<u64, Arc<AtomicBool>>>,
-    session: AtomicU64,
-    cancel_before: AtomicU64,
-    query_before: AtomicU64,
-    stop: AtomicBool,
-    native_waker: OnceLock<Arc<dyn Fn() + Send + Sync>>,
-    native_waiting: AtomicBool,
-}
-
-impl Mailbox {
-    fn notify(&self) {
-        self.ready.notify_one();
-        if self.native_waiting.load(Ordering::Acquire)
-            && let Some(wake) = self.native_waker.get()
-        {
-            wake();
-        }
-    }
-}
-
-pub(crate) struct WindowWorker {
-    mailbox: Arc<Mailbox>,
-    worker: WorkerJoin,
-}
-
-impl WindowWorker {
-    pub(crate) fn clear_overlap_cache(&self) {
-        let mut queue = self.mailbox.queue.lock().unwrap_or_else(|e| e.into_inner());
-        queue.retain(|pending| {
-            !matches!(
-                pending.operation(),
-                Some(WindowOperation::CycleOverlapping { .. })
-            ) && !matches!(pending, Pending::ClearOverlap)
-        });
-        queue.push_back(Pending::ClearOverlap);
-        self.mailbox.notify();
-    }
-    pub(crate) fn start<A: WindowAccess + 'static>(
-        create: impl FnOnce() -> A + Send + 'static,
-        emit: impl Fn(BackendEvent) + Send + Sync + 'static,
-    ) -> Result<Self, String> {
-        let emit: super::audio_worker::EventSink = Arc::new(emit);
-        let mailbox = Arc::new(Mailbox::default());
-        let input = mailbox.clone();
-        let worker = WorkerJoin::spawn(
-            "window-manager",
-            std::thread::Builder::new().name("keysteer-window".into()),
-            move || {
-                let native = A::native_batch(create);
-                if let Some(wake) = native.event_waker() {
-                    let _ = input.native_waker.set(wake);
-                }
-                let mut access = super::window_tabs::Grouped::new(native);
-                let mut audio: Option<super::audio_worker::AudioWorker> = None;
-                let mut session = Session::default();
-                let mut focus_cycle = Session::default();
-                let mut displays = Vec::new();
-                loop {
-                    let audio_active = A::native_batch(|| {
-                        let active = access.maintain_audio();
-                        if access.persistent()
-                            && let Err(error) =
-                                access.pump(&displays, &|| input.stop.load(Ordering::Acquire))
-                        {
-                            emit(BackendEvent::Warning(format!("window tabs: {error}")));
-                        }
-                        active
-                    });
-                    let pending = {
-                        let mut queue = input.queue.lock().unwrap_or_else(|e| e.into_inner());
-                        while queue.is_empty() && !input.stop.load(Ordering::Acquire) {
-                            if access.persistent() || audio_active {
-                                // Release the mailbox before native waiting. A
-                                // posted wake remains queued even if submission
-                                // races with entering the wait.
-                                if input.native_waker.get().is_some() {
-                                    input.native_waiting.store(true, Ordering::Release);
-                                    drop(queue);
-                                    if !input.stop.load(Ordering::Acquire) {
-                                        A::native_batch(|| {
-                                            access.wait_for_events(
-                                                audio_active.then_some(Duration::from_millis(250)),
-                                            )
-                                        });
-                                    }
-                                    input.native_waiting.store(false, Ordering::Release);
-                                    queue = input.queue.lock().unwrap_or_else(|e| e.into_inner());
-                                    break;
-                                }
-                                queue = input
-                                    .ready
-                                    .wait_timeout(
-                                        queue,
-                                        if audio_active && !access.persistent() {
-                                            Duration::from_millis(250)
-                                        } else {
-                                            Duration::from_millis(20)
-                                        },
-                                    )
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .0;
-                                break;
-                            }
-                            queue = input.ready.wait(queue).unwrap_or_else(|e| e.into_inner());
-                        }
-                        if input.stop.load(Ordering::Acquire) {
-                            break;
-                        }
-                        queue.pop_front()
-                    };
-                    let Some(pending) = pending else {
-                        continue;
-                    };
-                    A::native_batch(|| {
-                        let (request, screens) = match pending {
-                            Pending::Audio(request, cancelled) => {
-                                if cancelled.load(Ordering::Acquire) {
-                                    return;
-                                }
-                                if let Some(factory) = access.audio_factory() {
-                                    let (session, id) = (request.session, request.id);
-                                    let submitted = (|| {
-                                        let process = access.audio_process(request.target)?;
-                                        if audio.is_none() {
-                                            audio = Some(super::audio_worker::AudioWorker::start(
-                                                factory,
-                                                emit.clone(),
-                                            )?);
-                                        }
-                                        audio.as_ref().ok_or("audio worker unavailable")?.submit(
-                                            request,
-                                            process,
-                                            cancelled.clone(),
-                                        )
-                                    })();
-                                    if let Err(error) = submitted
-                                        && !cancelled.load(Ordering::Acquire)
-                                    {
-                                        super::audio_worker::publish_result(
-                                            &emit,
-                                            crate::api::audio::AudioResult {
-                                                session,
-                                                id,
-                                                outcome: Err(error),
-                                            },
-                                        );
-                                    }
-                                } else {
-                                    // Portable test/adaptor fallback; native platforms
-                                    // always supply the independent audio factory.
-                                    let result = execute_audio(&access, request);
-                                    if !cancelled.load(Ordering::Acquire) {
-                                        super::audio_worker::publish_result(&emit, result);
-                                    }
-                                }
-                                return;
-                            }
-                            Pending::ClearOverlap => {
-                                focus_cycle.overlap = None;
-                                session.overlap = None;
-                                return;
-                            }
-                            Pending::Window { request, screens } => (request, screens),
-                        };
-                        if request.operation.is_standalone_cycle() {
-                            let cancelled = || input.stop.load(Ordering::Acquire);
-                            displays.clone_from(&screens);
-                            let result =
-                                focus_cycle.execute(&mut access, request, &screens, &cancelled);
-                            if !cancelled() {
-                                let outcome = match result.message {
-                                    Some(error) => Err(error),
-                                    None => match result.pointer {
-                                        Some(point) => Ok(point),
-                                        None => return, // No overlapping candidate: no focus or pointer change.
-                                    },
-                                };
-                                emit(BackendEvent::WindowCycleCompleted(outcome));
-                            }
-                            return;
-                        }
-                        let id = request.session;
-                        let acquisition = matches!(
-                            request.operation,
-                            WindowOperation::Acquire(_) | WindowOperation::EndEdit { .. }
-                        );
-                        let query = matches!(request.operation, WindowOperation::Enumerate);
-                        let request_id = request.id;
-                        let cancelled = || {
-                            input.stop.load(Ordering::Acquire)
-                                || input.session.load(Ordering::Acquire) != id
-                                || (!acquisition
-                                    && request_id < input.cancel_before.load(Ordering::Acquire))
-                                || (query
-                                    && request_id < input.query_before.load(Ordering::Acquire))
-                        };
-                        if cancelled() {
-                            if input.session.load(Ordering::Acquire) == 0 {
-                                session.cleanup_edit(&mut access);
-                                access.end_session();
-                                session = Session::default();
-                            }
-                            return;
-                        }
-                        // Cancellation wakeups carry no displays. Only accepted
-                        // requests may replace the persistent groups' geometry context.
-                        displays.clone_from(&screens);
-                        if session.id != id {
-                            session.cleanup_edit(&mut access);
-                            access.reset();
-                            session = Session {
-                                id,
-                                ..Session::default()
-                            };
-                        }
-                        let result = session.execute(&mut access, request, &screens, &cancelled);
-                        if !cancelled() {
-                            emit(BackendEvent::WindowResult(Box::new(result)));
-                        } else {
-                            session.pending_closed.extend(result.closed);
-                        }
-                        // Deliver feedback before file I/O; errors never delay the
-                        // acknowledgement or run on the engine's keyboard thread.
-                        if let Some(error) = session.error.take() {
-                            crate::report_error!(
-                                "window-worker",
-                                "session={id} request={request_id}: {error}"
-                            );
-                        }
-                    });
-                }
-                A::native_batch(|| {
-                    session.cleanup_edit(&mut access);
-                    access.shutdown();
-                    drop(access);
-                });
+impl Snapshot {
+    /// Scalar-only native submission view; metadata remains owned by the result.
+    pub(crate) fn placement(&self) -> Self {
+        Self {
+            info: WindowInfo {
+                id: self.info.id,
+                title: String::new(),
+                app: String::new(),
+                bounds: self.info.bounds,
+                screen: self.info.screen,
+                resizable: self.info.resizable,
+                maximized: self.info.maximized,
+                minimized: self.info.minimized,
+                fullscreen: self.info.fullscreen,
             },
-        )?;
-        Ok(Self { mailbox, worker })
-    }
-
-    pub(crate) fn submit(&self, request: WindowRequest, screens: &[Screen]) -> Result<(), String> {
-        let mut queue = self
-            .mailbox
-            .queue
-            .lock()
-            .map_err(|_| "window queue poisoned")?;
-        if request.operation.is_standalone_cycle() {
-            if queue.len() >= 64 {
-                return Err("window operation queue is full".into());
-            }
-            queue.push_back(Pending::Window {
-                request,
-                screens: screens.to_vec(),
-            });
-            drop(queue);
-            self.mailbox.notify();
-            return Ok(());
-        }
-        if matches!(request.operation, WindowOperation::Acquire(_)) {
-            self.mailbox
-                .session
-                .store(request.session, Ordering::Release);
-            self.mailbox.cancel_before.store(0, Ordering::Release);
-            self.mailbox.query_before.store(0, Ordering::Release);
-            queue.retain(|p| matches!(p, Pending::Audio(..) | Pending::ClearOverlap));
-        }
-        if self.mailbox.session.load(Ordering::Acquire) != request.session {
-            return Err("window session expired".into());
-        }
-        if request.operation.precedes_inventory() {
-            self.mailbox
-                .query_before
-                .store(request.id, Ordering::Release);
-            queue.retain(|p| !matches!(p.operation(), Some(WindowOperation::Enumerate)));
-        }
-        if matches!(request.operation, WindowOperation::CancelPending) {
-            self.mailbox
-                .cancel_before
-                .store(request.id, Ordering::Release);
-            queue.retain(|p| {
-                matches!(p, Pending::Audio(..) | Pending::ClearOverlap)
-                    || matches!(
-                        p.operation(),
-                        Some(
-                            WindowOperation::Acquire(_)
-                                | WindowOperation::BeginEdit { .. }
-                                | WindowOperation::EndEdit { .. }
-                        )
-                    )
-            });
-        }
-        if matches!(
-            request.operation,
-            WindowOperation::EndEdit { commit: false, .. }
-        ) {
-            self.mailbox
-                .cancel_before
-                .store(request.id, Ordering::Release);
-            queue.retain(|p| {
-                matches!(p, Pending::Audio(..) | Pending::ClearOverlap)
-                    || matches!(
-                        p.operation(),
-                        Some(WindowOperation::Acquire(_) | WindowOperation::BeginEdit { .. })
-                    )
-            });
-        }
-        // Absolute layouts replace pending revisions, rather than accumulating
-        // intermediate native work. Transaction boundaries are never coalesced.
-        if let Some(Pending::Window {
-            request: last,
-            screens: last_screens,
-        }) = queue.back_mut()
-            && let (
-                WindowOperation::ApplyLayout { transaction: a, .. },
-                WindowOperation::ApplyLayout { transaction: b, .. },
-            ) = (&last.operation, &request.operation)
-            && a == b
-        {
-            *last = request;
-            *last_screens = screens.to_vec();
-            return Ok(());
-        }
-        // Coalesce relative changes only within the same uninterrupted gesture.
-        if let Some(Pending::Window { request: last, .. }) = queue.back_mut()
-            && last.session == request.session
-            && let (
-                WindowOperation::Adjust {
-                    target: a,
-                    change: ca,
-                    group: ga,
-                },
-                WindowOperation::Adjust {
-                    target: b,
-                    change: cb,
-                    group: gb,
-                },
-            ) = (&mut last.operation, &request.operation)
-            && a == b
-            && ga == gb
-        {
-            let merged = match (ca, cb) {
-                (WindowChange::MoveTo(a), WindowChange::MoveTo(b)) => {
-                    *a = *b;
-                    true
-                }
-                (WindowChange::Move { dx: ax, dy: ay }, WindowChange::Move { dx: bx, dy: by }) => {
-                    *ax += bx;
-                    *ay += by;
-                    true
-                }
-                (
-                    WindowChange::Resize { dw: ax, dh: ay },
-                    WindowChange::Resize { dw: bx, dh: by },
-                ) => {
-                    *ax += bx;
-                    *ay += by;
-                    true
-                }
-                _ => false,
-            };
-            if merged {
-                last.id = request.id;
-                return Ok(());
-            }
-        }
-        if queue.len() >= 64 {
-            return Err("window operation queue is full".into());
-        }
-        queue.push_back(Pending::Window {
-            request,
-            screens: screens.to_vec(),
-        });
-        drop(queue);
-        self.mailbox.notify();
-        Ok(())
-    }
-
-    /// Resolve audio identity in window FIFO order, then execute independently,
-    /// but never enters the layout session or its history/cancellation barriers.
-    pub(crate) fn submit_audio(
-        &self,
-        request: crate::api::audio::AudioRequest,
-    ) -> Result<(), String> {
-        let mut queue = self
-            .mailbox
-            .queue
-            .lock()
-            .map_err(|_| "audio queue poisoned")?;
-        if self.mailbox.stop.load(Ordering::Acquire) {
-            return Err("audio worker stopped".into());
-        }
-        if queue.len() >= 64 {
-            return Err("audio operation queue is full".into());
-        }
-        let token = self
-            .mailbox
-            .audio_tokens
-            .lock()
-            .map_err(|_| "audio cancellation map poisoned")?
-            .entry(request.session)
-            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
-            .clone();
-        queue.push_back(Pending::Audio(request, token));
-        drop(queue);
-        self.mailbox.notify();
-        Ok(())
-    }
-
-    pub(crate) fn cancel_audio(&self, session: u64) {
-        let mut queue = self.mailbox.queue.lock().unwrap_or_else(|e| {
-            crate::report_error!("audio", "recovering a poisoned cancellation queue");
-            e.into_inner()
-        });
-        queue.retain(|p| !matches!(p, Pending::Audio(r, _) if r.session == session));
-        if let Some(token) = self
-            .mailbox
-            .audio_tokens
-            .lock()
-            .unwrap_or_else(|e| {
-                crate::report_error!("audio", "recovering a poisoned cancellation map");
-                e.into_inner()
-            })
-            .remove(&session)
-        {
-            token.store(true, Ordering::Release);
-        }
-    }
-
-    pub(crate) fn cancel(&self, session: u64) {
-        let mut queue = self.mailbox.queue.lock().unwrap_or_else(|error| {
-            crate::report_error!("window-worker", "recovering a poisoned cancellation queue");
-            error.into_inner()
-        });
-        if self
-            .mailbox
-            .session
-            .compare_exchange(session, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            queue.retain(|p| matches!(p, Pending::Audio(..) | Pending::ClearOverlap));
-            // Wake the owner to release retained native references and undo
-            // snapshots immediately, including when no operation is active.
-            queue.push_back(Pending::Window {
-                request: WindowRequest {
-                    scope: None,
-                    session,
-                    id: 0,
-                    operation: WindowOperation::Enumerate,
-                },
-                screens: Vec::new(),
-            });
-            self.mailbox.notify();
-        }
-    }
-
-    pub(crate) fn stop_until(&mut self, deadline: Instant) -> Result<(), String> {
-        let guard = self.mailbox.queue.lock().unwrap_or_else(|e| e.into_inner());
-        self.mailbox.stop.store(true, Ordering::Release);
-        drop(guard);
-        self.mailbox.notify();
-        self.worker.join_until(deadline)
-    }
-}
-
-impl Drop for WindowWorker {
-    fn drop(&mut self) {
-        let guard = self.mailbox.queue.lock().unwrap_or_else(|e| e.into_inner());
-        self.mailbox.stop.store(true, Ordering::Release);
-        drop(guard);
-        self.mailbox.notify();
-        if !self.worker.shutdown_failure_was_returned()
-            && let Err(error) = self.worker.join_timeout(Duration::from_secs(2))
-        {
-            crate::report_error!("window-worker", "{error}");
+            restored: self.restored,
         }
     }
 }
@@ -851,9 +58,9 @@ struct Session {
     scope: Option<crate::api::window::WindowScope>,
     id: u64,
     target: Option<WindowId>,
-    history: VecDeque<(u64, Vec<Snapshot>)>,
-    redo: VecDeque<(u64, Vec<Snapshot>)>,
-    initial: std::collections::BTreeMap<WindowId, Snapshot>,
+    history: VecDeque<(u64, Vec<PlacementSnapshot>)>,
+    redo: VecDeque<(u64, Vec<PlacementSnapshot>)>,
+    initial: std::collections::BTreeMap<WindowId, PlacementSnapshot>,
     changed_windows: std::collections::BTreeSet<WindowId>,
     cycle: Vec<WindowId>,
     overlap: Option<Box<OverlapCache>>,
@@ -870,7 +77,7 @@ struct EditTransaction {
     id: u64,
     group: u64,
     revision: u64,
-    before: Vec<Snapshot>,
+    before: Vec<PlacementSnapshot>,
     minimums: Vec<(WindowId, Point)>,
 }
 
@@ -881,7 +88,8 @@ fn rect_matches(a: Rect, b: Rect) -> bool {
         && (a.height - b.height).abs() <= 1.5
 }
 
-fn same_placement(a: &Snapshot, b: &Snapshot) -> bool {
+fn same_placement(a: impl Into<PlacementSnapshot>, b: impl Into<PlacementSnapshot>) -> bool {
+    let (a, b) = (a.into(), b.into());
     rect_matches(a.info.bounds, b.info.bounds)
         && a.info.maximized == b.info.maximized
         && a.info.minimized == b.info.minimized
@@ -899,6 +107,61 @@ pub(crate) struct WindowSessionProbe {
 
 #[cfg(test)]
 impl WindowSessionProbe {
+    /// Functional native acceptance of the same state machines used by the worker.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn execute_deferred(
+        &mut self,
+        access: &mut impl WindowAccess,
+        operation: WindowOperation,
+        screens: &[Screen],
+    ) -> WindowResult {
+        self.request += 1;
+        let request = WindowRequest {
+            scope: None,
+            session: 1,
+            id: self.request,
+            operation,
+        };
+        let screens: Arc<[Screen]> = screens.into();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        if let Some(mut pending) =
+            layout_confirmation::PendingLayout::begin(&mut self.session, access, &request, &screens)
+                .unwrap()
+        {
+            loop {
+                if let Some(result) = pending.advance(&mut self.session, access, false) {
+                    return result;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "native layout confirmation timed out"
+                );
+                if !access.wait_for_events(Some(Duration::from_millis(5))) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        if let Some(mut pending) =
+            PendingAdjustment::begin(&mut self.session, access, &request, &screens)
+                .unwrap()
+                .0
+        {
+            loop {
+                if let Some(result) = pending.poll(&mut self.session, access, false) {
+                    return result;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "native adjustment confirmation timed out"
+                );
+                if !access.wait_for_events(Some(Duration::from_millis(5))) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        self.session.execute(access, request, &screens, &|| false)
+    }
+
     pub(crate) fn new(target: WindowId) -> Self {
         Self {
             session: Session {
@@ -947,143 +210,8 @@ impl Session {
         self.edit = None;
     }
 
-    fn recover_edit(&mut self, access: &mut impl WindowAccess) {
-        if let Some(edit) = self.edit.take() {
-            // Only native partial failure uses bounded entry-layout recovery.
-            let deadline = Instant::now() + Duration::from_millis(1500);
-            for before in edit.before.iter().rev() {
-                if Instant::now() >= deadline {
-                    crate::report_error!("window-worker", "entry-layout recovery timed out");
-                    break;
-                }
-                if let Err(error) =
-                    access.restore(before, &self.screens, &|| Instant::now() >= deadline)
-                {
-                    crate::report_error!(
-                        "window-worker",
-                        "recover window {:?}: {error}",
-                        before.info.id
-                    );
-                }
-            }
-        }
-    }
-
-    fn remember(&mut self, group: u64, before: Snapshot) {
-        self.initial
-            .entry(before.info.id)
-            .or_insert_with(|| before.clone());
-        self.changed_windows.insert(before.info.id);
-        self.redo.clear();
-        if self.history.back().is_none_or(|(g, _)| *g != group) {
-            if self.history.len() == 32 {
-                self.history.pop_front();
-            }
-            self.history.push_back((group, Vec::new()));
-        }
-        if let Some((_, snapshots)) = self.history.back_mut()
-            && !snapshots.iter().any(|s| s.info.id == before.info.id)
-        {
-            snapshots.push(before);
-        }
-    }
-
-    fn capture_initial(&mut self, access: &impl WindowAccess, id: WindowId, screens: &[Screen]) {
-        if let std::collections::btree_map::Entry::Vacant(entry) = self.initial.entry(id)
-            && let Ok(snapshot) = access.snapshot(id, screens)
-        {
-            entry.insert(snapshot);
-        }
-    }
-
-    fn push_history(
-        stack: &mut VecDeque<(u64, Vec<Snapshot>)>,
-        group: u64,
-        snapshots: Vec<Snapshot>,
-    ) {
-        if snapshots.is_empty() {
-            return;
-        }
-        if stack.len() == 32 {
-            stack.pop_front();
-        }
-        stack.push_back((group, snapshots));
-    }
-
-    // Return inverse snapshots for every actual native change, and retain
-    // uncompleted work so cancellation or a refused write can be retried.
-    fn restore_snapshots(
-        access: &mut impl WindowAccess,
-        mut snapshots: Vec<Snapshot>,
-        screens: &[Screen],
-        cancelled: &dyn Fn() -> bool,
-        result: &mut WindowResult,
-    ) -> (Vec<Snapshot>, Vec<Snapshot>) {
-        let mut inverse = Vec::new();
-        let mut remaining = Vec::new();
-        // One geometry operation per live group, preferring its stable anchor.
-        snapshots.sort_by_key(|s| access.layout_representative(s.info.id) != s.info.id);
-        let mut represented = std::collections::BTreeSet::new();
-        snapshots.retain(|s| represented.insert(access.layout_representative(s.info.id)));
-        while let Some(desired) = snapshots.pop() {
-            if cancelled() {
-                snapshots.push(desired);
-                remaining.extend(snapshots);
-                break;
-            }
-            let Ok(before) = access.snapshot(desired.info.id, screens) else {
-                remaining.push(desired);
-                result.skipped += 1;
-                continue;
-            };
-            if same_placement(&before, &desired) {
-                continue;
-            }
-            let applied = access.restore(&desired, screens, cancelled);
-            let after = access.snapshot(desired.info.id, screens);
-            if let Ok(after) = &after {
-                if !same_placement(&before, after) {
-                    inverse.push(before);
-                    result.changed += 1;
-                }
-                if same_placement(after, &desired) {
-                    continue;
-                }
-            } else {
-                // The write may have succeeded before the read timed out.
-                // Keep its inverse without claiming an observed state change.
-                inverse.push(before);
-            }
-            remaining.push(desired);
-            result.skipped += 1;
-            if let Err(error) = applied
-                && !cancelled()
-            {
-                crate::report_error!("window-worker", "restore history: {error}");
-            }
-        }
-        (inverse, remaining)
-    }
-
-    fn execute(
-        &mut self,
-        access: &mut impl WindowAccess,
-        request: WindowRequest,
-        screens: &[Screen],
-        cancelled: &dyn Fn() -> bool,
-    ) -> WindowResult {
-        if self.screens != screens {
-            self.resize_minimum = None;
-            self.screens.clear();
-            self.screens.extend_from_slice(screens);
-        }
-        access.set_scope(
-            request.scope,
-            matches!(request.operation, WindowOperation::Acquire(_)),
-        );
-        self.scope = request.scope;
-        self.error = None;
-        let mut result = WindowResult {
+    fn result_for(request: &WindowRequest) -> WindowResult {
+        WindowResult {
             tabs: None,
             session: request.session,
             id: request.id,
@@ -1095,13 +223,58 @@ impl Session {
             skipped: 0,
             message: None,
             edit: None,
-        };
+        }
+    }
+    fn prepare_context(
+        &mut self,
+        access: &mut impl WindowAccess,
+        request: &WindowRequest,
+        screens: &[Screen],
+    ) {
+        if self.screens != screens {
+            self.resize_minimum = None;
+            self.screens.clear();
+            self.screens.extend_from_slice(screens);
+        }
+        access.set_scope(
+            request.scope,
+            matches!(request.operation, WindowOperation::Acquire(_)),
+        );
+        self.scope = request.scope;
+        self.error = None;
+    }
+    fn execute(
+        &mut self,
+        access: &mut impl WindowAccess,
+        request: WindowRequest,
+        screens: &[Screen],
+        cancelled: &dyn Fn() -> bool,
+    ) -> WindowResult {
+        self.execute_prepared(access, request, screens, cancelled, None)
+    }
+    fn execute_prepared(
+        &mut self,
+        access: &mut impl WindowAccess,
+        request: WindowRequest,
+        screens: &[Screen],
+        cancelled: &dyn Fn() -> bool,
+        prepared: Option<Snapshot>,
+    ) -> WindowResult {
+        self.prepare_context(access, &request, screens);
+        let mut result = Self::result_for(&request);
         let starting = match &request.operation {
             WindowOperation::BeginEdit { transaction, .. } => Some(*transaction),
             _ => None,
         };
         let standalone = request.operation.is_standalone_cycle();
-        let outcome = self.apply(access, request.operation, screens, cancelled, &mut result);
+        let outcome = self.apply(
+            access,
+            request.operation,
+            screens,
+            cancelled,
+            &mut result,
+            prepared,
+        );
         if standalone {
             if let Err(error) = outcome {
                 result.message = Some(error);
@@ -1122,6 +295,15 @@ impl Session {
                 }));
             }
         }
+        self.complete_result(access, result, screens)
+    }
+
+    fn complete_result(
+        &mut self,
+        access: &mut impl WindowAccess,
+        mut result: WindowResult,
+        screens: &[Screen],
+    ) -> WindowResult {
         if result.target.as_ref().map(|w| w.id) != self.target {
             result.target = self.target.and_then(|id| {
                 result
@@ -1174,6 +356,199 @@ impl Session {
         result
     }
 
+    fn adjustment_rect(
+        &mut self,
+        access: &impl WindowAccess,
+        target: WindowId,
+        change: WindowChange,
+        group: u64,
+        before: &Snapshot,
+        screens: &[Screen],
+    ) -> Result<Option<Rect>, String> {
+        let screen = screens
+            .get(before.info.screen)
+            .ok_or("display is unavailable")?;
+        let scale = access.logical_scale(screen);
+        let base = if before.info.maximized {
+            before.restored
+        } else {
+            before.info.bounds
+        };
+        let next = match change {
+            WindowChange::MoveTo(point) => {
+                let destination = screens
+                    .iter()
+                    .find(|screen| screen.bounds.contains(&point))
+                    .ok_or("target display is unavailable")?;
+                self.move_remainder = None;
+                geometry::constrain_move(
+                    Rect::new(
+                        point.x - base.width / 2.0,
+                        point.y - base.height / 2.0,
+                        base.width,
+                        base.height,
+                    ),
+                    destination.work_area,
+                )
+            }
+            WindowChange::Move { dx, dy } => {
+                let remainder = self
+                    .move_remainder
+                    .filter(|(id, gesture, dpi, last, _)| {
+                        *id == target && *gesture == group && *dpi == scale && *last == base
+                    })
+                    .map_or(Point::default(), |(_, _, _, _, remainder)| remainder);
+                let (next, remainder) = geometry::move_with_remainder(
+                    base,
+                    screen.work_area,
+                    Point::new(dx * scale, dy * scale),
+                    remainder,
+                );
+                self.move_remainder = Some((target, group, scale, next, remainder));
+                next
+            }
+            WindowChange::Resize { dw, dh } => {
+                if !before.info.resizable {
+                    return Err("Window does not support resizing".into());
+                }
+                let minimum = match self.resize_minimum {
+                    Some((id, cached_group, cached_screen, cached_scale, minimum))
+                        if id == target
+                            && cached_group == group
+                            && cached_screen == before.info.screen
+                            && cached_scale == scale =>
+                    {
+                        minimum
+                    }
+                    _ => {
+                        let minimum = access.minimum_size(target);
+                        self.resize_minimum =
+                            Some((target, group, before.info.screen, scale, minimum));
+                        minimum
+                    }
+                };
+                geometry::resize_center(base, dw * scale, dh * scale, screen.work_area, minimum)
+            }
+            WindowChange::Place { index, gap } => {
+                if !before.info.resizable {
+                    return Err("Window does not support resizing".into());
+                }
+                geometry::placement(screen.work_area, index, gap * scale)
+                    .ok_or("invalid window layout")?
+            }
+            WindowChange::Center => Rect::new(
+                screen.work_area.center().x - base.width / 2.0,
+                screen.work_area.center().y - base.height / 2.0,
+                base.width,
+                base.height,
+            ),
+            WindowChange::Screen(destination) => {
+                let Some((source, dest)) =
+                    window_placement::destination(screens, before.info.bounds, destination)
+                else {
+                    return Ok(None);
+                };
+                window_placement::map_between_screens(base, &screens[source], &screens[dest])
+            }
+            WindowChange::CycleState
+            | WindowChange::ToggleMaximize
+            | WindowChange::ToggleMinimize => unreachable!(),
+        };
+        Ok(Some(next))
+    }
+
+    fn prepare_layout(
+        &mut self,
+        access: &mut impl WindowAccess,
+        operation: WindowOperation,
+        screens: &[Screen],
+        cancelled: &dyn Fn() -> bool,
+        result: &mut WindowResult,
+    ) -> Result<Vec<(Snapshot, Rect)>, String> {
+        let WindowOperation::ApplyLayout {
+            additional_screens,
+            transaction,
+            revision,
+            screen,
+            placements,
+            gap,
+            strict,
+        } = operation
+        else {
+            return Err("Not a layout request".into());
+        };
+        let edit = self
+            .edit
+            .as_mut()
+            .filter(|edit| edit.id == transaction)
+            .ok_or("Window edit expired")?;
+        if revision <= edit.revision {
+            return Err("Stale layout revision".into());
+        }
+        edit.revision = revision;
+        let count = placements.len()
+            + additional_screens
+                .iter()
+                .map(|s| s.placements.len())
+                .sum::<usize>();
+        let mut batch = Vec::with_capacity(count);
+        let mut seen = std::collections::BTreeSet::new();
+        let layouts =
+            std::iter::once(crate::api::window::WindowScreenLayout { screen, placements })
+                .chain(additional_screens);
+        for layout in layouts {
+            let display = screens.get(layout.screen).ok_or("display is unavailable")?;
+            let gap = gap * access.logical_scale(display);
+            for (id, rect) in layout.placements {
+                if !seen.insert(id) {
+                    return Err("Duplicate window in layout transaction".into());
+                }
+                if cancelled() {
+                    return Ok(batch);
+                }
+                if !edit.before.iter().any(|s| s.info.id == id) {
+                    return Err("Window is outside the edit transaction".into());
+                }
+                let Ok(before) = access.snapshot(id, screens) else {
+                    result.skipped += 1;
+                    continue;
+                };
+                if !before.info.resizable || before.info.fullscreen {
+                    return Err("Window does not support this layout".into());
+                }
+                if ![rect.x, rect.y, rect.width, rect.height]
+                    .iter()
+                    .all(|v| v.is_finite())
+                    || rect.x < 0.0
+                    || rect.y < 0.0
+                    || rect.width <= 0.0
+                    || rect.height <= 0.0
+                    || rect.right() > 1.0 + 1e-6
+                    || rect.bottom() > 1.0 + 1e-6
+                {
+                    return Err("Invalid normalized window rectangle".into());
+                }
+                let mut requested =
+                    crate::api::window_layout::placed_rect(display.work_area, rect, gap);
+                if !strict {
+                    let minimum = edit
+                        .minimums
+                        .iter()
+                        .find(|(w, _)| *w == id)
+                        .map_or(Point::new(100.0, 80.0), |(_, min)| *min);
+                    let center = requested.center();
+                    requested.width = requested.width.max(minimum.x);
+                    requested.height = requested.height.max(minimum.y);
+                    requested.x = center.x - requested.width / 2.0;
+                    requested.y = center.y - requested.height / 2.0;
+                    requested = geometry::constrain_move(requested, display.work_area);
+                }
+                batch.push((before, requested));
+            }
+        }
+        Ok(batch)
+    }
+
     fn apply(
         &mut self,
         access: &mut impl WindowAccess,
@@ -1181,6 +556,7 @@ impl Session {
         screens: &[Screen],
         cancelled: &dyn Fn() -> bool,
         result: &mut WindowResult,
+        prepared: Option<Snapshot>,
     ) -> Result<(), String> {
         match operation {
             WindowOperation::Tabs(operation) => {
@@ -1408,7 +784,7 @@ impl Session {
                         continue;
                     }
                     if let Ok(snapshot) = access.snapshot(id, screens) {
-                        self.initial.entry(id).or_insert_with(|| snapshot.clone());
+                        self.initial.entry(id).or_insert_with(|| (&snapshot).into());
                         let queried = access.minimum_size(id);
                         let cached = self.minimums.entry(id).or_insert(queried);
                         *cached = Point::new(cached.x.max(queried.x), cached.y.max(queried.y));
@@ -1437,7 +813,7 @@ impl Session {
                     id: transaction,
                     group,
                     revision: 0,
-                    before,
+                    before: before.into_iter().map(PlacementSnapshot::from).collect(),
                     minimums,
                 });
             }
@@ -1456,75 +832,22 @@ impl Session {
                     accepted: false,
                     minimums: Vec::new(),
                 }));
-                let edit = self
-                    .edit
-                    .as_mut()
-                    .filter(|edit| edit.id == transaction)
-                    .ok_or("Window edit expired")?;
-                if revision <= edit.revision {
-                    return Err("Stale layout revision".into());
-                }
-                edit.revision = revision;
-                let count = placements.len()
-                    + additional_screens
-                        .iter()
-                        .map(|s| s.placements.len())
-                        .sum::<usize>();
-                let mut batch = Vec::with_capacity(count);
-                let mut seen = std::collections::BTreeSet::new();
-                let layouts =
-                    std::iter::once(crate::api::window::WindowScreenLayout { screen, placements })
-                        .chain(additional_screens);
-                for layout in layouts {
-                    let display = screens.get(layout.screen).ok_or("display is unavailable")?;
-                    let gap = gap * access.logical_scale(display);
-                    for (id, rect) in layout.placements {
-                        if !seen.insert(id) {
-                            return Err("Duplicate window in layout transaction".into());
-                        }
-                        if cancelled() {
-                            return Ok(());
-                        }
-                        if !edit.before.iter().any(|s| s.info.id == id) {
-                            return Err("Window is outside the edit transaction".into());
-                        }
-                        let Ok(before) = access.snapshot(id, screens) else {
-                            result.skipped += 1;
-                            continue;
-                        };
-                        if !before.info.resizable || before.info.fullscreen {
-                            return Err("Window does not support this layout".into());
-                        }
-                        if ![rect.x, rect.y, rect.width, rect.height]
-                            .iter()
-                            .all(|v| v.is_finite())
-                            || rect.x < 0.0
-                            || rect.y < 0.0
-                            || rect.width <= 0.0
-                            || rect.height <= 0.0
-                            || rect.right() > 1.0 + 1e-6
-                            || rect.bottom() > 1.0 + 1e-6
-                        {
-                            return Err("Invalid normalized window rectangle".into());
-                        }
-                        let mut requested =
-                            crate::api::window_layout::placed_rect(display.work_area, rect, gap);
-                        if !strict {
-                            let minimum = edit
-                                .minimums
-                                .iter()
-                                .find(|(w, _)| *w == id)
-                                .map_or(Point::new(100.0, 80.0), |(_, min)| *min);
-                            let center = requested.center();
-                            requested.width = requested.width.max(minimum.x);
-                            requested.height = requested.height.max(minimum.y);
-                            requested.x = center.x - requested.width / 2.0;
-                            requested.y = center.y - requested.height / 2.0;
-                            requested = geometry::constrain_move(requested, display.work_area);
-                        }
-                        batch.push((before, requested));
-                    }
-                }
+                let batch = self.prepare_layout(
+                    access,
+                    WindowOperation::ApplyLayout {
+                        additional_screens,
+                        transaction,
+                        revision,
+                        screen,
+                        placements,
+                        gap,
+                        strict,
+                    },
+                    screens,
+                    cancelled,
+                    result,
+                )?;
+                let edit = self.edit.as_mut().ok_or("Window edit expired")?;
                 let mut failure = None;
                 let mut restore_failed = false;
                 let mut observed_minimum = None;
@@ -1686,7 +1009,7 @@ impl Session {
                             actual.push(after.info);
                         }
                     } else {
-                        match access.restore(&before, screens, &|| false) {
+                        match before.restore(access, screens, &|| false) {
                             Ok(info) => {
                                 actual.push(info);
                                 result.changed += 1;
@@ -1719,7 +1042,10 @@ impl Session {
                 change,
                 group,
             } => {
-                let before = access.snapshot(target, screens)?;
+                let before = match prepared {
+                    Some(snapshot) => snapshot,
+                    None => access.snapshot(target, screens)?,
+                };
                 if before.info.fullscreen {
                     if let WindowChange::Screen(destination) = change {
                         let (after, pointer) =
@@ -1733,10 +1059,6 @@ impl Session {
                     }
                     return Err("Exit native fullscreen before adjusting this window".into());
                 }
-                let screen = screens
-                    .get(before.info.screen)
-                    .ok_or("display is unavailable")?;
-                let scale = access.logical_scale(screen);
                 let base = if before.info.maximized {
                     before.restored
                 } else {
@@ -1762,110 +1084,10 @@ impl Session {
                         access.toggle_state(target, true, screens, cancelled)
                     }
                     change => {
-                        let next = match change {
-                            WindowChange::MoveTo(point) => {
-                                let destination = screens
-                                    .iter()
-                                    .find(|screen| screen.bounds.contains(&point))
-                                    .ok_or("target display is unavailable")?;
-                                self.move_remainder = None;
-                                geometry::constrain_move(
-                                    Rect::new(
-                                        point.x - base.width / 2.0,
-                                        point.y - base.height / 2.0,
-                                        base.width,
-                                        base.height,
-                                    ),
-                                    destination.work_area,
-                                )
-                            }
-                            WindowChange::Move { dx, dy } => {
-                                let remainder = self
-                                    .move_remainder
-                                    .filter(|(id, gesture, dpi, last, _)| {
-                                        *id == target
-                                            && *gesture == group
-                                            && *dpi == scale
-                                            && *last == base
-                                    })
-                                    .map_or(Point::default(), |(_, _, _, _, remainder)| remainder);
-                                let (next, remainder) = geometry::move_with_remainder(
-                                    base,
-                                    screen.work_area,
-                                    Point::new(dx * scale, dy * scale),
-                                    remainder,
-                                );
-                                self.move_remainder = Some((target, group, scale, next, remainder));
-                                next
-                            }
-                            WindowChange::Resize { dw, dh } => {
-                                if !before.info.resizable {
-                                    return Err("Window does not support resizing".into());
-                                }
-                                let minimum = match self.resize_minimum {
-                                    Some((
-                                        id,
-                                        cached_group,
-                                        cached_screen,
-                                        cached_scale,
-                                        minimum,
-                                    )) if id == target
-                                        && cached_group == group
-                                        && cached_screen == before.info.screen
-                                        && cached_scale == scale =>
-                                    {
-                                        minimum
-                                    }
-                                    _ => {
-                                        let minimum = access.minimum_size(target);
-                                        self.resize_minimum = Some((
-                                            target,
-                                            group,
-                                            before.info.screen,
-                                            scale,
-                                            minimum,
-                                        ));
-                                        minimum
-                                    }
-                                };
-                                geometry::resize_center(
-                                    base,
-                                    dw * scale,
-                                    dh * scale,
-                                    screen.work_area,
-                                    minimum,
-                                )
-                            }
-                            WindowChange::Place { index, gap } => {
-                                if !before.info.resizable {
-                                    return Err("Window does not support resizing".into());
-                                }
-                                geometry::placement(screen.work_area, index, gap * scale)
-                                    .ok_or("invalid window layout")?
-                            }
-                            WindowChange::Center => Rect::new(
-                                screen.work_area.center().x - base.width / 2.0,
-                                screen.work_area.center().y - base.height / 2.0,
-                                base.width,
-                                base.height,
-                            ),
-                            WindowChange::Screen(destination) => {
-                                let Some((source, dest)) = window_placement::destination(
-                                    screens,
-                                    before.info.bounds,
-                                    destination,
-                                ) else {
-                                    return Ok(());
-                                };
-                                window_placement::map_between_screens(
-                                    base,
-                                    &screens[source],
-                                    &screens[dest],
-                                )
-                            }
-                            WindowChange::CycleState
-                            | WindowChange::ToggleMaximize
-                            | WindowChange::ToggleMinimize => unreachable!(),
+                        let Some(next) =
+                            self.adjustment_rect(access, target, change, group, &before, screens)?
+                        else {
+                            return Ok(());
                         };
                         if cancelled() {
                             return Ok(());
@@ -1902,7 +1124,7 @@ impl Session {
                         || after.info.maximized != before.info.maximized
                         || after.info.minimized != before.info.minimized)
                 {
-                    self.remember(group, before.clone());
+                    self.remember(group, PlacementSnapshot::from(&before));
                     result.changed = 1;
                     if !after.info.minimized
                         && let Some(pointer) = pointer
@@ -2101,6 +1323,12 @@ mod tests {
         volume_requests: std::cell::RefCell<Vec<(WindowId, crate::api::audio::AudioAction)>>,
         unchanged_ack: bool,
         snapshot_unavailable: bool,
+        snapshot_reads: std::cell::Cell<usize>,
+        decline_submission: bool,
+        deferred: bool,
+        async_states: bool,
+        submitted_states: BTreeMap<WindowId, bool>,
+        submitted: BTreeMap<WindowId, Rect>,
         minimum: Point,
         minimum_queries: std::cell::Cell<usize>,
         closed: Vec<WindowId>,
@@ -2161,6 +1389,12 @@ mod tests {
                 volume_requests: Default::default(),
                 unchanged_ack: false,
                 snapshot_unavailable: false,
+                snapshot_reads: std::cell::Cell::new(0),
+                decline_submission: false,
+                deferred: false,
+                async_states: false,
+                submitted_states: BTreeMap::new(),
+                submitted: BTreeMap::new(),
                 minimum: Point::new(100.0, 80.0),
                 minimum_queries: std::cell::Cell::new(0),
                 closed: Vec::new(),
@@ -2191,10 +1425,62 @@ mod tests {
                 .collect())
         }
         fn snapshot(&self, id: WindowId, _: &[Screen]) -> Result<Snapshot, String> {
+            self.snapshot_reads.set(self.snapshot_reads.get() + 1);
             if self.snapshot_unavailable {
                 return Err("temporarily unavailable".into());
             }
             self.windows.get(&id).cloned().ok_or("closed".into())
+        }
+        fn can_submit_frame(&self, _: WindowId) -> bool {
+            self.deferred
+        }
+        fn refresh_geometry(&self, snapshot: &mut Snapshot, _: &[Screen]) -> Result<(), String> {
+            if self.snapshot_unavailable {
+                return Err("temporarily unavailable".into());
+            }
+            let current = self.windows.get(&snapshot.info.id).ok_or("closed")?;
+            snapshot.info.bounds = current.info.bounds;
+            snapshot.info.maximized = current.info.maximized;
+            snapshot.info.minimized = current.info.minimized;
+            snapshot.info.fullscreen = current.info.fullscreen;
+            snapshot.restored = current.restored;
+            Ok(())
+        }
+        fn submit_maximize(
+            &mut self,
+            before: &Snapshot,
+            maximize: bool,
+            _: &[Screen],
+        ) -> Result<bool, String> {
+            if !self.async_states {
+                return Ok(false);
+            }
+            self.submitted_states.insert(before.info.id, maximize);
+            Ok(true)
+        }
+        fn submit_maximized_frame(
+            &mut self,
+            before: &Snapshot,
+            rect: Rect,
+            screens: &[Screen],
+        ) -> Result<bool, String> {
+            self.submit_frame(before, rect, screens)
+        }
+        fn submit_frame(
+            &mut self,
+            before: &Snapshot,
+            rect: Rect,
+            _: &[Screen],
+        ) -> Result<bool, String> {
+            let id = before.info.id;
+            if !self.deferred || self.decline_submission {
+                return Ok(false);
+            }
+            self.submitted.insert(id, rect);
+            if self.reject == Some(id) {
+                return Err("asynchronous write rejected".into());
+            }
+            Ok(true)
         }
         fn set_frame(
             &mut self,
@@ -3937,4 +3223,418 @@ mod tests {
             .stop_until(Instant::now() + Duration::from_secs(2))
             .unwrap();
     }
+
+    #[test]
+    fn deferred_geometry_requires_observation_and_preserves_undo_metadata() {
+        let mut access = Fake::new(2);
+        access.deferred = true;
+        let mut session = Session::default();
+        let screens: Arc<[Screen]> = screens().into();
+        let request = WindowRequest {
+            session: 1,
+            id: 2,
+            scope: None,
+            operation: WindowOperation::Adjust {
+                target: WindowId(1),
+                change: WindowChange::Move { dx: 20.0, dy: 0.0 },
+                group: 1,
+            },
+        };
+        let before = access.windows[&WindowId(1)].info.bounds;
+        let mut pending = PendingAdjustment::begin(&mut session, &mut access, &request, &screens)
+            .unwrap()
+            .0
+            .unwrap();
+        assert!(pending.poll(&mut session, &mut access, false).is_none());
+        assert!(session.history.is_empty());
+        let accepted = access.submitted[&WindowId(1)];
+        access.windows.get_mut(&WindowId(1)).unwrap().info.bounds = accepted;
+        let result = pending.poll(&mut session, &mut access, false).unwrap();
+        assert_eq!(result.changed, 1);
+        assert_eq!(result.target.unwrap().bounds, accepted);
+        assert_eq!(session.history.len(), 1);
+        access.windows.get_mut(&WindowId(1)).unwrap().info.title = "renamed after move".into();
+        run(&mut session, &mut access, WindowOperation::Undo);
+        assert_eq!(access.windows[&WindowId(1)].info.bounds, before);
+        assert_eq!(
+            access.windows[&WindowId(1)].info.title,
+            "renamed after move"
+        );
+        assert!(std::mem::size_of::<PlacementSnapshot>() < std::mem::size_of::<Snapshot>());
+    }
+
+    #[test]
+    fn independent_geometry_submits_while_another_window_has_not_acknowledged() {
+        let mut access = Fake::new(2);
+        access.deferred = true;
+        let mut session = Session::default();
+        let screens: Arc<[Screen]> = screens().into();
+        let request = |target, id| WindowRequest {
+            session: 1,
+            id,
+            scope: None,
+            operation: WindowOperation::Adjust {
+                target: WindowId(target),
+                change: WindowChange::Move { dx: 20.0, dy: 0.0 },
+                group: id,
+            },
+        };
+        let mut first =
+            PendingAdjustment::begin(&mut session, &mut access, &request(1, 1), &screens)
+                .unwrap()
+                .0
+                .unwrap();
+        let mut second =
+            PendingAdjustment::begin(&mut session, &mut access, &request(2, 2), &screens)
+                .unwrap()
+                .0
+                .unwrap();
+        assert_eq!(access.submitted.len(), 2);
+        assert!(first.poll(&mut session, &mut access, false).is_none());
+        let accepted = access.submitted[&WindowId(2)];
+        access.windows.get_mut(&WindowId(2)).unwrap().info.bounds = accepted;
+        assert_eq!(
+            second
+                .poll(&mut session, &mut access, false)
+                .unwrap()
+                .changed,
+            1
+        );
+        assert!(first.poll(&mut session, &mut access, false).is_none());
+        let cancelled = first.poll(&mut session, &mut access, true).unwrap();
+        assert_eq!(cancelled.changed, 0);
+    }
+
+    #[test]
+    fn confirmation_waiting_has_zero_allocations_and_no_metadata_reads() {
+        let mut access = Fake::new(1);
+        access.deferred = true;
+        let mut session = Session::default();
+        let screens: Arc<[Screen]> = screens().into();
+        let request = WindowRequest {
+            session: 1,
+            id: 2,
+            scope: None,
+            operation: WindowOperation::Adjust {
+                target: WindowId(1),
+                change: WindowChange::Move { dx: 20.0, dy: 0.0 },
+                group: 1,
+            },
+        };
+        let mut pending = PendingAdjustment::begin(&mut session, &mut access, &request, &screens)
+            .unwrap()
+            .0
+            .unwrap();
+        let reads = access.snapshot_reads.get();
+        let now = Instant::now();
+        let allocation = stats_alloc::Region::new(crate::TEST_ALLOCATOR);
+        for _ in 0..10_000 {
+            assert!(
+                pending
+                    .poll_at(&mut session, &mut access, false, now)
+                    .is_none()
+            );
+        }
+        let stats = allocation.change();
+        assert_eq!((stats.allocations, stats.reallocations), (0, 0));
+        assert_eq!(access.snapshot_reads.get(), reads);
+        access.windows.get_mut(&WindowId(1)).unwrap().info.bounds = access.submitted[&WindowId(1)];
+        let result = pending.poll(&mut session, &mut access, false).unwrap();
+        assert_eq!(result.target.unwrap().title, "Window 1");
+    }
+
+    #[test]
+    fn fallback_reuses_prepared_snapshot_without_extra_native_reads() {
+        for case in 0..6 {
+            let mut direct = Fake::new(1);
+            let mut prepared = Fake::new(1);
+            prepared.deferred = case != 0;
+            prepared.decline_submission = case == 4;
+            for access in [&mut direct, &mut prepared] {
+                let info = &mut access.windows.get_mut(&WindowId(1)).unwrap().info;
+                info.maximized = case == 1;
+                info.fullscreen = case == 2;
+                info.minimized = case == 5;
+            }
+            let mut session = Session {
+                target: Some(WindowId(1)),
+                ..Session::default()
+            };
+            let mut reference = Session {
+                target: Some(WindowId(1)),
+                ..Session::default()
+            };
+            let screens: Arc<[Screen]> = screens().into();
+            let request = WindowRequest {
+                session: 1,
+                id: 2,
+                scope: None,
+                operation: WindowOperation::Adjust {
+                    target: WindowId(1),
+                    change: WindowChange::Move {
+                        dx: if case == 3 { 0.01 } else { 20.0 },
+                        dy: 0.0,
+                    },
+                    group: 1,
+                },
+            };
+            let expected = reference.execute(&mut direct, request.clone(), &screens, &|| false);
+            let (pending, before) =
+                PendingAdjustment::begin(&mut session, &mut prepared, &request, &screens).unwrap();
+            assert!(pending.is_none());
+            let actual =
+                session.execute_prepared(&mut prepared, request, &screens, &|| false, before);
+            assert_eq!(actual.target, expected.target);
+            assert_eq!(actual.message, expected.message);
+            assert_eq!(
+                prepared.snapshot_reads.get(),
+                direct.snapshot_reads.get(),
+                "case {case}"
+            );
+            assert_eq!(session.move_remainder, reference.move_remainder);
+        }
+    }
+
+    #[test]
+    fn deferred_subpixel_fallback_does_not_accumulate_movement_twice() {
+        let mut access = Fake::new(1);
+        access.deferred = true;
+        let mut session = Session::default();
+        let screens: Arc<[Screen]> = screens().into();
+        let request = WindowRequest {
+            session: 1,
+            id: 2,
+            scope: None,
+            operation: WindowOperation::Adjust {
+                target: WindowId(1),
+                change: WindowChange::Move { dx: 0.01, dy: 0.0 },
+                group: 1,
+            },
+        };
+        assert!(
+            PendingAdjustment::begin(&mut session, &mut access, &request, &screens)
+                .unwrap()
+                .0
+                .is_none()
+        );
+        assert!(session.move_remainder.is_none());
+        assert!(access.submitted.is_empty());
+    }
+
+    #[test]
+    fn deferred_timeout_and_cancel_never_claim_unobserved_success() {
+        for partial in [false, true] {
+            let mut access = Fake::new(1);
+            access.deferred = true;
+            let mut session = Session::default();
+            let screens: Arc<[Screen]> = screens().into();
+            let request = WindowRequest {
+                session: 1,
+                id: 2,
+                scope: None,
+                operation: WindowOperation::Adjust {
+                    target: WindowId(1),
+                    change: WindowChange::Move { dx: 20.0, dy: 0.0 },
+                    group: 1,
+                },
+            };
+            let mut pending =
+                PendingAdjustment::begin(&mut session, &mut access, &request, &screens)
+                    .unwrap()
+                    .0
+                    .unwrap();
+            if partial {
+                access.windows.get_mut(&WindowId(1)).unwrap().info.bounds.x += 5.0;
+            }
+            let result = pending
+                .poll_at(
+                    &mut session,
+                    &mut access,
+                    partial,
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .unwrap();
+            assert_eq!(result.changed, usize::from(partial));
+            assert_eq!(session.history.len(), usize::from(partial));
+            if partial {
+                assert!(result.message.is_none());
+            } else {
+                assert!(result.message.unwrap().contains("Timed out"));
+            }
+        }
+    }
+
+    #[test]
+    fn worker_services_independent_geometry_and_audio_before_confirmation() {
+        use crate::api::audio::{AudioAction, AudioRequest, AudioTarget};
+        struct Deferred {
+            fake: Fake,
+            writes: BTreeMap<WindowId, Rect>,
+            submitted: std::sync::mpsc::Sender<WindowId>,
+            release: Arc<AtomicBool>,
+        }
+        impl WindowAccess for Deferred {
+            fn acquire(&mut self, p: Point, s: &[Screen]) -> Result<Option<WindowInfo>, String> {
+                self.fake.acquire(p, s)
+            }
+            fn enumerate(
+                &mut self,
+                s: &[Screen],
+                c: &dyn Fn() -> bool,
+            ) -> Result<Vec<WindowInfo>, String> {
+                self.fake.enumerate(s, c)
+            }
+            fn snapshot(&self, id: WindowId, s: &[Screen]) -> Result<Snapshot, String> {
+                let mut snapshot = self.fake.snapshot(id, s)?;
+                if self.release.load(Ordering::Acquire)
+                    && let Some(rect) = self.writes.get(&id)
+                {
+                    snapshot.info.bounds = *rect;
+                }
+                Ok(snapshot)
+            }
+            fn can_submit_frame(&self, _: WindowId) -> bool {
+                true
+            }
+            fn submit_frame(
+                &mut self,
+                before: &Snapshot,
+                rect: Rect,
+                _: &[Screen],
+            ) -> Result<bool, String> {
+                let id = before.info.id;
+                self.writes.insert(id, rect);
+                self.submitted.send(id).unwrap();
+                Ok(true)
+            }
+            fn set_frame(
+                &mut self,
+                _: WindowId,
+                _: Rect,
+                _: &[Screen],
+                _: &dyn Fn() -> bool,
+            ) -> Result<WindowInfo, String> {
+                panic!("reactor must use submission")
+            }
+            fn restore(
+                &mut self,
+                before: &Snapshot,
+                s: &[Screen],
+                c: &dyn Fn() -> bool,
+            ) -> Result<WindowInfo, String> {
+                self.fake.restore(before, s, c)
+            }
+            fn cycle_state(
+                &mut self,
+                id: WindowId,
+                s: &[Screen],
+                c: &dyn Fn() -> bool,
+            ) -> Result<WindowInfo, String> {
+                self.fake.cycle_state(id, s, c)
+            }
+            fn select(&self, id: WindowId) -> Result<(), String> {
+                self.fake.select(id)
+            }
+            fn pointer(&self) -> Result<Point, String> {
+                self.fake.pointer()
+            }
+            fn volume(&self, id: WindowId, action: AudioAction) -> Result<String, String> {
+                self.fake.volume(id, action)
+            }
+            fn reset(&mut self) {}
+        }
+        let (submitted, writes) = std::sync::mpsc::channel();
+        let (tx, events) = std::sync::mpsc::channel();
+        let release = Arc::new(AtomicBool::new(false));
+        let worker_release = release.clone();
+        let mut worker = WindowWorker::start(
+            move || Deferred {
+                fake: Fake::new(3),
+                writes: BTreeMap::new(),
+                submitted,
+                release: worker_release,
+            },
+            move |event| {
+                tx.send(event).unwrap();
+            },
+        )
+        .unwrap();
+        let request = |id, operation| WindowRequest {
+            session: 1,
+            id,
+            scope: None,
+            operation,
+        };
+        worker
+            .submit(
+                request(1, WindowOperation::Acquire(Point::default())),
+                &screens(),
+            )
+            .unwrap();
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(5)).unwrap(),
+            BackendEvent::WindowResult(_)
+        ));
+        for (id, target) in [(2, 1), (3, 2)] {
+            worker
+                .submit(
+                    request(
+                        id,
+                        WindowOperation::Adjust {
+                            target: WindowId(target),
+                            change: WindowChange::Move { dx: 20.0, dy: 0.0 },
+                            group: id,
+                        },
+                    ),
+                    &screens(),
+                )
+                .unwrap();
+            assert_eq!(
+                writes.recv_timeout(Duration::from_secs(5)).unwrap(),
+                WindowId(target)
+            );
+        }
+        // Request 5 targets an independent window, but must not overtake the
+        // blocked request 4: result consumers discard lower request ids.
+        for (id, target) in [(4, 1), (5, 3)] {
+            worker
+                .submit(
+                    request(
+                        id,
+                        WindowOperation::Adjust {
+                            target: WindowId(target),
+                            change: WindowChange::Move { dx: 20.0, dy: 0.0 },
+                            group: id,
+                        },
+                    ),
+                    &screens(),
+                )
+                .unwrap();
+        }
+        worker
+            .submit_audio(AudioRequest {
+                session: 9,
+                id: 1,
+                target: AudioTarget::Application(WindowId(1)),
+                action: AudioAction::Down,
+            })
+            .unwrap();
+        assert!(
+            matches!(events.recv_timeout(Duration::from_secs(5)).unwrap(), BackendEvent::AudioResult(result) if result.outcome.is_ok())
+        );
+        assert!(
+            writes.try_recv().is_err(),
+            "later window request overtook blocked geometry"
+        );
+        release.store(true, Ordering::Release);
+        for expected in [2, 3, 4, 5] {
+            assert!(
+                matches!(events.recv_timeout(Duration::from_secs(5)).unwrap(), BackendEvent::WindowResult(result) if result.id == expected && result.changed == 1)
+            );
+        }
+        worker
+            .stop_until(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+    }
+    include!("window_session/async_tests.rs");
 }

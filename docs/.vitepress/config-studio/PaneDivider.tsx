@@ -1,3 +1,4 @@
+import { useStudioI18n } from './i18n'
 import { defineComponent, ref } from 'vue'
 
 /** Presentation widths never modify the configuration document. */
@@ -5,6 +6,7 @@ export default defineComponent({
   props: { navigation: Boolean, value: { type: Number, required: true }, disabled: Boolean },
   emits: { change: (_value: number) => true, start: () => true },
   setup(props, { emit }) {
+    const { t } = useStudioI18n()
     const dragging = ref(false)
     let origin = 0, initial = 0, span = 1
     const min = () => props.navigation ? 180 : 35
@@ -26,10 +28,10 @@ export default defineComponent({
     return () => <div
       class={{ 'ks-pane-divider': true, 'ks-nav-divider': props.navigation, 'is-dragging': dragging.value }}
       role="separator" tabindex={props.disabled ? -1 : 0} aria-orientation="vertical"
-      aria-label={props.navigation ? '调整分类导航宽度' : '调整设置与预览宽度'}
+      aria-label={props.navigation ? t("调整分类导航宽度") : t("调整设置与预览宽度")}
       aria-valuemin={min()} aria-valuemax={max()} aria-valuenow={Math.round(props.value)}
-      aria-valuetext={props.navigation ? `${Math.round(props.value)} 像素` : `设置占 ${Math.round(props.value)}%`}
-      title="拖动调整宽度 · 方向键微调 · 双击恢复默认"
+      aria-valuetext={props.navigation ? t("{0} 像素", [Math.round(props.value)]) : t("设置占 {0}%", [Math.round(props.value)])}
+      title={t("拖动调整宽度 · 方向键微调 · 双击恢复默认")}
       onPointerdown={start}
       onPointermove={event => { if (dragging.value) update(initial + (event.clientX - origin) * (props.navigation ? 1 : 100 / span)) }}
       onPointerup={event => { dragging.value = false; (event.currentTarget as HTMLElement).releasePointerCapture(event.pointerId) }}

@@ -1,4 +1,13 @@
+---
+releaseHistory: true
+outline: false
+---
+
 # Release notes
+
+## 0.10.19
+
+- Improved window scheduling and background workspace saves on Windows and macOS, reducing synchronous waits and duplicate undo-history data; refined key release during error recovery, logging, and native resource management.
 
 ## 0.10.18
 

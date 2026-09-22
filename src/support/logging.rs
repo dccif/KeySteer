@@ -13,7 +13,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 const RETAINED_LOGS: usize = 3;
@@ -42,9 +42,17 @@ impl fmt::Display for Level {
     }
 }
 
+struct RepeatedError {
+    target: String,
+    message: String,
+    since: Instant,
+    suppressed: u64,
+}
+
 struct LoggerState {
     file: Option<File>,
     bytes: u64,
+    repeated: Option<RepeatedError>,
 }
 
 struct Logger {
@@ -65,16 +73,55 @@ impl Logger {
             state: Mutex::new(LoggerState {
                 file: Some(file),
                 bytes,
+                repeated: None,
             }),
         })
     }
 
     fn write(&self, level: Level, target: &str, message: &str) {
+        self.write_at(level, target, message, Instant::now());
+    }
+    fn write_at(&self, level: Level, target: &str, message: &str, now: Instant) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if level == Level::Error
+            && state.file.is_some()
+            && let Some(repeated) = &mut state.repeated
+            && repeated.target == target
+            && repeated.message == message
+            && now.saturating_duration_since(repeated.since) < Duration::from_secs(1)
+        {
+            repeated.suppressed = repeated.suppressed.saturating_add(1);
+            return;
+        }
+        self.write_repeats(&mut state);
+        self.write_record(&mut state, level, target, message);
+        // Keep bounded exact keys: no hash collisions or unbounded error cache.
+        if level == Level::Error && state.file.is_some() && target.len() + message.len() <= 4096 {
+            state.repeated = Some(RepeatedError {
+                target: target.into(),
+                message: message.into(),
+                since: now,
+                suppressed: 0,
+            });
+        }
+    }
+    fn write_repeats(&self, state: &mut LoggerState) {
+        if let Some(repeated) = state.repeated.take()
+            && repeated.suppressed > 0
+        {
+            self.write_record(
+                state,
+                Level::Error,
+                &repeated.target,
+                &format!(
+                    "{} (repeated {} additional times)",
+                    repeated.message, repeated.suppressed
+                ),
+            );
+        }
+    }
+    fn write_record(&self, state: &mut LoggerState, level: Level, target: &str, message: &str) {
         let line = format_line(level, target, message);
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.file.is_none() {
             match open_append(&self.path) {
                 Ok(file) => {
@@ -91,7 +138,7 @@ impl Logger {
             }
         }
         if state.bytes.saturating_add(line.len() as u64 + 1) > MAX_LOG_BYTES
-            && let Err(error) = self.rotate(&mut state)
+            && let Err(error) = self.rotate(state)
         {
             write_emergency_stderr(format_args!(
                 "cannot rotate diagnostic log {}: {error}",
@@ -168,6 +215,7 @@ impl Logger {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.write_repeats(&mut state);
         let flush_error = state.file.as_mut().and_then(|file| file.flush().err());
         if let Some(error) = flush_error {
             write_emergency_stderr(format_args!(
@@ -355,14 +403,18 @@ pub(crate) fn report_warning_args(target: &str, message: fmt::Arguments<'_>) {
 #[macro_export]
 macro_rules! log_info {
     ($target:expr, $($arg:tt)*) => {
-        $crate::support::logging::info_args($target, format_args!($($arg)*))
+        if $crate::support::logging::level_enabled($crate::support::logging::Level::Info) {
+            $crate::support::logging::info_args($target, format_args!($($arg)*))
+        }
     };
 }
 
 #[macro_export]
 macro_rules! report_warning {
     ($target:expr, $($arg:tt)*) => {
-        $crate::support::logging::report_warning_args($target, format_args!($($arg)*))
+        if $crate::support::logging::level_enabled($crate::support::logging::Level::Warning) {
+            $crate::support::logging::report_warning_args($target, format_args!($($arg)*))
+        }
     };
 }
 
@@ -415,7 +467,7 @@ pub fn install_panic_hook() {
     });
 }
 
-fn level_enabled(level: Level) -> bool {
+pub fn level_enabled(level: Level) -> bool {
     level_enabled_with(level, NON_ERROR_ENABLED.load(Ordering::Relaxed))
 }
 
@@ -576,6 +628,43 @@ mod tests {
     }
 
     #[test]
+    fn repeated_errors_write_once_then_flush_an_exact_count() {
+        let path = temporary_log();
+        let logger = Logger::open(path.clone()).unwrap();
+        let now = Instant::now();
+        logger.write_at(Level::Error, "window", "unavailable", now);
+        let first = fs::read_to_string(&path).unwrap();
+        for _ in 0..100 {
+            logger.write_at(Level::Error, "window", "unavailable", now);
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), first);
+        logger.flush();
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        assert!(text.contains("repeated 100 additional times"));
+        drop(logger);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn repeated_errors_do_not_merge_different_targets_messages_or_time_windows() {
+        let path = temporary_log();
+        let logger = Logger::open(path.clone()).unwrap();
+        let now = Instant::now();
+        for (target, message, time) in [
+            ("one", "error", now),
+            ("two", "error", now),
+            ("two", "another", now),
+            ("two", "another", now + Duration::from_secs(1)),
+        ] {
+            logger.write_at(Level::Error, target, message, time);
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 4);
+        drop(logger);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn error_is_visible_and_flushed_when_non_error_logging_is_disabled() {
         let path = temporary_log();
         let logger = Logger::open(path.clone()).unwrap();
@@ -607,5 +696,35 @@ mod tests {
         assert!(text.contains("reopened sink"), "{text}");
         drop(logger);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn disabled_macros_do_not_evaluate_targets_or_arguments() {
+        let previous = NON_ERROR_ENABLED.swap(false, Ordering::Relaxed);
+        let evaluated = std::cell::Cell::new(0);
+        crate::log_info!(
+            {
+                evaluated.set(1);
+                "unused"
+            },
+            "{}",
+            {
+                evaluated.set(2);
+                "unused"
+            }
+        );
+        crate::report_warning!(
+            {
+                evaluated.set(3);
+                "unused"
+            },
+            "{}",
+            {
+                evaluated.set(4);
+                "unused"
+            }
+        );
+        NON_ERROR_ENABLED.store(previous, Ordering::Relaxed);
+        assert_eq!(evaluated.get(), 0);
     }
 }

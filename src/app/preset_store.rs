@@ -20,6 +20,23 @@ pub(crate) struct PresetStore {
     worker: Option<usage::UsageWorker>,
 }
 impl super::runtime::PresetRepository for PresetStore {
+    fn submit(
+        &mut self,
+        id: u64,
+        operation: crate::api::window_presets::WorkspaceOperation,
+        emit: Option<std::sync::Arc<dyn Fn(crate::api::BackendEvent) + Send + Sync>>,
+    ) -> Result<Option<crate::api::window_presets::WorkspaceCompletion>, String> {
+        if self.file.is_some()
+            && let Some(emit) = emit
+        {
+            self.queue_operation(id, operation, emit)?;
+            return Ok(None);
+        }
+        Ok(Some(crate::api::window_presets::WorkspaceCompletion {
+            id,
+            outcome: self.execute(operation),
+        }))
+    }
     fn record_mode_entry(&mut self, mode: &str, save_after_entries: u32) {
         self.record_entry(mode, save_after_entries);
     }

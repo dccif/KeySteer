@@ -58,6 +58,9 @@ impl ConfigFile {
 }
 
 impl ConfigurationRepository for ConfigRepository {
+    fn fork_for_worker(&self) -> Option<Box<dyn ConfigurationRepository>> {
+        Some(Box::new(self.clone()))
+    }
     fn source_text(&self) -> Result<String, String> {
         Ok(self.source.clone())
     }

@@ -1,5 +1,14 @@
 # 构建、打包、文档站与测试
 
+中英文 `releases/index.md` 使用 `releaseHistory: true`，由 Markdown 插件在渲染阶段将最新版本之后的内容包入原生 `details/summary`；最新版本展开，旧版本独立折叠，关闭冗长的右侧目录。
+保留源文件中的 `## 版本号` 和全部正文，确保 `tools/compose-release-notes.sh` 不会提取到折叠标记；新增版本无需手动调整旧版本。`release-history.test.ts` 检查中英文内容／锚点不变，以及代码块和未启用页面不受影响。
+
+配置模拟器语言默认跟随 VitePress 页面语言，顶部选择器可在同一实例切换中文／英文。
+`config-studio/i18n.ts` 使用 provide/inject 保存实例级语言，避免 SSR 请求间共享状态；切换时释放预览按键，但不重建配置文档、工作区或编辑页面。
+`messages.ts` 集中维护显示文案；模式、命令、TOML 路径、配置值和用户备注保持原值，旧模拟器事件只在显示边界匹配完整模板。
+设置搜索同时索引中英文名称和原始路径；动作分类使用稳定的原始值，不能把翻译后的名称写入选项 value。
+`studio-i18n.test.ts` 检查全部字段元数据翻译、双语搜索和插值内容保留；浏览器验收语言切换前后按键绑定不变，以及英文窄屏换行。
+
 Windows 前台锁回归：`foreground_unlock_*` 检查屏蔽批次、自身注入标记、保留已按住 Alt、所有部分发送前缀的清理；ignored `native_explicit_selection_recovers_foreground_lock` 只操作临时自有窗口，先用 LockSetForegroundWindow 验证原始调用被拒绝，再验证共享 select 恢复前后台切换，并恢复原前台。需交互桌面；沙箱 SendInput 拒绝访问不代表产品路径失败。
 
 Window 固定帮助预编译：`window_help_is_precompiled_before_entry_and_reused_across_move_resize_and_reentry` 检查入口前准备、跨会话 Arc 复用与 Resize 隐藏 Other Actions；`precompiled_window_help_matches_dynamic_rendering` 对比单/双栏、Move/Resize 和 1/1.5/2 DPI 的完整场景。分配探针 `precompiled_window_help_allocation_comparison` 必须单线程运行 ignored 测试。2026-09-16 本机 debug 下，1920 宽/1 倍 DPI，当前动态回退构建与预编译消费分别为 Move 817→106、Resize 767→96 次分配；仅比较一次面板重建，不代表整程序延迟或旧版本基准。
@@ -205,6 +214,8 @@ GitHub Pages。需要更新线上文档时，在 Actions 页面运行 `Deploy do
 已经存在的 labels。
 
 ## VitePress 文档与模拟器
+
+Grid／Recursive Grid 预览通过 `grid-region.ts` 按选键路径逐层细分逻辑画布；网格范围与模拟指针中心使用同一计算。Backspace 弹出路径后恢复父区域，重新进入模式清空路径。`grid-region.test.ts` 覆盖多层坐标、矩形网格、返回父级和不存在的格子；浏览器验收确认位置与尺寸同时改变，而非只改变高亮。
 
 配置工作台按鼠标控制、目标定位、窗口管理、全局设置和配置文件分类；分类是展示元数据，不改变独立模式或 TOML 路径。`config-studio/navigation.ts` 维护页面、页签及字段归属，`fields.ts` 维护现有控件和中文搜索标签。搜索结果打开对应页面、页签和折叠区后定位控件；`settings-navigation.test.ts` 检查字段入口覆盖、共享样式归属及搜索。
 
@@ -437,3 +448,29 @@ macOS overlay 回归 ll_displays_have_separate_local_origins_without_retina_coo
 
 
 窗口枚举回归：window_visibility 测试跨屏窗口标题不同／缺失、完整重叠集合和其他进程／Space 歧义；all_screen_inventory_numbers_every_window_without_pointer_acquisition 验证 300 个跨屏窗口无需鼠标命中即可全部编号，current 范围仍正确过滤，且不改变焦点或几何。
+
+
+## 异步响应与资源所有权回归
+
+运行 `cargo test -- --test-threads=1`；分配预算测试使用进程级计数器，需要单线程测试。运行 `cargo clippy --all-targets -- -D warnings`，并交叉检查 macOS 的 aarch64／x86_64 目标。回归覆盖工作区磁盘锁阻塞下非阻塞提交和完成顺序、日志参数惰性求值、独立窗口及音频进度、请求屏障、取消／超时、部分写入撤销和标题更新后的恢复。
+
+场景基准 `tests/fixtures/window-scenes-c7bff963.txt` 的 1,296 项摘要由历史提交 c7bff963 的渲染实现生成，不使用当前实现生成期望值。safety_budget 同时约束全局与各原生模块：本次改动前 HEAD 实际为 385 个 unsafe 表达式（旧门禁预算已漂移），收拢封装后为 383；这包含测试代码，不能解释为消除了所有原生 unsafe。
+
+Windows 可显式运行 `cargo test --lib native_deferred_geometry_submission_and_readback -- --ignored --nocapture --test-threads=1`。该探针只操作自己创建的临时窗口，40 次采样打印包含准备读取的提交耗时和读回确认耗时；debug 构建、桌面调度和测试窗口消息泵会影响数值。它验证原生路径可用，不是优化前后基准或按键到像素测量。macOS 交叉编译不替代 macOS 实机验收。
+
+本次 Windows 验证：全量测试 1,052 通过／83 ignored，Clippy all-targets 无告警；aarch64-apple-darwin 和 x86_64-apple-darwin 均通过 cargo check。显式运行普通几何提交、窗口还原与关闭身份、布局事务、最大化标签栏四项原生探针均通过。40 次 debug 几何探针的准备＋提交 p50／p95 为 5.01／5.37ms，确认 p50／p95 为 30.50／37.45ms；未进行相同环境下优化前后的端到端或 RSS 对比。
+
+
+## 确认分配与 Normal 巡航优化验收
+
+确认等待 10,000 次的 portable 回归要求零 allocation/reallocation 且不读取完整元数据；同步回退六个分支与直接同步执行结果一致且不增加快照读取。Windows `native_deferred_geometry_submission_and_readback` 额外要求 256 次原生读回零 Rust 分配、title/app 地址不变。Normal 编译前后配置结构同尺寸，多个速度／加速度／曲线及时间点与旧积分对照。
+
+2026-09-22 三版本同场 release 基准，固定 affinity=4，每版交替 5 轮，20k 样本：Normal p50（135b5f4／修复前／修复后）18／19／15ns，p99 为 21／21／17ns；默认按键 p99 为 181／183／180ns，WASD 为 187／190／186ns。均为各轮分位数的中位数；Normal 样本是 1,000 次帧的批均值、按键是 100 次事件的批均值，不是输入到像素延迟。前轮 Normal 23→28ns 的差异没有稳定复现，不能把调度噪声直接判为逻辑回退。原始运行与说明保留在 target/perf-135b5f4/results-fixed.json、fixed-comparison.md。
+
+修复后全量 1,055 passed／83 ignored，Clippy 无告警，macOS ARM／Intel 编译通过，4 项 Windows 自有窗口原生测试通过。macOS 编译不等价于 AX 实机性能验收。
+
+## 异步确认与配置回归
+
+`window_session/async_tests.rs` 覆盖布局在途上限、提交部分失败后的回滚、取消等待已提交写入、最大化入口恢复、EndEdit 取消、撤销提交边界，以及快速窗口提前确认但不提前提交历史。Grouped 测试覆盖非活动代表编号到活动成员的转换、标签栏占位、无元数据重读和确认回声过滤。`configuration_async.rs` 用受控阻塞 repository 验证 Engine 不等待磁盘工作、连续候选使用最新 repository、失败不覆盖有效配置。logging 测试通过注入时间验证错误合并、计数 flush、键与时间窗口隔离，不依赖真实 sleep。
+
+执行 `cargo test --all-targets -- --test-threads=1`、`cargo clippy --all-targets -- -D warnings`，并交叉检查两种 macOS 架构。分配断言需串行执行；Windows 上的跨平台编译不替代 macOS 桌面验收。

@@ -1,3 +1,4 @@
+import { useStudioI18n } from './i18n'
 import { defineComponent } from 'vue'
 
 export default defineComponent({
@@ -10,6 +11,7 @@ export default defineComponent({
     onSelect: { type: Function as unknown as () => (mode: string) => void, required: true },
   },
   setup(props) {
+    const { t } = useStudioI18n()
     return () => {
       const ui = props.settings.ui ?? {}
       const color = (value: any, fallback: string) => typeof value === 'string' ? value : value?.[props.appearance] ?? fallback
@@ -34,7 +36,7 @@ export default defineComponent({
       }}>
         {props.rows.length ? props.rows.map((mode, index) => <button type="button" onMousedown={event => event.preventDefault()} onClick={() => props.onSelect(mode)}>
           <kbd>{index + 1}</kbd><span>{mode}</span>
-        </button>) : <span>没有可切换的模式</span>}
+        </button>) : <span>{t("没有可切换的模式")}</span>}
       </div>
     }
   },

@@ -550,6 +550,13 @@ impl Drop for WindowsBackend {
 }
 
 impl Backend for WindowsBackend {
+    fn event_sink(&self) -> Option<Arc<dyn Fn(BackendEvent) + Send + Sync>> {
+        let sender = self.event_tx.clone();
+        Some(Arc::new(move |event| {
+            let _ = sender.send(event);
+        }))
+    }
+
     fn focused_window_bounds(&self) -> Result<Option<crate::api::Rect>, String> {
         Ok(accessibility::window_bounds(native::foreground_window()))
     }

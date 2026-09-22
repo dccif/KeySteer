@@ -1041,7 +1041,7 @@ mod tests {
                 .iter()
                 .map(|input| {
                     // SAFETY: the helper emits keyboard inputs only.
-                    let key = unsafe { input.Anonymous.ki };
+                    let key = keyboard_data(input);
                     assert_eq!(key.dwExtraInfo, INJECTED_TAG);
                     (key.wVk.0, key.dwFlags.contains(KEYEVENTF_KEYUP))
                 })
@@ -1067,7 +1067,7 @@ mod tests {
                 let count = if calls == 1 { accepted } else { inputs.len() };
                 for input in inputs.iter().take(count) {
                     // SAFETY: the helper emits keyboard inputs only.
-                    let key = unsafe { input.Anonymous.ki };
+                    let key = keyboard_data(input);
                     assert!(matches!(key.wVk.0, 0xA4 | 0xE8));
                     if key.dwFlags.contains(KEYEVENTF_KEYUP) {
                         held.remove(&key.wVk.0);
@@ -1158,6 +1158,12 @@ mod tests {
         );
     }
 
+    fn keyboard_data(input: &INPUT) -> KEYBDINPUT {
+        assert_eq!(input.r#type, INPUT_KEYBOARD);
+        // SAFETY: the tag is checked above; test inputs come from our typed constructors.
+        unsafe { input.Anonymous.ki }
+    }
+
     fn mouse_data(input: &INPUT) -> MOUSEINPUT {
         // SAFETY: every caller passes an INPUT value built by
         // `mouse_button_inputs`, which activates the `mi` union variant.
@@ -1205,7 +1211,7 @@ mod tests {
                     assert_eq!(input.r#type, INPUT_KEYBOARD);
                     // SAFETY: mapped_chord_inputs constructs only INPUT_KEYBOARD
                     // values; the tag above also checks the active union member.
-                    let key = unsafe { input.Anonymous.ki };
+                    let key = keyboard_data(input);
                     let code = key.wVk.0;
                     if code == 0xE8 {
                         continue;

@@ -352,6 +352,13 @@ impl Drop for MacOsBackend {
 }
 
 impl Backend for MacOsBackend {
+    fn event_sink(&self) -> Option<Arc<dyn Fn(BackendEvent) + Send + Sync>> {
+        let sender = self.event_tx.clone();
+        Some(Arc::new(move |event| {
+            let _ = sender.send(event);
+        }))
+    }
+
     fn focused_window_bounds(&self) -> Result<Option<crate::api::Rect>, String> {
         self.workspace
             .focused_app()

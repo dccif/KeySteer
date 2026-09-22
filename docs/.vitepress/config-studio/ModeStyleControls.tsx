@@ -1,3 +1,4 @@
+import { useStudioI18n } from './i18n'
 import { fieldLocation, type SettingsTab } from './navigation'
 import { cardPositionRatios } from '../simulator/window-card-position.ts'
 import CardPositionEditor from './CardPositionEditor'
@@ -28,6 +29,7 @@ export default defineComponent({
     appearanceChange: (_appearance: Appearance) => true,
   },
   setup(props, { emit }) {
+    const { t } = useStudioI18n()
     const positionRoot = computed(() => props.mode === 'window_editor' ? 'window_editor.card' : 'window.card')
     const modeFields = computed(() => fields[props.mode])
     const isCardField = (field: StyleField) => props.mode.startsWith('window') &&
@@ -81,25 +83,25 @@ export default defineComponent({
       return (
         <div class="ks-style-controls">
           <div class="ks-style-heading">
-            <div><strong>{props.tab === 'behavior' ? '行为参数' : '外观设置'}</strong><span>修改即时显示在右侧预览；默认值继续继承</span></div>
-            <div class="ks-appearance-switch" aria-label="预览配色">
+            <div><strong>{props.tab === 'behavior' ? t("行为参数") : t("外观设置")}</strong><span>{t("修改即时显示在右侧预览；默认值继续继承")}</span></div>
+            <div class="ks-appearance-switch" aria-label={t("预览配色")}>
               {(['dark', 'light'] as Appearance[]).map((appearance) => (
                 <button class={{ active: props.appearance === appearance }} onClick={() => emit('appearanceChange', appearance)}>
-                  {appearance === 'dark' ? '深色' : '浅色'}
+                  {appearance === 'dark' ? t("深色") : t("浅色")}
                 </button>
               ))}
             </div>
           </div>
-          {props.page === 'window_editor' && props.tab === 'appearance' && <p>卡片颜色与字体继承窗口共用外观；此处只覆盖布局编辑的位置与当前模式标记。</p>}
+          {props.page === 'window_editor' && props.tab === 'appearance' && <p>{t("卡片颜色与字体继承窗口共用外观；此处只覆盖布局编辑的位置与当前模式标记。")}</p>}
           {props.mode.startsWith('window') && props.tab === 'appearance' && <div class="ks-style-section ks-card-editor">
             <CardStylePreview document={props.effectiveDocument} mode={props.mode} appearance={props.appearance} />
             <div class="ks-card-editor-controls">
-              <strong>颜色、透明度与边框</strong>
+              <strong>{t("颜色、透明度与边框")}</strong>
               {renderFields(modeFields.value.colors.filter(isCardField))}
-              <details class="ks-style-advanced"><summary>高级设置 · 字体、尺寸与间距</summary>
+              <details class="ks-style-advanced"><summary>{t("高级设置 · 字体、尺寸与间距")}</summary>
               {renderFields(modeFields.value.advanced.filter(isCardField))}</details>
             </div>
-            <strong>位置与排列</strong>
+            <strong>{t("位置与排列")}</strong>
             {renderFields(modeFields.value.layout.filter(isCardField))}
             {(props.page === 'window_card' || props.page === 'window_editor') && <CardPositionEditor
               position={getConfigPath(props.effectiveDocument, positionRoot.value + '.position') as string[] ?? ['50%', '50%', '50%', '50%']}
@@ -107,19 +109,19 @@ export default defineComponent({
               onChange={value => update(positionRoot.value + '.position', value)} />}
           </div>}
           <div class="ks-style-section" hidden={props.page !== 'key_help'}>
-            <span class="ks-style-section-label">{props.appearance === 'dark' ? '深色主题' : '浅色主题'}</span>
+            <span class="ks-style-section-label">{props.appearance === 'dark' ? t("深色主题") : t("浅色主题")}</span>
             {renderFields(palette)}
           </div>
           <div class="ks-style-section" hidden={props.tab !== 'appearance'}>
-            <span class="ks-style-section-label">模式颜色</span>
+            <span class="ks-style-section-label">{t("模式颜色")}</span>
             {renderFields(modeFields.value.colors.filter(field => !isCardField(field)))}
           </div>
           <div class="ks-style-section">
-            <span class="ks-style-section-label">常用布局</span>
+            <span class="ks-style-section-label">{t("常用布局")}</span>
             {renderFields(modeFields.value.layout.filter(field => !isCardField(field)))}
           </div>
           <details class="ks-style-advanced">
-            <summary>高级设置</summary>
+            <summary>{t("高级设置")}</summary>
             {renderFields(modeFields.value.advanced.filter(field => !isCardField(field)))}
           </details>
         </div>
@@ -138,6 +140,7 @@ const StyleControl = defineComponent({
     onReset: { type: Function as unknown as () => () => void, required: true },
   },
   setup(props) {
+    const { t } = useStudioI18n()
     return () => {
       const field = props.field
       const source = props.value ?? fallback(field, props.appearance)
@@ -146,14 +149,14 @@ const StyleControl = defineComponent({
       const updateColor = (next: string) => props.onUpdate(variants ? { ...variants, [props.appearance]: next } : next)
       return (
         <label class={{ 'ks-style-control': true, toggle: field.kind === 'boolean' }} title={field.path} data-config-path={field.path}>
-          <span>{field.label}</span>
+          <span>{t(field.label)}</span>
           {field.kind === 'boolean' ? (
-            <button type="button" class={{ active: Boolean(value) }} onClick={() => props.onUpdate(!value)}><i />{value ? '开启' : '关闭'}</button>
+            <button type="button" class={{ active: Boolean(value) }} onClick={() => props.onUpdate(!value)}><i />{value ? t("开启") : t("关闭")}</button>
           ) : field.kind === 'color' ? (
             <div class="ks-style-color">
               <input type="color" value={normalizeColor(value, props.appearance)} onInput={(event) => updateColor(withAlpha((event.target as HTMLInputElement).value, value))} />
               <input value={String(value)} onInput={(event) => updateColor((event.target as HTMLInputElement).value)} />
-              <input class="ks-color-alpha" type="range" aria-label={`${field.label}不透明度`} title="不透明度" min="0" max="255"
+              <input class="ks-color-alpha" type="range" aria-label={t("{0}不透明度", [t(field.label)])} title={t("不透明度")} min="0" max="255"
                 value={/^#[0-9a-f]{8}$/i.test(String(value)) ? parseInt(String(value).slice(7), 16) : 255}
                 onInput={event => updateColor(`${normalizeColor(value, props.appearance)}${Number((event.target as HTMLInputElement).value).toString(16).padStart(2, '0')}`)} />
             </div>
@@ -190,7 +193,7 @@ const StyleControl = defineComponent({
             class={{ 'ks-style-reset': true, inherited: props.inherited }}
             disabled={props.inherited}
             onClick={(event) => { event.preventDefault(); props.onReset() }}
-          >{props.inherited ? '默认' : '重置'}</button>
+          >{props.inherited ? t("默认") : t("重置")}</button>
         </label>
       )
     }

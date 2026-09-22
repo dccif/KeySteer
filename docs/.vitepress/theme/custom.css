@@ -98,6 +98,26 @@
 
 .ks-open-simulator { margin: 28px 0; }
 
+.vp-doc .ks-release-history {
+  margin: 12px 0;
+  padding: 12px 18px;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 12px;
+  background: var(--vp-c-bg-soft);
+}
+.vp-doc .ks-release-history > summary { cursor: pointer; color: var(--vp-c-text-1); }
+.vp-doc .ks-release-history > summary > h2 {
+  display: inline;
+  margin: 0 0 0 8px;
+  padding: 0;
+  border: 0;
+  font-size: 17px;
+  line-height: 28px;
+}
+.vp-doc .ks-release-history > summary:focus-visible { outline: 2px solid var(--vp-c-brand-1); outline-offset: 4px; border-radius: 4px; }
+.vp-doc .ks-release-history > summary .header-anchor { position: static; display: inline; float: none; margin-left: 8px; padding: 0; }
+.vp-doc .ks-release-history[open] > summary { margin-bottom: 12px; }
+
 .ks-standalone {
   min-height: 100vh;
   padding: 14px 0 32px;
@@ -119,6 +139,19 @@
 .ks-standalone-header strong { color: var(--vp-c-text-1); font-size: 14px; }
 .ks-standalone-header span { color: var(--vp-c-text-2); font-size: 11px; font-weight: 400; }
 .ks-standalone-header a { color: var(--vp-c-brand-1); }
+.ks-standalone-header .ks-language-picker {
+  color: var(--vp-c-text-1);
+  background: var(--vp-c-bg-soft);
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 8px;
+  padding: 4px 8px;
+  font: inherit;
+  max-width: 120px;
+}
+.ks-language-picker:focus-visible { outline: 2px solid var(--vp-c-brand-1); outline-offset: 2px; }
+@media (max-width: 640px) {
+  .ks-standalone-header { flex-wrap: wrap; gap: 8px 12px; }
+}
 
 .ks-standalone .ks-studio {
   width: min(1540px, calc(100vw - 32px));

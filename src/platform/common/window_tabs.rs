@@ -75,6 +75,8 @@ pub(crate) struct Grouped<A> {
     observed: BTreeMap<WindowId, Snapshot>,
     bars: Vec<TabBar>,
     watched: Vec<WindowId>,
+    confirming: Vec<WindowId>,
+    deferred_events: Vec<TabNativeEvent>,
     retired: Vec<WindowId>,
     hidden: BTreeSet<WindowId>,
     screens: Vec<Screen>,
@@ -109,13 +111,17 @@ impl<A: WindowAccess> Grouped<A> {
             observed: BTreeMap::new(),
             bars: Vec::new(),
             watched: Vec::new(),
+            confirming: Vec::new(),
+            deferred_events: Vec::new(),
             retired: Vec::new(),
             hidden: BTreeSet::new(),
             screens: Vec::new(),
         }
     }
     pub fn persistent(&self) -> bool {
-        !self.groups.state.groups.is_empty() || !self.hidden.is_empty()
+        !self.groups.state.groups.is_empty()
+            || !self.hidden.is_empty()
+            || !self.deferred_events.is_empty()
     }
 
     fn checkpoint(&self, extra: &[WindowId], screens: &[Screen]) -> Checkpoint {
@@ -229,6 +235,22 @@ impl<A: WindowAccess> Grouped<A> {
         }
         Ok(())
     }
+    pub(super) fn watch_confirmations(
+        &mut self,
+        ids: impl Iterator<Item = WindowId>,
+    ) -> Result<(), String> {
+        self.confirming.clear();
+        for id in ids {
+            self.confirming.push(self.active_window(id));
+        }
+        self.confirming.sort_unstable();
+        self.confirming.dedup();
+        let mut watched = self.watched.clone();
+        watched.extend(self.confirming.iter().copied());
+        watched.sort_unstable();
+        watched.dedup();
+        self.native.tab_watch(&watched)
+    }
     fn publish(&mut self, screens: &[Screen]) -> Result<(), String> {
         if self.screens != screens {
             self.screens = screens.to_vec();
@@ -266,7 +288,11 @@ impl<A: WindowAccess> Grouped<A> {
             .collect();
         self.interacting.retain(|id| watched.contains(id));
         if watched != self.watched {
-            self.native.tab_watch(&watched)?;
+            let mut all = watched.clone();
+            all.extend(self.confirming.iter().copied());
+            all.sort_unstable();
+            all.dedup();
+            self.native.tab_watch(&all)?;
             self.watched = watched;
         }
         let mut bars = Vec::new();
@@ -952,13 +978,72 @@ impl<A: WindowAccess> Grouped<A> {
         self.publish(screens)
     }
 
+    fn active_window(&self, id: WindowId) -> WindowId {
+        self.groups
+            .state
+            .containing(id)
+            .map_or(id, |group| group.active)
+    }
+    fn refresh_placement(
+        &self,
+        snapshot: &mut Snapshot,
+        screens: &[Screen],
+        read: impl FnOnce(&A, &mut Snapshot, &[Screen]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let id = snapshot.info.id;
+        let grouped = self.groups.state.containing(id).is_some();
+        if !grouped {
+            return read(&self.native, snapshot, screens);
+        }
+        let mut native = snapshot.placement();
+        native.info.id = self.active_window(id);
+        let header = self.header_height(native.info.screen, screens);
+        native.info.bounds = Self::content_frame(native.info.bounds, header)?;
+        native.restored = Self::content_frame(native.restored, header)?;
+        read(&self.native, &mut native, screens)?;
+        let header = self.header_height(native.info.screen, screens);
+        snapshot.info.bounds = Self::outer_frame(native.info.bounds, header);
+        snapshot.restored = Self::outer_frame(native.restored, header);
+        snapshot.info.screen = native.info.screen;
+        snapshot.info.maximized = native.info.maximized;
+        snapshot.info.minimized = native.info.minimized;
+        snapshot.info.fullscreen = native.info.fullscreen;
+        Ok(())
+    }
+    fn native_placement(
+        &self,
+        before: &Snapshot,
+        rect: Rect,
+        screens: &[Screen],
+    ) -> Result<(Snapshot, Rect), String> {
+        let mut native = before.placement();
+        if self.groups.state.containing(before.info.id).is_none() {
+            return Ok((native, rect));
+        }
+        native.info.id = self.active_window(before.info.id);
+        let header = self.header_height(before.info.screen, screens);
+        native.info.bounds = Self::content_frame(before.info.bounds, header)?;
+        native.restored = Self::content_frame(before.restored, header)?;
+        let screen =
+            super::window_geometry::screen_index(screens, rect).ok_or("Display is unavailable")?;
+        Ok((
+            native,
+            Self::content_frame(rect, self.header_height(screen, screens))?,
+        ))
+    }
+
     /// Native callbacks only enqueue/coalesce identities. All snapshots and
     /// writes happen here, serialized with keyboard-driven operations.
     pub fn pump(&mut self, screens: &[Screen], cancelled: &dyn Fn() -> bool) -> Result<(), String> {
         if cancelled() {
             return Ok(());
         }
-        let events = self.native.tab_events();
+        let mut events = if self.confirming.is_empty() {
+            std::mem::take(&mut self.deferred_events)
+        } else {
+            Vec::new()
+        };
+        events.extend(self.native.tab_events());
         if events.is_empty() {
             if !self.pending_bars.is_empty() {
                 return self.publish_changed(&BTreeSet::new(), screens);
@@ -981,6 +1066,23 @@ impl<A: WindowAccess> Grouped<A> {
         for event in events {
             if cancelled() {
                 return Ok(());
+            }
+            // Group identity must stay fixed until every submitted write settles.
+            // Preserve action order; repeated notifications can be coalesced.
+            if !self.confirming.is_empty()
+                && matches!(
+                    event,
+                    TabNativeEvent::Focused(_)
+                        | TabNativeEvent::Activate(_)
+                        | TabNativeEvent::Dissolve(_)
+                        | TabNativeEvent::Drop(_)
+                        | TabNativeEvent::Closed(_)
+                )
+            {
+                if self.deferred_events.last() != Some(&event) {
+                    self.deferred_events.push(event);
+                }
+                continue;
             }
             match event {
                 TabNativeEvent::GeometryChanged(id) => {
@@ -1035,7 +1137,7 @@ impl<A: WindowAccess> Grouped<A> {
             if cancelled() {
                 return Ok(());
             }
-            if self.groups.state.containing(id).is_none() {
+            if self.groups.state.containing(id).is_none() || self.confirming.contains(&id) {
                 continue;
             }
             let read = if !metadata && let Some(previous) = self.observed.get(&id) {
@@ -1321,6 +1423,104 @@ impl<A: WindowAccess> WindowAccess for Grouped<A> {
             snapshot.restored = Self::outer_frame(snapshot.restored, header);
         }
         Ok(snapshot)
+    }
+    fn tab_geometry(
+        &self,
+        id: WindowId,
+        previous: &Snapshot,
+        screens: &[Screen],
+    ) -> Result<Snapshot, String> {
+        if self.groups.state.containing(id).is_some() {
+            return self.snapshot(id, screens);
+        }
+        self.native.tab_geometry(id, previous, screens)
+    }
+    fn can_submit_frame(&self, id: WindowId) -> bool {
+        let active = self.active_window(id);
+        self.native.can_submit_frame(active)
+    }
+    fn validate_frame(&self, snapshot: &mut Snapshot, screens: &[Screen]) -> Result<(), String> {
+        self.refresh_placement(snapshot, screens, A::validate_frame)
+    }
+    fn refresh_geometry(&self, snapshot: &mut Snapshot, screens: &[Screen]) -> Result<(), String> {
+        self.refresh_placement(snapshot, screens, A::refresh_geometry)
+    }
+    fn refresh_frame(&self, snapshot: &mut Snapshot, screens: &[Screen]) -> Result<(), String> {
+        self.refresh_placement(snapshot, screens, A::refresh_frame)
+    }
+    fn submit_frame(
+        &mut self,
+        before: &Snapshot,
+        rect: Rect,
+        screens: &[Screen],
+    ) -> Result<bool, String> {
+        let (native, rect) = self.native_placement(before, rect, screens)?;
+        self.native.submit_frame(&native, rect, screens)
+    }
+    fn submit_maximize(
+        &mut self,
+        before: &Snapshot,
+        maximize: bool,
+        screens: &[Screen],
+    ) -> Result<bool, String> {
+        let (native, _) = self.native_placement(before, before.info.bounds, screens)?;
+        self.native.submit_maximize(&native, maximize, screens)
+    }
+    fn accept_maximized_frame(&mut self, observed: &mut Snapshot, screens: &[Screen]) {
+        if let Ok((mut native, _)) = self.native_placement(observed, observed.info.bounds, screens)
+        {
+            self.native.accept_maximized_frame(&mut native, screens);
+            observed.info.maximized = native.info.maximized;
+            observed.restored = if self.groups.state.containing(observed.info.id).is_some() {
+                Self::outer_frame(
+                    native.restored,
+                    self.header_height(native.info.screen, screens),
+                )
+            } else {
+                native.restored
+            };
+        }
+    }
+    fn submit_maximized_frame(
+        &mut self,
+        before: &Snapshot,
+        rect: Rect,
+        screens: &[Screen],
+    ) -> Result<bool, String> {
+        let (native, rect) = self.native_placement(before, rect, screens)?;
+        self.native.submit_maximized_frame(&native, rect, screens)
+    }
+    fn confirmed_placement(
+        &mut self,
+        snapshot: &Snapshot,
+        screens: &[Screen],
+    ) -> Result<(), String> {
+        let (native, _) = self.native_placement(snapshot, snapshot.info.bounds, screens)?;
+        self.native.confirmed_placement(&native, screens)?;
+        let active = native.info.id;
+        if self.groups.state.containing(active).is_none() {
+            return Ok(());
+        }
+        // Keep the existing member metadata; only the acknowledged scalar fields change.
+        if let Some(cached) = self.observed.get_mut(&active) {
+            cached.info.bounds = native.info.bounds;
+            cached.info.screen = native.info.screen;
+            cached.info.maximized = native.info.maximized;
+            cached.info.minimized = native.info.minimized;
+            cached.info.fullscreen = native.info.fullscreen;
+            cached.restored = native.restored;
+        } else {
+            self.observed
+                .insert(active, self.native.snapshot(active, screens)?);
+        }
+        if self.screens != screens {
+            self.publish(screens)
+        } else {
+            self.publish_changed(&BTreeSet::from([active]), screens)
+        }
+    }
+    fn confirmed_frame(&mut self, id: WindowId) {
+        self.native.confirmed_frame(self.active_window(id));
     }
     fn set_frame(
         &mut self,

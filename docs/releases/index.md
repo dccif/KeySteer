@@ -1,4 +1,15 @@
+---
+releaseHistory: true
+outline: false
+---
+
 # 更新日志 / Release Notes
+
+## 0.10.19
+
+- 优化 Windows 和 macOS 的窗口调度与工作区后台保存，减少同步等待和撤销历史中的重复数据；改进异常时的按键释放、日志与原生资源管理。
+
+- Improved window scheduling and background workspace saves on Windows and macOS, reducing synchronous waits and duplicate undo-history data; refined key release during error recovery, logging, and native resource management.
 
 ## 0.10.18
 

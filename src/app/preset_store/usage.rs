@@ -1,8 +1,25 @@
 //! Event-driven checkpoints. The bounded mailbox never blocks the input thread.
 use super::{PresetStore, codec::Usage};
+use crate::api::{
+    BackendEvent,
+    window_presets::{WorkspaceCompletion, WorkspaceOperation},
+};
+use crate::app::runtime::PresetRepository;
 use crate::support::worker::WorkerJoin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::time::Duration;
+
+pub(super) enum Work {
+    Usage(Usage),
+    Operation {
+        id: u64,
+        operation: WorkspaceOperation,
+        usage: Usage,
+        emit: Arc<dyn Fn(BackendEvent) + Send + Sync>,
+    },
+}
 
 pub(super) fn merge(target: &mut Usage, incoming: &Usage) {
     for (mode, count) in incoming {
@@ -12,8 +29,9 @@ pub(super) fn merge(target: &mut Usage, incoming: &Usage) {
 }
 
 pub(super) struct UsageWorker {
-    sender: SyncSender<Usage>,
+    sender: SyncSender<Work>,
     join: WorkerJoin,
+    usage_queued: Arc<AtomicBool>,
 }
 
 impl PresetStore {
@@ -45,40 +63,95 @@ impl PresetStore {
         }
     }
 
-    fn queue_usage(&mut self) -> Result<(), String> {
-        if self.file.is_none() {
-            return Ok(());
-        }
+    fn ensure_worker(&mut self) -> Result<(), String> {
         if self.worker.is_none() {
             let mut store = PresetStore {
                 file: self.file.clone(),
                 io: self.io.clone(),
                 ..Default::default()
             };
-            let (sender, receiver) = sync_channel(1);
+            let (sender, receiver) = sync_channel(16);
+            let usage_queued = Arc::new(AtomicBool::new(false));
+            let queued = usage_queued.clone();
             let join = WorkerJoin::spawn(
-                "workspace-usage",
-                std::thread::Builder::new().name("workspace-usage".into()),
+                "workspace-io",
+                std::thread::Builder::new().name("workspace-io".into()),
                 move || {
-                    while let Ok(mut usage) = receiver.recv() {
-                        // Keep only the newest snapshot if a newer checkpoint is already queued.
-                        while let Ok(newer) = receiver.try_recv() {
-                            merge(&mut usage, &newer);
-                        }
-                        store.usage = usage;
-                        if let Err(error) = store.write_usage() {
-                            crate::report_error!("mode-usage", "{error}");
+                    while let Ok(work) = receiver.recv() {
+                        match work {
+                            Work::Usage(usage) => {
+                                queued.store(false, Ordering::Release);
+                                merge(&mut store.usage, &usage);
+                                if let Err(error) = store.write_usage() {
+                                    crate::report_error!(
+                                        "mode-usage",
+                                        "operation=checkpoint: {error}"
+                                    );
+                                }
+                            }
+                            Work::Operation {
+                                id,
+                                operation,
+                                usage,
+                                emit,
+                            } => {
+                                merge(&mut store.usage, &usage);
+                                let outcome = store.execute(operation);
+                                emit(BackendEvent::WorkspaceCompleted(Box::new(
+                                    WorkspaceCompletion { id, outcome },
+                                )));
+                            }
                         }
                     }
                 },
             )?;
-            self.worker = Some(UsageWorker { sender, join });
+            self.worker = Some(UsageWorker {
+                sender,
+                join,
+                usage_queued,
+            });
         }
+        Ok(())
+    }
+
+    pub(super) fn queue_operation(
+        &mut self,
+        id: u64,
+        operation: WorkspaceOperation,
+        emit: Arc<dyn Fn(BackendEvent) + Send + Sync>,
+    ) -> Result<(), String> {
+        self.ensure_worker()?;
+        let worker = self.worker.as_ref().ok_or("Workspace worker unavailable")?;
+        worker
+            .sender
+            .try_send(Work::Operation {
+                id,
+                operation,
+                usage: self.usage.clone(),
+                emit,
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => "Workspace request queue is full".to_string(),
+                TrySendError::Disconnected(_) => "Workspace worker stopped".to_string(),
+            })
+    }
+
+    fn queue_usage(&mut self) -> Result<(), String> {
+        if self.file.is_none() {
+            return Ok(());
+        }
+        self.ensure_worker()?;
         if let Some(worker) = &self.worker {
-            match worker.sender.try_send(self.usage.clone()) {
+            if worker.usage_queued.swap(true, Ordering::AcqRel) {
+                return Ok(());
+            }
+            match worker.sender.try_send(Work::Usage(self.usage.clone())) {
                 Ok(()) => self.pending_entries = 0,
-                Err(TrySendError::Full(_)) => {} // Retry on the next entry; retain dirty state.
+                Err(TrySendError::Full(_)) => {
+                    worker.usage_queued.store(false, Ordering::Release);
+                } // Retry on the next entry; retain dirty state.
                 Err(TrySendError::Disconnected(_)) => {
+                    worker.usage_queued.store(false, Ordering::Release);
                     return Err("Workspace usage worker stopped".into());
                 }
             }
@@ -103,7 +176,10 @@ impl PresetStore {
     }
 
     pub(super) fn finish_usage(&mut self) -> Result<(), String> {
-        if let Some(UsageWorker { sender, mut join }) = self.worker.take() {
+        if let Some(UsageWorker {
+            sender, mut join, ..
+        }) = self.worker.take()
+        {
             drop(sender);
             join.join_timeout(Duration::from_secs(2))?;
         }
@@ -128,7 +204,9 @@ mod tests {
         assert!(!path.exists());
         assert!(store.worker.is_none());
         store.record_entry("window", 2);
-        let UsageWorker { sender, mut join } = store.worker.take().unwrap();
+        let UsageWorker {
+            sender, mut join, ..
+        } = store.worker.take().unwrap();
         drop(sender);
         join.join_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(store.read_workspace().unwrap().1["window"], 1);
@@ -175,6 +253,94 @@ mod tests {
         failed.record_entry("normal", 100);
         assert!(failed.finish_usage().is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn persistence_submission_does_not_wait_for_disk_lock_and_completes_in_order() {
+        let path = super::super::tests::path();
+        let mut store = PresetStore::persistent(path.clone(), super::super::tests::replace);
+        let io = store.io.clone();
+        let lock = io.lock().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let emit: Arc<dyn Fn(BackendEvent) + Send + Sync> = Arc::new(move |event| {
+            sender.send(event).unwrap();
+        });
+        let submitted = store
+            .submit(
+                1,
+                WorkspaceOperation::Save {
+                    template: RegionTemplate::Slot { id: 1 }.into(),
+                    window_count: 1,
+                    note: "asynchronous".into(),
+                },
+                Some(emit.clone()),
+            )
+            .unwrap();
+        assert!(submitted.is_none());
+        assert!(receiver.try_recv().is_err());
+        assert!(!path.exists());
+        store
+            .submit(2, WorkspaceOperation::List, Some(emit))
+            .unwrap();
+        drop(lock);
+        let BackendEvent::WorkspaceCompleted(first) =
+            receiver.recv_timeout(Duration::from_secs(5)).unwrap()
+        else {
+            panic!("unexpected event");
+        };
+        let BackendEvent::WorkspaceCompleted(second) =
+            receiver.recv_timeout(Duration::from_secs(5)).unwrap()
+        else {
+            panic!("unexpected event");
+        };
+        assert_eq!((first.id, second.id), (1, 2));
+        let crate::api::window_presets::WorkspaceValue::Library { presets, saved } =
+            first.outcome.unwrap()
+        else {
+            panic!("unexpected result");
+        };
+        assert!(saved.is_some());
+        assert_eq!(presets[0].note, "asynchronous");
+        assert!(
+            matches!(second.outcome.unwrap(), crate::api::window_presets::WorkspaceValue::Library { presets: listed, .. } if listed == presets)
+        );
+        store.finish_usage().unwrap();
+        assert_eq!(store.list().unwrap(), presets);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn failed_async_save_returns_error_and_keeps_previous_file() {
+        let path = super::super::tests::path();
+        let mut store = PresetStore::persistent(path.clone(), super::super::tests::replace);
+        store
+            .save(RegionTemplate::Slot { id: 1 }, 1, "original".into())
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut failed = PresetStore::persistent(path.clone(), super::super::tests::fail);
+        let (tx, rx) = std::sync::mpsc::channel();
+        failed
+            .submit(
+                10,
+                WorkspaceOperation::Save {
+                    template: RegionTemplate::Slot { id: 2 }.into(),
+                    window_count: 1,
+                    note: "rejected".into(),
+                },
+                Some(Arc::new(move |event| {
+                    tx.send(event).unwrap();
+                })),
+            )
+            .unwrap();
+        let BackendEvent::WorkspaceCompleted(result) =
+            rx.recv_timeout(Duration::from_secs(5)).unwrap()
+        else {
+            panic!("unexpected event");
+        };
+        assert!(result.outcome.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        failed.finish_usage().unwrap();
         std::fs::remove_file(path).unwrap();
     }
 }

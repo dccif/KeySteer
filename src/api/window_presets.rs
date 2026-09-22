@@ -239,6 +239,37 @@ pub struct PresetLibraryResult {
     pub message: Option<String>,
 }
 
+/// Ordered persistence commands; a save already contains the accepted note.
+pub enum WorkspaceOperation {
+    List,
+    Delete {
+        expected: SavedPreset,
+    },
+    Save {
+        template: WindowTemplate,
+        window_count: usize,
+        note: String,
+    },
+    Export,
+    Checkpoint(std::sync::mpsc::Sender<()>),
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkspaceCompletion {
+    pub id: u64,
+    pub outcome: Result<WorkspaceValue, String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum WorkspaceValue {
+    Library {
+        presets: Vec<SavedPreset>,
+        saved: Option<u32>,
+    },
+    Export(Option<Vec<u8>>),
+    Checkpoint,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextPrompt {
     /// Inline input bar in desktop coordinates, supplied by the host.

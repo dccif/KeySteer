@@ -1172,7 +1172,7 @@ mod tests {
     fn precompiled_window_help_allocation_comparison() {
         for resizing in [false, true] {
             let (before, after) = compare_prepared_window_help(1920.0, 1.0, resizing);
-            eprintln!("resizing={resizing}: allocations {before} -> {after}");
+            println!("resizing={resizing}: allocations {before} -> {after}");
             assert!(after < before);
         }
     }

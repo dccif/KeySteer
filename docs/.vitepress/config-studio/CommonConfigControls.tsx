@@ -1,3 +1,4 @@
+import { useStudioI18n } from './i18n'
 import { fieldLocation, type SettingsTab } from './navigation'
 import { defineComponent } from 'vue'
 import {
@@ -21,6 +22,7 @@ export default defineComponent({
     change: (_document: ConfigDocument) => true,
   },
   setup(props, { emit }) {
+    const { t } = useStudioI18n()
 
     function update(path: string, value: unknown): void {
       const next = cloneConfigDocument(props.document)
@@ -52,15 +54,15 @@ export default defineComponent({
       <section class="ks-card ks-common-card">
         <div class="ks-toolbar ks-compact-toolbar">
           <div>
-            <h2>{props.tab === 'appearance' ? '常用外观' : '常用参数'}</h2>
-            <p>调整当前功能的行为；未修改的参数继续继承内置默认值。</p>
+            <h2>{props.tab === 'appearance' ? t("常用外观") : t("常用参数")}</h2>
+            <p>{t("调整当前功能的行为；未修改的参数继续继承内置默认值。")}</p>
           </div>
         </div>
         <div class="ks-common-body">
           {renderFields(frequentFields)}
           <details class="ks-advanced-settings">
-            <summary>高级设置</summary>
-            <p>这些设置通常无需修改；展开后仍会写回同一份 TOML。</p>
+            <summary>{t("高级设置")}</summary>
+            <p>{t("这些设置通常无需修改；展开后仍会写回同一份 TOML。")}</p>
             {renderFields(advancedFields)}
           </details>
         </div>
@@ -78,15 +80,16 @@ const ConfigControl = defineComponent({
     onReset: { type: Function as unknown as () => () => void, required: true },
   },
   setup(props) {
+    const { t } = useStudioI18n()
     return () => {
       const field = props.field
       const control = field.kind === 'boolean' ? (
         <button type="button" class={{ 'ks-setting-toggle': true, active: Boolean(props.value) }} onClick={() => props.onUpdate(!props.value)}>
-          <i />{props.value ? '开启' : '关闭'}
+          <i />{props.value ? t("开启") : t("关闭")}
         </button>
       ) : field.kind === 'select' ? (
         <select value={String(props.value ?? '')} onChange={(event) => props.onUpdate((event.target as HTMLSelectElement).value)}>
-          {field.options?.map((option) => <option value={option.value}>{option.label}</option>)}
+          {field.options?.map((option) => <option value={option.value}>{t(option.label)}</option>)}
         </select>
       ) : (
         <input
@@ -103,8 +106,8 @@ const ConfigControl = defineComponent({
       return (
         <label class="ks-common-control" title={field.path} data-config-path={field.path}>
           <span class="ks-common-copy">
-            <strong>{field.label}</strong>
-            <small>{field.description}</small>
+            <strong>{t(field.label)}</strong>
+            <small>{t(field.description)}</small>
           </span>
           <span class="ks-common-input">{control}</span>
           <button
@@ -113,7 +116,7 @@ const ConfigControl = defineComponent({
             disabled={props.inherited}
             onClick={(event) => { event.preventDefault(); props.onReset() }}
           >
-            {props.inherited ? '内置默认' : '恢复默认'}
+            {props.inherited ? t("内置默认") : t("恢复默认")}
           </button>
         </label>
       )

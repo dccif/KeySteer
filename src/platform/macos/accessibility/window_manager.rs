@@ -177,10 +177,18 @@ fn adjusted_position(desired: Rect, actual: Rect, work: &Rect) -> Point {
     )
 }
 
+fn wait_confirmation(monitor: &super::window_tabs::Monitor, timeout: Duration) {
+    if !monitor.wait(Some(timeout)) {
+        // A missing native wake source uses a bounded fallback, never spins.
+        std::thread::park_timeout(timeout);
+    }
+}
+
 // Only the window worker waits. Do not interpret the first stale AX reply as
 // an application's minimum size; finish on the requested frame or a stable
 // changed frame, with a finite deadline and cancellation on every iteration.
 fn wait_frame(
+    monitor: &super::window_tabs::Monitor,
     window: &MovableWindow,
     desired: Rect,
     before: Rect,
@@ -202,7 +210,7 @@ fn wait_frame(
         {
             return Ok(actual);
         }
-        std::thread::sleep(Duration::from_millis(10));
+        wait_confirmation(monitor, Duration::from_millis(10));
     }
 }
 
@@ -301,17 +309,17 @@ impl MacWindows {
             return Ok(());
         }
         let window = &self.entry(id)?.window;
-        let attribute = CFString::new("AXMinimized");
-        if copy_bool_attribute(window.window.as_ptr(), &attribute) == Some(minimized) {
+        let attribute = &window.minimized;
+        if copy_bool_attribute(window.window.as_ptr(), attribute) == Some(minimized) {
             return Ok(());
         }
         let value = CFBoolean::from(minimized);
-        observe_write(window.set_attribute(&attribute, value.as_CFTypeRef()))?;
+        observe_write(window.set_attribute(attribute, value.as_CFTypeRef()))?;
         let started = Instant::now();
         let deadline = started + Duration::from_millis(1000);
         let mut retried = false;
         while !cancelled() {
-            if copy_bool_attribute(window.window.as_ptr(), &attribute) == Some(minimized) {
+            if copy_bool_attribute(window.window.as_ptr(), attribute) == Some(minimized) {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -323,10 +331,10 @@ impl MacWindows {
             // AppKit can acknowledge but drop a request during a preceding
             // minimize animation. Retry the same idempotent state once.
             if !retried && started.elapsed() >= Duration::from_millis(250) {
-                observe_write(window.set_attribute(&attribute, value.as_CFTypeRef()))?;
+                observe_write(window.set_attribute(attribute, value.as_CFTypeRef()))?;
                 retried = true;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            wait_confirmation(&self.monitor, Duration::from_millis(10));
         }
         Ok(())
     }
@@ -389,28 +397,44 @@ impl WindowAccess for MacWindows {
         previous: &Snapshot,
         screens: &[Screen],
     ) -> Result<Snapshot, String> {
-        let entry = self.entry(id)?;
-        let window = &entry.window;
-        let bounds = element_rect(window.window.as_ptr(), &window.attributes)
+        debug_assert_eq!(id, previous.info.id);
+        let mut current = previous.clone();
+        self.refresh_geometry(&mut current, screens)?;
+        Ok(current)
+    }
+    fn can_submit_frame(&self, id: WindowId) -> bool {
+        !self.hidden.contains(&id)
+    }
+    fn refresh_frame(&self, now: &mut Snapshot, screens: &[Screen]) -> Result<(), String> {
+        let entry = self.entry(now.info.id)?;
+        let bounds = element_rect(entry.window.window.as_ptr(), &entry.window.attributes)
             .ok_or("window geometry unavailable")?;
-        let mut now = previous.clone();
         now.info.bounds = bounds;
         now.info.screen =
             window_geometry::screen_index(screens, bounds).ok_or("display unavailable")?;
+        now.restored = bounds;
+        Ok(())
+    }
+    fn validate_frame(&self, now: &mut Snapshot, _screens: &[Screen]) -> Result<(), String> {
+        let entry = self.entry(now.info.id)?;
+        let window = &entry.window;
         now.info.maximized = entry
             .maximized_frame
-            .is_some_and(|frame| same_rect(bounds, frame));
-        now.info.minimized =
-            copy_bool_attribute(window.window.as_ptr(), &CFString::new("AXMinimized"))
-                .unwrap_or(previous.info.minimized);
+            .is_some_and(|frame| same_rect(now.info.bounds, frame));
+        now.info.minimized = copy_bool_attribute(window.window.as_ptr(), &window.minimized)
+            .unwrap_or(now.info.minimized);
         now.info.fullscreen = copy_bool_attribute(window.window.as_ptr(), &window.fullscreen)
-            .unwrap_or(previous.info.fullscreen);
+            .unwrap_or(now.info.fullscreen);
         now.restored = if now.info.maximized {
-            entry.restored.unwrap_or(bounds)
+            entry.restored.unwrap_or(now.info.bounds)
         } else {
-            bounds
+            now.info.bounds
         };
-        Ok(now)
+        Ok(())
+    }
+    fn refresh_geometry(&self, now: &mut Snapshot, screens: &[Screen]) -> Result<(), String> {
+        self.refresh_frame(now, screens)?;
+        self.validate_frame(now, screens)
     }
 
     fn set_scope(&mut self, scope: Option<crate::api::window::WindowScope>, _reset: bool) {
@@ -592,10 +616,9 @@ impl WindowAccess for MacWindows {
                     window: owned,
                     attributes: AxAttributes::new(),
                     fullscreen: CFString::new("AXFullScreen"),
+                    minimized: CFString::new("AXMinimized"),
                 };
-                if copy_bool_attribute(window.window.as_ptr(), &CFString::new("AXMinimized"))
-                    == Some(true)
-                {
+                if copy_bool_attribute(window.window.as_ptr(), &window.minimized) == Some(true) {
                     if self.include_minimized
                         && let Ok(info) = self.retain(window, pid, screens)
                     {
@@ -653,7 +676,7 @@ impl WindowAccess for MacWindows {
                     if settling_until.is_none_or(|until| Instant::now() >= until) {
                         break;
                     }
-                    std::thread::sleep(Duration::from_millis(10));
+                    wait_confirmation(&self.monitor, Duration::from_millis(10));
                 }
                 pass += 1;
                 refreshed = visible_windows()?;
@@ -709,6 +732,127 @@ impl WindowAccess for MacWindows {
             },
         })
     }
+    fn submit_maximize(
+        &mut self,
+        before: &Snapshot,
+        maximize: bool,
+        screens: &[Screen],
+    ) -> Result<bool, String> {
+        if before.info.fullscreen || self.hidden.contains(&before.info.id) {
+            return Ok(false);
+        }
+        let id = before.info.id;
+        if before.info.minimized {
+            let window = &self.entry(id)?.window;
+            observe_write(
+                window.set_attribute(&window.minimized, CFBoolean::false_value().as_CFTypeRef()),
+            )?;
+        }
+        if maximize {
+            let desired = screens
+                .get(before.info.screen)
+                .ok_or("display unavailable")?
+                .work_area;
+            let mut normal = before.placement();
+            normal.info.maximized = false;
+            normal.info.minimized = false;
+            self.submit_frame(&normal, desired, screens)?;
+            let entry = self.entries.get_mut(&id).ok_or("window was closed")?;
+            entry.restored = Some(before.restored);
+            entry.maximized_frame = Some(desired);
+        } else {
+            let entry = self.entries.get_mut(&id).ok_or("window was closed")?;
+            entry.maximized_frame = None;
+        }
+        Ok(true)
+    }
+    fn accept_maximized_frame(&mut self, observed: &mut Snapshot, _screens: &[Screen]) {
+        if observed.info.minimized || observed.info.fullscreen {
+            return;
+        }
+        if let Some(entry) = self.entries.get_mut(&observed.info.id)
+            && entry.maximized_frame.is_some()
+        {
+            entry.maximized_frame = Some(observed.info.bounds);
+            observed.info.maximized = true;
+            observed.restored = entry.restored.unwrap_or(observed.info.bounds);
+        }
+    }
+    fn confirmed_placement(
+        &mut self,
+        observed: &Snapshot,
+        _screens: &[Screen],
+    ) -> Result<(), String> {
+        if observed.info.maximized {
+            if let Some(entry) = self.entries.get_mut(&observed.info.id) {
+                entry.maximized_frame = Some(observed.info.bounds);
+                entry.settling_until = Some(Instant::now() + Duration::from_millis(250));
+            }
+        } else {
+            self.confirmed_frame(observed.info.id);
+        }
+        Ok(())
+    }
+    fn submit_maximized_frame(
+        &mut self,
+        before: &Snapshot,
+        desired: Rect,
+        screens: &[Screen],
+    ) -> Result<bool, String> {
+        let mut normal = before.placement();
+        normal.info.maximized = false;
+        let accepted = self.submit_frame(&normal, desired, screens)?;
+        if accepted {
+            self.entries
+                .get_mut(&before.info.id)
+                .ok_or("window was closed")?
+                .maximized_frame = Some(desired);
+        }
+        Ok(accepted)
+    }
+    fn submit_frame(
+        &mut self,
+        before: &Snapshot,
+        desired: Rect,
+        _screens: &[Screen],
+    ) -> Result<bool, String> {
+        use crate::platform::macos::window_move::WindowAccess as _;
+        if ![desired.x, desired.y, desired.width, desired.height]
+            .iter()
+            .all(|v| v.is_finite())
+            || desired.width < 1.0
+            || desired.height < 1.0
+        {
+            return Err("invalid window geometry".into());
+        }
+        let id = before.info.id;
+        if before.info.maximized
+            || before.info.minimized
+            || before.info.fullscreen
+            || self.hidden.contains(&id)
+        {
+            return Ok(false);
+        }
+        let window = &self.entry(id)?.window;
+        if (desired.x - before.info.bounds.x).abs() > 0.5
+            || (desired.y - before.info.bounds.y).abs() > 0.5
+        {
+            observe_write(window.set_position(Point::new(desired.x, desired.y)))?;
+        }
+        if (desired.width - before.info.bounds.width).abs() > 0.5
+            || (desired.height - before.info.bounds.height).abs() > 0.5
+        {
+            Self::set_size(window, desired.width, desired.height)?;
+        }
+        Ok(true)
+    }
+    fn confirmed_frame(&mut self, id: WindowId) {
+        if let Some(entry) = self.entries.get_mut(&id) {
+            entry.restored = None;
+            entry.maximized_frame = None;
+            entry.settling_until = Some(Instant::now() + Duration::from_millis(250));
+        }
+    }
     fn set_frame(
         &mut self,
         id: WindowId,
@@ -752,10 +896,16 @@ impl WindowAccess for MacWindows {
         if resizing && !cancelled() {
             Self::set_size(window, desired.width, desired.height)?;
         }
-        let mut actual = wait_frame(window, desired, before.info.bounds, cancelled)?;
+        let mut actual = wait_frame(
+            &self.monitor,
+            window,
+            desired,
+            before.info.bounds,
+            cancelled,
+        )?;
         if resizing && !cancelled() && !same_rect(actual, desired) {
             Self::set_size(window, desired.width, desired.height)?;
-            actual = wait_frame(window, desired, actual, cancelled)?;
+            actual = wait_frame(&self.monitor, window, desired, actual, cancelled)?;
         }
         if !cancelled() {
             let position = if resizing {
@@ -772,6 +922,7 @@ impl WindowAccess for MacWindows {
             if (position.x - actual.x).abs() > 0.5 || (position.y - actual.y).abs() > 0.5 {
                 observe_write(window.set_position(position))?;
                 wait_frame(
+                    &self.monitor,
                     window,
                     Rect::new(position.x, position.y, actual.width, actual.height),
                     actual,
@@ -932,7 +1083,7 @@ impl WindowAccess for MacWindows {
             if Instant::now() >= deadline {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            wait_confirmation(&self.monitor, Duration::from_millis(10));
         }
         if error == AX_OK {
             Ok(())
@@ -997,7 +1148,10 @@ impl WindowAccess for MacWindows {
                 let pointer = result?;
                 return self.snapshot(id, screens).map(|s| (s.info, Some(pointer)));
             }
-            std::thread::sleep(crate::platform::macos::window_move::POLL_INTERVAL);
+            wait_confirmation(
+                &self.monitor,
+                crate::platform::macos::window_move::POLL_INTERVAL,
+            );
         }
     }
     fn reset(&mut self) {

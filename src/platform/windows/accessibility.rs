@@ -1452,7 +1452,10 @@ fn target_from_element(
     // return E_ELEMENTNOTAVAILABLE after the bulk query.
     // SAFETY: the element came from a cache-populated array and the cached
     // property call returns a value without retaining Rust data.
-    let control_type = unsafe { element.CachedControlType() }.ok()?.0;
+    let control_type = super::native::CachedElement::new(element)
+        .control_type()
+        .ok()?
+        .0;
     // Windows applications often expose custom controls with a generic UIA
     // control type. Their interaction pattern is more reliable than the type,
     // and also lets shared macOS-oriented role lists work on Windows.
@@ -1466,12 +1469,14 @@ fn target_from_element(
     }
     // SAFETY: the cached element remains live for this synchronous property
     // read on the owning MTA thread.
-    let visible = unsafe { element.CachedIsOffscreen() }
+    let visible = super::native::CachedElement::new(element)
+        .is_offscreen()
         .ok()
         .is_none_or(|offscreen| !offscreen.as_bool());
     // SAFETY: the cached element remains live for this synchronous property
     // read on the owning MTA thread.
-    let enabled = unsafe { element.CachedIsEnabled() }
+    let enabled = super::native::CachedElement::new(element)
+        .is_enabled()
         .ok()
         .is_none_or(|value| value.as_bool());
     if (request.visible_only && !visible)
@@ -1481,7 +1486,7 @@ fn target_from_element(
     }
     // SAFETY: the cached element remains live and returns its rectangle by
     // value on the owning MTA thread.
-    let raw_rect = unsafe { element.CachedBoundingRectangle() }.ok()?;
+    let raw_rect = super::native::CachedElement::new(element).bounds().ok()?;
     let rect = Rect::new(
         raw_rect.left as f64,
         raw_rect.top as f64,
@@ -1493,7 +1498,8 @@ fn target_from_element(
     }
     // SAFETY: the cached element remains live; the returned BSTR is converted
     // to an owned Rust String before the COM value is released.
-    let name = unsafe { element.CachedName() }
+    let name = super::native::CachedElement::new(element)
+        .name()
         .map(|name| name.to_string())
         .unwrap_or_default();
     Some(to_target(rect, name, control_type))
@@ -1502,7 +1508,9 @@ fn target_from_element(
 fn is_interactive(element: &IUIAutomationElement) -> bool {
     // SAFETY: the cached element remains live for this synchronous property
     // read on the owning MTA thread.
-    unsafe { element.CachedIsKeyboardFocusable() }.is_ok_and(|value| value.as_bool())
+    super::native::CachedElement::new(element)
+        .is_focusable()
+        .is_ok_and(|value| value.as_bool())
 }
 
 /// Map semantic roles to UIA control type ids.
@@ -1683,7 +1691,7 @@ mod tests {
 
     #[test]
     fn visible_target_prefers_owner_and_only_queries_parent_on_fallback() {
-        let child = HWND(1usize as *mut _);
+        let child = HWND(std::ptr::dangling_mut());
         let owner = HWND(2usize as *mut _);
         let mut queries = Vec::new();
         assert_eq!(
@@ -1711,7 +1719,7 @@ mod tests {
 
     #[test]
     fn invisible_owner_falls_back_to_visible_top_level_never_the_child() {
-        let child = HWND(1usize as *mut _);
+        let child = HWND(std::ptr::dangling_mut());
         let owner = HWND(2usize as *mut _);
         let top = HWND(3usize as *mut _);
         for original in [child, top] {

@@ -1,6 +1,7 @@
 import vueJsx from '@vitejs/plugin-vue-jsx'
 import { withMermaid } from 'vitepress-plugin-mermaid'
 import { loadLatestRelease } from './latest-release.ts'
+import { releaseHistory } from './release-history.ts'
 
 const base = process.env.KEYSTEER_DOCS_BASE || '/'
 const windowSidebar = (prefix = '', english = false) => ({
@@ -93,6 +94,7 @@ export default async ({ command }: { command: string }) => {
   // Vite passes serve/build explicitly; do not infer it from argv or NODE_ENV.
   const latestRelease = await loadLatestRelease(command, process.env.GITHUB_TOKEN)
   return withMermaid({
+  markdown: { config: releaseHistory },
   base,
   lang: 'zh-CN',
   locales: {

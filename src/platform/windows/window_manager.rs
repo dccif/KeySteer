@@ -112,8 +112,31 @@ impl Windows {
         screens: &[Screen],
         previous: Option<&WindowInfo>,
     ) -> Result<Snapshot, String> {
-        let application = self.hwnd(id)?;
-        let hwnd = application;
+        let hwnd = self.hwnd(id)?;
+        let mut info = WindowInfo {
+            id,
+            title: previous.map_or_else(
+                || super::native::window_title(hwnd),
+                |info| info.title.clone(),
+            ),
+            app: self.windows[&id].app.clone(),
+            bounds: Rect::default(),
+            screen: 0,
+            resizable: false,
+            maximized: false,
+            minimized: false,
+            fullscreen: false,
+        };
+        let restored = self.read_geometry(hwnd, &mut info, screens)?;
+        Ok(Snapshot { info, restored })
+    }
+    fn read_geometry(
+        &self,
+        hwnd: HWND,
+        info: &mut WindowInfo,
+        screens: &[Screen],
+    ) -> Result<Rect, String> {
+        let id = info.id;
         let mut bounds =
             super::accessibility::window_bounds(hwnd).ok_or("cannot read window bounds")?;
         let p = self.placement(hwnd)?;
@@ -144,28 +167,18 @@ impl Windows {
             bounds = restored;
         }
         let screen = window_geometry::screen_index(screens, bounds).ok_or("no displays")?;
-        let title = previous.map_or_else(
-            || super::native::window_title(application),
-            |info| info.title.clone(),
-        );
-        let app = self.windows[&id].app.clone();
-        let mut info = WindowInfo {
-            id,
-            title,
-            app,
-            bounds,
-            screen,
-            resizable: super::native::window_long(hwnd, GWL_STYLE) as u32 & WS_THICKFRAME.0 != 0,
-            maximized: p.showCmd == SW_SHOWMAXIMIZED.0 as u32,
-            minimized,
-            fullscreen: !minimized
-                && p.showCmd != SW_SHOWMAXIMIZED.0 as u32
-                && super::native::window_long(hwnd, GWL_STYLE) as u32
-                    & windows::Win32::UI::WindowsAndMessaging::WS_CAPTION.0
-                    == 0
-                && bounds.width >= screens[screen].bounds.width
-                && bounds.height >= screens[screen].bounds.height,
-        };
+        info.bounds = bounds;
+        info.screen = screen;
+        info.resizable = super::native::window_long(hwnd, GWL_STYLE) as u32 & WS_THICKFRAME.0 != 0;
+        info.maximized = p.showCmd == SW_SHOWMAXIMIZED.0 as u32;
+        info.minimized = minimized;
+        info.fullscreen = !minimized
+            && p.showCmd != SW_SHOWMAXIMIZED.0 as u32
+            && super::native::window_long(hwnd, GWL_STYLE) as u32
+                & windows::Win32::UI::WindowsAndMessaging::WS_CAPTION.0
+                == 0
+            && bounds.width >= screens[screen].bounds.width
+            && bounds.height >= screens[screen].bounds.height;
         if let Some(prepared) = self.prepared.get(&id) {
             info.bounds = prepared.bounds;
             info.screen = window_geometry::screen_index(screens, prepared.bounds)
@@ -174,7 +187,7 @@ impl Windows {
             info.minimized = false;
             restored = prepared.bounds;
         }
-        Ok(Snapshot { info, restored })
+        Ok(restored)
     }
 
     fn tab_opacity(&mut self, id: WindowId, hwnd: HWND, hidden: bool) -> Result<bool, String> {
@@ -354,8 +367,50 @@ impl Windows {
                 return Err("Timed out minimizing window".into());
             }
             super::window_tabs::NativeTabs::dispatch_messages();
-            std::thread::sleep(Duration::from_millis(10));
+            super::window_tabs::wait_for_events(10);
         }
+    }
+    fn submit_geometry(
+        &mut self,
+        id: WindowId,
+        desired: Rect,
+        before: &Snapshot,
+        screens: &[Screen],
+    ) -> Result<(), String> {
+        if ![desired.x, desired.y, desired.width, desired.height]
+            .iter()
+            .all(|v| v.is_finite() && v.abs() < i32::MAX as f64 / 2.0)
+            || desired.width < 1.0
+            || desired.height < 1.0
+        {
+            return Err("invalid window geometry".into());
+        }
+        let hwnd = self.geometry_hwnd(id)?;
+        let visible = if before.info.maximized || before.info.minimized {
+            super::accessibility::window_bounds(hwnd).ok_or("window was closed")?
+        } else {
+            before.info.bounds
+        };
+        let raw = read_bounds(hwnd)?;
+        let source = screens
+            .get(before.info.screen)
+            .ok_or("source display unavailable")?;
+        let dest = window_geometry::screen_index(screens, desired)
+            .and_then(|i| screens.get(i))
+            .ok_or("destination display unavailable")?;
+        let scale = dest.scale / source.scale;
+        let native = Rect::new(
+            desired.x + (raw.x - visible.x) * scale,
+            desired.y + (raw.y - visible.y) * scale,
+            desired.width + (raw.width - visible.width) * scale,
+            desired.height + (raw.height - visible.height) * scale,
+        );
+        self.windows
+            .get_mut(&id)
+            .ok_or("window was closed")?
+            .cycle_restore = None;
+        submit_frame(hwnd, native)?;
+        Ok(())
     }
     fn placement(&self, hwnd: HWND) -> Result<WINDOWPLACEMENT, String> {
         read_placement(hwnd)
@@ -404,10 +459,10 @@ impl Windows {
             }
             previous = Some(bounds);
             super::window_tabs::NativeTabs::dispatch_messages();
-            // Wait on the compositor rather than quantizing movement to a
-            // fixed sleep interval. Keep the existing cancellation/deadline checks.
-            super::native::wait_for_dwm_frame()
-                .map_err(|e| format!("window frame wait failed: {e}"))?;
+            // Native notifications wake immediately. Missing notifications use
+            // bounded readback; never enter an uninterruptible compositor flush.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            super::window_tabs::wait_for_events(remaining.as_millis().min(16) as u32);
         }
     }
 }
@@ -553,7 +608,7 @@ impl WindowAccess for Windows {
             if Instant::now() >= deadline {
                 return Err("Timed out changing tab visibility".into());
             }
-            std::thread::sleep(Duration::from_millis(2));
+            super::window_tabs::wait_for_events(2);
         }
         if hidden {
             self.hidden.insert(id);
@@ -730,6 +785,95 @@ impl WindowAccess for Windows {
         self.tabs.update_bar(bar, &self.tab_screens)?;
         Ok(true)
     }
+    fn can_submit_frame(&self, id: WindowId) -> bool {
+        !self.hidden.contains(&id)
+    }
+    fn refresh_geometry(&self, snapshot: &mut Snapshot, screens: &[Screen]) -> Result<(), String> {
+        use windows::Win32::UI::WindowsAndMessaging::{WS_CAPTION, WS_MAXIMIZE, WS_MINIMIZE};
+        let hwnd = self.geometry_hwnd(snapshot.info.id)?;
+        let style = super::native::window_long(hwnd, GWL_STYLE) as u32;
+        if style & WS_MINIMIZE.0 != 0 || self.prepared.contains_key(&snapshot.info.id) {
+            snapshot.restored = self.read_geometry(hwnd, &mut snapshot.info, screens)?;
+            return Ok(());
+        }
+        let bounds =
+            super::accessibility::window_bounds(hwnd).ok_or("cannot read window bounds")?;
+        let screen = window_geometry::screen_index(screens, bounds).ok_or("no displays")?;
+        snapshot.info.bounds = bounds;
+        snapshot.info.screen = screen;
+        snapshot.info.resizable = style & WS_THICKFRAME.0 != 0;
+        snapshot.info.maximized = style & WS_MAXIMIZE.0 != 0;
+        snapshot.info.minimized = false;
+        snapshot.info.fullscreen = !snapshot.info.maximized
+            && style & WS_CAPTION.0 == 0
+            && bounds.width >= screens[screen].bounds.width
+            && bounds.height >= screens[screen].bounds.height;
+        if !snapshot.info.maximized {
+            snapshot.restored = bounds;
+        }
+        Ok(())
+    }
+    fn submit_maximize(
+        &mut self,
+        before: &Snapshot,
+        maximize: bool,
+        _screens: &[Screen],
+    ) -> Result<bool, String> {
+        let id = before.info.id;
+        if before.info.fullscreen || self.hidden.contains(&id) {
+            return Ok(false);
+        }
+        let hwnd = self.geometry_hwnd(id)?;
+        if maximize {
+            self.windows
+                .get_mut(&id)
+                .ok_or("window was closed")?
+                .cycle_restore = Some(before.restored);
+        }
+        show_state(
+            hwnd,
+            if maximize {
+                SW_SHOWMAXIMIZED
+            } else {
+                SW_SHOWNORMAL
+            },
+        )?;
+        Ok(true)
+    }
+    fn submit_maximized_frame(
+        &mut self,
+        before: &Snapshot,
+        desired: Rect,
+        screens: &[Screen],
+    ) -> Result<bool, String> {
+        let saved = self
+            .windows
+            .get(&before.info.id)
+            .ok_or("window was closed")?
+            .cycle_restore;
+        let result = self.submit_geometry(before.info.id, desired, before, screens);
+        if let Some(entry) = self.windows.get_mut(&before.info.id) {
+            entry.cycle_restore = saved;
+        }
+        result.map(|_| true)
+    }
+    fn submit_frame(
+        &mut self,
+        before: &Snapshot,
+        desired: Rect,
+        screens: &[Screen],
+    ) -> Result<bool, String> {
+        let id = before.info.id;
+        if before.info.maximized
+            || before.info.minimized
+            || before.info.fullscreen
+            || self.hidden.contains(&id)
+        {
+            return Ok(false);
+        }
+        self.submit_geometry(id, desired, before, screens)?;
+        Ok(true)
+    }
     fn set_frame(
         &mut self,
         id: WindowId,
@@ -817,30 +961,7 @@ impl WindowAccess for Windows {
         if cancelled() {
             return self.snapshot(id, screens).map(|s| s.info);
         }
-        let visible = if before.info.maximized || before.info.minimized {
-            super::accessibility::window_bounds(hwnd).ok_or("window was closed")?
-        } else {
-            before.info.bounds
-        };
-        let raw = read_bounds(hwnd)?;
-        let source = screens
-            .get(before.info.screen)
-            .ok_or("source display unavailable")?;
-        let dest = window_geometry::screen_index(screens, desired)
-            .and_then(|i| screens.get(i))
-            .ok_or("destination display unavailable")?;
-        let scale = dest.scale / source.scale;
-        let native = Rect::new(
-            desired.x + (raw.x - visible.x) * scale,
-            desired.y + (raw.y - visible.y) * scale,
-            desired.width + (raw.width - visible.width) * scale,
-            desired.height + (raw.height - visible.height) * scale,
-        );
-        self.windows
-            .get_mut(&id)
-            .ok_or("window was closed")?
-            .cycle_restore = None;
-        submit_frame(hwnd, native)?;
+        self.submit_geometry(id, desired, &before, screens)?;
         self.wait_frame(id, screens, Some(desired), Some(false), cancelled)
     }
     fn restore(
@@ -903,9 +1024,7 @@ impl WindowAccess for Windows {
             .cycle_restore = Some(before.info.bounds);
         let hwnd = self.geometry_hwnd(id)?;
         // SAFETY: validated borrowed HWND; no Rust pointers retained.
-        if !unsafe { ShowWindowAsync(hwnd, SW_SHOWMAXIMIZED) }.as_bool() {
-            return Err("cannot maximize window".into());
-        }
+        show_state(hwnd, SW_SHOWMAXIMIZED)?;
         let after = self.wait_frame(
             id,
             screens,
@@ -1059,6 +1178,18 @@ impl WindowAccess for Windows {
 impl Drop for Windows {
     fn drop(&mut self) {
         self.reset();
+    }
+}
+
+fn show_state(
+    hwnd: HWND,
+    state: windows::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD,
+) -> Result<(), String> {
+    // SAFETY: caller validates the borrowed HWND; the asynchronous call retains no Rust data.
+    if unsafe { ShowWindowAsync(hwnd, state) }.as_bool() {
+        Ok(())
+    } else {
+        Err("cannot submit window state".into())
     }
 }
 
@@ -1841,6 +1972,41 @@ mod tests {
         ids: Vec<WindowId>,
     }
     impl WindowAccess for NativeProbeAccess {
+        fn can_submit_frame(&self, id: WindowId) -> bool {
+            self.native.can_submit_frame(id)
+        }
+        fn submit_frame(
+            &mut self,
+            before: &Snapshot,
+            rect: Rect,
+            screens: &[Screen],
+        ) -> Result<bool, String> {
+            self.native.submit_frame(before, rect, screens)
+        }
+        fn submit_maximize(
+            &mut self,
+            before: &Snapshot,
+            maximize: bool,
+            screens: &[Screen],
+        ) -> Result<bool, String> {
+            self.native.submit_maximize(before, maximize, screens)
+        }
+        fn submit_maximized_frame(
+            &mut self,
+            before: &Snapshot,
+            rect: Rect,
+            screens: &[Screen],
+        ) -> Result<bool, String> {
+            self.native.submit_maximized_frame(before, rect, screens)
+        }
+        fn refresh_geometry(
+            &self,
+            snapshot: &mut Snapshot,
+            screens: &[Screen],
+        ) -> Result<(), String> {
+            self.native.refresh_geometry(snapshot, screens)
+        }
+
         fn tab_minimize(
             &mut self,
             id: WindowId,
@@ -2496,6 +2662,159 @@ mod tests {
         assert!(
             access.close(id).is_err(),
             "stale target must not close another window"
+        );
+    }
+
+    #[test]
+    #[ignore = "functional async acceptance; changes only disposable owned windows"]
+    fn native_async_group_maximize_layout_and_cancel() {
+        use crate::api::window::{WindowChange, WindowOperation as O};
+        use crate::api::window_tabs::{TabOperation, WindowTarget};
+        use crate::platform::common::WindowGroupsProbe as Grouped;
+        use crate::platform::common::window_session::WindowSessionProbe;
+        let _ = super::super::screens::enable_dpi_awareness();
+        let screens = super::super::screens::list_screens().unwrap();
+        let area = screens
+            .iter()
+            .find(|screen| screen.is_primary)
+            .unwrap()
+            .work_area;
+        let first = Probe::start(Rect::new(area.x + 50.0, area.y + 50.0, 480.0, 320.0));
+        let second = Probe::start(Rect::new(area.x + 80.0, area.y + 80.0, 480.0, 320.0));
+        let mut native = Windows::default();
+        let one = native.retain(first.hwnd, &screens).unwrap().id;
+        let two = native.retain(second.hwnd, &screens).unwrap().id;
+        native.tab_screens = screens.clone();
+        let mut access = Grouped::new(NativeProbeAccess {
+            native,
+            ids: vec![one, two],
+        });
+        for id in [one, two] {
+            access
+                .tab_operation(
+                    TabOperation::Choose(WindowTarget::Window(id)),
+                    &screens,
+                    &|| false,
+                )
+                .unwrap();
+        }
+        let entry = access.snapshot(one, &screens).unwrap();
+        let mut session = WindowSessionProbe::new(one);
+        for expected in [true, false] {
+            let result = session.execute_deferred(
+                &mut access,
+                O::Adjust {
+                    target: one,
+                    change: WindowChange::ToggleMaximize,
+                    group: 1,
+                },
+                &screens,
+            );
+            assert!(result.message.is_none(), "{:?}", result.message);
+            assert_eq!(result.target.unwrap().maximized, expected);
+        }
+        assert_eq!(
+            access.snapshot(one, &screens).unwrap().info.bounds,
+            entry.info.bounds
+        );
+        session.execute(
+            &mut access,
+            O::BeginEdit {
+                transaction: 1,
+                targets: vec![one],
+                screen: None,
+                group: 2,
+            },
+            &screens,
+        );
+        let result = session.execute_deferred(
+            &mut access,
+            O::ApplyLayout {
+                transaction: 1,
+                revision: 1,
+                screen: entry.info.screen,
+                placements: vec![(one, Rect::new(0.0, 0.0, 0.5, 1.0))],
+                additional_screens: Vec::new(),
+                gap: 0.0,
+                strict: true,
+            },
+            &screens,
+        );
+        assert!(result.message.is_none(), "{:?}", result.message);
+        let result = session.execute_deferred(
+            &mut access,
+            O::EndEdit {
+                transaction: 1,
+                commit: false,
+            },
+            &screens,
+        );
+        assert!(result.message.is_none(), "{:?}", result.message);
+        assert_eq!(
+            access.snapshot(one, &screens).unwrap().info.bounds,
+            entry.info.bounds
+        );
+    }
+
+    #[test]
+    #[ignore = "creates only a disposable owned window; measures native submission and readback"]
+    fn native_deferred_geometry_submission_and_readback() {
+        let _ = super::super::screens::enable_dpi_awareness();
+        let screens = super::super::screens::list_screens().unwrap();
+        let area = screens.iter().find(|s| s.is_primary).unwrap().work_area;
+        let probe = Probe::start(Rect::new(area.x + 80.0, area.y + 80.0, 480.0, 320.0));
+        let mut access = Windows::default();
+        let id = access.retain(probe.hwnd, &screens).unwrap().id;
+        let original = access.snapshot(id, &screens).unwrap();
+        let mut readback = original.clone();
+        access.refresh_geometry(&mut readback, &screens).unwrap();
+        let title_storage = readback.info.title.as_ptr();
+        let app_storage = readback.info.app.as_ptr();
+        let allocation = stats_alloc::Region::new(crate::TEST_ALLOCATOR);
+        for _ in 0..256 {
+            access.refresh_geometry(&mut readback, &screens).unwrap();
+        }
+        let stats = allocation.change();
+        assert_eq!((stats.allocations, stats.reallocations), (0, 0));
+        assert_eq!(readback.info.title.as_ptr(), title_storage);
+        assert_eq!(readback.info.app.as_ptr(), app_storage);
+        access.tab_watch(&[id]).unwrap();
+        let mut submissions = Vec::with_capacity(40);
+        let mut confirmations = Vec::with_capacity(40);
+        for step in 0..40 {
+            let mut desired = original.info.bounds;
+            desired.x += if step % 2 == 0 { 30.0 } else { 0.0 };
+            let start = Instant::now();
+            let before = access.snapshot(id, &screens).unwrap();
+            assert!(access.submit_frame(&before, desired, &screens).unwrap());
+            submissions.push(start.elapsed().as_nanos());
+            loop {
+                access.refresh_geometry(&mut readback, &screens).unwrap();
+                let actual = readback.info.bounds;
+                if (actual.x - desired.x).abs() < 2.0 && (actual.y - desired.y).abs() < 2.0 {
+                    break;
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(1),
+                    "native confirmation timed out"
+                );
+                access.wait_for_events(Some(Duration::from_millis(16)));
+                super::super::window_tabs::NativeTabs::dispatch_messages();
+            }
+            confirmations.push(start.elapsed().as_nanos());
+        }
+        access.tab_watch(&[]).unwrap();
+        access.restore(&original, &screens, &|| false).unwrap();
+        submissions.sort_unstable();
+        confirmations.sort_unstable();
+        println!(
+            "native_deferred_geometry samples=40 submit_p50={}ns submit_p95={}ns submit_p99={}ns confirm_p50={}ns confirm_p95={}ns confirm_p99={}ns",
+            submissions[20],
+            submissions[38],
+            submissions[39],
+            confirmations[20],
+            confirmations[38],
+            confirmations[39]
         );
     }
 

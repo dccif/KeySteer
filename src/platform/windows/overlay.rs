@@ -13,10 +13,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use smallvec::SmallVec;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BLENDFUNCTION, CLIP_DEFAULT_PRECIS,
-    CreateFontW, DEFAULT_CHARSET, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject,
-    DrawTextW, FF_DONTCARE, FW_BOLD, FW_NORMAL, GetTextExtentExPointW, HBRUSH, HFONT,
-    OUT_DEFAULT_PRECIS, SetBkMode, SetTextColor, TRANSPARENT, UpdateWindow, ValidateRect,
+    AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, CLIP_DEFAULT_PRECIS, DT_CENTER, DT_NOPREFIX,
+    DT_SINGLELINE, DT_VCENTER, DrawTextW, GetTextExtentExPointW, HBRUSH, SetBkMode, SetTextColor,
+    TRANSPARENT, UpdateWindow, ValidateRect,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, HCURSOR, HICON, ULW_ALPHA, UpdateLayeredWindow, WM_DESTROY, WM_PAINT,
@@ -31,7 +30,7 @@ use crate::api::overlay::{
 };
 
 use super::native::{
-    GdiDibSurface, NativeDimensions, OwnedWindow, OwnedWindowSpec, create_owned_window,
+    GdiDibSurface, NativeDimensions, OwnedFont, OwnedWindow, OwnedWindowSpec, create_owned_window,
     reposition_owned_window,
 };
 
@@ -890,56 +889,6 @@ struct FontEntry {
     font: OwnedFont,
 }
 
-struct OwnedFont(HFONT);
-
-impl OwnedFont {
-    fn new(key: &FontKey) -> Result<Self, String> {
-        let family: Vec<u16> = key.family.encode_utf16().chain(Some(0)).collect();
-        // SAFETY: `family` is NUL-terminated and remains live for the complete
-        // CreateFontW call; all numeric parameters are initialized values.
-        let font = unsafe {
-            CreateFontW(
-                -key.pixel_height,
-                0,
-                0,
-                0,
-                if key.bold {
-                    FW_BOLD.0 as i32
-                } else {
-                    FW_NORMAL.0 as i32
-                },
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET,
-                OUT_DEFAULT_PRECIS,
-                CLIP_DEFAULT_PRECIS,
-                ANTIALIASED_QUALITY,
-                FF_DONTCARE.0 as u32,
-                PCWSTR(family.as_ptr()),
-            )
-        };
-        if font.is_invalid() {
-            Err("CreateFontW failed".into())
-        } else {
-            Ok(Self(font))
-        }
-    }
-}
-
-impl Drop for OwnedFont {
-    fn drop(&mut self) {
-        // SAFETY: this HFONT came from CreateFontW and this guard is its sole
-        // owner, so DeleteObject is called exactly once.
-        if !unsafe { DeleteObject(self.0.into()) }.as_bool() {
-            crate::support::logging::report_error(
-                "windows-overlay",
-                "DeleteObject(font) failed during drop",
-            );
-        }
-    }
-}
-
 struct TextRasterizer {
     scratch: Option<GdiDibSurface>,
     fonts: Vec<FontEntry>,
@@ -999,7 +948,7 @@ impl TextRasterizer {
                 bold: style.bold,
             };
             FontEntry {
-                font: OwnedFont::new(&key)?,
+                font: OwnedFont::new(&key.family, key.pixel_height, key.bold)?,
                 key,
             }
         };
@@ -1010,17 +959,17 @@ impl TextRasterizer {
         scratch.clear_region(width, height);
         let mut matched_boundary = None;
         {
-            let _selected_font = scratch.select_object(font.font.0.into())?;
+            let selected_font = scratch.select_font(&font.font)?;
             // SAFETY: the selected DC and font remain alive for this scope and
             // the color/background operations do not retain pointers.
             unsafe {
-                if SetBkMode(scratch.dc(), TRANSPARENT) == 0 {
+                if SetBkMode(selected_font.dc(), TRANSPARENT) == 0 {
                     crate::support::logging::report_error(
                         "windows-overlay",
                         "SetBkMode failed while drawing text",
                     );
                 }
-                SetTextColor(scratch.dc(), COLORREF(0x00FF_FFFF));
+                SetTextColor(selected_font.dc(), COLORREF(0x00FF_FFFF));
             }
             let text_offset_y = super::label_text_offset_y(style, analysis).round() as i32;
             let mut draw_rect = windows::Win32::Foundation::RECT {
@@ -1039,7 +988,7 @@ impl TextRasterizer {
                     self.advances.resize(self.utf16.len(), 0);
                     let mut text_size = SIZE::default();
                     if !GetTextExtentExPointW(
-                        scratch.dc(),
+                        selected_font.dc(),
                         PCWSTR(self.utf16.as_ptr()),
                         utf16_len,
                         i32::MAX,
@@ -1063,7 +1012,7 @@ impl TextRasterizer {
                     matched_boundary = Some((left + prefix_width).clamp(0, width as i32) as usize);
                 }
                 DrawTextW(
-                    scratch.dc(),
+                    selected_font.dc(),
                     &mut self.utf16,
                     &mut draw_rect,
                     match style.text_alignment {

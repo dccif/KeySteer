@@ -365,3 +365,14 @@ Engine 直接执行 `Command::CycleWindow`，经 `Backend::request_window` 提�
 Window Session 处理 ScreenRetargeted 时仅通过 Command::warp_to 移动指针到目标屏幕中心，不结束窗口会话、不切换 Move/Resize、不改动所选窗口几何；临时 Normal 的 screen next/previous/编号动作因此可正常执行。
 
 Quick Switch 松开触发键时先清理候选并走普通 Up 路由回复 native disposition，handle_key 完成后才收起面板；禁止在同步 macOS EventTap 等待期间提前重绘。debug.enabled + debug.keys 输出 quick-switch 的 arm 条件（配置/排除/备注/held）、取消来源和 takeover，用于区分未计时与原生显示失败。
+
+
+## 异步工作区操作与输入恢复
+
+持久化仓库通过 `PresetRepository::submit` 接收 `WorkspaceOperation`。Engine 记录请求 ID、Mode 实例会话或模拟器归属，原生 `Backend::event_sink` 返回已有事件队列的发送端；文件 worker 完成后发送 `BackendEvent::WorkspaceCompleted`，由 Engine 路由回对应请求。退出模式、重载及输入恢复清退原 Mode 的完成路由，迟到完成不能作用于新会话。已接受的文件写入仍会完成。内存仓库和未提供事件发送端的测试宿主保留同步回退。
+
+输入恢复根据 `RuntimeError::RecoverableInput` 分类，不比较错误消息文本。先取消暂态按压并释放合成输入，再清理其余运行状态，最后集中写恢复诊断；shutdown 同样先释放输入再等待工作区持久化。日志仍统一走 `support/logging.rs`，不要恢复散落的 stderr 输出。
+
+## 配置后台队列
+
+交互 Reload / set_config 的磁盘读取、解析、编译与持久化在惰性创建的 `configuration-io` worker 执行。队列最多 8 个待执行操作，只有一个候选在途；`BackendEvent::ConfigurationReady` 只通知 Engine 取回应用层候选，不把 RuntimePlan 放入 API。Engine 接受计划与 repository 后才从新 repository 派生下一项，避免连续 set_config 丢失先前更新。候选失败保留上一个有效计划并继续队列。`source_text` 本来就是内存缓存。没有 event sink 或 detached repository 能力的测试／兼容适配器保留同步路径。退出释放输入后等待已开始的配置工作（有界 2s），未开始的配置请求取消。

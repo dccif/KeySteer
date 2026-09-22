@@ -1,3 +1,4 @@
+import { useStudioI18n } from './i18n'
 import { defineComponent } from 'vue'
 import type { ConfigDocument } from './document'
 
@@ -8,6 +9,7 @@ export default defineComponent({
     appearance: { type: String, required: true },
   },
   setup(props) {
+    const { t } = useStudioI18n()
     return () => {
       const card = props.document.window?.card ?? {}, ui = props.document[props.mode]?.ui ?? {}
       const theme = props.document.theme?.[props.appearance] ?? {}
@@ -23,7 +25,7 @@ export default defineComponent({
       const line = `${ui.border_width ?? 1}px solid ${border}`
       const label = { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', lineHeight: `${row}px` } as const
       return <div class="ks-card-style-preview">
-        <div class="ks-card-preview-caption"><strong>卡片外观 · 实时预览</strong><span>位置范围共用；编号字号和边框尺寸使用当前模式的 ui。</span></div>
+        <div class="ks-card-preview-caption"><strong>{t("卡片外观 · 实时预览")}</strong><span>{t("位置范围共用；编号字号和边框尺寸使用当前模式的 ui。")}</span></div>
         <div class="ks-card-preview-stage">
           {card.guide_line_enabled !== false && <div style={{ width: '70px', margin: '0 auto 8px',
             borderTop: `${card.guide_line_width ?? 3}px solid ${color(card.guide_line_color, border)}` }} />}
@@ -37,7 +39,7 @@ export default defineComponent({
             <div style={{ width: `${card.text_width ?? 260}px`, boxSizing: 'content-box', minWidth: 0,
               padding: `${card.padding_y ?? 4}px ${card.padding_x ?? 9}px` }}>
               <div style={{ ...label, fontSize: `${appSize}px`, color: color(card.app_color, text), fontWeight: card.app_bold === false ? 400 : 700, fontFamily: card.app_font_family || 'inherit' }}>KeySteer</div>
-              <div style={{ ...label, fontSize: `${titleSize}px`, color: color(card.title_color, text), fontWeight: card.title_bold ? 700 : 400, fontFamily: card.title_font_family || 'inherit' }}>窗口标题 — Window title</div>
+              <div style={{ ...label, fontSize: `${titleSize}px`, color: color(card.title_color, text), fontWeight: card.title_bold ? 700 : 400, fontFamily: card.title_font_family || 'inherit' }}>{t("窗口标题 — Window title")}</div>
             </div>
           </div>
         </div>

@@ -133,6 +133,10 @@ pub struct ConfigurationCandidate {
 /// Runtime-owned port for configuration persistence. Implementations live at
 /// the application boundary, so the engine knows neither TOML nor ConfigFile.
 pub trait ConfigurationRepository: Send {
+    /// Detached source for background read/compile/write. Headless adapters may omit it.
+    fn fork_for_worker(&self) -> Option<Box<dyn ConfigurationRepository>> {
+        None
+    }
     fn source_text(&self) -> Result<String, String>;
 
     fn source_path(&self) -> Option<PathBuf>;

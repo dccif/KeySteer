@@ -1,9 +1,17 @@
 //! Minimal Win32 safety boundary for process-wide utilities.
 
+mod gdi;
+mod uia_cache;
+pub(crate) use gdi::OwnedFont;
 use std::marker::PhantomData;
 use std::path::Path;
 use std::ptr::NonNull;
 use std::rc::Rc;
+pub(crate) use uia_cache::CachedElement;
+use windows::Win32::Graphics::Gdi::{
+    ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, DEFAULT_CHARSET, DeleteObject,
+    FF_DONTCARE, FW_BOLD, FW_NORMAL, HFONT, OUT_DEFAULT_PRECIS,
+};
 
 use windows::Win32::Foundation::{HANDLE, HWND};
 use windows::Win32::Graphics::Gdi::{HBITMAP, HDC, HGDIOBJ};
@@ -1214,48 +1222,6 @@ impl Drop for OwnedWindow {
     }
 }
 
-/// Restores the previously selected GDI object when the guard leaves scope.
-pub(crate) struct SelectedObject<'dc> {
-    dc: HDC,
-    previous: HGDIOBJ,
-    _dc: PhantomData<&'dc GdiDibSurface>,
-    _thread: PhantomData<Rc<()>>,
-}
-
-impl GdiDibSurface {
-    #[inline(always)]
-    pub(crate) fn select_object(&self, object: HGDIOBJ) -> Result<SelectedObject<'_>, String> {
-        use windows::Win32::Graphics::Gdi::SelectObject;
-
-        // SAFETY: both handles are live for the guard lifetime. Drop restores
-        // the exact object returned by this call.
-        let previous = unsafe { SelectObject(self.memory, object) };
-        if previous.0.is_null() || previous.0 as usize == usize::MAX {
-            Err("SelectObject failed".into())
-        } else {
-            Ok(SelectedObject {
-                dc: self.memory,
-                previous,
-                _dc: PhantomData,
-                _thread: PhantomData,
-            })
-        }
-    }
-}
-
-impl Drop for SelectedObject<'_> {
-    #[inline(always)]
-    fn drop(&mut self) {
-        use windows::Win32::Graphics::Gdi::SelectObject;
-
-        // SAFETY: `previous` came from selecting into this same live DC.
-        let restored = unsafe { SelectObject(self.dc, self.previous) };
-        if restored.0.is_null() || restored.0 as usize == usize::MAX {
-            crate::report_error!("windows-native", "cannot restore selected GDI object");
-        }
-    }
-}
-
 /// Whether Desktop Window Manager composition is available.
 pub(crate) fn dwm_composition_enabled() -> windows::core::Result<bool> {
     use windows::Win32::Graphics::Dwm::DwmIsCompositionEnabled;
@@ -1264,12 +1230,10 @@ pub(crate) fn dwm_composition_enabled() -> windows::core::Result<bool> {
     unsafe { DwmIsCompositionEnabled() }.map(|enabled| enabled.as_bool())
 }
 
-/// Block the calling worker until DWM completes the next composition pass.
+/// Compositor synchronization for the dedicated frame/capture workers only.
 pub(crate) fn wait_for_dwm_frame() -> windows::core::Result<()> {
-    use windows::Win32::Graphics::Dwm::DwmFlush;
-
     // SAFETY: DwmFlush has no arguments or caller-owned resources.
-    unsafe { DwmFlush() }
+    unsafe { windows::Win32::Graphics::Dwm::DwmFlush() }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

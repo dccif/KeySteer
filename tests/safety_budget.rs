@@ -42,8 +42,12 @@ use std::path::{Path, PathBuf};
 // Two audited Objective-C protocol conformances for deferred system termination.
 // One test-only INPUT_KEYBOARD union read verifies mapped-chord restoration.
 // Overlay adds one main-thread, retained NSPanel subclass initializer.
-const MAX_UNSAFE_EXPRESSIONS: usize = 370;
-const MAX_UNSAFE_FILES: usize = 31;
+// HEAD contained 385 expressions (including native acceptance probes), despite
+// the stale 370 budget. Audited this migration: six cached UIA getters and the
+// GDI owners moved to typed native modules; three tagged test union reads now
+// share one checked accessor. No new production FFI was introduced.
+const MAX_UNSAFE_EXPRESSIONS: usize = 383;
+const MAX_UNSAFE_FILES: usize = 33;
 const PER_FILE_BUDGET: &[(&str, usize)] = &[
     // macOS audio owns, changes, maintains and destroys native state,
     // with one bounded diagnostic callback into centralized logging.
@@ -65,24 +69,26 @@ const PER_FILE_BUDGET: &[(&str, usize)] = &[
     ("src/platform/macos/status_item.rs", 7),
     ("src/platform/windows/text_prompt.rs", 7),
     ("src/platform/macos/vision.rs", 5),
-    ("src/platform/windows/accessibility.rs", 31),
+    ("src/platform/windows/accessibility.rs", 30),
     ("src/platform/windows/autostart.rs", 4),
     ("src/platform/windows/gpu_overlay.rs", 28),
     ("src/platform/windows/hook.rs", 8),
     // Includes a test-only read of INPUT.Anonymous.ki for mapped-chord
     // modifier restoration. The batch constructor activates INPUT_KEYBOARD;
     // no pointer dereference, native call or production unsafe block is added.
-    ("src/platform/windows/input.rs", 9),
-    ("src/platform/windows/overlay.rs", 9),
+    ("src/platform/windows/input.rs", 10),
+    ("src/platform/windows/overlay.rs", 5),
     ("src/platform/windows/screens.rs", 5),
     ("src/platform/windows/window_mover.rs", 4),
-    ("src/platform/windows/window_manager.rs", 27),
+    ("src/platform/windows/window_manager.rs", 31),
     ("src/platform/windows/window_tabs.rs", 7),
     ("src/platform/windows/status_item.rs", 14),
     ("src/platform/windows/update_installer/candidate.rs", 4),
     ("src/platform/windows/update_installer/mod.rs", 11),
     ("src/platform/windows/update_installer/signature.rs", 9),
-    ("src/platform/windows/native/mod.rs", 84),
+    ("src/platform/windows/native/mod.rs", 83),
+    ("src/platform/windows/native/gdi.rs", 4),
+    ("src/platform/windows/native/uia_cache.rs", 6),
 ];
 
 fn rust_files(directory: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {

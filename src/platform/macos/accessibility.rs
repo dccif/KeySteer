@@ -173,6 +173,7 @@ pub(super) fn window_under_pointer(
         window,
         attributes: lookup.attributes,
         fullscreen: CFString::new("AXFullScreen"),
+        minimized: CFString::new("AXMinimized"),
     }))
 }
 
@@ -250,6 +251,7 @@ pub(super) struct MovableWindow {
     window: OwnedCf,
     attributes: AxAttributes,
     fullscreen: CFString,
+    minimized: CFString,
 }
 
 impl MovableWindow {

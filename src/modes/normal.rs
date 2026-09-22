@@ -153,6 +153,45 @@ impl FromIterator<Direction> for DirectionMask {
     }
 }
 
+/// Configuration compiled once per mode. Replaces acceleration with ramp
+/// duration, retaining the same size and no extra per-gesture allocation.
+#[derive(Debug, Clone)]
+struct MotionProfile {
+    initial_speed: f64,
+    max_speed: f64,
+    ramp_duration: f64,
+    smooth_acceleration: bool,
+    tap_distance: f64,
+    slow_multiplier: f64,
+    precision_multiplier: f64,
+    fast_multiplier: f64,
+}
+impl From<PointerSettings> for MotionProfile {
+    fn from(settings: PointerSettings) -> Self {
+        let initial_speed = settings.initial_speed.min(settings.max_speed);
+        let range = settings.max_speed - initial_speed;
+        let ramp_duration = if range > 0.0 && settings.acceleration > 0.0 {
+            range / settings.acceleration
+        } else {
+            0.0
+        };
+        Self {
+            initial_speed,
+            max_speed: if ramp_duration > 0.0 {
+                settings.max_speed
+            } else {
+                initial_speed
+            },
+            ramp_duration,
+            smooth_acceleration: settings.smooth_acceleration,
+            tap_distance: settings.tap_distance,
+            slow_multiplier: settings.slow_multiplier,
+            precision_multiplier: settings.precision_multiplier,
+            fast_multiplier: settings.fast_multiplier,
+        }
+    }
+}
+
 /// Acceleration state for one continuous gesture.
 ///
 /// Tracks sub-pixel remainders so slow speeds still move the cursor and
@@ -177,7 +216,7 @@ impl Motion {
     fn step(
         &mut self,
         directions: DirectionMask,
-        profile: &PointerSettings,
+        profile: &MotionProfile,
         multiplier: f64,
         elapsed: Duration,
     ) -> (f64, f64) {
@@ -206,29 +245,28 @@ impl Motion {
     /// that crosses from acceleration into cruising speed.
     #[cfg(test)]
     fn distance(profile: &PointerSettings, start: f64, end: f64) -> f64 {
-        Self::travel_at(profile, end) - Self::travel_at(profile, start)
+        let profile = MotionProfile::from(profile.clone());
+        Self::travel_at(&profile, end) - Self::travel_at(&profile, start)
     }
 
     /// Distance travelled from the beginning of the gesture through `time`.
-    fn travel_at(profile: &PointerSettings, time: f64) -> f64 {
+    fn travel_at(profile: &MotionProfile, time: f64) -> f64 {
         let time = time.max(0.0);
-        let max_speed = profile.max_speed;
-        let initial_speed = profile.initial_speed.min(max_speed);
-        let speed_range = max_speed - initial_speed;
-        if speed_range <= 0.0 || profile.acceleration <= 0.0 {
-            return initial_speed * time;
+        let initial_speed = profile.initial_speed;
+        let speed_range = profile.max_speed - initial_speed;
+        let ramp_duration = profile.ramp_duration;
+        // Almost every held frame is past the short ramp. No division or
+        // smootherstep polynomial is needed in the cruising path.
+        if time >= ramp_duration {
+            return profile.max_speed * time - 0.5 * speed_range * ramp_duration;
         }
-
-        let ramp_duration = speed_range / profile.acceleration;
-        let ramp_time = time.min(ramp_duration);
-        let ramp_distance = if profile.smooth_acceleration {
-            let progress = ramp_time / ramp_duration;
-            initial_speed * ramp_time
+        if profile.smooth_acceleration {
+            let progress = time / ramp_duration;
+            initial_speed * time
                 + speed_range * ramp_duration * Self::smootherstep_integral(progress)
         } else {
-            initial_speed * ramp_time + 0.5 * profile.acceleration * ramp_time * ramp_time
-        };
-        ramp_distance + max_speed * (time - ramp_time)
+            initial_speed * time + 0.5 * (speed_range / ramp_duration) * time * time
+        }
     }
 
     /// Integral from zero to `u` of `6u⁵ - 15u⁴ + 10u³`.
@@ -243,7 +281,7 @@ impl Motion {
     fn tap(
         &mut self,
         directions: DirectionMask,
-        profile: &PointerSettings,
+        profile: &MotionProfile,
         multiplier: f64,
     ) -> (f64, f64) {
         self.advance(directions, profile.tap_distance * multiplier)
@@ -274,7 +312,7 @@ impl Motion {
 }
 
 pub struct NormalMode {
-    profile: PointerSettings,
+    profile: MotionProfile,
     scroll: ScrollSettings,
     passthrough_unbound_keys: bool,
 
@@ -304,7 +342,7 @@ pub struct NormalMode {
 impl NormalMode {
     pub fn new(settings: Settings) -> Self {
         Self {
-            profile: settings.pointer,
+            profile: settings.pointer.into(),
             scroll: settings.scroll,
             passthrough_unbound_keys: settings.passthrough_unbound_keys,
             moving: SmallKeyMap::default(),
@@ -666,11 +704,59 @@ mod tests {
         let mut motion = Motion::default();
         let elapsed = Duration::from_millis(100);
 
-        let first = motion.step(directions, &profile, 1.0, elapsed).0;
-        let second = motion.step(directions, &profile, 1.0, elapsed).0;
-        let third = motion.step(directions, &profile, 1.0, elapsed).0;
+        let first = motion
+            .step(directions, &profile.clone().into(), 1.0, elapsed)
+            .0;
+        let second = motion
+            .step(directions, &profile.clone().into(), 1.0, elapsed)
+            .0;
+        let third = motion
+            .step(directions, &profile.clone().into(), 1.0, elapsed)
+            .0;
         assert_eq!((first, second, third), (12.0, 18.0, 20.0));
         assert!((motion.elapsed_seconds - 0.3).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn compiled_motion_matches_original_integral_without_growing_profile() {
+        assert_eq!(
+            std::mem::size_of::<MotionProfile>(),
+            std::mem::size_of::<PointerSettings>()
+        );
+        for (initial, max, acceleration) in [
+            (100.0, 600.0, 500.0),
+            (500.0, 200.0, 100.0),
+            (100.0, 200.0, 0.0),
+            (0.0, 1.0, 0.001),
+        ] {
+            for smooth in [false, true] {
+                let mut settings = pointer_settings();
+                settings.initial_speed = initial;
+                settings.max_speed = max;
+                settings.acceleration = acceleration;
+                settings.smooth_acceleration = smooth;
+                let profile = MotionProfile::from(settings.clone());
+                for tick in 0..10_001 {
+                    let time = tick as f64 / 10.0;
+                    let initial = initial.min(max);
+                    let range = max - initial;
+                    let expected = if range <= 0.0 || acceleration <= 0.0 {
+                        initial * time
+                    } else {
+                        let duration = range / acceleration;
+                        let ramp = time.min(duration);
+                        let distance = if smooth {
+                            initial * ramp
+                                + range * duration * Motion::smootherstep_integral(ramp / duration)
+                        } else {
+                            initial * ramp + 0.5 * acceleration * ramp * ramp
+                        };
+                        distance + max * (time - ramp)
+                    };
+                    assert!((Motion::travel_at(&profile, time) - expected).abs() < 1e-8);
+                }
+            }
+        }
     }
 
     #[test]
@@ -728,7 +814,11 @@ mod tests {
         let distance = |updates: usize, elapsed: Duration| {
             let mut motion = Motion::default();
             (0..updates)
-                .map(|_| motion.step(directions, &profile, 1.0, elapsed).0)
+                .map(|_| {
+                    motion
+                        .step(directions, &profile.clone().into(), 1.0, elapsed)
+                        .0
+                })
                 .sum::<f64>()
         };
         assert_eq!(

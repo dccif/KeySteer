@@ -20,6 +20,8 @@ struct Fake {
     hidden: BTreeSet<WindowId>,
     hidden_foreground: usize,
     header: f64,
+    deferred: bool,
+    submitted: BTreeMap<WindowId, Rect>,
 }
 fn screens() -> Vec<Screen> {
     vec![Screen {
@@ -541,11 +543,38 @@ fn setup() -> Grouped<Fake> {
         hidden: BTreeSet::new(),
         hidden_foreground: 0,
         header: 0.0,
+        deferred: false,
+        submitted: BTreeMap::new(),
     });
     grouped.enumerate(&screens(), &|| false).unwrap();
     grouped
 }
 impl WindowAccess for Fake {
+    fn can_submit_frame(&self, id: WindowId) -> bool {
+        self.deferred && !self.hidden.contains(&id)
+    }
+    fn submit_frame(
+        &mut self,
+        before: &Snapshot,
+        rect: Rect,
+        _: &[Screen],
+    ) -> Result<bool, String> {
+        if !self.can_submit_frame(before.info.id) {
+            return Ok(false);
+        }
+        self.submitted.insert(before.info.id, rect);
+        Ok(true)
+    }
+    fn refresh_geometry(&self, observed: &mut Snapshot, _: &[Screen]) -> Result<(), String> {
+        let current = self.windows.get(&observed.info.id).ok_or("closed")?;
+        observed.info.bounds = current.info.bounds;
+        observed.info.screen = current.info.screen;
+        observed.info.maximized = current.info.maximized;
+        observed.info.minimized = current.info.minimized;
+        observed.restored = current.restored;
+        Ok(())
+    }
+
     fn pointer_window(&mut self, _: &[Screen]) -> Result<Option<WindowId>, String> {
         Ok(self.focus.get())
     }
@@ -1858,4 +1887,75 @@ fn ended_dissolved_session_preserves_undo_and_redo() {
     access.end_session();
     op(&mut access, TabOperation::Redo);
     assert_eq!(access.tab_state().unwrap().groups, grouped);
+}
+
+#[test]
+fn asynchronous_group_geometry_uses_active_member_and_preserves_header_and_metadata() {
+    let mut access = setup();
+    access.native.header = 30.0;
+    choose(&mut access, 1);
+    choose(&mut access, 2);
+    assert_eq!(
+        access.groups.state.containing(WindowId(1)).unwrap().active,
+        WindowId(2)
+    );
+    let inactive = access.native.windows[&WindowId(1)].info.bounds;
+    access.native.deferred = true;
+    let mut before = access.snapshot(WindowId(1), &screens()).unwrap();
+    let title = before.info.title.as_ptr();
+    let desired = Rect::new(100.0, 70.0, 500.0, 400.0);
+    assert!(access.can_submit_frame(WindowId(1)));
+    assert!(access.submit_frame(&before, desired, &screens()).unwrap());
+    assert_eq!(access.native.submitted.len(), 1);
+    let content = access.native.submitted[&WindowId(2)];
+    assert_eq!(content, Rect::new(100.0, 100.0, 500.0, 370.0));
+    access
+        .watch_confirmations(std::iter::once(WindowId(1)))
+        .unwrap();
+    assert_eq!(access.confirming, vec![WindowId(2)]);
+    let window = access.native.windows.get_mut(&WindowId(2)).unwrap();
+    window.info.bounds = content;
+    window.restored = content;
+    let reads = access.native.snapshot_reads.get();
+    access.refresh_frame(&mut before, &screens()).unwrap();
+    access.validate_frame(&mut before, &screens()).unwrap();
+    assert_eq!(before.info.title.as_ptr(), title);
+    assert_eq!(before.info.bounds, desired);
+    assert_eq!(access.native.snapshot_reads.get(), reads);
+    // Echo notifications must not trigger the synchronous header adjustment path.
+    let writes = access.native.writes;
+    access
+        .native
+        .events
+        .push(TabNativeEvent::GeometryChanged(WindowId(2)));
+    access.pump(&screens(), &|| false).unwrap();
+    assert_eq!(access.native.writes, writes);
+    access.confirmed_placement(&before, &screens()).unwrap();
+    assert_eq!(access.bars[0].bounds, content);
+    assert_eq!(access.native.windows[&WindowId(1)].info.bounds, inactive);
+}
+
+#[test]
+fn native_tab_actions_wait_until_confirmation_releases_member_identity() {
+    let mut access = setup();
+    choose(&mut access, 1);
+    choose(&mut access, 2);
+    access
+        .watch_confirmations(std::iter::once(WindowId(1)))
+        .unwrap();
+    access
+        .native
+        .events
+        .push(TabNativeEvent::Activate(WindowId(1)));
+    access.pump(&screens(), &|| false).unwrap();
+    assert_eq!(
+        access.groups.state.containing(WindowId(1)).unwrap().active,
+        WindowId(2)
+    );
+    access.watch_confirmations(std::iter::empty()).unwrap();
+    access.pump(&screens(), &|| false).unwrap();
+    assert_eq!(
+        access.groups.state.containing(WindowId(1)).unwrap().active,
+        WindowId(1)
+    );
 }

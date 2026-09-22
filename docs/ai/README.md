@@ -4,6 +4,10 @@ Window 入口激活鼠标下窗口、可配置关闭动作见 [公共 API](02-ru
 
 # KeySteer 项目手册
 
+中英文更新历史的旧版本自动折叠见 [构建与文档站](08-build-docs-and-tests.md)，源文件标题仍供发布脚本提取说明。
+
+配置模拟器中英文文案、实例级语言状态与双语搜索见 [构建与文档站](08-build-docs-and-tests.md)。
+
 网页配置分类、字段归属、独立滚动预览与焦点管理见 [构建与文档站](08-build-docs-and-tests.md)，模块入口见 [项目地图](01-project-map.md)。
 
 Window 跨屏选窗后的鼠标跳转遵守指针事件订阅，避免误触发窗口移动／还原，见 [运行时](02-runtime-and-api.md) 和 [验证](08-build-docs-and-tests.md)。
@@ -179,3 +183,13 @@ macOS Window 全屏幕标记的逐屏 Panel、独立坐标与裁剪、混合 Ret
 
 
 全屏幕窗口枚举不截断、AX／Quartz 标题差异容错与公共候选编号回归见 [后端](06-platform-backends.md) 和 [验证](08-build-docs-and-tests.md)。
+
+
+
+异步工作区持久化、普通窗口几何提交／确认、紧凑历史快照及原生资源 guard 见 [项目地图](01-project-map.md)、[运行时](02-runtime-and-api.md)、[原生后端](06-platform-backends.md)、[性能](07-rendering-and-performance.md)、[验证](08-build-docs-and-tests.md) 和 [架构边界](10-architecture-boundaries.md)。
+
+
+
+窗口确认零字符串复制、同步回退快照复用及 Normal 加速曲线预计算见 [性能](07-rendering-and-performance.md) 与 [验证](08-build-docs-and-tests.md)。
+
+组内调整、最大化与布局事务的异步确认、独立读回和按序交付、后台配置队列及重复错误合并见 [运行时](02-runtime-and-api.md)、[原生后端](06-platform-backends.md)、[性能](07-rendering-and-performance.md) 与 [验证](08-build-docs-and-tests.md)。
