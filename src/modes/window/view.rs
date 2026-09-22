@@ -107,6 +107,7 @@ impl WindowSession {
                 _ => None,
             });
         View::Window(WindowView {
+            text_cache: Some(&self.text_cache),
             configurable_position: matches!(self.kind, WindowKind::Move | WindowKind::Editor),
             tabs: &self.tabs.state,
             group_input: self.kind == WindowKind::Tab && self.number.slot,

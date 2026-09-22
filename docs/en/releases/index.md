@@ -7,7 +7,9 @@ outline: false
 
 ## 0.10.19
 
-- Improved window scheduling and background workspace saves on Windows and macOS, reducing synchronous waits and duplicate undo-history data; refined key release during error recovery, logging, and native resource management.
+- Improved window adjustments, maximization, layouts, and undo/redo on Windows and macOS with batched asynchronous confirmation, reducing interference from slow windows.
+- Optimized Normal-mode pointer calculations and reused window snapshots and card text to reduce repeated queries and memory allocations.
+- Improved background workspace saves, cancellation and recovery, deduplicated error logs, and refined key release during error recovery and native resource management.
 
 ## 0.10.18
 

@@ -77,6 +77,7 @@ pub(crate) struct Grouped<A> {
     watched: Vec<WindowId>,
     confirming: Vec<WindowId>,
     deferred_events: Vec<TabNativeEvent>,
+    deferred_closed: BTreeSet<WindowId>,
     retired: Vec<WindowId>,
     hidden: BTreeSet<WindowId>,
     screens: Vec<Screen>,
@@ -113,6 +114,7 @@ impl<A: WindowAccess> Grouped<A> {
             watched: Vec::new(),
             confirming: Vec::new(),
             deferred_events: Vec::new(),
+            deferred_closed: BTreeSet::new(),
             retired: Vec::new(),
             hidden: BTreeSet::new(),
             screens: Vec::new(),
@@ -122,6 +124,7 @@ impl<A: WindowAccess> Grouped<A> {
         !self.groups.state.groups.is_empty()
             || !self.hidden.is_empty()
             || !self.deferred_events.is_empty()
+            || !self.deferred_closed.is_empty()
     }
 
     fn checkpoint(&self, extra: &[WindowId], screens: &[Screen]) -> Checkpoint {
@@ -1032,17 +1035,79 @@ impl<A: WindowAccess> Grouped<A> {
         ))
     }
 
+    fn event_windows(&self, event: TabNativeEvent) -> Vec<WindowId> {
+        let mut ids = Vec::new();
+        let mut target = |target| match target {
+            WindowTarget::Window(id) => {
+                if let Some(group) = self.groups.state.containing(id) {
+                    ids.extend_from_slice(&group.members);
+                } else {
+                    ids.push(id);
+                }
+            }
+            WindowTarget::Group(id) => {
+                if let Some(group) = self.groups.state.group(id) {
+                    ids.extend_from_slice(&group.members);
+                }
+            }
+        };
+        match event {
+            TabNativeEvent::Focused(id)
+            | TabNativeEvent::Activate(id)
+            | TabNativeEvent::Closed(id) => target(WindowTarget::Window(id)),
+            TabNativeEvent::Dissolve(id) => target(WindowTarget::Group(id)),
+            TabNativeEvent::Drop(drop) => {
+                target(drop.source);
+                target(WindowTarget::Group(drop.target));
+            }
+            _ => {}
+        }
+        ids
+    }
+    fn defer_event(&mut self, event: TabNativeEvent) {
+        if self.deferred_events.last() == Some(&event) {
+            return;
+        }
+        // Focus notifications are replaceable state, but never cross a structural action.
+        if matches!(event, TabNativeEvent::Focused(_)) {
+            let affected = self.event_windows(event);
+            let previous = self.deferred_events.iter().rposition(|old| {
+                self.event_windows(*old)
+                    .iter()
+                    .any(|id| affected.contains(id))
+            });
+            if let Some(index) = previous
+                && matches!(self.deferred_events[index], TabNativeEvent::Focused(_))
+            {
+                self.deferred_events.remove(index);
+            }
+        }
+        const MAX_ACTIONS: usize = 64;
+        if self.deferred_events.len() < MAX_ACTIONS {
+            self.deferred_events.push(event);
+        } else {
+            // Close is lifecycle state, not an optional user action. Keep one per
+            // retained identity; its bound is the existing native inventory.
+            if let TabNativeEvent::Closed(id) = event {
+                self.deferred_closed.insert(id);
+            } else {
+                crate::report_error!("window-tabs", "Tab action queue is full; action rejected");
+            }
+        }
+    }
+
     /// Native callbacks only enqueue/coalesce identities. All snapshots and
     /// writes happen here, serialized with keyboard-driven operations.
     pub fn pump(&mut self, screens: &[Screen], cancelled: &dyn Fn() -> bool) -> Result<(), String> {
         if cancelled() {
             return Ok(());
         }
-        let mut events = if self.confirming.is_empty() {
-            std::mem::take(&mut self.deferred_events)
-        } else {
-            Vec::new()
-        };
+        let mut events = std::mem::take(&mut self.deferred_events);
+        events.extend(
+            std::mem::take(&mut self.deferred_closed)
+                .into_iter()
+                .map(TabNativeEvent::Closed),
+        );
         events.extend(self.native.tab_events());
         if events.is_empty() {
             if !self.pending_bars.is_empty() {
@@ -1067,21 +1132,15 @@ impl<A: WindowAccess> Grouped<A> {
             if cancelled() {
                 return Ok(());
             }
-            // Group identity must stay fixed until every submitted write settles.
-            // Preserve action order; repeated notifications can be coalesced.
-            if !self.confirming.is_empty()
-                && matches!(
-                    event,
-                    TabNativeEvent::Focused(_)
-                        | TabNativeEvent::Activate(_)
-                        | TabNativeEvent::Dissolve(_)
-                        | TabNativeEvent::Drop(_)
-                        | TabNativeEvent::Closed(_)
-                )
-            {
-                if self.deferred_events.last() != Some(&event) {
-                    self.deferred_events.push(event);
-                }
+            let affected = self.event_windows(event);
+            let blocked = affected.iter().any(|id| self.confirming.contains(id))
+                || self.deferred_events.iter().any(|old| {
+                    self.event_windows(*old)
+                        .iter()
+                        .any(|id| affected.contains(id))
+                });
+            if blocked {
+                self.defer_event(event);
                 continue;
             }
             match event {

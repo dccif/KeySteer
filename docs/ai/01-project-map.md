@@ -1,5 +1,7 @@
 # 项目目录与代码地图
 
+`platform/common/window_session/transaction.rs` 统一 worker 的事务调度；`layout_confirmation.rs` 管理布局增量校验、提交、回滚和恢复；`history_confirmation.rs` 管理撤销／重做／初始状态恢复的独立确认及历史提交。原生句柄仍由平台适配器拥有。`api::WindowTextCache` 是模式拥有、presentation 使用的原始卡片文本缓存。
+
 `app/runtime/quick_switch.rs` 负责操作模式中的长按／数字选择、固定排名快照及按键消费配对；`presentation/quick_switch.rs` 只使用 API 数据绘制面板。`app/preset_store/usage.rs` 负责有界 mailbox、事件触发 checkpoint 和后台 writer 生命周期。原生后端仅提供窗口几何和系统退出通知。
 
 ## 顶层目录

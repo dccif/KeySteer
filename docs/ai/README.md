@@ -4,6 +4,8 @@ Window 入口激活鼠标下窗口、可配置关闭动作见 [公共 API](02-ru
 
 # KeySteer 项目手册
 
+窗口事务增量准备、组级原生事件屏障、异步历史恢复见 [后端](06-platform-backends.md)；卡片文本复用和稳定错误去重见 [性能](07-rendering-and-performance.md)，模块入口见 [项目地图](01-project-map.md)。
+
 中英文更新历史的旧版本自动折叠见 [构建与文档站](08-build-docs-and-tests.md)，源文件标题仍供发布脚本提取说明。
 
 配置模拟器中英文文案、实例级语言状态与双语搜索见 [构建与文档站](08-build-docs-and-tests.md)。

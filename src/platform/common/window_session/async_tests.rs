@@ -47,6 +47,8 @@ fn async_layout_bounds_inflight_and_commits_history_only_at_end_edit() {
     let mut pending = layout_confirmation::PendingLayout::begin(&mut session, &mut access, &layout_request(20), &screens).unwrap().unwrap();
     assert!(access.submitted.is_empty());
     assert!(pending.advance(&mut session, &mut access, false).is_none());
+    assert!(access.submitted.is_empty(), "preparation must finish before any write");
+    while pending.preparing() { assert!(pending.advance(&mut session, &mut access, false).is_none()); }
     assert_eq!(access.submitted.len(), 16);
     let result = finish_layout(&mut pending, &mut session, &mut access, false);
     assert!(result.message.is_none(), "{:?}", result.message);
@@ -186,4 +188,106 @@ fn failed_async_rollback_ends_edit_after_entry_recovery_attempt() {
     assert!(matches!(*result.edit.unwrap(), WindowEditResult::Ended { committed: false, .. }));
     assert!(result.message.unwrap().contains("entry-layout recovery"));
     assert!(same_placement(&original, &access.windows[&WindowId(1)]));
+}
+
+#[test]
+fn layout_preparation_is_incremental_cancellable_and_has_no_native_writes() {
+    let mut access = Fake::new(40);
+    let mut session = Session::default();
+    begin_async_edit(&mut session, &mut access);
+    let reads = access.snapshot_reads.get();
+    let mut request = layout_request(40);
+    let mut pending = layout_confirmation::PendingLayout::take_begin(&mut session, &mut access, &mut request, &screens().into()).unwrap().unwrap();
+    assert!(matches!(request.operation, WindowOperation::CancelPending));
+    assert_eq!(access.snapshot_reads.get(), reads, "begin only moves the request");
+    assert!(pending.advance(&mut session, &mut access, false).is_none());
+    assert!(access.snapshot_reads.get() - reads <= 8);
+    assert!(access.submitted.is_empty());
+    let reads = access.snapshot_reads.get();
+    let result = pending.advance(&mut session, &mut access, true).unwrap();
+    assert!(result.message.unwrap().contains("cancelled"));
+    assert_eq!(access.snapshot_reads.get(), reads);
+    assert!(access.submitted.is_empty());
+}
+
+#[test]
+fn late_invalid_layout_item_prevents_all_submissions() {
+    let mut access = Fake::new(20);
+    let mut session = Session::default();
+    begin_async_edit(&mut session, &mut access);
+    let mut request = layout_request(20);
+    if let WindowOperation::ApplyLayout { placements, .. } = &mut request.operation { placements[19].1.width = f64::NAN; }
+    let mut pending = layout_confirmation::PendingLayout::begin(&mut session, &mut access, &request, &screens().into()).unwrap().unwrap();
+    let result = finish_layout(&mut pending, &mut session, &mut access, false);
+    assert!(result.message.unwrap().contains("Invalid normalized"));
+    assert!(access.submitted.is_empty());
+    assert!(access.writes.is_empty());
+}
+
+#[test]
+fn layout_preparation_checks_live_cancellation_between_native_reads() {
+    let mut access = Fake::new(20);
+    let mut session = Session::default();
+    begin_async_edit(&mut session, &mut access);
+    let mut pending = layout_confirmation::PendingLayout::begin(&mut session, &mut access, &layout_request(20), &screens().into()).unwrap().unwrap();
+    let reads = access.snapshot_reads.get();
+    let checks = std::cell::Cell::new(0);
+    let cancelled = || {
+        checks.set(checks.get() + 1);
+        checks.get() > 2
+    };
+    let result = pending.advance_checked(&mut session, &mut access, &cancelled, Instant::now()).unwrap();
+    assert!(result.message.unwrap().contains("cancelled"));
+    assert!(access.snapshot_reads.get() - reads <= 1);
+    assert!(access.submitted.is_empty());
+    assert!(access.writes.is_empty());
+}
+
+fn history_fixture(count: u64) -> (Session, Fake, BTreeMap<WindowId, Snapshot>) {
+    let mut access = Fake::new(count);
+    let original = access.windows.clone();
+    let mut session = Session::default();
+    for id in 1..=count {
+        run(&mut session, &mut access, WindowOperation::Adjust { target: WindowId(id), change: WindowChange::Move { dx: 30.0, dy: 0.0 }, group: 9 });
+    }
+    access.deferred = true;
+    access.async_states = true;
+    (session, access, original)
+}
+fn finish_history(pending: &mut history_confirmation::PendingHistory, session: &mut Session, access: &mut Fake, cancel: bool) -> WindowResult {
+    let now = Instant::now();
+    for step in 0..30 {
+        acknowledge(access);
+        if let Some(result) = pending.advance(session, access, &|| cancel, now + Duration::from_millis(step * 20)) { return result; }
+    }
+    panic!("history did not finish");
+}
+
+#[test]
+fn asynchronous_undo_redo_and_reset_preserve_grouped_history_and_current_titles() {
+    let (mut session, mut access, original) = history_fixture(3);
+    let moved = access.windows.clone();
+    access.windows.get_mut(&WindowId(1)).unwrap().info.title = "new title".into();
+    for operation in [WindowOperation::Undo, WindowOperation::Redo, WindowOperation::ResetInitial { group: 10 }] {
+        let reset = !matches!(operation, WindowOperation::Redo);
+        let request = WindowRequest { session: 1, id: 7, scope: None, operation };
+        let mut pending = history_confirmation::PendingHistory::begin(&mut session, &mut access, &request, &screens().into()).unwrap().unwrap();
+        finish_history(&mut pending, &mut session, &mut access, false);
+        for (id, window) in if reset { &original } else { &moved } { assert!(same_placement(window, &access.windows[id])); }
+        assert_eq!(access.windows[&WindowId(1)].info.title, "new title");
+    }
+    assert!(!session.history.is_empty(), "reset remains undoable");
+}
+
+#[test]
+fn cancelled_history_retains_unstarted_work_and_inverse_of_submitted_changes() {
+    let (mut session, mut access, _) = history_fixture(20);
+    let request = WindowRequest { session: 1, id: 7, scope: None, operation: WindowOperation::Undo };
+    let mut pending = history_confirmation::PendingHistory::begin(&mut session, &mut access, &request, &screens().into()).unwrap().unwrap();
+    assert!(pending.advance(&mut session, &mut access, &|| false, Instant::now()).is_none());
+    let submitted = access.submitted.len();
+    assert!((1..=8).contains(&submitted));
+    finish_history(&mut pending, &mut session, &mut access, true);
+    assert_eq!(session.history.back().unwrap().1.len(), 20 - submitted);
+    assert_eq!(session.redo.back().unwrap().1.len(), submitted);
 }

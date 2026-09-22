@@ -1959,3 +1959,54 @@ fn native_tab_actions_wait_until_confirmation_releases_member_identity() {
         WindowId(1)
     );
 }
+
+#[test]
+fn confirmation_blocks_only_related_groups_and_dependent_structural_actions() {
+    let mut access = two_groups();
+    access
+        .watch_confirmations(std::iter::once(WindowId(1)))
+        .unwrap();
+    access.native.events.extend([
+        TabNativeEvent::Activate(WindowId(1)),
+        TabNativeEvent::Activate(WindowId(3)),
+    ]);
+    access.pump(&screens(), &|| false).unwrap();
+    assert_eq!(
+        access.groups.state.containing(WindowId(1)).unwrap().active,
+        WindowId(2)
+    );
+    assert_eq!(
+        access.groups.state.containing(WindowId(3)).unwrap().active,
+        WindowId(3)
+    );
+    assert_eq!(
+        access.deferred_events,
+        vec![TabNativeEvent::Activate(WindowId(1))]
+    );
+    access.watch_confirmations(std::iter::empty()).unwrap();
+    access.pump(&screens(), &|| false).unwrap();
+    assert_eq!(
+        access.groups.state.containing(WindowId(1)).unwrap().active,
+        WindowId(1)
+    );
+}
+
+#[test]
+fn deferred_actions_are_bounded_focus_is_coalesced_and_closed_identity_is_retained() {
+    let mut access = setup();
+    choose(&mut access, 1);
+    choose(&mut access, 2);
+    for _ in 0..100 {
+        access.defer_event(TabNativeEvent::Focused(WindowId(1)));
+        access.defer_event(TabNativeEvent::Focused(WindowId(2)));
+    }
+    assert_eq!(access.deferred_events.len(), 1);
+    access.deferred_events.clear();
+    for index in 0..64 {
+        access.defer_event(TabNativeEvent::Activate(WindowId(1 + index % 2)));
+    }
+    access.defer_event(TabNativeEvent::Closed(WindowId(1)));
+    access.defer_event(TabNativeEvent::Closed(WindowId(1)));
+    assert_eq!(access.deferred_events.len(), 64);
+    assert_eq!(access.deferred_closed.len(), 1);
+}

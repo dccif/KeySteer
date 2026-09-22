@@ -45,13 +45,7 @@ impl From<&PlacementSnapshot> for PlacementSnapshot {
     }
 }
 impl PlacementSnapshot {
-    pub(super) fn restore(
-        &self,
-        access: &mut impl WindowAccess,
-        screens: &[Screen],
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<WindowInfo, String> {
-        let mut snapshot = access.snapshot(self.info.id, screens)?;
+    pub(super) fn apply_to(&self, snapshot: &mut Snapshot) {
         snapshot.info.bounds = self.info.bounds;
         snapshot.info.screen = self.info.screen;
         snapshot.info.resizable = self.info.resizable;
@@ -59,6 +53,15 @@ impl PlacementSnapshot {
         snapshot.info.minimized = self.info.minimized;
         snapshot.info.fullscreen = self.info.fullscreen;
         snapshot.restored = self.restored;
+    }
+    pub(super) fn restore(
+        &self,
+        access: &mut impl WindowAccess,
+        screens: &[Screen],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<WindowInfo, String> {
+        let mut snapshot = access.snapshot(self.info.id, screens)?;
+        self.apply_to(&mut snapshot);
         access.restore(&snapshot, screens, cancelled)
     }
 }

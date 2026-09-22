@@ -1,5 +1,5 @@
 //! Mailbox, cancellation and the native worker event loop.
-use super::layout_confirmation::PendingLayout;
+use super::transaction::PendingTransaction;
 use super::*;
 enum Pending {
     ClearOverlap,
@@ -142,19 +142,28 @@ impl WindowWorker {
                 let mut focus_cycle = Session::default();
                 let mut displays: Arc<[Screen]> = Arc::from([]);
                 let mut frames: VecDeque<PendingAdjustment> = VecDeque::new();
-                let mut layout: Option<PendingLayout> = None;
+                let mut layout: Option<PendingTransaction> = None;
                 loop {
                     A::native_batch(|| {
                         let mut changed = false;
                         if let Some(pending) = &mut layout {
-                            let cancelled = input.stop.load(Ordering::Acquire)
-                                || input.session.load(Ordering::Acquire) != pending.request.session
-                                || pending.request.id < input.cancel_before.load(Ordering::Acquire);
-                            if let Some(result) =
-                                pending.advance(&mut session, &mut access, cancelled)
-                            {
-                                if !cancelled {
-                                    if let Some(error) = &result.message {
+                            let request_session = pending.request().session;
+                            let request_id = pending.request().id;
+                            let cancelled = || {
+                                input.stop.load(Ordering::Acquire)
+                                    || input.session.load(Ordering::Acquire) != request_session
+                                    || request_id < input.cancel_before.load(Ordering::Acquire)
+                            };
+                            if let Some(result) = pending.advance_checked(
+                                &mut session,
+                                &mut access,
+                                &cancelled,
+                                Instant::now(),
+                            ) {
+                                if !cancelled() {
+                                    if pending.is_layout()
+                                        && let Some(error) = &result.message
+                                    {
                                         crate::report_error!("window-layout", "{error}");
                                     }
                                     emit(BackendEvent::WindowResult(Box::new(result)));
@@ -185,11 +194,13 @@ impl WindowWorker {
                                 emit(BackendEvent::WindowResult(Box::new(result)));
                             }
                             if let Some(error) = error.filter(|_| !cancelled) {
-                                crate::report_error!(
+                                crate::support::logging::report_error_context(
                                     "window-confirmation",
-                                    "session={} request={}: {error}",
-                                    frame.request.session,
-                                    frame.request.id
+                                    &error,
+                                    format_args!(
+                                        "session={} request={}",
+                                        frame.request.session, frame.request.id
+                                    ),
                                 );
                             }
                             frames.pop_front();
@@ -220,13 +231,16 @@ impl WindowWorker {
                         if (layout.is_some() || runnable(&queue, &frames).is_none())
                             && (!input.stop.load(Ordering::Acquire) || layout.is_some())
                         {
-                            let timeout = if !frames.is_empty() || layout.is_some() {
-                                Some(Duration::from_millis(16))
-                            } else if audio_active {
-                                Some(Duration::from_millis(250))
-                            } else {
-                                None
-                            };
+                            let timeout =
+                                if layout.as_ref().is_some_and(PendingTransaction::preparing) {
+                                    Some(Duration::ZERO)
+                                } else if !frames.is_empty() || layout.is_some() {
+                                    Some(Duration::from_millis(16))
+                                } else if audio_active {
+                                    Some(Duration::from_millis(250))
+                                } else {
+                                    None
+                                };
                             if input.native_waker.get().is_some()
                                 && (access.persistent()
                                     || !frames.is_empty()
@@ -268,7 +282,7 @@ impl WindowWorker {
                         continue;
                     };
                     A::native_batch(|| {
-                        let (request, screens) = match pending {
+                        let (mut request, screens) = match pending {
                             Pending::Audio(request, cancelled) => {
                                 if cancelled.load(Ordering::Acquire) {
                                     return;
@@ -373,7 +387,12 @@ impl WindowWorker {
                                 ..Session::default()
                             };
                         }
-                        match PendingLayout::begin(&mut session, &mut access, &request, &screens) {
+                        match PendingTransaction::take_begin(
+                            &mut session,
+                            &mut access,
+                            &mut request,
+                            &screens,
+                        ) {
                             Ok(Some(pending)) => {
                                 if let Err(error) = access.watch_confirmations(pending.targets()) {
                                     crate::report_warning!("window-layout", "watch: {error}");
@@ -463,9 +482,10 @@ impl WindowWorker {
                                 emit(BackendEvent::WindowResult(Box::new(
                                     session.complete_result(&mut access, result, &screens),
                                 )));
-                                crate::report_error!(
+                                crate::support::logging::report_error_context(
                                     "window-confirmation",
-                                    "session={id} request={request_id}: {error}"
+                                    &error,
+                                    format_args!("session={id} request={request_id}"),
                                 );
                                 return;
                             }
@@ -498,9 +518,10 @@ impl WindowWorker {
                         // Deliver feedback before file I/O; errors never delay the
                         // acknowledgement or run on the engine's keyboard thread.
                         if let Some(error) = session.error.take() {
-                            crate::report_error!(
+                            crate::support::logging::report_error_context(
                                 "window-worker",
-                                "session={id} request={request_id}: {error}"
+                                &error,
+                                format_args!("session={id} request={request_id}"),
                             );
                         }
                     });

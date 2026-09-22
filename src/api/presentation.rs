@@ -88,8 +88,19 @@ pub struct RecursiveGridView<'a> {
     pub can_descend: bool,
 }
 
+#[derive(Default)]
+pub struct WindowTextCache {
+    pub(crate) entries: std::cell::RefCell<BTreeMap<WindowId, std::sync::Arc<[String]>>>,
+}
+impl WindowTextCache {
+    pub fn clear(&mut self) {
+        self.entries.get_mut().clear();
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct WindowView<'a> {
+    pub text_cache: Option<&'a WindowTextCache>,
     pub configurable_position: bool,
     pub tabs: &'a super::window_tabs::TabState,
     pub group_input: bool,

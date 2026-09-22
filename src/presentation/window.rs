@@ -80,7 +80,51 @@ impl CardGuides for Guides {
     }
 }
 
+// Compare formatted content directly against the cache, with no temporary String or hash collisions.
+fn formatted_eq(mut expected: &str, args: std::fmt::Arguments<'_>) -> bool {
+    struct Compare<'a, 'b>(&'a mut &'b str);
+    impl std::fmt::Write for Compare<'_, '_> {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            if let Some(rest) = self.0.strip_prefix(text) {
+                *self.0 = rest;
+                Ok(())
+            } else {
+                Err(std::fmt::Error)
+            }
+        }
+    }
+    std::fmt::write(&mut Compare(&mut expected), args).is_ok() && expected.is_empty()
+}
+
 impl WindowView<'_> {
+    fn text_matches(&self, window: &crate::api::window::WindowInfo, lines: &[String]) -> bool {
+        if let Some(group) = self.tabs.containing(window.id) {
+            lines.len() == group.members.len() + 1
+                && formatted_eq(
+                    &lines[0],
+                    format_args!("~{} · {} windows", group.id.0, group.members.len()),
+                )
+                && group.members.iter().zip(&lines[1..]).all(|(id, line)| {
+                    let number = self.numbers.get(id).copied().unwrap_or(0);
+                    let selected = if *id == group.active { "●" } else { "○" };
+                    self.inventory.get(id).map_or_else(
+                        || formatted_eq(line, format_args!("{selected} {number} · Window")),
+                        |member| {
+                            formatted_eq(
+                                line,
+                                format_args!(
+                                    "{selected} {number} · {} — {}",
+                                    app_name(member),
+                                    member.title
+                                ),
+                            )
+                        },
+                    )
+                })
+        } else {
+            lines.len() == 2 && lines[0] == app_name(window) && lines[1] == window.title
+        }
+    }
     pub(crate) fn scene(&self, ctx: &HostContext<'_>) -> OverlayScene {
         (self.styles.render_scene)(self, ctx)
     }
@@ -199,11 +243,25 @@ impl WindowView<'_> {
         let number_width = (style.font_size * 0.75 * digits as f64 + style.padding_x * 2.0)
             .max(card_config.number_min_width);
         let height = resolved.min_height;
-        let lines: Vec<Vec<String>> = windows
+        let mut cache = self.text_cache.map(|cache| cache.entries.borrow_mut());
+        if let Some(cache) = &mut cache {
+            cache.retain(|id, _| self.inventory.contains_key(id));
+        }
+        let lines: Vec<std::sync::Arc<[String]>> = windows
             .iter()
             .map(|window| {
-                if let Some(group) = self.tabs.containing(window.id) {
-                    std::iter::once(format!("~{} · {} windows", group.id.0, group.members.len()))
+                if let Some(lines) = cache.as_ref().and_then(|cache| cache.get(&window.id))
+                    && self.text_matches(window, lines)
+                {
+                    return lines.clone();
+                }
+                let built: Vec<String> = {
+                    if let Some(group) = self.tabs.containing(window.id) {
+                        std::iter::once(format!(
+                            "~{} · {} windows",
+                            group.id.0,
+                            group.members.len()
+                        ))
                         .chain(group.members.iter().map(|id| {
                             let number = self.numbers.get(id).copied().unwrap_or(0);
                             let selected = if *id == group.active { "●" } else { "○" };
@@ -219,11 +277,18 @@ impl WindowView<'_> {
                             )
                         }))
                         .collect()
-                } else {
-                    vec![app_name(window).to_string(), window.title.clone()]
+                    } else {
+                        vec![app_name(window).to_string(), window.title.clone()]
+                    }
+                };
+                let lines: std::sync::Arc<[String]> = built.into();
+                if let Some(cache) = &mut cache {
+                    cache.insert(window.id, lines.clone());
                 }
+                lines
             })
             .collect();
+        drop(cache);
         let row_height = resolved.row_height;
         let max_rows = ((screen.work_area.height / scale - card_config.padding_y * 2.0 - 6.0)
             / row_height)
@@ -420,6 +485,112 @@ impl WindowView<'_> {
 mod tests {
     use super::*;
     use crate::api::Point;
+
+    #[test]
+    fn card_cache_reuses_geometry_only_content_and_invalidates_exact_text_changes() {
+        use crate::api::presentation::WindowTextCache;
+        use crate::api::window::{WindowId, WindowInfo};
+        use crate::api::window_tabs::{TabGroup, TabGroupId, TabState};
+        let config = crate::config::Config::default();
+        let palette = config.palette(crate::api::Appearance::Light);
+        let styles = crate::api::style::WindowStyles::new(
+            &config.window.ui,
+            &config.window.card,
+            &palette,
+            &config.palette(crate::api::Appearance::Dark),
+            RENDERERS,
+        );
+        let screens = [crate::api::Screen {
+            bounds: Rect::new(0.0, 0.0, 1920.0, 1080.0),
+            work_area: Rect::new(0.0, 0.0, 1920.0, 1080.0),
+            name: None,
+            scale: 1.0,
+            is_primary: true,
+        }];
+        let ctx = HostContext {
+            presenter: &crate::presentation::COMPOSER,
+            screens: &screens,
+            cursor: Point::default(),
+            focused_app: None,
+            palette: &palette,
+        };
+        let cache = WindowTextCache::default();
+        let mut inventory: std::collections::BTreeMap<_, _> = (1..=2)
+            .map(|id| {
+                (
+                    WindowId(id),
+                    WindowInfo {
+                        id: WindowId(id),
+                        title: format!("Title {id}"),
+                        app: "Example.exe".into(),
+                        bounds: Rect::new(20.0, 30.0, 500.0, 400.0),
+                        screen: 0,
+                        resizable: true,
+                        minimized: false,
+                        maximized: false,
+                        fullscreen: false,
+                    },
+                )
+            })
+            .collect();
+        let mut numbers = [(WindowId(1), 1), (WindowId(2), 2)].into_iter().collect();
+        let mut tabs = TabState::default();
+        let render = |inventory: &std::collections::BTreeMap<_, _>,
+                      numbers: &std::collections::BTreeMap<_, _>,
+                      tabs: &TabState| {
+            WindowView {
+                text_cache: Some(&cache),
+                configurable_position: true,
+                tabs,
+                group_input: false,
+                styles: &styles,
+                border_width: 3.0,
+                target: None,
+                screen: 0,
+                inventory,
+                visible: &[WindowId(1), WindowId(2)],
+                numbers,
+                tree: None,
+                gap: 0.0,
+            }
+            .scene(&ctx)
+        };
+        render(&inventory, &numbers, &tabs);
+        let first = cache.entries.borrow()[&WindowId(1)].clone();
+        inventory.get_mut(&WindowId(1)).unwrap().bounds.x += 200.0;
+        render(&inventory, &numbers, &tabs);
+        assert!(std::sync::Arc::ptr_eq(
+            &first,
+            &cache.entries.borrow()[&WindowId(1)]
+        ));
+        inventory.get_mut(&WindowId(1)).unwrap().title = "Renamed".into();
+        let scene = render(&inventory, &numbers, &tabs);
+        assert!(scene.labels.iter().any(|label| label.text == "Renamed"));
+        assert!(!std::sync::Arc::ptr_eq(
+            &first,
+            &cache.entries.borrow()[&WindowId(1)]
+        ));
+        tabs.groups.push(TabGroup {
+            id: TabGroupId(1),
+            active: WindowId(1),
+            members: vec![WindowId(1), WindowId(2)],
+        });
+        render(&inventory, &numbers, &tabs);
+        let grouped = cache.entries.borrow()[&WindowId(1)].clone();
+        assert_eq!(grouped.len(), 3);
+        numbers.insert(WindowId(2), 9);
+        render(&inventory, &numbers, &tabs);
+        assert!(!std::sync::Arc::ptr_eq(
+            &grouped,
+            &cache.entries.borrow()[&WindowId(1)]
+        ));
+        assert!(cache.entries.borrow()[&WindowId(1)][2].contains("9 ·"));
+        tabs.groups.clear();
+        inventory.remove(&WindowId(2));
+        render(&inventory, &numbers, &tabs);
+        assert!(!cache.entries.borrow().contains_key(&WindowId(2)));
+        assert_eq!(cache.entries.borrow()[&WindowId(1)].len(), 2);
+    }
     #[test]
     fn card_colors_and_large_title_keep_text_separate() {
         use crate::api::window::{WindowId, WindowInfo};
@@ -468,6 +639,7 @@ border_color = "#FEDCBAFF"
         .into_iter()
         .collect();
         let view = WindowView {
+            text_cache: None,
             configurable_position: true,
             tabs: &Default::default(),
             group_input: false,
@@ -519,6 +691,7 @@ border_color = "#FEDCBAFF"
                 );
             }
             let mut rendered = WindowView {
+                text_cache: None,
                 styles: &styles,
                 ..view
             }

@@ -7,9 +7,13 @@ outline: false
 
 ## 0.10.19
 
-- 优化 Windows 和 macOS 的窗口调度与工作区后台保存，减少同步等待和撤销历史中的重复数据；改进异常时的按键释放、日志与原生资源管理。
+- 优化 Windows 和 macOS 的窗口调整、最大化、布局及撤销／重做，分批异步确认，减少慢窗口对其他窗口操作的影响。
+- 优化 Normal 模式指针计算，复用窗口快照与卡片文字，减少重复查询和内存分配。
+- 改进工作区后台保存、操作取消与恢复，合并重复错误日志，并完善异常时的按键释放和原生资源管理。
 
-- Improved window scheduling and background workspace saves on Windows and macOS, reducing synchronous waits and duplicate undo-history data; refined key release during error recovery, logging, and native resource management.
+- Improved window adjustments, maximization, layouts, and undo/redo on Windows and macOS with batched asynchronous confirmation, reducing interference from slow windows.
+- Optimized Normal-mode pointer calculations and reused window snapshots and card text to reduce repeated queries and memory allocations.
+- Improved background workspace saves, cancellation and recovery, deduplicated error logs, and refined key release during error recovery and native resource management.
 
 ## 0.10.18
 

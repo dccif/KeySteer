@@ -2754,6 +2754,29 @@ mod tests {
             access.snapshot(one, &screens).unwrap().info.bounds,
             entry.info.bounds
         );
+        session.execute_deferred(
+            &mut access,
+            O::Adjust {
+                target: one,
+                change: WindowChange::Move { dx: 30.0, dy: 0.0 },
+                group: 3,
+            },
+            &screens,
+        );
+        let moved = access.snapshot(one, &screens).unwrap().info.bounds;
+        assert_ne!(moved, entry.info.bounds);
+        for (operation, expected) in [
+            (O::Undo, entry.info.bounds),
+            (O::Redo, moved),
+            (O::ResetInitial { group: 4 }, entry.info.bounds),
+        ] {
+            let result = session.execute_deferred(&mut access, operation, &screens);
+            assert_eq!(result.changed, 1, "{:?}", result.message);
+            assert_eq!(
+                access.snapshot(one, &screens).unwrap().info.bounds,
+                expected
+            );
+        }
     }
 
     #[test]

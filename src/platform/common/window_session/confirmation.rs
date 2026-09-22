@@ -3,6 +3,7 @@ use super::*;
 
 pub(super) struct PendingAdjustment {
     pub request: WindowRequest,
+    pub(super) transaction_order: usize,
     pub screens: Arc<[Screen]>,
     pub(super) before: PlacementSnapshot,
     pub(super) observed: Snapshot,
@@ -21,7 +22,7 @@ pub(super) struct PendingAdjustment {
     centered: bool,
     pub(super) failure: Option<String>,
     ready: bool,
-    observation_failed: bool,
+    pub(super) observation_failed: bool,
 }
 
 impl PendingAdjustment {
@@ -121,6 +122,7 @@ impl PendingAdjustment {
         Ok((
             Some(Self {
                 request: request.clone(),
+                transaction_order: 0,
                 screens: screens.clone(),
                 previous: before.info.bounds,
                 before: PlacementSnapshot::from(&before),
@@ -158,6 +160,7 @@ impl PendingAdjustment {
             && !observed.info.minimized
             && rect_matches(observed.info.bounds, desired);
         Self {
+            transaction_order: 0,
             request: WindowRequest {
                 operation: WindowOperation::Adjust {
                     target: observed.info.id,

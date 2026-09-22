@@ -45,6 +45,8 @@ impl fmt::Display for Level {
 struct RepeatedError {
     target: String,
     message: String,
+    identity: Option<String>,
+    console: bool,
     since: Instant,
     suppressed: u64,
 }
@@ -58,6 +60,51 @@ struct LoggerState {
 struct Logger {
     path: PathBuf,
     state: Mutex<LoggerState>,
+}
+
+// Error rendering happens outside the logger mutex: a caller's Display
+// implementation must not deadlock the panic hook. Common errors stay on stack.
+struct MessageBuffer {
+    bytes: [u8; 4096],
+    len: usize,
+}
+impl fmt::Write for MessageBuffer {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        let end = self
+            .len
+            .checked_add(text.len())
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or(fmt::Error)?;
+        self.bytes[self.len..end].copy_from_slice(text.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+fn suppress(
+    state: &mut LoggerState,
+    level: Level,
+    target: &str,
+    message: &str,
+    identity: Option<&str>,
+    console: bool,
+    now: Instant,
+) -> bool {
+    if level == Level::Error
+        && state.file.is_some()
+        && let Some(repeated) = &mut state.repeated
+        && repeated.target == target
+        && repeated.console == console
+        && now.saturating_duration_since(repeated.since) < Duration::from_secs(1)
+        && match identity {
+            Some(key) => repeated.identity.as_deref() == Some(key),
+            None => repeated.identity.is_none() && repeated.message == message,
+        }
+    {
+        repeated.suppressed = repeated.suppressed.saturating_add(1);
+        true
+    } else {
+        false
+    }
 }
 
 impl Logger {
@@ -82,24 +129,70 @@ impl Logger {
         self.write_at(level, target, message, Instant::now());
     }
     fn write_at(&self, level: Level, target: &str, message: &str, now: Instant) {
+        self.emit(level, target, format_args!("{message}"), None, false, now);
+    }
+    fn emit(
+        &self,
+        level: Level,
+        target: &str,
+        message: fmt::Arguments<'_>,
+        identity: Option<&str>,
+        console: bool,
+        now: Instant,
+    ) {
+        if let Some(key) = identity {
+            {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if suppress(&mut state, level, target, "", identity, console, now) {
+                    return;
+                }
+            }
+            let message = format!("{key}; {message}");
+            self.emit_rendered(level, target, &message, identity, console, now);
+        } else if let Some(message) = message.as_str() {
+            self.emit_rendered(level, target, message, None, console, now);
+        } else {
+            let mut buffer = MessageBuffer {
+                bytes: [0; 4096],
+                len: 0,
+            };
+            if fmt::write(&mut buffer, message).is_ok() {
+                // Only complete &str chunks were appended.
+                let text = std::str::from_utf8(&buffer.bytes[..buffer.len])
+                    .unwrap_or("invalid diagnostic text");
+                self.emit_rendered(level, target, text, None, console, now);
+            } else {
+                self.emit_rendered(level, target, &message.to_string(), None, console, now);
+            }
+        }
+    }
+    fn emit_rendered(
+        &self,
+        level: Level,
+        target: &str,
+        message: &str,
+        identity: Option<&str>,
+        console: bool,
+        now: Instant,
+    ) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if level == Level::Error
-            && state.file.is_some()
-            && let Some(repeated) = &mut state.repeated
-            && repeated.target == target
-            && repeated.message == message
-            && now.saturating_duration_since(repeated.since) < Duration::from_secs(1)
-        {
-            repeated.suppressed = repeated.suppressed.saturating_add(1);
+        if suppress(&mut state, level, target, message, identity, console, now) {
             return;
         }
         self.write_repeats(&mut state);
+        if console {
+            write_emergency_stderr(format_args!("{message}"));
+        }
         self.write_record(&mut state, level, target, message);
-        // Keep bounded exact keys: no hash collisions or unbounded error cache.
-        if level == Level::Error && state.file.is_some() && target.len() + message.len() <= 4096 {
+        if level == Level::Error
+            && state.file.is_some()
+            && target.len() + message.len() + identity.map_or(0, str::len) <= 4096
+        {
             state.repeated = Some(RepeatedError {
                 target: target.into(),
                 message: message.into(),
+                identity: identity.map(str::to_owned),
+                console,
                 since: now,
                 suppressed: 0,
             });
@@ -109,15 +202,14 @@ impl Logger {
         if let Some(repeated) = state.repeated.take()
             && repeated.suppressed > 0
         {
-            self.write_record(
-                state,
-                Level::Error,
-                &repeated.target,
-                &format!(
-                    "{} (repeated {} additional times)",
-                    repeated.message, repeated.suppressed
-                ),
+            let message = format!(
+                "{} (repeated {} additional times)",
+                repeated.message, repeated.suppressed
             );
+            if repeated.console {
+                write_emergency_stderr(format_args!("{message}"));
+            }
+            self.write_record(state, Level::Error, &repeated.target, &message);
         }
     }
     fn write_record(&self, state: &mut LoggerState, level: Level, target: &str, message: &str) {
@@ -344,24 +436,40 @@ pub(crate) fn info_args(target: &str, message: fmt::Arguments<'_>) {
 #[inline(never)]
 fn report(level: Level, target: &str, message: &str) {
     debug_assert!(level >= Level::Warning);
-    write_emergency_stderr(format_args!("{message}"));
+    report_args(level, target, format_args!("{message}"));
+}
+fn report_args(level: Level, target: &str, message: fmt::Arguments<'_>) {
     if let Some(logger) = LOGGER.get() {
-        logger.write(level, target, message);
+        logger.emit(level, target, message, None, true, Instant::now());
+    } else {
+        write_emergency_stderr(message);
     }
 }
-
+/// Stable error identity is separate from request-specific context. The first
+/// occurrence retains that context; subsequent occurrences retain an exact count.
+pub(crate) fn report_error_context(target: &str, error: &str, context: fmt::Arguments<'_>) {
+    if let Some(logger) = LOGGER.get() {
+        logger.emit(
+            Level::Error,
+            target,
+            context,
+            Some(error),
+            true,
+            Instant::now(),
+        );
+    } else {
+        write_emergency_stderr(format_args!("{error}; {context}"));
+    }
+}
 #[cold]
 #[inline(never)]
 pub fn report_error(target: &str, message: impl AsRef<str>) {
-    let message = message.as_ref();
-    report(Level::Error, target, message);
+    report(Level::Error, target, message.as_ref());
 }
-
 #[cold]
 #[inline(never)]
 pub(crate) fn report_error_args(target: &str, message: fmt::Arguments<'_>) {
-    let message = message.to_string();
-    report(Level::Error, target, &message);
+    report_args(Level::Error, target, message);
 }
 
 /// Central emergency console path used before the persistent logger exists or
@@ -641,6 +749,50 @@ mod tests {
         logger.flush();
         let text = fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 2);
+        assert!(text.contains("repeated 100 additional times"));
+        drop(logger);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn repeated_contextual_errors_skip_formatting_and_keep_first_context_and_count() {
+        struct Context<'a>(&'a std::cell::Cell<u32>);
+        impl fmt::Display for Context<'_> {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.set(self.0.get() + 1);
+                formatter.write_str("request=first")
+            }
+        }
+        let path = temporary_log();
+        let logger = Logger::open(path.clone()).unwrap();
+        let now = Instant::now();
+        let formats = std::cell::Cell::new(0);
+        logger.emit(
+            Level::Error,
+            "window",
+            format_args!("{}", Context(&formats)),
+            Some("timed out"),
+            false,
+            now,
+        );
+        let allocation = stats_alloc::Region::new(crate::TEST_ALLOCATOR);
+        for request in 0..100 {
+            logger.emit(
+                Level::Error,
+                "window",
+                format_args!("request={request} {}", Context(&formats)),
+                Some("timed out"),
+                false,
+                now,
+            );
+        }
+        let stats = allocation.change();
+        assert_eq!((stats.allocations, stats.reallocations), (0, 0));
+        assert_eq!(formats.get(), 1);
+        logger.flush();
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        assert!(text.contains("request=first"));
         assert!(text.contains("repeated 100 additional times"));
         drop(logger);
         fs::remove_file(path).unwrap();

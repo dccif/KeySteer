@@ -1,5 +1,7 @@
 # 构建、打包、文档站与测试
 
+窗口事务优化的功能回归位于 `window_session/async_tests.rs`：覆盖分批准备、取消前无写入、晚发现非法布局、提交次序回滚和历史重试。`window_tabs/tests.rs` 验证独立组不受阻挡、相关结构事件保序和队列上限；presentation 测试验证几何变化复用文本及标题／组／编号失效；logging 测试验证稳定错误合并时跳过上下文格式化。Windows 的显式 `native_async_group_maximize_layout_and_cancel` 使用自建临时窗口，包含 Undo／Redo／ResetInitial 原生验收；它不是性能基准，不给生产路径增加插桩。
+
 中英文 `releases/index.md` 使用 `releaseHistory: true`，由 Markdown 插件在渲染阶段将最新版本之后的内容包入原生 `details/summary`；最新版本展开，旧版本独立折叠，关闭冗长的右侧目录。
 保留源文件中的 `## 版本号` 和全部正文，确保 `tools/compose-release-notes.sh` 不会提取到折叠标记；新增版本无需手动调整旧版本。`release-history.test.ts` 检查中英文内容／锚点不变，以及代码块和未启用页面不受影响。
 

@@ -4,8 +4,10 @@
 mod access;
 mod confirmation;
 mod history;
+mod history_confirmation;
 mod layout_confirmation;
 mod overlap;
+mod transaction;
 mod worker;
 pub(crate) use access::WindowAccess;
 use confirmation::PendingAdjustment;
@@ -116,7 +118,7 @@ impl WindowSessionProbe {
         screens: &[Screen],
     ) -> WindowResult {
         self.request += 1;
-        let request = WindowRequest {
+        let mut request = WindowRequest {
             scope: None,
             session: 1,
             id: self.request,
@@ -124,12 +126,18 @@ impl WindowSessionProbe {
         };
         let screens: Arc<[Screen]> = screens.into();
         let deadline = Instant::now() + Duration::from_secs(3);
-        if let Some(mut pending) =
-            layout_confirmation::PendingLayout::begin(&mut self.session, access, &request, &screens)
-                .unwrap()
+        if let Some(mut pending) = transaction::PendingTransaction::take_begin(
+            &mut self.session,
+            access,
+            &mut request,
+            &screens,
+        )
+        .unwrap()
         {
             loop {
-                if let Some(result) = pending.advance(&mut self.session, access, false) {
+                if let Some(result) =
+                    pending.advance_checked(&mut self.session, access, &|| false, Instant::now())
+                {
                     return result;
                 }
                 assert!(

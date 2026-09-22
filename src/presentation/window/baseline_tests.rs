@@ -107,6 +107,7 @@ fn window_scenes_match_pre_optimization_baseline() {
                                     },
                                 };
                                 let view = WindowView {
+                                    text_cache: None,
                                     configurable_position: kind != 2,
                                     tabs: &tabs,
                                     group_input: grouped,

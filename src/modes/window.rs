@@ -129,6 +129,7 @@ pub struct WindowSession {
     pending_move_to: Option<Point>,
     screen: usize,
     inventory: BTreeMap<WindowId, WindowInfo>,
+    text_cache: crate::api::presentation::WindowTextCache,
     visible: Vec<WindowId>,
     inventory_dirty: bool,
     numbered_screen: usize,
@@ -181,6 +182,7 @@ impl WindowSession {
             pending_move_to: None,
             screen: 0,
             inventory: BTreeMap::new(),
+            text_cache: Default::default(),
             visible: Vec::new(),
             inventory_dirty: true,
             numbered_screen: 0,
@@ -593,6 +595,7 @@ impl WindowSession {
                 self.pending_move_to = None;
                 self.edit = None;
                 self.inventory.clear();
+                self.text_cache.clear();
                 self.visible.clear();
                 self.inventory_dirty = true;
                 self.window_index = NumberIndex::default();
@@ -660,6 +663,7 @@ impl WindowSession {
                 self.pending_move_to = None;
                 self.edit = None;
                 self.inventory.clear();
+                self.text_cache.clear();
                 self.visible.clear();
                 self.inventory_dirty = true;
                 self.window_index = NumberIndex::default();
