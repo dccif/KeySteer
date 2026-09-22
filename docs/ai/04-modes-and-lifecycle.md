@@ -206,3 +206,7 @@ immediately, without adding a timer. Old inventory cannot resolve a newer close
 request. Save/cancel dialogs therefore do not cause hide/restore flicker; confirmed
 closure retains the existing number compaction. Windows and macOS share this
 mode logic and continue executing native close only in their backends.
+
+## Text Input
+
+`src/modes/text_input.rs` 是无状态的透传模式，激活时隐藏覆盖层；进入／返回交给 Engine 普通绑定，没有 Enter 特殊处理。进入复用安全清理，停止 Normal 手势并释放 toggle／press，隐藏帮助且不启动 Quick Switch。Primary 临时层消费触发键，松开后停止借用的连续手势及锁定输入，保留物理边沿配对。路由支持标准继承、临时层和穿透键；不调用原生 API，不创建定时器。

@@ -1569,7 +1569,16 @@ impl Engine {
                         );
                         continue;
                     };
-                    self.dispatch(ModeEvent::ScreenRetargeted { screen, preserve }, backend)?;
+                    // Plugin commands must reach the effective interaction
+                    // mode, just like the binding that invoked them. The base
+                    // mode may be a passthrough shell while a temporary mode
+                    // owns the input (for example Text Input borrowing Normal).
+                    let recipient = self.display_mode();
+                    self.dispatch_to(
+                        &recipient,
+                        ModeEvent::ScreenRetargeted { screen, preserve },
+                        backend,
+                    )?;
                 }
 
                 Command::SetTimer {

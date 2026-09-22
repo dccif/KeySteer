@@ -5,6 +5,43 @@ outline: false
 
 # Release notes
 
+## 0.10.20
+
+- Added Text Input for temporary typing from Normal. Ordinary typing passes through, and standard bindings configure entry, exit, and editing shortcuts.
+- Supports borrowing Normal with `primary` and optional binding inheritance. Fixed screen-switch commands such as `screen next` delivering their results to the base mode instead of the temporary mode.
+- Text Input hides its text badge by default. Arrow, Backspace, Delete, Insert, Home/End, and Ctrl/Shift mappings are provided as commented, opt-in examples.
+
+### Enable and use
+
+With the new default configuration, press **`\`** in Normal. For an existing profile, add the entry to your current `[normal.bindings]` and merge the other settings into their corresponding tables. Do not create duplicate tables or replace your existing bindings.
+
+```toml
+[normal.bindings]
+'\' = "text_input"
+
+[text_input]
+inherits = []
+temporary_mode = "normal"
+temporary_mode_keys = ["primary"]
+
+[text_input.bindings]
+'enter \ esc' = "normal"
+
+# Optional: send Enter to the app before returning to Normal.
+# Replace the grouped binding above with these two lines:
+# '\ esc' = "normal"
+# enter = ["send enter", "normal"]
+
+[mode_indicator.modes.text_input]
+enabled = false
+```
+
+1. Save and reload the configuration from the tray/status-bar menu.
+2. Press `Primary+E` to enter Normal, then `\` to type. Press `Enter`, `\`, or `Esc` to return to Normal.
+3. Hold `Primary` while typing to borrow Normal, for example H/J/K/L to move the pointer. Release it to continue typing. `Primary` follows your existing `key_aliases` configuration.
+
+Exit keys are consumed by default: Enter does not submit to the application. Use the commented sequence above to submit and return. For multiline editing or IMEs that need Enter, change the exit binding to `'\ esc' = "normal"`. Editing mappings remain commented out until you enable them. See [temporary text input](../modes/normal.md#temporary-text-input).
+
 ## 0.10.19
 
 - Improved window adjustments, maximization, layouts, and undo/redo on Windows and macOS with batched asynchronous confirmation, reducing interference from slow windows.

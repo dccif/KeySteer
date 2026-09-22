@@ -148,7 +148,11 @@ pub fn hint(config: &Config) -> HintMode {
 #[doc(hidden)]
 #[allow(dead_code)]
 pub fn built_in(config: &Config) -> Vec<Box<dyn Mode>> {
-    let mut catalog: Vec<Box<dyn Mode>> = vec![Box::new(IdleMode::new()), Box::new(normal(config))];
+    let mut catalog: Vec<Box<dyn Mode>> = vec![
+        Box::new(IdleMode::new()),
+        Box::new(normal(config)),
+        Box::new(modes::text_input::TextInputMode::new()),
+    ];
     if config.grid.enabled {
         catalog.push(Box::new(grid(config)));
     }
@@ -257,6 +261,17 @@ pub fn bundled_plugins(config: &Config) -> Result<Vec<Box<dyn Plugin>>, String> 
 /// point and cannot produce a route/instance mismatch.
 pub(crate) fn built_in_specs(config: &Config) -> Result<Vec<ModeSpec>, String> {
     let mut specs = Vec::with_capacity(5);
+    specs.push(ModeSpec::built_in(
+        Box::new(modes::text_input::TextInputMode::new()),
+        compile_route(
+            &config.text_input.bindings,
+            &config.text_input.inherits,
+            config.text_input.temporary_mode.as_deref(),
+            &config.text_input.temporary_mode_keys,
+            &config.text_input.temporary_mode_passthrough_keys,
+            Vec::new(),
+        )?,
+    ));
     specs.push(ModeSpec::built_in(
         Box::new(IdleMode::new()),
         compile_route(
@@ -465,13 +480,13 @@ mod tests {
         config.window_restore.enabled = false;
         config.window_tab.enabled = false;
         let ids: Vec<_> = built_in(&config).iter().map(|mode| mode.id()).collect();
-        assert_eq!(ids, vec![ModeId::idle(), ModeId::normal()]);
+        assert_eq!(ids, vec![ModeId::idle(), ModeId::normal(), ModeId::text_input()]);
     }
 
     #[test]
     fn default_capture_policy_is_owned_by_each_mode() {
         for mode in built_in(&Config::default()) {
-            let expected = !matches!(mode.id().as_str(), "idle" | "normal");
+            let expected = !matches!(mode.id().as_str(), "idle" | "normal" | "text_input");
             assert_eq!(mode.captures_keyboard(), expected, "{}", mode.id());
         }
     }

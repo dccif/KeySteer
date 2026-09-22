@@ -437,6 +437,7 @@ impl ConfigFile {
             ));
         }
         for (mode, keys) in [
+            ("text_input", &self.text_input.temporary_mode_keys),
             ("grid", &self.grid.temporary_mode_keys),
             ("recursive_grid", &self.recursive_grid.temporary_mode_keys),
             ("ui_hint", &self.ui_hint.temporary_mode_keys),
@@ -625,6 +626,7 @@ impl ConfigFile {
         let mut tables: Vec<(String, &Bindings)> = vec![
             ("[hotkeys]".into(), &self.hotkeys),
             ("[normal.bindings]".into(), &self.normal.bindings),
+            ("[text_input.bindings]".into(), &self.text_input.bindings),
             ("[grid.bindings]".into(), &self.grid.bindings),
             (
                 "[recursive_grid.bindings]".into(),
@@ -689,6 +691,7 @@ impl ConfigFile {
 fn validate_inheritance(config: &Config) -> Result<(), String> {
     let mut graph: BTreeMap<String, Vec<String>> = BTreeMap::from([
         ("normal".into(), config.normal.inherits.clone()),
+        ("text_input".into(), config.text_input.inherits.clone()),
         ("grid".into(), config.grid.inherits.clone()),
         (
             "recursive_grid".into(),
@@ -713,6 +716,7 @@ fn validate_inheritance(config: &Config) -> Result<(), String> {
         }
     }
     for (mode, source) in [
+        ("text_input", config.text_input.temporary_mode.as_deref()),
         ("grid", config.grid.temporary_mode.as_deref()),
         ("window", config.window.temporary_mode.as_deref()),
         (

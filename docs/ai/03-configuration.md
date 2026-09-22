@@ -300,3 +300,11 @@ WindowStyles 编译边界进一步收敛：不再保存原始 WindowCardUi，仅
 `window.card.guide_line_enabled` 与零宽度在 WindowStyles 配置编译时选择宿主提供的 plain／with_guides 渲染入口。关闭时两套主题都不解析／保存引导线样式；运行时样式没有 enabled 字段。重载重新编译入口，Mode 不引用具体 presentation 实现。开启时每种主题只编译一份样式，整张场景共用，不按窗口复制样式条目。
 
 Window 家族的临时层使用已去掉激活键的输入借用目标模式：当前层完整组合键 → 去激活键临时层 → 去激活键当前层；激活键不再同时匹配临时 Normal 的 Primary+组合。因此默认临时 F 进入 Recursive Grid。其他 targeting 模式保留上述四阶段优先级。字符输入保留已激活的临时触发键，其他产生字符的修饰键仍剥离。
+
+## 临时文本输入
+
+Normal 默认 `\` 绑定 `text_input`。`[text_input.bindings]` 默认 `'enter \ esc' = "normal"`，均是消费按键的普通 Mode 绑定；无独立 Enter 配置或特殊生命周期。提交 Enter 再返回使用注释示例 `enter = ["send enter", "normal"]`，同时把合并绑定改为 `'\ esc' = "normal"`。显式表整体替换，支持别名、组合键和动作序列。
+
+支持 inherits／temporary_mode／temporary_mode_keys／temporary_mode_passthrough_keys。默认空继承，`temporary_mode_keys = ["primary"]` 借用 Normal，别名解析与其他模式一致。Primary+HJKL/U/I/O/T/Y 及 Ctrl、Shift 组合仅是注释示例，默认不启用；测试读取注释并显式启用，验证目标按键、修饰键及重复。
+
+`[mode_indicator.modes.text_input] enabled = false` 同时存在于内置默认值与发布 TOML，默认不显示文本输入模式文字；临时 Normal 仍使用 Normal 自己的指示器配置。

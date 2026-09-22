@@ -90,6 +90,7 @@ impl Engine {
             && self.enabled
             && !self.is_excluded_app()
             && self.registry.active != ModeId::idle()
+            && self.registry.active != ModeId::text_input()
             && self.window_presets.pending.is_none()
             && self.quick_switch.pending.is_none()
             && !input.repeat

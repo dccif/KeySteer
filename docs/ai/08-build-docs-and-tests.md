@@ -476,3 +476,13 @@ Windows 可显式运行 `cargo test --lib native_deferred_geometry_submission_an
 `window_session/async_tests.rs` 覆盖布局在途上限、提交部分失败后的回滚、取消等待已提交写入、最大化入口恢复、EndEdit 取消、撤销提交边界，以及快速窗口提前确认但不提前提交历史。Grouped 测试覆盖非活动代表编号到活动成员的转换、标签栏占位、无元数据重读和确认回声过滤。`configuration_async.rs` 用受控阻塞 repository 验证 Engine 不等待磁盘工作、连续候选使用最新 repository、失败不覆盖有效配置。logging 测试通过注入时间验证错误合并、计数 flush、键与时间窗口隔离，不依赖真实 sleep。
 
 执行 `cargo test --all-targets -- --test-threads=1`、`cargo clippy --all-targets -- -D warnings`，并交叉检查两种 macOS 架构。分配断言需串行执行；Windows 上的跨平台编译不替代 macOS 桌面验收。
+
+`runtime/tests/text_input.rs` 覆盖文字透传、普通 Enter 返回与 Send+Mode 序列、返回键与严格修饰匹配、别名／组合键配置往返、移除 Enter 返回绑定及停止手势／释放 latch。输入法候选确认与真实应用提交仍需桌面验收。
+
+临时文本输入验收：默认 Normal 标记下，`cargo test --all-targets -- --test-threads=1` 为 1,085 passed／84 ignored。保留本地已有标记 `N` 后，integration 为 24 passed／1 failed，失败仅为 shipped 与 embedded 的 Normal/N 默认值差异；新增 Text Input 配置一致性通过。Clippy 无告警，网页 121 项测试和 TypeScript 检查通过，macOS ARM／Intel 编译通过。原生输入法和应用提交未做实机验收。
+
+配置写法统一后的回归：Text Input 专项 10 项通过（含直接读取注释示例的 36 个编辑组合及 Enter 序列）；网页 121 项和 TypeScript 检查通过，Clippy 无告警。全量执行跳过此前 Normal/N 默认值差异测试后为 1,086 passed／84 ignored／1 filtered out。
+
+`text_input_temporary_normal_routes_plugin_screen_commands_to_normal` 用真实插件、双屏及物理／字符事件验证 S 正反切屏、基础模式不切换、释放 Primary 后 S 恢复透传；`text_input_default_indicator_is_disabled_in_code_and_shipped_config` 验证代码／发布默认均隐藏 Text Input 文字且保留 Normal 指示器。
+
+临时切屏／指示器回归：库测试 1,075 passed／84 ignored，唯一失败为当前 TOML 的 Normal `.`／`/` 横向滚动绑定与内置默认差异；Text Input 双屏／文字隐藏及原 Window 临时切屏测试通过。Clippy lib/tests 和 docs:check 通过。all-targets 构建因运行中的 target/debug/keysteer.exe 无法覆盖而中断，未替换用户正在运行的程序。

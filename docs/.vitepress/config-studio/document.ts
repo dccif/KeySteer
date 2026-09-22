@@ -21,6 +21,7 @@ const replacementTables = new Set([
   'key_aliases.keys',
   'mode_indicator.modes',
   'normal.bindings',
+  'text_input.bindings',
   'window.bindings',
   'window_quick.bindings', 'window_editor.bindings', 'window_restore.bindings', 'window_tab.bindings',
   'grid.bindings',

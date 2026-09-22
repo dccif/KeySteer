@@ -58,6 +58,7 @@ impl Default for Normal {
 fn default_normal_bindings() -> Bindings {
     let entries: &[(&str, &str)] = &[
         ("?", "key_help"),
+        ("\\", "text_input"),
         // Movement and speed modifiers, held alongside a direction.
         ("h", "move_left"),
         ("j", "move_down"),
@@ -91,6 +92,36 @@ fn default_normal_bindings() -> Bindings {
         ("esc", "idle"),
     ];
     builtin_bindings(entries)
+}
+
+// ---------------------------------------------------------------------------
+// [text_input]
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TextInput {
+    pub inherits: Vec<String>,
+    pub temporary_mode: Option<String>,
+    pub temporary_mode_keys: Vec<String>,
+    pub temporary_mode_passthrough_keys: Vec<String>,
+    pub bindings: Bindings,
+}
+
+impl Default for TextInput {
+    fn default() -> Self {
+        Self {
+            inherits: Vec::new(),
+            temporary_mode: Some("normal".into()),
+            temporary_mode_keys: vec!["primary".into()],
+            temporary_mode_passthrough_keys: Vec::new(),
+            bindings: default_text_input_bindings(),
+        }
+    }
+}
+
+fn default_text_input_bindings() -> Bindings {
+    builtin_bindings(&[("enter", "normal"), ("\\", "normal"), ("esc", "normal")])
 }
 
 // ---------------------------------------------------------------------------

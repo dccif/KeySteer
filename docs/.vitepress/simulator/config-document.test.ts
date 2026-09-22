@@ -148,3 +148,25 @@ test('shipped audio bindings and edited configuration survive browser export/imp
   assert.deepEqual(restored.window_quick.split_ratios, ['1/3', '0.30', '0.45'])
   assert.equal(restored.window_editor.gap, 7)
 })
+
+
+test('text input keeps independent editing bindings and configurable temporary Normal', async () => {
+  const { resolveLayeredPhysicalBinding } = await import('./bindings.ts')
+  const source = await readFile(new URL('../../../keysteer.default.toml', import.meta.url), 'utf8')
+  const defaults = parseConfigDocument(source).document
+  assert.equal(defaults.normal.bindings['\\'], 'text_input')
+  assert.deepEqual(defaults.text_input.bindings, { 'enter \\ esc': 'normal' })
+  assert.deepEqual(defaults.text_input.temporary_mode_keys, ['primary'])
+  const examples = source.split('[text_input.bindings]')[1].split('[window]')[0].split('\n').filter(line => line.startsWith('# \"') && line.includes('primary+')).map(line => line.slice(2))
+  assert.equal(examples.length, 36)
+  const configured = resolveConfigDocument(defaults, parseConfigDocument('[text_input.bindings]\n' + examples.join('\n') + '\n').document)
+  assert.equal(resolveLayeredPhysicalBinding(configured, 'text_input', ['left_alt', 'h'], 'h', false)?.value, 'arrow_left')
+  assert.equal(resolveLayeredPhysicalBinding(configured, 'text_input', ['left_ctrl', 'left_shift', 'left_alt', 'h'], 'h', false)?.value, 'send ctrl+shift+arrow_left')
+  assert.equal(resolveLayeredPhysicalBinding(defaults, 'text_input', ['left_alt', 'h'], 'h', false)?.value, 'move_left')
+  assert.equal(resolveLayeredPhysicalBinding(defaults, 'text_input', ['h'], 'h', false), undefined)
+  const custom = parseConfigDocument('[text_input]\ninherits = ["normal"]\ntemporary_mode_keys = ["right_ctrl"]\n[text_input.bindings]\nf8 = "normal"').document
+  const effective = resolveConfigDocument(defaults, custom)
+  assert.deepEqual(effective.text_input.bindings, { f8: 'normal' })
+  assert.deepEqual(effective.text_input.inherits, ['normal'])
+  assert.deepEqual(effective.text_input.temporary_mode_keys, ['right_ctrl'])
+})

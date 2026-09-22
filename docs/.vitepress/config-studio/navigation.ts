@@ -8,6 +8,7 @@ export const categories = [
 ] as const
 export interface SettingsPage { id: string; category: string; label: string; mode?: string; tabs: SettingsTab[] }
 export const pages: SettingsPage[] = [
+  { id: 'text_input', category: 'mouse', label: '文本输入 · Text Input', mode: 'text_input', tabs: ['keys'] },
   { id: 'normal', category: 'mouse', label: '鼠标控制 · Normal', mode: 'normal', tabs: ['keys', 'behavior'] },
   ...[['grid', '分层网格 · Grid'], ['recursive_grid', '递归网格 · Recursive Grid'], ['ui_hint', '界面定位 · UI Hint']].map(([id, label]) => ({ id, label, category: 'target', mode: id, tabs: ['keys', 'behavior', 'appearance'] as SettingsTab[] })),
   ...[['window', '移动与缩放'], ['window_quick', '快速布局'], ['window_editor', '布局编辑'], ['window_restore', '布局恢复'], ['window_tab', '标签分组']].map(([id, label]) => ({ id, label, category: 'windows', mode: id, tabs: ['keys', 'behavior', 'appearance'] as SettingsTab[] })),

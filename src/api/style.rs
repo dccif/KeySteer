@@ -34,14 +34,23 @@ impl Default for ModeIndicator {
         Self {
             cursor: CursorIndicatorUi::default(),
             ui,
-            modes: BTreeMap::from([(
-                "normal".into(),
-                ModeIndicatorEntry {
-                    enabled: Some(true),
-                    text: Some("Normal".into()),
-                    ..Default::default()
-                },
-            )]),
+            modes: BTreeMap::from([
+                (
+                    "normal".into(),
+                    ModeIndicatorEntry {
+                        enabled: Some(true),
+                        text: Some("Normal".into()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "text_input".into(),
+                    ModeIndicatorEntry {
+                        enabled: Some(false),
+                        ..Default::default()
+                    },
+                ),
+            ]),
         }
     }
 }

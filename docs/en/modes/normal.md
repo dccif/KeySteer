@@ -92,3 +92,33 @@ q = "idle"
 ::: warning
 In a targeting Mode, Grid or UI Hint labels take priority over inherited Normal bindings. Hold `Primary` to use Normal temporarily.
 :::
+
+## Temporary text input
+
+`\` enters Text Input from Normal. Ordinary typing passes through; all exits use standard bindings:
+
+```toml
+[normal.bindings]
+'\' = "text_input"
+
+[text_input]
+inherits = []
+temporary_mode = "normal"
+temporary_mode_keys = ["primary"]
+temporary_mode_passthrough_keys = []
+
+[text_input.bindings]
+'enter \ esc' = "normal"
+
+# Optional: submit Enter before returning. Replace the grouped binding above:
+# '\ esc' = "normal"
+# enter = ["send enter", "normal"]
+```
+
+Default exit keys are consumed. Remove enter from the binding for multiline editing or IME candidate selection. Explicit binding tables replace defaults; add the entry to your existing Normal table.
+
+Hold Primary to borrow Normal and release it to continue typing. Primary uses key_aliases like other modes. Direct `inherits = ["normal"]` is supported, with local overrides winning, but inherited bare letters intercept typing. Entry and temporary-layer release clean up gestures and latched inputs; Q does not start Quick Switch while typing.
+
+Home-row mappings are commented examples, disabled by default: Primary+H/J/K/L sends arrows, Primary+U/I/O sends Backspace/Delete/Insert, and Primary+T/Y sends Home/End. Ctrl, Shift and Ctrl+Shift variants are also commented. Choose modifiers that do not duplicate Primary. Explicit full chords precede trigger-stripped temporary-layer bindings. Mappings retain existing Send modifier suspension/restoration and key repeat behavior.
+
+Text Input hides its text badge by default through `[mode_indicator.modes.text_input] enabled = false`. Temporary Normal uses its own badge settings and receives plugin results such as `screen next`.

@@ -46,7 +46,7 @@ use aliases::{
     platform_warning,
 };
 pub use settings::{
-    Grid, GridLayer, GridUi, Normal, Pointer, RecursiveGrid, RecursiveGridUi, Scroll, UiHint,
+    Grid, GridLayer, GridUi, Normal, Pointer, RecursiveGrid, RecursiveGridUi, Scroll, TextInput, UiHint,
 };
 pub use store::{ConfigStore, ReplaceFile};
 pub use theme::{Palette, Theme, ThemeColors, ThemedColor};
@@ -79,6 +79,8 @@ pub struct ConfigFile {
     pub hotkeys: Bindings,
     #[serde(default)]
     pub normal: Normal,
+    #[serde(default)]
+    pub text_input: TextInput,
     #[serde(default)]
     pub window: Window,
     #[serde(default)]
@@ -140,6 +142,7 @@ impl Default for ConfigFile {
             theme: Theme::default(),
             hotkeys: default_idle_bindings(),
             normal: Normal::default(),
+            text_input: TextInput::default(),
             window: Window::default(),
             window_quick: WindowQuick::default(),
             window_editor: WindowEditor::default(),
@@ -536,6 +539,7 @@ impl ConfigFile {
         let aliases = self.resolved_key_aliases.clone();
         normalize_binding_keys(&mut self.hotkeys, "[hotkeys]", &aliases)?;
         normalize_binding_keys(&mut self.normal.bindings, "[normal.bindings]", &aliases)?;
+        normalize_binding_keys(&mut self.text_input.bindings, "[text_input.bindings]", &aliases)?;
         for (name, mode) in self.window_modes_mut() {
             normalize_binding_keys(&mut mode.bindings, &format!("[{name}.bindings]"), &aliases)?;
             for over in &mut mode.app_configs {
@@ -595,6 +599,7 @@ impl ConfigFile {
         }
         normalize_key_if_aliased(&mut self.ui_hint.overlap_cycle_key, &aliases)?;
         for keys in [
+            &mut self.text_input.temporary_mode_keys,
             &mut self.grid.temporary_mode_keys,
             &mut self.recursive_grid.temporary_mode_keys,
             &mut self.ui_hint.temporary_mode_keys,
@@ -602,6 +607,7 @@ impl ConfigFile {
             normalize_key_list(keys, &aliases)?;
         }
         for keys in [
+            &mut self.text_input.temporary_mode_passthrough_keys,
             &mut self.grid.temporary_mode_passthrough_keys,
             &mut self.recursive_grid.temporary_mode_passthrough_keys,
             &mut self.ui_hint.temporary_mode_passthrough_keys,

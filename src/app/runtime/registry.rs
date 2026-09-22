@@ -513,7 +513,7 @@ impl Engine {
                 .extend(self.input.pressed.iter().cloned());
         }
         self.overlay.key_help_cache = None;
-        if active == ModeId::idle() {
+        if active == ModeId::idle() || active == ModeId::text_input() {
             self.overlay.key_help_visible = false;
         } else if !active.is_window()
             && (self.registry.active == ModeId::idle() || self.registry.active.is_window())

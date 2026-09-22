@@ -5,6 +5,47 @@ outline: false
 
 # 更新日志 / Release Notes
 
+## 0.10.20
+
+- 新增 Text Input 临时文本输入模式：从 Normal 一键进入，普通文字透传，输入结束后直接返回 Normal；进入、返回和编辑映射均使用普通按键绑定。
+- 支持通过 `primary` 临时借用 Normal，也可配置绑定继承；修复临时 Normal 中 `screen next` 等切屏指令的结果未交给临时模式处理的问题。
+- Text Input 默认隐藏模式文字提示。默认配置提供方向键、Backspace、Delete、Insert、Home／End 及 Ctrl／Shift 组合的注释示例，按需启用。
+
+- Added Text Input for temporary typing from Normal, with configurable entry, exit, and editing bindings.
+- Supports borrowing Normal with `primary` and optional binding inheritance; fixed screen-switch results being delivered to the base mode instead of the temporary mode.
+- Text Input hides its text badge by default. Home-row editing mappings and Ctrl/Shift variants are provided as commented, opt-in examples.
+
+### 简单启用与使用
+
+使用新版默认配置时，Normal 中按 **`\`** 即可进入。已有用户配置请将下面的入口加入现有 `[normal.bindings]`，其他配置合并到对应表中；不要重复创建同名表或覆盖原有绑定。
+
+```toml
+[normal.bindings]
+'\' = "text_input"
+
+[text_input]
+inherits = []
+temporary_mode = "normal"
+temporary_mode_keys = ["primary"]
+
+[text_input.bindings]
+'enter \ esc' = "normal"
+
+# 可选：先向应用发送 Enter，再返回 Normal。
+# 用下面两行替换上面的合并绑定：
+# '\ esc' = "normal"
+# enter = ["send enter", "normal"]
+
+[mode_indicator.modes.text_input]
+enabled = false
+```
+
+1. 保存配置，从托盘／状态栏菜单重载配置。
+2. 按 `Primary+E` 进入 Normal，再按 `\` 输入文字；按 `Enter`、`\` 或 `Esc` 返回 Normal。
+3. 输入期间按住 `Primary` 可临时使用 Normal，例如用 H/J/K/L 移动鼠标；松开继续输入。`Primary` 使用现有 `key_aliases` 配置。
+
+默认返回键会被消费，Enter 不会提交给应用；需要提交时使用上面的注释序列。多行编辑或输入法需要 Enter 时，可把返回绑定改为 `'\ esc' = "normal"`。编辑组合键示例默认全部注释，取消所需行的注释即可启用。详见 [Normal 的临时文本输入](../modes/normal.md#临时输入文本)。
+
 ## 0.10.19
 
 - 优化 Windows 和 macOS 的窗口调整、最大化、布局及撤销／重做，分批异步确认，减少慢窗口对其他窗口操作的影响。

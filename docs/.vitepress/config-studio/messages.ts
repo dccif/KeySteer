@@ -2,6 +2,7 @@ export type StudioLocale = 'zh' | 'en'
 
 /** Display text only. Command values, paths and user content are never localized. */
 export const englishMessages: Record<string, string> = {
+  '文本输入 · Text Input': 'Text Input',
   "项目笔记": "Project notes",
   "KeySteer 文档": "KeySteer documentation",
   "文件": "Files",

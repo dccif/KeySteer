@@ -168,3 +168,5 @@ macOS：
 
 - `app/runtime/configuration_work.rs`：按序运行配置读取、编译与持久化；Engine 接受候选后才启动下一项。
 - `platform/common/window_session/layout_confirmation.rs`：布局提交、独立确认、失败回滚与取消编辑恢复；复用 confirmation 的原生状态／几何状态机。
+
+- `src/modes/text_input.rs`：临时文本输入透传模式，退出使用标准可配置绑定。

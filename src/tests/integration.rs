@@ -350,7 +350,7 @@ fn defaults_and_shipped_config_agree_on_mode_availability() {
 #[test]
 fn idle_and_default_normal_let_unbound_keys_reach_the_focused_app() {
     for mode in keysteer::app::mode_catalog::built_in(&Config::default()) {
-        let expected = !matches!(mode.id().as_str(), "idle" | "normal");
+        let expected = !matches!(mode.id().as_str(), "idle" | "normal" | "text_input");
         assert_eq!(
             mode.captures_keyboard(),
             expected,
@@ -444,8 +444,8 @@ fn every_targeting_mode_returns_to_idle_on_escape() {
     let palette = config.palette(Appearance::Dark);
 
     for mut mode in keysteer::app::mode_catalog::built_in(&config) {
-        // idle has nowhere to go; normal's escape is the engine's job.
-        if matches!(mode.id().as_str(), "idle" | "normal") || mode.id().is_window() {
+        // Idle has nowhere to go; Normal/Text Input exits use engine bindings.
+        if matches!(mode.id().as_str(), "idle" | "normal" | "text_input") || mode.id().is_window() {
             continue;
         }
         let ctx = HostContext {
@@ -569,4 +569,10 @@ fn windows_visual_capture_keeps_one_barrier_and_an_unscaled_copy_path() {
             && native.contains("source_height == self.dimensions.height_i32()"),
         "the BitBlt path must be restricted to exact-size copies"
     );
+}
+
+
+#[test]
+fn text_input_defaults_match_shipped_configuration() {
+    assert_eq!(Config::default().text_input, shipped().text_input);
 }

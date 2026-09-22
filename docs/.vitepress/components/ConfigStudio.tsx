@@ -37,7 +37,7 @@ import {
   type ConfigDocument,
 } from '../config-studio/document'
 
-type EditorMode = 'hotkeys' | 'normal' | 'grid' | 'recursive_grid' | 'ui_hint' | 'window' | 'window_quick' | 'window_editor' | 'window_restore' | 'window_tab'
+type EditorMode = 'hotkeys' | 'normal' | 'text_input' | 'grid' | 'recursive_grid' | 'ui_hint' | 'window' | 'window_quick' | 'window_editor' | 'window_restore' | 'window_tab'
 type Modifier = 'primary' | 'shift' | 'alt'
 type Appearance = 'dark' | 'light'
 
@@ -69,6 +69,7 @@ interface KeyBindingInfo {
 const modes: Array<{ id: EditorMode; label: string }> = [
   { id: 'hotkeys', label: '全局启动键' },
   { id: 'normal', label: 'Normal' },
+  { id: 'text_input', label: 'Text Input' },
   { id: 'grid', label: 'Grid' },
   { id: 'recursive_grid', label: 'Recursive Grid' },
   { id: 'ui_hint', label: 'UI Hint' },
@@ -140,7 +141,7 @@ const actionGroups: ActionGroup[] = [
   {
     name: '模式',
     actions: [
-      ['normal', 'Normal'], ['grid', 'Grid'],
+      ['normal', 'Normal'], ['text_input', 'Text Input'], ['grid', 'Grid'],
       ['recursive_grid', 'Recursive Grid'], ['ui_hint', 'UI Hint'],
       ['idle', 'Idle'], ['window', 'Window'], ['window_quick', 'Quick'], ['window_editor', 'Editor'], ['window_restore', 'Restore'], ['window_tab', 'Tabs'],
     ].map(([value, label]) => ({ value, label })),
@@ -654,7 +655,7 @@ export default defineComponent({
         if (mode) chooseQuickMode(mode)
         return
       }
-      if (simulator.mode !== 'idle' && effectiveDocument.value?.quick_switch?.enabled !== false && event.key.toLowerCase() === quickKey && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey) {
+      if (simulator.mode !== 'idle' && simulator.mode !== 'text_input' && effectiveDocument.value?.quick_switch?.enabled !== false && event.key.toLowerCase() === quickKey && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey) {
         event.preventDefault()
         if (!event.repeat) { quickStarted = performance.now(); quickUsed = false; quickRows.value = [...quickCandidates.value] }
         return
@@ -663,6 +664,23 @@ export default defineComponent({
         event.preventDefault()
         if (event.key === 'Escape') { quickVisible.value = false; quickUsed = true }
         else if (/^[1-9]$/.test(event.key)) { const mode = quickRows.value[Number(event.key) - 1]; if (mode) chooseQuickMode(mode) }
+        return
+      }
+      if (simulator.mode === 'text_input' && effectiveDocument.value) {
+        const physical = physicalKey(event)
+        physicalKeys.add(physical)
+        const pressed = currentPhysicalKeys(event)
+        const resolved = resolveLayeredPhysicalBinding(effectiveDocument.value, 'text_input', pressed, physical, isMac.value, temporaryEntryKeys)
+        if (resolved) {
+          event.preventDefault()
+          const actions = Array.isArray(resolved.value) ? resolved.value.map(String) : [String(resolved.value)]
+          if (!event.repeat) {
+            heldCharacterActions.set(event.code, actions)
+            actions.forEach(action => { if (MOVEMENT_ACTIONS.has(action)) heldActions.add(action); else executeAction(action) })
+          }
+        } else if (temporaryPhysicalKeys(effectiveDocument.value, 'text_input', pressed, isMac.value, temporaryEntryKeys).includes(physical)) {
+          event.preventDefault()
+        }
         return
       }
       if (event.repeat) {
@@ -679,7 +697,7 @@ export default defineComponent({
       const physical = physicalKey(event)
       physicalKeys.add(physical)
       updateTemporaryWindow(event)
-      if (event.key === 'Escape' && !isWindowMode(simulator.mode)) {
+      if (event.key === 'Escape' && simulator.mode !== 'text_input' && !isWindowMode(simulator.mode)) {
         simulatorArmed.value = false
         heldActions.clear(); heldCharacterActions.clear()
         return
@@ -712,7 +730,7 @@ export default defineComponent({
         } else {
           const resolved = resolvePhysicalBinding(document, simulator.mode === 'idle' ? 'hotkeys' : simulator.mode, pressed, physical, isMac.value)
           const actions = Array.isArray(resolved?.value) ? resolved.value.map(String) : [String(resolved?.value)]
-          if (actions.some(action => ['idle', 'normal', 'grid', 'recursive_grid', 'ui_hint'].includes(action) || isWindowMode(action))) {
+          if (actions.some(action => ['idle', 'normal', 'text_input', 'grid', 'recursive_grid', 'ui_hint'].includes(action) || isWindowMode(action))) {
             event.preventDefault(); heldActions.clear(); actions.forEach(action => executeAction(action)); return
           }
         }
@@ -778,6 +796,8 @@ export default defineComponent({
         return
       }
       physicalKeys.delete(physicalKey(event))
+      if (simulator.mode === 'text_input' && effectiveDocument.value && /^(left_|right_)?(alt|ctrl|shift|cmd|win)$/.test(physicalKey(event))
+        && !temporaryPhysicalKeys(effectiveDocument.value, 'text_input', currentPhysicalKeys(event), isMac.value, temporaryEntryKeys).length) heldActions.clear()
       temporaryEntryKeys.delete(physicalKey(event))
       updateTemporaryWindow(event)
       heldCharacterActions.get(event.code)?.forEach(action => heldActions.delete(action))
@@ -831,7 +851,7 @@ export default defineComponent({
       simulator.pointer.y = region.y + region.height / 2
     }
 
-    function setPreviewMode(mode: 'normal' | 'grid' | 'recursive_grid' | 'ui_hint' | 'window' | 'window_quick' | 'window_editor' | 'window_restore' | 'window_tab'): void {
+    function setPreviewMode(mode: 'normal' | 'text_input' | 'grid' | 'recursive_grid' | 'ui_hint' | 'window' | 'window_quick' | 'window_editor' | 'window_restore' | 'window_tab'): void {
       heldActions.clear(); physicalKeys.clear()
       if (isWindowMode(mode)) switchWindowMode(simulator, mode, effectiveDocument.value?.[mode] ?? {})
       else applyModeAction(simulator, mode, effectiveDocument.value?.key_help?.mouse_key_help === true)
@@ -1163,7 +1183,7 @@ export default defineComponent({
             </div>
             {selectedTab.value === 'keys' && currentPage.value.mode && renderKeyboard()}
             {document.value && effectiveDocument.value && selectedTab.value !== 'keys' && <>
-              {['normal', 'grid', 'recursive_grid', 'ui_hint'].includes(pageId.value) && <CommonConfigControls page={pageId.value} tab={selectedTab.value} document={document.value} effectiveDocument={effectiveDocument.value} onChange={next => document.value = next} />}
+              {['normal', 'text_input', 'grid', 'recursive_grid', 'ui_hint'].includes(pageId.value) && <CommonConfigControls page={pageId.value} tab={selectedTab.value} document={document.value} effectiveDocument={effectiveDocument.value} onChange={next => document.value = next} />}
               {(pageId.value.startsWith('window') || ['grid', 'recursive_grid', 'ui_hint', 'key_help'].includes(pageId.value)) && <ModeStyleControls page={pageId.value} tab={selectedTab.value} mode={(pageId.value === 'window_card' ? 'window' : pageId.value) as any} appearance={appearance.value} document={document.value} effectiveDocument={effectiveDocument.value} onChange={next => document.value = next} onAppearanceChange={next => appearance.value = next} />}
             </>}
             {pageId.value === 'quick_switch' && renderQuickSwitch()}

@@ -23,6 +23,7 @@ pub mod grid;
 pub mod hint;
 pub mod idle;
 pub mod normal;
+pub mod text_input;
 pub mod recursive_grid;
 pub(crate) mod targeting;
 pub mod window;

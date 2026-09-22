@@ -195,3 +195,7 @@ macOS Window 全屏幕标记的逐屏 Panel、独立坐标与裁剪、混合 Ret
 窗口确认零字符串复制、同步回退快照复用及 Normal 加速曲线预计算见 [性能](07-rendering-and-performance.md) 与 [验证](08-build-docs-and-tests.md)。
 
 组内调整、最大化与布局事务的异步确认、独立读回和按序交付、后台配置队列及重复错误合并见 [运行时](02-runtime-and-api.md)、[原生后端](06-platform-backends.md)、[性能](07-rendering-and-performance.md) 与 [验证](08-build-docs-and-tests.md)。
+
+临时文本输入 `text_input`、自定义进入／返回键见 [配置](03-configuration.md)、[模式](04-modes-and-lifecycle.md) 和 [验证](08-build-docs-and-tests.md)。
+
+临时模式的插件切屏结果按当前有效模式处理、Text Input 默认隐藏文字指示器见 [运行时](02-runtime-and-api.md)、[配置](03-configuration.md) 和 [验证](08-build-docs-and-tests.md)。

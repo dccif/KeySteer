@@ -96,3 +96,53 @@ q = "idle"
 ::: warning 注意
 在定位 Mode 中，`Grid` 标签或 `UI Hint` 标签优先于继承来的 `Normal` 模式按键；按住 `Primary` 可临时使用 `Normal`。
 :::
+
+## 临时输入文本
+
+Normal 默认按 `\` 进入 Text Input，普通文字透传到应用。进入和返回均使用普通绑定：
+
+```toml
+[normal.bindings]
+'\' = "text_input"
+
+[text_input]
+inherits = []
+temporary_mode = "normal"
+temporary_mode_keys = ["primary"]
+temporary_mode_passthrough_keys = []
+
+[text_input.bindings]
+'enter \ esc' = "normal"
+
+# 可选：先把 Enter 发送给应用，再返回 Normal。
+# 用下面两行替换上面的合并绑定：
+# '\ esc' = "normal"
+# enter = ["send enter", "normal"]
+```
+
+默认返回键会被消费，不发送给应用。需要 Enter 正常用于多行编辑或输入法选词时，从返回绑定中移除 enter 即可。显式 bindings 表替换默认值，请在现有 Normal 绑定表中追加入口，保留其他操作。
+
+按住 Primary 临时使用 Normal，松开继续输入；通过 `key_aliases` 解析，与其他模式一致。也支持 `inherits = ["normal"]`，本模式绑定优先；完整继承会让未覆盖的 HJKL 等字母执行 Normal 动作，因此连续打字通常使用临时层。进入文本输入或松开临时层触发键时停止借用的手势并释放锁定输入，长按 Q 不启动快速切换。
+
+### 可选主键区编辑映射
+
+默认配置中的编辑组合键全部为注释示例，按需取消注释启用：
+
+| 组合键 | 发送的按键 |
+| --- | --- |
+| Primary + H/J/K/L | 左／下／上／右箭头 |
+| Primary + U/I/O | Backspace／Delete／Insert |
+| Primary + T/Y | Home／End |
+
+还提供 Ctrl、Shift、Ctrl+Shift 的注释示例。请选择与 Primary 实际映射不重复的修饰键。例如 Primary 是 Ctrl 时，不使用 Ctrl+Primary 的示例。
+
+```toml
+# 在 [text_input.bindings] 中按需启用：
+# "primary+h" = "arrow_left"
+# "ctrl+primary+h" = "send ctrl+arrow_left"
+# "shift+primary+h" = "send shift+arrow_left"
+```
+
+显式完整组合键优先于临时层中去掉触发键后的普通绑定。映射使用现有 Send 的源修饰键暂停／恢复和系统按键重复逻辑，不改变应用对目标快捷键的处理。
+
+文本输入模式默认不显示文字提示，可在 `[mode_indicator.modes.text_input]` 中用 `enabled` 自定义。临时 Normal 仍使用 Normal 的提示设置，且 `s = "screen next"` 等插件动作的结果由 Normal 处理。

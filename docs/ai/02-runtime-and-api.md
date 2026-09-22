@@ -376,3 +376,7 @@ Quick Switch 松开触发键时先清理候选并走普通 Up 路由回复 nativ
 ## 配置后台队列
 
 交互 Reload / set_config 的磁盘读取、解析、编译与持久化在惰性创建的 `configuration-io` worker 执行。队列最多 8 个待执行操作，只有一个候选在途；`BackendEvent::ConfigurationReady` 只通知 Engine 取回应用层候选，不把 RuntimePlan 放入 API。Engine 接受计划与 repository 后才从新 repository 派生下一项，避免连续 set_config 丢失先前更新。候选失败保留上一个有效计划并继续队列。`source_text` 本来就是内存缓存。没有 event sink 或 detached repository 能力的测试／兼容适配器保留同步路径。退出释放输入后等待已开始的配置工作（有界 2s），未开始的配置请求取消。
+
+`text_input` 使用严格修饰匹配，不启动 Quick Switch。进入复用 `releases_toggle_session_on_entry` 清理锁定输入，模式切换停止连续手势。Enter／反斜杠／Esc 均由普通绑定路由切换并消费；可用 Send+Mode 序列提交后返回，无 Enter 专属分支。
+
+`Command::RetargetScreen` 将 `ScreenRetargeted` 发送给当前有效模式（display_mode），不固定发给 registry.active。这样 Text Input 等模式借用 Normal 时，插件 `screen next` 的结果由 Normal 执行 WarpPointer；未激活临时层时仍由基础模式维护定位／重扫。此规则适用于所有临时模式，不在 Text Input 添加切屏特例。

@@ -557,6 +557,7 @@ fn engine_with_probes(seen: &Arc<Mutex<Vec<String>>>, extra: &[&str]) -> Engine 
 
 include!("performance.rs");
 include!("input.rs");
+include!("text_input.rs");
 include!("drag.rs");
 include!("modes.rs");
 include!("toggle.rs");

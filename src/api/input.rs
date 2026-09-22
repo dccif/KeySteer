@@ -512,6 +512,7 @@ pub struct ModeId(ModeName);
 enum ModeName {
     Idle,
     Normal,
+    TextInput,
     Grid,
     RecursiveGrid,
     UiHint,
@@ -538,6 +539,7 @@ impl ModeId {
             let name = match value {
                 "idle" => ModeName::Idle,
                 "normal" => ModeName::Normal,
+                "text_input" => ModeName::TextInput,
                 "grid" => ModeName::Grid,
                 "recursive_grid" => ModeName::RecursiveGrid,
                 "ui_hint" => ModeName::UiHint,
@@ -555,9 +557,10 @@ impl ModeId {
     }
 
     /// The ids of the built-in modes.
-    pub const BUILT_IN: [&'static str; 10] = [
+    pub const BUILT_IN: [&'static str; 11] = [
         "idle",
         "normal",
+        "text_input",
         "grid",
         "recursive_grid",
         "ui_hint",
@@ -582,6 +585,9 @@ impl ModeId {
     }
     pub fn normal() -> Self {
         Self(ModeName::Normal)
+    }
+    pub fn text_input() -> Self {
+        Self(ModeName::TextInput)
     }
     pub fn grid() -> Self {
         Self(ModeName::Grid)
@@ -622,6 +628,7 @@ impl ModeId {
         match &self.0 {
             ModeName::Idle => "idle",
             ModeName::Normal => "normal",
+            ModeName::TextInput => "text_input",
             ModeName::Grid => "grid",
             ModeName::RecursiveGrid => "recursive_grid",
             ModeName::UiHint => "ui_hint",

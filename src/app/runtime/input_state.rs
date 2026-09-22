@@ -913,12 +913,16 @@ impl Engine {
             return Ok(());
         }
 
-        let captures = !input.key.is_mouse_side_button()
-            && self
-                .registry
-                .get(&self.registry.active)
-                .map(|m| m.captures_keyboard())
-                .unwrap_or(false);
+        let captures_temporary_trigger = self.registry.active == ModeId::text_input()
+            && self.key_may_change_temporary_mode(&input.key)
+            && self.temporary_mode_is_active(&self.registry.active);
+        let captures = captures_temporary_trigger
+            || (!input.key.is_mouse_side_button()
+                && self
+                    .registry
+                    .get(&self.registry.active)
+                    .map(|m| m.captures_keyboard())
+                    .unwrap_or(false));
 
         if !captures
             && input.state == KeyState::Down
@@ -985,6 +989,36 @@ impl Engine {
         backend
             .dispose_key(disposition)
             .map_err(|error| self.recoverable_input_error("keyboard disposition", error))?;
+        // A text-entry temporary layer ends when its modifier is released,
+        // even when a movement companion remains physically held.
+        if !input.injected
+            && input.state == KeyState::Up
+            && input.key.is_modifier()
+            && self.registry.active == ModeId::text_input()
+            && self.key_may_change_temporary_mode(&input.key)
+            && !self.temporary_mode_is_active(&self.registry.active)
+        {
+            let released: SmallVec<[(Key, ActiveGesture); 4]> = self
+                .input
+                .active_gestures
+                .iter()
+                .filter(|(_, gesture)| gesture.owner != self.registry.active)
+                .map(|(key, gesture)| (key.clone(), gesture.clone()))
+                .collect();
+            for (key, gesture) in released {
+                self.input.active_gestures.remove(&key);
+                self.dispatch_to(
+                    &gesture.owner,
+                    ModeEvent::Binding {
+                        binding: gesture.binding,
+                        state: KeyState::Up,
+                        key,
+                    },
+                    backend,
+                )?;
+            }
+            self.release_toggle_session_for_safe_mode(backend)?;
+        }
         // Publish the native decision before injection. An unrelated forwarded
         // key must join the replay so its Down cannot overtake the prefix.
         if flush_prefixes {
@@ -1563,7 +1597,7 @@ impl Engine {
     }
 
     pub(super) fn releases_toggle_session_on_entry(target: &ModeId) -> bool {
-        matches!(target.as_str(), "normal" | "idle")
+        matches!(target.as_str(), "normal" | "idle" | "text_input")
     }
 
     pub(super) fn send_chord(
@@ -2177,6 +2211,7 @@ impl Engine {
 
     pub(super) fn strict_modifier_matching_enabled(&self) -> bool {
         self.registry.active == ModeId::idle()
+            || self.registry.active == ModeId::text_input()
             || (self.registry.active == ModeId::normal() && self.settings.passthrough_unbound_keys)
     }
 

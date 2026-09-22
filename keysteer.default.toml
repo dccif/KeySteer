@@ -189,6 +189,8 @@ auto_release_ms = 0
 
 [normal.bindings]
 "?" = "key_help"
+# Temporarily pass typing to the focused application; rebind freely.
+'\' = "text_input"
 # Optional synthetic side clicks (the receiving app decides their behavior):
 # t = "mouse_x1"
 # y = "mouse_x2"
@@ -217,6 +219,8 @@ left_shift = "slow"
 # Scrolling. A tap takes effect immediately; hold to repeat.
 m = "wheel_down"
 "," = "wheel_up"
+"." = "scroll_left"
+"/" = "scroll_right"
 
 # Pointer buttons.
 ";" = "left_click"
@@ -250,6 +254,64 @@ y = "end"
 
 # Bare q is safe in normal, which has no q-labelled cells.
 "q esc" = "idle"
+
+# ---------------------------------------------------------------------------
+# text_input — temporary native text entry, then return to normal
+# ---------------------------------------------------------------------------
+
+[text_input]
+inherits = []
+# Hold Primary to borrow Normal; release it to continue typing.
+temporary_mode = "normal"
+temporary_mode_keys = ["primary"]
+temporary_mode_passthrough_keys = []
+
+[text_input.bindings]
+# These keys are consumed. Replace this table to choose your own return keys.
+'enter \ esc' = "normal"
+# Optional: submit Enter to the application before returning to Normal.
+# Replace the grouped binding above with these two lines:
+# '\ esc' = "normal"
+# enter = ["send enter", "normal"]
+
+# Optional home-row editing: uncomment only the mappings you want.
+# Primary resolves through key_aliases; choose modifiers that do not duplicate it.
+# "primary+h" = "arrow_left"
+# "primary+j" = "arrow_down"
+# "primary+k" = "arrow_up"
+# "primary+l" = "arrow_right"
+# "primary+u" = "backspace"
+# "primary+i" = "delete"
+# "primary+o" = "insert"
+# "primary+t" = "home"
+# "primary+y" = "end"
+# "shift+primary+h" = "send shift+arrow_left"
+# "shift+primary+j" = "send shift+arrow_down"
+# "shift+primary+k" = "send shift+arrow_up"
+# "shift+primary+l" = "send shift+arrow_right"
+# "shift+primary+u" = "send shift+backspace"
+# "shift+primary+i" = "send shift+delete"
+# "shift+primary+o" = "send shift+insert"
+# "shift+primary+t" = "send shift+home"
+# "shift+primary+y" = "send shift+end"
+# "ctrl+primary+h" = "send ctrl+arrow_left"
+# "ctrl+primary+j" = "send ctrl+arrow_down"
+# "ctrl+primary+k" = "send ctrl+arrow_up"
+# "ctrl+primary+l" = "send ctrl+arrow_right"
+# "ctrl+primary+u" = "send ctrl+backspace"
+# "ctrl+primary+i" = "send ctrl+delete"
+# "ctrl+primary+o" = "send ctrl+insert"
+# "ctrl+primary+t" = "send ctrl+home"
+# "ctrl+primary+y" = "send ctrl+end"
+# "ctrl+shift+primary+h" = "send ctrl+shift+arrow_left"
+# "ctrl+shift+primary+j" = "send ctrl+shift+arrow_down"
+# "ctrl+shift+primary+k" = "send ctrl+shift+arrow_up"
+# "ctrl+shift+primary+l" = "send ctrl+shift+arrow_right"
+# "ctrl+shift+primary+u" = "send ctrl+shift+backspace"
+# "ctrl+shift+primary+i" = "send ctrl+shift+delete"
+# "ctrl+shift+primary+o" = "send ctrl+shift+insert"
+# "ctrl+shift+primary+t" = "send ctrl+shift+home"
+# "ctrl+shift+primary+y" = "send ctrl+shift+end"
 
 # ---------------------------------------------------------------------------
 # window — lock, move, resize and arrange ordinary windows
@@ -803,6 +865,9 @@ indicator_y_offset = 18
 [mode_indicator.modes.normal]
 enabled = true
 text = "Normal"
+
+[mode_indicator.modes.text_input]
+enabled = false
 
 # Optional per-mode visual overrides:
 # [mode_indicator.modes.normal.cursor]

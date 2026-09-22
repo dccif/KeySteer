@@ -1,6 +1,6 @@
 import { createWindowState, leaveWindow, isWindowMode, type WindowState, type WindowMode } from './window.ts'
 
-export type SimulatorMode = 'idle' | 'normal' | 'grid' | 'recursive_grid' | 'ui_hint' | WindowMode
+export type SimulatorMode = 'idle' | 'normal' | 'text_input' | 'grid' | 'recursive_grid' | 'ui_hint' | WindowMode
 
 export interface Point {
   x: number
@@ -64,8 +64,9 @@ export function movePointer(state: SimulatorState, action: string, distance: num
 
 export function applyModeAction(state: SimulatorState, action: string, mouseKeyHelp = false): boolean {
   if (!isSimulatorMode(action)) return false
-  if (action === 'idle') state.keyHelpVisible = false
+  if (action === 'idle' || action === 'text_input') state.keyHelpVisible = false
   else if (state.mode === 'idle' || isWindowMode(state.mode)) state.keyHelpVisible = mouseKeyHelp
+  if (action === 'text_input') state.pressedButtons.clear()
   if (state.mode.startsWith('window')) leaveWindow(state)
   state.mode = action
   state.lastEvent = `进入 ${action}`
@@ -87,7 +88,7 @@ export function resetTargetingPath(state: SimulatorState, mode: 'grid' | 'recurs
 }
 
 function isSimulatorMode(value: string): value is SimulatorMode {
-  return ['idle', 'normal', 'grid', 'recursive_grid', 'ui_hint'].includes(value)
+  return ['idle', 'normal', 'text_input', 'grid', 'recursive_grid', 'ui_hint'].includes(value)
 }
 
 function clamp(value: number, minimum: number, maximum: number): number {
