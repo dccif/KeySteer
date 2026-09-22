@@ -516,12 +516,24 @@ impl Default for SearchInputUi {
     }
 }
 
+/// Badge placement relative to the cursor, before applying signed offsets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndicatorPosition {
+    #[default]
+    BottomLeft,
+    BottomRight,
+    TopLeft,
+    TopRight,
+}
+
 /// `[mode_indicator.ui]`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IndicatorUi {
     #[serde(flatten)]
     pub label: LabelUi,
+    pub position: IndicatorPosition,
     pub indicator_x_offset: i32,
     pub indicator_y_offset: i32,
 }
@@ -530,6 +542,7 @@ impl Default for IndicatorUi {
     fn default() -> Self {
         Self {
             label: LabelUi::default(),
+            position: IndicatorPosition::default(),
             indicator_x_offset: -12,
             indicator_y_offset: 18,
         }
@@ -607,6 +620,7 @@ impl CursorIndicatorOverride {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct IndicatorUiOverride {
+    pub position: Option<IndicatorPosition>,
     pub font_size: Option<i32>,
     pub font_family: Option<String>,
     pub border_radius: Option<i32>,
@@ -624,6 +638,9 @@ pub struct IndicatorUiOverride {
 impl IndicatorUiOverride {
     pub fn apply(&self, base: &IndicatorUi) -> IndicatorUi {
         let mut resolved = base.clone();
+        if let Some(value) = self.position {
+            resolved.position = value;
+        }
         if let Some(value) = self.font_size {
             resolved.label.font_size = value;
         }

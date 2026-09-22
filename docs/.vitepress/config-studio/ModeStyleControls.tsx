@@ -130,7 +130,7 @@ export default defineComponent({
   },
 })
 
-const StyleControl = defineComponent({
+export const StyleControl = defineComponent({
   props: {
     field: { type: Object as () => StyleField, required: true },
     value: { required: false },

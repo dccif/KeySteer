@@ -5,6 +5,12 @@ outline: false
 
 # 更新日志 / Release Notes
 
+## 0.10.21
+
+- 网页模拟器新增「全局设置 → 模式标识符」，支持实时修改位置、偏移、字号、颜色和边框；各模式外观页保留可选覆盖，修改可导出为 TOML。
+
+- 模式标识符支持按模式配置鼠标左下／右下／左上／右上位置和任意有符号偏移，并可独立覆盖字号、颜色等样式；默认保持原位置。配置示例见 [模式标识符样式与位置](https://dccif.github.io/KeySteer/en/modes/normal#模式标识符样式与位置)。
+
 ## 0.10.20
 
 - 新增 Text Input 临时文本输入模式：从 Normal 一键进入，普通文字透传，输入结束后直接返回 Normal；进入、返回和编辑映射均使用普通按键绑定。
@@ -44,7 +50,7 @@ enabled = false
 2. 按 `Primary+E` 进入 Normal，再按 `\` 输入文字；按 `Enter`、`\` 或 `Esc` 返回 Normal。
 3. 输入期间按住 `Primary` 可临时使用 Normal，例如用 H/J/K/L 移动鼠标；松开继续输入。`Primary` 使用现有 `key_aliases` 配置。
 
-默认返回键会被消费，Enter 不会提交给应用；需要提交时使用上面的注释序列。多行编辑或输入法需要 Enter 时，可把返回绑定改为 `'\ esc' = "normal"`。编辑组合键示例默认全部注释，取消所需行的注释即可启用。详见 [Normal 的临时文本输入](../modes/normal.md#临时输入文本)。
+默认返回键会被消费，Enter 不会提交给应用；需要提交时使用上面的注释序列。多行编辑或输入法需要 Enter 时，可把返回绑定改为 `'\ esc' = "normal"`。编辑组合键示例默认全部注释，取消所需行的注释即可启用。详见 [Normal 的临时文本输入](https://dccif.github.io/KeySteer/modes/normal#%E4%B8%B4%E6%97%B6%E8%BE%93%E5%85%A5%E6%96%87%E6%9C%AC)。
 
 ## 0.10.19
 

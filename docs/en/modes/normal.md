@@ -122,3 +122,34 @@ Hold Primary to borrow Normal and release it to continue typing. Primary uses ke
 Home-row mappings are commented examples, disabled by default: Primary+H/J/K/L sends arrows, Primary+U/I/O sends Backspace/Delete/Insert, and Primary+T/Y sends Home/End. Ctrl, Shift and Ctrl+Shift variants are also commented. Choose modifiers that do not duplicate Primary. Explicit full chords precede trigger-stripped temporary-layer bindings. Mappings retain existing Send modifier suspension/restoration and key repeat behavior.
 
 Text Input hides its text badge by default through `[mode_indicator.modes.text_input] enabled = false`. Temporary Normal uses its own badge settings and receives plugin results such as `screen next`.
+## Mode badge style and position
+
+Select Windows or macOS in the preview. On Windows, **Badge display scaling** calibrates placement without multiplying the configured X/Y offsets. Font size, badge dimensions, and styling continue to follow the configuration. Choose a preset or enter a percentage. macOS uses logical points, so Retina does not enlarge the badge. This preview setting is not exported to TOML; native and browser font rasterization may still differ slightly.
+
+Usually, edit the shared `[mode_indicator.ui]` settings; the default file lists font, corner radius, padding, border, and placement together. In the web simulator, open **Global settings → Mode badge** for live editing. Each mode's **Appearance** tab supports optional overrides; reset a field to inherit the shared style again.
+
+Each mode can override the shared `[mode_indicator.ui]` style. Merge these settings into the corresponding existing tables:
+
+```toml
+[mode_indicator.modes.normal]
+enabled = true
+text = "Normal"
+
+[mode_indicator.modes.normal.ui]
+position = "bottom_right"
+indicator_x_offset = 12
+indicator_y_offset = 18
+font_size = 13
+background_color = "#0A1338FF"
+text_color = "#E8EEFFFF"
+border_radius = 6
+padding_x = 8
+padding_y = 4
+
+[mode_indicator.modes.text_input]
+enabled = false
+```
+
+`position` accepts `bottom_left`, `bottom_right`, `top_left`, or `top_right`, relative to the current pointer. Offsets use signed logical pixels: positive X moves right, positive Y moves down. For example, use `top_left`, X = -12, Y = -18 for a gap above and left of the pointer. Adjust the offsets for any distance; placement is clamped to the display edges.
+
+The default remains `bottom_left`, X = -12, Y = 18, preserving the original placement. Unspecified styles inherit global values; `font_family`, `border_width`, and `border_color` are also supported. To show the Text Input badge, set `enabled = true` and use the same style fields in `[mode_indicator.modes.text_input.ui]`.

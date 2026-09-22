@@ -30,6 +30,8 @@ import { windowHelpSections, windowHelpGrid, windowHelpActionSupported, type Hel
 import { consumeConfigHandoff } from '../simulator/config-handoff'
 import CommonConfigControls from '../config-studio/CommonConfigControls'
 import ModeStyleControls from '../config-studio/ModeStyleControls'
+import ModeIndicatorControls from '../config-studio/ModeIndicatorControls'
+import { modeIndicatorPreview } from '../simulator/mode-indicator'
 import {
   cloneConfigDocument,
   parseConfigDocument,
@@ -329,6 +331,7 @@ export default defineComponent({
     const screen = ref<HTMLElement | null>(null)
     const simulatorArmed = ref(false)
     const canvasScale = ref(1)
+    const indicatorDpi = ref(1)
     let previewObserver: ResizeObserver | undefined
     const layoutNote = ref('')
     const layoutNoteInput = ref<HTMLInputElement>()
@@ -459,6 +462,11 @@ export default defineComponent({
     const targetingVisual = computed(() => targetingAppearance(effectiveDocument.value, simulator.mode, appearance.value))
     const targetingSettings = computed(() => effectiveDocument.value?.[simulator.mode] ?? {})
     const temporaryMode = computed(() => String(targetingSettings.value.temporary_mode ?? 'normal'))
+    const indicatorPreview = computed(() => {
+      const borrowed = isWindowMode(simulator.mode) && simulator.window.temporary
+        || simulator.mode === 'text_input' && temporaryPhysicalKeys(effectiveDocument.value ?? {}, 'text_input', [...physicalKeys], isMac.value, temporaryEntryKeys).length > 0
+      return modeIndicatorPreview(effectiveDocument.value ?? {}, borrowed ? temporaryMode.value : simulator.mode, appearance.value, simulator.pointer, undefined, { platform: isMac.value ? 'macos' : 'windows', scale: indicatorDpi.value })
+    })
     let windowNumberTimer: ReturnType<typeof setTimeout> | undefined
     watch(() => isWindowMode(simulator.mode) && !simulator.window.temporary ? simulator.window.numberDeadline : null, deadline => {
       clearTimeout(windowNumberTimer)
@@ -762,8 +770,8 @@ export default defineComponent({
     }
 
     const heldCharacterActions = new Map<string, string[]>()
-    const physicalKeys = new Set<string>()
-    const temporaryEntryKeys = new Set<string>()
+    const physicalKeys = reactive(new Set<string>())
+    const temporaryEntryKeys = reactive(new Set<string>())
     watch(() => simulator.mode, () => {
       temporaryEntryKeys.clear()
       physicalKeys.forEach(key => temporaryEntryKeys.add(key))
@@ -860,6 +868,7 @@ export default defineComponent({
 
     onMounted(() => {
       isMac.value = /Mac|iPhone|iPad/.test(navigator.platform)
+      indicatorDpi.value = Math.max(1, Math.min(4, window.devicePixelRatio || 1))
       try { simulator.window.presets = readSavedPresets(localStorage.getItem(WORKSPACE_STORAGE_KEY)) }
       catch (error) { layoutStorageError.value = formatError(error) }
       try {
@@ -1009,7 +1018,7 @@ export default defineComponent({
                 <div class="ks-preview-canvas" style={{ transform: `translate(-50%, -50%) scale(${canvasScale.value})` }}>
                 <div class="ks-screen-grid" />
                 {!isWindowMode(simulator.mode) && <DesktopBackdrop />}
-                {(!isWindowMode(simulator.mode) || simulator.window.temporary) && <div class="ks-mode-badge">{isWindowMode(simulator.mode) ? temporaryMode.value : simulator.mode}</div>}
+                {indicatorPreview.value.enabled && <div data-mode-indicator style={indicatorPreview.value.style}>{indicatorPreview.value.text}</div>}
                 {(isWindowMode(simulator.mode) || simulator.window.tabs.groups.length > 0) && <div class="ks-window-demo">
                   <div class="ks-window-screen-label">{t("示例屏幕 ")}{simulator.window.screen + 1} / 2</div>
 
@@ -1183,6 +1192,10 @@ export default defineComponent({
             </div>
             {selectedTab.value === 'keys' && currentPage.value.mode && renderKeyboard()}
             {document.value && effectiveDocument.value && selectedTab.value !== 'keys' && <>
+              {selectedTab.value === 'appearance' && (pageId.value === 'mode_indicator' || currentPage.value.mode && currentPage.value.mode !== 'hotkeys') && <ModeIndicatorControls
+                mode={pageId.value === 'mode_indicator' ? undefined : currentPage.value.mode}
+                document={document.value} effectiveDocument={effectiveDocument.value} appearance={appearance.value}
+                onChange={next => document.value = next} />}
               {['normal', 'text_input', 'grid', 'recursive_grid', 'ui_hint'].includes(pageId.value) && <CommonConfigControls page={pageId.value} tab={selectedTab.value} document={document.value} effectiveDocument={effectiveDocument.value} onChange={next => document.value = next} />}
               {(pageId.value.startsWith('window') || ['grid', 'recursive_grid', 'ui_hint', 'key_help'].includes(pageId.value)) && <ModeStyleControls page={pageId.value} tab={selectedTab.value} mode={(pageId.value === 'window_card' ? 'window' : pageId.value) as any} appearance={appearance.value} document={document.value} effectiveDocument={effectiveDocument.value} onChange={next => document.value = next} onAppearanceChange={next => appearance.value = next} />}
             </>}
@@ -1195,6 +1208,16 @@ export default defineComponent({
           <aside ref={previewPane} class={{ 'ks-preview-pane': true, 'is-expanded': expanded.value }} role={expanded.value ? 'dialog' : 'complementary'} aria-modal={expanded.value ? true : undefined} aria-label={t("实时预览")} {...{ onKeydownCapture: previewDialogKey }}>
             <div class="ks-preview-context"><span>{t("编辑：")}{t(currentPage.value.label)}</span><button onClick={() => { releasePreview(); setPreviewMode((pageId.value === 'window_card' ? 'window' : currentPage.value.mode && currentPage.value.mode !== 'hotkeys' ? currentPage.value.mode : 'normal') as any) }}>{t("返回当前编辑模式")}</button>
               <select aria-label={t("预览主题")} value={appearance.value} onChange={e => appearance.value = (e.target as HTMLSelectElement).value as Appearance}><option value="light">{t("浅色")}</option><option value="dark">{t("深色")}</option></select>
+              <select aria-label={t('预览平台')} value={isMac.value ? 'macos' : 'windows'} onChange={e => { releasePreview(); isMac.value = (e.target as HTMLSelectElement).value === 'macos' }}><option value="windows">Windows</option><option value="macos">macOS</option></select>
+              {!isMac.value && <div class="ks-indicator-scale" title={t('校准定位，不放大配置偏移、字号或标识符尺寸')}><span>{t('标识符屏幕缩放')}</span><select aria-label={t('标识符屏幕缩放')} value={indicatorDpi.value} onChange={e => indicatorDpi.value = Number((e.target as HTMLSelectElement).value)}>
+                {[...new Set([1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4, indicatorDpi.value])].sort((a, b) => a - b).map(scale => <option value={scale}>{Number((scale * 100).toFixed(2))}%</option>)}
+              </select><input type="number" aria-label={t('自定义缩放百分比')} min="100" max="400" step="any"
+                value={Number((indicatorDpi.value * 100).toFixed(2))}
+                onInput={e => {
+                  const input = e.target as HTMLInputElement
+                  if (input.value !== '' && input.validity.valid && Number.isFinite(input.valueAsNumber)) indicatorDpi.value = input.valueAsNumber / 100
+                }}
+                onBlur={e => { (e.target as HTMLInputElement).value = String(Number((indicatorDpi.value * 100).toFixed(2))) }} />%</div>}
             </div>
             {renderPreview()}
           </aside>

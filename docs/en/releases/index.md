@@ -5,6 +5,12 @@ outline: false
 
 # Release notes
 
+## 0.10.21
+
+- The web simulator adds **Global settings → Mode badge**, with live placement, offset, font, color, and border editing. Optional per-mode overrides remain available in Appearance, and changes export to TOML.
+
+- Mode badges support per-mode placement at any of the four pointer corners, signed offsets, and independent font/color overrides, preserving the original default location. See [mode-badge-style-and-position](https://dccif.github.io/KeySteer/en/modes/normal#mode-badge-style-and-position) for configuration.
+
 ## 0.10.20
 
 - Added Text Input for temporary typing from Normal. Ordinary typing passes through, and standard bindings configure entry, exit, and editing shortcuts.
@@ -40,7 +46,7 @@ enabled = false
 2. Press `Primary+E` to enter Normal, then `\` to type. Press `Enter`, `\`, or `Esc` to return to Normal.
 3. Hold `Primary` while typing to borrow Normal, for example H/J/K/L to move the pointer. Release it to continue typing. `Primary` follows your existing `key_aliases` configuration.
 
-Exit keys are consumed by default: Enter does not submit to the application. Use the commented sequence above to submit and return. For multiline editing or IMEs that need Enter, change the exit binding to `'\ esc' = "normal"`. Editing mappings remain commented out until you enable them. See [temporary text input](../modes/normal.md#temporary-text-input).
+Exit keys are consumed by default: Enter does not submit to the application. Use the commented sequence above to submit and return. For multiline editing or IMEs that need Enter, change the exit binding to `'\ esc' = "normal"`. Editing mappings remain commented out until you enable them. See [temporary text input](https://dccif.github.io/KeySteer/en/modes/normal#temporary-text-input).
 
 ## 0.10.19
 

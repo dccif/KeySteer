@@ -433,3 +433,6 @@ Windows 普通确认只验证身份、读取可见 bounds 和一次 GWL_STYLE；
 日志保留第一条 Error 立即写入／flush。相同错误在 1s 内合并重复项，同时抑制重复 stderr；下一条不同记录、到期后的记录或退出 flush 写出次数。窗口请求通过稳定错误内容与 session/request 上下文分离，命中时不格式化上下文；普通动态错误在锁外使用栈缓冲格式化后精确比较。缓存 target、首条内容和稳定键的总字节最多 4096，只缓存一个错误；失败 sink 不抑制重试。不开定时器、不新增日志线程，没有增加生产性能插桩或新的探测基准。
 
 Window 模式持有 `WindowTextCache`，presentation 缓存每个窗口的原始卡片文字，以流式精确比较验证标题、应用、组成员、活动标记和编号。几何变化复用 `Arc<[String]>`；样式和宽度相关的省略与度量仍使用当前场景参数。库存删除回收对应条目，模式库存重置清空缓存；缓存不跨会话无限保留。
+## 模式标识符定位
+
+`IndicatorUi.position` 使用独立的 `IndicatorPosition`（默认 bottom_left），全局与 per-mode ui override 均支持四角定位。保留原有有符号 indicator_x/y_offset；presentation::dynamic 根据 badge 总宽高将方向转换为缓存的右边缘／顶部偏移，后续 pointer fast path 仍只调用 IndicatorGeometry::position 并做显示器边界限制。配置不进入原生后端，鼠标移动不重建文本或分配布局。

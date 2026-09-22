@@ -1209,6 +1209,8 @@ fn mode_indicator_merges_per_mode_cursor_and_badge_styles() {
 
             [mode_indicator.ui]
             font_size = 11
+            position = "top_left"
+            indicator_y_offset = -24
             background_color = "#112233FF"
 
             [mode_indicator.modes.normal]
@@ -1220,6 +1222,8 @@ fn mode_indicator_merges_per_mode_cursor_and_badge_styles() {
 
             [mode_indicator.modes.normal.ui]
             font_size = 14
+            position = "bottom_right"
+            indicator_x_offset = 20
             text_color = "#FFFFFFFF"
             "##,
     )
@@ -1237,8 +1241,27 @@ fn mode_indicator_merges_per_mode_cursor_and_badge_styles() {
         .expect("badge");
     assert_eq!(text, "Temp Normal");
     assert_eq!(ui.label.font_size, 14);
+    assert_eq!(
+        ui.position,
+        crate::api::style::IndicatorPosition::BottomRight
+    );
+    assert_eq!(ui.indicator_x_offset, 20);
+    assert_eq!(ui.indicator_y_offset, -24);
+    let (_, inherited) = config.mode_indicator.for_mode("grid", "Grid").unwrap();
+    assert_eq!(
+        inherited.position,
+        crate::api::style::IndicatorPosition::TopLeft
+    );
+    assert_eq!(inherited.indicator_y_offset, -24);
     assert!(ui.label.background_color.is_some());
     assert!(ui.label.text_color.is_some());
+}
+
+#[test]
+fn mode_indicator_rejects_unknown_position() {
+    for section in ["mode_indicator.ui", "mode_indicator.modes.normal.ui"] {
+        assert!(Config::parse(&format!("[{section}]\nposition = 'somewhere'")).is_err());
+    }
 }
 
 #[test]

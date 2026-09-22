@@ -840,7 +840,8 @@ fast_multiplier = 2.0
 # ---------------------------------------------------------------------------
 # Mode indicator — a badge pinned near the cursor
 #
-# Every non-idle mode shows its name at the pointer's lower-right by default.
+# Non-idle modes show their name at the pointer's lower-left by default,
+# except text_input, whose badge is disabled below.
 # Disable or rename one with `[mode_indicator.modes.<mode_id>]`.
 # ---------------------------------------------------------------------------
 
@@ -857,7 +858,21 @@ middle_pressed_color = "#FF00FFFF"
 right_pressed_color = "#00FFFFFF"
 
 [mode_indicator.ui]
+# Shared by all modes; per-mode .ui tables only override specified fields.
 font_size = 11
+font_family = ""
+# -1 sizes adapt to the font automatically.
+border_radius = -1
+padding_x = -1
+padding_y = -1
+border_width = 1
+# Colors follow the current mode/theme when omitted.
+# background_color = "#0A1338FF"
+# text_color = "#E8EEFFFF"
+# border_color = "#6E82D6FF"
+# bottom_left (default), bottom_right, top_left, top_right; relative to cursor.
+position = "bottom_left"
+# Signed offsets: positive X moves right, positive Y moves down.
 indicator_x_offset = -12
 indicator_y_offset = 18
 

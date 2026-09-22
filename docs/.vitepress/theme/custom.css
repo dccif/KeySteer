@@ -1474,6 +1474,9 @@
 .ks-classified .ks-action-groups { grid-template-columns: 1fr; }
 .ks-preview-context { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 10px; font-size: 11px; }
 .ks-preview-context span { flex: 1 0 100%; color: var(--vp-c-text-2); }
+.ks-indicator-scale { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.ks-indicator-scale > span { flex: 0 0 auto; }
+.ks-indicator-scale > input { width: 76px; padding: 7px 8px; border: 1px solid var(--vp-c-divider); border-radius: 8px; font-size: 12px; background: var(--vp-c-bg-soft); }
 .ks-classified .ks-simulator-card { border-radius: 12px; }
 .ks-classified .ks-screen { margin: 10px; width: auto; min-height: 0; aspect-ratio: 16 / 10; }
 .ks-classified .ks-toolbar { padding: 12px; }

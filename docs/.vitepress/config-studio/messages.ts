@@ -2,6 +2,18 @@ export type StudioLocale = 'zh' | 'en'
 
 /** Display text only. Command values, paths and user content are never localized. */
 export const englishMessages: Record<string, string> = {
+  '标识符屏幕缩放': 'Badge display scaling',
+  '校准定位，不放大配置偏移、字号或标识符尺寸': 'Calibrates placement without enlarging configured offsets, font or badge dimensions',
+  '自定义缩放百分比': 'Custom scale percentage',
+  '模式标识符': 'Mode badge',
+  '模式标识符 · 单独覆盖（可选）': 'Mode badge · Optional overrides',
+  '所有模式共用此样式；单个模式可在外观页覆盖。-1 表示自动尺寸。': 'Shared by all modes; override individual modes on their Appearance page. -1 means automatic sizing.',
+  '显示模式标识符': 'Show mode badge',
+  '标识符文字': 'Badge text',
+  '标识符位置': 'Badge position',
+  '水平偏移（正数向右）': 'Horizontal offset (positive moves right)',
+  '垂直偏移（正数向下）': 'Vertical offset (positive moves down)',
+  '位置相对模拟鼠标；正 X 向右，正 Y 向下。重置后继承全局样式。': 'Position is relative to the simulated pointer; positive X moves right, positive Y moves down. Reset to inherit the shared style.',
   '文本输入 · Text Input': 'Text Input',
   "项目笔记": "Project notes",
   "KeySteer 文档": "KeySteer documentation",

@@ -1,4 +1,5 @@
 import { cardPositionRatios } from '../simulator/window-card-position.ts'
+import { indicatorPositions } from './indicator-fields.ts'
 import { toRaw } from 'vue'
 import { parse, stringify } from 'smol-toml'
 import { parseSplitRatios } from '../simulator/window-ratios.ts'
@@ -55,6 +56,10 @@ export function parseConfigDocument(source: string): ParsedConfigDocument {
     }
   }
   checkBindings(parsed)
+  const indicator = parsed.mode_indicator as ConfigDocument | undefined
+  for (const ui of [indicator?.ui, ...Object.values(indicator?.modes ?? {}).map(entry => (entry as ConfigDocument)?.ui)]) {
+    if (ui?.position !== undefined && !indicatorPositions.includes(ui.position)) throw new Error('mode_indicator.ui.position must be bottom_left, bottom_right, top_left or top_right')
+  }
   for (const mode of ['window', 'window_quick', 'window_editor', 'window_restore', 'window_tab']) {
     const settings: unknown = parsed[mode]
     const card = isRecord(settings) ? settings.card : undefined

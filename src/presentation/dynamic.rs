@@ -1,7 +1,7 @@
 //! Stateless geometry and styling for host-owned cursor decorations.
 use crate::api::binding::Button;
 use crate::api::overlay::{Color, CursorMarker, Indicator};
-use crate::api::style::{IndicatorUi, ResolvedCursorIndicatorUi};
+use crate::api::style::{IndicatorPosition, IndicatorUi, ResolvedCursorIndicatorUi};
 use crate::api::{Palette, Point, Screen};
 
 pub(crate) struct HeldTargetsText {
@@ -106,8 +106,16 @@ pub(crate) fn indicator(
     let geometry = IndicatorGeometry {
         width,
         height,
-        x_offset: ui.indicator_x_offset as f64,
-        y_offset: ui.indicator_y_offset as f64,
+        x_offset: ui.indicator_x_offset as f64
+            + match ui.position {
+                IndicatorPosition::BottomLeft | IndicatorPosition::TopLeft => 0.0,
+                IndicatorPosition::BottomRight | IndicatorPosition::TopRight => width,
+            },
+        y_offset: ui.indicator_y_offset as f64
+            - match ui.position {
+                IndicatorPosition::BottomLeft | IndicatorPosition::BottomRight => 0.0,
+                IndicatorPosition::TopLeft | IndicatorPosition::TopRight => height,
+            },
     };
     (
         Indicator {
@@ -118,4 +126,75 @@ pub(crate) fn indicator(
         },
         geometry,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::Rect;
+
+    #[test]
+    fn indicator_placement_preserves_defaults_and_supports_all_corners() {
+        let palette = Palette::default();
+        let cursor = Point::new(400.0, 300.0);
+        for position in [
+            IndicatorPosition::BottomLeft,
+            IndicatorPosition::BottomRight,
+            IndicatorPosition::TopLeft,
+            IndicatorPosition::TopRight,
+        ] {
+            for held in [false, true] {
+                let ui = IndicatorUi {
+                    position,
+                    ..Default::default()
+                };
+                let (badge, geometry) = indicator(
+                    "Normal".into(),
+                    &ui,
+                    palette.surface,
+                    held.then(|| HeldTargetsText {
+                        value: "Ctrl + Left".into(),
+                        character_count: 11,
+                    }),
+                    &palette,
+                    cursor,
+                    &[],
+                );
+                let right = matches!(
+                    position,
+                    IndicatorPosition::BottomRight | IndicatorPosition::TopRight
+                );
+                let top = matches!(
+                    position,
+                    IndicatorPosition::TopLeft | IndicatorPosition::TopRight
+                );
+                assert_eq!(
+                    badge.position.x,
+                    388.0 + if right { geometry.width } else { 0.0 }
+                );
+                assert_eq!(
+                    badge.position.y,
+                    318.0 - if top { geometry.height } else { 0.0 }
+                );
+                // Pointer movement uses the cached geometry, without rebuilding text.
+                assert_eq!(
+                    geometry.position(Point::new(410.0, 320.0), &[]),
+                    Point::new(badge.position.x + 10.0, badge.position.y + 20.0)
+                );
+                let bounds = Rect::new(-1000.0, -800.0, 1000.0, 800.0);
+                let screens = [Screen {
+                    bounds,
+                    work_area: bounds,
+                    is_primary: true,
+                    scale: 1.0,
+                    name: None,
+                }];
+                for corner in [Point::new(-999.0, -799.0), Point::new(-1.0, -1.0)] {
+                    let p = geometry.position(corner, &screens);
+                    assert!(p.x - geometry.width >= bounds.x && p.x <= bounds.right());
+                    assert!(p.y >= bounds.y && p.y + geometry.height <= bounds.bottom());
+                }
+            }
+        }
+    }
 }
