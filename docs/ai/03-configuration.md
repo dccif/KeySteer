@@ -1,5 +1,7 @@
 # 配置、按键和持久化
 
+Normal targeting 有效 max_depth 为 1 时只检查根层实际选格键的冲突（含 recursive_grid 的 depth 0 覆盖），不生成 Tab／Backspace／Space 导航绑定；省略 max_depth 时按继承后的值判断。多层继续检查导航键。
+
 ## Normal 盲操定位
 
 `normal.targeting` 是可选 boxed DTO，缺省为 None 且导出省略，不创建 reset_on 列表，默认 TOML 仅注释示例。存在时 `method` 默认 grid，也支持 recursive_grid；`reset_on` 默认 [move, click]，接受子集或空列表。引用对应顶层布局／层配置，即使独立模式关闭也验证该几何。无视图配置，不继承网格 lifecycle／follow，盲操每次选择均定位中心。

@@ -104,6 +104,16 @@ impl TargetingController {
             .is_some_and(|ch| self.layouts.iter().any(|layout| layout.keys.contains(&ch)))
     }
 
+    /// Stateless absolute positioning for a one-level silent grid.
+    pub fn root_point(&self, key: &Key, bounds: Rect) -> Option<Point> {
+        let layout = self.layout_at(0);
+        let ch = key.as_char()?;
+        let index = layout.keys.iter().position(|candidate| *candidate == ch)?;
+        bounds
+            .subdivision(layout.rows, layout.cols, index)
+            .map(|cell| cell.center())
+    }
+
     pub fn can_descend(&self) -> bool {
         let Some((min_width, min_height)) = self.min_size else {
             return self.session.depth() < self.max_depth;

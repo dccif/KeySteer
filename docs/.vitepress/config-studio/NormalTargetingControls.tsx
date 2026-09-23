@@ -1,7 +1,7 @@
 import { defineComponent } from 'vue'
 import { useStudioI18n } from './i18n.ts'
 import { cloneConfigDocument, type ConfigDocument } from './document.ts'
-import { targetingConfig, targetingLayout, targetingMethod } from '../simulator/normal-targeting.ts'
+import { targetingConfig, targetingKeys, targetingLayout, targetingMethod } from '../simulator/normal-targeting.ts'
 import { effectiveBindings } from '../simulator/bindings.ts'
 
 const overrides = [
@@ -39,9 +39,7 @@ export default defineComponent({
       const source = props.effectiveDocument[method] ?? {}
       const inheritedLayers = source.layers ?? []
       const layers = effective?.layers ?? inheritedLayers
-      const keys = new Set([...(String(effective?.keys ?? source.keys ?? '')),
-        ...(Array.isArray(layers) ? layers.flatMap((layer: ConfigDocument) => [...String(layer.keys ?? '')]) : []),
-        'tab', 'backspace', 'space'])
+      const keys = targetingKeys(props.effectiveDocument)
       const conflicts = [...effectiveBindings(props.effectiveDocument, 'normal')]
         .filter(([chord, binding]) => keys.has(chord) && binding.value !== 'none')
         .map(([chord, binding]) => `${chord} → ${binding.value}`)

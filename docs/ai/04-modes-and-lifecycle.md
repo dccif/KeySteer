@@ -2,7 +2,7 @@
 
 ## Normal 可选定位组合
 
-Normal 盲操在有效 `max_depth = 1` 时，每次选格后标记 pending reset，下次输入重新使用整屏根布局，支持连续绝对定位，不依赖 `reset_on`。多层及独立 Grid／Recursive Grid 的终点行为不变；网页模拟器遵循相同规则。
+Normal 盲操在有效 `max_depth = 1` 时直接用根布局计算坐标，不入栈、不保存选格路径、不逐次重置，支持连续绝对定位，不依赖 `reset_on`。只生成根层实际选格键，Tab／Backspace／Space 保留 Normal 原绑定；多层及独立 Grid／Recursive Grid 的终点行为不变。网页模拟器和冲突提示共用按键集合。
 
 `NormalTargeting` 只在配置存在时替代 catalog 中的 Normal 实例；普通 Normal 类型、Frame 实现和 pointer interest 不变。它持有普通 Normal 与共享 TargetingController，不持有 UI 样式，也不调用网格 Presenter。move 观察 Normal 输出的非零 MovePointer，click 观察成功 Clicked；只标记 pending reset，下次定位输入才重置，不立即 warp。实体鼠标不新增订阅，选格前按 active_bounds 懒检查换屏。插件 ScreenRetargeted 复用 controller 的 preserve 路径重放。
 

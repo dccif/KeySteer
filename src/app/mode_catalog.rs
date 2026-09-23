@@ -183,17 +183,30 @@ pub(crate) fn compile_normal_targeting(
         return Ok(());
     };
     let geometry = targeting.resolve(config);
-    let mut alphabet = std::iter::once(geometry.keys)
-        .chain(
-            geometry
-                .layers
-                .iter()
-                .filter_map(|layer| layer.keys.as_deref()),
-        )
-        .flat_map(str::chars)
-        .map(|ch| ch.to_string())
-        .collect::<BTreeSet<_>>();
-    alphabet.extend(["tab", "backspace", "space"].map(str::to_owned));
+    let root_keys = geometry
+        .layers
+        .iter()
+        .find(|layer| layer.depth == 0)
+        .and_then(|layer| layer.keys.as_deref())
+        .unwrap_or(geometry.keys);
+    let mut alphabet = std::iter::once(if geometry.max_depth == 1 {
+        root_keys
+    } else {
+        geometry.keys
+    })
+    .chain(
+        geometry
+            .layers
+            .iter()
+            .filter(|_| geometry.max_depth != 1)
+            .filter_map(|layer| layer.keys.as_deref()),
+    )
+    .flat_map(str::chars)
+    .map(|ch| ch.to_string())
+    .collect::<BTreeSet<_>>();
+    if geometry.max_depth != 1 {
+        alphabet.extend(["tab", "backspace", "space"].map(str::to_owned));
+    }
     let mut generated = BTreeMap::new();
     for name in alphabet {
         let chord = KeyChord::parse_with_aliases(&name, config.resolved_key_aliases())?;

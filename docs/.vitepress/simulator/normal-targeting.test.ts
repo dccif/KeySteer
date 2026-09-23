@@ -47,10 +47,11 @@ test('Single-level targeting continuously selects root cells for either method',
   for (const method of ['grid', 'recursive_grid']) {
     const config = { ...document, normal: { targeting: { method, grid_cols: 3, grid_rows: 2, keys: 'asdzxc', max_depth: 1, reset_on: [] } } }
     const state = createBlindTargetingState()
+    assert.deepEqual([...targetingKeys(config)], [...'asdzxc'])
     for (const key of ['a', 'c', 's', 's', 'z', 'x', 'd', 'tab', 'space', 'a']) {
       const result = blindTargetingInput(config, state, key)
       const index = 'asdzxc'.indexOf(key)
-      if (index < 0) assert.equal(result.pointer, undefined)
+      if (index < 0) assert.deepEqual(result, { handled: false })
       else {
         assert.ok(Math.abs(result.pointer!.x - ((index % 3) * 100 / 3 + 100 / 6)) < 1e-9)
         assert.equal(result.pointer!.y, Math.floor(index / 3) * 50 + 25)

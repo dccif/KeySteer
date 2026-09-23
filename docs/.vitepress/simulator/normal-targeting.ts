@@ -47,6 +47,9 @@ export function targetingKeys(document: ConfigDocument): Set<string> {
   const settings = targetingConfig(document)
   if (!settings) return new Set()
   const method = targetingMethod(settings)
+  if (Number(settings.max_depth ?? document[method]?.max_depth ?? (method === 'grid' ? 3 : 10)) === 1) {
+    return new Set([...(targetingLayout(document, 0)?.keys ?? '')])
+  }
   const alphabet = new Set([...String(settings.keys ?? document[method]?.keys ?? '')])
   const layers = method === 'recursive_grid' ? settings.layers ?? document.recursive_grid?.layers : undefined
   if (Array.isArray(layers)) for (const layer of layers) for (const key of String(layer?.keys ?? '')) alphabet.add(key)
@@ -67,6 +70,18 @@ export function blindTargetingInput(
 ): { handled: boolean; pointer?: Point } {
   const settings = targetingConfig(document)
   if (!settings || !targetingKeys(document).has(key)) return { handled: false }
+  const method = targetingMethod(settings)
+  const source = document[method] ?? {}
+  const maxDepth = Number(settings.max_depth ?? source.max_depth ?? (method === 'grid' ? 3 : 10))
+  if (maxDepth === 1) {
+    const layout = targetingLayout(document, 0)!
+    const index = [...layout.keys].indexOf(key)
+    if (index < 0 || layout.grid_cols < 1 || layout.grid_rows < 1 || index >= layout.grid_cols * layout.grid_rows) return { handled: true }
+    return { handled: true, pointer: {
+      x: (index % layout.grid_cols + .5) * 100 / layout.grid_cols,
+      y: (Math.floor(index / layout.grid_cols) + .5) * 100 / layout.grid_rows,
+    } }
+  }
   if (state.pendingReset) resetBlindTargeting(state)
   if (key === 'space') { resetBlindTargeting(state); return { handled: true } }
   if (key === 'tab' || key === 'backspace') {
@@ -89,10 +104,6 @@ export function blindTargetingInput(
     }
   }
   state.path.push(index)
-  const method = targetingMethod(settings)
-  const source = document[method] ?? {}
-  const maxDepth = Number(settings.max_depth ?? source.max_depth ?? (method === 'grid' ? 3 : 10))
-  state.pendingReset = maxDepth === 1
   const next = targetingLayout(document, state.path.length)!
   const minWidth = Number(settings.min_size_width ?? source.min_size_width ?? 1)
   const minHeight = Number(settings.min_size_height ?? source.min_size_height ?? 1)

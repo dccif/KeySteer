@@ -72,12 +72,16 @@ impl Mode for NormalTargeting {
                 let Binding::TargetingKey(key) = binding.as_ref() else {
                     unreachable!()
                 };
+                if self.grid.max_depth == 1 {
+                    return self
+                        .grid
+                        .root_point(key, ctx.active_bounds())
+                        .map(|point| Command::warp_to(point).into())
+                        .unwrap_or_default();
+                }
                 let bounds = self.prepare(ctx);
                 return match self.grid.input(key, bounds) {
                     Selection::Follow(point) | Selection::Commit(point) => {
-                        // A one-level silent grid is an absolute positioning pad.
-                        // Reuse the root on the next input, regardless of reset_on.
-                        self.pending_reset = self.grid.max_depth == 1;
                         Command::warp_to(point).into()
                     }
                     _ => CommandBatch::new(),

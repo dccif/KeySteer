@@ -429,6 +429,27 @@ fn screen_plugin_preserves_grid_path_while_temporary_normal_is_held() {
 }
 
 #[test]
+fn single_level_targeting_leaves_normal_navigation_bindings_available() {
+    for method in ["grid", "recursive_grid"] {
+        let mut config = blind_config(method, "[]");
+        config.normal.targeting.as_mut().unwrap().max_depth = Some(1);
+        for key in ["tab", "backspace", "space"] {
+            config.normal.bindings.insert(key.into(), Binding::parse("send enter").unwrap());
+        }
+        let (mut engine, mut backend, log) = blind_engine(&config);
+        for key in ["tab", "backspace", "space"] {
+            blind_tap(&mut engine, &mut backend, key);
+        }
+        assert_eq!(log.lock().unwrap().sent.iter().filter(|(key, state)| key == "enter" && *state == KeyState::Down).count(), 3);
+        config.normal.targeting.as_mut().unwrap().max_depth = Some(3);
+        assert!(crate::app::configuration::compile(&config).is_err());
+        config.normal.targeting.as_mut().unwrap().max_depth = Some(1);
+        config.normal.bindings.insert("a".into(), Binding::parse("send enter").unwrap());
+        assert!(crate::app::configuration::compile(&config).is_err());
+    }
+}
+
+#[test]
 fn normal_targeting_single_level_repeatedly_selects_root_cells() {
     for method in ["grid", "recursive_grid"] {
         for reset_on in ["[]", "[\"move\", \"click\"]"] {
