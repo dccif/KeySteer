@@ -1142,9 +1142,7 @@ fn indicator_bounds(indicator: &Indicator, position: Point) -> Rect {
 }
 
 fn indicator_rect(text: &str, position: Point, style: &LabelStyle) -> Rect {
-    let width = (text.chars().count() as f64 * style.font_size * 0.7 + style.padding_x * 2.0)
-        .max(style.font_size * 2.0);
-    let height = style.font_size + style.padding_y * 2.0;
+    let (width, height) = Indicator::label_size(text.chars().count(), style);
     Rect::new(position.x - width, position.y, width, height)
 }
 

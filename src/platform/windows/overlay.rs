@@ -237,11 +237,7 @@ impl Overlay {
         }
         if let Some(indicator) = &scene.indicator {
             let label_size = |text: &str| {
-                let width = (text.chars().count() as f64 * indicator.style.font_size * 0.7
-                    + indicator.style.padding_x * 2.0)
-                    .max(indicator.style.font_size * 2.0);
-                let height = indicator.style.font_size + indicator.style.padding_y * 2.0;
-                (width, height)
+                crate::api::overlay::Indicator::label_size(text.chars().count(), &indicator.style)
             };
             let (width, height) = label_size(&indicator.text);
             surface.label_parts(
@@ -301,7 +297,7 @@ impl DpiSceneCache {
         scale: f64,
     ) -> Cow<'a, OverlayScene> {
         let scale = normalized_label_scale(scale);
-        if (scale - 1.0).abs() < f64::EPSILON {
+        if (scale - 1.0).abs() < f64::EPSILON || scene.labels.is_empty() {
             self.clear();
             return Cow::Borrowed(scene);
         }
@@ -330,11 +326,8 @@ impl DpiSceneCache {
                 self.scaled_labels = Some(scaled.labels.clone());
             }
         }
-        if let Some(indicator) = &mut scaled.indicator {
-            scale_style(&mut indicator.style, scale);
-            indicator.position.x = indicator.position.x.round();
-            indicator.position.y = indicator.position.y.round();
-        }
+        // Indicator layout is already resolved in scene coordinates. Scaling
+        // it again here would move its left edge away from the cached anchor.
         Cow::Owned(scaled)
     }
 }
@@ -1343,6 +1336,22 @@ mod tests {
             scene.labels[0].rect.center()
         );
         assert!(scaled.labels[0].rect.width > scene.labels[0].rect.width);
+    }
+
+    #[test]
+    fn indicator_layout_is_not_scaled_again_by_the_backend() {
+        let mut scene = OverlayScene::new();
+        scene.indicator = Some(crate::api::overlay::Indicator {
+            text: "Normal".into(),
+            held_text: None,
+            position: Point::new(388.0, 318.0),
+            style: LabelStyle::default(),
+        });
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let resolved = scene_for_dpi(&scene, scale);
+            assert!(matches!(resolved, Cow::Borrowed(_)));
+            assert_eq!(resolved.indicator, scene.indicator);
+        }
     }
 
     #[test]

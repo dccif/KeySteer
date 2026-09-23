@@ -1321,14 +1321,8 @@ fn effective_label_rect(label: &OverlayLabel) -> Rect {
 }
 
 fn indicator_layout(indicator: &Indicator) -> (f64, f64, Rect, Option<Rect>) {
-    let label_width = |text: &str| {
-        (indicator.style.font_size * 0.75 * text.chars().count() as f64
-            + indicator.style.padding_x.max(0.0) * 2.0)
-            .max(indicator.style.font_size * 2.0)
-            .ceil()
-    };
-    let line_height =
-        (indicator.style.font_size * 1.4 + indicator.style.padding_y.max(0.0) * 2.0).ceil();
+    let label_width = |text: &str| Indicator::label_size(text.chars().count(), &indicator.style).0;
+    let line_height = Indicator::label_size(0, &indicator.style).1;
     let main_width = label_width(&indicator.text);
     let held_width = indicator
         .held_text

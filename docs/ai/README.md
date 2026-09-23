@@ -4,7 +4,7 @@ Window 入口激活鼠标下窗口、可配置关闭动作见 [公共 API](02-ru
 
 # KeySteer 项目手册
 
-模式标识符四角定位、按模式样式覆盖与缓存几何见 [覆盖层与性能](07-rendering-and-performance.md)，网页全局与独立覆盖编辑、实时预览见 [构建与文档站](08-build-docs-and-tests.md)。
+0.10.22 移除旧模式标识符定位字段，配置拒绝与迁移见 [配置](03-configuration.md)。模式标识符 indicator_offset 二维偏移、统一后端尺寸与拖动定位、按模式样式覆盖与缓存几何见 [覆盖层与性能](07-rendering-and-performance.md)，网页全局与独立覆盖编辑、实时预览见 [构建与文档站](08-build-docs-and-tests.md)。
 
 窗口事务增量准备、组级原生事件屏障、异步历史恢复见 [后端](06-platform-backends.md)；卡片文本复用和稳定错误去重见 [性能](07-rendering-and-performance.md)，模块入口见 [项目地图](01-project-map.md)。
 

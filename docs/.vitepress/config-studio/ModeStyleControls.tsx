@@ -160,6 +160,15 @@ export const StyleControl = defineComponent({
                 value={/^#[0-9a-f]{8}$/i.test(String(value)) ? parseInt(String(value).slice(7), 16) : 255}
                 onInput={event => updateColor(`${normalizeColor(value, props.appearance)}${Number((event.target as HTMLInputElement).value).toString(16).padStart(2, '0')}`)} />
             </div>
+          ) : field.kind === 'offset' ? (
+            <input value={JSON.stringify(value)} onChange={event => {
+              const input = event.target as HTMLInputElement
+              try {
+                const pair = JSON.parse(input.value)
+                if (!Array.isArray(pair) || pair.length !== 2 || !pair.every(v => Number.isInteger(v) && v >= -32768 && v <= 32767)) throw new Error()
+                input.setCustomValidity(''); props.onUpdate(pair)
+              } catch { input.setCustomValidity(t('请输入两个整数，例如 [-12, 18]')); input.reportValidity() }
+            }} />
           ) : field.kind === 'percentages' ? (
             <input value={Array.isArray(value) ? value.join(', ') : String(value)} onChange={event => {
               const input = event.target as HTMLInputElement

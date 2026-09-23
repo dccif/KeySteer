@@ -1,2 +1,5 @@
 allowBuilds:
   esbuild: true
+minimumReleaseAgeExclude:
+  - smol-toml@1.9.0
+minimumReleaseAgeExcludePrune: true

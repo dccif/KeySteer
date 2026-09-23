@@ -1,8 +1,8 @@
 # 构建、打包、文档站与测试
 
-标识符网页预览的 Windows 屏幕缩放用于还原原生右边缘锚点到左边缘的宽度换算，不乘以 indicator_x/y_offset，也不修改可见字号、内边距、边框、圆角或标识符尺寸；用户可从选项选择或输入百分比。Windows 使用 0.7 字宽／1.0 行高，macOS 使用 0.75 字宽／1.4 行高并保持逻辑点布局。默认背景取各模式 indicator_color，文字按 Palette::readable_on 对比度选择。缩放初值取浏览器 devicePixelRatio，不导出至 TOML；它与预览画布适配缩放独立。几何测试不代表 macOS 原生字体栅格验收。
+标识符网页与程序统一使用 0.75 字宽／1.4 行高及相同右上角锚点；不再提供额外缩放补偿。indicator_offset 为 i16 二元数组，网页支持拖动、键盘微调、输入及全局/模式继承。Windows 后端不再二次放大 Indicator，macOS 保持逻辑点。测试覆盖数组边界、平台一致性、DPI 无二次缩放及缓存几何；字体栅格实机验收仍需分别执行。
 
-网页模式标识符由 `ModeIndicatorControls` 编辑全局 ui 与各模式覆盖，`indicator-fields.ts` 统一字段和搜索入口；`simulator/mode-indicator.ts` 解析继承并生成跟随指针的四角定位样式。预览切换临时模式时使用借用模式的配置。`mode-indicator.test.ts` 覆盖默认隐藏、覆盖/重置、TOML 往返、定位边界、主题和搜索归属。
+网页模式标识符由 `ModeIndicatorControls` 编辑全局 ui 与各模式覆盖，`indicator-fields.ts` 统一字段和搜索入口；`simulator/mode-indicator.ts` 解析继承并生成跟随鼠标热点的右上角定位样式。预览切换临时模式时使用借用模式的配置。`mode-indicator.test.ts` 覆盖默认隐藏、覆盖/重置、TOML 往返、定位边界、主题和搜索归属。
 
 窗口事务优化的功能回归位于 `window_session/async_tests.rs`：覆盖分批准备、取消前无写入、晚发现非法布局、提交次序回滚和历史重试。`window_tabs/tests.rs` 验证独立组不受阻挡、相关结构事件保序和队列上限；presentation 测试验证几何变化复用文本及标题／组／编号失效；logging 测试验证稳定错误合并时跳过上下文格式化。Windows 的显式 `native_async_group_maximize_layout_and_cancel` 使用自建临时窗口，包含 Undo／Redo／ResetInitial 原生验收；它不是性能基准，不给生产路径增加插桩。
 

@@ -1209,8 +1209,7 @@ fn mode_indicator_merges_per_mode_cursor_and_badge_styles() {
 
             [mode_indicator.ui]
             font_size = 11
-            position = "top_left"
-            indicator_y_offset = -24
+            indicator_offset = [-12, -24]
             background_color = "#112233FF"
 
             [mode_indicator.modes.normal]
@@ -1222,8 +1221,7 @@ fn mode_indicator_merges_per_mode_cursor_and_badge_styles() {
 
             [mode_indicator.modes.normal.ui]
             font_size = 14
-            position = "bottom_right"
-            indicator_x_offset = 20
+            indicator_offset = [20, -24]
             text_color = "#FFFFFFFF"
             "##,
     )
@@ -1241,27 +1239,57 @@ fn mode_indicator_merges_per_mode_cursor_and_badge_styles() {
         .expect("badge");
     assert_eq!(text, "Temp Normal");
     assert_eq!(ui.label.font_size, 14);
-    assert_eq!(
-        ui.position,
-        crate::api::style::IndicatorPosition::BottomRight
-    );
-    assert_eq!(ui.indicator_x_offset, 20);
-    assert_eq!(ui.indicator_y_offset, -24);
+    assert_eq!(ui.indicator_offset, [20, -24]);
     let (_, inherited) = config.mode_indicator.for_mode("grid", "Grid").unwrap();
-    assert_eq!(
-        inherited.position,
-        crate::api::style::IndicatorPosition::TopLeft
-    );
-    assert_eq!(inherited.indicator_y_offset, -24);
+    assert_eq!(inherited.indicator_offset, [-12, -24]);
     assert!(ui.label.background_color.is_some());
     assert!(ui.label.text_color.is_some());
 }
 
 #[test]
-fn mode_indicator_rejects_unknown_position() {
+fn mode_indicator_rejects_removed_placement_fields() {
     for section in ["mode_indicator.ui", "mode_indicator.modes.normal.ui"] {
-        assert!(Config::parse(&format!("[{section}]\nposition = 'somewhere'")).is_err());
+        for field in [
+            "position = 'bottom_left'",
+            "indicator_x_offset = -12",
+            "indicator_y_offset = 18",
+        ] {
+            assert!(Config::parse(&format!("[{section}]\n{field}")).is_err());
+        }
     }
+}
+
+#[test]
+fn mode_indicator_offset_is_a_bounded_pair_and_inherits_per_mode() {
+    let config = Config::parse("[mode_indicator.ui]\nindicator_offset = [-12, 18]\n[mode_indicator.modes.normal.ui]\nindicator_offset = [40, 30]").unwrap();
+    assert_eq!(
+        config
+            .mode_indicator
+            .for_mode("normal", "Normal")
+            .unwrap()
+            .1
+            .indicator_offset,
+        [40, 30]
+    );
+    assert_eq!(
+        config
+            .mode_indicator
+            .for_mode("grid", "Grid")
+            .unwrap()
+            .1
+            .indicator_offset,
+        [-12, 18]
+    );
+    for pair in ["[-32768, 32767]", "[0, 0]"] {
+        assert!(Config::parse(&format!("[mode_indicator.ui]\nindicator_offset = {pair}")).is_ok());
+    }
+    for section in ["mode_indicator.ui", "mode_indicator.modes.normal.ui"] {
+        for pair in ["[-32769, 0]", "[0, 32768]", "[1]", "[1, 2, 3]", "[1.5, 2]"] {
+            assert!(Config::parse(&format!("[{section}]\nindicator_offset = {pair}")).is_err());
+        }
+    }
+    let sparse = Config::parse("[mode_indicator.ui]\nfont_size = 18").unwrap();
+    assert_eq!(sparse.mode_indicator.ui.indicator_offset, [-12, 18]);
 }
 
 #[test]

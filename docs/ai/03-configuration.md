@@ -24,6 +24,8 @@
 
 ## 配置模型
 
+0.10.22 起模式标识符只接受 `indicator_offset = [X, Y]`（i16 二元数组）；旧 `position`、`indicator_x_offset`、`indicator_y_offset` 在全局及单模式 UI 中均报错。全局缺省 [-12, 18]，单模式缺省继承。Normal 内置默认与发布配置都包含 `.` / `/` 的水平滚动绑定。
+
 Recursive Grid 的 `ui.font_size = 0` 默认按格子短边的 40% 自动显示字母，默认使用常规字重；正数仍是用户指定的最大字号。内部导出和网页编辑器保留此语义。
 
 根类型是 `src/config/mod.rs::ConfigFile`（`Config` 暂为内部迁移别名）。所有主要 section 都有默认值，因此空配置或没有

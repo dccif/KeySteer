@@ -148,7 +148,7 @@ temporary_mode_passthrough_keys = []
 文本输入模式默认不显示文字提示，可在 `[mode_indicator.modes.text_input]` 中用 `enabled` 自定义。临时 Normal 仍使用 Normal 的提示设置，且 `s = "screen next"` 等插件动作的结果由 Normal 处理。
 ## 模式标识符样式与位置
 
-网页预览可切换 Windows／macOS。Windows 的「标识符屏幕缩放」仅校准标识符定位，不放大配置的 X／Y 偏移，字号、标识符尺寸和样式仍由配置决定；可选择常用比例或直接输入百分比。macOS 按逻辑点预览，Retina 不额外放大标识符。该选项只影响预览，不写入 TOML；原生字体与浏览器的文字栅格仍可能有细微差异。
+程序和网页现在使用相同的标识符尺寸与定位公式，移除了额外的预览屏幕缩放补偿。坐标原点是系统鼠标热点（通常为箭头尖端，也是圆形指示器中心），不是箭头图片的中心。Windows 使用桌面坐标像素，macOS 使用逻辑点；标识符后端不再二次缩放尺寸，字体栅格仍可能有细微差异。
 
 通常只需修改全局 `[mode_indicator.ui]`；默认配置已集中列出字体、圆角、内边距、边框及位置。网页模拟器的「全局设置 → 模式标识符」可直接编辑并实时预览。各模式「外观」页保留独立覆盖，重置字段即可恢复继承全局样式。
 
@@ -159,10 +159,8 @@ temporary_mode_passthrough_keys = []
 enabled = true
 text = "Normal"
 
-[mode_indicator.modes.normal.ui]
-position = "bottom_right"
-indicator_x_offset = 12
-indicator_y_offset = 18
+[mode_indicator.ui]
+indicator_offset = [-12, 18]
 font_size = 13
 background_color = "#0A1338FF"
 text_color = "#E8EEFFFF"
@@ -174,6 +172,6 @@ padding_y = 4
 enabled = false
 ```
 
-`position` 支持 `bottom_left`（左下）、`bottom_right`（右下）、`top_left`（左上）、`top_right`（右上），均相对当前鼠标。偏移为有符号的逻辑像素：X 正数向右、负数向左；Y 正数向下、负数向上。例如左上可设 `top_left`、X = -12、Y = -18。任意距离都可通过这两个偏移调整，超出显示器边缘时会限制在屏幕内。
+`indicator_offset = [X, Y]` 定位标识符的**右上角**：X 正数向右、负数向左；Y 正数向下、负数向上。两项都是 -32768～32767 的整数。默认 `[-12, 18]` 表示右上角在鼠标左侧 12、下方 18。网页可拖动橙色锚点、用方向键微调（Shift 为 10），或直接输入数组；显示器边缘会限制整个标识符的位置。
 
-默认仍为 `bottom_left`、X = -12、Y = 18，保持原来的位置。未覆盖的样式继承全局值；还支持 `font_family`、`border_width`、`border_color` 等样式字段。Text Input 默认隐藏文字，若需要显示，设 `enabled = true`，并在 `[mode_indicator.modes.text_input.ui]` 中配置相同字段。
+各模式 `[mode_indicator.modes.normal.ui]` 等表可覆盖同名字段。从 0.10.22 起，旧 `position`、`indicator_x_offset` 和 `indicator_y_offset` 已移除，请使用 `indicator_offset = [X, Y]`；未设置时使用默认值或继承全局配置。Text Input 默认隐藏文字，若需要显示，设 `enabled = true`，并在 `[mode_indicator.modes.text_input.ui]` 中配置相同字段。

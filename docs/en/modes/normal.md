@@ -124,7 +124,7 @@ Home-row mappings are commented examples, disabled by default: Primary+H/J/K/L s
 Text Input hides its text badge by default through `[mode_indicator.modes.text_input] enabled = false`. Temporary Normal uses its own badge settings and receives plugin results such as `screen next`.
 ## Mode badge style and position
 
-Select Windows or macOS in the preview. On Windows, **Badge display scaling** calibrates placement without multiplying the configured X/Y offsets. Font size, badge dimensions, and styling continue to follow the configuration. Choose a preset or enter a percentage. macOS uses logical points, so Retina does not enlarge the badge. This preview setting is not exported to TOML; native and browser font rasterization may still differ slightly.
+Native and web badges now share the same size and positioning formulas; the extra preview display scaling compensation has been removed. The origin is the system cursor hotspot (usually the arrow tip and the cursor ring's centre), not the centre of the arrow image. Windows uses desktop coordinate pixels; macOS uses logical points. Backends do not rescale badge layout; font rasterization can still differ slightly.
 
 Usually, edit the shared `[mode_indicator.ui]` settings; the default file lists font, corner radius, padding, border, and placement together. In the web simulator, open **Global settings → Mode badge** for live editing. Each mode's **Appearance** tab supports optional overrides; reset a field to inherit the shared style again.
 
@@ -135,10 +135,8 @@ Each mode can override the shared `[mode_indicator.ui]` style. Merge these setti
 enabled = true
 text = "Normal"
 
-[mode_indicator.modes.normal.ui]
-position = "bottom_right"
-indicator_x_offset = 12
-indicator_y_offset = 18
+[mode_indicator.ui]
+indicator_offset = [-12, 18]
 font_size = 13
 background_color = "#0A1338FF"
 text_color = "#E8EEFFFF"
@@ -150,6 +148,6 @@ padding_y = 4
 enabled = false
 ```
 
-`position` accepts `bottom_left`, `bottom_right`, `top_left`, or `top_right`, relative to the current pointer. Offsets use signed logical pixels: positive X moves right, positive Y moves down. For example, use `top_left`, X = -12, Y = -18 for a gap above and left of the pointer. Adjust the offsets for any distance; placement is clamped to the display edges.
+`indicator_offset = [X, Y]` positions the badge's **top-right corner**. Positive X moves right; positive Y moves down. Both values are integers from -32768 to 32767. The default `[-12, 18]` puts that corner 12 left and 18 below the cursor. Drag the orange anchor in the editor, use arrow keys (Shift moves by 10), or enter the array. The whole badge is clamped to display edges.
 
-The default remains `bottom_left`, X = -12, Y = 18, preserving the original placement. Unspecified styles inherit global values; `font_family`, `border_width`, and `border_color` are also supported. To show the Text Input badge, set `enabled = true` and use the same style fields in `[mode_indicator.modes.text_input.ui]`.
+Individual modes can override these fields in tables such as `[mode_indicator.modes.normal.ui]`. As of 0.10.22, `position`, `indicator_x_offset`, and `indicator_y_offset` are removed. Use `indicator_offset = [X, Y]`; omitted offsets use the default or inherit the global setting. To show the Text Input badge, set `enabled = true` and use the same style fields in `[mode_indicator.modes.text_input.ui]`.

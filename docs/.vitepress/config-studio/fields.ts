@@ -1,7 +1,7 @@
 import { fieldLocation } from './navigation.ts'
 export type TargetingMode = 'grid' | 'recursive_grid' | 'ui_hint' | 'key_help' | 'window' | 'window_quick' | 'window_editor' | 'window_restore' | 'window_tab'
 export type Appearance = 'dark' | 'light'
-export type ControlKind = 'color' | 'number' | 'text' | 'boolean' | 'select' | 'ratios' | 'percentages'
+export type ControlKind = 'color' | 'number' | 'text' | 'boolean' | 'select' | 'ratios' | 'percentages' | 'offset'
 
 export interface StyleField {
   path: string

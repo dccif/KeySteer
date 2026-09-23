@@ -1,5 +1,7 @@
 # Windows 与 macOS 原生后端
 
+模式标识符尺寸统一由 `Indicator::label_size` 计算，Windows GPU/软件与 macOS 均复用；Windows DpiSceneCache 不再二次缩放 Indicator。纯标识符／光标场景无静态 labels 时直接借用原场景，不为 DPI 复制文本或样式；普通静态 label 的 DPI 缩放不变。
+
 相交切换能力在配置编译时由已启用模式的绑定、应用覆盖和嵌套动作序列推导为 EngineSettings.window_overlap_enabled；无相关绑定时不发送相交请求。Session 只保留可空缓存指针，首次相交请求才分配缓存，普通窗口/音频路径不创建相交状态。运行时配置重载从启用变为禁用时，Backend::clear_window_overlap_cache 仅通知已有 worker：丢弃待执行相交请求，在 worker 中释放缓存；不启动新 worker。几何仍按实际操作时的系统数据核对。
 
 macOS 不存在 GA_ROOTOWNER；对应漏识别修复位于 `accessibility::window_under_pointer` 的有界 AX 关系回退。`is_ordinary_ax_window` 由命中与枚举共用：必须明确为 AXWindow，允许 AXSubrole 缺失，已知非 AXStandardWindow 子角色仍拒绝。枚举继续使用 Quartz 可见元数据匹配，不扩大到隐藏／其他 Space 的窗口；AX 拒绝访问或应用完全不提供可访问性时不承诺可操作。

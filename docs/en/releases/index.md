@@ -5,11 +5,28 @@ outline: false
 
 # Release notes
 
+## 0.10.22
+
+- **Breaking change:** Removed mode-badge `position`, `indicator_x_offset`, and `indicator_y_offset`. Both `[mode_indicator.ui]` and `[mode_indicator.modes.<mode>.ui]` now use only `indicator_offset = [X, Y]`. Old fields fail configuration validation; remove and migrate them before upgrading, even if the new pair is already present.
+- The offset places the badge's **top-right corner** relative to the cursor hotspot. Positive X moves right and positive Y moves down; each integer ranges from -32768 to 32767. The global default is `[-12, 18]`; omitted per-mode offsets inherit it. Drag the anchor in the web simulator and export the result.
+- Added the missing embedded Normal defaults: `.` scrolls left and `/` scrolls right, matching the shipped configuration.
+
+### Migration example
+
+Remove `position = "bottom_left"`, `indicator_x_offset = -12`, and `indicator_y_offset = 18`, then replace them with:
+
+```toml
+[mode_indicator.ui]
+indicator_offset = [-12, 18]
+```
+
+For old `bottom_left` placement, reuse X/Y directly. For `bottom_right`, add the badge width to X; for `top_left`, subtract the total badge height from Y; for `top_right`, apply both adjustments. Dimensions depend on font, padding, and the second held-input line, so dragging in the web editor is recommended. Per-mode overrides use the same format. Other style fields are unchanged.
+
 ## 0.10.21
 
 - The web simulator adds **Global settings → Mode badge**, with live placement, offset, font, color, and border editing. Optional per-mode overrides remain available in Appearance, and changes export to TOML.
 
-- Mode badges support per-mode placement at any of the four pointer corners, signed offsets, and independent font/color overrides, preserving the original default location. See [mode-badge-style-and-position](https://dccif.github.io/KeySteer/en/modes/normal#mode-badge-style-and-position) for configuration.
+- Mode badges add `indicator_offset = [-12, 18]` (an i16 pair) and a draggable top-right anchor in the web editor. Shared geometry removes Windows double-scaling placement differences. Global/per-mode styles and legacy placement settings remain supported. See [Mode badge style and position](../modes/normal.md#mode-badge-style-and-position).
 
 ## 0.10.20
 

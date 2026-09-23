@@ -1,5 +1,4 @@
 import { cardPositionRatios } from '../simulator/window-card-position.ts'
-import { indicatorPositions } from './indicator-fields.ts'
 import { toRaw } from 'vue'
 import { parse, stringify } from 'smol-toml'
 import { parseSplitRatios } from '../simulator/window-ratios.ts'
@@ -58,7 +57,10 @@ export function parseConfigDocument(source: string): ParsedConfigDocument {
   checkBindings(parsed)
   const indicator = parsed.mode_indicator as ConfigDocument | undefined
   for (const ui of [indicator?.ui, ...Object.values(indicator?.modes ?? {}).map(entry => (entry as ConfigDocument)?.ui)]) {
-    if (ui?.position !== undefined && !indicatorPositions.includes(ui.position)) throw new Error('mode_indicator.ui.position must be bottom_left, bottom_right, top_left or top_right')
+    if (ui?.indicator_offset !== undefined && (!Array.isArray(ui.indicator_offset) || ui.indicator_offset.length !== 2 || !ui.indicator_offset.every((v: unknown) => typeof v === 'number' && Number.isInteger(v) && v >= -32768 && v <= 32767))) throw new Error('indicator_offset requires [X, Y] integers')
+    for (const field of ['position', 'indicator_x_offset', 'indicator_y_offset']) {
+      if (ui?.[field] !== undefined) throw new Error(`mode_indicator.ui.${field} was removed; use indicator_offset = [X, Y]`)
+    }
   }
   for (const mode of ['window', 'window_quick', 'window_editor', 'window_restore', 'window_tab']) {
     const settings: unknown = parsed[mode]

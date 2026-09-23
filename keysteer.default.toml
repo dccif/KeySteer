@@ -870,11 +870,9 @@ border_width = 1
 # background_color = "#0A1338FF"
 # text_color = "#E8EEFFFF"
 # border_color = "#6E82D6FF"
-# bottom_left (default), bottom_right, top_left, top_right; relative to cursor.
-position = "bottom_left"
-# Signed offsets: positive X moves right, positive Y moves down.
-indicator_x_offset = -12
-indicator_y_offset = 18
+# Badge right/top anchor relative to the cursor hotspot (the ring centre).
+# [X, Y]: positive X moves right; positive Y moves down. Drag in the web editor.
+indicator_offset = [-12, 18]
 
 # Recommended: show a badge in `normal`, where nothing else marks the mode.
 [mode_indicator.modes.normal]

@@ -1,7 +1,7 @@
 //! Stateless geometry and styling for host-owned cursor decorations.
 use crate::api::binding::Button;
 use crate::api::overlay::{Color, CursorMarker, Indicator};
-use crate::api::style::{IndicatorPosition, IndicatorUi, ResolvedCursorIndicatorUi};
+use crate::api::style::{IndicatorUi, ResolvedCursorIndicatorUi};
 use crate::api::{Palette, Point, Screen};
 
 pub(crate) struct HeldTargetsText {
@@ -88,17 +88,13 @@ pub(crate) fn indicator(
         palette.readable_on(background),
         palette.accent,
     );
-    let text_width = |character_count: usize| {
-        (character_count as f64 * style.font_size * 0.75 + style.padding_x * 2.0)
-            .max(style.font_size * 2.0)
-            .ceil()
-    };
+    let text_width = |character_count: usize| Indicator::label_size(character_count, &style).0;
     let width = held_text
         .as_ref()
         .map(|held| text_width(held.character_count))
         .unwrap_or_default()
         .max(text_width(text.chars().count()));
-    let line_height = (style.font_size * 1.4 + style.padding_y * 2.0).ceil();
+    let line_height = Indicator::label_size(0, &style).1;
     let height = line_height + held_text.as_ref().map_or(0.0, |_| line_height + 4.0);
     // `position.x` is the shared right edge of both badges. Keeping the
     // anchor independent of the longest line prevents a wide held-input
@@ -106,16 +102,8 @@ pub(crate) fn indicator(
     let geometry = IndicatorGeometry {
         width,
         height,
-        x_offset: ui.indicator_x_offset as f64
-            + match ui.position {
-                IndicatorPosition::BottomLeft | IndicatorPosition::TopLeft => 0.0,
-                IndicatorPosition::BottomRight | IndicatorPosition::TopRight => width,
-            },
-        y_offset: ui.indicator_y_offset as f64
-            - match ui.position {
-                IndicatorPosition::BottomLeft | IndicatorPosition::BottomRight => 0.0,
-                IndicatorPosition::TopLeft | IndicatorPosition::TopRight => height,
-            },
+        x_offset: f64::from(ui.indicator_offset[0]),
+        y_offset: f64::from(ui.indicator_offset[1]),
     };
     (
         Indicator {
@@ -134,18 +122,47 @@ mod tests {
     use crate::api::Rect;
 
     #[test]
-    fn indicator_placement_preserves_defaults_and_supports_all_corners() {
+    fn offset_pair_uses_right_top_anchor_and_cached_metrics() {
+        let palette = Palette::default();
+        for pair in [[-12, 18], [40, 30], [-32768, 32767]] {
+            let ui = IndicatorUi {
+                indicator_offset: pair,
+                ..Default::default()
+            };
+            let (badge, geometry) = indicator(
+                "Normal".into(),
+                &ui,
+                palette.surface,
+                None,
+                &palette,
+                Point::new(400.0, 300.0),
+                &[],
+            );
+            assert_eq!(
+                badge.position,
+                Point::new(400.0 + f64::from(pair[0]), 300.0 + f64::from(pair[1]))
+            );
+            assert_eq!(
+                Indicator::label_size(6, &badge.style),
+                (geometry.width, geometry.height)
+            );
+            for x in 0..1000 {
+                assert_eq!(
+                    geometry.position(Point::new(x as f64, 300.0), &[]).x,
+                    x as f64 + f64::from(pair[0])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn indicator_placement_preserves_anchor_and_clamps_both_lines() {
         let palette = Palette::default();
         let cursor = Point::new(400.0, 300.0);
-        for position in [
-            IndicatorPosition::BottomLeft,
-            IndicatorPosition::BottomRight,
-            IndicatorPosition::TopLeft,
-            IndicatorPosition::TopRight,
-        ] {
+        for pair in [[-12, 18], [40, 30], [-80, -60], [0, 0]] {
             for held in [false, true] {
                 let ui = IndicatorUi {
-                    position,
+                    indicator_offset: pair,
                     ..Default::default()
                 };
                 let (badge, geometry) = indicator(
@@ -160,22 +177,8 @@ mod tests {
                     cursor,
                     &[],
                 );
-                let right = matches!(
-                    position,
-                    IndicatorPosition::BottomRight | IndicatorPosition::TopRight
-                );
-                let top = matches!(
-                    position,
-                    IndicatorPosition::TopLeft | IndicatorPosition::TopRight
-                );
-                assert_eq!(
-                    badge.position.x,
-                    388.0 + if right { geometry.width } else { 0.0 }
-                );
-                assert_eq!(
-                    badge.position.y,
-                    318.0 - if top { geometry.height } else { 0.0 }
-                );
+                assert_eq!(badge.position.x, cursor.x + f64::from(pair[0]));
+                assert_eq!(badge.position.y, cursor.y + f64::from(pair[1]));
                 // Pointer movement uses the cached geometry, without rebuilding text.
                 assert_eq!(
                     geometry.position(Point::new(410.0, 320.0), &[]),

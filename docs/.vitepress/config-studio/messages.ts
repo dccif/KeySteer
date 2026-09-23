@@ -2,6 +2,10 @@ export type StudioLocale = 'zh' | 'en'
 
 /** Display text only. Command values, paths and user content are never localized. */
 export const englishMessages: Record<string, string> = {
+  '标识符偏移 [X, Y]': 'Badge offset [X, Y]',
+  '请输入两个整数，例如 [-12, 18]': 'Enter two integers, for example [-12, 18]',
+  '拖动右上角锚点；圆心是鼠标热点。方向键微调，Shift 加速。': 'Drag the top-right anchor; the circle centre is the cursor hotspot. Arrow keys adjust; Shift moves faster.',
+  '标识符拖动定位': 'Drag to position the badge',
   '标识符屏幕缩放': 'Badge display scaling',
   '校准定位，不放大配置偏移、字号或标识符尺寸': 'Calibrates placement without enlarging configured offsets, font or badge dimensions',
   '自定义缩放百分比': 'Custom scale percentage',

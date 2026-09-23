@@ -435,4 +435,4 @@ Windows 普通确认只验证身份、读取可见 bounds 和一次 GWL_STYLE；
 Window 模式持有 `WindowTextCache`，presentation 缓存每个窗口的原始卡片文字，以流式精确比较验证标题、应用、组成员、活动标记和编号。几何变化复用 `Arc<[String]>`；样式和宽度相关的省略与度量仍使用当前场景参数。库存删除回收对应条目，模式库存重置清空缓存；缓存不跨会话无限保留。
 ## 模式标识符定位
 
-`IndicatorUi.position` 使用独立的 `IndicatorPosition`（默认 bottom_left），全局与 per-mode ui override 均支持四角定位。保留原有有符号 indicator_x/y_offset；presentation::dynamic 根据 badge 总宽高将方向转换为缓存的右边缘／顶部偏移，后续 pointer fast path 仍只调用 IndicatorGeometry::position 并做显示器边界限制。配置不进入原生后端，鼠标移动不重建文本或分配布局。
+`IndicatorUi.indicator_offset: [i16; 2]` 定义右上角相对鼠标热点的偏移。全局默认 [-12, 18]，仅单模式覆盖使用 Option 表示继承；0.10.22 移除旧 position/indicator_x_offset/indicator_y_offset，解析时拒绝这些字段。Indicator::label_size 为 presentation、Windows GPU/软件及 macOS 共享尺寸公式；Windows 后端不得再次 DPI 缩放标识符。配置覆盖、颜色、文字尺寸与偏移在内容更新时解析成 IndicatorGeometry；后续鼠标移动只加偏移并做边界限制，零文本解析及布局分配。

@@ -693,6 +693,18 @@ pub struct Indicator {
     pub style: LabelStyle,
 }
 
+impl Indicator {
+    /// Shared badge metrics. Backends must not apply another DPI layout scale.
+    pub fn label_size(character_count: usize, style: &LabelStyle) -> (f64, f64) {
+        (
+            (character_count as f64 * style.font_size * 0.75 + style.padding_x * 2.0)
+                .max(style.font_size * 2.0)
+                .ceil(),
+            (style.font_size * 1.4 + style.padding_y * 2.0).ceil(),
+        )
+    }
+}
+
 /// Copy-on-write storage for the static primitives in an overlay scene.
 ///
 /// Overlay scenes are cloned whenever the cursor marker or mode indicator

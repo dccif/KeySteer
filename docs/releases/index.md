@@ -5,11 +5,38 @@ outline: false
 
 # 更新日志 / Release Notes
 
+## 0.10.22
+
+- **破坏性改动：** 模式标识符移除 `position`、`indicator_x_offset`、`indicator_y_offset`，全局 `[mode_indicator.ui]` 和单模式 `[mode_indicator.modes.<模式>.ui]` 均只使用 `indicator_offset = [X, Y]`。旧字段会导致配置校验失败，请在升级前删除并迁移；即使已配置新数组，也必须删除旧字段。
+- 偏移以鼠标热点为原点，定位标识符的**右上角**；正 X 向右、正 Y 向下，范围为 -32768～32767。全局未配置时默认 `[-12, 18]`，单模式未配置时继承全局值。可在网页模拟器拖动锚点调整并导出配置。
+- 补齐代码内置 Normal 默认绑定：`.` 向左滚动、`/` 向右滚动，与发布的默认配置保持一致。
+
+- **Breaking change:** Removed mode-badge `position`, `indicator_x_offset`, and `indicator_y_offset`. Both `[mode_indicator.ui]` and `[mode_indicator.modes.<mode>.ui]` now use only `indicator_offset = [X, Y]`. Old fields fail configuration validation; remove and migrate them before upgrading, even if the new pair is already present.
+- The offset places the badge's **top-right corner** relative to the cursor hotspot. Positive X moves right and positive Y moves down; each integer ranges from -32768 to 32767. The global default is `[-12, 18]`; omitted per-mode offsets inherit it. Drag the anchor in the web simulator and export the result.
+- Added the missing embedded Normal defaults: `.` scrolls left and `/` scrolls right, matching the shipped configuration.
+
+### 迁移示例 / Migration example
+
+将旧的 `position = "bottom_left"`、`indicator_x_offset = -12`、`indicator_y_offset = 18` 三项删除，替换为下方配置。
+
+旧 `bottom_left` 可直接使用原 X/Y；旧 `bottom_right` 需在 X 上加标识符宽度，`top_left` 需从 Y 减标识符总高度，`top_right` 同时调整两者。宽高受字体、内边距和第二行按键提示影响，建议用网页拖动重新定位。单模式覆盖使用相同格式。其他样式字段不变。
+
+Remove `position = "bottom_left"`, `indicator_x_offset = -12`, and `indicator_y_offset = 18`, then use the shared configuration below.
+
+For old `bottom_left` placement, reuse X/Y directly. For `bottom_right`, add the badge width to X; for `top_left`, subtract the total badge height from Y; for `top_right`, apply both adjustments. Dimensions depend on font, padding, and the second held-input line, so dragging in the web editor is recommended. Per-mode overrides use the same format. Other style fields are unchanged.
+
+```toml
+[mode_indicator.ui]
+indicator_offset = [-12, 18]
+```
+
 ## 0.10.21
 
 - 网页模拟器新增「全局设置 → 模式标识符」，支持实时修改位置、偏移、字号、颜色和边框；各模式外观页保留可选覆盖，修改可导出为 TOML。
+- 模式标识符新增 `indicator_offset = [-12, 18]` 二维偏移（i16），网页可拖动右上角锚点；程序与网页统一尺寸和定位规则，消除 Windows 二次缩放造成的位置差异。保留全局及模式独立样式覆盖和旧配置兼容。配置示例见 [模式标识符样式与位置](../modes/normal.md#模式标识符样式与位置)。
 
-- 模式标识符支持按模式配置鼠标左下／右下／左上／右上位置和任意有符号偏移，并可独立覆盖字号、颜色等样式；默认保持原位置。配置示例见 [模式标识符样式与位置](https://dccif.github.io/KeySteer/en/modes/normal#模式标识符样式与位置)。
+- The web simulator adds **Global settings → Mode badge**, with live placement, offset, font, color, and border editing. Optional per-mode overrides remain available in Appearance, and changes export to TOML.
+- Mode badges add `indicator_offset = [-12, 18]` (an i16 pair) and a draggable top-right anchor in the web editor. Shared geometry removes Windows double-scaling placement differences. Global/per-mode styles and legacy placement settings remain supported. See [Mode badge style and position](../en/modes/normal.md#mode-badge-style-and-position).
 
 ## 0.10.20
 
@@ -17,13 +44,15 @@ outline: false
 - 支持通过 `primary` 临时借用 Normal，也可配置绑定继承；修复临时 Normal 中 `screen next` 等切屏指令的结果未交给临时模式处理的问题。
 - Text Input 默认隐藏模式文字提示。默认配置提供方向键、Backspace、Delete、Insert、Home／End 及 Ctrl／Shift 组合的注释示例，按需启用。
 
-- Added Text Input for temporary typing from Normal, with configurable entry, exit, and editing bindings.
-- Supports borrowing Normal with `primary` and optional binding inheritance; fixed screen-switch results being delivered to the base mode instead of the temporary mode.
-- Text Input hides its text badge by default. Home-row editing mappings and Ctrl/Shift variants are provided as commented, opt-in examples.
+- Added Text Input for temporary typing from Normal. Ordinary typing passes through, and standard bindings configure entry, exit, and editing shortcuts.
+- Supports borrowing Normal with `primary` and optional binding inheritance. Fixed screen-switch commands such as `screen next` delivering their results to the base mode instead of the temporary mode.
+- Text Input hides its text badge by default. Arrow, Backspace, Delete, Insert, Home/End, and Ctrl/Shift mappings are provided as commented, opt-in examples.
 
-### 简单启用与使用
+### 简单启用与使用 / Enable and use
 
 使用新版默认配置时，Normal 中按 **`\`** 即可进入。已有用户配置请将下面的入口加入现有 `[normal.bindings]`，其他配置合并到对应表中；不要重复创建同名表或覆盖原有绑定。
+
+With the new default configuration, press **`\`** in Normal. For an existing profile, add the entry to your current `[normal.bindings]` and merge the other settings into their corresponding tables. Do not create duplicate tables or replace your existing bindings.
 
 ```toml
 [normal.bindings]
@@ -39,6 +68,8 @@ temporary_mode_keys = ["primary"]
 
 # 可选：先向应用发送 Enter，再返回 Normal。
 # 用下面两行替换上面的合并绑定：
+# Optional: send Enter to the app before returning to Normal.
+# Replace the grouped binding above with these two lines:
 # '\ esc' = "normal"
 # enter = ["send enter", "normal"]
 
@@ -51,6 +82,12 @@ enabled = false
 3. 输入期间按住 `Primary` 可临时使用 Normal，例如用 H/J/K/L 移动鼠标；松开继续输入。`Primary` 使用现有 `key_aliases` 配置。
 
 默认返回键会被消费，Enter 不会提交给应用；需要提交时使用上面的注释序列。多行编辑或输入法需要 Enter 时，可把返回绑定改为 `'\ esc' = "normal"`。编辑组合键示例默认全部注释，取消所需行的注释即可启用。详见 [Normal 的临时文本输入](https://dccif.github.io/KeySteer/modes/normal#%E4%B8%B4%E6%97%B6%E8%BE%93%E5%85%A5%E6%96%87%E6%9C%AC)。
+
+1. Save the configuration and reload it from the tray/status-bar menu.
+2. Press `Primary+E` to enter Normal, then `\` to type; press `Enter`, `\`, or `Esc` to return to Normal.
+3. While typing, hold `Primary` to borrow Normal, for example H/J/K/L to move the pointer; release it to resume typing. `Primary` follows your existing `key_aliases` configuration.
+
+The default return keys are consumed, so Enter does not submit to the app. Use the commented sequence above when submission is needed. For multiline editing or an input method that needs Enter, use `'\ esc' = "normal"` instead. Editing chord examples are commented out by default; uncomment the ones you need. See [Temporary text input](../en/modes/normal.md#temporary-text-input).
 
 ## 0.10.19
 

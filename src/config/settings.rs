@@ -71,6 +71,8 @@ fn default_normal_bindings() -> Bindings {
         // Scroll takes effect immediately on a tap and repeats while held.
         ("m", "wheel_down"),
         (",", "wheel_up"),
+        (".", "scroll_left"),
+        ("/", "scroll_right"),
         // Pointer buttons.
         (";", "left_click"),
         ("'", "right_click"),
