@@ -2,6 +2,7 @@ export type StudioLocale = 'zh' | 'en'
 
 /** Display text only. Command values, paths and user content are never localized. */
 export const englishMessages: Record<string, string> = {
+  '单层只使用根层定位键，每次从整屏定位；Esc、Enter、Tab、Backspace、Space 保留 Normal 绑定，无需重置。': 'A single level uses only root selection keys and always targets the full screen. Esc, Enter, Tab, Backspace and Space keep their Normal bindings; no reset is needed.',
   'Normal 盲操定位': 'Normal blind positioning',
   '盲操定位': 'Blind positioning',
   '启用 Normal 盲操定位': 'Enable Normal blind positioning',

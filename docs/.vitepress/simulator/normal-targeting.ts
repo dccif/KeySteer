@@ -26,6 +26,13 @@ export function targetingMethod(settings: ConfigDocument): 'grid' | 'recursive_g
   return settings.method === 'recursive_grid' ? 'recursive_grid' : 'grid'
 }
 
+export function targetingSingleLevel(document: ConfigDocument): boolean {
+  const settings = targetingConfig(document)
+  if (!settings) return false
+  const method = targetingMethod(settings)
+  return Number(settings.max_depth ?? document[method]?.max_depth ?? (method === 'grid' ? 3 : 10)) === 1
+}
+
 export function targetingLayout(document: ConfigDocument, depth: number): TargetingLayout | undefined {
   const settings = targetingConfig(document)
   if (!settings) return undefined
@@ -47,7 +54,7 @@ export function targetingKeys(document: ConfigDocument): Set<string> {
   const settings = targetingConfig(document)
   if (!settings) return new Set()
   const method = targetingMethod(settings)
-  if (Number(settings.max_depth ?? document[method]?.max_depth ?? (method === 'grid' ? 3 : 10)) === 1) {
+  if (targetingSingleLevel(document)) {
     return new Set([...(targetingLayout(document, 0)?.keys ?? '')])
   }
   const alphabet = new Set([...String(settings.keys ?? document[method]?.keys ?? '')])

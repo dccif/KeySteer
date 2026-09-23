@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { blindTargetingInput, createBlindTargetingState, targetingKeys, targetingLayout } from './normal-targeting.ts'
+import { blindTargetingInput, createBlindTargetingState, targetingKeys, targetingLayout, targetingSingleLevel } from './normal-targeting.ts'
 
 const document = {
   normal: { targeting: { method: 'grid', grid_cols: 2, grid_rows: 2, keys: 'asdf', max_depth: 2 } },
@@ -48,6 +48,10 @@ test('Single-level targeting continuously selects root cells for either method',
     const config = { ...document, normal: { targeting: { method, grid_cols: 3, grid_rows: 2, keys: 'asdzxc', max_depth: 1, reset_on: [] } } }
     const state = createBlindTargetingState()
     assert.deepEqual([...targetingKeys(config)], [...'asdzxc'])
+    assert.equal(targetingSingleLevel(config), true)
+    for (const key of ['esc', 'enter', 'tab', 'backspace', 'space']) {
+      assert.deepEqual(blindTargetingInput(config, state, key), { handled: false })
+    }
     for (const key of ['a', 'c', 's', 's', 'z', 'x', 'd', 'tab', 'space', 'a']) {
       const result = blindTargetingInput(config, state, key)
       const index = 'asdzxc'.indexOf(key)

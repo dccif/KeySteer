@@ -433,14 +433,14 @@ fn single_level_targeting_leaves_normal_navigation_bindings_available() {
     for method in ["grid", "recursive_grid"] {
         let mut config = blind_config(method, "[]");
         config.normal.targeting.as_mut().unwrap().max_depth = Some(1);
-        for key in ["tab", "backspace", "space"] {
+        for key in ["esc", "enter", "tab", "backspace", "space"] {
             config.normal.bindings.insert(key.into(), Binding::parse("send enter").unwrap());
         }
         let (mut engine, mut backend, log) = blind_engine(&config);
-        for key in ["tab", "backspace", "space"] {
+        for key in ["esc", "enter", "tab", "backspace", "space"] {
             blind_tap(&mut engine, &mut backend, key);
         }
-        assert_eq!(log.lock().unwrap().sent.iter().filter(|(key, state)| key == "enter" && *state == KeyState::Down).count(), 3);
+        assert_eq!(log.lock().unwrap().sent.iter().filter(|(key, state)| key == "enter" && *state == KeyState::Down).count(), 5);
         config.normal.targeting.as_mut().unwrap().max_depth = Some(3);
         assert!(crate::app::configuration::compile(&config).is_err());
         config.normal.targeting.as_mut().unwrap().max_depth = Some(1);

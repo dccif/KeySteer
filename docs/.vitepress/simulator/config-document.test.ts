@@ -80,6 +80,24 @@ import {
   resolveConfigDocument,
 } from '../config-studio/document.ts'
 
+test('Nested reactive configuration survives binding edits and targeting toggles', async () => {
+  const { stringify } = await import('smol-toml')
+  const original = reactive({ normal: { bindings: { tab: 'toggle' } } })
+  const edited = reactive({ ...original })
+  const enabled = cloneConfigDocument(edited)
+  enabled.normal.targeting = { method: 'recursive_grid', layers: [reactive({ depth: 0, keys: 'asdf' })] }
+  const effective = resolveConfigDocument({}, reactive(enabled))
+  const exported = parseConfigDocument(stringify(effective)).document
+  assert.equal(exported.normal.targeting.method, 'recursive_grid')
+  assert.equal(exported.normal.bindings.tab, 'toggle')
+  const disabled = cloneConfigDocument({ ...reactive(enabled) })
+  delete disabled.normal.targeting
+  disabled.normal.bindings.tab = 'none'
+  assert.equal(original.normal.bindings.tab, 'toggle')
+  assert.equal(enabled.normal.targeting.layers[0].keys, 'asdf')
+  assert.equal(disabled.normal.targeting, undefined)
+})
+
 test('Vue reactive configuration can be cloned before a style update', () => {
   const document = reactive({ theme: { dark: { accent_alt: '#8FA2F0FF' } } })
   const clone = cloneConfigDocument(document)

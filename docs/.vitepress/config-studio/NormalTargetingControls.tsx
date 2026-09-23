@@ -1,7 +1,7 @@
 import { defineComponent } from 'vue'
 import { useStudioI18n } from './i18n.ts'
 import { cloneConfigDocument, type ConfigDocument } from './document.ts'
-import { targetingConfig, targetingKeys, targetingLayout, targetingMethod } from '../simulator/normal-targeting.ts'
+import { targetingConfig, targetingKeys, targetingLayout, targetingMethod, targetingSingleLevel } from '../simulator/normal-targeting.ts'
 import { effectiveBindings } from '../simulator/bindings.ts'
 
 const overrides = [
@@ -44,6 +44,7 @@ export default defineComponent({
         .filter(([chord, binding]) => keys.has(chord) && binding.value !== 'none')
         .map(([chord, binding]) => `${chord} → ${binding.value}`)
       const resetOn: string[] = effective?.reset_on ?? ['move', 'click']
+      const singleLevel = targetingSingleLevel(props.effectiveDocument)
       return <section class="ks-card ks-common-card ks-normal-targeting" data-config-path="normal.targeting">
         <div class="ks-toolbar ks-compact-toolbar"><div><h2>{t('Normal 盲操定位')}</h2>
           <p>{t('直接用网格键定位鼠标，不显示网格；细调仍使用 Normal 移动键。')}</p></div>
@@ -65,11 +66,11 @@ export default defineComponent({
                   }} /></span></label>
             })}
           </div>
-          <div class="ks-targeting-reset" data-config-path="normal.targeting.reset_on"><strong>{t('重新开始定位')}</strong>
+          {singleLevel ? <p>{t('单层只使用根层定位键，每次从整屏定位；Esc、Enter、Tab、Backspace、Space 保留 Normal 绑定，无需重置。')}</p> : <div class="ks-targeting-reset" data-config-path="normal.targeting.reset_on"><strong>{t('重新开始定位')}</strong>
             {(['move', 'click'] as const).map(reason => <label><input type="checkbox" checked={resetOn.includes(reason)} onChange={e => update(settings => {
               settings.reset_on = (e.target as HTMLInputElement).checked ? [...new Set([...resetOn, reason])] : resetOn.filter(item => item !== reason)
             })} />{reason === 'move' ? t('细调后') : t('点击后')}</label>)}
-          </div>
+          </div>}
           {method === 'recursive_grid' && <details class="ks-advanced-settings"><summary>{t('按层覆盖')} ({Array.isArray(layers) ? layers.length : 0})</summary>
             <p>{t('不设置时继承 Recursive Grid 的层；启用覆盖后整组替换。')}</p>
             <button type="button" onClick={() => update(settings => { settings.layers = configured.layers === undefined ? cloneConfigDocument({ layers: inheritedLayers }).layers : undefined })}>{configured.layers === undefined ? t('覆盖层配置') : t('恢复继承层')}</button>

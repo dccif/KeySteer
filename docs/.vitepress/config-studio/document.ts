@@ -32,7 +32,19 @@ const replacementTables = new Set([
 
 /** Clone Vue-backed configuration state into a plain writable document. */
 export function cloneConfigDocument(document: ConfigDocument): ConfigDocument {
-  return structuredClone(toRaw(document))
+  return cloneConfigValue(document)
+}
+
+// A shallow copy of a reactive document may retain proxies at any depth.
+// TOML values are arrays, records and primitives; unwrap each container while
+// copying once, rather than passing nested proxies to structuredClone.
+function cloneConfigValue<T>(value: T): T {
+  const raw = toRaw(value)
+  if (Array.isArray(raw)) return raw.map(item => cloneConfigValue(item)) as T
+  if (isRecord(raw)) return Object.fromEntries(
+    Object.entries(raw).map(([key, child]) => [key, cloneConfigValue(child)]),
+  ) as T
+  return raw
 }
 
 /** Parse an uploaded TOML file into the editable value model used by the UI. */
@@ -140,11 +152,11 @@ export function deleteConfigPath(document: ConfigDocument, path: string): void {
 }
 
 function mergeValue(defaultValue: unknown, configuredValue: unknown, path: string): unknown {
-  if (configuredValue === undefined) return structuredClone(toRaw(defaultValue))
+  if (configuredValue === undefined) return cloneConfigValue(defaultValue)
   if (replacementTables.has(path) || Array.isArray(configuredValue) || !isRecord(configuredValue)) {
-    return structuredClone(toRaw(configuredValue))
+    return cloneConfigValue(configuredValue)
   }
-  if (!isRecord(defaultValue)) return structuredClone(toRaw(configuredValue))
+  if (!isRecord(defaultValue)) return cloneConfigValue(configuredValue)
 
   const result: ConfigDocument = {}
   const keys = new Set([...Object.keys(defaultValue), ...Object.keys(configuredValue)])
