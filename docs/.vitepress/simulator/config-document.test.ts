@@ -20,7 +20,8 @@ test('usage checkpoint and quick-switch options survive sparse import and export
   assert.equal(effective.mode_usage.save_after_entries, 37)
   assert.equal(effective.quick_switch.hold_ms, 350)
   assert.equal(effective.quick_switch.ui.font_size, 28)
-  assert.deepEqual(parseConfigDocument(stringify(effective)).document, effective)
+  // TOML tables may have null prototypes; cloning compares configuration data.
+  assert.deepEqual(cloneConfigDocument(parseConfigDocument(stringify(effective)).document), cloneConfigDocument(effective))
 })
 
 test('window card defaults and custom styles survive browser export', async () => {
@@ -33,7 +34,7 @@ test('window card defaults and custom styles survive browser export', async () =
     const effective = resolveConfigDocument(defaults, uploaded)
     assert.equal(effective[mode].card.app_font_size, 0)
     assert.equal(effective[mode].card.title_font_size, 30)
-    assert.deepEqual(parseConfigDocument(stringify(effective)).document, effective)
+    assert.deepEqual(cloneConfigDocument(parseConfigDocument(stringify(effective)).document), cloneConfigDocument(effective))
     for (const child of ['window_quick', 'window_editor', 'window_restore', 'window_tab']) {
       if (child === 'window_editor') assert.deepEqual(effective[child].card.position, ['0%', '50%', '100%', '50%'])
       else assert.equal(effective[child].card, undefined)
@@ -155,7 +156,7 @@ test('text input keeps independent editing bindings and configurable temporary N
   const source = await readFile(new URL('../../../keysteer.default.toml', import.meta.url), 'utf8')
   const defaults = parseConfigDocument(source).document
   assert.equal(defaults.normal.bindings['\\'], 'text_input')
-  assert.deepEqual(defaults.text_input.bindings, { 'enter \\ esc': 'normal' })
+  assert.deepEqual(cloneConfigDocument(defaults.text_input.bindings), { 'enter \\ esc': 'normal' })
   assert.deepEqual(defaults.text_input.temporary_mode_keys, ['primary'])
   const examples = source.split('[text_input.bindings]')[1].split('[window]')[0].split('\n').filter(line => line.startsWith('# \"') && line.includes('primary+')).map(line => line.slice(2))
   assert.equal(examples.length, 36)

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { stringify } from 'smol-toml'
 import { resolveModeIndicator, modeIndicatorPreview } from './mode-indicator.ts'
-import { parseConfigDocument, resolveConfigDocument, setConfigPath, deleteConfigPath } from '../config-studio/document.ts'
+import { cloneConfigDocument, parseConfigDocument, resolveConfigDocument, setConfigPath, deleteConfigPath } from '../config-studio/document.ts'
 import { indicatorFields } from '../config-studio/indicator-fields.ts'
 import { fieldLocation, pages, searchSettings, utilitySearchFields } from '../config-studio/navigation.ts'
 
@@ -22,7 +22,8 @@ test('badge defaults, sparse overrides, reset inheritance and export match confi
   deleteConfigPath(document, 'mode_indicator.modes.normal.ui.font_size')
   assert.equal(resolveModeIndicator(resolveConfigDocument(defaults, document), 'normal').ui.font_size, 18)
   const exported = parseConfigDocument(stringify(document)).document
-  assert.deepEqual(exported, document)
+  // Edited tables and parsed TOML can have different prototypes.
+  assert.deepEqual(cloneConfigDocument(exported), cloneConfigDocument(document))
   assert.equal(exported.mode_indicator.modes.normal.ui.indicator_offset, undefined)
   for (const path of ['mode_indicator.ui', 'mode_indicator.modes.normal.ui']) {
     for (const field of ['position = "bottom_left"', 'indicator_x_offset = -12', 'indicator_y_offset = 18']) {
