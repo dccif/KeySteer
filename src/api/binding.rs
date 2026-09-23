@@ -206,6 +206,8 @@ pub enum Binding {
     Quit,
     /// Explicitly unbound: removes an inherited default.
     Disabled,
+    /// Feed a precompiled selection/navigation key to embedded positioning.
+    TargetingKey(Key),
 }
 
 impl Binding {
@@ -246,6 +248,12 @@ impl Binding {
 
         // Explicit forms, needed when the argument is not a bare word.
         match head {
+            "targeting_key" => {
+                if rest.len() != 1 {
+                    return Err("`targeting_key` needs exactly one grid key".into());
+                }
+                return Key::new(rest[0]).map(Binding::TargetingKey);
+            }
             "call" => {
                 let (verb, args) = rest
                     .split_first()
@@ -540,6 +548,7 @@ impl Binding {
             B::SpeedToggle(Speed::Slow) => "slow_toggle".into(),
             B::SpeedToggle(Speed::Fast) => "fast_toggle".into(),
             B::ToggleCursorFollowSelection => "follow".into(),
+            B::TargetingKey(key) => format!("targeting_key {key}"),
             B::Send(chord) => format!("send {}", chord.canonical()),
             B::Exec { program, args } if args.is_empty() => format!("exec {program}"),
             B::Exec { program, args } => format!("exec {program} {}", args.join(" ")),

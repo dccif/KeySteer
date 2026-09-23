@@ -16,6 +16,24 @@ passthrough_unbound_keys = true # Set false to restore keyboard exclusivity.
 
 <ModeVideo file="normal.mp4" title="Normal mode demonstration" description="Keyboard pointer movement, speed modifiers, scrolling, and common click operations." />
 
+## Blind grid positioning
+
+Normal can combine grid selection with HJKL fine movement, without an activation key, mode switch, or grid overlay:
+
+```toml
+[normal.targeting]
+method = "grid" # Default; "recursive_grid" is also supported.
+reset_on = ["move", "click"]
+```
+
+Omitting the section keeps the original Normal runtime. The selected top-level grid supplies its keys, geometry, depth limits and recursive layer overrides, even if that standalone mode is disabled. Normal always moves to each selected cell's center and does not inherit the grid's UI, follow setting or lifecycle.
+
+Reserve those selection keys plus Tab, Backspace and Space in Normal. Conflicts with local/inherited bindings or possible application overrides reject the configuration and are reported through `keysteer.log` and the available console. Remove/rebind conflicting actions, or use `none` to relinquish a key and mask inheritance. Modifier chords keep their existing resolution rules. `--check` also detects these conflicts; failed reloads retain the previous configuration.
+
+Tab/Backspace move back one level, Space clears the path, and neither moves the pointer. Root-level backtracking and reaching the terminal cell stay in Normal; Enter, Esc and clicks retain Normal bindings. `reset_on` accepts `move`, `click`, both, or `[]`: fine-movement commands and successful KeySteer clicks/double-clicks can end the path, so the next grid key starts from the current screen. Grid warps, physical mouse events, scrolling, press/release/toggle do not trigger these resets.
+
+The example is maintained in `keysteer.default.toml`, after Normal bindings. With shipped layouts, relinquish q/t/f/g/v/b for Grid or q for Recursive Grid, retaining Esc to exit. A `[normal.bindings]` table replaces the built-in table rather than merging into it.
+
 ## Default keys
 
 <KeyLayout
@@ -151,3 +169,6 @@ enabled = false
 `indicator_offset = [X, Y]` positions the badge's **top-right corner**. Positive X moves right; positive Y moves down. Both values are integers from -32768 to 32767. The default `[-12, 18]` puts that corner 12 left and 18 below the cursor. Drag the orange anchor in the editor, use arrow keys (Shift moves by 10), or enter the array. The whole badge is clamped to display edges.
 
 Individual modes can override these fields in tables such as `[mode_indicator.modes.normal.ui]`. As of 0.10.22, `position`, `indicator_x_offset`, and `indicator_y_offset` are removed. Use `indicator_offset = [X, Y]`; omitted offsets use the default or inherit the global setting. To show the Text Input badge, set `enabled = true` and use the same style fields in `[mode_indicator.modes.text_input.ui]`.
+
+
+Normal targeting geometry overrides: `grid_cols`, `grid_rows`, `keys`, and `max_depth` inherit from the selected method when omitted. With `method = "recursive_grid"`, `min_size_width`, `min_size_height`, and `layers` can also be overridden. An explicit `layers` list replaces all inherited layers; `layers = []` clears them. Overrides affect Normal only, accept no UI fields, and are resolved before geometry validation and binding-conflict compilation. See the commented example in `keysteer.default.toml`.

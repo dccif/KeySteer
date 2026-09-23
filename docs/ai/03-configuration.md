@@ -1,5 +1,13 @@
 # 配置、按键和持久化
 
+## Normal 盲操定位
+
+`normal.targeting` 是可选 boxed DTO，缺省为 None 且导出省略，不创建 reset_on 列表，默认 TOML 仅注释示例。存在时 `method` 默认 grid，也支持 recursive_grid；`reset_on` 默认 [move, click]，接受子集或空列表。引用对应顶层布局／层配置，即使独立模式关闭也验证该几何。无视图配置，不继承网格 lifecycle／follow，盲操每次选择均定位中心。
+
+mode_catalog 仅在启用时选择 NormalTargeting 实例并编译 TargetingKey 输入表。选区键、Tab/Backspace/Space 经别名解析后必须唯一；与 Normal 本地、继承链及潜在应用覆盖的非 none 单键冲突时编译报错，列出来源，不静默覆盖。Normal 的 none 表示让出键并屏蔽继承；应用覆盖的 none 同样让出。组合键继续走原 resolver。生成绑定不导出到 TOML；继承 Normal 的其他模式以编译期占位隔离生成键，保留本地绑定及原始输入处理。临时 Normal 使用其完整键表。
+
+`--check` 对启用 targeting 的配置额外运行计划编译，以报告同一冲突；普通启动错误沿现有日志边界报告，Reload 失败保留旧计划。唯一配置示例维护在 keysteer.default.toml 的 Normal 段。
+
 相交切换能力在配置编译时由已启用模式的绑定、应用覆盖和嵌套动作序列推导为 EngineSettings.window_overlap_enabled；无相关绑定时不发送相交请求。Session 只保留可空缓存指针，首次相交请求才分配缓存，普通窗口/音频路径不创建相交状态。运行时配置重载从启用变为禁用时，Backend::clear_window_overlap_cache 仅通知已有 worker：丢弃待执行相交请求，在 worker 中释放缓存；不启动新 worker。几何仍按实际操作时的系统数据核对。
 
 `[mode_usage].save_after_entries` 默认 100，必须是正 u32；不再使用分钟间隔。每次实际模式转换累计一次，工作区修改和正常退出也保存。workspace.ksw 的 v2 在 v1 预设记录后添加最多 256 条模式名与 u64 进入次数；v1 仍可读取，无统计时仍导出 v1。浏览器用十进制字符串保存 u64，避免 JS Number 精度丢失。
@@ -310,3 +318,6 @@ Normal 默认 `\` 绑定 `text_input`。`[text_input.bindings]` 默认 `'enter \
 支持 inherits／temporary_mode／temporary_mode_keys／temporary_mode_passthrough_keys。默认空继承，`temporary_mode_keys = ["primary"]` 借用 Normal，别名解析与其他模式一致。Primary+HJKL/U/I/O/T/Y 及 Ctrl、Shift 组合仅是注释示例，默认不启用；测试读取注释并显式启用，验证目标按键、修饰键及重复。
 
 `[mode_indicator.modes.text_input] enabled = false` 同时存在于内置默认值与发布 TOML，默认不显示文本输入模式文字；临时 Normal 仍使用 Normal 自己的指示器配置。
+
+
+`normal.targeting` 可覆盖 `grid_cols`、`grid_rows`、`keys`、`max_depth`，未写的字段继承所选 method 的原配置。`method = "recursive_grid"` 另支持 `min_size_width`、`min_size_height` 和 `layers`；显式 layers 整组替换继承列表，`layers = []` 清空。覆盖只影响 Normal，不改变独立网格模式，不接受 UI 字段。布局校验、键位冲突检测和控制器使用同一份合并结果，仅在加载配置时解析。完整注释示例见 `keysteer.default.toml`。

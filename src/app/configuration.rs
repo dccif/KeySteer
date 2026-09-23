@@ -184,6 +184,9 @@ pub fn compile(config: &ConfigFile) -> Result<RuntimePlan, String> {
 
     let mut specs = super::mode_catalog::built_in_specs(config)?;
     specs.extend(super::mode_catalog::bundled_specs(config)?);
+    if config.normal.targeting.is_some() {
+        super::mode_catalog::compile_normal_targeting(config, &mut specs)?;
+    }
     let mut ids: Vec<_> = specs.iter().map(|spec| spec.id()).collect();
     ids.sort();
     let duplicate = ids.windows(2).find(|ids| ids[0] == ids[1]);

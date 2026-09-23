@@ -13,9 +13,8 @@ use crate::api::lifecycle::TargetingLifecycle;
 use crate::api::overlay::Color;
 use crate::api::presentation::{GridLayout, GridView, View};
 use crate::api::theme::Palette;
-use smallvec::SmallVec;
 
-use super::targeting::TargetingSession;
+use super::targeting::{Layout, Selection, TargetingController};
 
 pub use crate::api::presentation::GridStyle as VisualSettings;
 
@@ -30,13 +29,6 @@ pub struct Settings {
     pub ui: VisualSettings,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-struct Layout {
-    rows: usize,
-    cols: usize,
-    keys: Vec<char>,
-}
-
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 struct Cell {
@@ -44,36 +36,40 @@ struct Cell {
 }
 
 pub struct GridMode {
-    layout: Layout,
-    max_depth: u32,
+    controller: TargetingController,
     ui: VisualSettings,
-    session: TargetingSession,
 }
 
 impl GridMode {
     pub fn new(settings: Settings) -> Self {
-        Self {
-            layout: Layout {
+        let controller = TargetingController::new(
+            Layout {
                 rows: settings.grid_rows.max(1) as usize,
                 cols: settings.grid_cols.max(1) as usize,
                 keys: settings.keys.chars().collect(),
             },
-            max_depth: settings.max_depth.max(1),
+            &[],
+            settings.max_depth,
+            None,
+            settings.cursor_follow_selection,
+            settings.lifecycle,
+        );
+        Self {
+            controller,
             ui: settings.ui,
-            session: TargetingSession::new(settings.cursor_follow_selection, settings.lifecycle),
         }
     }
 
     fn depth(&self) -> u32 {
-        self.session.depth()
+        self.controller.session.depth()
     }
 
     fn current(&self) -> Option<Rect> {
-        self.session.current()
+        self.controller.session.current()
     }
 
     fn root(&self) -> Option<Rect> {
-        self.session.root()
+        self.controller.session.root()
     }
 
     #[cfg(test)]
@@ -81,13 +77,18 @@ impl GridMode {
         let Some(area) = self.current() else {
             return Vec::new();
         };
-        self.layout
+        self.controller
+            .layout_at(0)
             .keys
             .iter()
             .enumerate()
             .filter_map(|(index, _)| {
-                area.subdivision(self.layout.rows, self.layout.cols, index)
-                    .map(|rect| Cell { rect })
+                area.subdivision(
+                    self.controller.layout_at(0).rows,
+                    self.controller.layout_at(0).cols,
+                    index,
+                )
+                .map(|rect| Cell { rect })
             })
             .collect()
     }
@@ -95,16 +96,16 @@ impl GridMode {
     fn view(&self) -> GridView<'_> {
         GridView {
             layout: GridLayout {
-                rows: self.layout.rows,
-                cols: self.layout.cols,
-                keys: &self.layout.keys,
+                rows: self.controller.layout_at(0).rows,
+                cols: self.controller.layout_at(0).cols,
+                keys: &self.controller.layout_at(0).keys,
             },
             ui: &self.ui,
             current: self.current(),
             root: self.root(),
-            terminal: self.session.terminal,
+            terminal: self.controller.session.terminal,
             depth: self.depth(),
-            max_depth: self.max_depth,
+            max_depth: self.controller.max_depth,
         }
     }
 
@@ -114,139 +115,50 @@ impl GridMode {
 
     fn toggle_cursor_follow(&mut self, ctx: &HostContext<'_>) -> CommandBatch {
         let mut commands = CommandBatch::new();
-        if let Some(area) = self.session.toggle_cursor_follow() {
+        if let Some(area) = self.controller.session.toggle_cursor_follow() {
             commands.push(Command::warp_to(area.center()));
         }
         commands.extend(self.redraw(ctx));
         commands
     }
 
-    fn reset(&mut self, bounds: Rect) {
-        self.session.reset(bounds);
-    }
-
-    fn retarget(&mut self, bounds: Rect, preserve: bool, ctx: &HostContext<'_>) -> CommandBatch {
-        let path = if preserve {
-            self.session.path.clone()
-        } else {
-            SmallVec::new()
-        };
-        let was_finished = preserve && self.session.finished;
-        let follow = self.session.cursor_follow_selection;
-        self.reset(bounds);
-        if preserve {
-            self.session.cursor_follow_selection = follow;
-            for index in path {
-                let Some(cell) = self
-                    .current()
-                    .and_then(|area| area.subdivision(self.layout.rows, self.layout.cols, index))
-                else {
-                    break;
-                };
-                self.session.stack.push(cell);
-                self.session.path.push(index);
-            }
-            self.session.terminal = self.depth() >= self.max_depth;
-            self.session.finished = was_finished;
-        }
-        let mut commands =
-            CommandBatch::one(Command::warp_to(self.current().unwrap_or(bounds).center()));
-        commands.extend(self.redraw(ctx));
-        commands
-    }
-
-    fn select(&mut self, index: usize, cell: Rect, ctx: &HostContext<'_>) -> CommandBatch {
-        self.session.stack.push(cell);
-        self.session.path.push(index);
-        if self.depth() >= self.max_depth {
-            self.session.terminal = true;
-        }
-
-        if self.session.terminal {
-            let mut commands = CommandBatch::two(
-                Command::warp_to(cell.center()),
-                ctx.present(View::Grid(self.view())),
-            );
-            commands.push(Command::FinishMode {
-                cause: FinishCause::Selection,
-            });
-            return commands;
-        }
-
-        let mut commands = CommandBatch::new();
-        if self.session.cursor_follow_selection {
-            commands.push(Command::warp_to(cell.center()));
-        }
-        commands.extend(self.redraw(ctx));
-        commands
-    }
-
-    fn commit_current(&self, ctx: &HostContext<'_>) -> CommandBatch {
-        let Some(area) = self.current() else {
-            return self.cancel();
-        };
-        let mut commands = CommandBatch::two(
-            Command::warp_to(area.center()),
-            ctx.present(View::Grid(self.view())),
-        );
-        commands.push(Command::FinishMode {
-            cause: FinishCause::Selection,
-        });
-        commands
-    }
-
     fn cancel(&self) -> CommandBatch {
         CommandBatch::two(
             Command::HideOverlay,
-            Command::SwitchMode(self.session.return_mode.clone()),
+            Command::SwitchMode(self.controller.session.return_mode.clone()),
         )
     }
 
-    fn key_down(&mut self, key: &Key, ctx: &HostContext<'_>) -> CommandBatch {
-        match key.as_str() {
-            "esc" => return self.cancel(),
-            "enter" => return self.commit_current(ctx),
-            "backspace" | "tab" => {
-                if self.session.stack.len() <= 1 {
-                    return self.cancel();
-                }
-                self.session.stack.pop();
-                self.session.path.pop();
-                self.session.terminal = false;
-                self.session.finished = false;
-                return self.redraw(ctx);
-            }
-            "space" => {
-                if let Some(root) = self.root() {
-                    self.reset(root);
-                    return self.redraw(ctx);
-                }
-                return self.cancel();
-            }
-            _ => {}
-        }
+    fn reset(&mut self, bounds: Rect) {
+        self.controller.reset(bounds);
+    }
 
-        if self.session.terminal || self.session.finished {
-            return CommandBatch::new();
+    fn retarget(&mut self, bounds: Rect, preserve: bool, ctx: &HostContext<'_>) -> CommandBatch {
+        let point = self.controller.retarget(bounds, preserve);
+        let mut commands = CommandBatch::one(Command::warp_to(point));
+        commands.extend(self.redraw(ctx));
+        commands
+    }
+
+    fn key_down(&mut self, key: &Key, ctx: &HostContext<'_>) -> CommandBatch {
+        match self.controller.input(key, ctx.active_bounds()) {
+            Selection::Ignored => CommandBatch::new(),
+            Selection::Cancel => self.cancel(),
+            Selection::Changed => self.redraw(ctx),
+            Selection::Follow(point) => {
+                let mut commands = CommandBatch::one(Command::warp_to(point));
+                commands.extend(self.redraw(ctx));
+                commands
+            }
+            Selection::Commit(point) => {
+                let mut commands = CommandBatch::one(Command::warp_to(point));
+                commands.extend(self.redraw(ctx));
+                commands.push(Command::FinishMode {
+                    cause: FinishCause::Selection,
+                });
+                commands
+            }
         }
-        let Some(key) = key.as_char() else {
-            return CommandBatch::new();
-        };
-        let Some(index) = self
-            .layout
-            .keys
-            .iter()
-            .position(|candidate| *candidate == key)
-        else {
-            return CommandBatch::new();
-        };
-        let Some(cell) = self
-            .current()
-            .and_then(|area| area.subdivision(self.layout.rows, self.layout.cols, index))
-        else {
-            return CommandBatch::new();
-        };
-        self.select(index, cell, ctx)
     }
 }
 
@@ -260,8 +172,7 @@ impl Mode for GridMode {
     }
 
     fn claims_key(&self, key: &Key) -> bool {
-        key.as_char()
-            .is_some_and(|character| self.layout.keys.contains(&character))
+        self.controller.claims_key(key)
     }
 
     fn available_keys(&self) -> Vec<(String, String)> {
@@ -285,12 +196,12 @@ impl Mode for GridMode {
     fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
         match event {
             ModeEvent::Pushed { previous } => {
-                self.session.return_mode = previous.clone();
+                self.controller.session.return_mode = previous.clone();
                 self.reset(ctx.active_bounds());
                 self.redraw(ctx)
             }
             ModeEvent::Activated { previous } => {
-                self.session.return_mode = previous.clone().unwrap_or_else(ModeId::idle);
+                self.controller.session.return_mode = previous.clone().unwrap_or_else(ModeId::idle);
                 self.reset(ctx.active_bounds());
                 self.redraw(ctx)
             }
@@ -298,19 +209,21 @@ impl Mode for GridMode {
                 self.reset(ctx.active_bounds());
                 self.redraw(ctx)
             }
-            ModeEvent::FinishRequested { .. } if self.session.finished => CommandBatch::new(),
+            ModeEvent::FinishRequested { .. } if self.controller.session.finished => {
+                CommandBatch::new()
+            }
             ModeEvent::FinishRequested { .. } => {
-                self.session.finished = true;
+                self.controller.session.finished = true;
                 let mut commands = self.redraw(ctx);
                 commands.extend(super::targeting::lifecycle_commands(
-                    &self.session.lifecycle.after_finish,
-                    &self.session.return_mode,
+                    &self.controller.session.lifecycle.after_finish,
+                    &self.controller.session.return_mode,
                 ));
                 commands
             }
             ModeEvent::Clicked { .. } => super::targeting::lifecycle_commands(
-                &self.session.lifecycle.after_click,
-                &self.session.return_mode,
+                &self.controller.session.lifecycle.after_click,
+                &self.controller.session.return_mode,
             ),
             ModeEvent::ScreensChanged(_) => {
                 self.reset(ctx.active_bounds());
@@ -325,10 +238,10 @@ impl Mode for GridMode {
             }
             ModeEvent::Resumed => self.redraw(ctx),
             ModeEvent::Deactivated => {
-                self.session.stack.clear();
-                self.session.path.clear();
-                self.session.terminal = false;
-                self.session.finished = false;
+                self.controller.session.stack.clear();
+                self.controller.session.path.clear();
+                self.controller.session.terminal = false;
+                self.controller.session.finished = false;
                 CommandBatch::new()
             }
             ModeEvent::Binding {
@@ -499,8 +412,12 @@ mod tests {
         let scene = scene_of(&out);
 
         assert_eq!(scene.clip, Some(env.screens[0].bounds));
-        let suffix_count = mode.layout.keys.len() * mode.layout.keys.len();
-        assert_eq!(scene.labels.len(), suffix_count + mode.layout.keys.len());
+        let suffix_count =
+            mode.controller.layout_at(0).keys.len() * mode.controller.layout_at(0).keys.len();
+        assert_eq!(
+            scene.labels.len(),
+            suffix_count + mode.controller.layout_at(0).keys.len()
+        );
         assert_eq!(
             scene
                 .labels
@@ -556,9 +473,9 @@ mod tests {
         assert_eq!(rectangles, 1);
         assert_eq!(
             lines,
-            mode.layout.cols - 1 + mode.layout.rows - 1
-                + mode.layout.cols * (mode.layout.cols - 1)
-                + mode.layout.rows * (mode.layout.rows - 1)
+            mode.controller.layout_at(0).cols - 1 + mode.controller.layout_at(0).rows - 1
+                + mode.controller.layout_at(0).cols * (mode.controller.layout_at(0).cols - 1)
+                + mode.controller.layout_at(0).rows * (mode.controller.layout_at(0).rows - 1)
         );
         assert!(scene.labels.iter().all(|label| {
             label.fit_to_text
@@ -577,7 +494,7 @@ mod tests {
         let out = press(&mut mode, &env, "1");
         let scene = scene_of(&out);
         assert_eq!(mode.depth(), 1);
-        assert_eq!(scene.labels.len(), mode.layout.keys.len());
+        assert_eq!(scene.labels.len(), mode.controller.layout_at(0).keys.len());
         assert_eq!(
             scene
                 .labels
@@ -629,14 +546,14 @@ mod tests {
         let out = press(&mut mode, &env, "1");
         assert_eq!(mode.current(), Some(second));
         assert_eq!(mode.depth(), 2);
-        assert!(!mode.session.terminal);
+        assert!(!mode.controller.session.terminal);
         assert!(out.contains(&Command::warp_to(second.center())));
 
         let third = mode.cells()[0].rect;
         let out = press(&mut mode, &env, "1");
         assert_eq!(mode.current(), Some(third));
         assert_eq!(mode.depth(), 3);
-        assert!(mode.session.terminal);
+        assert!(mode.controller.session.terminal);
         assert!(out.contains(&Command::warp_to(third.center())));
         assert!(
             out.iter()
@@ -684,7 +601,10 @@ mod tests {
         let third_layer = press(&mut mode, &env, "1");
         let labels = &scene_of(&third_layer).labels;
         assert_eq!(mode.depth(), 2);
-        assert_eq!(labels.len(), mode.layout.rows * mode.layout.cols);
+        assert_eq!(
+            labels.len(),
+            mode.controller.layout_at(0).rows * mode.controller.layout_at(0).cols
+        );
         assert!(
             labels
                 .iter()
@@ -705,7 +625,7 @@ mod tests {
         activate(&mut mode, &env);
 
         toggle_follow(&mut mode, &env);
-        assert!(!mode.session.cursor_follow_selection);
+        assert!(!mode.controller.session.cursor_follow_selection);
         let out = press(&mut mode, &env, "1");
         assert!(
             !out.iter()
@@ -725,7 +645,7 @@ mod tests {
 
         let out = toggle_follow(&mut mode, &env);
 
-        assert!(mode.session.cursor_follow_selection);
+        assert!(mode.controller.session.cursor_follow_selection);
         assert_eq!(mode.depth(), depth, "toggle must not select another layer");
         assert!(out.contains(&Command::warp_to(selected.center())));
         assert!(
@@ -766,7 +686,7 @@ mod tests {
         activate(&mut mode, &env);
         press(&mut mode, &env, "q");
         press(&mut mode, &env, "w");
-        assert_eq!(mode.session.path.as_slice(), [5, 6]);
+        assert_eq!(mode.controller.session.path.as_slice(), [5, 6]);
         let target = Screen {
             bounds: Rect::new(1000.0, 0.0, 1600.0, 900.0),
             work_area: Rect::new(1000.0, 0.0, 1600.0, 900.0),
@@ -782,7 +702,7 @@ mod tests {
             },
             &env.ctx(),
         );
-        assert_eq!(mode.session.path.as_slice(), [5, 6]);
+        assert_eq!(mode.controller.session.path.as_slice(), [5, 6]);
         assert_eq!(mode.depth(), 2);
         assert_eq!(scene_of(&out).clip, Some(target.bounds));
         assert!(out.contains(&Command::warp_to(mode.current().unwrap().center())));
@@ -794,7 +714,7 @@ mod tests {
             },
             &env.ctx(),
         );
-        assert!(mode.session.path.is_empty());
+        assert!(mode.controller.session.path.is_empty());
         assert_eq!(mode.depth(), 0);
         assert_eq!(mode.current(), Some(target.bounds));
         assert_eq!(scene_of(&out).clip, Some(target.bounds));
@@ -811,7 +731,7 @@ mod tests {
 
         press(&mut mode, &env, "backspace");
         assert_eq!(mode.depth(), 1);
-        assert!(!mode.session.terminal);
+        assert!(!mode.controller.session.terminal);
         press(&mut mode, &env, "space");
         assert_eq!(mode.depth(), 0);
         assert_eq!(mode.current(), Some(env.screens[0].bounds));
@@ -833,10 +753,13 @@ mod tests {
             },
             &env.ctx(),
         );
-        assert!(mode.session.finished);
+        assert!(mode.controller.session.finished);
         assert_eq!(mode.current(), selected);
         let scene = scene_of(&finished);
-        assert_eq!(scene.labels.len(), mode.layout.rows * mode.layout.cols);
+        assert_eq!(
+            scene.labels.len(),
+            mode.controller.layout_at(0).rows * mode.controller.layout_at(0).cols
+        );
         assert!(
             scene
                 .shapes
@@ -860,7 +783,7 @@ mod tests {
         );
 
         press(&mut mode, &env, "backspace");
-        assert!(!mode.session.finished);
+        assert!(!mode.controller.session.finished);
         assert_eq!(mode.depth(), 0);
     }
 

@@ -130,6 +130,173 @@ pub fn normal(config: &Config) -> NormalMode {
     NormalMode::new(normal_settings(config))
 }
 
+/// Select the concrete runtime once; ordinary Normal retains its original
+/// object size and frame/input implementation when targeting is absent.
+fn normal_instance(config: &Config) -> Box<dyn Mode> {
+    use crate::config::TargetingReset;
+    use modes::targeting::{Layout, TargetingController};
+    let Some(targeting) = &config.normal.targeting else {
+        return Box::new(normal(config));
+    };
+    let geometry = targeting.resolve(config);
+    let layers: Vec<_> = geometry
+        .layers
+        .iter()
+        .map(|layer| modes::targeting::LayerSettings {
+            depth: layer.depth,
+            grid_cols: layer.grid_cols,
+            grid_rows: layer.grid_rows,
+            keys: layer.keys.clone(),
+        })
+        .collect();
+    let controller = TargetingController::new(
+        Layout {
+            rows: geometry.grid_rows as usize,
+            cols: geometry.grid_cols as usize,
+            keys: geometry.keys.chars().collect(),
+        },
+        &layers,
+        geometry.max_depth,
+        geometry
+            .min_size
+            .map(|(width, height)| (width as f64, height as f64)),
+        true,
+        crate::api::TargetingLifecycle::default(),
+    );
+    Box::new(modes::normal_targeting::NormalTargeting::new(
+        normal(config),
+        controller,
+        targeting.reset_on.contains(&TargetingReset::Move),
+        targeting.reset_on.contains(&TargetingReset::Click),
+    ))
+}
+
+/// Compile and validate the optional input alphabet once. No registry/runtime
+/// fields or conflict checks are added to ordinary input processing.
+pub(crate) fn compile_normal_targeting(
+    config: &Config,
+    specs: &mut [ModeSpec],
+) -> Result<(), String> {
+    use crate::api::{Binding, Key, KeyChord};
+    use std::collections::{BTreeMap, BTreeSet};
+    let Some(targeting) = &config.normal.targeting else {
+        return Ok(());
+    };
+    let geometry = targeting.resolve(config);
+    let mut alphabet = std::iter::once(geometry.keys)
+        .chain(
+            geometry
+                .layers
+                .iter()
+                .filter_map(|layer| layer.keys.as_deref()),
+        )
+        .flat_map(str::chars)
+        .map(|ch| ch.to_string())
+        .collect::<BTreeSet<_>>();
+    alphabet.extend(["tab", "backspace", "space"].map(str::to_owned));
+    let mut generated = BTreeMap::new();
+    for name in alphabet {
+        let chord = KeyChord::parse_with_aliases(&name, config.resolved_key_aliases())?;
+        if chord.keys().len() != 1 || chord.activation_key().is_modifier() {
+            return Err(format!(
+                "normal.targeting key {name:?} must resolve to a single non-modifier key"
+            ));
+        }
+        let binding = Binding::TargetingKey(Key::new(&name)?);
+        if generated.insert(chord.canonical(), binding).is_some() {
+            return Err(format!(
+                "normal.targeting key {name:?} collides with another selection/control key after aliases"
+            ));
+        }
+    }
+    let Some(normal) = specs.iter().position(|spec| spec.id() == ModeId::normal()) else {
+        return Err("normal.targeting requires the Normal mode in the catalog".into());
+    };
+    let mut pending = vec![ModeId::normal()];
+    let mut visited = BTreeSet::new();
+    let mut conflicts = BTreeSet::new();
+    // Every possible inherited application override is checked up front. The
+    // feature cannot become partially unusable only after focus changes.
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id.clone()) {
+            continue;
+        }
+        let Some(spec) = specs.iter().find(|spec| spec.id() == id) else {
+            continue;
+        };
+        pending.extend(spec.route.inherits.iter().cloned());
+        for (scope, bindings) in std::iter::once((id.to_string(), &spec.route.bindings)).chain(
+            spec.route
+                .app_overrides
+                .iter()
+                .map(|entry| (format!("{id} app {:?}", entry.pattern), &entry.bindings)),
+        ) {
+            for (text, binding) in bindings {
+                let chord = KeyChord::parse_with_aliases(text, config.resolved_key_aliases())?;
+                let Some(expected) = generated.get(&chord.canonical()) else {
+                    continue;
+                };
+                // An explicit Normal 'none' relinquishes its old single-key
+                // action and masks inherited conflicts. App overrides still
+                // require validation, because they replace that local entry.
+                if id != ModeId::normal()
+                    && specs[normal].route.bindings.get(&chord.canonical())
+                        == Some(&Binding::Disabled)
+                {
+                    continue;
+                }
+                if binding != &Binding::Disabled && binding != expected {
+                    conflicts.insert(format!(
+                        "{} = {} ({scope})",
+                        chord.canonical(),
+                        binding.canonical()
+                    ));
+                }
+            }
+        }
+    }
+    if !conflicts.is_empty() {
+        return Err(format!(
+            "normal.targeting conflicts: {}. Rebind the grid keys or remove these Normal bindings (use none to relinquish an inherited/default action).",
+            conflicts.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    // Keep generated inputs local to Normal: inheritors retain their own raw
+    // key behavior. Temporary Normal still accesses Normal's compiled table.
+    let mut inheritors = BTreeSet::from([ModeId::normal()]);
+    loop {
+        let before = inheritors.len();
+        for spec in specs.iter() {
+            if spec.route.inherits.iter().any(|id| inheritors.contains(id)) {
+                inheritors.insert(spec.id());
+            }
+        }
+        if inheritors.len() == before {
+            break;
+        }
+    }
+    for spec in specs
+        .iter_mut()
+        .filter(|spec| spec.id() != ModeId::normal() && inheritors.contains(&spec.id()))
+    {
+        for name in generated.keys() {
+            spec.route
+                .bindings
+                .entry(name.clone())
+                .or_insert(Binding::Disabled);
+        }
+    }
+    for entry in &mut specs[normal].route.app_overrides {
+        for (key, binding) in &generated {
+            if entry.bindings.get(key) == Some(&Binding::Disabled) {
+                entry.bindings.insert(key.clone(), binding.clone());
+            }
+        }
+    }
+    specs[normal].route.bindings.extend(generated);
+    Ok(())
+}
+
 #[doc(hidden)]
 pub fn grid(config: &Config) -> GridMode {
     GridMode::new(grid_settings(config))
@@ -150,7 +317,7 @@ pub fn hint(config: &Config) -> HintMode {
 pub fn built_in(config: &Config) -> Vec<Box<dyn Mode>> {
     let mut catalog: Vec<Box<dyn Mode>> = vec![
         Box::new(IdleMode::new()),
-        Box::new(normal(config)),
+        normal_instance(config),
         Box::new(modes::text_input::TextInputMode::new()),
     ];
     if config.grid.enabled {
@@ -284,7 +451,7 @@ pub(crate) fn built_in_specs(config: &Config) -> Result<Vec<ModeSpec>, String> {
         )?,
     ));
     specs.push(ModeSpec::built_in(
-        Box::new(normal(config)),
+        normal_instance(config),
         compile_route(
             &config.normal.bindings,
             &config.normal.inherits,
@@ -480,7 +647,10 @@ mod tests {
         config.window_restore.enabled = false;
         config.window_tab.enabled = false;
         let ids: Vec<_> = built_in(&config).iter().map(|mode| mode.id()).collect();
-        assert_eq!(ids, vec![ModeId::idle(), ModeId::normal(), ModeId::text_input()]);
+        assert_eq!(
+            ids,
+            vec![ModeId::idle(), ModeId::normal(), ModeId::text_input()]
+        );
     }
 
     #[test]

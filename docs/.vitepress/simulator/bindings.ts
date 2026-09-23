@@ -27,6 +27,21 @@ export function effectiveBindings(
   return all
 }
 
+/** The keycap legend shows a temporary mode's actions only while its trigger is held. */
+export function displayedBindings(
+  document: BindingDocument,
+  mode: string,
+  temporaryHeld: boolean,
+): Map<string, ResolvedBinding> {
+  const bindings = effectiveBindings(document, mode)
+  const borrowed = asRecord(document[mode]).temporary_mode
+  if (!borrowed || temporaryHeld) return bindings
+  for (const [chord, binding] of bindings) {
+    if (binding.source === borrowed) bindings.delete(chord)
+  }
+  return bindings
+}
+
 function collectBindings(
   document: BindingDocument,
   mode: string,

@@ -46,7 +46,8 @@ use aliases::{
     platform_warning,
 };
 pub use settings::{
-    Grid, GridLayer, GridUi, Normal, Pointer, RecursiveGrid, RecursiveGridUi, Scroll, TextInput, UiHint,
+    Grid, GridLayer, GridUi, Normal, NormalTargeting, Pointer, RecursiveGrid, RecursiveGridUi,
+    Scroll, TargetingMethod, TargetingReset, TextInput, UiHint,
 };
 pub use store::{ConfigStore, ReplaceFile};
 pub use theme::{Palette, Theme, ThemeColors, ThemedColor};
@@ -539,7 +540,11 @@ impl ConfigFile {
         let aliases = self.resolved_key_aliases.clone();
         normalize_binding_keys(&mut self.hotkeys, "[hotkeys]", &aliases)?;
         normalize_binding_keys(&mut self.normal.bindings, "[normal.bindings]", &aliases)?;
-        normalize_binding_keys(&mut self.text_input.bindings, "[text_input.bindings]", &aliases)?;
+        normalize_binding_keys(
+            &mut self.text_input.bindings,
+            "[text_input.bindings]",
+            &aliases,
+        )?;
         for (name, mode) in self.window_modes_mut() {
             normalize_binding_keys(&mut mode.bindings, &format!("[{name}.bindings]"), &aliases)?;
             for over in &mut mode.app_configs {

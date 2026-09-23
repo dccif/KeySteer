@@ -50,13 +50,13 @@ test('badge preview follows signed offsets, edges and theme overrides', () => {
 })
 
 test('offset pair has identical anchor and dimensions on Windows and macOS', () => {
-  for (const platform of ['windows', 'macos']) for (const [pair, left, top] of [[[-12, 18], 410, 318], [[40, 30], 462, 330]] as const) {
+  for (const platform of ['windows', 'macos']) for (const [pair, left, top] of [[[-12, 18], 413.8, 318], [[40, 30], 465.8, 330]] as const) {
     const document = resolveConfigDocument(defaults, { mode_indicator: { ui: { indicator_offset: [...pair] } } })
     const badge = modeIndicatorPreview(document, 'normal', 'light', { x: 50, y: 50 }, undefined, { platform })
     assert.equal(badge.style.fontSize, '11px')
-    assert.equal(badge.style.width, '58px')
+    assert.ok(Math.abs(parseFloat(badge.style.width) - 54.2) < 1e-9)
     assert.equal(parseFloat(badge.style.left), left)
-    assert.equal(badge.style.height, '20px')
+    assert.equal(badge.style.height, '15px')
     assert.equal(parseFloat(badge.style.top), top)
     assert.equal(badge.style.borderRadius, '4px')
     assert.equal(badge.style.boxShadow, 'inset 0 0 0 1px #465FBCFF')

@@ -179,6 +179,27 @@ long_press_toggle_ms = 500
 # latches are unaffected. Set to 0 to keep manual release.
 auto_release_ms = 0
 
+# Optional blind grid positioning in Normal; no activation key or grid overlay.
+# [normal.targeting]
+# method = "grid"
+# reset_on = ["move", "click"]
+# Optional geometry overrides; omitted fields inherit the selected method above.
+# These affect Normal only; standalone grid/recursive_grid and their UI stay unchanged.
+# grid_cols = 2
+# grid_rows = 2
+# keys = "1234"
+# max_depth = 3
+# Recursive_grid only (method = "recursive_grid"):
+# min_size_width = 1
+# min_size_height = 1
+# layers = [] # Replace the whole inherited list; [] clears all layer overrides.
+# Or use per-depth entries (do not also specify layers = []):
+# [[normal.targeting.layers]]
+# depth = 0
+# grid_cols = 4
+# grid_rows = 1
+# keys = "1234"
+
 # ---------------------------------------------------------------------------
 # normal — the working mode
 #
@@ -186,7 +207,6 @@ auto_release_ms = 0
 # such as `hjkl` are captured; unbound keys and unconfigured modifier chords
 # pass through when `passthrough_unbound_keys` is enabled.
 # ---------------------------------------------------------------------------
-
 [normal.bindings]
 "?" = "key_help"
 # Temporarily pass typing to the focused application; rebind freely.
@@ -254,6 +274,8 @@ y = "end"
 
 # Bare q is safe in normal, which has no q-labelled cells.
 "q esc" = "idle"
+
+
 
 # ---------------------------------------------------------------------------
 # text_input — temporary native text entry, then return to normal

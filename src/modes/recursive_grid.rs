@@ -17,17 +17,10 @@ use crate::api::lifecycle::TargetingLifecycle;
 use crate::api::overlay::Color;
 use crate::api::presentation::{GridLayout, RecursiveGridView, View};
 use crate::api::theme::Palette;
-use smallvec::SmallVec;
 
-use super::targeting::TargetingSession;
+use super::targeting::{Layout, Selection, TargetingController};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LayerSettings {
-    pub depth: u32,
-    pub grid_cols: Option<u32>,
-    pub grid_rows: Option<u32>,
-    pub keys: Option<String>,
-}
+pub use super::targeting::LayerSettings;
 
 pub use crate::api::presentation::RecursiveGridStyle as VisualSettings;
 
@@ -45,62 +38,51 @@ pub struct Settings {
     pub ui: VisualSettings,
 }
 
-/// Grid shape at one depth.
-#[derive(Debug, Clone, PartialEq)]
-struct Layout {
-    rows: usize,
-    cols: usize,
-    keys: Vec<char>,
-}
-
 pub struct RecursiveGridMode {
-    /// Fully resolved per-depth layouts. Native input never clones a base
-    /// layout or searches configuration overrides.
-    layouts: Vec<Layout>,
-    min_size: (f64, f64),
-    max_depth: u32,
+    controller: TargetingController,
     ui: VisualSettings,
-    session: TargetingSession,
 }
 
 impl RecursiveGridMode {
     pub fn new(settings: Settings) -> Self {
-        let max_depth = settings.max_depth.max(1);
-        let base = Layout {
-            rows: settings.grid_rows.max(1) as usize,
-            cols: settings.grid_cols.max(1) as usize,
-            keys: settings.keys.chars().collect(),
-        };
-        Self {
-            layouts: compile_layouts(&base, &settings.layers, max_depth),
-            min_size: (
+        let controller = TargetingController::new(
+            Layout {
+                rows: settings.grid_rows.max(1) as usize,
+                cols: settings.grid_cols.max(1) as usize,
+                keys: settings.keys.chars().collect(),
+            },
+            &settings.layers,
+            settings.max_depth,
+            Some((
                 settings.min_size_width as f64,
                 settings.min_size_height as f64,
-            ),
-            max_depth,
+            )),
+            settings.cursor_follow_selection,
+            settings.lifecycle,
+        );
+        Self {
+            controller,
             ui: settings.ui,
-            session: TargetingSession::new(settings.cursor_follow_selection, settings.lifecycle),
         }
     }
 
     fn depth(&self) -> u32 {
-        self.session.depth()
+        self.controller.session.depth()
     }
 
     fn current(&self) -> Option<Rect> {
-        self.session.current()
+        self.controller.session.current()
     }
 
     /// Layout for `depth`, applying any `[recursive_grid.layers]` override.
     fn layout_at(&self, depth: u32) -> &Layout {
-        let index = (depth as usize).min(self.layouts.len().saturating_sub(1));
-        &self.layouts[index]
+        self.controller.layout_at(depth)
     }
 
     /// Cells of the current area, paired with their keys.
     #[cfg(test)]
     fn cells(&self) -> Vec<(char, Rect)> {
-        if self.session.terminal {
+        if self.controller.session.terminal {
             return Vec::new();
         }
         let Some(area) = self.current() else {
@@ -121,16 +103,7 @@ impl RecursiveGridMode {
 
     /// Whether the current area may be subdivided again.
     fn can_descend(&self) -> bool {
-        if self.depth() + 1 >= self.max_depth {
-            return false;
-        }
-        let Some(area) = self.current() else {
-            return false;
-        };
-        let layout = self.layout_at(self.depth());
-        let cell_w = area.width / layout.cols as f64;
-        let cell_h = area.height / layout.rows as f64;
-        cell_w >= self.min_size.0 && cell_h >= self.min_size.1
+        self.controller.can_descend()
     }
 
     fn view(&self) -> RecursiveGridView<'_> {
@@ -149,8 +122,8 @@ impl RecursiveGridMode {
             },
             ui: &self.ui,
             current: self.current(),
-            root: self.session.root(),
-            terminal: self.session.terminal,
+            root: self.controller.session.root(),
+            terminal: self.controller.session.terminal,
             can_descend: self.can_descend(),
         }
     }
@@ -159,28 +132,16 @@ impl RecursiveGridMode {
         CommandBatch::one(ctx.present(View::RecursiveGrid(self.view())))
     }
 
-    /// Complete selection by moving only; lifecycle configuration decides what follows.
-    fn commit(&self, point: Point, ctx: &HostContext<'_>) -> CommandBatch {
-        let mut commands = CommandBatch::two(
-            Command::warp_to(point),
-            ctx.present(View::RecursiveGrid(self.view())),
-        );
-        commands.push(Command::FinishMode {
-            cause: FinishCause::Selection,
-        });
-        commands
-    }
-
     fn cancel(&self) -> CommandBatch {
         CommandBatch::two(
             Command::HideOverlay,
-            Command::SwitchMode(self.session.return_mode.clone()),
+            Command::SwitchMode(self.controller.session.return_mode.clone()),
         )
     }
 
     fn toggle_cursor_follow(&mut self, ctx: &HostContext<'_>) -> CommandBatch {
         let mut commands = CommandBatch::new();
-        if let Some(area) = self.session.toggle_cursor_follow() {
+        if let Some(area) = self.controller.session.toggle_cursor_follow() {
             commands.push(Command::warp_to(area.center()));
         }
         commands.extend(self.redraw(ctx));
@@ -188,124 +149,36 @@ impl RecursiveGridMode {
     }
 
     fn reset(&mut self, bounds: Rect) {
-        self.session.reset(bounds);
+        self.controller.reset(bounds);
     }
 
     fn retarget(&mut self, bounds: Rect, preserve: bool, ctx: &HostContext<'_>) -> CommandBatch {
-        let path = if preserve {
-            self.session.path.clone()
-        } else {
-            SmallVec::new()
-        };
-        let was_finished = preserve && self.session.finished;
-        let follow = self.session.cursor_follow_selection;
-        self.reset(bounds);
-        if preserve {
-            self.session.cursor_follow_selection = follow;
-            for index in path {
-                let layout = self.layout_at(self.depth());
-                let Some(cell) = self
-                    .current()
-                    .and_then(|area| area.subdivision(layout.rows, layout.cols, index))
-                else {
-                    break;
-                };
-                self.session.stack.push(cell);
-                self.session.path.push(index);
-            }
-            self.session.terminal = self.depth() >= self.max_depth || !self.can_descend();
-            self.session.finished = was_finished;
-        }
-        let mut commands =
-            CommandBatch::one(Command::warp_to(self.current().unwrap_or(bounds).center()));
-        commands.extend(self.redraw(ctx));
-        commands
-    }
-
-    fn select(&mut self, index: usize, cell: Rect, ctx: &HostContext<'_>) -> CommandBatch {
-        self.session.stack.push(cell);
-        self.session.path.push(index);
-        // A selected cell is terminal after the configured depth, or when it
-        // cannot be meaningfully subdivided further.
-        self.session.terminal = self.depth() >= self.max_depth || !self.can_descend();
-
-        if self.session.terminal {
-            return self.commit(cell.center(), ctx);
-        }
-
-        let mut commands = CommandBatch::new();
-        if self.session.cursor_follow_selection {
-            commands.push(Command::warp_to(cell.center()));
-        }
+        let point = self.controller.retarget(bounds, preserve);
+        let mut commands = CommandBatch::one(Command::warp_to(point));
         commands.extend(self.redraw(ctx));
         commands
     }
 
     fn key_down(&mut self, key: &Key, ctx: &HostContext<'_>) -> CommandBatch {
-        match key.as_str() {
-            "esc" => return self.cancel(),
-            "enter" => {
-                return match self.current() {
-                    Some(area) => self.commit(area.center(), ctx),
-                    None => self.cancel(),
-                };
+        match self.controller.input(key, ctx.active_bounds()) {
+            Selection::Ignored => CommandBatch::new(),
+            Selection::Cancel => self.cancel(),
+            Selection::Changed => self.redraw(ctx),
+            Selection::Follow(point) => {
+                let mut commands = CommandBatch::one(Command::warp_to(point));
+                commands.extend(self.redraw(ctx));
+                commands
             }
-            "backspace" | "tab" => {
-                // Widen back out; at the root this leaves the mode.
-                if self.session.stack.len() <= 1 {
-                    return self.cancel();
-                }
-                self.session.stack.pop();
-                self.session.path.pop();
-                self.session.terminal = false;
-                self.session.finished = false;
-                return self.redraw(ctx);
+            Selection::Commit(point) => {
+                let mut commands = CommandBatch::one(Command::warp_to(point));
+                commands.extend(self.redraw(ctx));
+                commands.push(Command::FinishMode {
+                    cause: FinishCause::Selection,
+                });
+                commands
             }
-            "space" => {
-                self.reset(ctx.active_bounds());
-                return self.redraw(ctx);
-            }
-            _ => {}
         }
-
-        if self.session.terminal || self.session.finished {
-            return CommandBatch::new();
-        }
-        let Some(ch) = key.as_char() else {
-            return CommandBatch::new();
-        };
-        let layout = self.layout_at(self.depth());
-        let Some(index) = layout.keys.iter().position(|candidate| *candidate == ch) else {
-            return CommandBatch::new();
-        };
-        let Some(cell) = self
-            .current()
-            .and_then(|area| area.subdivision(layout.rows, layout.cols, index))
-        else {
-            return CommandBatch::new();
-        };
-        self.select(index, cell, ctx)
     }
-}
-
-fn compile_layouts(base: &Layout, layers: &[LayerSettings], max_depth: u32) -> Vec<Layout> {
-    (0..=max_depth)
-        .map(|depth| {
-            let mut layout = base.clone();
-            if let Some(layer) = layers.iter().find(|layer| layer.depth == depth) {
-                if let Some(cols) = layer.grid_cols {
-                    layout.cols = cols.max(1) as usize;
-                }
-                if let Some(rows) = layer.grid_rows {
-                    layout.rows = rows.max(1) as usize;
-                }
-                if let Some(keys) = &layer.keys {
-                    layout.keys = keys.chars().collect();
-                }
-            }
-            layout
-        })
-        .collect()
 }
 
 impl Mode for RecursiveGridMode {
@@ -318,11 +191,7 @@ impl Mode for RecursiveGridMode {
     }
 
     fn claims_key(&self, key: &Key) -> bool {
-        key.as_char().is_some_and(|character| {
-            self.layouts
-                .iter()
-                .any(|layout| layout.keys.contains(&character))
-        })
+        self.controller.claims_key(key)
     }
 
     fn available_keys(&self) -> Vec<(String, String)> {
@@ -346,12 +215,12 @@ impl Mode for RecursiveGridMode {
     fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
         match event {
             ModeEvent::Pushed { previous } => {
-                self.session.return_mode = previous.clone();
+                self.controller.session.return_mode = previous.clone();
                 self.reset(ctx.active_bounds());
                 self.redraw(ctx)
             }
             ModeEvent::Activated { previous } => {
-                self.session.return_mode = previous.clone().unwrap_or_else(ModeId::idle);
+                self.controller.session.return_mode = previous.clone().unwrap_or_else(ModeId::idle);
                 self.reset(ctx.active_bounds());
                 self.redraw(ctx)
             }
@@ -359,25 +228,27 @@ impl Mode for RecursiveGridMode {
                 self.reset(ctx.active_bounds());
                 self.redraw(ctx)
             }
-            ModeEvent::FinishRequested { .. } if self.session.finished => CommandBatch::new(),
+            ModeEvent::FinishRequested { .. } if self.controller.session.finished => {
+                CommandBatch::new()
+            }
             ModeEvent::FinishRequested { .. } => {
-                self.session.finished = true;
+                self.controller.session.finished = true;
                 let mut commands = self.redraw(ctx);
                 commands.extend(super::targeting::lifecycle_commands(
-                    &self.session.lifecycle.after_finish,
-                    &self.session.return_mode,
+                    &self.controller.session.lifecycle.after_finish,
+                    &self.controller.session.return_mode,
                 ));
                 commands
             }
             ModeEvent::Clicked { .. } => super::targeting::lifecycle_commands(
-                &self.session.lifecycle.after_click,
-                &self.session.return_mode,
+                &self.controller.session.lifecycle.after_click,
+                &self.controller.session.return_mode,
             ),
             ModeEvent::Deactivated => {
-                self.session.stack.clear();
-                self.session.path.clear();
-                self.session.terminal = false;
-                self.session.finished = false;
+                self.controller.session.stack.clear();
+                self.controller.session.path.clear();
+                self.controller.session.terminal = false;
+                self.controller.session.finished = false;
                 CommandBatch::new()
             }
             ModeEvent::ScreensChanged(_) => {
@@ -388,7 +259,7 @@ impl Mode for RecursiveGridMode {
                 self.retarget(screen.bounds, *preserve, ctx)
             }
             ModeEvent::PointerMoved(_)
-                if self.session.stack.first().copied() != Some(ctx.active_bounds()) =>
+                if self.controller.session.stack.first().copied() != Some(ctx.active_bounds()) =>
             {
                 self.reset(ctx.active_bounds());
                 self.redraw(ctx)
@@ -551,10 +422,10 @@ mod tests {
         let mut mode = crate::app::mode_catalog::recursive_grid(&env.config);
         let out = activate(&mut mode, &env);
         assert_eq!(scene_of(&out).labels.len(), 9);
-        assert!(mode.session.cursor_follow_selection);
+        assert!(mode.controller.session.cursor_follow_selection);
 
         toggle_follow(&mut mode, &env);
-        assert!(!mode.session.cursor_follow_selection);
+        assert!(!mode.controller.session.cursor_follow_selection);
         let out = press(&mut mode, &env, "q");
         assert!(
             !out.iter()
@@ -574,7 +445,7 @@ mod tests {
 
         let out = toggle_follow(&mut mode, &env);
 
-        assert!(mode.session.cursor_follow_selection);
+        assert!(mode.controller.session.cursor_follow_selection);
         assert_eq!(mode.depth(), depth, "toggle must not select another layer");
         assert!(out.contains(&Command::warp_to(selected.center())));
         assert!(
@@ -637,7 +508,7 @@ mod tests {
         activate(&mut mode, &env);
         press(&mut mode, &env, "t");
         press(&mut mode, &env, "g");
-        assert_eq!(mode.session.path.as_slice(), [1, 4]);
+        assert_eq!(mode.controller.session.path.as_slice(), [1, 4]);
         let target = Screen {
             bounds: Rect::new(-1200.0, 100.0, 1200.0, 800.0),
             work_area: Rect::new(-1200.0, 100.0, 1200.0, 800.0),
@@ -653,7 +524,7 @@ mod tests {
             },
             &env.ctx(),
         );
-        assert_eq!(mode.session.path.as_slice(), [1, 4]);
+        assert_eq!(mode.controller.session.path.as_slice(), [1, 4]);
         assert_eq!(mode.depth(), 2);
         assert_eq!(scene_of(&out).clip, Some(target.bounds));
         assert!(out.contains(&Command::warp_to(mode.current().unwrap().center())));
@@ -665,7 +536,7 @@ mod tests {
             },
             &env.ctx(),
         );
-        assert!(mode.session.path.is_empty());
+        assert!(mode.controller.session.path.is_empty());
         assert_eq!(mode.depth(), 0);
         assert_eq!(mode.current(), Some(target.bounds));
     }
@@ -732,7 +603,7 @@ mod tests {
 
         let out = press(&mut mode, &env, "g");
         assert!(out.iter().any(|c| matches!(c, Command::WarpPointer { .. })));
-        assert!(mode.session.terminal);
+        assert!(mode.controller.session.terminal);
         assert!(!out.contains(&Command::SwitchMode(ModeId::idle())));
     }
 
@@ -750,7 +621,7 @@ mod tests {
         let out = press(&mut mode, &env, "g");
         assert!(out.iter().any(|c| matches!(c, Command::WarpPointer { .. })));
         assert_eq!(mode.depth(), 1);
-        assert!(mode.session.terminal);
+        assert!(mode.controller.session.terminal);
     }
 
     #[test]
@@ -828,7 +699,10 @@ mod tests {
         env.cursor = Point::new(1500.0, 400.0);
         let out = mode.handle(&ModeEvent::PointerMoved(env.cursor), &env.ctx());
 
-        assert_eq!(mode.session.stack.as_slice(), [env.screens[1].bounds]);
+        assert_eq!(
+            mode.controller.session.stack.as_slice(),
+            [env.screens[1].bounds]
+        );
         assert_eq!(mode.depth(), 0);
         assert_eq!(scene_of(&out).clip, Some(env.screens[1].bounds));
     }
@@ -897,11 +771,11 @@ mod tests {
             &env.ctx(),
         );
         assert!(clicked.is_empty());
-        assert!(!mode.session.finished);
+        assert!(!mode.controller.session.finished);
         assert_eq!(mode.current(), selected);
 
         let continued = press(&mut mode, &env, "g");
-        assert!(!mode.session.finished);
+        assert!(!mode.controller.session.finished);
         assert_eq!(mode.depth(), 2);
         assert!(
             continued
@@ -924,7 +798,7 @@ mod tests {
         mode.handle(&ModeEvent::Restarted, &env.ctx());
 
         assert_eq!(mode.depth(), 0);
-        assert!(!mode.session.finished);
-        assert_eq!(mode.session.return_mode, ModeId::normal());
+        assert!(!mode.controller.session.finished);
+        assert_eq!(mode.controller.session.return_mode, ModeId::normal());
     }
 }

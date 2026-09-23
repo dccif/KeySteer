@@ -23,6 +23,9 @@ use super::{AppOverride, Bindings, UiHintAppOverride, app_override_matches, buil
 #[serde(default, deny_unknown_fields)]
 pub struct Normal {
     pub inherits: Vec<String>,
+    /// Opt-in blind positioning. Absence keeps the ordinary Normal runtime.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub targeting: Option<Box<NormalTargeting>>,
     /// Forward keyboard input that does not match a complete KeySteer binding.
     pub passthrough_unbound_keys: bool,
     /// Hold a physical key bound to click/double-click for this many
@@ -40,11 +43,115 @@ impl Default for Normal {
     fn default() -> Self {
         Self {
             inherits: vec!["hotkeys".into()],
+            targeting: None,
             passthrough_unbound_keys: true,
             long_press_toggle_ms: 500,
             auto_release_ms: 0,
             bindings: default_normal_bindings(),
             app_configs: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetingMethod {
+    #[default]
+    Grid,
+    RecursiveGrid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetingReset {
+    Move,
+    Click,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NormalTargeting {
+    pub method: TargetingMethod,
+    pub reset_on: Vec<TargetingReset>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grid_cols: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grid_rows: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keys: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_depth: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_size_width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_size_height: Option<u32>,
+    /// None inherits all layers; Some replaces the entire list (empty clears it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layers: Option<Vec<GridLayer>>,
+}
+
+impl Default for NormalTargeting {
+    fn default() -> Self {
+        Self {
+            method: TargetingMethod::Grid,
+            reset_on: vec![TargetingReset::Move, TargetingReset::Click],
+            grid_cols: None,
+            grid_rows: None,
+            keys: None,
+            max_depth: None,
+            min_size_width: None,
+            min_size_height: None,
+            layers: None,
+        }
+    }
+}
+
+/// Borrowed geometry only: resolving overrides never clones UI or binding tables.
+pub(crate) struct TargetingGeometry<'a> {
+    pub grid_cols: u32,
+    pub grid_rows: u32,
+    pub keys: &'a str,
+    pub max_depth: u32,
+    pub min_size: Option<(u32, u32)>,
+    pub layers: &'a [GridLayer],
+}
+
+impl NormalTargeting {
+    pub(crate) fn resolve<'a>(&'a self, config: &'a super::Config) -> TargetingGeometry<'a> {
+        let (cols, rows, keys, depth, min_size, layers) = match self.method {
+            TargetingMethod::Grid => {
+                let grid = &config.grid;
+                (
+                    grid.grid_cols,
+                    grid.grid_rows,
+                    grid.keys.as_str(),
+                    grid.max_depth,
+                    None,
+                    &[][..],
+                )
+            }
+            TargetingMethod::RecursiveGrid => {
+                let grid = &config.recursive_grid;
+                (
+                    grid.grid_cols,
+                    grid.grid_rows,
+                    grid.keys.as_str(),
+                    grid.max_depth,
+                    Some((
+                        self.min_size_width.unwrap_or(grid.min_size_width),
+                        self.min_size_height.unwrap_or(grid.min_size_height),
+                    )),
+                    self.layers.as_deref().unwrap_or(&grid.layers),
+                )
+            }
+        };
+        TargetingGeometry {
+            grid_cols: self.grid_cols.unwrap_or(cols),
+            grid_rows: self.grid_rows.unwrap_or(rows),
+            keys: self.keys.as_deref().unwrap_or(keys),
+            max_depth: self.max_depth.unwrap_or(depth),
+            min_size,
+            layers,
         }
     }
 }

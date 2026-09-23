@@ -1,5 +1,15 @@
 # 构建、打包、文档站与测试
 
+网页 Normal 盲操编辑器以 `normal.targeting` 表存在性为启用开关，关闭时导出省略该表；方法、重置条件、几何字段和 Recursive Grid 层列表可编辑，覆盖键位冲突在配置页提示。Normal 预览仅移动指针且不绘制网格。模式键盘的临时继承标签由当前物理触发键状态控制，不再始终高亮借用的 Normal 绑定。`simulator/normal-targeting.test.ts` 覆盖选格／回退／重置／层替换，`bindings.test.ts` 覆盖高亮时机。网页 133 项测试与 `docs:check` 通过；本地 `docs:build` 在 esbuild 读取 `docs/.vitepress/config.mts` 时因工作区父目录访问被拒而未完成，不能作为页面实机验收。
+
+Normal 盲操回归：`cargo test --lib normal_targeting -- --test-threads=1` 覆盖 Grid／Recursive Grid 的选格、Tab/Backspace/Space、终点、四种 reset_on、组合键、未绑定透传、冲突／别名／应用覆盖、独立网格导航隔离及禁用独立模式后的引用验证。NormalTargeting 的拒绝渲染 Presenter 与分配计数器验证 20 层选格／回退／重置／跨屏及持续 Frame 不分配、不构造网格。分配检查必须单线程；这些逻辑测试不替代 Windows/macOS 实机输入到像素延迟验证。
+
+定位覆盖回归验证独立模式保持原值、覆盖键表与坐标一致、终止深度／最小尺寸、层列表继承／整组替换／清空、禁用底层模式时只验证有效几何、冲突来源与 UI 字段拒绝。网页导入导出覆盖稀疏字段和层数组。该扩展全量 Rust 1,110 passed／84 ignored，Clippy、网页 129 项／TypeScript 和 macOS ARM／Intel 编译检查通过；参数解析仅位于配置加载路径，不修改 Engine 或 Normal 帧／输入处理。
+
+2026-09-23 未启用 targeting 的 release 对照：HEAD／当前实现交替五轮、affinity=4、High priority；Normal 帧 p50/p99 均为 15/23ns，默认按键为 159/234→158/239ns，WASD 为 164/195→163/186ns。数值是每轮批均值分位数的中位数，非端到端延迟；默认按键 p99 增加约 2.14%，略超 2% 门禁，不能宣称零回退。原始数据及限制保存在本地 `target/perf-normal-targeting/comparison.md` 和 `final-results.json`。全量 Rust 1,106 passed／84 ignored，Clippy 无告警，网页 129 项和 TypeScript 检查通过，macOS ARM／Intel 编译通过；CLI `--check` 验证可用配置通过、冲突配置列出按键／动作／来源并失败。
+
+同日快速复核增加 A/A 对照：旧版、当前版、同一旧版再运行，交替顺序各 7 轮，沿用上述 affinity／priority，未改程序或基准。默认按键 p50 分别为 160／159／159ns，p99 为 272／274／268ns；当前相对第一组旧版 +0.74%，同一旧版两组相差 4ns。WASD p99 为 279／279／278ns。此前 +2.14% 未稳定复现，差值与环境波动同量级，不能据此认定新增逻辑造成回退，也不能证明绝对零差异。基准测的是 100 次事件批均值的 p99，包含 Engine 循环／时钟／模拟后端；不是单按键或端到端 p99。原始复核保存于本地 `target/perf-normal-targeting/recheck-*.txt` 和 `recheck-results.json`。
+
 标识符网页与程序统一使用 0.75 字宽／1.4 行高及相同右上角锚点；不再提供额外缩放补偿。indicator_offset 为 i16 二元数组，网页支持拖动、键盘微调、输入及全局/模式继承。Windows 后端不再二次放大 Indicator，macOS 保持逻辑点。测试覆盖数组边界、平台一致性、DPI 无二次缩放及缓存几何；字体栅格实机验收仍需分别执行。
 
 网页模式标识符由 `ModeIndicatorControls` 编辑全局 ui 与各模式覆盖，`indicator-fields.ts` 统一字段和搜索入口；`simulator/mode-indicator.ts` 解析继承并生成跟随鼠标热点的右上角定位样式。预览切换临时模式时使用借用模式的配置。`mode-indicator.test.ts` 覆盖默认隐藏、覆盖/重置、TOML 往返、定位边界、主题和搜索归属。

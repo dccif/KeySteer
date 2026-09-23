@@ -3,6 +3,18 @@ import test from 'node:test'
 import { reactive } from 'vue'
 import { readFile } from 'node:fs/promises'
 
+test('optional Normal targeting stays absent by default and survives import/export', async () => {
+  const { stringify } = await import('smol-toml')
+  const defaults = parseConfigDocument(await readFile(new URL('../../../keysteer.default.toml', import.meta.url), 'utf8')).document
+  assert.equal(defaults.normal.targeting, undefined)
+  for (const targeting of ['[normal.targeting]', '[normal.targeting]\nmethod = "recursive_grid"\nreset_on = []', '[normal.targeting]\ngrid_cols = 2\ngrid_rows = 2\nkeys = "1234"\nmax_depth = 3', '[normal.targeting]\nmethod = "recursive_grid"\nmin_size_width = 8\nlayers = []', '[normal.targeting]\nmethod = "recursive_grid"\n[[normal.targeting.layers]]\ndepth = 0\ngrid_cols = 2\ngrid_rows = 2\nkeys = "1234"']) {
+    const imported = parseConfigDocument(targeting).document
+    const effective = resolveConfigDocument(defaults, imported)
+    const exported = parseConfigDocument(stringify(effective)).document
+    assert.deepEqual(cloneConfigDocument(exported.normal.targeting), cloneConfigDocument(imported.normal.targeting))
+  }
+})
+
 test('complete shipped defaults load with guide-line settings', async () => {
   const source = await readFile(new URL('../../../keysteer.default.toml', import.meta.url), 'utf8')
   const parsed = parseConfigDocument(source).document

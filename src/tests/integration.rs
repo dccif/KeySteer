@@ -571,7 +571,6 @@ fn windows_visual_capture_keeps_one_barrier_and_an_unscaled_copy_path() {
     );
 }
 
-
 #[test]
 fn text_input_defaults_match_shipped_configuration() {
     assert_eq!(Config::default().text_input, shipped().text_input);

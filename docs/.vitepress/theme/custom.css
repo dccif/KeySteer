@@ -712,6 +712,16 @@
 .ks-setting-toggle i { width: 9px; height: 9px; border-radius: 50%; background: var(--vp-c-text-3); }
 .ks-setting-toggle.active { border-color: var(--vp-c-brand-1); color: var(--vp-c-brand-1); }
 .ks-setting-toggle.active i { background: var(--vp-c-brand-1); box-shadow: 0 0 7px var(--vp-c-brand-1); }
+.ks-normal-targeting .ks-toolbar { gap: 12px; }
+.ks-targeting-switch { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; cursor: pointer; font-size: 12px; }
+.ks-targeting-switch input, .ks-targeting-reset input { accent-color: var(--vp-c-brand-1); }
+.ks-targeting-reset { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 15px; font-size: 12px; }
+.ks-targeting-reset label { display: inline-flex; align-items: center; gap: 4px; }
+.ks-targeting-layer { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; margin: 8px 0; font-size: 11px; }
+.ks-targeting-layer label { display: grid; gap: 3px; }
+.ks-targeting-layer input { width: 85px; min-width: 0; padding: 5px; border: 1px solid var(--ks-border); border-radius: 6px; background: var(--vp-c-bg); color: var(--vp-c-text-1); }
+.ks-targeting-layer label:last-of-type input { width: 125px; }
+.ks-targeting-conflict { margin: 14px 0 0; color: var(--vp-c-danger-1, #c34a4a); font-size: 11px; line-height: 1.5; }
 .ks-inherit-button { justify-self: start; border: 0; padding: 0; background: transparent; color: var(--vp-c-brand-1); font-size: 9px; cursor: pointer; }
 .ks-inherit-button.inherited { color: var(--vp-c-text-3); cursor: default; }
 .ks-advanced-settings { margin-top: 14px; border-top: 1px solid var(--ks-border); padding-top: 3px; }

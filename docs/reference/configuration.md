@@ -543,3 +543,9 @@ q = "normal"
 穿透键匹配完整或去掉临时激活键后的输入，只跳过临时层，仍解析当前模式及其继承；不会向操作系统注入按键。默认 `[]`，支持组合键、别名和左右修饰键，也适用于 Recursive Grid、UI Hint、Window 家族和插件模式。不对 `idle` 或退出动作做特殊处理。
 
 Window 家族临时使用 Normal 时，激活键只负责启用临时层，不参与 Normal 的组合键；先保留 Window 显式完整组合键，再按去掉激活键后的输入查临时层、当前层。于是临时 S 可执行 Normal 的 screen next，临时 F 默认进入 Recursive Grid。固定 Window 面板不列出 Normal 的其他快捷键，Move 的 Other Actions 只补充 Grid/Recursive Grid 入口。
+## Normal 盲操定位
+
+可选 `[normal.targeting]` 使用 `method = "grid" | "recursive_grid"`（默认 grid）和 `reset_on = ["move", "click"]`（可取子集或空列表）。缺省不启用、不导出配置段；布局引用对应顶层网格，输入冲突在计划编译时拒绝。完整行为、键位让出与示例见 [Normal 盲操网格定位](../modes/normal.md#盲操网格定位)。
+
+
+`normal.targeting` 可覆盖 `grid_cols`、`grid_rows`、`keys`、`max_depth`，未写的字段继承所选 method 的原配置。`method = "recursive_grid"` 另支持 `min_size_width`、`min_size_height` 和 `layers`；显式 layers 整组替换继承列表，`layers = []` 清空。覆盖只影响 Normal，不改变独立网格模式，不接受 UI 字段。布局校验、键位冲突检测和控制器使用同一份合并结果，仅在加载配置时解析。完整注释示例见 `keysteer.default.toml`。

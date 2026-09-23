@@ -82,12 +82,27 @@ pub(crate) fn indicator(
     cursor: Point,
     screens: &[Screen],
 ) -> (Indicator, IndicatorGeometry) {
-    let style = ui.label.resolve(
+    let mut style = ui.label.resolve(
         palette,
         background,
         palette.readable_on(background),
         palette.accent,
     );
+    // Windows scenes use physical pixels; macOS scenes use logical points.
+    // Resolve DPI before measuring so placement and native drawing agree.
+    let scale =
+        super::label_scale(Screen::containing(screens, &cursor).map_or(1.0, |screen| screen.scale));
+    if scale != 1.0 {
+        style.font_size = (style.font_size * scale).round().max(1.0);
+        style.padding_x = (style.padding_x * scale).round();
+        style.padding_y = (style.padding_y * scale).round();
+        style.border_width = if style.border_width > 0.0 {
+            (style.border_width * scale).round().max(1.0)
+        } else {
+            0.0
+        };
+        style.border_radius = (style.border_radius * scale).round();
+    }
     let text_width = |character_count: usize| Indicator::label_size(character_count, &style).0;
     let width = held_text
         .as_ref()
@@ -120,6 +135,69 @@ pub(crate) fn indicator(
 mod tests {
     use super::*;
     use crate::api::Rect;
+
+    #[test]
+    fn indicator_preserves_original_compact_badge_dimensions() {
+        let style = crate::api::overlay::LabelStyle {
+            font_size: 17.0,
+            padding_x: 6.0,
+            padding_y: 3.0,
+            ..Default::default()
+        };
+        let (width, height) = Indicator::label_size(6, &style);
+        assert!((width - 83.4).abs() < 1.0e-9);
+        assert_eq!(height, 23.0);
+    }
+
+    #[test]
+    fn indicator_dpi_is_applied_before_measuring_and_clamping() {
+        let palette = Palette::default();
+        let ui = IndicatorUi::default();
+        let (base, _) = indicator(
+            "Normal".into(),
+            &ui,
+            palette.surface,
+            None,
+            &palette,
+            Point::new(400.0, 300.0),
+            &[],
+        );
+        for dpi in [1.0, 1.25, 1.5, 2.0] {
+            let bounds = Rect::new(0.0, 0.0, 1000.0, 800.0);
+            let screens = [Screen {
+                bounds,
+                work_area: bounds,
+                is_primary: true,
+                scale: dpi,
+                name: None,
+            }];
+            let (badge, geometry) = indicator(
+                "Normal".into(),
+                &ui,
+                palette.surface,
+                None,
+                &palette,
+                Point::new(1.0, 799.0),
+                &screens,
+            );
+            let scale = if cfg!(target_os = "windows") {
+                dpi
+            } else {
+                1.0
+            };
+            assert_eq!(
+                badge.style.font_size,
+                (base.style.font_size * scale).round()
+            );
+            assert_eq!(
+                Indicator::label_size(6, &badge.style),
+                (geometry.width, geometry.height)
+            );
+            assert!(badge.position.x - geometry.width >= 0.0);
+            assert!(badge.position.y + geometry.height <= 800.0);
+            assert_eq!(geometry.x_offset, f64::from(ui.indicator_offset[0]));
+        }
+    }
 
     #[test]
     fn offset_pair_uses_right_top_anchor_and_cached_metrics() {

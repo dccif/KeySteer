@@ -1,6 +1,19 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { effectiveBindings, resolveBinding } from './bindings.ts'
+import { displayedBindings, effectiveBindings, resolveBinding, temporaryPhysicalKeys } from './bindings.ts'
+
+test('temporary Normal keycap highlights appear only while the trigger is held', () => {
+  const document = {
+    normal: { bindings: { h: 'move_left' } },
+    grid: { inherits: ['normal'], temporary_mode: 'normal', temporary_mode_keys: ['primary'], bindings: { a: 'finish' } },
+  }
+  const held = (pressed: string[]) => temporaryPhysicalKeys(document, 'grid', pressed, false).length > 0
+  assert.equal(displayedBindings(document, 'grid', held([])).has('h'), false)
+  assert.equal(displayedBindings(document, 'grid', held([])).get('a')?.source, 'grid')
+  assert.equal(displayedBindings(document, 'grid', held(['left_ctrl'])).get('h')?.source, 'normal')
+  assert.equal(displayedBindings(document, 'grid', held(['left_ctrl'])).get('a')?.source, 'grid')
+  assert.equal(effectiveBindings(document, 'grid').get('h')?.source, 'normal')
+})
 
 test('targeting modes inherit normal bindings after their local bindings', () => {
   const document = {

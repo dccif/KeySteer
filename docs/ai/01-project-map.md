@@ -1,5 +1,7 @@
 # 项目目录与代码地图
 
+`modes/normal_targeting.rs` 仅在启用 `normal.targeting` 时组合 Normal 手势与 `modes/targeting.rs::TargetingController`。后者同时供 Grid／Recursive Grid 使用，统一选格、回退、重置、终点和跨屏路径重放；视图仍由各独立模式提交。
+
 `platform/common/window_session/transaction.rs` 统一 worker 的事务调度；`layout_confirmation.rs` 管理布局增量校验、提交、回滚和恢复；`history_confirmation.rs` 管理撤销／重做／初始状态恢复的独立确认及历史提交。原生句柄仍由平台适配器拥有。`api::WindowTextCache` 是模式拥有、presentation 使用的原始卡片文本缓存。
 
 `app/runtime/quick_switch.rs` 负责操作模式中的长按／数字选择、固定排名快照及按键消费配对；`presentation/quick_switch.rs` 只使用 API 数据绘制面板。`app/preset_store/usage.rs` 负责有界 mailbox、事件触发 checkpoint 和后台 writer 生命周期。原生后端仅提供窗口几何和系统退出通知。
@@ -126,6 +128,7 @@ macOS：
 - `docs/.vitepress/config-studio/PaneDivider.tsx`：可拖动和键盘调整的工作区分隔条，仅改变展示宽度。
 - `docs/.vitepress/config-studio/FittedKeyboard.tsx`：观察容器和完整键盘尺寸，等比缩放并保留正确点击／拖放坐标，避免键帽裁切和嵌套滚动。
 - `docs/.vitepress/simulator/grid-region.ts`：Grid／Recursive Grid 选键路径到百分比区域的公共计算，供网格预览和模拟指针复用。
+- `docs/.vitepress/simulator/normal-targeting.ts` 与 `config-studio/NormalTargetingControls.tsx`：Normal 盲操预览的无视图定位状态，以及可选配置的网页编辑；`simulator/bindings.ts::displayedBindings` 只在临时触发键按住时显示借用模式的键帽标签。
 - `docs/.vitepress/config-studio/ModeStyleControls.tsx`、`CommonConfigControls.tsx`：按当前页面和页签筛选字段，共用窗口卡片样式只在共用外观编辑。
 - `docs/.vitepress/simulator/`：浏览器端配置交接、绑定继承和鼠标状态模型及测试。
 - `docs/.vitepress/theme/custom.css`：独立模拟器与文档主题样式。

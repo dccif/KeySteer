@@ -2,6 +2,7 @@ import { useStudioI18n } from '../config-studio/i18n'
 import SettingsNavigation from '../config-studio/SettingsNavigation'
 import PaneDivider from '../config-studio/PaneDivider'
 import FittedKeyboard from '../config-studio/FittedKeyboard'
+import NormalTargetingControls from '../config-studio/NormalTargetingControls'
 import { gridRegion } from '../simulator/grid-region'
 import { commonSearchFields, styleSearchFields } from '../config-studio/fields'
 import { pages, tabLabels, searchSettings, utilitySearchFields, type SettingsTab, type SearchEntry } from '../config-studio/navigation'
@@ -18,7 +19,8 @@ import {
   movePointer,
   toggleButton,
 } from '../simulator/state'
-import { effectiveBindings, resolveBinding, resolveLayeredPhysicalBinding, resolvePhysicalBinding, shortcutCaption, temporaryPhysicalKeys } from '../simulator/bindings'
+import { displayedBindings, effectiveBindings, resolveBinding, resolveLayeredPhysicalBinding, resolvePhysicalBinding, shortcutCaption, temporaryPhysicalKeys } from '../simulator/bindings'
+import { blindTargetingInput, targetingConfig, targetingKeys } from '../simulator/normal-targeting'
 import { applyWindowAction, chooseWindowNumber, switchWindowMode, isWindowMode, finishWindowNumber, hasWindowPresetChanges, replaceWindowPresets, restoreWindowPreset, saveWindowPreset, setDemoWindowCount, temporaryWindow, windowActionAvailable, windowDetail, windowInputStatus, windowSelectionKey, windowTarget, WINDOW_AREA, WINDOW_MOTION } from '../simulator/window'
 import { decodeWorkspaceDocument, encodeWorkspaceFile, WORKSPACE_FILE_NAME, WORKSPACE_STORAGE_KEY, readSavedPresets, presetName, type ModeUsage } from '../simulator/window-presets'
 import type { WindowState } from '../simulator/window'
@@ -432,6 +434,7 @@ export default defineComponent({
       const resolved = defaultDocument.value ? resolveConfigDocument(defaultDocument.value, document.value) : cloneConfigDocument(document.value)
       return resolved
     })
+    const normalTargetKeys = computed(() => targetingKeys(effectiveDocument.value ?? {}))
 
     const tomlPreview = computed(() => {
       if (!document.value) return ''
@@ -454,7 +457,7 @@ export default defineComponent({
 
     const selectedAction = computed(() => {
       if (!effectiveDocument.value || !selectedChord.value) return ''
-      const value = resolveBinding(effectiveDocument.value, activeMode.value, selectedChord.value)?.value
+      const value = displayedBindings(effectiveDocument.value, activeMode.value, temporaryHeld()).get(selectedChord.value)?.value
       return Array.isArray(value) ? value.join(' → ') : String(value ?? '')
     })
 
@@ -564,14 +567,20 @@ export default defineComponent({
 
     function keyBindingInfo(spec: KeySpec): KeyBindingInfo | undefined {
       if (!effectiveDocument.value || !spec.key) return undefined
-      const entries = [...effectiveBindings(effectiveDocument.value, activeMode.value)]
+      const entries = [...displayedBindings(effectiveDocument.value, activeMode.value, temporaryHeld())]
         .filter(([chord]) => chord === spec.key || (!spec.literal && chord.endsWith(`+${spec.key}`)))
-      if (entries.length === 0) return undefined
+      if (entries.length === 0) return activeMode.value === 'normal' && normalTargetKeys.value.has(spec.key)
+        ? { text: t('盲操定位'), tone: 'target' } : undefined
       const [chord, binding] = entries[0]
       const action = Array.isArray(binding.value) ? String(binding.value[0] ?? '') : String(binding.value)
       const sourcePrefix = binding.source === activeMode.value ? '' : `${shortMode(binding.source)} `
       const prefix = chord === spec.key ? sourcePrefix : `${sourcePrefix}${shortChord(chord)} `
       return { text: `${prefix}${t(shortAction(action))}`, tone: actionTone(action) }
+    }
+
+    function temporaryHeld(): boolean {
+      const doc = effectiveDocument.value
+      return Boolean(doc && temporaryPhysicalKeys(doc, activeMode.value, [...physicalKeys], isMac.value, temporaryEntryKeys).length)
     }
 
     function onImport(event: Event): void {
@@ -620,16 +629,19 @@ export default defineComponent({
       if (applyKeyHelpAction(simulator, action, effectiveDocument.value?.key_help?.mouse_key_help !== false, effectiveDocument.value?.key_help?.window_key_help !== false)) return
       if (MOVEMENT_ACTIONS.has(action)) {
         movePointer(simulator, action, continuous ? 0.45 : 2.5)
+        if (simulator.mode === 'normal' && (targetingConfig(effectiveDocument.value ?? {})?.reset_on ?? ['move', 'click']).includes('move')) simulator.blindTargeting.pendingReset = true
         return
       }
       if (applyModeAction(simulator, action, effectiveDocument.value?.key_help?.mouse_key_help === true)) return
       if (action === 'left_click' || action === 'double_click') {
         clickPulse.value += 1
+        if (simulator.mode === 'normal' && (targetingConfig(effectiveDocument.value ?? {})?.reset_on ?? ['move', 'click']).includes('click')) simulator.blindTargeting.pendingReset = true
         simulator.lastEvent = action === 'double_click' ? '双击' : '左键点击'
         return
       }
       if (action === 'right_click' || action === 'middle_click') {
         clickPulse.value += 1
+        if (simulator.mode === 'normal' && (targetingConfig(effectiveDocument.value ?? {})?.reset_on ?? ['move', 'click']).includes('click')) simulator.blindTargeting.pendingReset = true
         simulator.lastEvent = action === 'right_click' ? '右键点击' : '中键点击'
         return
       }
@@ -712,6 +724,15 @@ export default defineComponent({
       const document = effectiveDocument.value
       if (document) {
         const pressed = currentPhysicalKeys(event)
+        if (simulator.mode === 'normal' && pressed.length === 1 && targetingConfig(document)) {
+          const selection = blindTargetingInput(document, simulator.blindTargeting, browserKeyName(event.key, event.code))
+          if (selection.handled) {
+            event.preventDefault()
+            if (selection.pointer) simulator.pointer = selection.pointer
+            simulator.lastEvent = `Normal 定位：${simulator.blindTargeting.path.join(' → ') || '起点'}`
+            return
+          }
+        }
         if (isWindowMode(simulator.mode)) {
           const temporary = simulator.window.temporary ? temporaryPhysicalKeys(document, simulator.mode, pressed, isMac.value, temporaryEntryKeys) : []
           let resolved = resolveLayeredPhysicalBinding(document, simulator.mode, pressed, physical, isMac.value, temporaryEntryKeys)
@@ -788,9 +809,8 @@ export default defineComponent({
     }
     function updateTemporaryWindow(event: KeyboardEvent): void {
       if (!isWindowMode(simulator.mode) || !effectiveDocument.value) return
-      const pressed = currentPhysicalKeys(event), physical = physicalKey(event)
-      const resolved = resolveLayeredPhysicalBinding(effectiveDocument.value, simulator.mode, pressed, physical, isMac.value, temporaryEntryKeys)
-      const active = resolved?.source !== simulator.mode && temporaryPhysicalKeys(effectiveDocument.value, simulator.mode, pressed, isMac.value, temporaryEntryKeys).length > 0
+      const pressed = currentPhysicalKeys(event)
+      const active = temporaryPhysicalKeys(effectiveDocument.value, simulator.mode, pressed, isMac.value, temporaryEntryKeys).length > 0
       if (active !== simulator.window.temporary) heldActions.clear()
       temporaryWindow(simulator.window, active, effectiveDocument.value[simulator.mode] ?? {})
     }
@@ -1195,6 +1215,7 @@ export default defineComponent({
                 document={document.value} effectiveDocument={effectiveDocument.value} appearance={appearance.value}
                 onChange={next => document.value = next} />}
               {['normal', 'text_input', 'grid', 'recursive_grid', 'ui_hint'].includes(pageId.value) && <CommonConfigControls page={pageId.value} tab={selectedTab.value} document={document.value} effectiveDocument={effectiveDocument.value} onChange={next => document.value = next} />}
+              {pageId.value === 'normal' && selectedTab.value === 'behavior' && <NormalTargetingControls document={document.value} effectiveDocument={effectiveDocument.value} onChange={next => { document.value = next; simulator.blindTargeting.pendingReset = true }} />}
               {(pageId.value.startsWith('window') || ['grid', 'recursive_grid', 'ui_hint', 'key_help'].includes(pageId.value)) && <ModeStyleControls page={pageId.value} tab={selectedTab.value} mode={(pageId.value === 'window_card' ? 'window' : pageId.value) as any} appearance={appearance.value} document={document.value} effectiveDocument={effectiveDocument.value} onChange={next => document.value = next} onAppearanceChange={next => appearance.value = next} />}
             </>}
             {pageId.value === 'quick_switch' && renderQuickSwitch()}

@@ -48,6 +48,33 @@ passthrough_unbound_keys = true # 设为 false 可恢复键盘独占
 | `Primary+S` | 切换到下一块显示器 |
 | `q` / `Esc` | 返回 Idle |
 
+## 盲操网格定位
+
+可在 Normal 内直接使用网格键粗定位，再用 HJKL 微调，不需要切换模式或按住激活键，也不显示网格。
+
+```toml
+[normal.targeting]
+method = "grid" # 默认；也可用 "recursive_grid"
+reset_on = ["move", "click"]
+```
+
+没有这个配置段时完全禁用，继续使用原来的 Normal；空表启用默认 Grid。
+布局、选择键、深度和 Recursive Grid 分层配置直接读取 `[grid]` 或 `[recursive_grid]`，即使该独立模式的 `enabled = false` 也可以借用其布局。盲操始终移动到所选格中心，不继承其显示、`cursor_follow_selection` 或生命周期设置。
+
+启用前需让出对应布局的单键及 `Tab`、`Backspace`、`Space`：它们与 Normal 本地、继承或应用覆盖绑定冲突时，新配置会被拒绝，错误写入 `keysteer.log` 和可用的控制台，并列出冲突键、动作及来源。可修改布局，或删除 Normal 对应绑定；`none` 可显式让出旧动作并屏蔽继承。组合键不与其中的单键直接冲突，仍按现有组合键规则处理。
+
+`[normal.bindings]` 整表替换内置绑定，不是增量补丁。示例与默认键位冲突说明统一放在 `keysteer.default.toml` 的 Normal 段末尾。默认 Grid 需让出 q/t/f/g/v/b；默认 Recursive Grid 需让出 q，保留 Esc 退出。可用 `keysteer --config keysteer.user.toml --check` 检查字段及绑定冲突；热重载失败保留旧配置。
+
+| 操作 | 行为 |
+| --- | --- |
+| 连续网格键 | 在当前区域逐层定位 |
+| Tab / Backspace | 回退一层，不移动鼠标；根层不退出 Normal |
+| Space | 清空定位路径，不移动鼠标 |
+| 到达深度／最小尺寸终点 | 保留当前区域，仍可微调、点击、回退或重置 |
+| Enter / Esc / 点击键 | 保持 Normal 自己的绑定 |
+
+`reset_on = ["move"]` 在 Normal 微调产生位移命令后结束当前路径；`["click"]` 在 KeySteer 点击／双击成功后结束路径；两项一起填写表示任一触发，`[]` 则保留路径。重置本身不移动鼠标，下一次网格键从当前屏幕重新开始。网格自身跳转、实体鼠标移动／点击、滚动、鼠标按下／释放／锁定均不触发这两个条件。离开并重新进入 Normal 开始新一轮；跨屏插件继续遵循其路径保留设置。
+
 ## 移动速度
 
 默认的 `precision`、`slow` 和 `fast` 需要按住。若希望点按切换，可在
@@ -175,3 +202,6 @@ enabled = false
 `indicator_offset = [X, Y]` 定位标识符的**右上角**：X 正数向右、负数向左；Y 正数向下、负数向上。两项都是 -32768～32767 的整数。默认 `[-12, 18]` 表示右上角在鼠标左侧 12、下方 18。网页可拖动橙色锚点、用方向键微调（Shift 为 10），或直接输入数组；显示器边缘会限制整个标识符的位置。
 
 各模式 `[mode_indicator.modes.normal.ui]` 等表可覆盖同名字段。从 0.10.22 起，旧 `position`、`indicator_x_offset` 和 `indicator_y_offset` 已移除，请使用 `indicator_offset = [X, Y]`；未设置时使用默认值或继承全局配置。Text Input 默认隐藏文字，若需要显示，设 `enabled = true`，并在 `[mode_indicator.modes.text_input.ui]` 中配置相同字段。
+
+
+`normal.targeting` 可覆盖 `grid_cols`、`grid_rows`、`keys`、`max_depth`，未写的字段继承所选 method 的原配置。`method = "recursive_grid"` 另支持 `min_size_width`、`min_size_height` 和 `layers`；显式 layers 整组替换继承列表，`layers = []` 清空。覆盖只影响 Normal，不改变独立网格模式，不接受 UI 字段。布局校验、键位冲突检测和控制器使用同一份合并结果，仅在加载配置时解析。完整注释示例见 `keysteer.default.toml`。

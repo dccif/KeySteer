@@ -1569,11 +1569,16 @@ impl Engine {
                         );
                         continue;
                     };
-                    // Plugin commands must reach the effective interaction
-                    // mode, just like the binding that invoked them. The base
-                    // mode may be a passthrough shell while a temporary mode
-                    // owns the input (for example Text Input borrowing Normal).
-                    let recipient = self.display_mode();
+                    // A grid retains ownership of its selection while borrowing
+                    // Normal shortcuts. Retarget it before the pointer crosses
+                    // screens, otherwise PointerMoved resets the retained path.
+                    // Passthrough shells still target their temporary mode.
+                    let recipient =
+                        if matches!(self.registry.active.as_str(), "grid" | "recursive_grid") {
+                            self.registry.active.clone()
+                        } else {
+                            self.display_mode()
+                        };
                     self.dispatch_to(
                         &recipient,
                         ModeEvent::ScreenRetargeted { screen, preserve },
@@ -1818,6 +1823,7 @@ impl Engine {
                 | Binding::Speed(_)
                 | Binding::SpeedToggle(_)
                 | Binding::ToggleCursorFollowSelection
+                | Binding::TargetingKey(_)
                 | Binding::Window(_)
                 | Binding::RescanUi
         ) {
@@ -2091,6 +2097,7 @@ impl Engine {
             | Binding::Speed(_)
             | Binding::SpeedToggle(_)
             | Binding::ToggleCursorFollowSelection
+            | Binding::TargetingKey(_)
             | Binding::Window(_)
             | Binding::RescanUi => {
                 Err("stateful binding reached the stateless runtime dispatch boundary".into())

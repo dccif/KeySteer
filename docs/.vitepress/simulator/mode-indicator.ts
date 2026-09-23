@@ -33,8 +33,8 @@ export function modeIndicatorPreview(document: ConfigDocument, mode: string, app
   const size = Math.max(1, ui.font_size)
   const px = auto(ui.padding_x, Math.round(size * .4))
   const py = auto(ui.padding_y, Math.round(size * .2))
-  const anchorWidth = Math.ceil(Math.max([...badge.text].length * size * .75 + px * 2, size * 2))
-  const anchorHeight = Math.ceil(size * 1.4 + py * 2)
+  const anchorWidth = Math.max([...badge.text].length * size * .7 + px * 2, size * 2)
+  const anchorHeight = size + py * 2
   const windows = rendering.platform === 'windows'
   const fontSize = size
   const width = anchorWidth

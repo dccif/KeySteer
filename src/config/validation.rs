@@ -460,83 +460,155 @@ impl ConfigFile {
                 }
             }
         }
-        if self.grid.enabled {
-            let grid = &self.grid;
-            let cells = (grid.grid_cols as usize) * (grid.grid_rows as usize);
-            if grid.grid_cols == 0 || grid.grid_rows == 0 || cells < 2 {
-                return Err(bad(
-                    "grid needs at least 2 cells (grid_cols * grid_rows)".into()
-                ));
-            }
-            if grid.keys.chars().count() != cells {
+        let targeting_geometry = self
+            .normal
+            .targeting
+            .as_ref()
+            .map(|targeting| targeting.resolve(self));
+        if let Some(targeting) = &self.normal.targeting
+            && targeting.method == super::TargetingMethod::Grid
+            && (targeting.min_size_width.is_some()
+                || targeting.min_size_height.is_some()
+                || targeting.layers.is_some())
+        {
+            return Err(bad("normal.targeting min_size_width, min_size_height and layers require method = recursive_grid".into()));
+        }
+        for (scope, grid_cols, grid_rows, keys, max_depth) in self
+            .grid
+            .enabled
+            .then_some((
+                "grid",
+                self.grid.grid_cols,
+                self.grid.grid_rows,
+                self.grid.keys.as_str(),
+                self.grid.max_depth,
+            ))
+            .into_iter()
+            .chain(
+                targeting_geometry
+                    .as_ref()
+                    .filter(|g| g.min_size.is_none())
+                    .map(|g| {
+                        (
+                            "normal.targeting",
+                            g.grid_cols,
+                            g.grid_rows,
+                            g.keys,
+                            g.max_depth,
+                        )
+                    }),
+            )
+        {
+            let cells = (grid_cols as usize) * (grid_rows as usize);
+            if grid_cols == 0 || grid_rows == 0 || cells < 2 {
                 return Err(bad(format!(
-                    "grid.keys has {} characters but the {}x{} grid needs {cells}",
-                    grid.keys.chars().count(),
-                    grid.grid_cols,
-                    grid.grid_rows,
+                    "{scope} needs at least 2 cells (grid_cols * grid_rows)"
                 )));
             }
-            if grid
-                .keys
+            if keys.chars().count() != cells {
+                return Err(bad(format!(
+                    "{scope}.keys has {} characters but the {}x{} grid needs {cells}",
+                    keys.chars().count(),
+                    grid_cols,
+                    grid_rows,
+                )));
+            }
+            if keys
                 .chars()
                 .collect::<std::collections::BTreeSet<_>>()
                 .len()
                 != cells
             {
-                return Err(bad("grid.keys must not contain duplicate characters".into()));
+                return Err(bad(format!(
+                    "{scope}.keys must not contain duplicate characters"
+                )));
             }
-            if !(1..=20).contains(&grid.max_depth) {
-                return Err(bad("grid.max_depth must be 1..=20".into()));
+            if !(1..=20).contains(&max_depth) {
+                return Err(bad(format!("{scope}.max_depth must be 1..=20")));
             }
         }
-
-        if self.recursive_grid.enabled {
-            let rg = &self.recursive_grid;
-            let cells = (rg.grid_cols as usize) * (rg.grid_rows as usize);
-            if rg.grid_cols == 0 || rg.grid_rows == 0 || cells < 2 {
-                return Err(bad(
-                    "recursive_grid needs at least 2 cells (grid_cols * grid_rows)".into(),
-                ));
-            }
-            if rg.keys.chars().count() != cells {
+        for (scope, grid_cols, grid_rows, keys, max_depth, layers) in self
+            .recursive_grid
+            .enabled
+            .then_some((
+                "recursive_grid",
+                self.recursive_grid.grid_cols,
+                self.recursive_grid.grid_rows,
+                self.recursive_grid.keys.as_str(),
+                self.recursive_grid.max_depth,
+                self.recursive_grid.layers.as_slice(),
+            ))
+            .into_iter()
+            .chain(
+                targeting_geometry
+                    .as_ref()
+                    .filter(|g| g.min_size.is_some())
+                    .map(|g| {
+                        (
+                            "normal.targeting",
+                            g.grid_cols,
+                            g.grid_rows,
+                            g.keys,
+                            g.max_depth,
+                            g.layers,
+                        )
+                    }),
+            )
+        {
+            let cells = (grid_cols as usize) * (grid_rows as usize);
+            if grid_cols == 0 || grid_rows == 0 || cells < 2 {
                 return Err(bad(format!(
-                    "recursive_grid.keys has {} characters but the {}x{} grid needs {cells}",
-                    rg.keys.chars().count(),
-                    rg.grid_cols,
-                    rg.grid_rows,
+                    "{scope} needs at least 2 cells (grid_cols * grid_rows)"
                 )));
             }
-            if rg
-                .keys
+            if keys.chars().count() != cells {
+                return Err(bad(format!(
+                    "{scope}.keys has {} characters but the {}x{} grid needs {cells}",
+                    keys.chars().count(),
+                    grid_cols,
+                    grid_rows,
+                )));
+            }
+            if keys
                 .chars()
                 .collect::<std::collections::BTreeSet<_>>()
                 .len()
                 != cells
             {
-                return Err(bad(
-                    "recursive_grid.keys must not contain duplicate characters".into(),
-                ));
+                return Err(bad(format!(
+                    "{scope}.keys must not contain duplicate characters"
+                )));
             }
-            if !(1..=20).contains(&rg.max_depth) {
-                return Err(bad("recursive_grid.max_depth must be 1..=20".into()));
+            if !(1..=20).contains(&max_depth) {
+                return Err(bad(format!("{scope}.max_depth must be 1..=20")));
             }
-            for layer in &rg.layers {
-                let cols = layer.grid_cols.unwrap_or(rg.grid_cols) as usize;
-                let rows = layer.grid_rows.unwrap_or(rg.grid_rows) as usize;
+            for layer in layers {
+                let cols = layer.grid_cols.unwrap_or(grid_cols) as usize;
+                let rows = layer.grid_rows.unwrap_or(grid_rows) as usize;
                 if cols == 0 || rows == 0 || cols * rows < 2 {
                     return Err(bad(format!(
-                        "recursive_grid.layers[depth={}] needs at least 2 cells",
+                        "{scope}.layers[depth={}] needs at least 2 cells",
                         layer.depth
                     )));
                 }
-                if let Some(keys) = &layer.keys
-                    && keys.chars().count() != cols * rows
+                let layer_keys = layer.keys.as_deref().unwrap_or(keys);
+                if layer_keys.chars().count() != cols * rows {
+                    return Err(bad(format!(
+                        "{scope}.layers[depth={}].keys has {} characters but needs {}",
+                        layer.depth,
+                        layer_keys.chars().count(),
+                        cols * rows,
+                    )));
+                }
+                if layer_keys
+                    .chars()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    != cols * rows
                 {
                     return Err(bad(format!(
-                        "recursive_grid.layers[depth={}].keys has {} characters but needs {}",
-                        layer.depth,
-                        keys.chars().count(),
-                        cols * rows,
+                        "{scope}.layers[depth={}].keys must not contain duplicate characters",
+                        layer.depth
                     )));
                 }
             }

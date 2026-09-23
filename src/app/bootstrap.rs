@@ -98,6 +98,9 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
 
     if args.check_only {
         config.validate().map_err(|e| e.to_string())?;
+        if config.normal.targeting.is_some() {
+            super::configuration::compile(&config)?;
+        }
         println!("ok");
         return Ok(());
     }

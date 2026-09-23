@@ -1,5 +1,9 @@
 # 核心运行时与公共 API
 
+`RetargetScreen` 在 Grid／Recursive Grid 中始终交给持有选格路径的活动网格，即使快捷键通过 temporary Normal 借用。先重放路径再 warp，避免 PointerMoved 跨屏重置层级；其他模式仍按 display_mode 路由，保留 Text Input 借用 Normal 的切屏能力。
+
+`Binding::TargetingKey(Key)` 是编译好的 Normal 盲操输入，使用现有 ModeEvent::Binding 分派、字符索引、严格修饰匹配、重复抑制和 Down/Up 配对；不新增全局原始按键或指针拦截。配置动作文本 `targeting_key <key>` 可表示同一动作。没有 normal.targeting 时不创建控制器／生成键表，普通 Normal 对象与输入／帧函数保持原样。
+
 相交切换能力在配置编译时由已启用模式的绑定、应用覆盖和嵌套动作序列推导为 EngineSettings.window_overlap_enabled；无相关绑定时不发送相交请求。Session 只保留可空缓存指针，首次相交请求才分配缓存，普通窗口/音频路径不创建相交状态。运行时配置重载从启用变为禁用时，Backend::clear_window_overlap_cache 仅通知已有 worker：丢弃待执行相交请求，在 worker 中释放缓存；不启动新 worker。几何仍按实际操作时的系统数据核对。
 
 直接 `Binding::Send` 通过 `repeats_on_key_down` 保留首次解析的 active gesture，并响应原生重复

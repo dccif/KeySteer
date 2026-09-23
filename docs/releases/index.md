@@ -5,6 +5,37 @@ outline: false
 
 # 更新日志 / Release Notes
 
+## 0.10.23
+
+- 修复 Grid／Recursive Grid 借用 Normal 快捷键切屏时忽略 `preserve = true`、丢失选格层级的问题。
+- Fixed Grid and Recursive Grid losing their selection depth when switching screens through temporary Normal shortcuts with `preserve = true`.
+
+- Normal 新增可选的盲操定位：无需切换模式或显示网格，直接用 Grid／Recursive Grid 的选格键粗定位鼠标，仍可用 H/J/K/L 细调。`Tab`／`Backspace` 返回上一层，`Space` 重置；选到最后一层后仍留在 Normal。
+- `[normal.targeting]` 可独立覆盖列数、行数、按键和最大层数；使用 Recursive Grid 时还可覆盖最小尺寸和按深度设置的 `layers`。未写的字段继承所选网格模式，独立 Grid／Recursive Grid 的配置和显示不受影响。`reset_on` 可选择细调、点击、两者或都不重置。
+- 定位键与 Normal 现有绑定冲突时，配置检查会列出键、动作和来源；请先移除、改绑或用 `none` 让出冲突键。未配置 `[normal.targeting]` 时保持原有行为。
+- 网页模拟器的 **Normal → 行为** 页可启用和编辑盲操定位，并在无网格的预览中试按选格键；借用 Normal 的按键标签只在按住配置的 `temporary_mode_keys` 时高亮。
+
+- Normal now offers optional blind positioning: use Grid or Recursive Grid selection keys to move the pointer without changing mode or displaying a grid, then fine-tune with H/J/K/L. `Tab`/`Backspace` step back, `Space` resets, and completing a selection stays in Normal.
+- `[normal.targeting]` can override columns, rows, keys, and depth independently; Recursive Grid also supports minimum-size and per-depth `layers` overrides. Omitted values inherit from the selected grid mode without changing that mode. Choose whether fine movement, clicks, both, or neither reset the selection with `reset_on`.
+- Conflicting Normal bindings are reported with their key, action, and source during configuration checking. Remove or rebind them, or use `none` to release a key. Existing behavior is unchanged when `[normal.targeting]` is absent.
+- The web simulator adds a switch and settings under **Normal → Behavior**, a grid-free pointer preview, and borrowed Normal key highlights that appear only while `temporary_mode_keys` are held.
+
+### 启用示例 / Enable example
+
+下面的数字键布局避开了发布默认配置中的 Normal 单键冲突；现有自定义绑定仍需按实际配置检查。保存后运行 `keysteer --config keysteer.user.toml --check`。
+
+The digit-key layout below avoids single-key Normal conflicts in the shipped defaults. Check any custom bindings in your own configuration with `keysteer --config keysteer.user.toml --check` after saving.
+
+```toml
+[normal.targeting]
+method = "grid"
+grid_cols = 3
+grid_rows = 2
+keys = "asdzxc"
+max_depth = 1
+reset_on = ["move", "click"]
+```
+
 ## 0.10.22
 
 - **破坏性改动：** 模式标识符移除 `position`、`indicator_x_offset`、`indicator_y_offset`，全局 `[mode_indicator.ui]` 和单模式 `[mode_indicator.modes.<模式>.ui]` 均只使用 `indicator_offset = [X, Y]`。旧字段会导致配置校验失败，请在升级前删除并迁移；即使已配置新数组，也必须删除旧字段。

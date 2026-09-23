@@ -35,6 +35,7 @@ export function fieldLocation(path: string): { page: string; tab: SettingsTab } 
 }
 export interface SearchEntry { path: string; label: string; page: string; tab: SettingsTab }
 export const utilitySearchFields: SearchEntry[] = [
+  ...Object.entries({ targeting: '启用 Normal 盲操定位', method: '盲操定位方式', reset_on: '盲操重置条件', grid_cols: '盲操列数', grid_rows: '盲操行数', keys: '盲操定位键', max_depth: '盲操最大层数', min_size_width: '盲操最小宽度', min_size_height: '盲操最小高度', layers: '盲操按层覆盖' }).map(([field, label]) => ({ path: `normal.targeting${field === 'targeting' ? '' : `.${field}`}`, label, page: 'normal', tab: 'behavior' as const })),
   ...[undefined, ...indicatorModes].flatMap(mode => indicatorFields(mode).map(field => ({ ...field, ...fieldLocation(field.path) }))),
   ...Object.entries({ key: '触发键', enabled: '启用快速切换', hold_ms: '长按毫秒', position: '面板位置', blacklist: '面板黑名单' }).map(([field, label]) => ({ path: `quick_switch.${field}`, label, page: 'quick_switch', tab: 'behavior' as const })),
   ...Object.entries({ font_size: '字号', border_width: '边框宽度', border_radius: '圆角', padding_x: '左右内边距', padding_y: '上下内边距', background_color: '背景颜色', text_color: '文字颜色', border_color: '边框颜色' }).map(([field, label]) => ({ path: `quick_switch.ui.${field}`, label, page: 'quick_switch', tab: 'appearance' as const })),

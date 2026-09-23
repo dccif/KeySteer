@@ -1,5 +1,13 @@
 # 内置模式、插件与 Finish 生命周期
 
+## Normal 可选定位组合
+
+Normal 盲操在有效 `max_depth = 1` 时，每次选格后标记 pending reset，下次输入重新使用整屏根布局，支持连续绝对定位，不依赖 `reset_on`。多层及独立 Grid／Recursive Grid 的终点行为不变；网页模拟器遵循相同规则。
+
+`NormalTargeting` 只在配置存在时替代 catalog 中的 Normal 实例；普通 Normal 类型、Frame 实现和 pointer interest 不变。它持有普通 Normal 与共享 TargetingController，不持有 UI 样式，也不调用网格 Presenter。move 观察 Normal 输出的非零 MovePointer，click 观察成功 Clicked；只标记 pending reset，下次定位输入才重置，不立即 warp。实体鼠标不新增订阅，选格前按 active_bounds 懒检查换屏。插件 ScreenRetargeted 复用 controller 的 preserve 路径重放。
+
+TargetingController 统一 Grid／Recursive Grid 的几何和输入状态转换，返回 Ignored/Changed/Cancel/Follow/Commit。可见模式将结果转换为视图及原生命周期命令；Normal 只发 WarpPointer，根层回退不退出、终点不切换模式，Enter/Esc 仍为普通 Normal 绑定。Tab/Backspace 只回退状态，Space 只清路径。层布局在构造时解析，均匀布局内联存一份，深路径容量预留，跨屏原地重放不 clone 路径。
+
 ## Mode 契约
 
 Tabs 的 `move_left/right` 消费为活动标签排序，`move_up/down` 消费为前后选择，默认 H/L 与 K/J；没有帧时钟和指针移动。Alt+W 的分组卡片列出所有成员编号、程序和标题并标识活动项，编辑布局仍每组只保留一个代表。
@@ -68,8 +76,8 @@ settings；不能注入输入、创建窗口或直接扫描 UI。
 - 以当前屏幕为 root，按 `grid_rows * grid_cols` 和 `keys` 逐层缩小。
 - depth 0 在每个一级格中央绘制醒目的大号第一键，并在其下绘制淡色的小号第二键装饰
   网格；它不修改 stack/path，第一次选择后的 depth 1 及后续 scene 保持原有单层行为。
-- 与 Recursive Grid 共用 `targeting::TargetingSession` 保存选择路径、return mode、finished、
-  cursor-follow 和生命周期公共转换；Grid 自己只拥有矩形布局和绘制状态。
+- 与 Recursive Grid／Normal 盲操共用 `targeting::TargetingController` 计算几何和处理导航；
+  内部 TargetingSession 保存路径、return mode、finished、cursor-follow 和生命周期状态，Grid 自己负责视图。
 - 每层 label 自动缩放以适应单元格；最终层建立完成态再触发生命周期。
 - finished 后 Backspace 取消完成态并回退一层；`keep` 不重建 Mode。
 

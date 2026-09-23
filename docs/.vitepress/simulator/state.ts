@@ -1,4 +1,5 @@
 import { createWindowState, leaveWindow, isWindowMode, type WindowState, type WindowMode } from './window.ts'
+import { createBlindTargetingState, type BlindTargetingState } from './normal-targeting.ts'
 
 export type SimulatorMode = 'idle' | 'normal' | 'text_input' | 'grid' | 'recursive_grid' | 'ui_hint' | WindowMode
 
@@ -26,6 +27,7 @@ export interface SimulatorState {
   pointer: Point
   pressedButtons: Set<'left' | 'right' | 'middle'>
   targeting: TargetingState
+  blindTargeting: BlindTargetingState
   lastEvent: string
 }
 
@@ -48,6 +50,7 @@ export function createSimulatorState(mouseKeyHelp = false): SimulatorState {
       grid: { path: [], maxDepth: 3 },
       recursiveGrid: { path: [], maxDepth: 10 },
     },
+    blindTargeting: createBlindTargetingState(),
     lastEvent: '模拟器就绪',
   }
 }
@@ -69,6 +72,7 @@ export function applyModeAction(state: SimulatorState, action: string, mouseKeyH
   if (action === 'text_input') state.pressedButtons.clear()
   if (state.mode.startsWith('window')) leaveWindow(state)
   state.mode = action
+  state.blindTargeting.pendingReset = true
   state.lastEvent = `进入 ${action}`
   return true
 }

@@ -1,5 +1,7 @@
 # 覆盖层、帧同步与性能约束
 
+模式标识符在 `presentation::dynamic::indicator` 中按所在屏幕应用一次 `label_scale`，先缩放字号、内边距、边框和圆角，再测量并限制位置。Windows 使用屏幕 DPI，macOS 保持逻辑点；原生后端不再次缩放。仅构造内容时计算，原有位置缓存和跨屏重建路径继续复用。
+
 Window 五种模式的固定帮助计划在 registry::rebuild_tables 中预编译：解析有效绑定、temporary_mode_keys 与 Grid/Recursive Grid 入口、冲突和返回目标，生成平台按键显示名、语义分组、单/双栏行及静态列宽字符计数。普通 Window 提前生成 Move/Resize 两份（Resize 无 Other Actions），其他模式共享同一版本。模式进入、重入和 S 切换只选择 Arc 中的已有内容，不重新解析、分组或构造固定行；配置/应用覆盖变化重建计划。Restore 页码提示、窗口状态、屏幕/DPI 和锚点几何仍按当前状态更新，完整场景缓存继续复用。
 
 窗口身份卡片的引导线由共享 `window.card.guide_line_enabled/width/color` 控制；颜色在 WindowStyles 中按主题预编译。配置编译选择无引导线或有引导线的专用渲染入口；场景的可选 WindowAnnotations 表只保存一份启用时共享的 LabelConnectorStyle，关闭时不分配引导线条目；统一避让仅为显式启用的窗口卡片生成连接线，关闭线条不影响避让。普通 Hint/Grid 标签不携带窗口专用数据。
@@ -434,5 +436,7 @@ Windows 普通确认只验证身份、读取可见 bounds 和一次 GWL_STYLE；
 
 Window 模式持有 `WindowTextCache`，presentation 缓存每个窗口的原始卡片文字，以流式精确比较验证标题、应用、组成员、活动标记和编号。几何变化复用 `Arc<[String]>`；样式和宽度相关的省略与度量仍使用当前场景参数。库存删除回收对应条目，模式库存重置清空缓存；缓存不跨会话无限保留。
 ## 模式标识符定位
+
+徽标保留原版紧凑尺寸：宽度为 `max(字符数 × 字号 × 0.7 + 2 × padding_x, 2 × 字号)`，高度为 `字号 + 2 × padding_y`。不要套用普通标签的 1.4 倍行高；网页预览复用相同公式。
 
 `IndicatorUi.indicator_offset: [i16; 2]` 定义右上角相对鼠标热点的偏移。全局默认 [-12, 18]，仅单模式覆盖使用 Option 表示继承；0.10.22 移除旧 position/indicator_x_offset/indicator_y_offset，解析时拒绝这些字段。Indicator::label_size 为 presentation、Windows GPU/软件及 macOS 共享尺寸公式；Windows 后端不得再次 DPI 缩放标识符。配置覆盖、颜色、文字尺寸与偏移在内容更新时解析成 IndicatorGeometry；后续鼠标移动只加偏移并做边界限制，零文本解析及布局分配。

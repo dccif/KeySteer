@@ -5,6 +5,29 @@ outline: false
 
 # Release notes
 
+## 0.10.23
+
+- Fixed Grid and Recursive Grid losing their selection depth when switching screens through temporary Normal shortcuts with `preserve = true`.
+
+- Normal now offers optional blind positioning: use Grid or Recursive Grid selection keys to move the pointer without changing mode or displaying a grid, then fine-tune with H/J/K/L. `Tab`/`Backspace` step back, `Space` resets, and completing a selection stays in Normal.
+- `[normal.targeting]` can override columns, rows, keys, and maximum depth independently. Recursive Grid also supports minimum-size and per-depth `layers` overrides. Omitted values inherit from the selected grid mode without changing that mode. Use `reset_on` to restart after fine movement, clicks, both, or neither.
+- Configuration checking reports conflicting Normal bindings with their key, action, and source. Remove or rebind them, or use `none` to release a key. Existing behavior is unchanged when `[normal.targeting]` is absent.
+- The web simulator adds a switch and settings under **Normal → Behavior**, a grid-free pointer preview, and borrowed Normal key highlights that appear only while `temporary_mode_keys` are held.
+
+### Enable example
+
+This digit-key layout avoids single-key Normal conflicts in the shipped defaults. Check any custom bindings in your own configuration with `keysteer --config keysteer.user.toml --check` after saving.
+
+```toml
+[normal.targeting]
+method = "grid"
+grid_cols = 3
+grid_rows = 2
+keys = "asdzxc"
+max_depth = 1
+reset_on = ["move", "click"]
+```
+
 ## 0.10.22
 
 - **Breaking change:** Removed mode-badge `position`, `indicator_x_offset`, and `indicator_y_offset`. Both `[mode_indicator.ui]` and `[mode_indicator.modes.<mode>.ui]` now use only `indicator_offset = [X, Y]`. Old fields fail configuration validation; remove and migrate them before upgrading, even if the new pair is already present.
