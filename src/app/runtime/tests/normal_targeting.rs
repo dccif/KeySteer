@@ -208,6 +208,66 @@ fn normal_targeting_reports_binding_alias_and_app_conflicts_before_installation(
 }
 
 #[test]
+fn temporary_normal_blind_targeting_keeps_priority_over_host_grid() {
+    for method in ["grid", "recursive_grid"] {
+        for host in [ModeId::grid(), ModeId::recursive_grid(), ModeId::text_input()] {
+            for literal in [false, true] {
+                for trigger in ["left_cmd", "left_ctrl"] {
+                let mut config = blind_config(method, "[]");
+                config.grid.temporary_mode_keys = vec![trigger.into()];
+                config.recursive_grid.temporary_mode_keys = vec![trigger.into()];
+                config.text_input.temporary_mode_keys = vec![trigger.into()];
+                config.normal.bindings.remove("ctrl+a");
+                config.normal.targeting.as_mut().unwrap().grid_cols = Some(4);
+                config.normal.targeting.as_mut().unwrap().grid_rows = Some(1);
+                let primary = trigger.to_string();
+                let (mut engine, mut backend, log) = blind_engine(&config);
+                engine.activate(host.clone(), Some(ModeId::normal()), &mut backend).unwrap();
+                engine.handle_backend_event(key_down(&primary), &mut backend).unwrap();
+                let physical = if literal { "x" } else { "a" };
+                let BackendEvent::Input(mut down) = key_down(physical) else { unreachable!() };
+                if literal { down.character = Some('a'); }
+                engine.handle_backend_event(BackendEvent::Input(down), &mut backend).unwrap();
+                engine.handle_backend_event(key_up(physical), &mut backend).unwrap();
+                assert_eq!(engine.cursor, Point::new(128.0, 512.0), "{method} {host} literal={literal}");
+                assert_eq!(engine.active_mode(), &host);
+                assert_eq!(engine.display_mode(), ModeId::normal());
+                assert!(log.lock().unwrap().dispositions.iter().rev().take(2).all(|value| *value == KeyDisposition::Consume));
+                engine.handle_backend_event(key_up(&primary), &mut backend).unwrap();
+                assert_eq!(engine.display_mode(), host);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn blind_targeting_forwards_application_command_chords() {
+    for method in ["grid", "recursive_grid"] {
+    for depth in [1, 3] {
+    let mut config = blind_config(method, "[]");
+    config.normal.targeting.as_mut().unwrap().max_depth = Some(depth);
+    config.normal.bindings.remove("ctrl+a");
+    for modifier in ["left_cmd", "right_cmd", "left_ctrl", "left_alt"] {
+    for physical in ["a", "q"] {
+        let (mut engine, mut backend, log) = blind_engine(&config);
+        engine.handle_backend_event(key_down(modifier), &mut backend).unwrap();
+        for event in [key_down(physical), key_up(physical)] {
+            let BackendEvent::Input(mut input) = event else { unreachable!() };
+            input.character = Some('a');
+            engine.handle_backend_event(BackendEvent::Input(input), &mut backend).unwrap();
+        }
+        engine.handle_backend_event(key_up(modifier), &mut backend).unwrap();
+        let log = log.lock().unwrap();
+        assert!(log.warps.is_empty(), "physical {physical}");
+        assert_eq!(log.dispositions, vec![KeyDisposition::Forward; 4], "physical {physical}");
+    }
+    }
+    }
+    }
+}
+
+#[test]
 fn normal_targeting_full_chords_unbound_keys_and_terminal_behavior() {
     let (mut engine, mut backend, log) = blind_engine(&blind_config("grid", "[]"));
     for event in tap_chord("left_ctrl+a") {

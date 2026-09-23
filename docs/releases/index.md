@@ -7,6 +7,9 @@ outline: false
 
 ## 0.10.23
 
+- 修复盲操定位在字符与物理键不一致的键盘布局下吞掉 Cmd／Ctrl／Alt 应用快捷键的问题，避免字符匹配去掉修饰键后误触发裸定位键。
+- Fixed blind targeting intercepting Cmd/Ctrl/Alt application shortcuts when the produced character differs from the physical key, preventing character lookup from treating those shortcuts as bare selection keys.
+
 - Normal 新增可选的盲操定位：无需切换模式或显示网格，直接用 Grid／Recursive Grid 的选格键粗定位鼠标，仍可用 H/J/K/L 细调。`Tab`／`Backspace` 返回上一层，`Space` 重置；选到最后一层后仍留在 Normal。
 - `[normal.targeting]` 可独立覆盖列数、行数、按键和最大层数；使用 Recursive Grid 时还可覆盖最小尺寸和按深度设置的 `layers`。未写的字段继承所选网格模式，独立 Grid／Recursive Grid 的配置和显示不受影响。`reset_on` 可选择细调、点击、两者或都不重置。
 - 定位键与 Normal 现有绑定冲突时，配置检查会列出键、动作和来源；请先移除、改绑或用 `none` 让出冲突键。未配置 `[normal.targeting]` 时保持原有行为。

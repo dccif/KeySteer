@@ -1809,7 +1809,22 @@ impl Engine {
             .cloned()
             .collect();
         literal.push(symbol.clone());
-        self.lookup_for_pressed(symbol, &literal)
+        let resolved = self.lookup_for_pressed(symbol, &literal)?;
+        // Character production may strip shortcut modifiers on alternate
+        // layouts. A generated grid key must not steal an application chord.
+        // Shift remains available for producing literal symbols; temporary
+        // activation modifiers retained in `literal` keep their normal routing.
+        // `win` is the canonical Meta family, including macOS Command:
+        // Key normalizes cmd aliases and the macOS backend emits *_win.
+        if matches!(resolved.binding.as_ref(), Binding::TargetingKey(_))
+            && self.input.pressed.iter().any(|key| {
+                matches!(Self::modifier_family(key), Some("ctrl" | "alt" | "win"))
+                    && !literal.contains(key)
+            })
+        {
+            return None;
+        }
+        Some(resolved)
     }
 
     fn binding_available(&self, mode: &ModeId, binding: &Binding) -> bool {

@@ -1,5 +1,7 @@
 # 核心运行时与公共 API
 
+字符定位匹配命中 TargetingKey 时，不得丢弃实际按住的 Cmd／Ctrl／Alt 后抢占应用快捷键；被临时模式路由保留的修饰键仍遵循该路由，Shift 仍可产生字面符号。物理组合键继续通过原绑定匹配与 Down/Up 透传配对处理。
+
 `RetargetScreen` 在 Grid／Recursive Grid 中始终交给持有选格路径的活动网格，即使快捷键通过 temporary Normal 借用。先重放路径再 warp，避免 PointerMoved 跨屏重置层级；其他模式仍按 display_mode 路由，保留 Text Input 借用 Normal 的切屏能力。
 
 `Binding::TargetingKey(Key)` 是编译好的 Normal 盲操输入，使用现有 ModeEvent::Binding 分派、字符索引、严格修饰匹配、重复抑制和 Down/Up 配对；不新增全局原始按键或指针拦截。配置动作文本 `targeting_key <key>` 可表示同一动作。没有 normal.targeting 时不创建控制器／生成键表，普通 Normal 对象与输入／帧函数保持原样。

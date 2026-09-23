@@ -7,6 +7,8 @@ outline: false
 
 ## 0.10.23
 
+- Fixed blind targeting intercepting Cmd/Ctrl/Alt application shortcuts when the produced character differs from the physical key, preventing character lookup from treating those shortcuts as bare selection keys.
+
 - Normal now offers optional blind positioning: use Grid or Recursive Grid selection keys to move the pointer without changing mode or displaying a grid, then fine-tune with H/J/K/L. `Tab`/`Backspace` step back, `Space` resets, and completing a selection stays in Normal.
 - `[normal.targeting]` can override columns, rows, keys, and maximum depth independently. Recursive Grid also supports minimum-size and per-depth `layers` overrides. Omitted values inherit from the selected grid mode without changing that mode. Use `reset_on` to restart after fine movement, clicks, both, or neither.
 - Configuration checking reports conflicting Normal bindings with their key, action, and source. Remove or rebind them, or use `none` to release a key. Existing behavior is unchanged when `[normal.targeting]` is absent.
