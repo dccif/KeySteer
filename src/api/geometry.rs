@@ -157,16 +157,127 @@ impl Screen {
     }
 }
 
+/// Semantic role of a scanned UI target.
+///
+/// Platform providers map their native control types onto this closed
+/// vocabulary, so a "button" means the same thing on every OS. The wire names
+/// are the values providers stamp onto [`UiTarget::role`]; `ui_hint.
+/// clickable_roles` additionally accepts aliases such as `heading` or `switch`,
+/// which `ax_roles_for` and `control_types_for` widen into these roles.
+///
+/// Stored inline instead of as text: producers used to format a string literal
+/// into a `String` for every scanned element, which cost one heap allocation
+/// per target. The enum itself occupies one byte; struct savings include padding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticRole {
+    Button,
+    MenuButton,
+    Link,
+    Checkbox,
+    Radio,
+    ComboBox,
+    TextField,
+    StaticText,
+    Slider,
+    Spinner,
+    Stepper,
+    Scrollbar,
+    Tab,
+    ListItem,
+    TreeItem,
+    Cell,
+    Row,
+    MenuItem,
+    MenubarItem,
+    Calendar,
+    Image,
+    Control,
+    Unknown,
+}
+
+impl SemanticRole {
+    /// Every variant, in declaration order.
+    pub const ALL: [Self; 23] = [
+        Self::Button,
+        Self::MenuButton,
+        Self::Link,
+        Self::Checkbox,
+        Self::Radio,
+        Self::ComboBox,
+        Self::TextField,
+        Self::StaticText,
+        Self::Slider,
+        Self::Spinner,
+        Self::Stepper,
+        Self::Scrollbar,
+        Self::Tab,
+        Self::ListItem,
+        Self::TreeItem,
+        Self::Cell,
+        Self::Row,
+        Self::MenuItem,
+        Self::MenubarItem,
+        Self::Calendar,
+        Self::Image,
+        Self::Control,
+        Self::Unknown,
+    ];
+
+    /// Wire name, identical to the literals providers used to assign.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Button => "button",
+            Self::MenuButton => "menu_button",
+            Self::Link => "link",
+            Self::Checkbox => "checkbox",
+            Self::Radio => "radio",
+            Self::ComboBox => "combo_box",
+            Self::TextField => "text_field",
+            Self::StaticText => "static_text",
+            Self::Slider => "slider",
+            Self::Spinner => "spinner",
+            Self::Stepper => "stepper",
+            Self::Scrollbar => "scrollbar",
+            Self::Tab => "tab",
+            Self::ListItem => "list_item",
+            Self::TreeItem => "tree_item",
+            Self::Cell => "cell",
+            Self::Row => "row",
+            Self::MenuItem => "menu_item",
+            Self::MenubarItem => "menubar_item",
+            Self::Calendar => "calendar",
+            Self::Image => "image",
+            Self::Control => "control",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Parses a name produced by [`Self::as_str`].
+    pub fn from_wire(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|role| role.as_str() == name)
+    }
+}
+
+impl std::fmt::Display for SemanticRole {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// An interactive element reported by the platform accessibility tree.
+///
+/// The OS-native control type is deliberately not carried here: it was only
+/// ever written, never read, and the field cost 24 bytes plus an allocation on
+/// providers that built it from a literal.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UiTarget {
     pub rect: Rect,
     /// Accessible name / label, may be empty.
     pub name: String,
-    /// Semantic role in this crate's vocabulary (`button`, `link`, ...).
-    pub role: String,
-    /// Native control type as reported by the OS, for diagnostics.
-    pub native_role: Option<String>,
+    /// Semantic role in this crate's vocabulary.
+    pub role: SemanticRole,
 }
 
 #[cfg(test)]

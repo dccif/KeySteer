@@ -1,5 +1,7 @@
 # UI Hint 扫描链路
 
+`UiTarget.role` 使用单字节 `SemanticRole`，平台扫描和 OCR/视觉 provider 在生成目标时映射，序列化仍为原 snake_case 名称。配置 clickable_roles 保持字符串及原平台别名；未使用的 native_role 不再携带，旧序列化输入仍可忽略该字段。64 位 UiTarget 从 104 降到 64 字节，不再为角色分配字符串；name 和原有去重算法保留。
+
 ## 可配置范围与跨屏重扫
 
 `ui_hint.scan_scope` 默认为 `window`；`screen` 扫描鼠标所在的整块屏幕，不合并多个显示器。

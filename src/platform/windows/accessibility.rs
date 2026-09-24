@@ -43,7 +43,7 @@ use windows::core::{BOOL, Interface};
 
 use super::ui_scan::ScanSource;
 use crate::api::command::{UiScanRequest, UiScanStatus};
-use crate::api::geometry::{Rect, UiTarget};
+use crate::api::geometry::{Rect, SemanticRole, UiTarget};
 use crate::platform::common::partial_batcher::PartialBatcher;
 use crate::support::worker::WorkerJoin;
 
@@ -1561,28 +1561,28 @@ pub fn control_types_for(semantic_roles: &[String]) -> Vec<i32> {
     out
 }
 
-pub fn semantic_role_for(control_type: i32) -> &'static str {
+pub fn semantic_role_for(control_type: i32) -> SemanticRole {
     match control_type {
-        50000 => "button",
-        50001 => "calendar",
-        50002 => "checkbox",
-        50003 => "combo_box",
-        50004 => "text_field",
-        50005 => "link",
-        50006 => "image",
-        50007 => "list_item",
-        50010 => "menubar_item",
-        50011 => "menu_item",
-        50013 => "radio",
-        50015 => "slider",
-        50016 => "stepper",
-        50019 => "tab",
-        50020 => "static_text",
-        50024 => "tree_item",
-        50029 => "row",
-        50031 => "menu_button",
-        50035 => "cell",
-        _ => "unknown",
+        50000 => SemanticRole::Button,
+        50001 => SemanticRole::Calendar,
+        50002 => SemanticRole::Checkbox,
+        50003 => SemanticRole::ComboBox,
+        50004 => SemanticRole::TextField,
+        50005 => SemanticRole::Link,
+        50006 => SemanticRole::Image,
+        50007 => SemanticRole::ListItem,
+        50010 => SemanticRole::MenubarItem,
+        50011 => SemanticRole::MenuItem,
+        50013 => SemanticRole::Radio,
+        50015 => SemanticRole::Slider,
+        50016 => SemanticRole::Stepper,
+        50019 => SemanticRole::Tab,
+        50020 => SemanticRole::StaticText,
+        50024 => SemanticRole::TreeItem,
+        50029 => SemanticRole::Row,
+        50031 => SemanticRole::MenuButton,
+        50035 => SemanticRole::Cell,
+        _ => SemanticRole::Unknown,
     }
 }
 
@@ -1590,8 +1590,7 @@ pub fn to_target(rect: Rect, name: String, control_type: i32) -> UiTarget {
     UiTarget {
         rect,
         name,
-        role: semantic_role_for(control_type).to_string(),
-        native_role: Some(control_type.to_string()),
+        role: semantic_role_for(control_type),
     }
 }
 
@@ -1620,7 +1619,7 @@ struct DedupEntry {
 struct SpatialDeduper {
     cell_size: f64,
     cells: HashMap<(i32, i32), SmallVec<[DedupEntry; 2]>>,
-    semantics: Vec<(String, String)>,
+    semantics: Vec<(String, SemanticRole)>,
     semantic_buckets: HashMap<u64, SmallVec<[usize; 2]>>,
 }
 
@@ -1676,8 +1675,7 @@ impl SpatialDeduper {
             return index;
         }
         let index = self.semantics.len();
-        self.semantics
-            .push((target.name.clone(), target.role.clone()));
+        self.semantics.push((target.name.clone(), target.role));
         self.semantic_buckets.entry(hash).or_default().push(index);
         index
     }
@@ -1854,12 +1852,11 @@ mod tests {
         ));
     }
 
-    fn target(x: f64, y: f64, name: &str, role: &str) -> UiTarget {
+    fn target(x: f64, y: f64, name: &str, role: SemanticRole) -> UiTarget {
         UiTarget {
             rect: Rect::new(x, y, 40.0, 20.0),
             name: name.into(),
-            role: role.into(),
-            native_role: None,
+            role,
         }
     }
 
@@ -1899,19 +1896,19 @@ mod tests {
     #[test]
     fn spatial_deduper_keeps_overlapping_distinct_controls() {
         let mut deduper = SpatialDeduper::new(8.0);
-        assert!(deduper.insert(&target(10.0, 10.0, "Save", "button")));
-        assert!(!deduper.insert(&target(11.0, 11.0, "Save", "button")));
-        assert!(deduper.insert(&target(11.0, 11.0, "Cancel", "button")));
-        assert!(deduper.insert(&target(11.0, 11.0, "Save", "link")));
+        assert!(deduper.insert(&target(10.0, 10.0, "Save", SemanticRole::Button)));
+        assert!(!deduper.insert(&target(11.0, 11.0, "Save", SemanticRole::Button)));
+        assert!(deduper.insert(&target(11.0, 11.0, "Cancel", SemanticRole::Button)));
+        assert!(deduper.insert(&target(11.0, 11.0, "Save", SemanticRole::Link)));
     }
 
     #[test]
     fn spatial_deduper_handles_extreme_native_coordinates() {
         let mut deduper = SpatialDeduper::new(8.0);
         let coordinate = f64::from(i32::MAX) * 8.0;
-        assert!(deduper.insert(&target(coordinate, coordinate, "Max", "button")));
+        assert!(deduper.insert(&target(coordinate, coordinate, "Max", SemanticRole::Button)));
         let coordinate = f64::from(i32::MIN) * 8.0;
-        assert!(deduper.insert(&target(coordinate, coordinate, "Min", "button")));
+        assert!(deduper.insert(&target(coordinate, coordinate, "Min", SemanticRole::Button)));
     }
 
     #[test]
@@ -2130,7 +2127,7 @@ mod tests {
     #[test]
     fn higher_z_order_windows_hide_only_covered_target_centres() {
         let bounds = Rect::new(0.0, 0.0, 200.0, 100.0);
-        let item = target(20.0, 20.0, "Save", "button");
+        let item = target(20.0, 20.0, "Save", SemanticRole::Button);
         let mut plan = test_scan_plan(UiScanRequest {
             scope: crate::api::UiScanScope::Window,
             id: 1,
@@ -2249,7 +2246,7 @@ mod tests {
     #[test]
     fn rejects_degenerate_and_container_targets() {
         let window = Rect::new(0.0, 0.0, 1000.0, 800.0);
-        let mut item = target(10.0, 10.0, "Save", "button");
+        let mut item = target(10.0, 10.0, "Save", SemanticRole::Button);
         assert!(is_usable(&item, window));
         item.rect.width = 1.0;
         assert!(!is_usable(&item, window));

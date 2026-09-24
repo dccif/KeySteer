@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use smallvec::SmallVec;
 
-use crate::api::{Rect, UiTarget};
+use crate::api::{Rect, SemanticRole, UiTarget};
 
 use super::MAX_IDLE_RETAINED_TARGETS;
 use super::labeling::CompactHint;
@@ -170,14 +170,12 @@ mod tests {
                 let target = UiTarget {
                     rect: Rect::new((index % 10) as f64, 0.0, 1.0, 1.0),
                     name: format!("Target {index}"),
-                    role: "button".into(),
-                    native_role: None,
+                    role: SemanticRole::Button,
                 };
                 expected.push(target.clone());
                 targets.push(target.clone());
-                let mut duplicate = target;
-                duplicate.native_role = Some("same semantic target".into());
-                targets.push(duplicate);
+                // An identical second copy must collapse into the first one.
+                targets.push(target);
             }
             let original_storage = targets.as_ptr();
             let mut session = ScanSession::default();

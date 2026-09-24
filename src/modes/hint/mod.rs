@@ -16,7 +16,7 @@ use crate::api::command::{
     Command, CommandBatch, FinishCause, FocusedApp, HostContext, Mode, ModeEvent, UiScanRequest,
     UiScanResult, UiScanStatus, UiScanStrategy, VisionOptions,
 };
-use crate::api::geometry::{Rect, UiTarget};
+use crate::api::geometry::{Rect, SemanticRole, UiTarget};
 use crate::api::hint::LabelDirection;
 use crate::api::input::{Key, KeyChord, KeyState, ModeId};
 use crate::api::lifecycle::TargetingLifecycle;
@@ -965,8 +965,7 @@ mod tests {
         UiTarget {
             rect: Rect::new(x, 100.0, 80.0, 24.0),
             name: name.into(),
-            role: "button".into(),
-            native_role: None,
+            role: SemanticRole::Button,
         }
     }
 
@@ -2671,7 +2670,7 @@ mod tests {
         let mut different_name = save.clone();
         different_name.name = "Save as".into();
         let mut different_role = save.clone();
-        different_role.role = "checkbox".into();
+        different_role.role = SemanticRole::Checkbox;
         deliver(
             &mut mode,
             &env,

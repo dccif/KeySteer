@@ -40,7 +40,7 @@ pub use command::{
     MouseButton, UiScanRequest, UiScanResult, UiScanScope, UiScanStatus, UiScanStrategy,
     VisionOptions,
 };
-pub use geometry::{Point, Rect, Screen, UiTarget};
+pub use geometry::{Point, Rect, Screen, SemanticRole, UiTarget};
 pub use hint::LabelDirection;
 pub use input::{InputEvent, Key, KeyChord, KeyState, ModeId};
 pub use lifecycle::{LifecycleAction, TargetingLifecycle};

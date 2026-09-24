@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::api::command::{UiScanResult, UiScanStatus};
-use crate::api::geometry::UiTarget;
+use crate::api::geometry::{SemanticRole, UiTarget};
 
 #[derive(Default)]
 struct State {
@@ -126,8 +126,7 @@ mod tests {
         UiTarget {
             rect: Rect::new(0.0, 0.0, 10.0, 10.0),
             name: name.into(),
-            role: "button".into(),
-            native_role: None,
+            role: SemanticRole::Button,
         }
     }
 

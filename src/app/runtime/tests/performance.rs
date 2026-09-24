@@ -417,68 +417,30 @@ fn binding_ownership_performance_probe() {
 
 #[test]
 #[ignore = "microbenchmark probe; run in release with --test-threads=1"]
-fn native_role_move_performance_probe() {
-    const WARMUP: usize = 2_000;
+fn semantic_role_stays_inline_probe() {
     const SAMPLES: usize = 20_000;
 
-    fn make_target(native_role: String, clone_role: bool) -> crate::api::geometry::UiTarget {
-        let retained_role = if clone_role {
-            native_role.clone()
-        } else {
-            native_role
-        };
+    fn make_target(role: crate::api::geometry::SemanticRole) -> crate::api::geometry::UiTarget {
         crate::api::geometry::UiTarget {
             rect: Rect::new(0.0, 0.0, 40.0, 20.0),
             name: String::new(),
-            role: "button".to_owned(),
-            native_role: Some(retained_role),
+            role,
         }
     }
 
-    fn percentiles(samples: &mut [u128]) -> (u128, u128, u128) {
-        samples.sort_unstable();
-        let last = samples.len() - 1;
-        (
-            samples[last * 50 / 100],
-            samples[last * 95 / 100],
-            samples[last * 99 / 100],
-        )
+    // The role used to be a `String` built from a literal for every scanned
+    // element, which cost one heap allocation per target. It is a fieldless
+    // enum now, so building a target with an empty name must not allocate.
+    let region = Region::new(TEST_ALLOCATOR);
+    for _ in 0..SAMPLES {
+        drop(std::hint::black_box(make_target(
+            crate::api::geometry::SemanticRole::Button,
+        )));
     }
-
-    for _ in 0..WARMUP {
-        drop(std::hint::black_box(make_target("AXButton".into(), false)));
-        drop(std::hint::black_box(make_target("AXButton".into(), true)));
-    }
-    let mut moved_samples = Vec::with_capacity(SAMPLES);
-    let mut cloned_samples = Vec::with_capacity(SAMPLES);
-    for sample in 0..SAMPLES {
-        let measure = |clone_role: bool, samples: &mut Vec<u128>| {
-            let native_role = String::from("AXButton");
-            let started = Instant::now();
-            drop(std::hint::black_box(make_target(native_role, clone_role)));
-            samples.push(started.elapsed().as_nanos());
-        };
-        if sample % 2 == 0 {
-            measure(false, &mut moved_samples);
-            measure(true, &mut cloned_samples);
-        } else {
-            measure(true, &mut cloned_samples);
-            measure(false, &mut moved_samples);
-        }
-    }
-
-    let native_role = String::from("AXButton");
-    let moved_region = Region::new(TEST_ALLOCATOR);
-    drop(make_target(native_role, false));
-    let moved_allocations = moved_region.change().allocations;
-    let native_role = String::from("AXButton");
-    let cloned_region = Region::new(TEST_ALLOCATOR);
-    drop(make_target(native_role, true));
-    let cloned_allocations = cloned_region.change().allocations;
-    println!(
-        "native_role_probe samples={SAMPLES} moved={:?} cloned={:?} moved_allocations={moved_allocations} cloned_allocations={cloned_allocations}",
-        percentiles(&mut moved_samples),
-        percentiles(&mut cloned_samples),
+    let allocations = region.change().allocations;
+    assert_eq!(
+        allocations, 0,
+        "UiTarget construction allocated {allocations} times; the semantic role must stay inline"
     );
 }
 

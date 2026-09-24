@@ -1,5 +1,7 @@
 Restore 内恢复／删除状态合并、移除独立 Delete 配置见 [配置](03-configuration.md)、[模式状态机](04-modes-and-lifecycle.md) 和 [验证](08-build-docs-and-tests.md)。
 
+UI 目标角色枚举及兼容性验证见 [UI 扫描](05-ui-scanning.md) 和 [验证](08-build-docs-and-tests.md)。此次仅保留角色存储优化，配置数值类型和去重索引保持原实现。
+
 Window 入口激活鼠标下窗口、可配置关闭动作见 [公共 API](02-runtime-and-api.md)、[模式](04-modes-and-lifecycle.md)、[原生后端](06-platform-backends.md) 和 [验证](08-build-docs-and-tests.md)。
 
 # KeySteer 项目手册

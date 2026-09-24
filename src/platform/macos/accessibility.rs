@@ -14,7 +14,7 @@ use core_graphics::geometry::{CGPoint, CGSize};
 use objc2_app_kit::NSWorkspace;
 
 use crate::api::command::UiScanRequest;
-use crate::api::geometry::{Rect, UiTarget};
+use crate::api::geometry::{Rect, SemanticRole, UiTarget};
 
 use super::native::OwnedCf;
 use super::window_move::WriteError;
@@ -564,8 +564,7 @@ impl Scan<'_> {
                 self.batch.push(UiTarget {
                     rect,
                     name: accessible_name(element, &self.attributes),
-                    role: semantic_role.to_string(),
-                    native_role: Some(role),
+                    role: semantic_role,
                 });
                 self.target_count += 1;
                 if self.batch.len() >= 24 {
@@ -771,23 +770,23 @@ fn accessible_name(element: AXUIElementRef, attributes: &AxAttributes) -> String
         .unwrap_or_default()
 }
 
-fn semantic_role(native_role: &str) -> &'static str {
+fn semantic_role(native_role: &str) -> SemanticRole {
     match native_role {
-        "AXButton" | "AXMenuButton" | "AXPopUpButton" | "AXToolbarButton" => "button",
-        "AXLink" => "link",
-        "AXCheckBox" => "checkbox",
-        "AXRadioButton" => "radio",
-        "AXTabButton" => "tab",
-        "AXMenuItem" => "menu_item",
-        "AXTextField" | "AXTextArea" | "AXSearchField" => "text_field",
-        "AXRow" | "AXOutlineRow" => "list_item",
-        "AXDisclosureTriangle" => "tree_item",
-        "AXComboBox" => "combo_box",
-        "AXSlider" => "slider",
-        "AXIncrementor" => "spinner",
-        "AXScrollBar" => "scrollbar",
-        "AXImage" => "image",
-        _ => "control",
+        "AXButton" | "AXMenuButton" | "AXPopUpButton" | "AXToolbarButton" => SemanticRole::Button,
+        "AXLink" => SemanticRole::Link,
+        "AXCheckBox" => SemanticRole::Checkbox,
+        "AXRadioButton" => SemanticRole::Radio,
+        "AXTabButton" => SemanticRole::Tab,
+        "AXMenuItem" => SemanticRole::MenuItem,
+        "AXTextField" | "AXTextArea" | "AXSearchField" => SemanticRole::TextField,
+        "AXRow" | "AXOutlineRow" => SemanticRole::ListItem,
+        "AXDisclosureTriangle" => SemanticRole::TreeItem,
+        "AXComboBox" => SemanticRole::ComboBox,
+        "AXSlider" => SemanticRole::Slider,
+        "AXIncrementor" => SemanticRole::Spinner,
+        "AXScrollBar" => SemanticRole::Scrollbar,
+        "AXImage" => SemanticRole::Image,
+        _ => SemanticRole::Control,
     }
 }
 

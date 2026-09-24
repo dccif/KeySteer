@@ -191,8 +191,7 @@ fn provider_batches_coalesce_in_the_fixed_mailbox_slot() {
         .map(|index| UiTarget {
             rect: Rect::new(index as f64, 0.0, 4.0, 4.0),
             name: index.to_string(),
-            role: "static_text".into(),
-            native_role: None,
+            role: SemanticRole::StaticText,
         })
         .collect();
     assert_eq!(
@@ -220,8 +219,7 @@ fn provider_mailbox_preserves_a_full_generation_without_blocking() {
             .map(|index| UiTarget {
                 rect: Rect::new((offset + index) as f64, 0.0, 4.0, 4.0),
                 name: index.to_string(),
-                role: "static_text".into(),
-                native_role: None,
+                role: SemanticRole::StaticText,
             })
             .collect::<Vec<_>>()
     };
@@ -289,8 +287,7 @@ fn quarantined_provider_mailbox_discards_published_target_owners() {
         .publish(ProviderEvent::FallbackBatch(vec![UiTarget {
             rect: Rect::new(0.0, 0.0, 4.0, 4.0),
             name: "discard me".into(),
-            role: "static_text".into(),
-            native_role: None,
+            role: SemanticRole::StaticText,
         }]))
         .unwrap();
     mailbox.close();
@@ -326,7 +323,11 @@ fn pure_rust_detector_finds_a_closed_button_border() {
         &mut FallbackScratch::default(),
         || false,
     );
-    assert!(targets.iter().any(|target| target.role == "button"));
+    assert!(
+        targets
+            .iter()
+            .any(|target| target.role == SemanticRole::Button)
+    );
 }
 
 #[test]

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use keysteer::api::{
     Appearance, Binding, Command, CommandBatch, Direction, HostContext, KeyState, LabelDirection,
-    Mode, Rect, Screen, UiScanResult, UiScanStatus, UiTarget,
+    Mode, Rect, Screen, SemanticRole, UiScanResult, UiScanStatus, UiTarget,
 };
 use keysteer::api::{Key, ModeEvent, Point};
 use keysteer::config::Config;
@@ -158,8 +158,7 @@ fn owned_hint_delivery_stays_within_allocation_budget() {
                 24.0,
             ),
             name: format!("Control {index} 设置"),
-            role: "button".into(),
-            native_role: Some("native button".into()),
+            role: SemanticRole::Button,
         })
         .collect();
     let mut mode = keysteer::app::mode_catalog::hint(&config);

@@ -1,5 +1,9 @@
 # 构建、打包、文档站与测试
 
+内存优化最终仅保留 SemanticRole 与移除未使用的 UiTarget.native_role；数值类型、配置范围、浮点精度、auto 表示和 Hint 去重索引均恢复原实现。target/perf-memory 和 target/perf-hint-fix 中的历史结果包含现已撤回的改动，不代表最终版本的整体性能。角色大小、名称唯一性、serde 往返及旧 native_role 输入兼容由 src/tests/compaction.rs 验证。
+
+最终收敛版本验证：Rust 1121 passed／84 ignored；Clippy all-targets（含 benchmark-hooks）无告警，macOS ARM／Intel 的 tests 编译检查、fmt 和 diff 检查通过。此前整套改动的性能百分比不能用于这份只含角色优化的版本。
+
 网页 Normal 盲操编辑器以 `normal.targeting` 表存在性为启用开关，关闭时导出省略该表；方法、重置条件、几何字段和 Recursive Grid 层列表可编辑，覆盖键位冲突在配置页提示。Normal 预览仅移动指针且不绘制网格。模式键盘的临时继承标签由当前物理触发键状态控制，不再始终高亮借用的 Normal 绑定。`simulator/normal-targeting.test.ts` 覆盖选格／回退／重置／层替换，`bindings.test.ts` 覆盖高亮时机。网页 133 项测试与 `docs:check` 通过；本地 `docs:build` 在 esbuild 读取 `docs/.vitepress/config.mts` 时因工作区父目录访问被拒而未完成，不能作为页面实机验收。
 
 Normal 盲操回归：`cargo test --lib normal_targeting -- --test-threads=1` 覆盖 Grid／Recursive Grid 的选格、Tab/Backspace/Space、终点、四种 reset_on、组合键、未绑定透传、冲突／别名／应用覆盖、独立网格导航隔离及禁用独立模式后的引用验证。NormalTargeting 的拒绝渲染 Presenter 与分配计数器验证 20 层选格／回退／重置／跨屏及持续 Frame 不分配、不构造网格。分配检查必须单线程；这些逻辑测试不替代 Windows/macOS 实机输入到像素延迟验证。

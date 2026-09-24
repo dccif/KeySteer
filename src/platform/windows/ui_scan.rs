@@ -12,9 +12,9 @@ use std::sync::{Arc, Mutex};
 use smallvec::SmallVec;
 
 use crate::api::command::UiScanStatus;
-#[cfg(test)]
-use crate::api::geometry::Rect;
 use crate::api::geometry::UiTarget;
+#[cfg(test)]
+use crate::api::geometry::{Rect, SemanticRole};
 use crate::platform::common::partial_batcher::PartialBatcher;
 use crate::platform::common::scan_mailbox::ScanMailbox;
 use crate::platform::common::spatial_index::{SpatialIndex, rectangles_match};
@@ -273,8 +273,7 @@ mod tests {
         let target = UiTarget {
             rect: rect(100.0, 100.0, 20.0, 20.0),
             name: String::new(),
-            role: String::new(),
-            native_role: None,
+            role: SemanticRole::Control,
         };
         assert!(plan.target_center_is_visible(&target));
         let outside = UiTarget {
@@ -350,8 +349,7 @@ mod tests {
         let target = |rect, name: &str| UiTarget {
             rect,
             name: name.into(),
-            role: "control".into(),
-            native_role: None,
+            role: SemanticRole::Control,
         };
         assert_eq!(
             first.push(vec![target(rect(0.0, 0.0, 40.0, 20.0), "first text")]),

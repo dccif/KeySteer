@@ -204,8 +204,7 @@ pub(super) fn detect_regions(
         .map(|Reverse(candidate)| UiTarget {
             rect: candidate.rect,
             name: String::new(),
-            role: candidate.role.into(),
-            native_role: Some(candidate.native_role.into()),
+            role: candidate.role,
         })
         .collect()
 }
@@ -343,14 +342,13 @@ fn consider_region(
     if !valid_target_rect(rect, image.desktop_bounds) {
         return;
     }
-    let Some((role, native_role)) = classify_region(rect, confidence, options) else {
+    let Some(role) = classify_region(rect, confidence, options) else {
         return;
     };
     let candidate = Reverse(RegionCandidate {
         confidence,
         rect,
         role,
-        native_role,
     });
     if candidates.len() < candidate_limit {
         candidates.push(candidate);
@@ -367,8 +365,7 @@ fn consider_region(
 struct RegionCandidate {
     confidence: f64,
     rect: Rect,
-    role: &'static str,
-    native_role: &'static str,
+    role: SemanticRole,
 }
 
 impl PartialEq for RegionCandidate {
@@ -395,21 +392,21 @@ fn classify_region(
     rect: Rect,
     confidence: f64,
     options: &crate::api::VisionOptions,
-) -> Option<(&'static str, &'static str)> {
+) -> Option<SemanticRole> {
     let aspect = rect.width / rect.height.max(f64::EPSILON);
     if rect.width <= options.checkbox_max_size
         && rect.height <= options.checkbox_max_size
         && (0.75..=1.35).contains(&aspect)
     {
-        Some(("checkbox", "vision:rust-checkbox"))
+        Some(SemanticRole::Checkbox)
     } else if confidence >= options.button_min_confidence
         && (options.button_min_aspect..=options.button_max_aspect).contains(&aspect)
     {
-        Some(("button", "vision:rust-button"))
+        Some(SemanticRole::Button)
     } else if rect.width >= options.image_min_size && rect.height >= options.image_min_size {
-        Some(("image", "vision:rust-image"))
+        Some(SemanticRole::Image)
     } else if confidence >= options.generic_clickable_min_confidence {
-        Some(("control", "vision:rust-rectangle"))
+        Some(SemanticRole::Control)
     } else {
         None
     }

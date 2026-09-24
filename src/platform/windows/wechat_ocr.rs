@@ -26,7 +26,7 @@ use windows_future::{
     IAsyncOperation,
 };
 
-use crate::api::geometry::{Rect, UiTarget};
+use crate::api::geometry::{Rect, SemanticRole, UiTarget};
 use crate::support::worker::WorkerJoin;
 
 use super::vision::{CaptureGeometry, image_to_desktop, valid_target_rect};
@@ -1105,8 +1105,7 @@ fn parse_response(
             targets.push(UiTarget {
                 rect,
                 name: item.text,
-                role: "static_text".into(),
-                native_role: Some("vision:wechat-ocr".into()),
+                role: SemanticRole::StaticText,
             });
         }
     }
@@ -1497,8 +1496,7 @@ mod tests {
         let target = |x, y, name: &str| UiTarget {
             rect: Rect::new(x, y, 20.0, 10.0),
             name: name.into(),
-            role: "static_text".into(),
-            native_role: Some("vision:wechat-ocr".into()),
+            role: SemanticRole::StaticText,
         };
         let merged = merge_text_lines(vec![
             target(0.0, 0.0, "Open"),

@@ -5,6 +5,10 @@ outline: false
 
 # Release notes
 
+## 0.10.24
+
+- Optimized memory usage during UI Hint scans.
+
 ## 0.10.23
 
 - Fixed blind targeting intercepting Cmd/Ctrl/Alt application shortcuts when the produced character differs from the physical key, preventing character lookup from treating those shortcuts as bare selection keys.

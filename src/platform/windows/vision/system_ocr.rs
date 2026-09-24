@@ -71,8 +71,7 @@ pub(super) fn stream_system_targets_from_result(
         batch.push(UiTarget {
             rect,
             name: text,
-            role: "static_text".into(),
-            native_role: Some("vision:windows-ocr".into()),
+            role: SemanticRole::StaticText,
         });
         accepted += 1;
         if batch.len() == PROVIDER_BATCH_SIZE {

@@ -43,8 +43,8 @@ pub mod benchmark {
     pub use crate::api::{
         Appearance, Backend, BackendEvent, Binding, ButtonAction, Command, CommandBatch, Direction,
         FocusedApp, HostContext, InputEvent, Key, KeyDisposition, KeyState, LabelDirection, Mode,
-        ModeEvent, MouseButton, OverlayScene, Point, Rect, Screen, UiScanRequest, UiScanResult,
-        UiScanStatus, UiTarget,
+        ModeEvent, MouseButton, OverlayScene, Point, Rect, Screen, SemanticRole, UiScanRequest,
+        UiScanResult, UiScanStatus, UiTarget,
     };
     pub use crate::config::Config;
     pub use crate::presentation::COMPOSER;

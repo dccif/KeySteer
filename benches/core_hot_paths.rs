@@ -97,8 +97,7 @@ fn hint_targets(count: usize) -> Vec<UiTarget> {
                 24.0,
             ),
             name: format!("Control {index} 设置"),
-            role: "button".into(),
-            native_role: Some("native button".into()),
+            role: keysteer::benchmark::SemanticRole::Button,
         })
         .collect()
 }

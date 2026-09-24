@@ -5,6 +5,12 @@ outline: false
 
 # 更新日志 / Release Notes
 
+## 0.10.24
+
+- 优化 UI Hint 扫描的内存占用。
+
+- Optimized memory usage during UI Hint scans.
+
 ## 0.10.23
 
 - 修复盲操定位在字符与物理键不一致的键盘布局下吞掉 Cmd／Ctrl／Alt 应用快捷键的问题，避免字符匹配去掉修饰键后误触发裸定位键。

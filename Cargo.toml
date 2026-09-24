@@ -1,6 +1,6 @@
 [package]
 name = "keysteer"
-version = "0.10.23"
+version = "0.10.24"
 authors = ["dccif"]
 edition = "2024"
 rust-version = "1.98"
@@ -129,9 +129,8 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
 ] }
 libc = "0.2.189"
 
-[target.'cfg(target_os = "windows")'.dependencies.windows]
-version = "0.62.2"
-features = [
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62.2", features = [
     "Foundation",
     "Globalization",
     "Graphics_Imaging",
@@ -175,19 +174,11 @@ features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
-]
-
-[target.'cfg(target_os = "windows")'.dependencies.windows-core]
-version = "0.62.2"
-
-[target.'cfg(target_os = "windows")'.dependencies.windows-numerics]
-version = "0.3.1"
-
-[target.'cfg(target_os = "windows")'.dependencies.windows-collections]
-version = "0.3.2"
-
-[target.'cfg(target_os = "windows")'.dependencies.windows-future]
-version = "0.3.2"
+] }
+windows-core = "0.62.2"
+windows-numerics = "0.3.1"
+windows-collections = "0.3.2"
+windows-future = "0.3.2"
 
 [target.'cfg(any(windows, target_os = "macos"))'.build-dependencies]
 cc = "1.2"

@@ -2,7 +2,7 @@ use std::ffi::c_char;
 use std::ptr::NonNull;
 
 use crate::api::command::{UiScanStatus, VisionOptions};
-use crate::api::geometry::{Rect, UiTarget};
+use crate::api::geometry::{Rect, SemanticRole, UiTarget};
 use crate::platform::common::spatial_index::SpatialIndex;
 
 #[repr(C)]
@@ -289,14 +289,14 @@ fn classify(
         return Ok(None);
     }
     let aspect = rect.width / rect.height.max(f64::EPSILON);
-    let (role, native_role) = if region.is_text {
+    let role = if region.is_text {
         if aspect >= options.link_min_aspect
             && rect.height <= options.link_max_height
             && rect.width >= options.link_min_width
         {
-            ("link", "vision:text-link")
+            SemanticRole::Link
         } else if region.confidence >= options.generic_clickable_min_confidence {
-            ("control", "vision:text")
+            SemanticRole::Control
         } else {
             return Ok(None);
         }
@@ -304,20 +304,21 @@ fn classify(
         && rect.height <= options.checkbox_max_size
         && (0.75..=1.35).contains(&aspect)
     {
-        ("checkbox", "vision:checkbox")
-    } else if region.confidence >= options.button_min_confidence
-        && (options.button_min_aspect..=options.button_max_aspect).contains(&aspect)
+        SemanticRole::Checkbox
+    } else if (region.confidence >= options.button_min_confidence
+        && (options.button_min_aspect..=options.button_max_aspect).contains(&aspect))
+        || (region.confidence >= options.generic_clickable_min_confidence
+            && rect.width <= options.button_icon_max_size
+            && rect.height <= options.button_icon_max_size)
     {
-        ("button", "vision:button")
-    } else if region.confidence >= options.generic_clickable_min_confidence
-        && rect.width <= options.button_icon_max_size
-        && rect.height <= options.button_icon_max_size
-    {
-        ("button", "vision:icon-button")
+        // Aspect-ratio fits and icon-sized candidates are both buttons. These
+        // were separate arms only because they carried different diagnostic
+        // native roles.
+        SemanticRole::Button
     } else if rect.width >= options.image_min_size && rect.height >= options.image_min_size {
-        ("image", "vision:image")
+        SemanticRole::Image
     } else if region.confidence >= options.generic_clickable_min_confidence {
-        ("control", "vision:rectangle")
+        SemanticRole::Control
     } else {
         return Ok(None);
     };
@@ -325,8 +326,7 @@ fn classify(
         target: UiTarget {
             rect,
             name: native_string(region.label, region.label_len, MAX_VISION_LABEL_BYTES)?,
-            role: role.into(),
-            native_role: Some(native_role.into()),
+            role,
         },
         confidence: region.confidence,
         is_text: region.is_text,
@@ -442,7 +442,7 @@ mod tests {
                 .unwrap()
                 .target
                 .role,
-            "link"
+            SemanticRole::Link
         );
         let checkbox = NativeRegion {
             x: 0.1,
@@ -460,7 +460,7 @@ mod tests {
                 .unwrap()
                 .target
                 .role,
-            "checkbox"
+            SemanticRole::Checkbox
         );
     }
 
@@ -499,8 +499,7 @@ mod tests {
         let target = |x| UiTarget {
             rect: Rect::new(x, 0.0, 100.0, 100.0),
             name: String::new(),
-            role: "button".into(),
-            native_role: None,
+            role: SemanticRole::Button,
         };
         assert_eq!(
             merge_targets(vec![target(0.0)], vec![target(10.0)], 0.5).len(),
