@@ -165,7 +165,8 @@ jobs:
     # builds still retain their downloadable workflow artifacts.
     if: ${{ inputs.publish }}
     needs: [windows, macos]
-    runs-on: ubuntu-latest
+    # Keep release tooling stable across GitHub's ubuntu-latest migrations.
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
