@@ -8,7 +8,16 @@ export const DOWNLOAD_TARGETS = [
   'x86_64-apple-darwin',
 ] as const
 
-const LATEST_RELEASE_API = 'https://api.github.com/repos/dccif/KeySteer/releases/latest'
+const RELEASES_API = 'https://api.github.com/repos/dccif/KeySteer/releases'
+
+function selectedTag(tag?: string): string | undefined {
+  const value = tag?.trim()
+  return value && value !== 'latest' ? value : undefined
+}
+
+function releaseUrl(tag: string): string {
+  return `${RELEASES_URL}/tag/${encodeURIComponent(tag)}`
+}
 
 interface GitHubReleaseAsset {
   name?: unknown
@@ -19,6 +28,8 @@ interface GitHubRelease {
   tag_name?: unknown
   html_url?: unknown
   assets?: unknown
+  draft?: unknown
+  prerelease?: unknown
 }
 
 export interface LatestRelease {
@@ -61,7 +72,7 @@ export function parseLatestRelease(value: unknown, targets: readonly string[]): 
 
   return {
     tag: release.tag_name,
-    url: githubUrl(release.html_url) ?? LATEST_RELEASE_URL,
+    url: githubUrl(release.html_url) ?? releaseUrl(release.tag_name),
     assets,
   }
 }
@@ -70,8 +81,11 @@ export async function fetchLatestRelease(
   targets: readonly string[],
   signal?: AbortSignal,
   token?: string,
+  tag?: string,
 ): Promise<LatestRelease> {
-  const response = await fetch(LATEST_RELEASE_API, {
+  const requestedTag = selectedTag(tag)
+  const endpoint = requestedTag ? `tags/${encodeURIComponent(requestedTag)}` : 'latest'
+  const response = await fetch(`${RELEASES_API}/${endpoint}`, {
     headers: {
       Accept: 'application/vnd.github+json',
       'X-GitHub-Api-Version': '2022-11-28',
@@ -80,23 +94,32 @@ export async function fetchLatestRelease(
     signal,
   })
 
-  if (!response.ok) throw new Error(`GitHub latest release request failed: HTTP ${response.status}`)
-  const release = parseLatestRelease(await response.json(), targets)
-  if (!release) throw new Error('GitHub latest release response has no valid release tag')
+  if (!response.ok) throw new Error(`GitHub release (${requestedTag ?? 'latest'}) request failed: HTTP ${response.status}`)
+  const payload: GitHubRelease = await response.json()
+  const release = parseLatestRelease(payload, targets)
+  if (!release) throw new Error('GitHub release response has no valid release tag')
+  if (payload.draft || (!requestedTag && payload.prerelease)) {
+    throw new Error('GitHub release is not a published stable release')
+  }
+  if (requestedTag && release.tag !== requestedTag) {
+    throw new Error(`GitHub release tag does not match requested tag: ${requestedTag}`)
+  }
   return release
 }
 
 /** Development can run offline; publishing must use verified release metadata. */
-export async function loadLatestRelease(command: string, token?: string): Promise<LatestRelease> {
+export async function loadLatestRelease(command: string, token?: string, tag?: string): Promise<LatestRelease> {
   try {
     return await fetchLatestRelease(
       DOWNLOAD_TARGETS,
       AbortSignal.timeout(command === 'serve' ? 3_000 : 15_000),
       token,
+      tag,
     )
   } catch (error) {
     if (command !== 'serve') throw error
-    console.warn('[docs] 无法获取最新 Release，本地预览继续启动；下载入口将指向 GitHub Releases。')
-    return { tag: 'Release unavailable · 本地预览', url: LATEST_RELEASE_URL, assets: {} }
+    console.warn('[docs] 无法获取所选 Release，本地预览继续启动；下载入口将指向 GitHub Releases。')
+    const requestedTag = selectedTag(tag)
+    return { tag: 'Release unavailable · 本地预览', url: requestedTag ? releaseUrl(requestedTag) : LATEST_RELEASE_URL, assets: {} }
   }
 }

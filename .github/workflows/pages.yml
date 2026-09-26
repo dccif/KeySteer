@@ -2,6 +2,12 @@ name: Deploy documentation
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Download release tag (latest = latest stable release)'
+        type: string
+        required: false
+        default: latest
 
 permissions:
   contents: read
@@ -41,6 +47,7 @@ jobs:
       - name: Build VitePress site
         env:
           KEYSTEER_DOCS_BASE: /KeySteer/
+          KEYSTEER_DOCS_RELEASE_TAG: ${{ inputs.release_tag }}
           GITHUB_TOKEN: ${{ github.token }}
         run: pnpm docs:build
 

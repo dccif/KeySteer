@@ -92,7 +92,7 @@ const languageStateScript = `(() => {
 
 export default async ({ command }: { command: string }) => {
   // Vite passes serve/build explicitly; do not infer it from argv or NODE_ENV.
-  const latestRelease = await loadLatestRelease(command, process.env.GITHUB_TOKEN)
+  const latestRelease = await loadLatestRelease(command, process.env.GITHUB_TOKEN, process.env.KEYSTEER_DOCS_RELEASE_TAG)
   return withMermaid({
   markdown: { config: releaseHistory },
   base,

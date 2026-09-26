@@ -88,6 +88,47 @@ test('rejects invalid payloads and non-GitHub download URLs', () => {
     }],
   }, targets)
 
-  assert.equal(release?.url, LATEST_RELEASE_URL)
+  assert.equal(release?.url, 'https://github.com/dccif/KeySteer/releases/tag/v1.2.3')
   assert.deepEqual(release?.assets, {})
+})
+
+test('explicit release selection uses the encoded tag and its own asset fallback', async (context) => {
+  context.mock.method(globalThis, 'fetch', async (url: string) => {
+    assert.equal(url, 'https://api.github.com/repos/dccif/KeySteer/releases/tags/release%2F1.2.0')
+    return Response.json({ tag_name: 'release/1.2.0', prerelease: true, assets: [] })
+  })
+  const release = await loadLatestRelease('build', undefined, ' release/1.2.0 ')
+  assert.equal(release.tag, 'release/1.2.0')
+  assert.equal(release.url, 'https://github.com/dccif/KeySteer/releases/tag/release%2F1.2.0')
+  assert.deepEqual(release.assets, {})
+})
+
+test('blank and latest selection resolve stable releases again after a rollback', async (context) => {
+  let tag = 'v1.2.3'
+  context.mock.method(globalThis, 'fetch', async (url: string) => {
+    assert.equal(url, 'https://api.github.com/repos/dccif/KeySteer/releases/latest')
+    return Response.json({ tag_name: tag, assets: [] })
+  })
+  assert.equal((await loadLatestRelease('build', undefined, 'latest')).tag, 'v1.2.3')
+  tag = 'v1.2.2'
+  assert.equal((await loadLatestRelease('build', undefined, ' ')).tag, 'v1.2.2')
+})
+
+test('selection errors never silently publish a different release', async (context) => {
+  const request = context.mock.method(globalThis, 'fetch', async () => new Response(null, { status: 404 }))
+  await assert.rejects(loadLatestRelease('build', undefined, 'v1.2.0'), /HTTP 404/)
+  request.mock.mockImplementation(async () => Response.json({ tag_name: 'v1.2.1' }))
+  await assert.rejects(loadLatestRelease('build', undefined, 'v1.2.0'), /does not match/)
+  request.mock.mockImplementation(async () => Response.json({ tag_name: 'v1.2.0', draft: true }))
+  await assert.rejects(loadLatestRelease('build', undefined, 'v1.2.0'), /not a published stable release/)
+  request.mock.mockImplementation(async () => Response.json({ tag_name: 'v1.2.0', prerelease: true }))
+  await assert.rejects(loadLatestRelease('build'), /not a published stable release/)
+})
+
+test('offline preview keeps an explicitly selected release page', async (context) => {
+  context.mock.method(console, 'warn', () => {})
+  context.mock.method(globalThis, 'fetch', async () => { throw new TypeError('offline') })
+  const release = await loadLatestRelease('serve', undefined, 'v1.2.0')
+  assert.equal(release.url, 'https://github.com/dccif/KeySteer/releases/tag/v1.2.0')
+  assert.deepEqual(release.assets, {})
 })
