@@ -76,6 +76,11 @@ pub enum BackendEvent {
     UpdateChecked(UpdateCheckResult),
     /// Non-fatal backend problem worth logging.
     Warning(String),
+    /// Optional panel geometry, delivered without blocking input routing.
+    FocusedWindowBounds {
+        id: u64,
+        bounds: Result<Option<super::geometry::Rect>, String>,
+    },
 }
 
 /// Visible progress for a user-requested background update.
@@ -119,9 +124,9 @@ pub trait Backend {
     fn event_sink(&self) -> Option<Arc<dyn Fn(BackendEvent) + Send + Sync>> {
         None
     }
-    /// Optional foreground geometry, queried only when opening a window-centered panel.
-    fn focused_window_bounds(&self) -> Result<Option<super::geometry::Rect>, String> {
-        Ok(None)
+    /// Enqueue optional panel geometry. Missing capability uses screen placement.
+    fn request_focused_window_bounds(&mut self, _id: u64, _process: u32) -> Result<(), String> {
+        Ok(())
     }
     /// Enqueue audio work; never block the engine on native audio execution.
     fn request_audio(&mut self, _request: super::audio::AudioRequest) -> Result<(), String> {

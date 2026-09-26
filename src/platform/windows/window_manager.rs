@@ -9,12 +9,13 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, POINT, RECT, WPARAM};
 
 use windows::Win32::Foundation::{COLORREF, GetLastError, SetLastError, WIN32_ERROR};
+#[cfg(test)]
+use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GWL_STYLE, GetPropW, MINMAXINFO, RemovePropW, SMTO_ABORTIFHUNG, SMTO_BLOCK,
-    SW_MINIMIZE, SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SendMessageTimeoutW,
-    SetForegroundWindow, SetPropW, ShowWindowAsync, WINDOWPLACEMENT, WM_GETMINMAXINFO,
-    WPF_ASYNCWINDOWPLACEMENT, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_MAXIMIZE,
-    WS_THICKFRAME,
+    SW_MINIMIZE, SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SendMessageTimeoutW, SetPropW,
+    ShowWindowAsync, WINDOWPLACEMENT, WM_GETMINMAXINFO, WPF_ASYNCWINDOWPLACEMENT, WS_CHILD,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_MAXIMIZE, WS_THICKFRAME,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetLayeredWindowAttributes, LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA,
@@ -46,6 +47,7 @@ pub(super) struct Windows {
     hidden: std::collections::BTreeSet<WindowId>,
     transparent: std::collections::BTreeSet<WindowId>,
     prepared: BTreeMap<WindowId, PreparedFrame>,
+    pending_focus: std::cell::Cell<Option<(WindowId, Instant)>>,
 }
 
 impl Default for Windows {
@@ -62,6 +64,7 @@ impl Default for Windows {
             hidden: Default::default(),
             transparent: Default::default(),
             prepared: BTreeMap::new(),
+            pending_focus: Default::default(),
             property: format!(
                 "KeySteer.WindowIdentity.{}.{instance}\0",
                 std::process::id()
@@ -468,6 +471,36 @@ impl Windows {
 }
 
 impl WindowAccess for Windows {
+    fn native_deadline(&self) -> Option<Instant> {
+        self.pending_focus.get().map(|(_, deadline)| deadline)
+    }
+    fn poll_native(&self) -> Result<(), String> {
+        let Some((id, deadline)) = self.pending_focus.get() else {
+            return Ok(());
+        };
+        let hwnd = match self.hwnd(id) {
+            Ok(hwnd) => hwnd,
+            Err(error) => {
+                self.pending_focus.set(None);
+                return Err(error);
+            }
+        };
+        if super::native::foreground_window() == hwnd {
+            self.pending_focus.set(None);
+        } else if Instant::now() >= deadline {
+            self.pending_focus.set(None);
+            return Err("Window selected · system denied keyboard focus".into());
+        }
+        Ok(())
+    }
+    fn focused_bounds(&self, process: u32) -> Result<Option<Rect>, String> {
+        let hwnd = super::native::foreground_window();
+        let mut current_process = 0;
+        super::native::window_thread_process_id(hwnd, Some(&mut current_process));
+        Ok((process == current_process)
+            .then(|| super::accessibility::window_bounds(hwnd))
+            .flatten())
+    }
     fn tab_minimize(
         &mut self,
         id: WindowId,
@@ -644,10 +677,21 @@ impl WindowAccess for Windows {
         Ok(())
     }
     fn tab_selected(&self, id: WindowId) -> bool {
-        self.hwnd(id)
-            .is_ok_and(|hwnd| hwnd == super::native::foreground_window())
+        self.pending_focus
+            .get()
+            .is_none_or(|(pending, _)| pending == id)
+            && self
+                .hwnd(id)
+                .is_ok_and(|hwnd| hwnd == super::native::foreground_window())
     }
     fn focused_window(&self, windows: &[WindowInfo]) -> Option<WindowId> {
+        if let Some((pending, _)) = self.pending_focus.get()
+            && windows.iter().any(|window| window.id == pending)
+        {
+            // Rapid cycle requests advance from the last accepted selection,
+            // even if its application has not processed activation yet.
+            return Some(pending);
+        }
         let foreground = super::native::foreground_window();
         windows.iter().find_map(|window| {
             self.hwnd(window.id)
@@ -1043,26 +1087,19 @@ impl WindowAccess for Windows {
         // Consumed hook input does not necessarily grant foreground permission.
         // On rejection, unlock with masked Alt input and retry the same target.
         // Never attach foreign input queues: a hung app could block our worker.
-        // SAFETY: borrowed validated HWND; no pointers retained.
-        if !unsafe { SetForegroundWindow(hwnd) }.as_bool() {
+        if !super::native::try_activate_window(hwnd) {
             super::input::unlock_foreground()?;
             let hwnd = self.hwnd(id)?;
             // SwitchToThisWindow may send SC_RESTORE. Selecting a visible
             // window must never change its placement or maximized state.
-            // SAFETY: the retained identity was revalidated after input injection.
-            unsafe {
-                let _ = SetForegroundWindow(hwnd);
-            }
+            let _ = super::native::try_activate_window(hwnd);
         }
-        let deadline = Instant::now() + Duration::from_millis(150);
-        while super::native::foreground_window() != hwnd {
-            super::window_tabs::NativeTabs::dispatch_messages();
-            self.hwnd(id)?;
-            if Instant::now() >= deadline {
-                return Err("Window selected · system denied keyboard focus".into());
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        // Cross-input-queue activation can complete after SetForegroundWindow.
+        // Retain only the latest selection; the worker confirms on native wakes
+        // or this deadline without holding up unrelated window operations.
+        self.pending_focus
+            .set(Some((id, Instant::now() + Duration::from_millis(150))));
+        self.poll_native()?;
         Ok(())
     }
     fn pointer(&self) -> Result<Point, String> {
@@ -1131,6 +1168,7 @@ impl WindowAccess for Windows {
         )
     }
     fn reset(&mut self) {
+        self.pending_focus.set(None);
         if let Err(error) = self.tabs.show(&[], &self.tab_screens) {
             crate::report_error!(
                 "window-tabs",
@@ -1196,6 +1234,17 @@ fn show_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn await_foreground(hwnd: HWND) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while super::super::native::foreground_window() != hwnd {
+            assert!(
+                Instant::now() < deadline,
+                "native activation did not complete"
+            );
+            super::super::window_tabs::wait_for_events(5);
+        }
+    }
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -1411,13 +1460,16 @@ mod tests {
         let first_id = access.retain(first.hwnd, &screens).unwrap().id;
         let second_id = access.retain(second.hwnd, &screens).unwrap().id;
         access.select(first_id).unwrap();
+        await_foreground(first.hwnd);
         // SAFETY: this process owns the current foreground window.
         unsafe { LockSetForegroundWindow(LSFW_LOCK) }.unwrap();
         // SAFETY: live test-owned target; verify the failure this regression fixes.
         assert!(!unsafe { SetForegroundWindow(second.hwnd) }.as_bool());
         access.select(second_id).unwrap();
+        await_foreground(second.hwnd);
         assert_eq!(super::super::native::foreground_window(), second.hwnd);
         access.select(first_id).unwrap();
+        await_foreground(first.hwnd);
         assert_eq!(super::super::native::foreground_window(), first.hwnd);
     }
 
@@ -1466,6 +1518,7 @@ mod tests {
             for (id, hwnd) in [(first_id, first.hwnd), (second_id, second.hwnd)] {
                 let selected = session.execute(&mut grouped, O::Select(id), &screens);
                 assert_eq!(selected.target.as_ref().map(|w| w.id), Some(id));
+                await_foreground(hwnd);
                 assert_eq!(super::super::native::foreground_window(), hwnd);
                 let after = grouped.snapshot(second_id, &screens).unwrap();
                 assert!(after.info.maximized);
@@ -1959,6 +2012,7 @@ mod tests {
                 selected.pointer,
                 selected.target.as_ref().map(|w| w.bounds.center())
             );
+            await_foreground(hwnd);
             assert_eq!(super::super::native::foreground_window(), hwnd);
         }
         access.reset();

@@ -1462,18 +1462,21 @@ impl Engine {
                 InputTarget::Mouse(button) => InputTarget::Mouse(*button),
             };
             if let Err(error) = Self::inject_target(&actual, KeyState::Down, backend) {
+                let mut errors = crate::support::errors::ErrorBundle::default();
+                errors.push("press", error);
                 for rollback in pressed.iter().rev() {
                     match Self::inject_target(rollback, KeyState::Up, backend) {
                         Ok(()) => {
                             self.input.latched.remove(rollback);
                         }
-                        Err(rollback_error) => crate::support::logging::report_error(
-                            "action",
-                            format!("cannot roll back held input: {rollback_error}"),
-                        ),
+                        Err(rollback_error) => {
+                            errors.push(format!("roll back {rollback:?}"), rollback_error)
+                        }
                     }
                 }
-                return Err(self.recoverable_input_error("input press", error));
+                return errors
+                    .into_result()
+                    .map_err(|error| self.recoverable_input_error("input press", error));
             }
             self.input.latched.insert(actual.clone());
             pressed.push(actual);
@@ -1526,10 +1529,12 @@ impl Engine {
             };
             if let Err(error) = result {
                 if let Err(rollback_error) = self.restore_latched(&original, backend) {
-                    crate::support::logging::report_error(
-                        "action",
-                        format!("cannot roll back toggle action: {rollback_error}"),
-                    );
+                    // Keep diagnostic I/O at the recovery boundary, after all
+                    // held inputs have had a chance to be released.
+                    let message = format!("{error}; toggle rollback: {rollback_error}");
+                    self.pending_runtime_error =
+                        Some(RuntimeError::RecoverableInput(message.clone()));
+                    return Err(message);
                 }
                 return Err(error);
             }

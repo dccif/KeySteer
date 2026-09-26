@@ -1,5 +1,7 @@
 # 项目目录与代码地图
 
+`platform/windows/native/` 按资源所有权拆分：`com.rs` 管理 COM apartment；`gdi.rs` 管理 DC、DIB、字体和选中对象 guard；`capture.rs` 安全组合截图资源；`winrt.rs` 管理图像/OCR factory；`ocr_bridge.rs` 独占 DLL 导出和回调；`dimensions.rs` 只做安全尺寸校验；`handles.rs` 管理内核句柄；`window.rs` 管理自有 HWND；`compositor.rs` 管理显示时钟；`message_loop.rs` 管理消息、timer 与 session 注册。`mod.rs` 保留重导出与通用系统查询，不改变上层调用入口。
+
 `modes/normal_targeting.rs` 仅在启用 `normal.targeting` 时组合 Normal 手势与 `modes/targeting.rs::TargetingController`。后者同时供 Grid／Recursive Grid 使用，统一选格、回退、重置、终点和跨屏路径重放；视图仍由各独立模式提交。
 
 `platform/common/window_session/transaction.rs` 统一 worker 的事务调度；`layout_confirmation.rs` 管理布局增量校验、提交、回滚和恢复；`history_confirmation.rs` 管理撤销／重做／初始状态恢复的独立确认及历史提交。原生句柄仍由平台适配器拥有。`api::WindowTextCache` 是模式拥有、presentation 使用的原始卡片文本缓存。

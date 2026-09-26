@@ -1,5 +1,7 @@
 # UI Hint 扫描链路
 
+公共 `SpatialIndex` 的整数坐标 cell 表采用 `rustc_hash::FxHashMap`，cell 内 SmallVec 不变，输出不依赖哈希表迭代顺序。此次在 SmolStr 基础上分别比较 CompactString、FxHashMap、组合及相同二进制 A/A，独立 FxHashMap 的 12 个扫描场景 p99 均下降，按键、Normal 和六规模 Hint 交付 p99 均未增加，故恢复采用。先前组合未通过不等于 FxHashMap 导致回退；CompactString 仍未采用。不同密度、负坐标、重复及超大矩形的逐项穷举参考对照测试保留。该哈希仅用于内部整数坐标，不推广到任意外部字符串键。
+
 `UiTarget.role` 使用单字节 `SemanticRole`，平台扫描和 OCR/视觉 provider 在生成目标时映射，序列化仍为原 snake_case 名称。配置 clickable_roles 保持字符串及原平台别名；未使用的 native_role 不再携带，旧序列化输入仍可忽略该字段。64 位 UiTarget 从 104 降到 64 字节，不再为角色分配字符串；name 和原有去重算法保留。
 
 ## 可配置范围与跨屏重扫

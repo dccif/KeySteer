@@ -73,6 +73,7 @@ struct Recorder {
     /// Synthetic keystrokes, in order.
     sent: Vec<(String, KeyState)>,
     fail_next_key_up: bool,
+    geometry_requests: Vec<(u64, u32)>,
     fail_next_mouse_release: bool,
     position_update_attempts: usize,
 }
@@ -214,6 +215,12 @@ impl Backend for FakeBackend {
     }
     fn focused_app(&self) -> Result<Option<FocusedApp>, String> {
         Ok(None)
+    }
+    fn request_focused_window_bounds(&mut self, id: u64, process: u32) -> Result<(), String> {
+        let mut log = self.log.lock().unwrap();
+        log.timeline.push("geometry-query");
+        log.geometry_requests.push((id, process));
+        Ok(())
     }
     fn warp_pointer(&self, to: Point) -> Result<(), String> {
         if self.fail_warp {

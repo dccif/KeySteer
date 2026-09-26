@@ -1,5 +1,6 @@
 import { useStudioI18n } from '../config-studio/i18n'
 import SettingsNavigation from '../config-studio/SettingsNavigation'
+import ConfigDiff from '../config-studio/ConfigDiff'
 import PaneDivider from '../config-studio/PaneDivider'
 import FittedKeyboard from '../config-studio/FittedKeyboard'
 import NormalTargetingControls from '../config-studio/NormalTargetingControls'
@@ -209,6 +210,8 @@ export default defineComponent({
     const document = ref<ConfigDocument | null>(null)
     const defaultDocument = ref<ConfigDocument | null>(null)
     const defaultSource = ref('')
+    const importedSource = ref('')
+    const review = ref<{ before: string; after: string; beforeName: string; afterName: string; action?: string; confirm?: () => void } | null>(null)
     const sourceName = ref('generated/keysteer.default.toml')
     const sourceStats = ref({ bytes: 0, sections: 0, values: 0 })
     const activeMode = ref<EditorMode>('normal')
@@ -485,6 +488,7 @@ export default defineComponent({
         const parsed = parseConfigDocument(defaultSource.value)
         defaultDocument.value = parsed.document
         document.value = cloneConfigDocument(parsed.document)
+        importedSource.value = defaultSource.value
         sourceName.value = 'generated/keysteer.default.toml'
         sourceStats.value = { bytes: parsed.bytes, sections: parsed.sections, values: parsed.values }
         message.value = '已载入默认配置'
@@ -496,6 +500,7 @@ export default defineComponent({
     function importSource(source: string, name: string, successMessage: string): void {
       const parsed = parseConfigDocument(source)
       document.value = parsed.document
+      importedSource.value = source
       sourceName.value = name
       sourceStats.value = { bytes: parsed.bytes, sections: parsed.sections, values: parsed.values }
       message.value = successMessage
@@ -583,24 +588,39 @@ export default defineComponent({
       return Boolean(doc && temporaryPhysicalKeys(doc, activeMode.value, [...physicalKeys], isMac.value, temporaryEntryKeys).length)
     }
 
-    function onImport(event: Event): void {
+    async function onImport(event: Event): Promise<void> {
       const input = event.target as HTMLInputElement
       const file = input.files?.[0]
       if (!file) return
-      file.text().then((source) => {
-        try {
-          importSource(source, file.name, `已导入 ${file.name}；配置值已解析，原注释不会写入生成文件`)
-        } catch (error) {
-          message.value = `TOML 解析失败：${formatError(error)}`
-        } finally {
-          input.value = ''
-        }
-      })
+      try {
+        const source = await file.text()
+        parseConfigDocument(source)
+        releasePreview()
+        review.value = { before: tomlPreview.value, after: source, beforeName: t('当前配置'), afterName: file.name, action: '确认导入',
+          confirm: () => importSource(source, file.name, `已导入 ${file.name}；配置值已解析，原注释不会写入生成文件`) }
+      } catch (error) {
+        message.value = `TOML 解析失败：${formatError(error)}`
+      } finally { input.value = '' }
     }
 
     function downloadConfig(): void {
-      downloadText(tomlPreview.value, 'keysteer.user.toml')
-      message.value = '已生成 keysteer.user.toml'
+      openDiff('确认下载')
+    }
+
+    function openDiff(action?: string): void {
+      if (!document.value) return
+      releasePreview()
+      const source = stringify(document.value)
+      review.value = { before: importedSource.value, after: source, beforeName: sourceName.value, afterName: t('当前配置'), action,
+        confirm: () => {
+          if (action === '确认复制') {
+            void navigator.clipboard.writeText(source).then(() => { message.value = 'TOML 已复制到剪贴板' })
+              .catch(error => { message.value = `${t('复制失败')}: ${formatError(error)}` })
+          } else {
+            downloadText(source, 'keysteer.user.toml')
+            message.value = '已生成 keysteer.user.toml'
+          }
+        } }
     }
 
     function downloadDefault(): void {
@@ -608,8 +628,7 @@ export default defineComponent({
     }
 
     function copyToml(): void {
-      void navigator.clipboard.writeText(tomlPreview.value)
-      message.value = 'TOML 已复制到剪贴板'
+      openDiff('确认复制')
     }
 
     function resolveAction(chord: string): string[] {
@@ -1179,6 +1198,7 @@ export default defineComponent({
                 <button class="ks-button" onClick={downloadDefault}>{t("默认配置")}</button>
                 <button class="ks-button ks-button-primary" onClick={downloadConfig}>{t("下载用户配置")}</button>
                 <button class="ks-button" onClick={copyToml}>{t("复制")}</button>
+                <button class="ks-button" onClick={() => openDiff()}>{t('TOML 变更对比')}</button>
 
               </div>
             </div>
@@ -1191,12 +1211,16 @@ export default defineComponent({
             <section class="ks-utility-card ks-workspace-files"><header class="ks-utility-heading"><h2>{t("工作区文件")}</h2><code>workspace.ksw</code></header><div class="ks-settings-body"><p>{t("导入或导出布局、标签分组与使用统计。")}</p><div class="ks-file-actions"><input aria-label={t("导入工作区文件")} type="file" accept=".ksw,application/octet-stream" onChange={importLayoutFile} /><button class="ks-button" onClick={downloadLayouts}>{t("下载工作区文件")}</button></div></div></section></div>)
     return () => (
       <div class="ks-studio ks-classified" style={{ '--ks-navigation-width': `${navigationWidth.value}px`, '--ks-settings-share': `${settingsShare.value}fr`, '--ks-preview-share': `${100 - settingsShare.value}fr` }}>
+        {review.value && <ConfigDiff before={review.value.before} after={review.value.after} beforeName={review.value.beforeName} afterName={review.value.afterName} action={review.value.action} onClose={() => { review.value = null }} onConfirm={() => {
+          review.value?.confirm?.(); review.value = null
+        }} />}
         <header class="ks-studio-topbar" inert={expanded.value}>
           <div><strong>{t("配置工作台")}</strong><small role="status" aria-live="polite" title={t(message.value)}>{t(message.value || sourceName.value)}</small></div>
           <div class="ks-settings-search"><input aria-label={t("搜索设置")} placeholder={t("搜索设置、模式或 TOML 路径…")} value={searchQuery.value} onInput={e => searchQuery.value = (e.target as HTMLInputElement).value} />
             {searchQuery.value.trim() && <div class="ks-search-results">{searchResults.value.map(entry => <button onClick={() => locateField(entry)}><strong>{t(entry.label)}</strong><small>{entry.path}</small></button>)}{!searchResults.value.length && <p>{t("没有匹配设置")}</p>}</div>}
           </div>
           <button onClick={() => importInput.value?.click()}>{t("导入 TOML")}</button><button class="ks-button-primary" onClick={downloadConfig}>{t("下载用户配置")}</button>
+          <button onClick={() => openDiff()}>{t('TOML 变更对比')}</button>
           <input ref={importInput} type="file" hidden accept=".toml,text/plain" onChange={onImport} />
         </header>
         <SettingsNavigation mobile page={pageId.value} disabled={expanded.value} onSelect={selectPage} />

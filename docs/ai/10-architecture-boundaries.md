@@ -1,5 +1,9 @@
 # 架构边界与运行计划
 
+面板几何请求只用 API 的请求编号、进程 id 和 Rect 跨层，借用现有窗口 worker，不新增 Engine 原生依赖、全局线程或定时器。原生确认的 deadline/poll 端口留在 `platform/common/window_session`，Windows 拥有 HWND 身份与实际确认，Mode 不参与原生焦点轮询。
+
+Windows native 按资源所有权拆分，详见项目地图；`capture` 与 `dimensions` 编译期禁止 unsafe。线程限定的资源/工厂使用零尺寸标记保证 !Send/!Sync，不能为了排队方便增加 unsafe Send/Sync。代码移动仅重分配逐文件 unsafe 预算，总预算仍向下收紧。
+
 KeySteer 保持单 crate，并采用混合模块布局：聚合目录使用 `mod.rs`，简单叶子使用
 `foo.rs`。文件命名不是架构规则；依赖方向和状态所有权才是。`tests/architecture_dependencies.rs`
 锁定稳定内层：`support` 不依赖业务层，`api` 是依赖底座，`config` 不访问 app/platform，

@@ -557,8 +557,22 @@ impl Backend for WindowsBackend {
         }))
     }
 
-    fn focused_window_bounds(&self) -> Result<Option<crate::api::Rect>, String> {
-        Ok(accessibility::window_bounds(native::foreground_window()))
+    fn request_focused_window_bounds(&mut self, id: u64, process: u32) -> Result<(), String> {
+        if self.window_worker.is_none() {
+            let tx = self.event_tx.clone();
+            self.window_worker = Some(
+                crate::platform::common::window_session::WindowWorker::start(
+                    window_manager::Windows::default,
+                    move |event| {
+                        let _ = tx.send(event);
+                    },
+                )?,
+            );
+        }
+        self.window_worker
+            .as_ref()
+            .ok_or("window worker did not initialize")?
+            .focused_bounds(id, process)
     }
     fn request_text_prompt(
         &mut self,

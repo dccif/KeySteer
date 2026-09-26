@@ -13,6 +13,55 @@ use stats_alloc::Region;
 
 #[test]
 #[ignore = "run alone with --test-threads=1 so other tests cannot pollute allocator counts"]
+fn startup_allocation_profile() {
+    let mut region = Region::new(keysteer::TEST_ALLOCATOR);
+    let config = Config::default();
+    let defaults = region.change_and_reset();
+    let plan = crate::app::configuration::compile(&config).unwrap();
+    let compilation = region.change_and_reset();
+    let engine = crate::app::runtime::Engine::from_plan(plan, Appearance::Dark).unwrap();
+    let assembly = region.change();
+    black_box(&engine);
+    println!("startup defaults={defaults:?} compile={compilation:?} assembly={assembly:?}");
+    #[cfg(target_os = "windows")]
+    {
+        let allocations = defaults.allocations + compilation.allocations + assembly.allocations;
+        let bytes =
+            defaults.bytes_allocated + compilation.bytes_allocated + assembly.bytes_allocated;
+        assert!(
+            allocations <= 2800,
+            "startup allocations grew to {allocations}"
+        );
+        assert!(bytes <= 210_000, "startup allocated bytes grew to {bytes}");
+    }
+}
+
+#[test]
+#[ignore = "run alone with --test-threads=1 so other tests cannot pollute allocator counts"]
+fn key_storage_allocation_profile() {
+    println!(
+        "layout Key={} KeyChord={} InputEvent={} BackendEvent={} Engine={}",
+        std::mem::size_of::<Key>(),
+        std::mem::size_of::<crate::api::KeyChord>(),
+        std::mem::size_of::<crate::api::InputEvent>(),
+        std::mem::size_of::<crate::api::BackendEvent>(),
+        std::mem::size_of::<crate::app::runtime::Engine>()
+    );
+    for name in [
+        "s",
+        "left_ctrl",
+        "abcdefghijklmnopqrstuvwxyz_long_custom_key",
+    ] {
+        let region = Region::new(keysteer::TEST_ALLOCATOR);
+        let key = Key::new(name).unwrap();
+        let cloned = key.clone();
+        black_box((&key, &cloned));
+        println!("key name={name} {:?}", region.change());
+    }
+}
+
+#[test]
+#[ignore = "run alone with --test-threads=1 so other tests cannot pollute allocator counts"]
 fn steady_normal_frames_do_not_allocate() {
     let config = Config::default();
     let palette = config.palette(Appearance::Dark);

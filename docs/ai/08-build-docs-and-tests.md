@@ -1,5 +1,34 @@
 # 构建、打包、文档站与测试
 
+TOML 对比对相同标量用 `Object.is` 跳过序列化（包括 NaN）；仍先解析双方输入，内容相同的非法 TOML 不会绕过校验。`config-diff.test.ts` 覆盖特殊数值与相同非法输入。
+
+Normal 18→22ns 的后续固定十二轮 A/A/B 复核见 `target/perf-c2-final-direct/normal-recheck/report.md`：复用原二进制，旧版两组 p99 中位数 20.5/18.5ns，当前 16ns；当前相对旧版逐轮八次持平、四次更快，配对差值中位数 0ns。相同旧版也有 16–27ns 波动，未复现稳定回退，不能把批均值 p99 解释为单帧端到端延迟或宣称稳定加速。本次没有生产代码变更，原对照数据保留；Hint 64 未在本次复核。
+
+保留 SmolStr + FxHashMap 后与 c2d718d 的新直接对照见 `target/perf-c2-final-direct/report.md`：core/scan 五对、runtime 十五对，各自依赖锁、相同 benchmark 源码，比较整包而非库的独立贡献。默认/WASD p99 −12.20%/−12.92%，setup −12.24%；22 场景中 Normal p99 18→22ns、Hint 64 的 p99 10.1→10.5µs 增加，不能宣称本轮全部 p99 无回退。构造 allocation 4361→2436（−44.14%），存活请求堆 105892→106508B（+616B）；此前 +424B 使用的是中间版本基准。没有据此改动当前生产代码或重跑挑选结果。
+
+优化库最终选择绑定 `target/perf-runtime-priority/hash/source-hashes.json`：SmolStr + FxHashMap，无 CompactString；移除候选后源码与 Cargo.lock 已核对匹配实测快照。完整五版本数据、A/A 及验收决定在 `libraries-recheck.md`，旧组合报告不能当作当前版本结果。最终构造仍为 2,436 次／200,423 请求字节／106,508 存活请求堆字节，2000 目标 Hint 请求字节 630,928。
+
+运行时优先的 SmolStr + 整表别名作用域复用验证：Rust 1,130 passed／87 ignored；Clippy all-targets（benchmark-hooks）、macOS ARM／Intel tests 编译检查及显式 Normal 稳态零分配门禁通过。构造 allocation 为 2,436 次、请求 200,423 字节、存活请求堆 106,508 字节（相对本轮 Arc 起点增加 424B）；短 Key 创建与克隆零 allocation。新增测试覆盖整表作用域中跳过非法条目、继续处理后续绑定、修饰键侧别和恢复外层作用域。性能证据见 `target/perf-runtime-priority/`，以下库撤回数字为之前验收条件下的历史记录。
+
+库实验撤回后重新验证：Rust 1,129 passed／87 ignored，三个 allocation_profile 显式通过，构造恢复为 2,765 次／203,463 字节，存活请求堆 106,084 字节。Cargo.toml/Cargo.lock 与本轮实验起点一致；生产逻辑恢复，仅保留新增基准、测试与实验说明。
+
+优化库实验新增别名边界／Unicode／嵌套恢复、Key 借用查找与序列化及扫描索引穷举对照；新增 ignored key_storage_allocation_profile 与 scan_index_allocation_profile 仅用于布局、分配取证。候选组合曾测得构造 2,717 次／203,103 字节，但全部库替换最终因防回退未通过而撤回，不能将此数字作为当前版本结果。当前依赖锁下的独立基线、阶段候选及 A/A/B 数据保存在 `target/perf-libraries/`，与旧 c2d718d 报告分开解释。
+
+最终 c2d718d 对照：固定旧版依赖、同 CPU、High 优先级和逐进程预热，core 五对／runtime 二十五对交替测量；10 场景的各轮 p99 中位数均未增加，默认按键 −2.34%、WASD −5.11%、setup −17.67%，Hint 六规模 −6.45% 至 −11.43%，Normal 持平。单独的扩展二十对默认按键仍有 +0.87%，完整二十五对为 −2.34%；保留所有原始数据，不将汇总通过解释为每轮或所有机器绝不波动。构造存活堆请求字节增加 192B，分配量减少不等同于常驻内存减少。完整证据及失败候选见 `target/perf-regression-fix/final/report.md`。
+
+2026-09-26 防回退修复验证：全量单线程 Rust 测试 1,126 passed／85 ignored，Clippy all-targets（benchmark-hooks）及 macOS ARM／Intel tests 编译检查通过。显式启动分配测试得到 2,765 次／203,463 字节；默认配置、计划编译、Engine 装配分别为 1,435／1,311／19 次。Normal 稳态零分配测试通过。与 c2d718d 的固定依赖、固定 CPU、交替次序完整性能证据保存于 `target/perf-regression-fix/final/`；该目录是本地测试产物，不进入版本库，也不代表原生端到端或 macOS 实机结果。
+
+防回退验证新增 ignored `startup_allocation_profile`，单独单线程输出默认配置、计划编译、Engine 装配三阶段分配；Windows 合计门禁为 2,800 次、210,000 字节，覆盖构造阶段而非原生启动或完整 Engine::run。`allocation_free_chord_identity_matches_canonical_identity` 对照原 canonical 语义；按键 Unicode/别名优先级及 15/16/24 Hint sweep 边界也有回归。
+
+
+模拟器 `config-studio/ConfigDiff.tsx` 用原生 dialog 展示 TOML 字段差异，`simulator/config-diff.ts` 独立解析任意 TOML 并比较显式值（忽略注释、空白、表键顺序，保留数组顺序，不补默认值）。ConfigStudio 保存最近成功导入的原文作为基线，默认配置与 URL handoff 也建立基线；下载／复制前比较基线与待导出的快照，手动导入前比较当前文档与候选文件，确认才应用，取消不改变文档或基线。独立左右文件对比仅保存在弹窗内，不影响编辑器。`config-diff.test.ts` 覆盖字段增删改、特殊键、数组、日期、空表与非法 TOML。
+
+响应/原生边界优化回归：`failed_press_retains_rollback_errors_and_releases_remaining_keys_before_recovery` 覆盖多按键回滚失败仍继续清理与错误保留；`quick_switch_geometry_is_requested_after_display_and_rejects_late_results` 覆盖先显示、后请求、关闭/重开后的旧结果；`focused_bounds_coalesces_without_blocking_submission` 覆盖后台查询单槽合并。`asynchronous_focus_keeps_previous_member_visible_until_confirmation` 覆盖异步激活期间旧成员仍可见；ignored `directcomposition_smoke` 验证 compositor 绘制、退出释放和异常大文本缓冲回收。
+
+本轮响应、日志与 native 分层验证（2026-09-26）：全量单线程测试 1,122 passed／84 ignored；Clippy all-targets（含 benchmark-hooks）、fmt 和 diff 检查通过；macOS ARM／Intel 的 `cargo check --tests` 均通过。Windows 显式运行 `directcomposition_smoke`、`native_explicit_selection_recovers_foreground_lock`、`native_selection_preserves_maximized_window_on_each_display` 均通过；焦点测试在沙箱外仅操作自有临时窗口。macOS 未做实机 AX/AppKit 验收，未测端到端延迟或进程 RSS 改善。多屏 surface 实验因渲染延迟回退撤回，取舍见性能主题；不要把实验面积节省当作最终版本内存收益。
+
+全局 `stats_alloc` 计数测试应以 `cargo test -- --test-threads=1` 验证，避免平行测试污染分配计数。Windows native 模块拆分后，截图路径源码门禁读取 `native/gdi.rs`；架构、统一日志和 unsafe 门禁仍独立运行。macOS 交叉检查不替代原生 AX/AppKit 验收。
+
 内存优化最终仅保留 SemanticRole 与移除未使用的 UiTarget.native_role；数值类型、配置范围、浮点精度、auto 表示和 Hint 去重索引均恢复原实现。target/perf-memory 和 target/perf-hint-fix 中的历史结果包含现已撤回的改动，不代表最终版本的整体性能。角色大小、名称唯一性、serde 往返及旧 native_role 输入兼容由 src/tests/compaction.rs 验证。
 
 最终收敛版本验证：Rust 1121 passed／84 ignored；Clippy all-targets（含 benchmark-hooks）无告警，macOS ARM／Intel 的 tests 编译检查、fmt 和 diff 检查通过。此前整套改动的性能百分比不能用于这份只含角色优化的版本。

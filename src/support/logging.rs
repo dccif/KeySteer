@@ -3,6 +3,9 @@
 //! Errors and panics are always persisted because the normal app may have no
 //! console. Debug, info and warning records are emitted only while logging is
 //! enabled by the active configuration. Files are rotated at a fixed bound.
+//! Error writes and `flush` are synchronous, but do not promise power-loss
+//! durability (`File::sync_all` is deliberately absent from interactive paths).
+//! Callers must finish input recovery before reporting aggregated failures.
 
 use std::backtrace::Backtrace;
 use std::fmt;

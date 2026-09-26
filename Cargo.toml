@@ -1,6 +1,6 @@
 [package]
 name = "keysteer"
-version = "0.10.24"
+version = "0.10.25"
 authors = ["dccif"]
 edition = "2024"
 rust-version = "1.98"
@@ -47,6 +47,8 @@ toml_edit = "0.25"
 # update.rs explicitly selects NativeTls because ureq defaults to Rustls. The
 # `native-tls-no-default` helper alone does not compile ureq's HTTPS connector.
 ureq = { version = "3.3", default-features = false, features = ["json", "native-tls"] }
+smol_str = "0.3.6"
+rustc-hash = "2.1.3"
 [features]
 default = []
 # Exposes existing production constructors to the standalone benchmark. It

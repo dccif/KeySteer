@@ -1,5 +1,13 @@
 # Windows 与 macOS 原生后端
 
+面板几何查询复用窗口 worker 的有界队列，同类待执行查询只保留最新一项；它不属于 Window 编辑会话，取消编辑不丢弃面板查询。Windows 校验请求进程仍为前台后读取矩形；macOS 在 worker 内查询对应进程的 AX 属性。
+
+Windows `select` 提交前台激活后保留最新目标与 150ms 确认期限，不在调用栈内 sleep。`WindowAccess::native_deadline/poll_native` 由现有 worker 推进，等待同时响应原生消息、队列唤醒和 deadline；迟到失败在确认边界记录一次，不回滚已提交的标签可见性。成功返回表示已提交选择，实际前台通过后续原生观察确认；新选择覆盖旧确认，reset 清空确认。
+
+确认期间旧标签成员保持可见，完成/超时后的 worker pump 才提交隐藏；迟到的旧成员焦点事件不能覆盖最新选择。快速连续循环以尚在确认的最新目标为起点，不因系统前台滞后重复选择同一窗口。
+
+Windows native 资源按 COM、GDI、WinRT、DLL、HWND 和消息循环拆分。DC、factory、apartment 的线程归属用零尺寸 `PhantomData<Rc<()>>` 明确表达；共享截图组合与尺寸验证禁止 unsafe。原生激活重复调用收敛到同一包装入口，unsafe 表达式预算从 383 降至 382，文件数因资源模块拆分增至 40，不代表增加原生操作。
+
 模式标识符尺寸统一由 `Indicator::label_size` 计算，Windows GPU/软件与 macOS 均复用；Windows DpiSceneCache 不再二次缩放 Indicator。纯标识符／光标场景无静态 labels 时直接借用原场景，不为 DPI 复制文本或样式；普通静态 label 的 DPI 缩放不变。
 
 相交切换能力在配置编译时由已启用模式的绑定、应用覆盖和嵌套动作序列推导为 EngineSettings.window_overlap_enabled；无相关绑定时不发送相交请求。Session 只保留可空缓存指针，首次相交请求才分配缓存，普通窗口/音频路径不创建相交状态。运行时配置重载从启用变为禁用时，Backend::clear_window_overlap_cache 仅通知已有 worker：丢弃待执行相交请求，在 worker 中释放缓存；不启动新 worker。几何仍按实际操作时的系统数据核对。
@@ -16,7 +24,7 @@ Windows 从 foreground HWND 匹配稳定 WindowId；macOS 复用 AXFocusedWindow
 `CycleOverlapping` 与 `CycleActive` 复用同一 worker、命中、稳定环、激活和结果路径。新增内置 `window_overlap_next` / `window_overlap_previous` 只选择本次起点所在相交连通组中的其他窗口（A-B、B-C 相交即可连通 A-C）；已有 Tabs 组优先用组内顺序，无匹配时检查全局剩余候选。两轮都要求属于同一连通组，跳过已查组员；完整遍历无匹配则成功返回空结果，worker 不发 warp 或错误事件。每次核对系统最新枚举的全部非最小化窗口身份与精确 x/y/宽/高，包括组外窗口；缓存按身份排序，命中验证使用二分查找，忽略 Z 顺序、标题；几何不变且起点仍在已缓存组内时复用连通分量，零相交比较。变化或起点移到其他组时，复用缓冲区重算，只扫描尚未入组的候选；完全重叠时 n-1 次比较，最坏 O(n²)、O(n) 存储且支持取消，不为每条边查询原生 API；候选激活前仍验证有效性，边缘接触不算；不使用过期重叠集合、不新增模式或 overlay。缓存仅有身份/矩形、成员 ID、遍历索引三个数组，64 位下有效元素约 56 字节/窗口（另有 Vec 容量余量）；数量大幅下降时按容量迟滞回收，避免永久保留历史峰值。缓存一致性以本次系统采样为准，原生枚举与激活不是原子操作。
 请求不回传 UI 库存、不复制结果标签状态、不消费编辑会话的关闭通知；成功后只发中心点，激活失败不移动鼠标。
 
-系统退出保存：Windows 隐藏托盘窗口在 WM_QUERYENDSESSION 将 SaveWorkspace 交给 Engine，托盘线程最多等待 3 秒，不阻塞输入 Hook；仅 WM_ENDSESSION 成功才发 Quit。macOS 复用 retained、主线程限定的 StatusTarget 实现 NSObjectProtocol / NSApplicationDelegate，返回 TerminateLater；Engine 保存后再通过后端回复系统。新增的 unsafe 仅是这两项 Objective-C 协议契约，无额外裸指针操作或 Send/Sync。窗口中心快速面板通过 Backend::focused_window_bounds 读取 Win32／AX 几何，模式和 presentation 不接触平台。
+系统退出保存：Windows 隐藏托盘窗口在 WM_QUERYENDSESSION 将 SaveWorkspace 交给 Engine，托盘线程最多等待 3 秒，不阻塞输入 Hook；仅 WM_ENDSESSION 成功才发 Quit。macOS 复用 retained、主线程限定的 StatusTarget 实现 NSObjectProtocol / NSApplicationDelegate，返回 TerminateLater；Engine 保存后再通过后端回复系统。新增的 unsafe 仅是这两项 Objective-C 协议契约，无额外裸指针操作或 Send/Sync。窗口中心快速面板通过 Backend::request_focused_window_bounds 异步请求及完成事件 读取 Win32／AX 几何，模式和 presentation 不接触平台。
 
 Grouped 按 WindowScope 筛选逻辑快照；活动组的隐藏成员仍继承活动成员的屏幕与最小化状态。编号在同一会话／范围内按窗口身份保留：最小化或暂时未进入候选库存不释放号码，恢复后沿用；仅明确关闭才删除，Acquire 或范围配置变化才清空并从 1 重建。可选数字仍只来自当前库存。持久组不随范围切换解散，范围外原生标签栏仍保留所有标题与点击目标，仅省略无效编号（TabBar 数字 0）。Windows ordinary_window_target 允许最小化库存，scannable_target 继续排除最小化 UI 扫描；最小化的屏幕归属从还原矩形确定。macOS 开启包含最小化时额外检查运行应用 AXWindows，普通窗口仍通过当前可见 Quartz 元数据匹配。
 

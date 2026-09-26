@@ -947,6 +947,36 @@ fn inferred_side_modifier_satisfies_a_generic_modifier_send() {
 }
 
 #[test]
+fn failed_press_retains_rollback_errors_and_releases_remaining_keys_before_recovery() {
+    let mut engine = Engine::new(Config::default(), Appearance::Dark);
+    let (mut backend, log) = FakeBackend::new(Vec::new());
+    backend.fail_mouse = true;
+    log.lock().unwrap().fail_next_key_up = true;
+    let error = engine.press_targets(
+        &[
+            InputTarget::Key(Key::new("home").unwrap()),
+            InputTarget::Key(Key::new("end").unwrap()),
+            InputTarget::Mouse(crate::api::binding::Button::Left),
+        ],
+        &mut backend,
+    ).unwrap_err();
+    assert!(error.contains("key-up failure"), "{error}");
+    assert!(error.contains("roll back"), "{error}");
+    assert_eq!(log.lock().unwrap().sent, vec![
+        ("home".into(), KeyState::Down),
+        ("end".into(), KeyState::Down),
+        ("home".into(), KeyState::Up),
+    ]);
+    assert_eq!(engine.input.latched, BTreeSet::from([
+        InputTarget::Key(Key::new("end").unwrap())
+    ]));
+    assert_eq!(engine.pending_runtime_error.as_ref().unwrap().message(), error);
+    assert!(engine.recover_from_input_error(&mut backend));
+    assert!(engine.input.latched.is_empty());
+    assert_eq!(log.lock().unwrap().sent.last(), Some(&("end".into(), KeyState::Up)));
+}
+
+#[test]
 fn failed_chord_release_is_retried_during_cleanup() {
     let mut engine = Engine::new(Config::default(), Appearance::Dark);
     let (mut backend, log) = FakeBackend::new(Vec::new());

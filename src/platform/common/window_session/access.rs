@@ -1,6 +1,17 @@
 //! Native capability boundary; implementations own handles on their worker.
 use super::*;
 pub(crate) trait WindowAccess {
+    /// Queried on the window worker; never on the engine or hook thread.
+    fn focused_bounds(&self, _process: u32) -> Result<Option<Rect>, String> {
+        Ok(None)
+    }
+    /// Native confirmations advanced by the existing worker event loop.
+    fn native_deadline(&self) -> Option<Instant> {
+        None
+    }
+    fn poll_native(&self) -> Result<(), String> {
+        Ok(())
+    }
     /// Bound temporary native objects to a work batch, never to the idle wait.
     fn native_batch<R>(work: impl FnOnce() -> R) -> R {
         work()
@@ -216,6 +227,8 @@ pub(crate) trait WindowAccess {
             self.cycle_state(id, screens, cancelled)
         }
     }
+    /// Submit selection. Asynchronous adapters retain confirmation state until
+    /// `native_deadline` clears; grouped visibility is committed after that.
     fn select(&self, id: WindowId) -> Result<(), String>;
     /// Resolve native foreground identity after refreshing the inventory.
     fn focused_window(&self, _windows: &[WindowInfo]) -> Option<WindowId> {

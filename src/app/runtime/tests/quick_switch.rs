@@ -1,4 +1,48 @@
 #[test]
+fn quick_switch_geometry_is_requested_after_display_and_rejects_late_results() {
+    let mut engine = Engine::from_plan(
+        crate::app::configuration::compile(&Config::default()).unwrap(), Appearance::Dark,
+    ).unwrap();
+    let (mut backend, log) = FakeBackend::new(vec![]);
+    engine.start_runtime(&mut backend).unwrap();
+    engine.activate(ModeId::grid(), None, &mut backend).unwrap();
+    engine.focused_app = Some(FocusedApp { process_id: 42, ..Default::default() });
+    engine.settings.quick_switch.position = crate::api::style::QuickSwitchPosition::Window;
+    engine.handle_backend_event(key_down("q"), &mut backend).unwrap();
+    engine.quick_switch.pending.as_mut().unwrap().deadline = Instant::now();
+    log.lock().unwrap().timeline.clear();
+    engine.fire_quick_switch(&mut backend).unwrap();
+    let id = {
+        let log = log.lock().unwrap();
+        let show = log.timeline.iter().position(|step| *step == "present").unwrap();
+        let query = log.timeline.iter().position(|step| *step == "geometry-query").unwrap();
+        assert!(show < query);
+        assert_eq!(log.geometry_requests[0].1, 42);
+        log.geometry_requests[0].0
+    };
+    engine.handle_backend_event(key_up("q"), &mut backend).unwrap();
+    let count = log.lock().unwrap().presents;
+    engine.handle_backend_event(BackendEvent::FocusedWindowBounds {
+        id, bounds: Ok(Some(Rect::new(100.0, 100.0, 400.0, 400.0))),
+    }, &mut backend).unwrap();
+    assert_eq!(log.lock().unwrap().presents, count);
+    engine.handle_backend_event(key_down("q"), &mut backend).unwrap();
+    engine.quick_switch.pending.as_mut().unwrap().deadline = Instant::now();
+    engine.fire_quick_switch(&mut backend).unwrap();
+    let next = log.lock().unwrap().geometry_requests[1].0;
+    assert_ne!(id, next);
+    let count = log.lock().unwrap().presents;
+    engine.handle_backend_event(BackendEvent::FocusedWindowBounds {
+        id, bounds: Ok(Some(Rect::new(100.0, 100.0, 400.0, 400.0))),
+    }, &mut backend).unwrap();
+    assert_eq!(log.lock().unwrap().presents, count);
+    engine.handle_backend_event(BackendEvent::FocusedWindowBounds {
+        id: next, bounds: Ok(Some(Rect::new(100.0, 100.0, 400.0, 400.0))),
+    }, &mut backend).unwrap();
+    assert!(log.lock().unwrap().presents > count);
+}
+
+#[test]
 fn quick_switch_release_acknowledges_before_redrawing_grid() {
     for mode in [ModeId::grid(), ModeId::recursive_grid()] {
         let mut engine = Engine::from_plan(

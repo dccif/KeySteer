@@ -2,7 +2,7 @@
 
 //! Cache-friendly bounded spatial index shared by native UI scanners.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use smallvec::SmallVec;
 
@@ -19,7 +19,7 @@ pub(crate) struct SpatialIndex {
     cell_size: f64,
     padding: f64,
     minimum_side: f64,
-    cells: HashMap<(i32, i32), SmallVec<[u32; 4]>>,
+    cells: FxHashMap<(i32, i32), SmallVec<[u32; 4]>>,
     oversize: SmallVec<[u32; 16]>,
     rects: Vec<Rect>,
     marks: Vec<u32>,
@@ -32,7 +32,7 @@ impl SpatialIndex {
             cell_size: cell_size.max(1.0),
             padding: padding.max(0.0),
             minimum_side: minimum_side.max(0.0),
-            cells: HashMap::new(),
+            cells: FxHashMap::default(),
             oversize: SmallVec::new(),
             rects: Vec::new(),
             marks: Vec::new(),
@@ -168,6 +168,55 @@ pub(crate) fn rectangles_match(a: Rect, b: Rect, iou_threshold: f64, minimum_spa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grid_deduplication_matches_exhaustive_scan_across_distributions() {
+        for spacing in [4.0, 30.0, 70.0, 256.0] {
+            let mut index = SpatialIndex::new(64.0, 8.0, 2.0);
+            let mut accepted = Vec::<Rect>::new();
+            for i in 0..1_000 {
+                let cell = i / 2;
+                let oversized = cell % 97 == 0;
+                let rect = Rect::new(
+                    (cell % 29) as f64 * spacing - 800.0,
+                    (cell / 29) as f64 * spacing - 300.0,
+                    if oversized { 600.0 } else { 64.0 },
+                    if oversized { 400.0 } else { 24.0 },
+                );
+                let unique = !accepted
+                    .iter()
+                    .any(|&old| rectangles_match(old, rect, 0.5, 8.0));
+                assert_eq!(
+                    index.insert_if_unique(rect, |a, b| rectangles_match(a, b, 0.5, 8.0)),
+                    unique
+                );
+                if unique {
+                    accepted.push(rect);
+                }
+                assert_eq!(index.len(), accepted.len());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "run alone with --test-threads=1 to isolate allocation counts"]
+    fn scan_index_allocation_profile() {
+        for count in [100, 2_000] {
+            let region = stats_alloc::Region::new(crate::TEST_ALLOCATOR);
+            let mut index = SpatialIndex::new(64.0, 8.0, 2.0);
+            for i in 0..count {
+                let rect = Rect::new(
+                    (i % 50) as f64 * 70.0 - 800.0,
+                    (i / 50) as f64 * 70.0 - 300.0,
+                    64.0,
+                    24.0,
+                );
+                assert!(index.insert_if_unique(rect, |a, b| rectangles_match(a, b, 0.5, 8.0)));
+            }
+            std::hint::black_box(&index);
+            println!("scan_index targets={count} {:?}", region.change());
+        }
+    }
 
     #[test]
     fn indexes_negative_coordinates_and_oversize_rectangles() {

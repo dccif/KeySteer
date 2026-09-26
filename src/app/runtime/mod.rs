@@ -169,10 +169,10 @@ impl Engine {
             palettes,
             modes,
         } = plan;
-        let routes = modes
-            .iter()
-            .map(|spec| (spec.id(), spec.route.clone()))
-            .collect();
+        let (routes, instances): (std::collections::BTreeMap<_, _>, Vec<_>) = modes
+            .into_iter()
+            .map(|spec| ((spec.id(), spec.route), spec.instance))
+            .unzip();
         crate::support::logging::set_non_error_enabled(settings.debug.enabled);
         let palette = palettes.for_appearance(appearance);
         let mut engine = Self {
@@ -202,8 +202,8 @@ impl Engine {
             started_at: Instant::now(),
         };
         if register_catalog {
-            for spec in modes {
-                match spec.instance {
+            for instance in instances {
+                match instance {
                     ModeInstance::BuiltIn(mode) => engine.register_deferred(mode),
                     ModeInstance::Plugin(plugin) => {
                         engine.register_plugin_dyn_deferred(plugin)?;
@@ -546,6 +546,17 @@ impl Engine {
                 return Err(error);
             }
         }
+        // Most input events schedule no delayed work. Check the authoritative
+        // state after dispatch (an event may just have armed a timer), before
+        // entering the five independent recovery/dispatch paths below.
+        if self.input.pending_long_press_toggles.is_empty()
+            && self.quick_switch.pending.is_none()
+            && self.input.drag_auto_release.fires_at.is_none()
+            && self.scheduler.timers.is_empty()
+            && self.scheduler.sequences.is_empty()
+        {
+            return Ok(());
+        }
         let long_press_result = self.fire_due_long_press_toggles(backend);
         self.fire_quick_switch(backend)?;
         if let Err(error) = long_press_result
@@ -636,7 +647,24 @@ impl Engine {
             .unwrap_or(true)
     }
 
+    /// Input dominates the event loop. Keep its dispatch small enough to
+    /// inline independently of the growing set of background notifications.
+    #[inline]
     fn handle_backend_event(
+        &mut self,
+        event: BackendEvent,
+        backend: &mut dyn Backend,
+    ) -> Result<(), String> {
+        match event {
+            BackendEvent::Input(input) => {
+                crate::support::perf_probe::mark("input_received");
+                self.handle_key(input, backend)
+            }
+            event => self.handle_backend_notification(event, backend),
+        }
+    }
+
+    fn handle_backend_notification(
         &mut self,
         event: BackendEvent,
         backend: &mut dyn Backend,
@@ -844,6 +872,9 @@ impl Engine {
             }
             BackendEvent::Warning(message) => {
                 crate::report_warning!("backend", "{message}")
+            }
+            BackendEvent::FocusedWindowBounds { id, bounds } => {
+                self.finish_quick_switch_geometry(id, bounds, backend)?;
             }
         }
         Ok(())

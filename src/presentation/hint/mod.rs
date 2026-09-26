@@ -132,15 +132,22 @@ pub(crate) fn prepare_hints(
     let visual_scale = visual_layer_scale(ctx, content.scan_bounds);
     let visual_padding_x = (style.padding_x * visual_scale).round();
     let visual_padding_y = (style.padding_y * visual_scale).round();
-    let visible = content
-        .hints
-        .iter()
-        .filter(|hint| hint.label.as_str().starts_with(content.prefix))
-        .count();
+    let visible = if content.prefix.is_empty() {
+        content.hints.len()
+    } else {
+        content
+            .hints
+            .iter()
+            .filter(|hint| hint.label.as_str().starts_with(content.prefix))
+            .count()
+    };
     let stacked = |left, right| visually_stacked(left, right, visual_padding_x, visual_padding_y);
     if visible > 128 {
         let mut placements = workspace.take().unwrap_or_default();
         placements.clear();
+        // Filtering loses the iterator's exact lower bound. The visible count
+        // is already known, so avoid repeated growth on the first wide scan.
+        placements.reserve(visible);
         placements.extend(
             content
                 .hints
@@ -171,12 +178,15 @@ pub(crate) fn prepare_hints(
 impl HintView<'_> {
     pub(crate) fn scene(&self, ctx: &HostContext<'_>) -> OverlayScene {
         let palette = ctx.palette;
-        let visible_count = self
-            .content
-            .hints
-            .iter()
-            .filter(|hint| hint.label.as_str().starts_with(self.content.prefix))
-            .count();
+        let visible_count = if self.content.prefix.is_empty() {
+            self.content.hints.len()
+        } else {
+            self.content
+                .hints
+                .iter()
+                .filter(|hint| hint.label.as_str().starts_with(self.content.prefix))
+                .count()
+        };
         let shape_capacity = if self.content.style.boundary_highlight.enabled {
             visible_count
         } else {
@@ -235,7 +245,15 @@ impl HintView<'_> {
         // than sorting and preserve equal-z source order exactly.
         let final_z = HINT_LAYER_Z_BASE
             .saturating_add(i32::try_from(self.layers.layer_count().max(1)).unwrap_or(i32::MAX));
-        for z_index in HINT_LAYER_Z_BASE..=final_z {
+        // Without an active overlap layer every label has the same rank.
+        // Avoid traversing the entire hint list for empty z layers.
+        let (first_z, final_z) = if active_overlap_layer.is_none() || self.layers.layer_count() == 0
+        {
+            (HINT_LAYER_Z_BASE + 1, HINT_LAYER_Z_BASE + 1)
+        } else {
+            (HINT_LAYER_Z_BASE, final_z)
+        };
+        for z_index in first_z..=final_z {
             for (hint_index, hint) in self
                 .content
                 .hints

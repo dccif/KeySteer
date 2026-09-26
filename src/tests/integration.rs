@@ -549,7 +549,7 @@ fn every_mode_has_a_binding_table_including_plugins() {
 fn windows_visual_capture_keeps_one_barrier_and_an_unscaled_copy_path() {
     let gpu = include_str!("../../src/platform/windows/gpu_overlay.rs");
     let worker = include_str!("../../src/platform/windows/overlay_worker.rs");
-    let native = include_str!("../../src/platform/windows/native/mod.rs");
+    let native = include_str!("../../src/platform/windows/native/gdi.rs");
 
     assert!(
         !gpu.contains("WaitForCommitCompletion"),

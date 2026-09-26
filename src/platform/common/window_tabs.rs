@@ -80,6 +80,7 @@ pub(crate) struct Grouped<A> {
     deferred_closed: BTreeSet<WindowId>,
     retired: Vec<WindowId>,
     hidden: BTreeSet<WindowId>,
+    visibility_pending: bool,
     screens: Vec<Screen>,
 }
 
@@ -117,6 +118,7 @@ impl<A: WindowAccess> Grouped<A> {
             deferred_closed: BTreeSet::new(),
             retired: Vec::new(),
             hidden: BTreeSet::new(),
+            visibility_pending: false,
             screens: Vec::new(),
         }
     }
@@ -255,6 +257,7 @@ impl<A: WindowAccess> Grouped<A> {
         self.native.tab_watch(&watched)
     }
     fn publish(&mut self, screens: &[Screen]) -> Result<(), String> {
+        let defer_hide = self.native.native_deadline().is_some();
         if self.screens != screens {
             self.screens = screens.to_vec();
         }
@@ -279,6 +282,9 @@ impl<A: WindowAccess> Grouped<A> {
             .copied()
             .collect::<Vec<_>>()
         {
+            if defer_hide {
+                continue;
+            }
             self.native.tab_set_hidden(id, true)?;
             self.hidden.insert(id);
         }
@@ -340,6 +346,7 @@ impl<A: WindowAccess> Grouped<A> {
             self.bars = bars;
             self.pending_bars.clear();
         }
+        self.visibility_pending = defer_hide;
         Ok(())
     }
 
@@ -617,7 +624,11 @@ impl<A: WindowAccess> Grouped<A> {
         if let Err(error) = self.native.select(id) {
             // The chosen member is already visible. Focus refusal must not undo
             // membership, replay geometry, or expose the previous member again.
-            crate::report_warning!("window-tabs", "{error}");
+            crate::support::logging::report_error_context(
+                "window-tabs",
+                &error,
+                format_args!("operation=activate"),
+            );
         }
         // Focus refusal still commits visibility; it must not roll back tabs.
         self.publish(screens)
@@ -960,7 +971,11 @@ impl<A: WindowAccess> Grouped<A> {
                 self.hidden.remove(&active);
                 self.groups.activate(active);
                 if let Err(error) = self.native.select(active) {
-                    crate::report_warning!("window-tabs", "{error}");
+                    crate::support::logging::report_error_context(
+                        "window-tabs",
+                        &error,
+                        format_args!("operation=activate-survivor"),
+                    );
                 }
                 self.publish(screens)?;
             }
@@ -1101,6 +1116,11 @@ impl<A: WindowAccess> Grouped<A> {
     pub fn pump(&mut self, screens: &[Screen], cancelled: &dyn Fn() -> bool) -> Result<(), String> {
         if cancelled() {
             return Ok(());
+        }
+        // Retire the previous visible member only after native activation has
+        // settled (or failed). Unrelated worker requests continue meanwhile.
+        if self.visibility_pending && self.native.native_deadline().is_none() {
+            self.publish(screens)?;
         }
         let mut events = std::mem::take(&mut self.deferred_events);
         events.extend(
@@ -1400,6 +1420,15 @@ impl<A: WindowAccess> WindowAccess for Grouped<A> {
     }
     fn focused_window(&self, windows: &[WindowInfo]) -> Option<WindowId> {
         self.native.focused_window(windows)
+    }
+    fn focused_bounds(&self, process: u32) -> Result<Option<Rect>, String> {
+        self.native.focused_bounds(process)
+    }
+    fn native_deadline(&self) -> Option<Instant> {
+        self.native.native_deadline()
+    }
+    fn poll_native(&self) -> Result<(), String> {
+        self.native.poll_native()
     }
     fn pointer_window(&mut self, screens: &[Screen]) -> Result<Option<WindowId>, String> {
         self.native.pointer_window(screens)

@@ -5,6 +5,18 @@ outline: false
 
 # Release notes
 
+## 0.10.25
+
+Improved keyboard responsiveness, reducing key processing time by about 15%.
+
+The configuration simulator now compares TOML files and previews import/export changes, highlighting added, removed and modified values while ignoring comments and formatting.
+
+| Key processing time | Before | After | Reduction |
+| --- | ---: | ---: | ---: |
+| p50 | 160 ns | 136 ns | 15.0% |
+| p95 | 163 ns | 138 ns | 15.3% |
+| p99 | 205 ns | 180 ns | 12.2% |
+
 ## 0.10.24
 
 - Optimized memory usage during UI Hint scans.

@@ -46,8 +46,10 @@ use std::path::{Path, PathBuf};
 // the stale 370 budget. Audited this migration: six cached UIA getters and the
 // GDI owners moved to typed native modules; three tagged test union reads now
 // share one checked accessor. No new production FFI was introduced.
-const MAX_UNSAFE_EXPRESSIONS: usize = 383;
-const MAX_UNSAFE_FILES: usize = 33;
+// Resource-boundary split moves existing blocks to focused owners; activation
+// submissions now share one wrapper instead of two raw call sites.
+const MAX_UNSAFE_EXPRESSIONS: usize = 382;
+const MAX_UNSAFE_FILES: usize = 40;
 const PER_FILE_BUDGET: &[(&str, usize)] = &[
     // macOS audio owns, changes, maintains and destroys native state,
     // with one bounded diagnostic callback into centralized logging.
@@ -80,14 +82,21 @@ const PER_FILE_BUDGET: &[(&str, usize)] = &[
     ("src/platform/windows/overlay.rs", 5),
     ("src/platform/windows/screens.rs", 5),
     ("src/platform/windows/window_mover.rs", 4),
-    ("src/platform/windows/window_manager.rs", 31),
+    ("src/platform/windows/window_manager.rs", 29),
     ("src/platform/windows/window_tabs.rs", 7),
     ("src/platform/windows/status_item.rs", 14),
     ("src/platform/windows/update_installer/candidate.rs", 4),
     ("src/platform/windows/update_installer/mod.rs", 11),
     ("src/platform/windows/update_installer/signature.rs", 9),
-    ("src/platform/windows/native/mod.rs", 83),
-    ("src/platform/windows/native/gdi.rs", 4),
+    ("src/platform/windows/native/mod.rs", 35),
+    ("src/platform/windows/native/com.rs", 2),
+    ("src/platform/windows/native/compositor.rs", 8),
+    ("src/platform/windows/native/handles.rs", 4),
+    ("src/platform/windows/native/message_loop.rs", 8),
+    ("src/platform/windows/native/ocr_bridge.rs", 12),
+    ("src/platform/windows/native/window.rs", 3),
+    ("src/platform/windows/native/winrt.rs", 5),
+    ("src/platform/windows/native/gdi.rs", 11),
     ("src/platform/windows/native/uia_cache.rs", 6),
 ];
 

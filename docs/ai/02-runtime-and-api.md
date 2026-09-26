@@ -1,5 +1,20 @@
 # 核心运行时与公共 API
 
+高频 `BackendEvent::Input` 经独立的小型可内联入口分发，其他后台通知保留完整事件处理；增加后台事件时不要把大型分支重新并入输入入口。该拆分不改变事件顺序、输入恢复或通知语义。
+
+CompiledKeymap 按精确激活键桶直接匹配，桶的键由 insert 保证，无需在每个候选上再次比较激活键。仅精确桶未命中且输入为左右修饰键时，才查询通用修饰键桶；精确优先和被过滤后的通用回退必须保留。
+
+只有一个非修饰键按住且与激活键相同时，键桶末尾的单键绑定是唯一可能匹配项，直接检查该项；否则走完整组合匹配。桶必须保持按组合长度降序和身份去重，不能把长度判断应用于通用／左右修饰键重叠的组合。
+
+事件处理完成后，若长按、快捷面板、拖动释放、timer 和延迟 sequence 均无待处理状态，当前 turn 直接结束；条件检查发生在事件之后，不能跳过事件刚刚创建的任务。有任务时仍按原次序处理与恢复。
+
+运行时装配直接消费 ModeSpec 的 route 与 instance，避免再次克隆整个键表；registry 按路由数量预留槽位。Quick Switch 的 Pending 面板状态仅在手势开始时装入 Box，普通输入循环只保留空指针；未挂起、未捕获、未阻止且非触发键时直接跳过面板状态机。组合键身份比较保留激活键顺序，以键集合比较代替临时 canonical 字符串；contains_chord 只查对应激活键桶。
+
+
+Quick Switch 按窗口定位通过 `Backend::request_focused_window_bounds(id, process)` 提交现有窗口 worker，再由 `BackendEvent::FocusedWindowBounds` 返回。面板先按屏幕回退位置显示；只应用仍可见且请求编号、进程归属均匹配的结果。关闭、重新打开或焦点换进程后的旧结果不得重新显示或移动面板。缺少该可选能力时保留屏幕定位，不同步回退到原生查询。
+
+press/toggle 回滚收集所有失败，清理循环不进行日志 I/O；错误连同原始失败交给 Engine 输入恢复边界，完成输入与 UI 恢复后记录。标签维护和提交后的焦点确认失败使用统一 Error；可用备用路径的能力降级仍可作为 Warning。`File::flush` 不承诺断电持久化，不在交互日志中添加 `sync_all`。
+
 字符定位匹配命中 TargetingKey 时，不得丢弃实际按住的 Cmd／Ctrl／Alt 后抢占应用快捷键；被临时模式路由保留的修饰键仍遵循该路由，Shift 仍可产生字面符号。物理组合键继续通过原绑定匹配与 Down/Up 透传配对处理。
 
 `RetargetScreen` 在 Grid／Recursive Grid 中始终交给持有选格路径的活动网格，即使快捷键通过 temporary Normal 借用。先重放路径再 warp，避免 PointerMoved 跨屏重置层级；其他模式仍按 display_mode 路由，保留 Text Input 借用 Normal 的切屏能力。
@@ -18,7 +33,7 @@
 
 Windows 托盘线程在 WM_QUERYENDSESSION 发出 SaveWorkspace 并有界等待确认；取消关机不会让 Engine 退出。macOS applicationShouldTerminate 返回 TerminateLater、发出 Quit，Engine 保存后由后端回复退出。不能保证强制结束或断电时未保存计数不丢失。
 
-QuickSwitcher 观察操作模式中单独按下的配置键，默认 Q；首次 Down 立即进入正常输入路由，不保存或补发短按动作；达到长按阈值或数字组合被 quick_switch 接管后，触发键后续重复 Down 消费到物理 Up 为止，即使面板已经选择目标或取消。阈值前 repeat 保持原行为，Up 仍进入正常路由以释放原手势；捕获丢失清理重复拦截状态。长按复用现有 poll deadline，Q+数字可立即选择。首次动作导致模式切换（包括 Idle）不取消本次候选；从 Idle 开始按键不创建候选。Idle、暂停、排除应用和原生备注输入不启用。面板打开时固定前 9 个模式的计数降序／id 同分排序；选择当前模式保持状态。仅面板选择键的 release 配对消费；触发键 release 继续正常释放手势并收起面板，捕获丢失清理候选与 captured 键。黑名单不参与普通快捷键路由。几何经 Backend::focused_window_bounds，样式在配置编译时解析，面板文本只在打开时构建。
+QuickSwitcher 观察操作模式中单独按下的配置键，默认 Q；首次 Down 立即进入正常输入路由，不保存或补发短按动作；达到长按阈值或数字组合被 quick_switch 接管后，触发键后续重复 Down 消费到物理 Up 为止，即使面板已经选择目标或取消。阈值前 repeat 保持原行为，Up 仍进入正常路由以释放原手势；捕获丢失清理重复拦截状态。长按复用现有 poll deadline，Q+数字可立即选择。首次动作导致模式切换（包括 Idle）不取消本次候选；从 Idle 开始按键不创建候选。Idle、暂停、排除应用和原生备注输入不启用。面板打开时固定前 9 个模式的计数降序／id 同分排序；选择当前模式保持状态。仅面板选择键的 release 配对消费；触发键 release 继续正常释放手势并收起面板，捕获丢失清理候选与 captured 键。黑名单不参与普通快捷键路由。几何经 Backend::request_focused_window_bounds 异步请求及完成事件，样式在配置编译时解析，面板文本只在打开时构建。
 
 `Mode::window_action_supported` 描述模式稳定支持的 Window 动作，用于模式进入时构建固定快捷键表；`window_action_available` 描述当前能否执行，仍保留编辑事务、恢复输入和确认状态的检查。两者共享 WindowKind 的动作集合，帮助表不会因瞬时未就绪而丢失保存或确认键。Host 的帮助解析使用独立候选状态，实际输入解析仍使用真实按键状态。
 

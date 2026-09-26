@@ -69,6 +69,16 @@ pub mod benchmark {
     pub fn normal(config: &Config) -> crate::modes::NormalMode {
         crate::app::mode_catalog::normal(config)
     }
+
+    /// Exercise the real scanner index without native UIA/AX provider costs.
+    pub fn scan_index(rects: &[Rect]) -> usize {
+        use crate::platform::common::spatial_index::{SpatialIndex, rectangles_match};
+        let mut index = SpatialIndex::new(64.0, 8.0, 2.0);
+        for &rect in rects {
+            index.insert_if_unique(rect, |a, b| rectangles_match(a, b, 0.5, 8.0));
+        }
+        index.len()
+    }
 }
 
 #[cfg(test)]

@@ -198,6 +198,26 @@
 .ks-file-input { display: none; }
 .ks-compact-toolbar { align-items: center; padding-block: 14px; }
 .ks-preview-toolbar { flex: 0 0 auto; background: var(--ks-surface); }
+.ks-config-diff { width: min(1040px, 94vw); max-height: 88dvh; margin: auto; padding: 24px; border: 1px solid var(--vp-c-divider); border-radius: 14px; background: var(--vp-c-bg); color: var(--vp-c-text-1); box-shadow: 0 24px 80px #0006; }
+.ks-config-diff::backdrop { background: #080d20aa; }
+.ks-config-diff header, .ks-config-diff footer { display: flex; gap: 12px; align-items: center; justify-content: space-between; }
+.ks-config-diff header h2 { margin: 0; padding: 0; border: 0; font-size: 20px; }
+.ks-config-diff footer { justify-content: flex-end; padding-top: 16px; }
+.ks-config-diff > p { margin: 12px 0; font-size: 13px; }
+.ks-config-diff button { color: var(--vp-c-text-1); border: 1px solid var(--vp-c-divider); }
+.ks-config-diff button:focus-visible, .ks-config-diff input:focus-visible { outline: 2px solid var(--vp-c-brand-1); outline-offset: 3px; }
+.ks-diff-sources, .ks-diff-values { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+.ks-diff-sources { margin-top: 16px; }
+.ks-diff-sources label { display: grid; gap: 6px; min-width: 0; font-size: 13px; overflow-wrap: anywhere; }
+.ks-diff-sources input { max-width: 100%; }
+.ks-diff-scroll { max-height: 46dvh; overflow: auto; overscroll-behavior: contain; }
+.ks-diff-change { border-top: 1px solid var(--vp-c-divider); padding: 12px 0; }
+.ks-diff-change h3 { margin: 0 0 8px; font-size: 13px; overflow-wrap: anywhere; }
+.ks-diff-change h3 span { color: var(--vp-c-text-2); }
+.ks-diff-values pre { margin: 0; padding: 10px; border-radius: 5px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.6; }
+.ks-diff-before { background: rgba(235, 80, 90, .12); }
+.ks-diff-after { background: rgba(60, 175, 110, .12); }
+@media (max-width: 600px) { .ks-config-diff { padding: 16px; } .ks-diff-values { grid-template-columns: minmax(0, 1fr); gap: 4px; } }
 .ks-toml-source { min-width: 0; }
 .ks-toml-source h2 { overflow: hidden; color: var(--vp-c-text-1); font: 700 15px/1.4 var(--vp-font-family-mono); text-overflow: ellipsis; white-space: nowrap; }
 .ks-toml-source > p { margin-top: 3px; }

@@ -2,6 +2,10 @@
 use super::transaction::PendingTransaction;
 use super::*;
 enum Pending {
+    FocusedBounds {
+        id: u64,
+        process: u32,
+    },
     ClearOverlap,
     Window {
         request: WindowRequest,
@@ -14,10 +18,11 @@ fn runnable(queue: &VecDeque<Pending>, frames: &VecDeque<PendingAdjustment>) -> 
     if frames.is_empty() {
         return (!queue.is_empty()).then_some(0);
     }
-    // Audio has its own worker and never crosses window transaction barriers.
+    // Audio has its own worker; focused bounds are a read-only query outside
+    // the edit session. Neither needs to wait for transaction frame barriers.
     if let Some(index) = queue
         .iter()
-        .position(|item| matches!(item, Pending::Audio(..)))
+        .position(|item| matches!(item, Pending::Audio(..) | Pending::FocusedBounds { .. }))
     {
         return Some(index);
     }
@@ -58,7 +63,7 @@ impl Pending {
     fn operation(&self) -> Option<&WindowOperation> {
         match self {
             Self::Window { request, .. } => Some(&request.operation),
-            Self::Audio(..) | Self::ClearOverlap => None,
+            Self::Audio(..) | Self::ClearOverlap | Self::FocusedBounds { .. } => None,
         }
     }
 }
@@ -110,6 +115,24 @@ pub(crate) struct WindowWorker {
 }
 
 impl WindowWorker {
+    pub(crate) fn focused_bounds(&self, id: u64, process: u32) -> Result<(), String> {
+        let mut queue = self
+            .mailbox
+            .queue
+            .lock()
+            .map_err(|_| "window queue poisoned")?;
+        if self.mailbox.stop.load(Ordering::Acquire) {
+            return Err("window worker stopped".into());
+        }
+        queue.retain(|pending| !matches!(pending, Pending::FocusedBounds { .. }));
+        if queue.len() >= 64 {
+            return Err("window operation queue is full".into());
+        }
+        queue.push_back(Pending::FocusedBounds { id, process });
+        drop(queue);
+        self.mailbox.notify();
+        Ok(())
+    }
     pub(crate) fn clear_overlap_cache(&self) {
         let mut queue = self.mailbox.queue.lock().unwrap_or_else(|e| e.into_inner());
         queue.retain(|pending| {
@@ -145,6 +168,13 @@ impl WindowWorker {
                 let mut layout: Option<PendingTransaction> = None;
                 loop {
                     A::native_batch(|| {
+                        if let Err(error) = access.poll_native() {
+                            crate::support::logging::report_error_context(
+                                "window-confirmation",
+                                &error,
+                                format_args!("operation=focus"),
+                            );
+                        }
                         let mut changed = false;
                         if let Some(pending) = &mut layout {
                             let request_session = pending.request().session;
@@ -222,7 +252,11 @@ impl WindowWorker {
                             && let Err(error) =
                                 access.pump(&displays, &|| input.stop.load(Ordering::Acquire))
                         {
-                            emit(BackendEvent::Warning(format!("window tabs: {error}")));
+                            crate::support::logging::report_error_context(
+                                "window-tabs",
+                                &error,
+                                format_args!("operation=maintain"),
+                            );
                         }
                         active
                     });
@@ -231,7 +265,7 @@ impl WindowWorker {
                         if (layout.is_some() || runnable(&queue, &frames).is_none())
                             && (!input.stop.load(Ordering::Acquire) || layout.is_some())
                         {
-                            let timeout =
+                            let mut timeout =
                                 if layout.as_ref().is_some_and(PendingTransaction::preparing) {
                                     Some(Duration::ZERO)
                                 } else if !frames.is_empty() || layout.is_some() {
@@ -241,11 +275,17 @@ impl WindowWorker {
                                 } else {
                                     None
                                 };
+                            if let Some(deadline) = access.native_deadline() {
+                                let remaining = deadline.saturating_duration_since(Instant::now());
+                                timeout =
+                                    Some(timeout.map_or(remaining, |value| value.min(remaining)));
+                            }
                             if input.native_waker.get().is_some()
                                 && (access.persistent()
                                     || !frames.is_empty()
                                     || layout.is_some()
-                                    || audio_active)
+                                    || audio_active
+                                    || access.native_deadline().is_some())
                             {
                                 input.native_waiting.store(true, Ordering::Release);
                                 drop(queue);
@@ -272,7 +312,12 @@ impl WindowWorker {
                         if layout.is_some() {
                             queue
                                 .iter()
-                                .position(|item| matches!(item, Pending::Audio(..)))
+                                .position(|item| {
+                                    matches!(
+                                        item,
+                                        Pending::Audio(..) | Pending::FocusedBounds { .. }
+                                    )
+                                })
                                 .and_then(|index| queue.remove(index))
                         } else {
                             runnable(&queue, &frames).and_then(|index| queue.remove(index))
@@ -283,6 +328,13 @@ impl WindowWorker {
                     };
                     A::native_batch(|| {
                         let (mut request, screens) = match pending {
+                            Pending::FocusedBounds { id, process } => {
+                                emit(BackendEvent::FocusedWindowBounds {
+                                    id,
+                                    bounds: access.focused_bounds(process),
+                                });
+                                return;
+                            }
                             Pending::Audio(request, cancelled) => {
                                 if cancelled.load(Ordering::Acquire) {
                                     return;
@@ -572,7 +624,12 @@ impl WindowWorker {
                 .store(request.session, Ordering::Release);
             self.mailbox.cancel_before.store(0, Ordering::Release);
             self.mailbox.query_before.store(0, Ordering::Release);
-            queue.retain(|p| matches!(p, Pending::Audio(..) | Pending::ClearOverlap));
+            queue.retain(|p| {
+                matches!(
+                    p,
+                    Pending::Audio(..) | Pending::ClearOverlap | Pending::FocusedBounds { .. }
+                )
+            });
         }
         if self.mailbox.session.load(Ordering::Acquire) != request.session {
             return Err("window session expired".into());
@@ -588,15 +645,17 @@ impl WindowWorker {
                 .cancel_before
                 .store(request.id, Ordering::Release);
             queue.retain(|p| {
-                matches!(p, Pending::Audio(..) | Pending::ClearOverlap)
-                    || matches!(
-                        p.operation(),
-                        Some(
-                            WindowOperation::Acquire(_)
-                                | WindowOperation::BeginEdit { .. }
-                                | WindowOperation::EndEdit { .. }
-                        )
+                matches!(
+                    p,
+                    Pending::Audio(..) | Pending::ClearOverlap | Pending::FocusedBounds { .. }
+                ) || matches!(
+                    p.operation(),
+                    Some(
+                        WindowOperation::Acquire(_)
+                            | WindowOperation::BeginEdit { .. }
+                            | WindowOperation::EndEdit { .. }
                     )
+                )
             });
         }
         if matches!(
@@ -607,11 +666,13 @@ impl WindowWorker {
                 .cancel_before
                 .store(request.id, Ordering::Release);
             queue.retain(|p| {
-                matches!(p, Pending::Audio(..) | Pending::ClearOverlap)
-                    || matches!(
-                        p.operation(),
-                        Some(WindowOperation::Acquire(_) | WindowOperation::BeginEdit { .. })
-                    )
+                matches!(
+                    p,
+                    Pending::Audio(..) | Pending::ClearOverlap | Pending::FocusedBounds { .. }
+                ) || matches!(
+                    p.operation(),
+                    Some(WindowOperation::Acquire(_) | WindowOperation::BeginEdit { .. })
+                )
             });
         }
         // Absolute layouts replace pending revisions, rather than accumulating
@@ -749,7 +810,12 @@ impl WindowWorker {
             .compare_exchange(session, 0, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            queue.retain(|p| matches!(p, Pending::Audio(..) | Pending::ClearOverlap));
+            queue.retain(|p| {
+                matches!(
+                    p,
+                    Pending::Audio(..) | Pending::ClearOverlap | Pending::FocusedBounds { .. }
+                )
+            });
             // Wake the owner to release retained native references and undo
             // snapshots immediately, including when no operation is active.
             queue.push_back(Pending::Window {

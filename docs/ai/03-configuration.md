@@ -1,5 +1,10 @@
 # 配置、按键和持久化
 
+运行时响应优先的键存储采用 `SmolStr`：短键名内联，长键名共享堆存储，公开字符串与 serde 表示不变。别名作用域和公开配置保持 `BTreeMap<String, String>`；CompiledKeymap 编译整张表共用一次别名作用域，退出恢复原作用域，非法条目仍跳过。长名称、Unicode、嵌套恢复、借用查找和排序测试保留。CompactString 单独及组合实验仍未满足运行时验收，未采用；扫描索引独立采用 FxHashMap，见扫描主题。先前因初始化 p99 而撤回 SmolStr 的记录属于旧验收条件。
+
+按键规范化在已规范的 ASCII 输入上借用原字符串；大小写、Unicode 和分隔符需要转换时才构造临时字符串，最终 Key 拥有 SmolStr。别名先于内建名称解析，单字符减号不改写。短组合键的重复检查不分配临时树；长组合键保留有界复杂度的 BTreeSet 回退。
+
+
 Normal targeting 有效 max_depth 为 1 时只检查根层实际选格键的冲突（含 recursive_grid 的 depth 0 覆盖），不生成 Tab／Backspace／Space 导航绑定；省略 max_depth 时按继承后的值判断。多层继续检查导航键。
 
 ## Normal 盲操定位

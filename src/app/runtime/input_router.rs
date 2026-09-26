@@ -73,22 +73,23 @@ impl CompiledKeymap {
     }
 
     pub fn compile(bindings: Vec<(String, Binding)>, aliases: &BTreeMap<String, String>) -> Self {
-        let mut map = Self::default();
-        for (text, binding) in bindings {
-            if let Ok(chord) = KeyChord::parse_with_aliases(&text, aliases) {
-                map.insert(chord, binding);
+        // All entries use the same aliases. Own one scope for the complete
+        // table instead of cloning the alias map for every chord.
+        crate::api::input::with_key_aliases(aliases, || {
+            let mut map = Self::default();
+            for (text, binding) in bindings {
+                if let Ok(chord) = KeyChord::parse(&text) {
+                    map.insert(chord, binding);
+                }
             }
-        }
-        map
+            map
+        })
     }
 
     pub fn insert(&mut self, chord: KeyChord, binding: Binding) {
         let activation = chord.activation_key().clone();
         let entries = self.by_activation.entry(activation).or_default();
-        if entries
-            .iter()
-            .any(|entry| entry.chord.canonical() == chord.canonical())
-        {
+        if entries.iter().any(|entry| entry.chord.same_binding(&chord)) {
             return;
         }
         entries.push(CompiledBinding {
@@ -172,9 +173,10 @@ impl CompiledKeymap {
 
     pub fn contains_chord(&self, chord: &KeyChord) -> bool {
         self.by_activation
-            .values()
+            .get(chord.activation_key())
+            .into_iter()
             .flatten()
-            .any(|entry| entry.chord.canonical() == chord.canonical())
+            .any(|entry| entry.chord.same_binding(chord))
     }
 
     #[cfg(test)]
@@ -257,6 +259,17 @@ impl CompiledKeymap {
         pressed: &[Key],
         modifier_filter: impl Fn(&CompiledBinding) -> bool,
     ) -> Option<(Arc<Binding>, usize)> {
+        if let [only] = pressed
+            && only == key
+            && !only.is_modifier()
+        {
+            // Buckets are sorted longest first and deduplicated. Only the
+            // final single-key binding can match one held non-modifier;
+            // modifier aliases cannot make a longer chord eligible here.
+            let entry = self.by_activation.get(key)?.last()?;
+            return (entry.chord.keys().len() == 1 && modifier_filter(entry))
+                .then(|| (Arc::clone(&entry.binding), 1));
+        }
         self.find_entry(key, |entry| {
             entry.chord.matches_pressed(pressed) && modifier_filter(entry)
         })
@@ -268,19 +281,26 @@ impl CompiledKeymap {
         key: &Key,
         mut matches: impl FnMut(&CompiledBinding) -> bool,
     ) -> Option<&CompiledBinding> {
+        // Each bucket is indexed by the exact activation key at insertion.
+        // Ordinary keys need neither alias lookup nor a second key comparison.
+        if let Some(entry) = self
+            .by_activation
+            .get(key)
+            .and_then(|entries| entries.iter().find(|entry| matches(entry)))
+        {
+            return Some(entry);
+        }
         let generic = match key.as_str() {
-            "left_alt" | "right_alt" => Some("alt"),
-            "left_ctrl" | "right_ctrl" => Some("ctrl"),
-            "left_shift" | "right_shift" => Some("shift"),
-            "left_win" | "right_win" => Some("win"),
-            _ => None,
+            "left_alt" | "right_alt" => "alt",
+            "left_ctrl" | "right_ctrl" => "ctrl",
+            "left_shift" | "right_shift" => "shift",
+            "left_win" | "right_win" => "win",
+            _ => return None,
         };
         self.by_activation
-            .get(key)
-            .into_iter()
-            .chain(generic.and_then(|name| self.by_activation.get(name)))
-            .flatten()
-            .find(|entry| entry.chord.activation_matches(key) && matches(entry))
+            .get(generic)?
+            .iter()
+            .find(|entry| matches(entry))
     }
 
     pub fn entries(&self) -> Vec<(String, Binding)> {
@@ -314,6 +334,33 @@ mod tests {
     }
 
     #[test]
+    fn table_alias_scope_restores_outer_scope_after_invalid_entries() {
+        let outer = BTreeMap::from([("primary".into(), "right_ctrl".into())]);
+        let inner = BTreeMap::from([("primary".into(), "left_alt".into())]);
+        crate::api::input::with_key_aliases(&outer, || {
+            let map = CompiledKeymap::compile(
+                vec![
+                    ("primary+e".into(), mode("normal")),
+                    ("primary+primary".into(), mode("grid")),
+                    ("primary+r".into(), mode("grid")),
+                ],
+                &inner,
+            );
+            assert_eq!(map.iter_entries().count(), 2);
+            assert_eq!(Key::new("primary").unwrap().as_str(), "right_ctrl");
+            for (name, target) in [("e", "normal"), ("r", "grid")] {
+                let key = Key::new(name).unwrap();
+                let pressed = [Key::new("left_alt").unwrap(), key.clone()];
+                assert_eq!(map.lookup(&key, &pressed), Some(Arc::new(mode(target))));
+            }
+        });
+        assert_eq!(
+            Key::new("primary").unwrap().as_str(),
+            crate::api::input::primary_modifier()
+        );
+    }
+
+    #[test]
     fn custom_primary_side_is_enforced_by_the_compiled_keymap() {
         let aliases = BTreeMap::from([("primary".into(), "left_alt".into())]);
         let map = CompiledKeymap::compile(vec![("primary+e".into(), mode("normal"))], &aliases);
@@ -341,6 +388,62 @@ mod tests {
                 Some(Arc::new(mode("normal")))
             );
         }
+    }
+
+    #[test]
+    fn physical_activation_precedes_generic_and_falls_back_after_rejection() {
+        for modifier in ["alt", "ctrl", "shift", "win"] {
+            let left = Key::new(format!("left_{modifier}")).unwrap();
+            let right = Key::new(format!("right_{modifier}")).unwrap();
+            let map = CompiledKeymap::compile(
+                vec![
+                    (modifier.into(), mode("normal")),
+                    (left.as_str().into(), mode("grid")),
+                ],
+                &BTreeMap::new(),
+            );
+            assert_eq!(
+                map.lookup(&left, std::slice::from_ref(&left)),
+                Some(Arc::new(mode("grid")))
+            );
+            assert_eq!(
+                map.lookup(&right, std::slice::from_ref(&right)),
+                Some(Arc::new(mode("normal")))
+            );
+            let fallback = map.find_entry(&left, |entry| entry.binding.as_ref() != &mode("grid"));
+            assert_eq!(
+                fallback.map(|entry| entry.binding.as_ref()),
+                Some(&mode("normal"))
+            );
+        }
+    }
+
+    #[test]
+    fn single_key_lookup_requires_activation_and_preserves_companion_chords() {
+        let map = CompiledKeymap::compile(
+            vec![("s".into(), mode("normal")), ("alt+s".into(), mode("grid"))],
+            &BTreeMap::new(),
+        );
+        let s = Key::new("s").unwrap();
+        let w = Key::new("w").unwrap();
+        let alt = Key::new("left_alt").unwrap();
+        assert_eq!(
+            map.lookup(&s, std::slice::from_ref(&s)),
+            Some(Arc::new(mode("normal")))
+        );
+        assert_eq!(map.lookup(&s, std::slice::from_ref(&w)), None);
+        assert_eq!(map.lookup(&s, &[]), None);
+        assert_eq!(
+            map.lookup(&s, &[w, s.clone()]),
+            Some(Arc::new(mode("normal")))
+        );
+        assert_eq!(
+            map.lookup(&s, &[alt, s.clone()]),
+            Some(Arc::new(mode("grid")))
+        );
+        let chord_only =
+            CompiledKeymap::compile(vec![("alt+s".into(), mode("grid"))], &BTreeMap::new());
+        assert_eq!(chord_only.lookup(&s, std::slice::from_ref(&s)), None);
     }
 
     #[test]

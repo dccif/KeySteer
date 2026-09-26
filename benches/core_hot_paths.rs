@@ -12,6 +12,9 @@ const CALLS_PER_SAMPLE: usize = 1_000;
 #[path = "support/runtime.rs"]
 mod runtime;
 
+#[path = "support/scan_index.rs"]
+mod scan_index;
+
 #[cfg(target_os = "windows")]
 #[path = "support/character_capture.rs"]
 mod character_capture;
@@ -21,6 +24,10 @@ mod character_capture;
 mod character_capture;
 
 fn main() -> Result<(), String> {
+    if std::env::args().any(|arg| arg == "--scan-index") {
+        scan_index::run();
+        return Ok(());
+    }
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     if std::env::args().any(|arg| arg == "--character-capture") {
         return character_capture::run();

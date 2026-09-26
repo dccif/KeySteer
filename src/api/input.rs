@@ -4,7 +4,7 @@
 //! elsewhere, so one configuration file works everywhere, and the aliases match
 //! what users already write (`Cmd`, `Super`, `Option`, `Return`, `PageUp`, …).
 
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -12,6 +12,7 @@ use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
+use smol_str::SmolStr;
 
 thread_local! {
     static ACTIVE_KEY_ALIASES: RefCell<Option<BTreeMap<String, String>>> = const { RefCell::new(None) };
@@ -50,7 +51,7 @@ pub const fn primary_modifier() -> &'static str {
 
 /// A normalized key name (lowercase, `_`-separated).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Key(Arc<str>);
+pub struct Key(SmolStr);
 
 impl Borrow<str> for Key {
     fn borrow(&self) -> &str {
@@ -81,7 +82,7 @@ impl Key {
     }
 
     /// Extra mouse buttons enter the ordinary binding pipeline as physical
-    /// keys. Cache canonical names so native edges only clone an Arc.
+    /// keys. Cache canonical names so native edges only clone the key value.
     pub(crate) fn mouse_side_button(number: u8) -> Option<Self> {
         static KEYS: OnceLock<[Key; 2]> = OnceLock::new();
         let index = usize::from(number.checked_sub(1)?);
@@ -99,7 +100,7 @@ impl Key {
         if normalized.is_empty() {
             Err("key must not be empty".into())
         } else {
-            Ok(Self(normalized.into()))
+            Ok(Self(SmolStr::new(normalized.as_ref())))
         }
     }
 
@@ -206,37 +207,50 @@ impl Key {
     }
 }
 
-fn normalize_key(value: &str) -> String {
-    let alias = normalize_alias_name(value);
+fn normalize_key(value: &str) -> Cow<'_, str> {
+    let alias = normalized_alias(value);
     if let Some(resolved) = ACTIVE_KEY_ALIASES.with(|active| {
         active
             .borrow()
             .as_ref()
-            .and_then(|aliases| aliases.get(&alias).cloned())
+            .and_then(|aliases| aliases.get(alias.as_ref()).cloned())
     }) {
-        return resolved;
+        return Cow::Owned(resolved);
     }
-    normalize_builtin_key(value)
+    builtin_key(alias)
+}
+
+fn normalized_alias(value: &str) -> Cow<'_, str> {
+    let trimmed = value.trim();
+    let single = trimmed.chars().count() == 1;
+    if trimmed.is_ascii()
+        && !trimmed
+            .bytes()
+            .any(|byte| byte.is_ascii_uppercase() || (!single && matches!(byte, b' ' | b'-')))
+    {
+        return Cow::Borrowed(trimmed);
+    }
+    let mut normalized = trimmed.to_lowercase();
+    if !single && normalized.contains([' ', '-']) {
+        normalized = normalized.replace([' ', '-'], "_");
+    }
+    Cow::Owned(normalized)
 }
 
 pub(crate) fn normalize_alias_name(value: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.chars().count() == 1 {
-        trimmed.to_lowercase()
-    } else {
-        trimmed.to_lowercase().replace([' ', '-'], "_")
-    }
+    normalized_alias(value).into_owned()
 }
 
 pub(crate) fn normalize_builtin_key(value: &str) -> String {
-    let trimmed = value.trim();
-    // A single character is a literal key: `-` is the minus key, not a
-    // separator, so it must not be rewritten below.
-    if trimmed.chars().count() == 1 {
-        return trimmed.to_lowercase();
+    builtin_key(normalized_alias(value)).into_owned()
+}
+
+fn builtin_key(value: Cow<'_, str>) -> Cow<'_, str> {
+    // Preserve literal single characters, including minus and Unicode keys.
+    if value.chars().count() == 1 {
+        return value;
     }
-    let value = trimmed.to_lowercase().replace([' ', '-'], "_");
-    match value.as_str() {
+    match value.as_ref() {
         // Platform-neutral modifier: the whole point of `primary`.
         "primary" | "mod" => primary_modifier().into(),
         "control" => "ctrl".into(),
@@ -280,7 +294,7 @@ pub(crate) fn normalize_builtin_key(value: &str) -> String {
         "equal" | "equals" => "=".into(),
         "leftbracket" | "left_bracket" => "[".into(),
         "rightbracket" | "right_bracket" => "]".into(),
-        other => other.into(),
+        _ => value,
     }
 }
 
@@ -331,7 +345,14 @@ impl KeyChord {
         if keys.is_empty() {
             return Err("chord must contain a key".into());
         }
-        if keys.iter().collect::<BTreeSet<_>>().len() != keys.len() {
+        let duplicate = if keys.len() <= 8 {
+            keys.iter()
+                .enumerate()
+                .any(|(index, key)| keys[..index].contains(key))
+        } else {
+            keys.iter().collect::<BTreeSet<_>>().len() != keys.len()
+        };
+        if duplicate {
             return Err(format!("chord contains a duplicate key: {value}"));
         }
         if keys.len() > 1 && keys.iter().all(Key::is_modifier) {
@@ -365,6 +386,14 @@ impl KeyChord {
 
     pub fn keys(&self) -> &[Key] {
         &self.keys[..self.input_len]
+    }
+
+    /// Canonical identity without allocating a formatted chord. Parsing has
+    /// already guaranteed unique keys; completion-key order remains significant.
+    pub(crate) fn same_binding(&self, other: &Self) -> bool {
+        self.activation_key() == other.activation_key()
+            && self.keys().len() == other.keys().len()
+            && self.keys().iter().all(|key| other.keys().contains(key))
     }
 
     /// Concrete output keys compiled at parse time; input matching keeps the
@@ -431,6 +460,116 @@ impl KeyChord {
 #[cfg(test)]
 mod injection_tests {
     use super::*;
+
+    #[test]
+    fn key_storage_preserves_borrowed_lookup_order_and_unicode_round_trip() {
+        let names = [
+            "s".into(),
+            "left_ctrl".into(),
+            "x".repeat(23),
+            "x".repeat(24),
+            "设置".repeat(5),
+        ];
+        let mut ordered = BTreeMap::new();
+        let mut hashed = std::collections::HashMap::new();
+        for (index, name) in names.iter().enumerate() {
+            let key = Key::new(name).unwrap();
+            assert_eq!(key.clone().as_str(), name);
+            let encoded = serde_json::to_string(&key).unwrap();
+            assert_eq!(serde_json::from_str::<Key>(&encoded).unwrap(), key);
+            ordered.insert(key.clone(), index);
+            hashed.insert(key, index);
+        }
+        for (index, name) in names.iter().enumerate() {
+            assert_eq!(ordered.get(name.as_str()), Some(&index));
+            assert_eq!(hashed.get(name.as_str()), Some(&index));
+        }
+        let mut expected: Vec<_> = names.iter().map(String::as_str).collect();
+        expected.sort_unstable();
+        assert_eq!(
+            ordered.keys().map(Key::as_str).collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn alias_scopes_preserve_long_utf8_names_and_restore_nested_state() {
+        let names = ["x".repeat(24), "y".repeat(25), "别名".repeat(8)];
+        let aliases = names
+            .iter()
+            .map(|name| (name.clone(), "left_alt".into()))
+            .collect();
+        let outer = BTreeMap::from([("ctrl".into(), "right_ctrl".into())]);
+        with_key_aliases(&outer, || {
+            assert_eq!(Key::new("ctrl").unwrap().as_str(), "right_ctrl");
+            with_key_aliases(&aliases, || {
+                for name in &names {
+                    assert_eq!(Key::new(name).unwrap().as_str(), "left_alt");
+                }
+                assert_eq!(Key::new("ctrl").unwrap().as_str(), "ctrl");
+            });
+            assert_eq!(Key::new("ctrl").unwrap().as_str(), "right_ctrl");
+        });
+        assert_eq!(Key::new("ctrl").unwrap().as_str(), "ctrl");
+    }
+
+    #[test]
+    fn borrowed_key_normalization_preserves_unicode_literals_and_alias_precedence() {
+        for (input, expected) in [
+            (" A ", "a"),
+            ("-", "-"),
+            ("Left-Control", "left_ctrl"),
+            ("PAGE UP", "page_up"),
+            ("İ", "i\u{307}"),
+            ("É", "é"),
+            ("设置", "设置"),
+            ("custom-name", "custom_name"),
+        ] {
+            assert_eq!(Key::new(input).unwrap().as_str(), expected);
+        }
+        let aliases = BTreeMap::from([("ctrl".into(), "x".into()), ("a".into(), "b".into())]);
+        assert_eq!(
+            Key::new_with_aliases("CTRL", &aliases).unwrap().as_str(),
+            "x"
+        );
+        assert_eq!(
+            Key::new_with_aliases(" A ", &aliases).unwrap().as_str(),
+            "b"
+        );
+        assert_eq!(Key::new("ctrl").unwrap().as_str(), "ctrl");
+        assert!(KeyChord::parse("a+b+a").is_err());
+        assert!(KeyChord::parse("a+b+c+d+e+f+g+h+a").is_err());
+        assert!(KeyChord::parse("a+b+c+d+e+f+g+h+i").is_ok());
+    }
+
+    #[test]
+    fn allocation_free_chord_identity_matches_canonical_identity() {
+        let chords: Vec<_> = [
+            "a",
+            "ctrl",
+            "left_ctrl",
+            "ctrl+shift+a",
+            "shift+ctrl+a",
+            "left_ctrl+shift+a",
+            "alt+s+a",
+            "alt+a+s",
+            "ctrl+a+b+c",
+            "ctrl+b+a+c",
+            "ctrl+c+b+a",
+            "a+b+c+d+e+f+g+h+i",
+        ]
+        .into_iter()
+        .map(|text| KeyChord::parse(text).unwrap())
+        .collect();
+        for left in &chords {
+            for right in &chords {
+                assert_eq!(
+                    left.same_binding(right),
+                    left.canonical() == right.canonical()
+                );
+            }
+        }
+    }
 
     #[test]
     fn compiled_injection_preserves_generic_input_matching_and_round_trip() {

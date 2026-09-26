@@ -5,6 +5,22 @@ outline: false
 
 # 更新日志 / Release Notes
 
+## 0.10.25
+
+优化按键响应，按键处理耗时降低约 15%。
+
+配置模拟器新增 TOML 文件对比和导入／导出变更预览，清晰展示新增、删除与修改，忽略注释和格式差异。
+
+Improved keyboard responsiveness, reducing key processing time by about 12%.
+
+The configuration simulator now compares TOML files and previews import/export changes, highlighting added, removed and modified values while ignoring comments and formatting.
+
+| 按键处理耗时 / Key processing time | 优化前 / Before | 优化后 / After | 降低 / Reduction |
+| --- | ---: | ---: | ---: |
+| p50 | 160 ns | 136 ns | 15.0% |
+| p95 | 163 ns | 138 ns | 15.3% |
+| p99 | 205 ns | 180 ns | 12.2% |
+
 ## 0.10.24
 
 - 优化 UI Hint 扫描的内存占用。

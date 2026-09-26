@@ -145,7 +145,7 @@ pub(crate) fn build_visual_layer_plan(
 
     let mut graph = ConflictGraph::new(placements.len());
     let swept =
-        placements.len() >= 32 && inline_sweep_edges(placements, &visually_stacked, &mut graph);
+        placements.len() >= 16 && inline_sweep_edges(placements, &visually_stacked, &mut graph);
     if !swept {
         for right in 1..placements.len() {
             for left in 0..right {
@@ -954,7 +954,7 @@ mod tests {
 
     #[test]
     fn inline_sweep_preserves_layers_for_sparse_dense_and_invalid_geometry() {
-        for count in [31, 32, 64, 100, 128] {
+        for count in [15, 16, 24, 31, 32, 64, 100, 128] {
             for pattern in 0..5 {
                 let placements: Vec<_> = (0..count)
                     .map(|index| {

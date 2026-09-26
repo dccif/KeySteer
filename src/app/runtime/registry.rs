@@ -68,6 +68,7 @@ impl Default for ModeRegistry {
 impl ModeRegistry {
     pub(super) fn with_routes(routes: BTreeMap<ModeId, ModeRoute>) -> Self {
         Self {
+            slots: Vec::with_capacity(routes.len()),
             routes,
             ..Self::default()
         }

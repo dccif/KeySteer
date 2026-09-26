@@ -7,10 +7,13 @@ use std::collections::BTreeSet;
 
 #[derive(Default)]
 pub(super) struct QuickSwitcher {
-    pub(super) pending: Option<Pending>,
+    // Panel state is cold: don't embed its strings and vectors in every
+    // Engine's input-loop working set while no gesture is active.
+    pub(super) pending: Option<Box<Pending>>,
     captured: BTreeSet<Key>,
     // Survives panel selection/cancellation until the physical trigger is released.
     blocked_trigger: Option<Key>,
+    geometry_sequence: u64,
 }
 pub(super) struct Pending {
     owner: ModeId,
@@ -20,6 +23,7 @@ pub(super) struct Pending {
     used: bool,
     candidates: Vec<ModeId>,
     window: Option<Rect>,
+    geometry_request: Option<(u64, u32)>,
     rows: Vec<crate::api::overlay::OverlayText>,
     text_metrics: crate::presentation::quick_switch::CaptionMetrics,
 }
@@ -32,7 +36,25 @@ impl Engine {
             self.quick_switch.blocked_trigger = None;
         }
     }
+    #[inline]
     pub(super) fn quick_switch_key(
+        &mut self,
+        input: &InputEvent,
+        backend: &mut dyn Backend,
+    ) -> Result<bool, String> {
+        // Ordinary keys cannot arm a panel or retire a captured gesture.
+        // Keep its cold state machine out of the normal input dispatch path.
+        if self.quick_switch.pending.is_none()
+            && self.quick_switch.blocked_trigger.is_none()
+            && self.quick_switch.captured.is_empty()
+            && input.key != self.settings.quick_switch.key
+        {
+            return Ok(false);
+        }
+        self.handle_quick_switch_key(input, backend)
+    }
+
+    fn handle_quick_switch_key(
         &mut self,
         input: &InputEvent,
         backend: &mut dyn Backend,
@@ -108,7 +130,7 @@ impl Engine {
             });
         }
         if starts {
-            self.quick_switch.pending = Some(Pending {
+            self.quick_switch.pending = Some(Box::new(Pending {
                 owner: self.registry.active.clone(),
                 input: input.clone(),
                 deadline: Instant::now()
@@ -117,9 +139,10 @@ impl Engine {
                 used: false,
                 candidates: Vec::new(),
                 window: None,
+                geometry_request: None,
                 rows: Vec::new(),
                 text_metrics: Default::default(),
-            });
+            }));
             return Ok(false);
         }
         if self
@@ -257,13 +280,52 @@ impl Engine {
             return Ok(());
         }
         pending.visible = true;
-        if self.settings.quick_switch.position == QuickSwitchPosition::Window {
-            pending.window = backend.focused_window_bounds().unwrap_or_else(|error| {
-                crate::report_error!("quick-switch", "{error}");
-                None
-            });
+        let process = self.focused_app.as_ref().map(|app| app.process_id);
+        let query = if self.settings.quick_switch.position == QuickSwitchPosition::Window {
+            self.quick_switch.geometry_sequence =
+                self.quick_switch.geometry_sequence.wrapping_add(1);
+            let id = self.quick_switch.geometry_sequence;
+            pending.geometry_request = process.map(|process| (id, process));
+            process.map(|process| (id, process))
+        } else {
+            None
+        };
+        self.refresh_overlay(backend)?;
+        if let Some((id, process)) = query
+            && let Err(error) = backend.request_focused_window_bounds(id, process)
+        {
+            crate::report_error!("quick-switch", "geometry submission: {error}");
         }
-        self.refresh_overlay(backend)
+        Ok(())
+    }
+
+    pub(super) fn finish_quick_switch_geometry(
+        &mut self,
+        id: u64,
+        bounds: Result<Option<Rect>, String>,
+        backend: &mut dyn Backend,
+    ) -> Result<(), String> {
+        let process = self.focused_app.as_ref().map(|app| app.process_id);
+        let Some(pending) = self.quick_switch.pending.as_mut().filter(|pending| {
+            pending.visible
+                && pending
+                    .geometry_request
+                    .is_some_and(|(request, owner)| request == id && process == Some(owner))
+        }) else {
+            return Ok(());
+        };
+        pending.geometry_request = None;
+        match bounds {
+            Ok(Some(bounds)) => {
+                pending.window = Some(bounds);
+                self.refresh_overlay(backend)
+            }
+            Ok(None) => Ok(()),
+            Err(error) => {
+                crate::report_error!("quick-switch", "geometry query: {error}");
+                Ok(())
+            }
+        }
     }
 
     pub(super) fn fire_quick_switch(&mut self, backend: &mut dyn Backend) -> Result<(), String> {

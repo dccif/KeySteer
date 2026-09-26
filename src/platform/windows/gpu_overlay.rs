@@ -373,6 +373,11 @@ impl GpuOverlay {
     /// needed before reading desktop pixels, while an ordinary mode exit must
     /// not wait for the compositor.
     pub(super) fn dismiss(&mut self) -> Result<(), String> {
+        // Keep the ordinary warm text buffer, but release exceptional title peaks
+        // when leaving the overlay, outside the render hot path.
+        if self.utf16.capacity() > 4096 {
+            self.utf16 = Vec::new();
+        }
         if self.content.is_none() {
             return Ok(());
         }
@@ -1337,7 +1342,11 @@ mod tests {
             style: LabelStyle::default(),
         });
         renderer.present(Arc::new(scene), area)?;
-        renderer.dismiss()
+        renderer.utf16.reserve(8192);
+        renderer.dismiss()?;
+        assert_eq!(renderer.utf16.capacity(), 0);
+        assert!(renderer.content.is_none());
+        Ok(())
     }
 
     #[test]

@@ -1411,6 +1411,9 @@ mod tests {
     }
 
     impl WindowAccess for Fake {
+        fn focused_bounds(&self, process: u32) -> Result<Option<Rect>, String> {
+            Ok(Some(Rect::new(f64::from(process), 0.0, 100.0, 100.0)))
+        }
         fn pointer_window(&mut self, _: &[Screen]) -> Result<Option<WindowId>, String> {
             Ok(self.pointer_target)
         }
@@ -1808,6 +1811,40 @@ mod tests {
         worker
             .stop_until(Instant::now() + Duration::from_secs(2))
             .unwrap();
+    }
+
+    #[test]
+    fn focused_bounds_coalesces_without_blocking_submission() {
+        use std::sync::mpsc;
+        let (started, waiting) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let (sender, events) = mpsc::channel();
+        let mut worker = WindowWorker::start(
+            move || {
+                started.send(()).unwrap();
+                gate.recv_timeout(Duration::from_secs(5)).unwrap();
+                Fake::new(0)
+            },
+            move |event| {
+                sender.send(event).unwrap();
+            },
+        )
+        .unwrap();
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.focused_bounds(1, 10).unwrap();
+        worker.focused_bounds(2, 20).unwrap();
+        release.send(()).unwrap();
+        let BackendEvent::FocusedWindowBounds { id, bounds } =
+            events.recv_timeout(Duration::from_secs(5)).unwrap()
+        else {
+            panic!("expected geometry reply");
+        };
+        assert_eq!(id, 2);
+        assert_eq!(bounds.unwrap().unwrap().x, 20.0);
+        worker
+            .stop_until(Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        assert!(events.try_recv().is_err());
     }
 
     #[test]

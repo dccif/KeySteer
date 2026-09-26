@@ -1,1493 +1,43 @@
-//! Minimal Win32 safety boundary for process-wide utilities.
-
+//! Native boundary entry point; resource owners live in focused modules.
+mod capture;
+mod com;
+mod compositor;
+mod dimensions;
 mod gdi;
+mod handles;
+mod message_loop;
+mod ocr_bridge;
 mod uia_cache;
-pub(crate) use gdi::OwnedFont;
-use std::marker::PhantomData;
-use std::path::Path;
-use std::ptr::NonNull;
-use std::rc::Rc;
-pub(crate) use uia_cache::CachedElement;
-use windows::Win32::Graphics::Gdi::{
-    ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, DEFAULT_CHARSET, DeleteObject,
-    FF_DONTCARE, FW_BOLD, FW_NORMAL, HFONT, OUT_DEFAULT_PRECIS,
+mod window;
+mod winrt;
+pub(crate) use capture::PreparedCapture;
+pub(crate) use com::ComApartment;
+pub(crate) use compositor::{
+    CompositorClockSignal, CompositorWait, DisplayOutput, boost_compositor_clock,
+    display_output_for_monitor, dwm_composition_enabled, interrupt_compositor_clock,
+    monitor_for_point, prefer_dynamic_vblank, wait_for_compositor_frame, wait_for_dwm_frame,
 };
-
+pub(crate) use dimensions::NativeDimensions;
+pub(crate) use gdi::{GdiDibSurface, OwnedFont, ScreenDc};
+pub(crate) use handles::KillOnCloseJob;
+use handles::OwnedHandle;
+pub(crate) use message_loop::{
+    SessionNotifications, ThreadTimer, default_window_proc, get_window_message,
+    post_thread_message, post_thread_wake, register_window_class,
+};
+pub(crate) use ocr_bridge::WechatBridge;
+use std::path::Path;
+pub(crate) use uia_cache::CachedElement;
+pub(crate) use window::{
+    OwnedWindow, OwnedWindowSpec, create_owned_window, reposition_owned_window,
+};
 use windows::Win32::Foundation::{HANDLE, HWND};
-use windows::Win32::Graphics::Gdi::{HBITMAP, HDC, HGDIOBJ};
-
-use crate::api::geometry::Rect;
-
-pub(crate) struct ComApartment(PhantomData<Rc<()>>);
-
-#[must_use = "closing the job is the fail-safe that terminates its helper process"]
-pub(crate) struct KillOnCloseJob(OwnedHandle);
-
-impl KillOnCloseJob {
-    pub(crate) fn create() -> Result<Self, String> {
-        use windows::Win32::System::JobObjects::{
-            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-            SetInformationJobObject,
-        };
-
-        // SAFETY: no security attributes or name are supplied. The returned
-        // handle transfers immediately into the owner before configuration.
-        let job = Self(OwnedHandle::new(
-            unsafe { CreateJobObjectW(None, None) }
-                .map_err(|error| format!("cannot create WeChat OCR job object: {error}"))?,
-        ));
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        // SAFETY: the pointer and byte count describe the exact initialized
-        // information struct and remain valid for this synchronous call.
-        unsafe {
-            SetInformationJobObject(
-                job.0.raw(),
-                JobObjectExtendedLimitInformation,
-                std::ptr::from_ref(&limits).cast(),
-                std::mem::size_of_val(&limits) as u32,
-            )
-        }
-        .map_err(|error| format!("cannot configure WeChat OCR job object: {error}"))?;
-        Ok(job)
-    }
-
-    pub(crate) fn assign(&self, process: HANDLE) -> Result<(), String> {
-        use windows::Win32::System::JobObjects::AssignProcessToJobObject;
-
-        // SAFETY: both handles are live for the duration of this synchronous
-        // call; ownership of the process handle remains with `Child`.
-        unsafe { AssignProcessToJobObject(self.0.raw(), process) }
-            .map_err(|error| format!("cannot contain WeChat OCR helper in job object: {error}"))
-    }
-}
-
-impl ComApartment {
-    pub(crate) fn initialise() -> Result<Self, String> {
-        use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
-
-        // SAFETY: the returned !Send guard binds the successful COM apartment
-        // initialization to this thread and balances it in Drop.
-        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
-            .ok()
-            .map_err(|error| format!("cannot initialize COM apartment: {error}"))?;
-        Ok(Self(PhantomData))
-    }
-}
-
-impl Drop for ComApartment {
-    fn drop(&mut self) {
-        use windows::Win32::System::Com::CoUninitialize;
-
-        // SAFETY: this !Send guard is dropped on the same thread that
-        // successfully initialized the apartment.
-        unsafe { CoUninitialize() };
-    }
-}
-
-#[must_use = "the desktop DC must be released on its acquiring thread"]
-pub(crate) struct ScreenDc(HDC);
-
-impl ScreenDc {
-    pub(crate) fn acquire() -> Result<Self, String> {
-        use windows::Win32::Graphics::Gdi::GetDC;
-
-        // SAFETY: a null HWND requests the desktop DC. This guard balances the
-        // successful acquisition on the same visual worker thread.
-        let dc = unsafe { GetDC(None) };
-        if dc.is_invalid() {
-            Err("GetDC failed for visual capture".into())
-        } else {
-            Ok(Self(dc))
-        }
-    }
-
-    pub(crate) fn raw(&self) -> HDC {
-        self.0
-    }
-}
-
-impl Drop for ScreenDc {
-    fn drop(&mut self) {
-        use windows::Win32::Graphics::Gdi::ReleaseDC;
-
-        // SAFETY: this is the exact desktop DC acquired by `ScreenDc::acquire`.
-        if unsafe { ReleaseDC(None, self.0) } == 0 {
-            crate::support::logging::report_error(
-                "windows-native",
-                "ReleaseDC failed for visual capture",
-            );
-        }
-    }
-}
-
-#[must_use = "the selected GDI bitmap and memory DC must be restored and released"]
-pub(crate) struct GdiDibSurface {
-    memory: HDC,
-    bitmap: HBITMAP,
-    previous: HGDIOBJ,
-    bits: NonNull<u8>,
-    dimensions: NativeDimensions,
-    _thread: PhantomData<Rc<()>>,
-}
-
-impl GdiDibSurface {
-    pub(crate) fn new(
-        reference: Option<HDC>,
-        dimensions: NativeDimensions,
-    ) -> Result<Self, String> {
-        use windows::Win32::Graphics::Gdi::{
-            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection,
-            DIB_RGB_COLORS, DeleteDC, DeleteObject, SelectObject,
-        };
-
-        let info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: dimensions.width_i32(),
-                biHeight: -dimensions.height_i32(),
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut raw_bits = std::ptr::null_mut();
-        // SAFETY: all GDI objects created here either transfer into the guard
-        // or are destroyed before returning an error. The selected top-down
-        // DIB remains selected until Drop restores `previous`.
-        unsafe {
-            let memory = CreateCompatibleDC(reference);
-            if memory.is_invalid() {
-                return Err("CreateCompatibleDC failed".into());
-            }
-            let bitmap = match CreateDIBSection(
-                reference.or(Some(memory)),
-                &info,
-                DIB_RGB_COLORS,
-                &mut raw_bits,
-                None,
-                0,
-            ) {
-                Ok(bitmap) => bitmap,
-                Err(error) => {
-                    if !DeleteDC(memory).as_bool() {
-                        crate::support::logging::report_error(
-                            "windows-native",
-                            "cannot delete failed GDI capture DC",
-                        );
-                    }
-                    return Err(format!("CreateDIBSection failed: {error}"));
-                }
-            };
-            let Some(bits) = NonNull::new(raw_bits.cast::<u8>()) else {
-                if !DeleteObject(HGDIOBJ(bitmap.0)).as_bool() {
-                    crate::support::logging::report_error(
-                        "windows-native",
-                        "cannot delete null-buffer GDI capture bitmap",
-                    );
-                }
-                if !DeleteDC(memory).as_bool() {
-                    crate::support::logging::report_error(
-                        "windows-native",
-                        "cannot delete null-buffer GDI capture DC",
-                    );
-                }
-                return Err("CreateDIBSection returned a null pixel buffer".into());
-            };
-            let previous = SelectObject(memory, HGDIOBJ(bitmap.0));
-            if previous.0.is_null() || previous.0 as usize == usize::MAX {
-                if !DeleteObject(HGDIOBJ(bitmap.0)).as_bool() {
-                    crate::support::logging::report_error(
-                        "windows-native",
-                        "cannot delete unselected GDI capture bitmap",
-                    );
-                }
-                if !DeleteDC(memory).as_bool() {
-                    crate::support::logging::report_error(
-                        "windows-native",
-                        "cannot delete unselected GDI capture DC",
-                    );
-                }
-                return Err("SelectObject failed for visual capture".into());
-            }
-            Ok(Self {
-                memory,
-                bitmap,
-                previous,
-                bits,
-                dimensions,
-                _thread: PhantomData,
-            })
-        }
-    }
-
-    pub(crate) fn width(&self) -> usize {
-        self.dimensions.width_u32() as usize
-    }
-
-    pub(crate) fn height(&self) -> usize {
-        self.dimensions.height_u32() as usize
-    }
-
-    pub(crate) fn dc(&self) -> HDC {
-        self.memory
-    }
-
-    pub(crate) fn pixels(&self) -> &[u8] {
-        // SAFETY: the surface owns a non-null DIB allocation of the validated
-        // byte length, and the shared borrow prevents mutation.
-        unsafe { std::slice::from_raw_parts(self.bits.as_ptr(), self.dimensions.byte_len()) }
-    }
-
-    pub(crate) fn pixels_mut(&mut self) -> &mut [u8] {
-        // SAFETY: the surface uniquely owns the validated DIB allocation and
-        // `&mut self` prevents aliases for the returned lifetime.
-        unsafe { std::slice::from_raw_parts_mut(self.bits.as_ptr(), self.dimensions.byte_len()) }
-    }
-
-    fn copy_from<R>(
-        &mut self,
-        screen: HDC,
-        source_x: i32,
-        source_y: i32,
-        source_width: i32,
-        source_height: i32,
-        consume: impl FnOnce(&[u8], u32, u32) -> Result<R, String>,
-    ) -> Result<R, String> {
-        use windows::Win32::Graphics::Gdi::{
-            BitBlt, CAPTUREBLT, HALFTONE, SRCCOPY, SetStretchBltMode, StretchBlt,
-        };
-
-        let copy_without_scaling = source_width == self.dimensions.width_i32()
-            && source_height == self.dimensions.height_i32();
-        // SAFETY: the cached DC owns a selected DIB of `dimensions`; BitBlt or
-        // StretchBlt completes before a validated, temporary byte slice is
-        // exposed to the caller. The callback cannot retain the slice beyond
-        // this borrow.
-        unsafe {
-            let copied = if copy_without_scaling {
-                BitBlt(
-                    self.memory,
-                    0,
-                    0,
-                    self.dimensions.width_i32(),
-                    self.dimensions.height_i32(),
-                    Some(screen),
-                    source_x,
-                    source_y,
-                    SRCCOPY | CAPTUREBLT,
-                )
-            } else {
-                SetStretchBltMode(self.memory, HALFTONE);
-                StretchBlt(
-                    self.memory,
-                    0,
-                    0,
-                    self.dimensions.width_i32(),
-                    self.dimensions.height_i32(),
-                    Some(screen),
-                    source_x,
-                    source_y,
-                    source_width,
-                    source_height,
-                    SRCCOPY | CAPTUREBLT,
-                )
-                .ok()
-            };
-            if let Err(error) = copied {
-                let operation = if copy_without_scaling {
-                    "BitBlt"
-                } else {
-                    "StretchBlt"
-                };
-                return Err(format!("{operation} failed for visual capture: {error}"));
-            }
-            let pixels = std::slice::from_raw_parts(self.bits.as_ptr(), self.dimensions.byte_len());
-            consume(
-                pixels,
-                self.dimensions.width_u32(),
-                self.dimensions.height_u32(),
-            )
-        }
-    }
-}
-
-impl Drop for GdiDibSurface {
-    fn drop(&mut self) {
-        use windows::Win32::Graphics::Gdi::{DeleteDC, DeleteObject, SelectObject};
-
-        // SAFETY: the guard owns these objects on this thread; restore the
-        // previous selection before destroying the DIB and compatible DC.
-        let (restored, bitmap_deleted, dc_deleted) = unsafe {
-            (
-                SelectObject(self.memory, self.previous),
-                DeleteObject(HGDIOBJ(self.bitmap.0)).as_bool(),
-                DeleteDC(self.memory).as_bool(),
-            )
-        };
-        if restored.0.is_null() || restored.0 as usize == usize::MAX {
-            crate::support::logging::report_error(
-                "windows-native",
-                "cannot restore selected GDI capture object",
-            );
-        }
-        if !bitmap_deleted {
-            crate::support::logging::report_error(
-                "windows-native",
-                "cannot delete GDI capture bitmap",
-            );
-        }
-        if !dc_deleted {
-            crate::support::logging::report_error("windows-native", "cannot delete GDI capture DC");
-        }
-    }
-}
-
-#[must_use = "prepared capture resources must remain on their acquiring thread"]
-pub(crate) struct PreparedCapture {
-    screen: ScreenDc,
-    surface: GdiDibSurface,
-}
-
-impl PreparedCapture {
-    pub(crate) fn new(width: u32, height: u32) -> Result<Self, String> {
-        let dimensions = NativeDimensions::from_usize(width as usize, height as usize)?;
-        let screen = ScreenDc::acquire()?;
-        let surface = GdiDibSurface::new(Some(screen.raw()), dimensions)?;
-        Ok(Self { screen, surface })
-    }
-
-    pub(crate) fn capture_with<R>(
-        &mut self,
-        source_x: i32,
-        source_y: i32,
-        source_width: i32,
-        source_height: i32,
-        consume: impl FnOnce(&[u8], u32, u32) -> Result<R, String>,
-    ) -> Result<R, String> {
-        self.surface.copy_from(
-            self.screen.raw(),
-            source_x,
-            source_y,
-            source_width,
-            source_height,
-            consume,
-        )
-    }
-}
-
-#[must_use = "the factory must stay in its creating COM apartment"]
-pub(crate) struct SoftwareBitmapFactory {
-    factory: windows::Graphics::Imaging::ISoftwareBitmapFactory,
-}
-
-impl SoftwareBitmapFactory {
-    pub(crate) fn load() -> Result<Self, String> {
-        let factory = windows::core::imp::load_factory::<
-            windows::Graphics::Imaging::SoftwareBitmap,
-            windows::Graphics::Imaging::ISoftwareBitmapFactory,
-        >()
-        .map_err(|error| format!("cannot load SoftwareBitmap factory: {error}"))?;
-        Ok(Self { factory })
-    }
-
-    pub(crate) fn bgra(
-        &self,
-        pixels: &[u8],
-        width: u32,
-        height: u32,
-    ) -> Result<windows::Graphics::Imaging::SoftwareBitmap, String> {
-        self.bgra_region(pixels, width, height, 0, 0, width, height)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn bgra_region(
-        &self,
-        pixels: &[u8],
-        source_width: u32,
-        source_height: u32,
-        x: u32,
-        y: u32,
-        width: u32,
-        height: u32,
-    ) -> Result<windows::Graphics::Imaging::SoftwareBitmap, String> {
-        let source = NativeDimensions::from_usize(source_width as usize, source_height as usize)?;
-        if pixels.len() != source.byte_len() {
-            return Err("BGRA byte length does not match source dimensions".into());
-        }
-        let right = x
-            .checked_add(width)
-            .ok_or_else(|| "SoftwareBitmap source x range overflowed".to_string())?;
-        let bottom = y
-            .checked_add(height)
-            .ok_or_else(|| "SoftwareBitmap source y range overflowed".to_string())?;
-        if right > source_width || bottom > source_height {
-            return Err("SoftwareBitmap source region exceeds captured pixels".into());
-        }
-        let dimensions = NativeDimensions::from_usize(width as usize, height as usize)?;
-        let source_stride = source_width as usize * 4;
-        let source_offset = (y as usize)
-            .checked_mul(source_stride)
-            .and_then(|offset| offset.checked_add(x as usize * 4))
-            .ok_or_else(|| "SoftwareBitmap source offset overflowed".to_string())?;
-        software_bitmap_from_rows(
-            &self.factory,
-            pixels,
-            source_stride,
-            source_offset,
-            dimensions,
-        )
-    }
-}
-
-fn software_bitmap_from_rows(
-    factory: &windows::Graphics::Imaging::ISoftwareBitmapFactory,
-    pixels: &[u8],
-    source_stride: usize,
-    source_offset: usize,
-    dimensions: NativeDimensions,
-) -> Result<windows::Graphics::Imaging::SoftwareBitmap, String> {
-    use windows::Graphics::Imaging::{
-        BitmapAlphaMode, BitmapBufferAccessMode, BitmapPixelFormat, SoftwareBitmap,
-    };
-    use windows::Win32::System::WinRT::IMemoryBufferByteAccess;
-    use windows::core::Interface;
-
-    // SAFETY: the factory was loaded for `SoftwareBitmap`, all value
-    // parameters use the generated ABI types, and `result` is a valid
-    // out-parameter converted into an owned projected object.
-    let bitmap: SoftwareBitmap = unsafe {
-        let mut result = core::ptr::null_mut();
-        (windows::core::Interface::vtable(factory).CreateWithAlpha)(
-            windows::core::Interface::as_raw(factory),
-            BitmapPixelFormat::Bgra8,
-            dimensions.width_i32(),
-            dimensions.height_i32(),
-            BitmapAlphaMode::Ignore,
-            &mut result,
-        )
-        .and_then(|| windows::core::Type::from_abi(result))
-    }
-    .map_err(|error| format!("SoftwareBitmap creation failed: {error}"))?;
-    let buffer = match bitmap.LockBuffer(BitmapBufferAccessMode::Write) {
-        Ok(buffer) => buffer,
-        Err(error) => {
-            let error = format!("cannot lock SoftwareBitmap pixels: {error}");
-            if let Err(close_error) = bitmap.Close() {
-                crate::support::logging::report_error(
-                    "windows-native",
-                    format!("cannot close unlocked SoftwareBitmap: {close_error}"),
-                );
-            }
-            return Err(error);
-        }
-    };
-    let copy = (|| -> Result<(), String> {
-        let plane = buffer
-            .GetPlaneDescription(0)
-            .map_err(|error| format!("cannot describe SoftwareBitmap plane: {error}"))?;
-        let reference = buffer
-            .CreateReference()
-            .map_err(|error| format!("cannot reference SoftwareBitmap memory: {error}"))?;
-        let copied = (|| -> Result<(), String> {
-            let access: IMemoryBufferByteAccess = reference
-                .cast()
-                .map_err(|error| format!("cannot access SoftwareBitmap memory: {error}"))?;
-            let start = usize::try_from(plane.StartIndex)
-                .map_err(|_| "SoftwareBitmap returned a negative start index".to_string())?;
-            let stride = usize::try_from(plane.Stride)
-                .map_err(|_| "SoftwareBitmap returned a negative stride".to_string())?;
-            let bitmap_width = dimensions.width_u32() as usize;
-            let bitmap_height = dimensions.height_u32() as usize;
-            let row_bytes = bitmap_width
-                .checked_mul(4)
-                .ok_or_else(|| "SoftwareBitmap row byte length overflowed".to_string())?;
-            let required = start
-                .checked_add(
-                    stride
-                        .checked_mul(bitmap_height.saturating_sub(1))
-                        .and_then(|offset| offset.checked_add(row_bytes))
-                        .ok_or_else(|| "SoftwareBitmap plane size overflowed".to_string())?,
-                )
-                .ok_or_else(|| "SoftwareBitmap plane range overflowed".to_string())?;
-            let mut destination = std::ptr::null_mut();
-            let mut capacity = 0u32;
-            // SAFETY: `reference` keeps the memory buffer alive, `required` is
-            // checked against its capacity, and destination rows are disjoint.
-            unsafe {
-                access
-                    .GetBuffer(&mut destination, &mut capacity)
-                    .map_err(|error| format!("cannot get SoftwareBitmap memory: {error}"))?;
-                if destination.is_null() || required > capacity as usize || stride < row_bytes {
-                    return Err("SoftwareBitmap returned an invalid writable plane".into());
-                }
-                for row in 0..bitmap_height {
-                    let source = source_offset
-                        .checked_add(row * source_stride)
-                        .and_then(|start| start.checked_add(row_bytes).map(|end| (start, end)))
-                        .and_then(|(start, end)| pixels.get(start..end))
-                        .ok_or_else(|| {
-                            "SoftwareBitmap source row exceeds captured pixels".to_string()
-                        })?;
-                    std::ptr::copy_nonoverlapping(
-                        source.as_ptr(),
-                        destination.add(start + row * stride),
-                        row_bytes,
-                    );
-                }
-            }
-            Ok(())
-        })();
-        let closed = reference
-            .Close()
-            .map_err(|error| format!("cannot close SoftwareBitmap reference: {error}"));
-        match (copied, closed) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-            (Err(error), Err(close_error)) => {
-                crate::support::logging::report_error("windows-native", close_error);
-                Err(error)
-            }
-        }
-    })();
-    let closed = buffer
-        .Close()
-        .map_err(|error| format!("cannot close SoftwareBitmap buffer: {error}"));
-    let fail = |error| {
-        if let Err(close_error) = bitmap.Close() {
-            crate::support::logging::report_error(
-                "windows-native",
-                format!("cannot close failed SoftwareBitmap: {close_error}"),
-            );
-        }
-        Err(error)
-    };
-    match (copy, closed) {
-        (Ok(()), Ok(())) => Ok(bitmap),
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => fail(error),
-        (Err(error), Err(close_error)) => {
-            crate::support::logging::report_error("windows-native", close_error);
-            fail(error)
-        }
-    }
-}
-
-/// Load and call the OCR activation factory without the projection's static
-/// `FactoryCache`. Windows can unload an in-process WinRT server when a
-/// temporary COM apartment ends, which would otherwise leave that process-wide
-/// cache pointing into freed code before the next UI Hint scan.
-type SystemOcrLanguages = windows_collections::IVectorView<windows::Globalization::Language>;
-type LoadedSystemOcr = (
-    windows::Media::Ocr::OcrEngine,
-    Option<(u32, SystemOcrLanguages)>,
-);
-
-#[must_use = "the factory must stay in its creating COM apartment"]
-pub(crate) struct SystemOcrFactory {
-    factory: windows::Media::Ocr::IOcrEngineStatics,
-}
-
-impl SystemOcrFactory {
-    pub(crate) fn load() -> Result<Self, String> {
-        use windows::Media::Ocr::{IOcrEngineStatics, OcrEngine};
-
-        let factory = windows::core::imp::load_factory::<OcrEngine, IOcrEngineStatics>()
-            .map_err(|error| format!("cannot load OcrEngine factory: {error}"))?;
-        Ok(Self { factory })
-    }
-
-    pub(crate) fn create_engine(&self) -> Result<windows::Media::Ocr::OcrEngine, String> {
-        self.query(false).map(|(engine, _)| engine)
-    }
-
-    fn query(&self, include_metadata: bool) -> Result<LoadedSystemOcr, String> {
-        // SAFETY: the local factory implements `IOcrEngineStatics`. Every result
-        // slot has the exact generated ABI type and is converted immediately into
-        // an owned projection before the factory can be released.
-        unsafe {
-            let mut result = core::ptr::null_mut();
-            (windows::core::Interface::vtable(&self.factory).TryCreateFromUserProfileLanguages)(
-                windows::core::Interface::as_raw(&self.factory),
-                &mut result,
-            )
-            .ok()
-            .map_err(|error| format!("cannot create per-scan OcrEngine: {error}"))?;
-            let engine = windows::core::Type::from_abi(result)
-                .map_err(|error| format!("cannot own per-scan OcrEngine: {error}"))?;
-            if !include_metadata {
-                return Ok((engine, None));
-            }
-            let mut maximum = 0;
-            (windows::core::Interface::vtable(&self.factory).MaxImageDimension)(
-                windows::core::Interface::as_raw(&self.factory),
-                &mut maximum,
-            )
-            .ok()
-            .map_err(|error| format!("cannot read OcrEngine maximum image dimension: {error}"))?;
-            let mut languages = core::ptr::null_mut();
-            (windows::core::Interface::vtable(&self.factory).AvailableRecognizerLanguages)(
-                windows::core::Interface::as_raw(&self.factory),
-                &mut languages,
-            )
-            .ok()
-            .map_err(|error| format!("cannot enumerate OCR languages: {error}"))?;
-            let languages = windows::core::Type::from_abi(languages)
-                .map_err(|error| format!("cannot own OCR language collection: {error}"))?;
-            Ok((engine, Some((maximum, languages))))
-        }
-    }
-}
-
 #[cfg(test)]
-pub(crate) fn create_system_ocr_engine() -> Result<windows::Media::Ocr::OcrEngine, String> {
-    SystemOcrFactory::load()?.create_engine()
-}
-
-pub(crate) fn probe_system_ocr_factory() -> Result<(u32, Vec<String>), String> {
-    let (engine, metadata) = SystemOcrFactory::load()?.query(true)?;
-    let (maximum, languages) =
-        metadata.ok_or_else(|| "OCR factory did not return discovery metadata".to_string())?;
-    let mut tags = Vec::with_capacity(languages.Size().unwrap_or_default() as usize);
-    for language in &languages {
-        tags.push(
-            language
-                .LanguageTag()
-                .map_err(|error| format!("cannot read OCR language tag: {error}"))?
-                .to_string(),
-        );
-    }
-    drop(engine);
-    Ok((maximum, tags))
-}
-
-pub(crate) fn create_png_bitmap_encoder_operation(
-    stream: &windows::Storage::Streams::IRandomAccessStream,
-) -> Result<windows_future::IAsyncOperation<windows::Graphics::Imaging::BitmapEncoder>, String> {
-    use windows::Graphics::Imaging::{BitmapEncoder, IBitmapEncoderStatics};
-
-    let factory = windows::core::imp::load_factory::<BitmapEncoder, IBitmapEncoderStatics>()
-        .map_err(|error| format!("cannot load BitmapEncoder factory: {error}"))?;
-    // SAFETY: the local factory implements `IBitmapEncoderStatics`, the caller
-    // keeps the stream alive through completion, and both output slots use the
-    // exact generated ABI types converted into owned values.
-    let operation: windows_future::IAsyncOperation<BitmapEncoder> = unsafe {
-        let mut result = windows::core::GUID::zeroed();
-        (windows::core::Interface::vtable(&factory).PngEncoderId)(
-            windows::core::Interface::as_raw(&factory),
-            &mut result,
-        )
-        .ok()
-        .map_err(|error| format!("cannot read PNG encoder id: {error}"))?;
-        let encoder_id = result;
-        let mut operation = core::ptr::null_mut();
-        (windows::core::Interface::vtable(&factory).CreateAsync)(
-            windows::core::Interface::as_raw(&factory),
-            encoder_id,
-            windows::core::Interface::as_raw(stream),
-            &mut operation,
-        )
-        .ok()
-        .map_err(|error| format!("cannot start PNG encoder creation: {error}"))?;
-        windows::core::Type::from_abi(operation)
-            .map_err(|error| format!("cannot own PNG encoder operation: {error}"))?
-    };
-    Ok(operation)
-}
-
-pub(crate) fn create_file_random_access_stream(
-    path: &Path,
-) -> Result<windows::Storage::Streams::IRandomAccessStream, String> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::System::Com::{STGM_CREATE, STGM_SHARE_EXCLUSIVE, STGM_WRITE};
-    use windows::Win32::System::WinRT::CreateRandomAccessStreamOnFile;
-    use windows::core::PCWSTR;
-
-    let wide = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let access = STGM_CREATE.0 | STGM_WRITE.0 | STGM_SHARE_EXCLUSIVE.0;
-    // SAFETY: `wide` is a NUL-terminated path retained for this call and the
-    // requested interface type matches the documented WinRT stream factory.
-    unsafe { CreateRandomAccessStreamOnFile(PCWSTR(wide.as_ptr()), access) }
-        .map_err(|error| format!("cannot create random-access file stream: {error}"))
-}
-
-type OcrCallback = unsafe extern "C" fn(windows::core::PCSTR);
-type WechatOcrFn = unsafe extern "C" fn(
-    windows::core::PCWSTR,
-    windows::core::PCWSTR,
-    windows::core::PCSTR,
-    OcrCallback,
-) -> bool;
-type StopOcrFn = unsafe extern "C" fn();
-static WECHAT_CALLBACK_VALUE: std::sync::OnceLock<std::sync::Mutex<Vec<u8>>> =
-    std::sync::OnceLock::new();
-const MAX_WECHAT_RESPONSE: usize = 8 * 1024 * 1024;
-
-unsafe extern "C" fn capture_wechat_callback(value: windows::core::PCSTR) {
-    if value.is_null() {
-        return;
-    }
-    // SAFETY: wcocr documents a readable NUL-terminated callback string valid
-    // for this callback. Scan no farther than the IPC ceiling and copy before
-    // returning to the bridge.
-    let bytes = unsafe {
-        let mut length = 0usize;
-        while length <= MAX_WECHAT_RESPONSE && *value.0.add(length) != 0 {
-            length += 1;
-        }
-        if length > MAX_WECHAT_RESPONSE {
-            return;
-        }
-        std::slice::from_raw_parts(value.0, length)
-    };
-    let mut output = WECHAT_CALLBACK_VALUE
-        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    output.clear();
-    if bytes.len() <= MAX_WECHAT_RESPONSE {
-        output.extend_from_slice(bytes);
-    }
-}
-
-#[must_use = "the module must stay loaded while exported function pointers are used"]
-struct OwnedModule(windows::Win32::Foundation::HMODULE);
-
-impl Drop for OwnedModule {
-    fn drop(&mut self) {
-        use windows::Win32::Foundation::FreeLibrary;
-
-        // SAFETY: this guard uniquely owns the successful LoadLibraryExW
-        // result and is destroyed only after all exported pointers are dead.
-        if let Err(error) = unsafe { FreeLibrary(self.0) } {
-            crate::support::logging::report_error(
-                "windows-native",
-                format!("cannot unload WeChat OCR bridge: {error}"),
-            );
-        }
-    }
-}
-
-pub(crate) struct WechatBridge {
-    _module: OwnedModule,
-    recognize: WechatOcrFn,
-    stop: Option<StopOcrFn>,
-}
-
-fn wechat_recognize_export(
-    address: windows::Win32::Foundation::FARPROC,
-) -> Result<WechatOcrFn, String> {
-    const _: () = assert!(
-        std::mem::size_of::<windows::Win32::Foundation::FARPROC>()
-            == std::mem::size_of::<WechatOcrFn>()
-    );
-    #[repr(C)]
-    union Export {
-        raw: windows::Win32::Foundation::FARPROC,
-        typed: WechatOcrFn,
-    }
-    if address.is_none() {
-        return Err("wcocr.dll returned a null wechat_ocr export".into());
-    }
-    // SAFETY: GetProcAddress returned this exact symbol from the architecture-
-    // checked bridge. The compile-time size assertion and dedicated union keep
-    // the only ABI reinterpretation local to this audited loader.
-    Ok(unsafe { Export { raw: address }.typed })
-}
-
-fn wechat_stop_export(address: windows::Win32::Foundation::FARPROC) -> Option<StopOcrFn> {
-    const _: () = assert!(
-        std::mem::size_of::<windows::Win32::Foundation::FARPROC>()
-            == std::mem::size_of::<StopOcrFn>()
-    );
-    #[repr(C)]
-    union Export {
-        raw: windows::Win32::Foundation::FARPROC,
-        typed: StopOcrFn,
-    }
-    address.map(|raw| {
-        // SAFETY: this optional address is the exact `stop_ocr` export from
-        // the same architecture-checked module and has the asserted size.
-        unsafe { Export { raw: Some(raw) }.typed }
-    })
-}
-
-impl WechatBridge {
-    pub(crate) fn load(path: &Path) -> Result<Self, String> {
-        use std::os::windows::ffi::OsStrExt;
-        use windows::Win32::System::LibraryLoader::{
-            GetProcAddress, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
-            LoadLibraryExW,
-        };
-        use windows::core::{PCSTR, PCWSTR};
-
-        let wide = path
-            .as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect::<Vec<_>>();
-        // SAFETY: the absolute path and symbol names are NUL terminated.
-        // Restricted search uses only the bridge directory and Windows safe
-        // defaults; the typed pointers use the bridge's documented C ABI and
-        // cannot outlive the returned module owner.
-        let module = unsafe {
-            OwnedModule(
-                LoadLibraryExW(
-                    PCWSTR(wide.as_ptr()),
-                    None,
-                    LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
-                )
-                .map_err(|error| format!("cannot load {}: {error}", path.display()))?,
-            )
-        };
-        // SAFETY: symbol names are static NUL-terminated C strings and the
-        // owned module remains loaded through all returned function pointers.
-        let (recognize, stop) = unsafe {
-            let address = GetProcAddress(module.0, PCSTR(c"wechat_ocr".as_ptr().cast()))
-                .ok_or_else(|| "wcocr.dll lacks wechat_ocr".to_string())?;
-            let recognize = wechat_recognize_export(Some(address))?;
-            let stop =
-                wechat_stop_export(GetProcAddress(module.0, PCSTR(c"stop_ocr".as_ptr().cast())));
-            (recognize, stop)
-        };
-        Ok(Self {
-            _module: module,
-            recognize,
-            stop,
-        })
-    }
-
-    pub(crate) fn recognize(
-        &self,
-        component: &Path,
-        runtime: &Path,
-        image: &std::ffi::CStr,
-    ) -> Result<Vec<u8>, String> {
-        use std::os::windows::ffi::OsStrExt;
-        use windows::core::{PCSTR, PCWSTR};
-
-        let component = component
-            .as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect::<Vec<_>>();
-        let runtime = runtime
-            .as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect::<Vec<_>>();
-        WECHAT_CALLBACK_VALUE
-            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clear();
-        // SAFETY: all path buffers remain NUL terminated for the synchronous
-        // call and the callback copies its result before returning.
-        let success = unsafe {
-            (self.recognize)(
-                PCWSTR(component.as_ptr()),
-                PCWSTR(runtime.as_ptr()),
-                PCSTR(image.as_ptr().cast()),
-                capture_wechat_callback,
-            )
-        };
-        let mut value = WECHAT_CALLBACK_VALUE
-            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if success && !value.is_empty() {
-            Ok(std::mem::take(&mut *value))
-        } else {
-            Err("WeChat OCR bridge returned no response".into())
-        }
-    }
-}
-
-impl Drop for WechatBridge {
-    fn drop(&mut self) {
-        // SAFETY: no recognition call remains active; all function pointers
-        // still belong to the live `OwnedModule`, which is dropped afterwards.
-        unsafe {
-            if let Some(stop) = self.stop {
-                stop();
-            }
-        }
-    }
-}
-
-/// Dimensions that are representable by Win32 APIs and by a Rust byte slice.
-///
-/// Construction performs every narrowing conversion and length calculation so
-/// native allocation sizes cannot diverge from the slices exposed to Rust.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct NativeDimensions {
-    width: i32,
-    height: i32,
-    byte_len: usize,
-}
-
-impl NativeDimensions {
-    pub(crate) fn from_usize(width: usize, height: usize) -> Result<Self, String> {
-        let width_i32 =
-            i32::try_from(width).map_err(|_| format!("native width {width} exceeds i32::MAX"))?;
-        let height_i32 = i32::try_from(height)
-            .map_err(|_| format!("native height {height} exceeds i32::MAX"))?;
-        if width_i32 == 0 || height_i32 == 0 {
-            return Err("native dimensions must be positive".into());
-        }
-        let byte_len = width
-            .checked_mul(height)
-            .and_then(|pixels| pixels.checked_mul(4))
-            .filter(|length| *length <= isize::MAX as usize)
-            .ok_or_else(|| format!("native BGRA surface {width}x{height} is too large"))?;
-        Ok(Self {
-            width: width_i32,
-            height: height_i32,
-            byte_len,
-        })
-    }
-
-    pub(crate) fn from_f64(width: f64, height: f64) -> Result<Self, String> {
-        fn rounded(value: f64, name: &str) -> Result<usize, String> {
-            if !value.is_finite() || value <= 0.0 || value.round() > i32::MAX as f64 {
-                return Err(format!("invalid native {name} {value}"));
-            }
-            Ok(value.round().max(1.0) as usize)
-        }
-
-        Self::from_usize(rounded(width, "width")?, rounded(height, "height")?)
-    }
-
-    pub(crate) const fn width_i32(self) -> i32 {
-        self.width
-    }
-
-    pub(crate) const fn height_i32(self) -> i32 {
-        self.height
-    }
-
-    pub(crate) const fn width_u32(self) -> u32 {
-        self.width as u32
-    }
-
-    pub(crate) const fn height_u32(self) -> u32 {
-        self.height as u32
-    }
-
-    pub(crate) const fn byte_len(self) -> usize {
-        self.byte_len
-    }
-}
-
-#[cfg(test)]
-mod native_dimension_tests {
-    use super::NativeDimensions;
-
-    #[test]
-    fn native_dimensions_reject_unrepresentable_surfaces() {
-        assert!(NativeDimensions::from_usize(0, 1).is_err());
-        assert!(NativeDimensions::from_usize(1, 0).is_err());
-        assert!(NativeDimensions::from_usize(i32::MAX as usize + 1, 1).is_err());
-        assert!(NativeDimensions::from_usize(i32::MAX as usize, i32::MAX as usize).is_err());
-        assert!(NativeDimensions::from_f64(f64::NAN, 1.0).is_err());
-        assert!(NativeDimensions::from_f64(1.0, f64::INFINITY).is_err());
-    }
-
-    #[test]
-    fn native_dimensions_preserve_the_validated_byte_length() {
-        let dimensions = NativeDimensions::from_usize(3840, 2160).unwrap();
-        assert_eq!(dimensions.width_i32(), 3840);
-        assert_eq!(dimensions.height_i32(), 2160);
-        assert_eq!(dimensions.byte_len(), 3840 * 2160 * 4);
-    }
-}
-
-unsafe extern "C" {
-    fn keysteer_compositor_clock_create() -> isize;
-    fn keysteer_compositor_clock_wait(stop_event: isize) -> isize;
-    fn keysteer_compositor_clock_signal(stop_event: isize) -> isize;
-    fn keysteer_compositor_clock_boost(enable: isize) -> isize;
-}
-
-enum CompositorCall {
-    Create,
-    Wait(isize),
-    Signal(isize),
-    Boost(bool),
-}
-
-/// Keep the C ABI and its dynamically resolved Windows 11 functions inside one
-/// reviewed native boundary. The bridge normalizes every result to `isize`.
-fn compositor_call(call: CompositorCall) -> isize {
-    // SAFETY: the C bridge is compiled into this crate with matching signatures.
-    // Handle tokens originate from `CreateEventW`, remain owned by
-    // `CompositorClockSignal`, and outlive every synchronous call using them.
-    unsafe {
-        match call {
-            CompositorCall::Create => keysteer_compositor_clock_create(),
-            CompositorCall::Wait(stop_event) => keysteer_compositor_clock_wait(stop_event),
-            CompositorCall::Signal(stop_event) => keysteer_compositor_clock_signal(stop_event),
-            CompositorCall::Boost(enable) => keysteer_compositor_clock_boost(enable as isize),
-        }
-    }
-}
-
-/// A process or thread handle that is closed exactly once.
-#[repr(transparent)]
-struct OwnedHandle(HANDLE);
-
-impl OwnedHandle {
-    fn new(handle: HANDLE) -> Self {
-        Self(handle)
-    }
-
-    fn raw(&self) -> HANDLE {
-        self.0
-    }
-}
-
-impl Drop for OwnedHandle {
-    #[inline(always)]
-    fn drop(&mut self) {
-        use windows::Win32::Foundation::CloseHandle;
-
-        // SAFETY: this wrapper is created only from an owned successful handle
-        // and Drop is its sole close path.
-        if let Err(error) = unsafe { CloseHandle(self.0) } {
-            crate::report_error!("windows-native", "CloseHandle failed: {error}");
-        }
-    }
-}
-
-/// A window created by KeySteer and destroyed on its owner thread.
-#[repr(transparent)]
-pub(crate) struct OwnedWindow {
-    raw: HWND,
-    _thread: PhantomData<Rc<()>>,
-}
-
-pub(crate) enum OwnedWindowSpec {
-    CpuOverlay(Rect),
-    GpuOverlay(Rect),
-    Status,
-}
-
-/// Create and immediately own one of KeySteer's fixed native window kinds.
-/// Keeping class names, styles and failure cleanup here prevents a safe caller
-/// from accidentally adopting an arbitrary borrowed HWND.
-pub(crate) fn create_owned_window(spec: OwnedWindowSpec) -> Result<OwnedWindow, String> {
-    use windows::Win32::Foundation::COLORREF;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, LWA_ALPHA, SW_SHOWNOACTIVATE, SetLayeredWindowAttributes,
-        ShowWindow, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-        WS_EX_TRANSPARENT, WS_POPUP,
-    };
-    use windows::core::w;
-
-    let instance = current_module().map_err(|error| format!("GetModuleHandleW failed: {error}"))?;
-    let (extended_style, class_name, area, enable_gpu_alpha, show_immediately, sized) = match spec {
-        OwnedWindowSpec::CpuOverlay(area) => (
-            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
-            w!("KeySteerOverlay"),
-            area,
-            false,
-            true,
-            true,
-        ),
-        OwnedWindowSpec::GpuOverlay(area) => (
-            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
-            w!("KeySteerGpuOverlay"),
-            area,
-            true,
-            false,
-            true,
-        ),
-        OwnedWindowSpec::Status => (
-            WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
-            w!("KeySteerStatusWindow"),
-            Rect::new(0.0, 0.0, 0.0, 0.0),
-            false,
-            false,
-            false,
-        ),
-    };
-    let dimensions = sized
-        .then(|| NativeDimensions::from_f64(area.width, area.height))
-        .transpose()?;
-    let (width, height) = dimensions
-        .map(|dimensions| (dimensions.width_i32(), dimensions.height_i32()))
-        .unwrap_or((0, 0));
-    // SAFETY: every class and title is a process-lifetime static string. The
-    // returned HWND transfers directly into `OwnedWindow`; GPU setup failure
-    // destroys it before returning, and immediate show does not retain data.
-    unsafe {
-        let hwnd = CreateWindowExW(
-            extended_style,
-            class_name,
-            w!("KeySteer"),
-            WS_POPUP,
-            area.x.round() as i32,
-            area.y.round() as i32,
-            width,
-            height,
-            None,
-            None,
-            Some(instance.into()),
-            None,
-        )
-        .map_err(|error| format!("CreateWindowExW failed: {error}"))?;
-        if enable_gpu_alpha
-            && let Err(error) = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA)
-        {
-            return match DestroyWindow(hwnd) {
-                Ok(()) => Err(format!("SetLayeredWindowAttributes failed: {error}")),
-                Err(cleanup) => Err(format!(
-                    "SetLayeredWindowAttributes failed: {error}; cannot destroy failed window: {cleanup}"
-                )),
-            };
-        }
-        if show_immediately {
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        }
-        Ok(OwnedWindow::new(hwnd))
-    }
-}
-
-pub(crate) fn reposition_owned_window(window: &OwnedWindow, area: Rect) -> Result<(), String> {
-    use windows::Win32::UI::WindowsAndMessaging::{HWND_TOPMOST, SWP_NOACTIVATE, SetWindowPos};
-
-    let dimensions = NativeDimensions::from_f64(area.width, area.height)?;
-    // SAFETY: `window` proves that KeySteer owns a live HWND for this
-    // synchronous call; validated dimensions fit the Win32 coordinate types.
-    unsafe {
-        SetWindowPos(
-            window.raw(),
-            Some(HWND_TOPMOST),
-            area.x.round() as i32,
-            area.y.round() as i32,
-            dimensions.width_i32(),
-            dimensions.height_i32(),
-            SWP_NOACTIVATE,
-        )
-    }
-    .map_err(|error| format!("SetWindowPos failed: {error}"))
-}
-
-fn destroy_owned_window(hwnd: HWND) -> windows::core::Result<()> {
-    use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
-
-    // SAFETY: callers transfer a KeySteer-owned HWND on its creating thread;
-    // the function consumes the final native ownership edge exactly once.
-    unsafe { DestroyWindow(hwnd) }
-}
-
-impl OwnedWindow {
-    #[inline(always)]
-    fn new(hwnd: HWND) -> Self {
-        Self {
-            raw: hwnd,
-            _thread: PhantomData,
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) fn raw(&self) -> HWND {
-        self.raw
-    }
-
-    #[inline(always)]
-    pub(crate) fn destroy(mut self) -> windows::core::Result<()> {
-        let hwnd = std::mem::take(&mut self.raw);
-        if hwnd.is_invalid() {
-            return Ok(());
-        }
-        destroy_owned_window(hwnd)
-    }
-}
-
-impl Drop for OwnedWindow {
-    #[inline(always)]
-    fn drop(&mut self) {
-        if !self.raw.is_invalid()
-            && let Err(error) = destroy_owned_window(self.raw)
-        {
-            crate::report_error!("windows-native", "DestroyWindow failed: {error}");
-        }
-    }
-}
-
-/// Whether Desktop Window Manager composition is available.
-pub(crate) fn dwm_composition_enabled() -> windows::core::Result<bool> {
-    use windows::Win32::Graphics::Dwm::DwmIsCompositionEnabled;
-
-    // SAFETY: the function has no pointer arguments and returns a BOOL value.
-    unsafe { DwmIsCompositionEnabled() }.map(|enabled| enabled.as_bool())
-}
-
-/// Compositor synchronization for the dedicated frame/capture workers only.
-pub(crate) fn wait_for_dwm_frame() -> windows::core::Result<()> {
-    // SAFETY: DwmFlush has no arguments or caller-owned resources.
-    unsafe { windows::Win32::Graphics::Dwm::DwmFlush() }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CompositorWait {
-    Frame,
-    Interrupted,
-    Failed,
-}
-
-/// Owner of the event used to interrupt the Windows 11 compositor clock.
-pub(crate) struct CompositorClockSignal(OwnedHandle);
-
-impl CompositorClockSignal {
-    /// Return `None` on Windows 10 or when the compositor-clock export cannot
-    /// be loaded. Callers then retain the DXGI/DWM compatibility path.
-    pub(crate) fn try_new() -> Option<Self> {
-        let token = compositor_call(CompositorCall::Create);
-        (token != 0).then(|| Self(OwnedHandle::new(HANDLE(token as *mut _))))
-    }
-
-    pub(crate) fn token(&self) -> isize {
-        self.0.raw().0 as isize
-    }
-}
-
-/// Wake a compositor-clock wait without borrowing the worker-owned handle.
-/// The token is published only while that worker retains the corresponding
-/// event, so callers never own or close it.
-pub(crate) fn interrupt_compositor_clock(token: isize) -> bool {
-    token != 0 && compositor_call(CompositorCall::Signal(token)) != 0
-}
-
-pub(crate) fn wait_for_compositor_frame(stop_event: isize) -> CompositorWait {
-    match compositor_call(CompositorCall::Wait(stop_event)) {
-        1 => CompositorWait::Frame,
-        0 => CompositorWait::Interrupted,
-        _ => CompositorWait::Failed,
-    }
-}
-
-/// Ask Windows 11 to use its high dynamic-refresh cadence while movement is
-/// active. Unsupported systems return false and continue normally.
-pub(crate) fn boost_compositor_clock(enable: bool) -> bool {
-    compositor_call(CompositorCall::Boost(enable)) != 0
-}
-
-/// Retained DXGI output selected for display-synchronised movement.
-pub(crate) struct DisplayOutput(windows::Win32::Graphics::Dxgi::IDXGIOutput);
-
-impl DisplayOutput {
-    /// Block until this output reaches its next vertical blank.
-    pub(crate) fn wait_for_vblank(&self) -> windows::core::Result<()> {
-        // SAFETY: the retained COM interface stays alive for the synchronous
-        // wait and is used only by the frame-clock worker that owns it.
-        unsafe { self.0.WaitForVBlank() }
-    }
-}
-
-/// Prefer actual Windows 11 dynamic-refresh VBlank cadence when supported.
-pub(crate) fn prefer_dynamic_vblank() {
-    use windows::Win32::Foundation::FreeLibrary;
-    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-    use windows::core::{s, w};
-
-    // SAFETY: dxgi.dll is a system component. The optional export has the same
-    // no-argument system ABI as FARPROC, and its ignored HRESULT only reports
-    // whether the preference was accepted. FreeLibrary balances our load.
-    unsafe {
-        let Ok(module) = LoadLibraryW(w!("dxgi.dll")) else {
-            return;
-        };
-        if let Some(disable) = GetProcAddress(module, s!("DXGIDisableVBlankVirtualization")) {
-            let _ = disable();
-        }
-        if let Err(error) = FreeLibrary(module) {
-            crate::report_error!("windows-native", "cannot unload dxgi.dll: {error}");
-        }
-    }
-}
-
-/// Map a desktop point to the nearest monitor without querying refresh rate.
-pub(crate) fn monitor_for_point(x: f64, y: f64) -> isize {
-    use windows::Win32::Foundation::POINT;
-    use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromPoint};
-
-    let point = POINT {
-        x: x.round() as i32,
-        y: y.round() as i32,
-    };
-    // SAFETY: `point` is a value type and nearest-monitor fallback returns a
-    // stable HMONITOR whenever a display is attached.
-    unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST) }.0 as isize
-}
-
-/// Find the DXGI output whose native monitor handle matches `monitor`.
-pub(crate) fn display_output_for_monitor(monitor: isize) -> Result<Option<DisplayOutput>, String> {
-    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
-    use windows::Win32::Graphics::Gdi::HMONITOR;
-
-    // SAFETY: DXGI creates retained COM wrappers. Enumeration is read-only,
-    // and every adapter/output/factory interface is released by RAII.
-    unsafe {
-        let factory: IDXGIFactory1 = CreateDXGIFactory1()
-            .map_err(|error| format!("cannot create DXGI factory for frame clock: {error}"))?;
-        let monitor = HMONITOR(monitor as *mut _);
-        let mut adapter_index = 0;
-        while let Ok(adapter) = factory.EnumAdapters1(adapter_index) {
-            let mut output_index = 0;
-            while let Ok(output) = adapter.EnumOutputs(output_index) {
-                if let Ok(description) = output.GetDesc()
-                    && description.Monitor == monitor
-                {
-                    return Ok(Some(DisplayOutput(output)));
-                }
-                output_index += 1;
-            }
-            adapter_index += 1;
-        }
-        Ok(None)
-    }
-}
-
-/// Wake a thread whose Win32 message queue has already been initialized.
-#[inline(always)]
-pub(crate) fn post_thread_wake(thread: u32, message: u32) -> windows::core::Result<()> {
-    post_thread_message(thread, message, 0)
-}
-
-/// Post an integer payload to an initialized Win32 thread message queue.
-#[inline(always)]
-pub(crate) fn post_thread_message(
-    thread: u32,
-    message: u32,
-    payload: usize,
-) -> windows::core::Result<()> {
-    use windows::Win32::Foundation::{LPARAM, WPARAM};
-    use windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW;
-
-    // SAFETY: the payload contains no pointers and the receiver treats this as
-    // an integer generation attached to an application-owned message.
-    unsafe { PostThreadMessageW(thread, message, WPARAM(payload), LPARAM(0)) }
-}
-
-/// Register a process-lifetime window class. Re-registering an existing class
-/// is idempotent for independently constructed renderer/tray workers.
-pub(crate) fn register_window_class(
-    class: &windows::Win32::UI::WindowsAndMessaging::WNDCLASSEXW,
-) -> Result<(), String> {
-    use windows::Win32::UI::WindowsAndMessaging::RegisterClassExW;
-
-    // SAFETY: callers provide a fully initialized class whose callback and
-    // static strings remain alive for the process lifetime.
-    if unsafe { RegisterClassExW(class) } != 0 {
-        return Ok(());
-    }
-    let last = windows::core::Error::from_thread();
-    if last.code() == windows::core::HRESULT::from_win32(1410) {
-        Ok(())
-    } else {
-        Err(format!("RegisterClassExW failed: {last}"))
-    }
-}
-
-#[inline(always)]
-pub(crate) fn default_window_proc(
-    hwnd: HWND,
-    message: u32,
-    wparam: windows::Win32::Foundation::WPARAM,
-    lparam: windows::Win32::Foundation::LPARAM,
-) -> windows::Win32::Foundation::LRESULT {
-    use windows::Win32::UI::WindowsAndMessaging::DefWindowProcW;
-
-    // SAFETY: this forwards the unchanged callback arguments to User32.
-    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
-}
-
-#[inline(always)]
-pub(crate) fn get_window_message(
-    message: &mut windows::Win32::UI::WindowsAndMessaging::MSG,
-) -> i32 {
-    use windows::Win32::UI::WindowsAndMessaging::GetMessageW;
-
-    // SAFETY: `message` is a valid writable out-parameter owned by the caller.
-    unsafe { GetMessageW(message, None, 0, 0) }.0
-}
-
-/// A message-only timer owned and destroyed on its creating thread.
-pub(crate) struct ThreadTimer {
-    id: usize,
-    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
-}
-
-impl ThreadTimer {
-    pub(crate) fn new(interval_ms: u32) -> Result<Self, String> {
-        // SAFETY: no HWND or callback is retained. Windows allocates the id;
-        // this thread-bound guard receives WM_TIMER on the creating thread.
-        let id = unsafe {
-            windows::Win32::UI::WindowsAndMessaging::SetTimer(None, 0, interval_ms, None)
-        };
-        if id == 0 {
-            return Err("cannot create Windows input recovery timer".into());
-        }
-        Ok(Self {
-            id,
-            _thread: std::marker::PhantomData,
-        })
-    }
-
-    pub(crate) fn matches(&self, message: &windows::Win32::UI::WindowsAndMessaging::MSG) -> bool {
-        message.message == windows::Win32::UI::WindowsAndMessaging::WM_TIMER
-            && message.hwnd.is_invalid()
-            && message.wParam.0 == self.id
-    }
-}
-
-impl Drop for ThreadTimer {
-    fn drop(&mut self) {
-        // SAFETY: this guard owns the timer id and cannot leave its thread.
-        let result = unsafe { windows::Win32::UI::WindowsAndMessaging::KillTimer(None, self.id) };
-        if let Err(error) = result {
-            crate::report_error!("windows-hook", "cannot stop recovery timer: {error}");
-        }
-    }
-}
-
-/// Borrows a tray HWND until notifications have been unregistered.
-pub(crate) struct SessionNotifications<'a>(&'a OwnedWindow);
-
-impl<'a> SessionNotifications<'a> {
-    pub(crate) fn new(window: &'a OwnedWindow) -> Result<Self, String> {
-        use windows::Win32::System::RemoteDesktop::{
-            NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification,
-        };
-        // SAFETY: the borrowed HWND remains live until this guard unregisters.
-        unsafe { WTSRegisterSessionNotification(window.raw(), NOTIFY_FOR_THIS_SESSION) }
-            .map_err(|error| format!("cannot subscribe to session changes: {error}"))?;
-        Ok(Self(window))
-    }
-}
-
-impl Drop for SessionNotifications<'_> {
-    fn drop(&mut self) {
-        // SAFETY: registration belongs to this guard and its borrowed HWND
-        // cannot be destroyed before the matching unregistration.
-        if let Err(error) = unsafe {
-            windows::Win32::System::RemoteDesktop::WTSUnRegisterSessionNotification(self.0.raw())
-        } {
-            crate::report_error!(
-                "windows-events",
-                "cannot unsubscribe from session changes: {error}"
-            );
-        }
-    }
-}
+pub(crate) use winrt::create_system_ocr_engine;
+pub(crate) use winrt::{
+    SoftwareBitmapFactory, SystemOcrFactory, create_file_random_access_stream,
+    create_png_bitmap_encoder_operation, probe_system_ocr_factory,
+};
 
 #[inline(always)]
 pub(crate) fn window_long(
@@ -1562,6 +112,13 @@ pub(crate) fn foreground_window() -> HWND {
 
     // SAFETY: this call has no arguments and returns a borrowed HWND value.
     unsafe { GetForegroundWindow() }
+}
+
+/// Submit activation of a borrowed identity; completion is confirmed by the worker.
+pub(crate) fn try_activate_window(hwnd: HWND) -> bool {
+    // SAFETY: the system validates the borrowed HWND; no Rust pointer or
+    // ownership is transferred, and no foreign input queues are attached.
+    unsafe { windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd) }.as_bool()
 }
 
 #[inline(always)]
@@ -2080,80 +637,6 @@ pub(crate) fn atomic_replace(source: &Path, destination: &Path) -> std::io::Resu
     .map_err(std::io::Error::other)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use windows::Win32::UI::WindowsAndMessaging::{HTTRANSPARENT, WM_NCHITTEST, WM_PAINT};
-
-    #[test]
-    fn overlays_never_claim_mouse_hit_tests() {
-        assert_eq!(
-            click_through_hit_test(WM_NCHITTEST),
-            Some(windows::Win32::Foundation::LRESULT(HTTRANSPARENT as isize))
-        );
-        assert_eq!(click_through_hit_test(WM_PAINT), None);
-    }
-
-    #[test]
-    fn integrity_rids_are_labeled_for_input_diagnostics() {
-        assert_eq!(integrity_name(0x1000), "low");
-        assert_eq!(integrity_name(0x2000), "medium");
-        assert_eq!(integrity_name(0x2100), "medium-plus");
-        assert_eq!(integrity_name(0x3000), "high");
-        assert_eq!(integrity_name(0x4000), "system");
-        assert_eq!(integrity_name(0x5000), "protected");
-    }
-
-    #[test]
-    fn compositor_clock_stop_event_is_immediately_interruptible_when_available() {
-        let Some(signal) = CompositorClockSignal::try_new() else {
-            // Windows 10 intentionally uses the DXGI compatibility path.
-            return;
-        };
-
-        assert!(interrupt_compositor_clock(signal.token()));
-        assert_eq!(
-            wait_for_compositor_frame(signal.token()),
-            CompositorWait::Interrupted
-        );
-    }
-
-    #[test]
-    #[ignore = "requires an interactive Windows desktop"]
-    fn visual_capture_prepares_and_releases_thread_bound_surface() -> Result<(), String> {
-        let mut capture = PreparedCapture::new(64, 64)?;
-        let first = capture.capture_with(0, 0, 64, 64, |pixels, width, height| {
-            Ok((pixels.len(), width, height))
-        })?;
-        let second = capture.capture_with(0, 0, 64, 64, |pixels, width, height| {
-            Ok((pixels.len(), width, height))
-        })?;
-        drop(capture);
-        assert_eq!(first, (64 * 64 * 4, 64, 64));
-        assert_eq!(second, first);
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires the optional Windows OCR capability"]
-    fn system_ocr_factory_survives_transient_apartments() -> Result<(), String> {
-        for _ in 0..3 {
-            std::thread::spawn(|| -> Result<(), String> {
-                let apartment = ComApartment::initialise()?;
-                let (maximum, _) = probe_system_ocr_factory()?;
-                let engine = create_system_ocr_engine()?;
-                assert!(maximum > 0);
-                drop(engine);
-                drop(apartment);
-                Ok(())
-            })
-            .join()
-            .map_err(|_| "transient OCR apartment thread panicked".to_string())??;
-        }
-        Ok(())
-    }
-}
-
 /// Keep a process identity lease alive throughout the operation. Audio requests
 /// cross workers as PID + creation time, never as HWND/COM references.
 pub(crate) fn with_process_identity<T>(
@@ -2239,5 +722,112 @@ pub(crate) fn audio_process_list() -> windows::core::Result<Vec<(u32, u32, Strin
             ));
             next = Process32NextW(snapshot.raw(), &mut entry);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apartment_and_graphics_owners_cannot_cross_threads() {
+        // If a type implements Send or Sync, inference becomes ambiguous and
+        // compilation fails. These checks require no runtime allocation.
+        trait AmbiguousIfSend<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+        struct IsSend;
+        impl<T: ?Sized + Send> AmbiguousIfSend<IsSend> for T {}
+        trait AmbiguousIfSync<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+        struct IsSync;
+        impl<T: ?Sized + Sync> AmbiguousIfSync<IsSync> for T {}
+        macro_rules! thread_bound {
+            ($($owner:ty),+ $(,)?) => { $(
+                let _ = <$owner as AmbiguousIfSend<_>>::check;
+                let _ = <$owner as AmbiguousIfSync<_>>::check;
+            )+ };
+        }
+        thread_bound!(
+            ComApartment,
+            ScreenDc,
+            GdiDibSurface,
+            PreparedCapture,
+            OwnedWindow,
+            SoftwareBitmapFactory,
+            SystemOcrFactory
+        );
+    }
+    use windows::Win32::UI::WindowsAndMessaging::{HTTRANSPARENT, WM_NCHITTEST, WM_PAINT};
+
+    #[test]
+    fn overlays_never_claim_mouse_hit_tests() {
+        assert_eq!(
+            click_through_hit_test(WM_NCHITTEST),
+            Some(windows::Win32::Foundation::LRESULT(HTTRANSPARENT as isize))
+        );
+        assert_eq!(click_through_hit_test(WM_PAINT), None);
+    }
+
+    #[test]
+    fn integrity_rids_are_labeled_for_input_diagnostics() {
+        assert_eq!(integrity_name(0x1000), "low");
+        assert_eq!(integrity_name(0x2000), "medium");
+        assert_eq!(integrity_name(0x2100), "medium-plus");
+        assert_eq!(integrity_name(0x3000), "high");
+        assert_eq!(integrity_name(0x4000), "system");
+        assert_eq!(integrity_name(0x5000), "protected");
+    }
+
+    #[test]
+    fn compositor_clock_stop_event_is_immediately_interruptible_when_available() {
+        let Some(signal) = CompositorClockSignal::try_new() else {
+            // Windows 10 intentionally uses the DXGI compatibility path.
+            return;
+        };
+
+        assert!(interrupt_compositor_clock(signal.token()));
+        assert_eq!(
+            wait_for_compositor_frame(signal.token()),
+            CompositorWait::Interrupted
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop"]
+    fn visual_capture_prepares_and_releases_thread_bound_surface() -> Result<(), String> {
+        let mut capture = PreparedCapture::new(64, 64)?;
+        let first = capture.capture_with(0, 0, 64, 64, |pixels, width, height| {
+            Ok((pixels.len(), width, height))
+        })?;
+        let second = capture.capture_with(0, 0, 64, 64, |pixels, width, height| {
+            Ok((pixels.len(), width, height))
+        })?;
+        drop(capture);
+        assert_eq!(first, (64 * 64 * 4, 64, 64));
+        assert_eq!(second, first);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires the optional Windows OCR capability"]
+    fn system_ocr_factory_survives_transient_apartments() -> Result<(), String> {
+        for _ in 0..3 {
+            std::thread::spawn(|| -> Result<(), String> {
+                let apartment = ComApartment::initialise()?;
+                let (maximum, _) = probe_system_ocr_factory()?;
+                let engine = create_system_ocr_engine()?;
+                assert!(maximum > 0);
+                drop(engine);
+                drop(apartment);
+                Ok(())
+            })
+            .join()
+            .map_err(|_| "transient OCR apartment thread panicked".to_string())??;
+        }
+        Ok(())
     }
 }

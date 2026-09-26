@@ -10,6 +10,7 @@ struct Fake {
     close_requests: std::cell::RefCell<Vec<WindowId>>,
     focus: Cell<Option<WindowId>>,
     deny_focus: bool,
+    deferred_focus: Cell<Option<Instant>>,
     fail_visibility: Option<(WindowId, bool)>,
     fail: Option<WindowId>,
     bars: Vec<TabBar>,
@@ -533,6 +534,7 @@ fn setup() -> Grouped<Fake> {
         close_requests: Default::default(),
         focus: Cell::new(None),
         deny_focus: false,
+        deferred_focus: Cell::new(None),
         fail_visibility: None,
         fail: None,
         bars: Vec::new(),
@@ -664,8 +666,13 @@ impl WindowAccess for Fake {
         if self.deny_focus {
             return Err("system denied focus".into());
         }
-        self.focus.set(Some(id));
+        if self.deferred_focus.get().is_none() {
+            self.focus.set(Some(id));
+        }
         Ok(())
+    }
+    fn native_deadline(&self) -> Option<Instant> {
+        self.deferred_focus.get()
     }
     fn close(&self, id: WindowId) -> Result<(), String> {
         self.close_requests.borrow_mut().push(id);
@@ -716,6 +723,30 @@ fn switching_transfers_focus_before_hiding_the_previous_member() {
     access
         .activate_window(WindowId(1), &screens(), &|| false)
         .unwrap();
+    assert_eq!(access.native.hidden_foreground, before);
+}
+
+#[test]
+fn asynchronous_focus_keeps_previous_member_visible_until_confirmation() {
+    let mut access = setup();
+    choose(&mut access, 1);
+    choose(&mut access, 2);
+    op(&mut access, TabOperation::Activate(WindowId(1)));
+    let before = access.native.hidden_foreground;
+    access
+        .native
+        .deferred_focus
+        .set(Some(Instant::now() + Duration::from_millis(150)));
+    op(&mut access, TabOperation::Activate(WindowId(2)));
+    assert_eq!(access.native.focus.get(), Some(WindowId(1)));
+    assert!(!access.native.hidden.contains(&WindowId(1)));
+    assert!(!access.native.hidden.contains(&WindowId(2)));
+    access.pump(&screens(), &|| false).unwrap();
+    assert!(!access.native.hidden.contains(&WindowId(1)));
+    access.native.focus.set(Some(WindowId(2)));
+    access.native.deferred_focus.set(None);
+    access.pump(&screens(), &|| false).unwrap();
+    assert!(access.native.hidden.contains(&WindowId(1)));
     assert_eq!(access.native.hidden_foreground, before);
 }
 

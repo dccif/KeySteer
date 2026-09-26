@@ -373,6 +373,9 @@ impl MacWindows {
 }
 
 impl WindowAccess for MacWindows {
+    fn focused_bounds(&self, process: u32) -> Result<Option<Rect>, String> {
+        super::focused_window_bounds(process as libc::pid_t).map(Some)
+    }
     fn focused_window(&self, _windows: &[WindowInfo]) -> Option<WindowId> {
         self.focused_window_id()
     }
