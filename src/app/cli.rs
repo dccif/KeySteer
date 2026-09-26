@@ -14,6 +14,7 @@ pub fn prepare_console_for_cli() {
             Some(value)
                 if value == std::ffi::OsStr::new("--internal-wechat-ocr-helper")
                     || value == std::ffi::OsStr::new("--internal-apply-update")
+                    || value == std::ffi::OsStr::new(super::restart::ARGUMENT)
         )
     {
         return;
@@ -33,6 +34,21 @@ pub(crate) struct CliOptions {
 }
 
 pub fn run_cli() -> ExitCode {
+    // A replacement process waits here before logging, hooks, workers or native
+    // application initialization. EOF arrives only after the old instance stops.
+    let restart_snapshot = if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(super::restart::ARGUMENT))
+    {
+        match super::restart::receive() {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                crate::support::logging::emergency_console(format_args!("{error}"));
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
     #[cfg(target_os = "windows")]
     if let Some(result) = crate::platform::run_internal_update_helper() {
         return if result.is_ok() {
@@ -53,10 +69,21 @@ pub fn run_cli() -> ExitCode {
         }
     };
     crate::support::logging::install_panic_hook();
-    match parse_args().and_then(|args| args.map_or(Ok(()), super::bootstrap::run)) {
-        Ok(()) => {
+    let result = match restart_snapshot {
+        Some(snapshot) => super::bootstrap::resume(snapshot),
+        None => parse_args().and_then(|args| args.map_or(Ok(None), super::bootstrap::run)),
+    };
+    match result {
+        Ok(restart) => {
             crate::support::logging::end_session();
             crate::support::logging::flush();
+            if let Some(restart) = restart
+                && let Err(error) = restart.commit()
+            {
+                crate::report_error!("reload", "{error}");
+                crate::support::logging::flush();
+                return ExitCode::FAILURE;
+            }
             ExitCode::SUCCESS
         }
         Err(error) => {

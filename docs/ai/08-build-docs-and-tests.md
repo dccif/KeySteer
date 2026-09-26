@@ -1,5 +1,9 @@
 # 构建、打包、文档站与测试
 
+完整进程 Reload 验证（2026-09-26）：全量 1,134 passed／88 ignored；Clippy all-targets（benchmark-hooks）无告警，macOS ARM／Intel tests 编译通过。固定 12 轮 A/A/B（A 与 A2 为相同旧二进制），默认按键 p50／p95／p99 为 137／139／155 → 136／138／148ns，WASD 为 141／143.5／154.5 → 138.5／141.5／151ns；setup p99 534.45 → 545.35µs（+2.04%）。初始化仍为 2,436 次分配、106,508B 存活，Engine 仍为 3,656B，不代表原生进程 RSS。先前同一候选七轮测试出现的 p99 增加未稳定复现，所有试验保留在 `target/perf-full-reload/report.md` 及相邻原始数据；不宣称端到端零回退。原生状态栏点击和 macOS 实机重启尚未验收。
+
+完整进程 Reload 回归位于 `runtime/tests/process_reload.rs` 与 `app/restart.rs`：覆盖退出完成前不提交、不部分安装新计划、非法配置保留模式，以及真实子进程管道在提交前等待、取消时退出和原文／路径快照交接。子进程 probe 是 ignored 测试入口，由普通测试显式启动，不创建原生窗口。
+
 TOML 对比对相同标量用 `Object.is` 跳过序列化（包括 NaN）；仍先解析双方输入，内容相同的非法 TOML 不会绕过校验。`config-diff.test.ts` 覆盖特殊数值与相同非法输入。
 
 Normal 18→22ns 的后续固定十二轮 A/A/B 复核见 `target/perf-c2-final-direct/normal-recheck/report.md`：复用原二进制，旧版两组 p99 中位数 20.5/18.5ns，当前 16ns；当前相对旧版逐轮八次持平、四次更快，配对差值中位数 0ns。相同旧版也有 16–27ns 波动，未复现稳定回退，不能把批均值 p99 解释为单帧端到端延迟或宣称稳定加速。本次没有生产代码变更，原对照数据保留；Hint 64 未在本次复核。
@@ -21,7 +25,7 @@ Normal 18→22ns 的后续固定十二轮 A/A/B 复核见 `target/perf-c2-final-
 防回退验证新增 ignored `startup_allocation_profile`，单独单线程输出默认配置、计划编译、Engine 装配三阶段分配；Windows 合计门禁为 2,800 次、210,000 字节，覆盖构造阶段而非原生启动或完整 Engine::run。`allocation_free_chord_identity_matches_canonical_identity` 对照原 canonical 语义；按键 Unicode/别名优先级及 15/16/24 Hint sweep 边界也有回归。
 
 
-模拟器 `config-studio/ConfigDiff.tsx` 用原生 dialog 展示 TOML 字段差异，`simulator/config-diff.ts` 独立解析任意 TOML 并比较显式值（忽略注释、空白、表键顺序，保留数组顺序，不补默认值）。ConfigStudio 保存最近成功导入的原文作为基线，默认配置与 URL handoff 也建立基线；下载／复制前比较基线与待导出的快照，手动导入前比较当前文档与候选文件，确认才应用，取消不改变文档或基线。独立左右文件对比仅保存在弹窗内，不影响编辑器。`config-diff.test.ts` 覆盖字段增删改、特殊键、数组、日期、空表与非法 TOML。
+模拟器 `config-studio/ConfigDiff.tsx` 在「TOML 查看 → 变更对比」标签内展示字段差异，与「配置源码」并列，不使用弹窗；现有导入导出页面及按钮保留。左右文本框可直接粘贴 TOML，也可分别上传文件，切换标签或页面保留对比草稿，不修改编辑器配置。`TomlEditor.tsx` 使用原生 textarea 处理粘贴、选择和 IME，非交互高亮镜像同步横纵滚动并显示行号；两层字体、间距和不折行设置必须一致。`toml-highlight.ts` 在生成语法颜色前转义所有用户文本，差异值也复用它；配色分别适配浅深主题。`simulator/config-diff.ts` 独立解析任意 TOML 并比较显式值（忽略注释、空白、表键顺序，保留数组顺序，不补默认值）。ConfigStudio 保存最近成功导入的原文作为基线，默认配置与 URL handoff 也建立基线；下载／复制和手动导入转到对比标签展示待确认的只读快照，确认才应用，取消后恢复可粘贴的独立对比。`config-diff.test.ts` 覆盖字段增删改、特殊键、数组、日期、空表与非法 TOML；`toml-highlight.test.ts` 覆盖字符串内注释符、多行字符串和 HTML 转义。
 
 响应/原生边界优化回归：`failed_press_retains_rollback_errors_and_releases_remaining_keys_before_recovery` 覆盖多按键回滚失败仍继续清理与错误保留；`quick_switch_geometry_is_requested_after_display_and_rejects_late_results` 覆盖先显示、后请求、关闭/重开后的旧结果；`focused_bounds_coalesces_without_blocking_submission` 覆盖后台查询单槽合并。`asynchronous_focus_keeps_previous_member_visible_until_confirmation` 覆盖异步激活期间旧成员仍可见；ignored `directcomposition_smoke` 验证 compositor 绘制、退出释放和异常大文本缓冲回收。
 
@@ -533,3 +537,7 @@ Windows 可显式运行 `cargo test --lib native_deferred_geometry_submission_an
 `text_input_temporary_normal_routes_plugin_screen_commands_to_normal` 用真实插件、双屏及物理／字符事件验证 S 正反切屏、基础模式不切换、释放 Primary 后 S 恢复透传；`text_input_default_indicator_is_disabled_in_code_and_shipped_config` 验证代码／发布默认均隐藏 Text Input 文字且保留 Normal 指示器。
 
 临时切屏／指示器回归：库测试 1,075 passed／84 ignored，唯一失败为当前 TOML 的 Normal `.`／`/` 横向滚动绑定与内置默认差异；Text Input 双屏／文字隐藏及原 Window 临时切屏测试通过。Clippy lib/tests 和 docs:check 通过。all-targets 构建因运行中的 target/debug/keysteer.exe 无法覆盖而中断，未替换用户正在运行的程序。
+
+`failed_background_reload_releases_work_and_discards_queue_before_retry` 验证后台 Reload 失败后释放 worker／队列容量／配置副本，丢弃已排队修改、保留当前 Normal 模式与配置，并允许下一次重新读取成功。原连续 set_config 测试同时检查队列排空自动回收。
+
+配置任务资源回收验证：全量 1,135 passed／88 ignored；随后新增的 `successful_background_reload_releases_configuration_resources_before_handoff` 检查成功交接前 worker、通道、队列容量及候选配置副本已释放，旧仓库随 Engine 销毁。进程自身资源由退出回收，持久化文件按普通启动读取，不复制旧运行状态。

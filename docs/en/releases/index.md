@@ -11,6 +11,8 @@ Improved keyboard responsiveness, reducing key processing time by about 15%.
 
 The configuration simulator now compares TOML files and previews import/export changes, highlighting added, removed and modified values while ignoring comments and formatting.
 
+Reload Configuration now fully restarts the app with the new configuration; invalid configuration leaves the current session unchanged.
+
 | Key processing time | Before | After | Reduction |
 | --- | ---: | ---: | ---: |
 | p50 | 160 ns | 136 ns | 15.0% |

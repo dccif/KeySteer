@@ -128,11 +128,21 @@ pub struct ConfigurationCandidate {
     pub plan: RuntimePlan,
     pub repository: Box<dyn ConfigurationRepository>,
     pub source_path: Option<PathBuf>,
+    pub restart: Option<Box<dyn PreparedRestart>>,
+}
+
+/// Application-owned replacement process, dormant until native shutdown completes.
+pub trait PreparedRestart: Send {
+    fn commit(self: Box<Self>) -> Result<(), String>;
 }
 
 /// Runtime-owned port for configuration persistence. Implementations live at
 /// the application boundary, so the engine knows neither TOML nor ConfigFile.
 pub trait ConfigurationRepository: Send {
+    /// Transfer a prepared replacement only after the retiring engine has stopped.
+    fn take_restart(&mut self) -> Option<Box<dyn PreparedRestart>> {
+        None
+    }
     /// Detached source for background read/compile/write. Headless adapters may omit it.
     fn fork_for_worker(&self) -> Option<Box<dyn ConfigurationRepository>> {
         None

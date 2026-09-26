@@ -108,6 +108,8 @@ Mode 的 cursor override 可单独覆盖这些值。普通反馈由物理按键�
 `--config` 时来源固定，Reload 只重读该路径。重新发现失败或文件无效时必须保留最后一份
 有效配置；目录中没有配置时则恢复内置默认值，并继续把 `keysteer.user.toml` 作为写入路径。
 
+生产 Reload 验证成功后完整重启进程，而非沿用后端热替换。新实例从管道接收已验证原文及配置来源策略，保留显式路径／自动发现规则；不交接任何临时运行状态。非法配置或准备进程失败保持旧实例，详见架构边界的“配置重载与进程重建”。`set_config` 仍在当前进程内替换计划。
+
 数据目录由 `src/app/paths.rs` 决定：
 
 - 打包的 macOS `.app`：`~/Library/Application Support/KeySteer/`。
@@ -328,3 +330,5 @@ Normal 默认 `\` 绑定 `text_input`。`[text_input.bindings]` 默认 `'enter \
 
 
 `normal.targeting` 可覆盖 `grid_cols`、`grid_rows`、`keys`、`max_depth`，未写的字段继承所选 method 的原配置。`method = "recursive_grid"` 另支持 `min_size_width`、`min_size_height` 和 `layers`；显式 layers 整组替换继承列表，`layers = []` 清空。覆盖只影响 Normal，不改变独立网格模式，不接受 UI 字段。布局校验、键位冲突检测和控制器使用同一份合并结果，仅在加载配置时解析。完整注释示例见 `keysteer.default.toml`。
+
+配置任务在发布完成通知前释放工作副本；队列排空后关闭配置 worker，回收线程、通道和队列容量。Reload 失败同时丢弃当时已排队的 Reload／set_config 请求，保留当前有效实例，下次点击重新读取文件。普通 set_config 失败仍按原顺序处理后续独立请求。清理只发生在配置完成路径，不增加普通按键处理工作。

@@ -11,9 +11,13 @@ outline: false
 
 配置模拟器新增 TOML 文件对比和导入／导出变更预览，清晰展示新增、删除与修改，忽略注释和格式差异。
 
-Improved keyboard responsiveness, reducing key processing time by about 12%.
+Reload Configuration 现在会完整重启程序并重新加载配置；配置有误时保持原状态。
+
+Improved keyboard responsiveness, reducing key processing time by about 15%.
 
 The configuration simulator now compares TOML files and previews import/export changes, highlighting added, removed and modified values while ignoring comments and formatting.
+
+Reload Configuration now fully restarts the app with the new configuration; invalid configuration leaves the current session unchanged.
 
 | 按键处理耗时 / Key processing time | 优化前 / Before | 优化后 / After | 降低 / Reduction |
 | --- | ---: | ---: | ---: |

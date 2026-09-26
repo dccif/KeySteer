@@ -216,6 +216,7 @@ export default defineComponent({
     const sourceStats = ref({ bytes: 0, sections: 0, values: 0 })
     const activeMode = ref<EditorMode>('normal')
     const pageId = ref('normal')
+    const tomlTab = ref<'source' | 'diff'>('source')
     const navigationWidth = ref(240)
     const settingsShare = ref(55)
     const selectedTab = ref<SettingsTab>('keys')
@@ -598,6 +599,7 @@ export default defineComponent({
         releasePreview()
         review.value = { before: tomlPreview.value, after: source, beforeName: t('当前配置'), afterName: file.name, action: '确认导入',
           confirm: () => importSource(source, file.name, `已导入 ${file.name}；配置值已解析，原注释不会写入生成文件`) }
+        tomlTab.value = 'diff'; selectPage('toml')
       } catch (error) {
         message.value = `TOML 解析失败：${formatError(error)}`
       } finally { input.value = '' }
@@ -610,6 +612,8 @@ export default defineComponent({
     function openDiff(action?: string): void {
       if (!document.value) return
       releasePreview()
+      tomlTab.value = 'diff'; selectPage('toml')
+      if (!action) { review.value = null; return }
       const source = stringify(document.value)
       review.value = { before: importedSource.value, after: source, beforeName: sourceName.value, afterName: t('当前配置'), action,
         confirm: () => {
@@ -1211,9 +1215,6 @@ export default defineComponent({
             <section class="ks-utility-card ks-workspace-files"><header class="ks-utility-heading"><h2>{t("工作区文件")}</h2><code>workspace.ksw</code></header><div class="ks-settings-body"><p>{t("导入或导出布局、标签分组与使用统计。")}</p><div class="ks-file-actions"><input aria-label={t("导入工作区文件")} type="file" accept=".ksw,application/octet-stream" onChange={importLayoutFile} /><button class="ks-button" onClick={downloadLayouts}>{t("下载工作区文件")}</button></div></div></section></div>)
     return () => (
       <div class="ks-studio ks-classified" style={{ '--ks-navigation-width': `${navigationWidth.value}px`, '--ks-settings-share': `${settingsShare.value}fr`, '--ks-preview-share': `${100 - settingsShare.value}fr` }}>
-        {review.value && <ConfigDiff before={review.value.before} after={review.value.after} beforeName={review.value.beforeName} afterName={review.value.afterName} action={review.value.action} onClose={() => { review.value = null }} onConfirm={() => {
-          review.value?.confirm?.(); review.value = null
-        }} />}
         <header class="ks-studio-topbar" inert={expanded.value}>
           <div><strong>{t("配置工作台")}</strong><small role="status" aria-live="polite" title={t(message.value)}>{t(message.value || sourceName.value)}</small></div>
           <div class="ks-settings-search"><input aria-label={t("搜索设置")} placeholder={t("搜索设置、模式或 TOML 路径…")} value={searchQuery.value} onInput={e => searchQuery.value = (e.target as HTMLInputElement).value} />
@@ -1245,7 +1246,17 @@ export default defineComponent({
             {pageId.value === 'quick_switch' && renderQuickSwitch()}
             {pageId.value === 'mode_usage' && renderUsage()}
             {pageId.value === 'files' && renderFiles()}
-            {pageId.value === 'toml' && <div><button onClick={copyToml}>{t("复制 TOML")}</button><p>{t("下载保持局部配置；解析后不保留注释。")}</p><pre class="ks-toml"><code innerHTML={highlightToml(tomlPreview.value)} /></pre></div>}
+            <div hidden={pageId.value !== 'toml'}>
+              <div class="ks-settings-tabs" role="tablist" aria-label={t('TOML 查看')}>
+                {(['source', 'diff'] as const).map(tab => <button role="tab" aria-selected={tomlTab.value === tab} aria-pressed={tomlTab.value === tab} onClick={() => { tomlTab.value = tab }}
+                  onKeydown={event => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) { event.preventDefault(); tomlTab.value = event.key === 'Home' ? 'source' : event.key === 'End' ? 'diff' : tab === 'source' ? 'diff' : 'source'; (event.currentTarget as HTMLElement).parentElement?.querySelectorAll<HTMLButtonElement>('button')[tomlTab.value === 'source' ? 0 : 1]?.focus() } }}>{t(tab === 'source' ? '配置源码' : '变更对比')}</button>)}
+              </div>
+              <div role="tabpanel" aria-label={t('配置源码')} hidden={tomlTab.value !== 'source'}><button onClick={copyToml}>{t("复制 TOML")}</button><p>{t("下载保持局部配置；解析后不保留注释。")}</p><pre class="ks-toml"><code innerHTML={highlightToml(tomlPreview.value)} /></pre></div>
+              <div role="tabpanel" aria-label={t('变更对比')} hidden={tomlTab.value !== 'diff'}>
+                <ConfigDiff before={review.value?.before ?? importedSource.value} after={review.value?.after ?? tomlPreview.value} beforeName={review.value?.beforeName ?? sourceName.value} afterName={review.value?.afterName ?? t('当前配置')} action={review.value?.action}
+                  onClose={() => { review.value = null }} onConfirm={() => { review.value?.confirm?.(); review.value = null }} />
+              </div>
+            </div>
           </section>
           <PaneDivider value={settingsShare.value} disabled={expanded.value} onStart={releasePreview} onChange={value => settingsShare.value = value} />
           <aside ref={previewPane} class={{ 'ks-preview-pane': true, 'is-expanded': expanded.value }} role={expanded.value ? 'dialog' : 'complementary'} aria-modal={expanded.value ? true : undefined} aria-label={t("实时预览")} {...{ onKeydownCapture: previewDialogKey }}>

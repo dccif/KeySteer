@@ -27,7 +27,8 @@ pub(crate) use window_presets::PresetRepository;
 
 pub use plan::{
     AppRouteOverride, ConfigurationCandidate, ConfigurationRepository, DebugSettings,
-    EngineSettings, ModeRoute, ModeSpec, PaletteSet, QuickSwitchSettings, RuntimePlan,
+    EngineSettings, ModeRoute, ModeSpec, PaletteSet, PreparedRestart, QuickSwitchSettings,
+    RuntimePlan,
 };
 
 #[cfg(test)]
@@ -533,6 +534,7 @@ impl Engine {
         Ok(())
     }
 
+    #[inline(always)]
     fn run_runtime_turn(
         &mut self,
         backend: &mut dyn Backend,
@@ -557,6 +559,12 @@ impl Engine {
         {
             return Ok(());
         }
+        self.run_scheduled_work(backend)
+    }
+
+    // Keep deferred-work recovery out of the common input turn's instruction path.
+    #[inline(never)]
+    fn run_scheduled_work(&mut self, backend: &mut dyn Backend) -> Result<(), String> {
         let long_press_result = self.fire_due_long_press_toggles(backend);
         self.fire_quick_switch(backend)?;
         if let Err(error) = long_press_result
@@ -638,6 +646,12 @@ impl Engine {
         self.finish_runtime(backend, result)
     }
 
+    pub(crate) fn take_restart(&mut self) -> Option<Box<dyn PreparedRestart>> {
+        self.configuration
+            .as_mut()
+            .and_then(|source| source.take_restart())
+    }
+
     fn active_wants_pointer_events(&self) -> bool {
         self.registry
             .active_slot
@@ -649,7 +663,7 @@ impl Engine {
 
     /// Input dominates the event loop. Keep its dispatch small enough to
     /// inline independently of the growing set of background notifications.
-    #[inline]
+    #[inline(always)]
     fn handle_backend_event(
         &mut self,
         event: BackendEvent,
@@ -664,6 +678,7 @@ impl Engine {
         }
     }
 
+    #[inline(never)]
     fn handle_backend_notification(
         &mut self,
         event: BackendEvent,
@@ -683,10 +698,7 @@ impl Engine {
                     self.dispatch_owned_to(&owner, ModeEvent::WindowResult(result), backend)?;
                 }
             }
-            BackendEvent::Input(input) => {
-                crate::support::perf_probe::mark("input_received");
-                self.handle_key(input, backend)?;
-            }
+            BackendEvent::Input(_) => unreachable!("input is routed by handle_backend_event"),
             BackendEvent::InputInjectionFailed(message) => {
                 return Err(self.recoverable_input_error("asynchronous native input", message));
             }
@@ -886,7 +898,7 @@ impl Engine {
 
     /// Swap in a precompiled plan without restarting runtime-owned tasks.
     /// This is intended for deterministic tests and initial assembly only;
-    /// interactive reloads always use the controlled restart path.
+    /// production Reload replaces the process, while set_config resets the runtime plan.
     pub fn apply_plan(&mut self, plan: RuntimePlan) -> Result<(), String> {
         let RuntimePlan {
             settings,

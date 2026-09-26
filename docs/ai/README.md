@@ -8,6 +8,8 @@ Window 入口激活鼠标下窗口、可配置关闭动作见 [公共 API](02-ru
 
 # KeySteer 项目手册
 
+状态栏及快捷键 Reload 在配置验证成功后完整重启进程，配置验证或进程准备失败时保留旧实例；失败后的配置 worker／队列回收、配置快照管道与退出顺序见 [架构边界](10-architecture-boundaries.md#配置重载与进程重建)、[配置](03-configuration.md) 和 [验证](08-build-docs-and-tests.md)。
+
 保留 SmolStr + FxHashMap 后与 c2d718d 的直接性能/内存对照及仍增加的尾延迟场景，见 [验证记录](08-build-docs-and-tests.md)。
 
 运行时优先的五版本独立验收最终采用 SmolStr 与 FxHashMap，CompactString 未采用，见 [键存储](03-configuration.md)、[扫描索引](05-ui-scanning.md)、[性能取舍](07-rendering-and-performance.md) 和 [验证](08-build-docs-and-tests.md)。
@@ -16,7 +18,7 @@ Window 入口激活鼠标下窗口、可配置关闭动作见 [公共 API](02-ru
 
 优化库分阶段采用与回退见 [配置](03-configuration.md)、[扫描索引](05-ui-scanning.md)、[性能基准](07-rendering-and-performance.md) 和 [测试门禁](08-build-docs-and-tests.md)。
 
-模拟器 TOML 导入／导出变更预览、导入基线和任意两份文件对比见 [构建、文档站与测试](08-build-docs-and-tests.md)。
+模拟器 TOML 查看中的变更对比标签、可编辑语法高亮与行号、粘贴／上传对比、导入／导出预览与导入基线见 [构建、文档站与测试](08-build-docs-and-tests.md)。
 
 输入回滚错误聚合、快捷切换异步几何与前台确认见 [运行时](02-runtime-and-api.md) 和 [后端](06-platform-backends.md)；多屏 surface 实验取舍与文本缓冲回收见 [性能](07-rendering-and-performance.md)。Windows 原生资源模块拆分见 [项目地图](01-project-map.md)、[边界](10-architecture-boundaries.md)，回归入口见 [验证](08-build-docs-and-tests.md)。
 

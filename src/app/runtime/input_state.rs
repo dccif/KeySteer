@@ -1058,13 +1058,26 @@ impl Engine {
         Ok(())
     }
 
+    #[inline]
     pub(super) fn trace_key_resolution(
         &self,
         input: &crate::api::input::InputEvent,
         bound: Option<&ResolvedBinding>,
         trace_key: bool,
     ) {
-        self.trace_lazy(trace_key, "resolve", || match bound {
+        if trace_key {
+            self.trace_key_resolution_enabled(input, bound);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn trace_key_resolution_enabled(
+        &self,
+        input: &crate::api::input::InputEvent,
+        bound: Option<&ResolvedBinding>,
+    ) {
+        self.trace_lazy(true, "resolve", || match bound {
             Some(resolved) => format!(
                 "key={} pressed={:?} mode={} owner={} action={:?}",
                 input.key,
@@ -1083,7 +1096,7 @@ impl Engine {
             && !input.key.is_modifier()
             && self.registry.active == ModeId::idle()
         {
-            self.trace_lazy(trace_key, "resolve", || {
+            self.trace_lazy(true, "resolve", || {
                 let available = self
                     .registry
                     .table(&ModeId::idle())

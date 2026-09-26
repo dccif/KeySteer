@@ -17,6 +17,7 @@ pub(crate) struct ConfigRepository {
     source: String,
     store: Option<ConfigStore>,
     discovery_directory: Option<PathBuf>,
+    process_reload: bool,
 }
 
 impl ConfigRepository {
@@ -31,15 +32,32 @@ impl ConfigRepository {
             source,
             store,
             discovery_directory,
+            process_reload: false,
         }
+    }
+
+    pub(crate) fn with_process_reload(mut self) -> Self {
+        self.process_reload = true;
+        self
     }
 
     fn candidate(self, source_path: Option<PathBuf>) -> Result<ConfigurationCandidate, String> {
         let plan = compile(&self.config)?;
+        let restart = if self.process_reload {
+            Some(super::restart::prepare(super::restart::Snapshot {
+                source: self.source.clone(),
+                write_path: self.source_path(),
+                loaded_from_file: source_path.is_some(),
+                discovery_directory: self.discovery_directory.clone(),
+            })?)
+        } else {
+            None
+        };
         Ok(ConfigurationCandidate {
             plan,
             repository: Box::new(self),
             source_path,
+            restart,
         })
     }
 }
@@ -80,13 +98,14 @@ impl ConfigurationRepository for ConfigRepository {
                         loaded.raw_text.clone(),
                         crate::platform::atomic_replace,
                     );
-                    Self::new(
+                    let mut repository = Self::new(
                         loaded.config,
                         loaded.raw_text,
                         Some(store),
                         Some(directory.clone()),
-                    )
-                    .candidate(Some(loaded.path))
+                    );
+                    repository.process_reload = self.process_reload;
+                    repository.candidate(Some(loaded.path))
                 }
                 None => {
                     let config = ConfigFile::default();
@@ -96,7 +115,10 @@ impl ConfigurationRepository for ConfigRepository {
                         source.clone(),
                         crate::platform::atomic_replace,
                     );
-                    Self::new(config, source, Some(store), Some(directory.clone())).candidate(None)
+                    let mut repository =
+                        Self::new(config, source, Some(store), Some(directory.clone()));
+                    repository.process_reload = self.process_reload;
+                    repository.candidate(None)
                 }
             };
         }
@@ -106,7 +128,9 @@ impl ConfigurationRepository for ConfigRepository {
             let config = store.reload().map_err(|error| error.to_string())?;
             let source = store.source_text();
             let path = store.path().to_path_buf();
-            return Self::new(config, source, Some(store), None).candidate(Some(path));
+            let mut repository = Self::new(config, source, Some(store), None);
+            repository.process_reload = self.process_reload;
+            return repository.candidate(Some(path));
         }
 
         self.clone().candidate(None)
@@ -124,16 +148,18 @@ impl ConfigurationRepository for ConfigRepository {
         store.persist().map_err(|error| error.to_string())?;
         let source = store.source_text();
         let source_path = store.path().to_path_buf();
-        let repository = Self::new(
+        let mut repository = Self::new(
             config,
             source,
             Some(store),
             self.discovery_directory.clone(),
         );
+        repository.process_reload = self.process_reload;
         Ok(ConfigurationCandidate {
             plan,
             repository: Box::new(repository),
             source_path: Some(source_path),
+            restart: None,
         })
     }
 }

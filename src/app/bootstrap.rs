@@ -7,57 +7,100 @@ use crate::platform;
 use super::cli::CliOptions;
 use super::runtime::Engine;
 
-pub(crate) fn run(args: CliOptions) -> Result<(), String> {
+pub(crate) fn run(
+    args: CliOptions,
+) -> Result<Option<Box<dyn super::runtime::PreparedRestart>>, String> {
+    run_with_snapshot(args, None)
+}
+
+pub(crate) fn resume(
+    snapshot: super::restart::Snapshot,
+) -> Result<Option<Box<dyn super::runtime::PreparedRestart>>, String> {
+    run_with_snapshot(
+        CliOptions {
+            config: None,
+            check_only: false,
+            dump_config: false,
+            doctor: false,
+        },
+        Some(snapshot),
+    )
+}
+
+fn run_with_snapshot(
+    args: CliOptions,
+    snapshot: Option<super::restart::Snapshot>,
+) -> Result<Option<Box<dyn super::runtime::PreparedRestart>>, String> {
     crate::support::perf_probe::mark("bootstrap_started");
     let rediscover_config_on_reload = args.config.is_none();
-    let (config, config_path, loaded_from_file, config_source) = match &args.config {
-        Some(name) => {
-            if !name
-                .file_name()
-                .is_some_and(Config::is_portable_config_name)
-            {
-                return Err(format!(
-                    "config must be named keysteer.<name>.toml: {}",
-                    name.display()
-                ));
-            }
-            let path = crate::app::paths::explicit_config_file(name)?;
-            let loaded = Config::load_with_source(&path).map_err(|e| e.to_string())?;
-            (
-                loaded.config,
-                Some(loaded.path),
-                true,
-                Some(loaded.raw_text),
-            )
-        }
-        None => match Config::discover() {
-            Ok(Some(path)) => match Config::load_with_source(&path) {
-                Ok(loaded) => (
+    let discovery_directory = snapshot.as_ref().map_or_else(
+        || {
+            rediscover_config_on_reload
+                .then(crate::app::paths::data_dir)
+                .flatten()
+        },
+        |snapshot| snapshot.discovery_directory.clone(),
+    );
+    let (config, config_path, loaded_from_file, config_source) = if let Some(snapshot) = snapshot {
+        let config = Config::parse(&snapshot.source).map_err(|error| error.to_string())?;
+        (
+            config,
+            snapshot.write_path,
+            snapshot.loaded_from_file,
+            Some(snapshot.source),
+        )
+    } else {
+        match &args.config {
+            Some(name) => {
+                if !name
+                    .file_name()
+                    .is_some_and(Config::is_portable_config_name)
+                {
+                    return Err(format!(
+                        "config must be named keysteer.<name>.toml: {}",
+                        name.display()
+                    ));
+                }
+                let path = crate::app::paths::explicit_config_file(name)?;
+                let loaded = Config::load_with_source(&path).map_err(|e| e.to_string())?;
+                (
                     loaded.config,
                     Some(loaded.path),
                     true,
                     Some(loaded.raw_text),
-                ),
+                )
+            }
+            None => match Config::discover() {
+                Ok(Some(path)) => match Config::load_with_source(&path) {
+                    Ok(loaded) => (
+                        loaded.config,
+                        Some(loaded.path),
+                        true,
+                        Some(loaded.raw_text),
+                    ),
+                    Err(error) => {
+                        crate::support::logging::report_error(
+                            "config",
+                            format!(
+                                "could not apply {}; using built-in defaults: {error}",
+                                path.display()
+                            ),
+                        );
+                        (Config::default(), Config::default_write_path(), false, None)
+                    }
+                },
+                Ok(None) => (Config::default(), Config::default_write_path(), false, None),
                 Err(error) => {
                     crate::support::logging::report_error(
                         "config",
                         format!(
-                            "could not apply {}; using built-in defaults: {error}",
-                            path.display()
+                            "could not discover configuration; using built-in defaults: {error}"
                         ),
                     );
                     (Config::default(), Config::default_write_path(), false, None)
                 }
             },
-            Ok(None) => (Config::default(), Config::default_write_path(), false, None),
-            Err(error) => {
-                crate::support::logging::report_error(
-                    "config",
-                    format!("could not discover configuration; using built-in defaults: {error}"),
-                );
-                (Config::default(), Config::default_write_path(), false, None)
-            }
-        },
+        }
     };
     crate::support::logging::set_non_error_enabled(config.debug.enabled);
     crate::support::logging::start_session(platform::backend_name());
@@ -83,7 +126,7 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
 
     if args.dump_config {
         print!("{}", config.to_toml().map_err(|error| error.to_string())?);
-        return Ok(());
+        return Ok(None);
     }
 
     if config.debug.enabled {
@@ -102,10 +145,10 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
             super::configuration::compile(&config)?;
         }
         println!("ok");
-        return Ok(());
+        return Ok(None);
     }
     if args.doctor {
-        return doctor(&config);
+        return doctor(&config).map(|()| None);
     }
 
     let plan = super::configuration::compile(&config)?;
@@ -131,11 +174,9 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
         Some(source) => source,
         None => config.to_toml().map_err(|error| error.to_string())?,
     };
-    let discovery_directory = rediscover_config_on_reload
-        .then(crate::app::paths::data_dir)
-        .flatten();
     let repository =
-        super::configuration::ConfigRepository::new(config, source, store, discovery_directory);
+        super::configuration::ConfigRepository::new(config, source, store, discovery_directory)
+            .with_process_reload();
     let mut engine = Engine::from_plan(plan, backend.appearance())?;
     engine.attach_configuration(Box::new(repository));
     let data = super::paths::data_dir().ok_or("Cannot determine saved layouts directory")?;
@@ -144,7 +185,11 @@ pub(crate) fn run(args: CliOptions) -> Result<(), String> {
         crate::platform::atomic_replace,
     )));
 
-    engine.run(backend.as_mut())
+    engine.run(backend.as_mut())?;
+    let restart = engine.take_restart();
+    drop(engine);
+    drop(backend);
+    Ok(restart)
 }
 
 fn log_debug_configuration(config: &Config, config_path: Option<&std::path::Path>) {

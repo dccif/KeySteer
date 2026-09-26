@@ -34,13 +34,19 @@ Engine 组合四类有状态协作者：`ModeRegistry`、`InputState`、`Schedul
 Engine 不识别 Grid/UI Hint 字符表。`ModeRegistry` 独占实例、活动 slot、路由、插件 manifest、
 modal stack 和生命周期；其他三个协作者分别独占输入配对、deadline 与 overlay 呈现状态。
 
-## 原子热重载
+## 配置重载与进程重建
 
 候选配置先完整 parse、validate、compile；失败时当前 Mode、timer、scan、overlay 和合成输入均
-不改变。成功候选在当前命令批次边界执行受控重启：取消 scan/timer/sequence/modal/frame clock，
-释放 KeySteer 拥有的合成输入，替换完整 Mode/Plugin 集和路由，再进入新计划的 Idle。物理按键
-的 pressed/disposition 记录保留到真实 KeyUp，因此不会吞 Down 却放行 Up。Mode 不接收
-`ConfigReloaded`，`HostContext` 也不暴露配置。
+不改变。生产 Reload 由配置仓库准备新的进程，Engine 只接收 `PreparedRestart` 端口并退出循环，
+不把新计划部分安装到旧实例。正常退出路径取消任务、释放合成输入、保存工作区并关闭后端；
+bootstrap 丢弃旧 Engine/Backend，CLI 结束日志会话后才提交重启。任何关闭错误都会放弃待启动进程。
+新进程在 `--internal-reload` 入口等待 stdin EOF，之前不初始化日志或原生资源；通过管道交接
+已验证的配置原文、写入路径及自动发现目录，不传递旧模式、线程、缓存、按键或事件状态。
+不重新读文件，避免校验后文件又变化；持久工作区按正常启动重新加载。准备失败保持旧实例。
+进程生命周期和 TOML 交接在 `app/restart.rs`，Engine 不依赖进程或 TOML API。
+重启句柄仅在接受 Reload 时分配到配置仓库包装器，常驻 Engine 不增加字段；成功接受时清退延迟任务，不在普通输入循环增加退出检查。
+`set_config` 和不启用进程重启的测试宿主仍使用计划替换，保留物理 Down/Up 配对到真实 KeyUp。
+Mode 不接收 `ConfigReloaded`，`HostContext` 也不暴露配置。
 
 
 ## 工作区与原生资源的所有权
@@ -50,3 +56,5 @@ PresetRepository 增加异步提交端口，具体仓库拥有磁盘 worker 和�
 窗口会话的状态、排队策略、确认状态机、历史和相交缓存分模块高内聚，仍在同一 crate，不增加动态分发层或每操作分配的策略对象。原生 handle 的 owning wrapper 与 borrowing guard 放在 platform/windows/native，portable 层继续禁止 unsafe。
 
 配置 I/O 的实现仍在应用层 repository，runtime 的配置 worker 只经 ConfigurationRepository 端口执行；ConfigurationReady 事件不携带应用层类型。窗口布局确认与失败回滚集中在公共 window_session，不让 Mode / Engine 获取原生句柄。
+
+配置任务在发布完成通知前释放工作副本；队列排空后关闭配置 worker，回收线程、通道和队列容量。Reload 失败同时丢弃当时已排队的 Reload／set_config 请求，保留当前有效实例，下次点击重新读取文件。普通 set_config 失败仍按原顺序处理后续独立请求。清理只发生在配置完成路径，不增加普通按键处理工作。
