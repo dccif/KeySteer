@@ -1816,3 +1816,23 @@
 .ks-quick-settings .ks-quick-colors input[type="color"] { width: 34px; height: 30px; min-height: 0; flex-basis: 34px; padding: 0; border: 0; background: transparent; }
 .ks-quick-settings .ks-quick-colors input[type="range"] { min-height: 0; height: 18px; padding: 0; border: 0; }
 .ks-quick-settings .ks-quick-colors input:not([type]) { min-height: 30px; padding: 5px 6px; }
+
+
+/* CPU guidance is optional and stays below the primary AVX2 download. */
+.hero-cpu-note {
+  max-width: 600px;
+  margin-top: 14px;
+  color: var(--vp-c-text-2);
+  font-size: 12px;
+  line-height: 1.7;
+  text-align: left;
+}
+.hero-cpu-note summary { cursor: pointer; color: var(--vp-c-text-1); }
+.hero-cpu-note-body { margin-top: 8px; }
+.hero-cpu-note-body p { margin: 8px 0; }
+.hero-cpu-note-body ul { margin: 8px 0; padding-left: 20px; list-style: disc; }
+.hero-cpu-note-body a { color: var(--vp-c-brand-1); text-decoration: underline; }
+.hero-download-menu { max-height: min(560px, 75vh); overflow-y: auto; }
+@media (max-width: 959px) {
+  .hero-cpu-note { margin-left: auto; margin-right: auto; }
+}

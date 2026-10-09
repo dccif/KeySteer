@@ -111,7 +111,7 @@ jobs:
           echo "sha=$source_sha" >> "$GITHUB_OUTPUT"
 
   windows:
-    name: Windows ${{ matrix.arch }}
+    name: Windows ${{ matrix.arch }} ${{ matrix.variant }}
     needs: source
     if: ${{ inputs.publish || inputs.platform == 'windows' || inputs.platform == 'all' }}
     runs-on: ubuntu-24.04
@@ -121,19 +121,38 @@ jobs:
       matrix:
         include:
           - arch: x64
+            variant: compatible
             target: x86_64-pc-windows-msvc
             xwin_arch: x86_64
-            cpu: native
-            cl_flags: /clang:-march=native
+            cpu: x86-64
+            cl_flags: /clang:-march=x86-64
+            artifact: KeySteer-Windows-x64-Compatible
+          - arch: x64
+            variant: avx2
+            target: x86_64-pc-windows-msvc
+            xwin_arch: x86_64
+            cpu: x86-64-v3
+            cl_flags: /clang:-march=x86-64-v3
+            artifact: KeySteer-Windows-x64
+          - arch: x64
+            variant: avx512
+            target: x86_64-pc-windows-msvc
+            xwin_arch: x86_64
+            cpu: x86-64-v4
+            cl_flags: /clang:-march=x86-64-v4
+            artifact: KeySteer-Windows-x64-AVX512
           - arch: ARM64
+            variant: compatible
             target: aarch64-pc-windows-msvc
             xwin_arch: aarch64
             cpu: generic
             cl_flags: ""
+            artifact: KeySteer-Windows-ARM64
     env:
       KEYSTEER_CROSS_WINDOWS: "1"
-      # Optimize x64 for the actual runner CPU. ARM64 is cross-compiled on an
-      # x64 runner, so it must retain an architecture-appropriate generic CPU.
+      # Pin every x64 instruction-set level; runner CPU changes must never
+      # silently change the requirements of any published package.
+      # ARM64 retains its architecture-appropriate generic CPU.
       RUSTFLAGS: -C link-arg=/Brepro -C target-cpu=${{ matrix.cpu }}
       RC_PATH: llvm-rc
       # winresource probes a GNU prefix even for MSVC; bypass the misleading
@@ -222,12 +241,12 @@ jobs:
           SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
           KEYSTEER_SIGNING_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}
           KEYSTEER_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
-        run: bash packaging/windows/package-cross.sh ${{ matrix.target }}
+        run: bash packaging/windows/package-cross.sh ${{ matrix.target }} ${{ matrix.variant }}
 
       - name: Upload Windows package
         uses: actions/upload-artifact@v7
         with:
-          name: KeySteer-Windows-${{ matrix.arch }}
+          name: ${{ matrix.artifact }}
           path: dist/${{ matrix.target }}/*.zip
           if-no-files-found: error
           retention-days: 30
@@ -380,10 +399,24 @@ jobs:
 
       - name: Verify release assets
         shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
         run: |
-          test "$(find release-assets -maxdepth 1 -name '*.zip' | wc -l)" -eq 4
-          test "$(find release-assets -maxdepth 1 -name '*.sha256' | wc -l)" -eq 0
-          find release-assets -maxdepth 1 -type f -printf '%f\n' | sort
+          shopt -s nullglob
+          packages=(release-assets/*.zip)
+          checksums=(release-assets/*.sha256)
+          test "${#packages[@]}" -eq 6
+          test "${#checksums[@]}" -eq 0
+          for package in \
+            "KeySteer-v$VERSION-x86_64-pc-windows-msvc.zip" \
+            "KeySteer-v$VERSION-x86_64-pc-windows-msvc-compatible.zip" \
+            "KeySteer-v$VERSION-x86_64-pc-windows-msvc-avx512.zip" \
+            "KeySteer-v$VERSION-aarch64-pc-windows-msvc.zip" \
+            "KeySteer-v$VERSION-aarch64-apple-darwin.zip" \
+            "KeySteer-v$VERSION-x86_64-apple-darwin.zip"; do
+            test -s "release-assets/$package"
+            printf '%s\n' "$package"
+          done
 
       - name: Replace tag and GitHub Release
         id: publish

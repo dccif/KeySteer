@@ -3,6 +3,8 @@ export const LATEST_RELEASE_URL = `${RELEASES_URL}/latest`
 
 export const DOWNLOAD_TARGETS = [
   'x86_64-pc-windows-msvc',
+  'x86_64-pc-windows-msvc-compatible',
+  'x86_64-pc-windows-msvc-avx512',
   'aarch64-pc-windows-msvc',
   'aarch64-apple-darwin',
   'x86_64-apple-darwin',

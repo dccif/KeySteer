@@ -5,6 +5,12 @@ outline: false
 
 # Release notes
 
+## 0.11.6
+
+- Windows x64 now offers three builds: the default AVX2 (x86-64-v3) build, a compatible build for older CPUs, and an AVX-512 (x86-64-v4) build. Fixed instruction-set targets prevent startup crashes caused by changes to the build machine.
+- Use the default build for most PCs; if it will not start, try the compatible build. The website and release notes offer brief guidance: once running, let Check for Updates choose the build automatically.
+- Regardless of the initially downloaded build, Check for Updates automatically selects the highest level supported by your CPU and OS, including switching builds within the same version. Signature verification, installation, and rollback on failure remain in place. Network fallback consistently uses gh-proxy.
+
 ## 0.11.5
 
 Improved UIHint responsiveness on Windows and macOS, with labels appearing more promptly and fewer pauses on screens with many targets. Across the three target counts below, CPU processing time dropped by **48% on average**, with a reduction of up to **67%**.

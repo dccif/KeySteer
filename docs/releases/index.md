@@ -5,6 +5,16 @@ outline: false
 
 # 更新日志 / Release Notes
 
+## 0.11.6
+
+- Windows 提供三种 x64 构建：默认 AVX2（x86-64-v3）版、旧 CPU 兼容版、AVX-512（x86-64-v4）版。固定编译指令集，避免构建机器变化导致启动即退出。
+- 一般下载默认版即可；无法启动时尝试兼容版。网页与发布说明提供简明提醒，启动后交给「检查更新」自动选包。
+- 无论最初下载兼容版、AVX2 版还是 AVX-512 版，「检查更新」都会自动选择 CPU 和系统支持的最高等级。同一版本也可切换构建，无需自行判断；保留签名校验、安装与失败回滚，网络回退统一使用 gh-proxy。
+
+- Windows x64 now offers three builds: the default AVX2 (x86-64-v3) build, a compatible build for older CPUs, and an AVX-512 (x86-64-v4) build. Fixed instruction-set targets prevent startup crashes caused by changes to the build machine.
+- Use the default build for most PCs; if it will not start, try the compatible build. The website and release notes offer brief guidance: once running, let Check for Updates choose the build automatically.
+- Regardless of the initially downloaded build, Check for Updates automatically selects the highest level supported by your CPU and OS, including switching builds within the same version. Signature verification, installation, and rollback on failure remain in place. Network fallback consistently uses gh-proxy.
+
 ## 0.11.5
 
 优化 Windows 和 macOS 的 UIHint 响应，让标签显示更及时、多标签界面更流畅。下表三个规模的结果处理 CPU 耗时平均降低约 **48%**，最高降低约 **67%**。

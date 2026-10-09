@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { fetchLatestRelease, loadLatestRelease, LATEST_RELEASE_URL, parseLatestRelease } from '../latest-release.ts'
+import { fetchLatestRelease, loadLatestRelease, LATEST_RELEASE_URL, parseLatestRelease, DOWNLOAD_TARGETS } from '../latest-release.ts'
 
 const targets = [
   'x86_64-pc-windows-msvc',
@@ -131,4 +131,23 @@ test('offline preview keeps an explicitly selected release page', async (context
   const release = await loadLatestRelease('serve', undefined, 'v1.2.0')
   assert.equal(release.url, 'https://github.com/dccif/KeySteer/releases/tag/v1.2.0')
   assert.deepEqual(release.assets, {})
+})
+
+
+test('CPU-specific Windows assets never replace the default AVX2 URL', () => {
+  const defaultTarget = 'x86_64-pc-windows-msvc'
+  const variants = [defaultTarget, `${defaultTarget}-compatible`, `${defaultTarget}-avx512`]
+  const assets = variants.map((target) => ({
+    name: `KeySteer-v1.2.3-${target}.zip`,
+    browser_download_url: `https://github.com/dccif/KeySteer/releases/download/v1.2.3/${target}.zip`,
+  }))
+  const expected = Object.fromEntries(variants.map((target, index) => [target, assets[index].browser_download_url]))
+  for (const order of [assets, [...assets].reverse()]) {
+    const release = parseLatestRelease({ tag_name: 'v1.2.3', assets: order }, DOWNLOAD_TARGETS)
+    assert.deepEqual(release?.assets, expected)
+  }
+
+  const advancedOnly = parseLatestRelease({ tag_name: 'v1.2.3', assets: assets.slice(1) }, DOWNLOAD_TARGETS)
+  assert.equal(advancedOnly?.assets[defaultTarget], undefined)
+  assert.equal(advancedOnly?.assets[`${defaultTarget}-avx512`], assets[2].browser_download_url)
 })

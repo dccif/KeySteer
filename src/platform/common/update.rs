@@ -15,7 +15,6 @@ use crate::api::backend::{UpdateCheckResult, UpdateProgress};
 use crate::support::worker::WorkerJoin;
 
 const LATEST_RELEASE_API: &str = "https://api.github.com/repos/dccif/KeySteer/releases/latest";
-const CDN_VERSIONS_API: &str = "https://data.jsdelivr.com/v1/package/gh/dccif/KeySteer";
 const RELEASE_DOWNLOAD_ROOT: &str = "https://github.com/dccif/KeySteer/releases/download";
 const GH_PROXY_ROOT: &str = "https://gh-proxy.com";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
@@ -117,22 +116,32 @@ struct LatestAsset {
     digest: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct CdnVersions {
-    #[serde(default)]
-    versions: Vec<String>,
-}
-
 struct ReleaseInfo {
     version: Version,
-    asset: Option<ReleaseAsset>,
+    asset: ReleaseAsset,
     source: ReleaseSource,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReleaseSource {
     GitHub,
-    JsDelivr,
+    GhProxy,
+}
+
+impl ReleaseSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::GitHub => "GitHub",
+            Self::GhProxy => "gh-proxy",
+        }
+    }
+
+    fn metadata_url(self) -> String {
+        match self {
+            Self::GitHub => LATEST_RELEASE_API.into(),
+            Self::GhProxy => gh_proxy_url(LATEST_RELEASE_API),
+        }
+    }
 }
 
 struct ReleaseAsset {
@@ -223,11 +232,12 @@ fn check_latest_release(
     ensure_not_cancelled(cancel)?;
     let current = Version::parse(env!("CARGO_PKG_VERSION"))
         .map_err(|error| format!("invalid current package version: {error}"))?;
-    let target = release_target()?;
+    let current_target = release_target(false)?;
+    let target = release_target(true)?;
     let latest = fetch_latest_release(target, cancel)?;
     ensure_not_cancelled(cancel)?;
 
-    if !update_available(&current, &latest)? {
+    if !update_needed(&current, current_target, &latest.version, target) {
         return Ok(UpdateCheckResult::UpToDate {
             current: current.to_string(),
         });
@@ -251,31 +261,39 @@ fn check_latest_release(
     })
 }
 
+// A newer release always updates; the same release can switch CPU builds.
+// Never downgrade the application version, and stop offering a switch once
+// the running build already matches the highest usable CPU level.
+fn update_needed(current: &Version, current_target: &str, latest: &Version, target: &str) -> bool {
+    latest > current || (latest == current && current_target != target)
+}
+
 fn fetch_latest_release(target: &str, cancel: &AtomicBool) -> Result<ReleaseInfo, String> {
-    match fetch_github_release(target) {
+    fetch_latest_release_with(cancel, |source| fetch_github_release(target, source))
+}
+
+fn fetch_latest_release_with(
+    cancel: &AtomicBool,
+    mut fetch: impl FnMut(ReleaseSource) -> Result<ReleaseInfo, FetchFailure>,
+) -> Result<ReleaseInfo, String> {
+    ensure_not_cancelled(cancel)?;
+    match fetch(ReleaseSource::GitHub) {
         Ok(release) => Ok(release),
         Err(github) => {
             ensure_not_cancelled(cancel)?;
-            match fetch_cdn_version() {
-                Ok(version) => Ok(ReleaseInfo {
-                    version,
-                    asset: None,
-                    source: ReleaseSource::JsDelivr,
-                }),
-                Err(cdn) => {
-                    if github.timed_out && cdn.timed_out {
-                        Err(format!(
-                            "Update check timed out: GitHub and the CDN fallback each exceeded {} seconds.",
-                            REQUEST_TIMEOUT.as_secs()
-                        ))
-                    } else {
-                        Err(format!(
-                            "Update check failed. {}: {}; CDN retry via {}: {}",
-                            github.source, github.details, cdn.source, cdn.details
-                        ))
-                    }
+            fetch(ReleaseSource::GhProxy).map_err(|proxy| {
+                if github.timed_out && proxy.timed_out {
+                    format!(
+                        "Update check timed out: GitHub and gh-proxy each exceeded {} seconds.",
+                        REQUEST_TIMEOUT.as_secs()
+                    )
+                } else {
+                    format!(
+                        "Update check failed. {}: {}; mirror retry via {}: {}",
+                        github.source, github.details, proxy.source, proxy.details
+                    )
                 }
-            }
+            })
         }
     }
 }
@@ -288,84 +306,53 @@ fn ensure_not_cancelled(cancel: &AtomicBool) -> Result<(), String> {
     }
 }
 
-fn fetch_github_release(target: &str) -> Result<ReleaseInfo, FetchFailure> {
+fn fetch_github_release(target: &str, source: ReleaseSource) -> Result<ReleaseInfo, FetchFailure> {
     let agent: ureq::Agent = metadata_agent_config().into();
     let release: LatestRelease = agent
-        .get(LATEST_RELEASE_API)
+        .get(source.metadata_url())
         .header("Accept", "application/vnd.github+json")
         .header(
             "User-Agent",
             concat!("KeySteer/", env!("CARGO_PKG_VERSION")),
         )
         .call()
-        .map_err(|error| FetchFailure::network("GitHub", error))?
+        .map_err(|error| FetchFailure::network(source.label(), error))?
         .body_mut()
         .with_config()
         .limit(MAX_RELEASE_RESPONSE_BYTES)
         .read_json()
-        .map_err(|error| FetchFailure::network("GitHub", error))?;
+        .map_err(|error| FetchFailure::network(source.label(), error))?;
+    parse_github_release(release, target, source)
+}
+
+fn parse_github_release(
+    release: LatestRelease,
+    target: &str,
+    source: ReleaseSource,
+) -> Result<ReleaseInfo, FetchFailure> {
     let version = parse_release_version(&release.tag_name)
-        .map_err(|error| FetchFailure::content("GitHub", error))?;
+        .map_err(|error| FetchFailure::content(source.label(), error))?;
     let asset_name = release_asset_name(&version, target);
     let asset = release
         .assets
         .into_iter()
         .find(|asset| asset.name == asset_name)
         .ok_or_else(|| {
-            FetchFailure::content("GitHub", format!("release asset {asset_name} is missing"))
+            FetchFailure::content(
+                source.label(),
+                format!("release asset {asset_name} is missing"),
+            )
         })?;
     let sha256 = parse_sha256_digest(asset.digest.as_deref())
-        .map_err(|error| FetchFailure::content("GitHub", error))?;
+        .map_err(|error| FetchFailure::content(source.label(), error))?;
     Ok(ReleaseInfo {
         version,
-        asset: Some(ReleaseAsset {
+        asset: ReleaseAsset {
             size: asset.size,
             sha256,
-        }),
-        source: ReleaseSource::GitHub,
+        },
+        source,
     })
-}
-
-fn fetch_cdn_version() -> Result<Version, FetchFailure> {
-    let agent: ureq::Agent = metadata_agent_config().into();
-    let response: CdnVersions = agent
-        .get(CDN_VERSIONS_API)
-        .header("Accept", "application/json")
-        .header(
-            "User-Agent",
-            concat!("KeySteer/", env!("CARGO_PKG_VERSION")),
-        )
-        .call()
-        .map_err(|error| FetchFailure::network("jsDelivr", error))?
-        .body_mut()
-        .with_config()
-        .limit(MAX_RELEASE_RESPONSE_BYTES)
-        .read_json()
-        .map_err(|error| FetchFailure::network("jsDelivr", error))?;
-    latest_stable_version(&response.versions)
-        .map_err(|error| FetchFailure::content("jsDelivr", error))
-}
-
-fn latest_stable_version(versions: &[String]) -> Result<Version, String> {
-    versions
-        .iter()
-        .filter_map(|value| parse_release_version(value).ok())
-        .filter(|version| version.pre.is_empty())
-        .max()
-        .ok_or_else(|| "version metadata contains no stable SemVer release".into())
-}
-
-fn update_available(current: &Version, latest: &ReleaseInfo) -> Result<bool, String> {
-    if &latest.version > current {
-        return Ok(true);
-    }
-    if latest.source == ReleaseSource::GitHub {
-        return Ok(false);
-    }
-    Err(format!(
-        "Could not verify the latest release because GitHub was unavailable and jsDelivr currently reports version {}. Please retry later.",
-        latest.version
-    ))
 }
 
 fn parse_release_version(tag: &str) -> Result<Version, String> {
@@ -386,9 +373,61 @@ fn parse_sha256_digest(digest: Option<&str>) -> Result<Option<String>, String> {
     Ok(Some(value.to_ascii_lowercase()))
 }
 
-fn release_target() -> Result<&'static str, String> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
+// Use the same feature requirements for the running binary (false) and the
+// best package usable on this machine (true), regardless of the original ZIP.
+fn release_target(include_runtime: bool) -> Result<&'static str, String> {
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    let (v3, v4) = windows_x64_cpu_levels(include_runtime);
+    #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+    let (v3, v4) = {
+        let _ = include_runtime;
+        (false, false)
+    };
+    release_target_for(std::env::consts::OS, std::env::consts::ARCH, v3, v4)
+}
+
+// Detect usable features, including the OS-managed AVX register state. AVX2
+// alone does not prove support for the full v3 build, nor AVX512F for v4.
+// This runs only in the background update check, never in an input hot path.
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+fn windows_x64_cpu_levels(include_runtime: bool) -> (bool, bool) {
+    macro_rules! has_feature {
+        ($feature:tt) => {
+            cfg!(target_feature = $feature)
+                || (include_runtime && std::is_x86_feature_detected!($feature))
+        };
+    }
+    let v3 = has_feature!("cmpxchg16b")
+        && has_feature!("sse3")
+        && has_feature!("ssse3")
+        && has_feature!("sse4.1")
+        && has_feature!("sse4.2")
+        && has_feature!("popcnt")
+        && has_feature!("avx")
+        && has_feature!("avx2")
+        && has_feature!("bmi1")
+        && has_feature!("bmi2")
+        && has_feature!("f16c")
+        && has_feature!("fma")
+        && has_feature!("lzcnt")
+        && has_feature!("movbe")
+        && has_feature!("xsave");
+    let v4 = v3
+        && has_feature!("avx512f")
+        && has_feature!("avx512bw")
+        && has_feature!("avx512cd")
+        && has_feature!("avx512dq")
+        && has_feature!("avx512vl");
+    (v3, v4)
+}
+
+fn release_target_for(os: &str, arch: &str, v3: bool, v4: bool) -> Result<&'static str, String> {
+    match (os, arch) {
+        ("windows", "x86_64") => Ok(match (v3, v4) {
+            (true, true) => "x86_64-pc-windows-msvc-avx512",
+            (true, false) => "x86_64-pc-windows-msvc",
+            (false, _) => "x86_64-pc-windows-msvc-compatible",
+        }),
         ("windows", "aarch64") => Ok("aarch64-pc-windows-msvc"),
         ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
         ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
@@ -420,9 +459,8 @@ fn download_release(
     let destination = directory.join(&file_name);
     let partial = directory.join(format!(".{file_name}.part"));
     let partial_guard = PartialDownload::new(partial);
-    if let Some(asset) = release.asset.as_ref()
-        && asset.size > MAX_DOWNLOAD_BYTES
-    {
+    let asset = &release.asset;
+    if asset.size > MAX_DOWNLOAD_BYTES {
         return Err(format!(
             "release asset is {} bytes, above the {} MiB update limit",
             asset.size,
@@ -430,30 +468,37 @@ fn download_release(
         ));
     }
 
-    if let Err(direct_error) = download_and_validate(
-        &url,
+    // When metadata already needed the mirror, avoid another failed direct
+    // connection before downloading. Both paths validate the same asset.
+    let proxy_url = gh_proxy_url(&url);
+    let attempts = match release.source {
+        ReleaseSource::GitHub => [(&url, "GitHub"), (&proxy_url, "gh-proxy")],
+        ReleaseSource::GhProxy => [(&proxy_url, "gh-proxy"), (&url, "GitHub")],
+    };
+    if let Err(first_error) = download_and_validate(
+        attempts[0].0,
         partial_guard.path(),
         target,
-        release.asset.as_ref(),
+        asset,
         progress,
         cancel,
     ) {
         ensure_not_cancelled(cancel)?;
-        let proxy_url = gh_proxy_url(&url);
         progress(0);
         download_and_validate(
-            &proxy_url,
+            attempts[1].0,
             partial_guard.path(),
             target,
-            release.asset.as_ref(),
+            asset,
             progress,
             cancel,
         )
-        .map_err(|proxy_error| {
-                format!(
-                    "Official GitHub download failed: {direct_error}\n\ngh-proxy retry failed: {proxy_error}"
-                )
-            })?;
+        .map_err(|retry_error| {
+            format!(
+                "{} download failed: {first_error}\n\n{} retry failed: {retry_error}",
+                attempts[0].1, attempts[1].1
+            )
+        })?;
     }
     replace_download(partial_guard.path(), &destination)?;
     Ok(destination)
@@ -467,25 +512,23 @@ fn download_and_validate(
     url: &str,
     path: &Path,
     target: &str,
-    asset: Option<&ReleaseAsset>,
+    asset: &ReleaseAsset,
     progress: &dyn Fn(u8),
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    let receipt = download_to(url, path, asset.map(|asset| asset.size), progress, cancel)?;
+    let receipt = download_to(url, path, Some(asset.size), progress, cancel)?;
     ensure_not_cancelled(cancel)?;
     validate_release_payload(path, target)?;
-    if let Some(asset) = asset {
-        if receipt.bytes != asset.size {
-            return Err(format!(
-                "download size mismatch: expected {} bytes, received {}",
-                asset.size, receipt.bytes
-            ));
-        }
-        if let Some(expected) = asset.sha256.as_deref()
-            && receipt.sha256 != expected
-        {
-            return Err("downloaded update failed GitHub SHA-256 verification".into());
-        }
+    if receipt.bytes != asset.size {
+        return Err(format!(
+            "download size mismatch: expected {} bytes, received {}",
+            asset.size, receipt.bytes
+        ));
+    }
+    if let Some(expected) = asset.sha256.as_deref()
+        && receipt.sha256 != expected
+    {
+        return Err("downloaded update failed GitHub SHA-256 verification".into());
     }
     progress(100);
     Ok(())
@@ -763,9 +806,10 @@ mod tests {
 
     #[test]
     #[ignore = "requires live HTTPS access"]
-    fn jsdelivr_version_metadata_live_https_smoke() {
-        let version = fetch_cdn_version().expect("jsDelivr should return stable SemVer metadata");
-        assert!(version.pre.is_empty());
+    fn gh_proxy_release_metadata_live_https_smoke() {
+        let release = fetch_github_release("x86_64-pc-windows-msvc", ReleaseSource::GhProxy)
+            .expect("gh-proxy should return GitHub release metadata");
+        assert!(release.version.pre.is_empty());
     }
 
     #[test]
@@ -829,6 +873,155 @@ mod tests {
     }
 
     #[test]
+    fn windows_updates_choose_only_a_fully_supported_cpu_level() {
+        let version = Version::new(0, 11, 6);
+        for (v3, v4, expected) in [
+            (
+                false,
+                false,
+                "KeySteer-v0.11.6-x86_64-pc-windows-msvc-compatible.zip",
+            ),
+            (true, false, "KeySteer-v0.11.6-x86_64-pc-windows-msvc.zip"),
+            (
+                true,
+                true,
+                "KeySteer-v0.11.6-x86_64-pc-windows-msvc-avx512.zip",
+            ),
+            (
+                false,
+                true,
+                "KeySteer-v0.11.6-x86_64-pc-windows-msvc-compatible.zip",
+            ),
+        ] {
+            let target = release_target_for("windows", "x86_64", v3, v4).unwrap();
+            assert_eq!(release_asset_name(&version, target), expected);
+        }
+        for (os, arch, target) in [
+            ("windows", "aarch64", "aarch64-pc-windows-msvc"),
+            ("macos", "aarch64", "aarch64-apple-darwin"),
+            ("macos", "x86_64", "x86_64-apple-darwin"),
+        ] {
+            assert_eq!(release_target_for(os, arch, true, true).unwrap(), target);
+        }
+        assert!(release_target_for("linux", "x86_64", true, true).is_err());
+    }
+
+    #[test]
+    fn same_version_updates_select_the_highest_supported_build_from_any_package() {
+        let version = Version::new(0, 11, 6);
+        let targets = [
+            "x86_64-pc-windows-msvc-compatible",
+            "x86_64-pc-windows-msvc",
+            "x86_64-pc-windows-msvc-avx512",
+        ];
+        for (v3, v4, expected_index) in [(false, false, 0), (true, false, 1), (true, true, 2)] {
+            let target = release_target_for("windows", "x86_64", v3, v4).unwrap();
+            assert_eq!(target, targets[expected_index]);
+            for (index, current_target) in targets.iter().enumerate() {
+                assert_eq!(
+                    update_needed(&version, current_target, &version, target),
+                    index != expected_index,
+                    "{current_target} -> {target}"
+                );
+            }
+        }
+        // Platforms without CPU variants keep their existing same-version behavior.
+        for (os, arch) in [
+            ("windows", "aarch64"),
+            ("macos", "aarch64"),
+            ("macos", "x86_64"),
+        ] {
+            let target = release_target_for(os, arch, false, false).unwrap();
+            assert!(!update_needed(&version, target, &version, target));
+        }
+    }
+
+    #[test]
+    fn cpu_build_switches_never_downgrade_the_application_version() {
+        let current = Version::new(0, 11, 6);
+        let targets = [
+            "x86_64-pc-windows-msvc-compatible",
+            "x86_64-pc-windows-msvc",
+            "x86_64-pc-windows-msvc-avx512",
+        ];
+        for current_target in targets {
+            for target in targets {
+                assert!(update_needed(
+                    &current,
+                    current_target,
+                    &Version::new(0, 11, 7),
+                    target
+                ));
+                assert!(!update_needed(
+                    &current,
+                    current_target,
+                    &Version::new(0, 11, 5),
+                    target
+                ));
+                assert!(!update_needed(
+                    &current,
+                    current_target,
+                    &Version::parse("0.11.6-rc.1").unwrap(),
+                    target
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn release_metadata_uses_the_selected_packages_size_and_digest() {
+        let targets = [
+            "x86_64-pc-windows-msvc",
+            "x86_64-pc-windows-msvc-compatible",
+            "x86_64-pc-windows-msvc-avx512",
+        ];
+        for (index, target) in targets.iter().enumerate() {
+            for reverse in [false, true] {
+                let mut assets: Vec<_> = targets
+                    .iter()
+                    .enumerate()
+                    .map(|(i, target)| LatestAsset {
+                        name: release_asset_name(&Version::new(0, 11, 6), target),
+                        size: 100 + i as u64,
+                        digest: Some(format!("sha256:{}", format!("{i:02x}").repeat(32))),
+                    })
+                    .collect();
+                if reverse {
+                    assets.reverse();
+                }
+                let release = parse_github_release(
+                    LatestRelease {
+                        tag_name: "v0.11.6".into(),
+                        assets,
+                    },
+                    target,
+                    ReleaseSource::GitHub,
+                )
+                .unwrap();
+                let asset = release.asset;
+                assert_eq!(asset.size, 100 + index as u64);
+                assert_eq!(asset.sha256, Some(format!("{index:02x}").repeat(32)));
+            }
+        }
+        // An older CPU must never fall back to an unsupported default package.
+        let error = parse_github_release(
+            LatestRelease {
+                tag_name: "v0.11.6".into(),
+                assets: vec![LatestAsset {
+                    name: "KeySteer-v0.11.6-x86_64-pc-windows-msvc.zip".into(),
+                    size: 100,
+                    digest: None,
+                }],
+            },
+            targets[1],
+            ReleaseSource::GhProxy,
+        )
+        .err()
+        .unwrap();
+        assert!(error.details.contains("msvc-compatible.zip is missing"));
+    }
+
+    #[test]
     fn gh_proxy_wraps_the_original_release_url() {
         assert_eq!(
             gh_proxy_url("https://github.com/dccif/KeySteer/releases/download/v0.5.0/a.zip"),
@@ -878,39 +1071,82 @@ mod tests {
     }
 
     #[test]
-    fn cdn_metadata_selects_the_highest_stable_semver() {
-        let versions = ["0.8.12", "0.9.0-beta.1", "not-a-release", "v0.8.13"].map(str::to_string);
+    fn metadata_retry_uses_gh_proxy_and_keeps_the_cpu_package_identity() {
+        let target = "x86_64-pc-windows-msvc-avx512";
+        let cancel = AtomicBool::new(false);
+        let mut requests = Vec::new();
+        let release = fetch_latest_release_with(&cancel, |source| {
+            requests.push(source.metadata_url());
+            if source == ReleaseSource::GitHub {
+                return Err(FetchFailure::content(source.label(), "offline"));
+            }
+            parse_github_release(
+                LatestRelease {
+                    tag_name: "v0.11.6".into(),
+                    assets: vec![LatestAsset {
+                        name: "KeySteer-v0.11.6-x86_64-pc-windows-msvc-avx512.zip".into(),
+                        size: 123,
+                        digest: Some(format!("sha256:{}", "ab".repeat(32))),
+                    }],
+                },
+                target,
+                source,
+            )
+        })
+        .unwrap();
         assert_eq!(
-            latest_stable_version(&versions).unwrap(),
-            Version::new(0, 8, 13)
+            requests,
+            [
+                LATEST_RELEASE_API.to_owned(),
+                "https://gh-proxy.com/https://api.github.com/repos/dccif/KeySteer/releases/latest"
+                    .into()
+            ]
+        );
+        assert_eq!(release.version, Version::new(0, 11, 6));
+        assert!(release.source == ReleaseSource::GhProxy);
+        assert_eq!(release.asset.size, 123);
+        assert_eq!(release.asset.sha256, Some("ab".repeat(32)));
+        assert_eq!(
+            gh_proxy_url(&format!(
+                "{RELEASE_DOWNLOAD_ROOT}/v{}/{}",
+                release.version,
+                release_asset_name(&release.version, target)
+            )),
+            "https://gh-proxy.com/https://github.com/dccif/KeySteer/releases/download/v0.11.6/KeySteer-v0.11.6-x86_64-pc-windows-msvc-avx512.zip"
         );
     }
 
     #[test]
-    fn newer_cdn_fallback_still_reports_an_available_update() {
-        let latest = ReleaseInfo {
-            version: Version::new(0, 8, 13),
-            asset: None,
-            source: ReleaseSource::JsDelivr,
-        };
-        assert!(update_available(&Version::new(0, 8, 12), &latest).unwrap());
+    fn cancelled_metadata_check_does_not_contact_the_mirror() {
+        let cancel = AtomicBool::new(false);
+        let mut attempts = 0;
+        let error = fetch_latest_release_with(&cancel, |source| {
+            attempts += 1;
+            cancel.store(true, Ordering::Release);
+            Err(FetchFailure::content(source.label(), "cancelled"))
+        })
+        .err()
+        .unwrap();
+        assert_eq!(attempts, 1);
+        assert!(error.contains("cancelled"));
     }
 
     #[test]
-    fn non_authoritative_fallback_never_claims_the_current_version_is_latest() {
-        let fallback = ReleaseInfo {
-            version: Version::new(0, 8, 12),
-            asset: None,
-            source: ReleaseSource::JsDelivr,
-        };
-        let error = update_available(&Version::new(0, 8, 12), &fallback).unwrap_err();
-        assert!(error.contains("Could not verify the latest release"));
-
-        let github = ReleaseInfo {
-            source: ReleaseSource::GitHub,
-            ..fallback
-        };
-        assert!(!update_available(&Version::new(0, 8, 12), &github).unwrap());
+    fn metadata_failures_report_both_sources_and_their_timeouts() {
+        for timed_out in [false, true] {
+            let error = fetch_latest_release_with(&AtomicBool::new(false), |source| {
+                Err(FetchFailure {
+                    source: source.label(),
+                    timed_out,
+                    details: "offline".into(),
+                })
+            })
+            .err()
+            .unwrap();
+            assert!(error.contains("GitHub"));
+            assert!(error.contains("gh-proxy"));
+            assert_eq!(error.contains("timed out"), timed_out);
+        }
     }
 
     #[test]
