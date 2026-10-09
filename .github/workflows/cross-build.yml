@@ -142,7 +142,6 @@ jobs:
             cl_flags: /clang:-march=x86-64-v4
             artifact: KeySteer-Windows-x64-AVX512
           - arch: ARM64
-            variant: compatible
             target: aarch64-pc-windows-msvc
             xwin_arch: aarch64
             cpu: generic

@@ -3,16 +3,13 @@
 set -euo pipefail
 
 target="${1:-}"
-variant="${2:-avx2}"
-if [[ "$target" == "aarch64-pc-windows-msvc" && -z "${2:-}" ]]; then
-  variant="compatible"
-fi
+variant="${2:-}"
 case "$target" in
   x86_64-pc-windows-msvc|aarch64-pc-windows-msvc) ;;
   *) echo "unsupported Windows target: $target" >&2; exit 2 ;;
 esac
 case "$target:$variant" in
-  x86_64-pc-windows-msvc:avx2|aarch64-pc-windows-msvc:compatible) suffix="" ;;
+  x86_64-pc-windows-msvc:|x86_64-pc-windows-msvc:avx2|aarch64-pc-windows-msvc:) suffix="" ;;
   x86_64-pc-windows-msvc:compatible) suffix="-compatible" ;;
   x86_64-pc-windows-msvc:avx512) suffix="-avx512" ;;
   *) echo "unsupported Windows CPU variant: $target / $variant" >&2; exit 2 ;;
