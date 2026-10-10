@@ -98,3 +98,37 @@ fn native_event_loop_services_due_timers_and_async_scan_results() {
     assert_eq!(*seen.lock().unwrap(), ["timer", "scan"]);
     assert_eq!(log.lock().unwrap().shutdowns, 1);
 }
+
+#[test]
+fn zero_delay_work_yields_to_input_between_dispatches() {
+    struct Preparation { seen: Arc<Mutex<Vec<&'static str>>>, remaining: usize }
+    impl Mode for Preparation {
+        fn id(&self) -> ModeId { ModeId::idle() }
+        fn handle(&mut self, event: &ModeEvent, _: &HostContext<'_>) -> CommandBatch {
+            let schedule = || CommandBatch::one(Command::SetTimer {
+                id: "cooperative-prewarm".into(), delay: Duration::ZERO, repeating: false,
+            });
+            match event {
+                ModeEvent::Activated { .. } => schedule(),
+                ModeEvent::Timer { .. } => {
+                    self.seen.lock().unwrap().push("prepare");
+                    self.remaining -= 1;
+                    if self.remaining > 0 { schedule() } else { CommandBatch::new() }
+                }
+                ModeEvent::Key { state: KeyState::Down, .. } => {
+                    self.seen.lock().unwrap().push("input");
+                    CommandBatch::new()
+                }
+                _ => CommandBatch::new(),
+            }
+        }
+    }
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut engine = Engine::new(Config::default(), Appearance::Dark);
+    engine.register(Box::new(Preparation { seen: Arc::clone(&seen), remaining: 3 }));
+    let (mut backend, log) = FakeBackend::new(Vec::new());
+    backend.native_batches = Some(vec![Ok(Vec::new()), Ok(vec![key_down("a")]), Ok(Vec::new())]);
+    engine.run(&mut backend).unwrap();
+    assert_eq!(*seen.lock().unwrap(), ["prepare", "input", "prepare", "prepare"]);
+    assert_eq!(log.lock().unwrap().shutdowns, 1);
+}

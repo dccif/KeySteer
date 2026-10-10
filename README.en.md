@@ -25,7 +25,7 @@ KeySteer brings native keyboard control to Windows and macOS. Move and click wit
 - **Hold and drag**: hold or toggle the left, middle, or right mouse button for dragging.
 - **Grid**: quickly target a region with a two-key combination.
 - **Recursive Grid**: keep subdividing the current region for precise targeting.
-- **UI Hint**: type labels shown on buttons, links, menus, and inputs. macOS supports Accessibility Tree, Vision, and Hybrid strategies; Windows supports UI Automation, dual OCR visual recognition, and Hybrid.
+- **UI Hint**: type labels shown on buttons, links, menus, and inputs; search by text or Chinese pinyin initials, copy information, and sample colors. macOS supports Accessibility Tree, Vision, and Hybrid strategies; Windows supports UI Automation, dual OCR visual recognition, and Hybrid.
 - **Multiple displays**: use `Primary+S` to switch to the next display.
 - **Appearance and configuration**: customise Grid/Hint labels, indicators, and more with TOML.
 
@@ -47,7 +47,7 @@ On macOS, the Window entry is **Option+W**, not Command+W. From Window, use `A` 
 
 ## Video demonstrations
 
-Seven short, silent simulator recordings: **keys and the current action centred together at the bottom**, with Chinese and English captions. Play the videos below directly on GitHub. All bindings shown are configurable.
+Short, silent demonstrations with Chinese and English captions. All bindings shown are configurable.
 
 ### Window: control your workspace
 
@@ -114,6 +114,16 @@ https://github.com/user-attachments/assets/cb399755-5cde-40a0-ba64-d00c7e581cc6
 Scan interface elements, filter labels, and target controls.
 
 https://github.com/user-attachments/assets/71efcae3-eb11-46d0-aba4-0a5df5e9c80c
+
+### UI Hint search: initials, copying, and color picking
+
+- **Search and preview**: press `/` to search text or Chinese pinyin initials, such as `sz` for “设置” (Settings). The best match opens its information panel automatically; press `Tab` to cycle through results.
+- **Copy information**: `Ctrl+1/2/3/4` copies text, accessibility information, coordinates, or color, respectively.
+- **Edit the point and pick colors**: tap `Ctrl` to enter point editing, adjust the sampling position with `H/J/K/L`, and use `Ctrl+Shift+4` to cycle through HEX, RGB, and HSL.
+
+https://github.com/user-attachments/assets/84d0872d-81f6-4e42-aa7f-767061cef646
+
+22-second bilingual demo, subtitles only. [Full usage guide](docs/en/modes/ui-hint.md). All keys above are configurable.
 
 ## Default keys
 

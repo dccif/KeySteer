@@ -24,16 +24,18 @@
 
 UIHint 搜索样式缺省时使用 `UiHint::default()` 的对应面板默认值。部分 `search_input_ui`／`search_info_ui` 表也在配置反序列化阶段补齐各自默认字段；信息面板不能退回输入框的通用宽度和屏幕锚点。补齐后沿用共享校验和启动样式编译，运行时不解析配置。
 
-`ui_hint.search_edit_keys` 按动作配置搜索编辑快捷键，稀疏表覆盖默认值；与信息复制键一起校验冲突，并在启动阶段解析为 KeyChord。编辑键、复制键与 `ui_hint.search_bindings` 一起在启动时展开组合键内部的配置别名；`primary` 遵循平台别名覆盖（发布 Windows 为 left_alt），也允许显式 cmd、ctrl。
+`ui_hint.search_edit_keys` 对外使用“按键 = 动作”表，加载时按动作归并并覆盖该动作的默认键；省略动作保留默认值。内部沿用动作到快捷键的模型和编译后的 Settings；与信息复制键一起校验冲突，并在启动阶段解析为 KeyChord。编辑键、复制键与 `ui_hint.search_bindings` 一起在启动时展开组合键内部的配置别名；`primary` 遵循平台别名覆盖（发布 Windows 为 left_alt），也允许显式 cmd、ctrl。
 
-搜索编辑键支持以空格分隔同一动作的多个快捷键，启动时展开与校验，不在输入热路径解析。默认 accept 为 `enter / primary+q`，自定义值替换该动作全部默认键。
+搜索编辑键在左侧以空格分隔多个快捷键，也可多行绑定同一动作，启动时展开与校验，不在输入热路径解析。默认 `"enter / primary+q" = "accept"`。旧“动作 = 按键”表兼容读取，原生导出统一使用新格式并保留禁用动作；网页导入也转换为新格式，按动作合并稀疏覆盖并复用现有绑定控件。
 
 颜色原文只保留在配置模型中，用于校验和序列化。网格、Hint、按键帮助与模式指示器在装配时转换为 `CompiledColor` 和 `style::compiled` 样式，运行时只选择浅／深色数值；未配置值及无效程序化颜色仍保留原有回退语义。搜索面板、窗口卡片和快速切换沿用已有整样式编译。透明度、对比度和场景默认色在绘制时派生，不因提前解析而冻结；主题变化选择另一组数值，配置重载重建整个计划。
 
 Window 多选入口与清空沿用 `window.bindings` 的 `window_multi_select`／`window_multi_clear`；输入期间由 `window.multi_select.bindings` 覆盖确认及编辑键，默认 Ctrl／Enter 确认、primary+h/l 移动输入光标。编辑键显式写在该表，支持 arrow_left/right、home/end、backspace/delete 及 Shift 方向选区，不从 Normal 复制配置。空格仍表示多个快捷键别名，也不改变 `window.target`。
 
-搜索点位操作使用 `ui_hint.search_bindings` 的“按键 = 动作”表（`point_toggle` / `point_next` / `color_next`；point_next 默认 Tab，仅调整期间生效），显式表替换默认映射；点位样式和格式顺序在 `ui_hint.search_point`，缺省字段不展开到导出配置。网页控件沿用此替换语义。四栏多点展示由 search_point.field_modes 固定长度数组配置，concat 拼接初始目标信息、switch 跟随当前检查点，默认 [concat, concat, switch, switch]；默认值不展开到导出。颜色与其他三栏一样可独立配置：concat 逐点异步采样并按选择顺序拼接，switch 跟随当前检查点。反序列化直接形成四项枚举，catalog 复制到 Settings，模式只接收编译后的按键、颜色、字段行为与格式枚举，运行时不解析字符串。
+搜索点位操作使用 `ui_hint.search_bindings` 的“按键 = 动作”表（`point_toggle` / `point_next` / `color_next`；point_next 默认 Tab，搜索输入时循环结果预览、调整期间切换已选点），显式表替换默认映射；点位样式和格式顺序在 `ui_hint.search_point`，缺省字段不展开到导出配置。网页控件沿用此替换语义。四栏多点展示由 search_point.field_modes 固定长度数组配置，concat 拼接初始目标信息、switch 跟随当前检查点，默认 [concat, concat, switch, switch]；默认值不展开到导出。颜色与其他三栏一样可独立配置：concat 逐点异步采样并按选择顺序拼接，switch 跟随当前检查点。反序列化直接形成四项枚举，catalog 复制到 Settings，模式只接收编译后的按键、颜色、字段行为与格式枚举，运行时不解析字符串。
 
 四个搜索信息复制键继续使用 `ui_hint.search_copy_keys` 独立数组配置，默认 Ctrl+1/2/3/4，两平台一致；显式 primary 仍按别名展开。`search_point.color_preview` 控制 Color 标题旁色块的开关、宽高、水平／垂直偏移与边框线宽；默认表及未改字段不导出。网页外观页提供同范围控件和预览，重置删除覆盖。
 
 Point 输入框的 `search_point.input_background_color`／`input_border_color` 为可选主题颜色；缺省背景采用窗口多选卡片同款浅／深绿色，边框继承普通搜索框。两项在装配时预编译，默认值不写入配置；网页外观页同时编辑普通搜索框和 Point 覆盖并预览对照。
+
+`ui_hint.search_match_priority` 是固定三项枚举数组，label／text／pinyin 各一次，默认 pinyin／text／label（简拼、文字、标签）；只控制同等匹配程度下的结果预览类别顺序，不改变普通完整标签解析和显式 @label 语义。完整词／标签、前缀、包含匹配依次排列，同分保持扫描顺序、空格词项保持输入顺序。配置校验拒绝缺项、重复及未知值，catalog 将已解析枚举编译为 64 项匹配度／优先级查表，运行时不遍历配置；网页编辑器提供相同校验和重置。

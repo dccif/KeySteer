@@ -11,6 +11,7 @@ export interface StyleField {
   max?: number
   step?: number
   options?: string[]
+  requireAll?: boolean
   default?: unknown
   action?: string
 }
@@ -139,7 +140,8 @@ export const fields = {
 fields.ui_hint.advanced.push(
   { path: 'ui_hint.search_copy_keys', label: '四个条目的复制键（按顺序，逗号分隔）', kind: 'chords', default: ['ctrl+1', 'ctrl+2', 'ctrl+3', 'ctrl+4'] },
   { path: 'ui_hint.search_bindings', label: '点位调整切换键（单击）', kind: 'binding', action: 'point_toggle', default: 'ctrl' },
-  { path: 'ui_hint.search_bindings', label: '多点位置切换键（调整时）', kind: 'binding', action: 'point_next', default: 'tab' },
+  { path: 'ui_hint.search_bindings', label: '搜索结果／多点位置切换键', kind: 'binding', action: 'point_next', default: 'tab' },
+  { path: 'ui_hint.search_match_priority', label: '同匹配程度时的优先级（pinyin 简拼 / text 文字／辅助信息／类型 / label 标签）', kind: 'choices', options: ['pinyin', 'text', 'label'], requireAll: true, default: ['pinyin', 'text', 'label'] },
   { path: 'ui_hint.search_point.field_modes', label: '多点信息栏展示方式（1–4）', kind: 'field-modes', default: ['concat', 'concat', 'switch', 'switch'] },
   { path: 'ui_hint.search_bindings', label: '颜色格式切换键（自动进入调整）', kind: 'binding', action: 'color_next', default: 'ctrl+shift+4' },
   { path: 'ui_hint.search_point.color_formats', label: '颜色格式顺序（首项为默认）', kind: 'choices', options: ['hex', 'rgb', 'hsl'], default: ['hex', 'rgb', 'hsl'] },
@@ -160,13 +162,13 @@ fields.ui_hint.layout.push(
   { path: 'ui_hint.search_point.marker_width', label: '点位标记线宽', kind: 'number', min: 0, max: 10, step: 1, default: 2 },
 )
 
-for (const [action, label] of [
-  ['paste', '搜索粘贴快捷键'], ['copy', '搜索复制选区快捷键'], ['cut', '搜索剪切快捷键'],
-  ['select_all', '搜索全选快捷键'], ['accept', '结束搜索快捷键（多个用空格分隔）'], ['cancel', '取消搜索快捷键'],
-  ['left', '搜索光标左移'], ['right', '搜索光标右移'], ['home', '搜索光标开头'], ['end', '搜索光标末尾'],
-  ['select_left', '搜索向左选择'], ['select_right', '搜索向右选择'], ['select_home', '搜索选择到开头'], ['select_end', '搜索选择到末尾'],
-  ['backspace', '搜索退格'], ['delete', '搜索删除'],
-] as const) fields.ui_hint.advanced.push({ path: `ui_hint.search_edit_keys.${action}`, label, kind: 'text' })
+for (const [action, label, keys] of [
+  ['paste', '搜索粘贴快捷键', 'primary+v'], ['copy', '搜索复制选区快捷键', 'primary+c'], ['cut', '搜索剪切快捷键', 'primary+x'],
+  ['select_all', '搜索全选快捷键', 'primary+a'], ['accept', '结束搜索快捷键（多个用空格分隔）', 'enter / primary+q'], ['cancel', '取消搜索快捷键', 'esc'],
+  ['left', '搜索光标左移', 'left'], ['right', '搜索光标右移', 'right'], ['home', '搜索光标开头', 'home'], ['end', '搜索光标末尾', 'end'],
+  ['select_left', '搜索向左选择', 'shift+left'], ['select_right', '搜索向右选择', 'shift+right'], ['select_home', '搜索选择到开头', 'shift+home'], ['select_end', '搜索选择到末尾', 'shift+end'],
+  ['backspace', '搜索退格', 'backspace'], ['delete', '搜索删除', 'delete'],
+] as const) fields.ui_hint.advanced.push({ path: 'ui_hint.search_edit_keys', label, kind: 'binding', action, default: keys })
 
 fields.window.layout.push({ path: 'window.card.position_mode', label: '卡片定位（window 窗口 / screen 当前屏幕）', kind: 'select', options: ['window', 'screen'] })
 for (const [block, title] of [['search_input_ui', '搜索框'], ['search_info_ui', '搜索信息']] as const) {

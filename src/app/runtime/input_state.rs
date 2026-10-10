@@ -589,12 +589,9 @@ impl Engine {
     }
 
     fn point_input_event(&mut self, input: &crate::api::input::InputEvent) -> Option<ModeEvent> {
-        if !self.scheduler.point_input.available {
-            return None;
-        }
-        let pressed = self.prompt_pressed(&input.key);
         let (_, prompt) = self.scheduler.text_prompt.as_ref()?;
         let keys = prompt.point_keys.as_ref()?;
+        let pressed = self.prompt_pressed(&input.key);
         let state = &mut self.scheduler.point_input;
         let matches = |chord: &KeyChord| {
             chord.activation_matches(&input.key)
@@ -603,9 +600,10 @@ impl Engine {
         };
         match input.state {
             KeyState::Down if !input.repeat => {
-                state.tap = if keys.iter().any(|(key, action)| {
-                    *action == crate::api::point_sample::Action::PointToggle && matches(key)
-                }) {
+                state.tap = if state.available
+                    && keys.iter().any(|(key, action)| {
+                        *action == crate::api::point_sample::Action::PointToggle && matches(key)
+                    }) {
                     Some(input.key.clone())
                 } else {
                     None
@@ -618,13 +616,15 @@ impl Engine {
                 }
                 if keys.iter().any(|(key, action)| {
                     *action == crate::api::point_sample::Action::PointNext && matches(key)
-                }) && state.adjusting
-                {
+                }) {
+                    // Search preview cycling is available before a result panel exists.
                     return Some(ModeEvent::CyclePointTarget);
                 }
-                if keys.iter().any(|(key, action)| {
-                    *action == crate::api::point_sample::Action::ColorNext && matches(key)
-                }) {
+                if state.available
+                    && keys.iter().any(|(key, action)| {
+                        *action == crate::api::point_sample::Action::ColorNext && matches(key)
+                    })
+                {
                     return Some(ModeEvent::CyclePointColor);
                 }
             }

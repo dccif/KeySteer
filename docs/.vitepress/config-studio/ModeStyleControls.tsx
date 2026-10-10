@@ -101,6 +101,11 @@ export default defineComponent({
       const table = { ...getConfigPath(props.effectiveDocument, field.path) as Record<string, string> }
       for (const [key, action] of Object.entries(table)) if (action === field.action) delete table[key]
       for (const key of String(value).trim().split(/\s+/).filter(Boolean)) table[key] = field.action!
+      if (field.path === 'ui_hint.search_edit_keys' && !String(value).trim()) {
+        let key = ''
+        while (key in table) key += ' '
+        table[key] = field.action!
+      }
       update(field.path, table)
     }
 
@@ -299,8 +304,8 @@ export const StyleControl = defineComponent({
             <input value={Array.isArray(value) ? value.join(', ') : String(value)} onChange={event => {
               const input = event.target as HTMLInputElement
               const values = input.value.split(',').map(part => part.trim().toLowerCase())
-              if (!values.length || new Set(values).size !== values.length || values.some(value => !field.options?.includes(value))) {
-                input.setCustomValidity(t('请输入不重复的颜色格式：hex, rgb, hsl')); input.reportValidity(); return
+              if (!values.length || new Set(values).size !== values.length || values.some(value => !field.options?.includes(value)) || field.requireAll && values.length !== field.options?.length) {
+                input.setCustomValidity(field.requireAll ? t('请按优先级填写全部选项且不重复：{0}', [field.options?.join(', ') ?? '']) : t('请输入不重复的颜色格式：hex, rgb, hsl')); input.reportValidity(); return
               }
               input.setCustomValidity(''); props.onUpdate(values)
             }} />

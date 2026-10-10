@@ -315,3 +315,53 @@ test('Point input colors are optional, theme aware, and stay on the appearance p
   }
   assert.deepEqual(fieldLocation('ui_hint.search_input_ui.border_color'), { page: 'ui_hint', tab: 'appearance' })
 })
+
+test('search match priorities validate, round-trip and reset without expanding sparse documents', async () => {
+  const { setConfigPath, deleteConfigPath } = await import('../config-studio/document.ts')
+  const { stringify } = await import('smol-toml')
+  const { fields } = await import('../config-studio/fields.ts')
+  const defaults = parseConfigDocument(await readFile(new URL('../../../keysteer.default.toml', import.meta.url), 'utf8')).document
+  assert.deepEqual(defaults.ui_hint.search_match_priority, ['pinyin', 'text', 'label'])
+  const document = parseConfigDocument('[ui_hint]\nhint_characters = "asdf"').document
+  setConfigPath(document, 'ui_hint.search_match_priority', ['label', 'text', 'pinyin'])
+  assert.deepEqual(parseConfigDocument(stringify(document)).document.ui_hint.search_match_priority, ['label', 'text', 'pinyin'])
+  deleteConfigPath(document, 'ui_hint.search_match_priority')
+  assert.equal('search_match_priority' in document.ui_hint, false)
+  assert.deepEqual(resolveConfigDocument(defaults, document).ui_hint.search_match_priority, ['pinyin', 'text', 'label'])
+  const field = fields.ui_hint.advanced.find(field => field.path === 'ui_hint.search_match_priority')
+  assert.equal(field?.requireAll, true)
+  for (const value of ['[]', '["label"]', '["label", "label", "pinyin"]', '["text", "pinyin", "unknown"]', '"label"']) {
+    assert.throws(() => parseConfigDocument(`[ui_hint]\nsearch_match_priority = ${value}`), /search_match_priority/)
+  }
+})
+
+test('search editing key-action tables inherit actions and migrate legacy imports', async () => {
+  const { stringify } = await import('smol-toml')
+  const { normalizeSearchEditBindings } = await import('../config-studio/document.ts')
+  const defaults = parseConfigDocument(await readFile(new URL('../../../keysteer.default.toml', import.meta.url), 'utf8')).document
+  assert.equal(defaults.ui_hint.search_edit_keys['enter / primary+q'], 'accept')
+  assert.equal(defaults.ui_hint.search_edit_keys.accept, undefined)
+  for (const source of [
+    '[ui_hint.search_edit_keys]\nf8 = "accept"\nf9 = "accept"\n"alt+v" = "paste"',
+    '[ui_hint.search_edit_keys]\naccept = "f8 f9"\npaste = "alt+v"',
+  ]) {
+    const document = parseConfigDocument(source).document
+    const effective = resolveConfigDocument(defaults, document)
+    const bindings = effective.ui_hint.search_edit_keys
+    assert.equal(bindings['enter / primary+q'], undefined)
+    assert.equal(bindings['primary+v'], undefined)
+    assert.equal(bindings.esc, 'cancel')
+    assert.equal(bindings['alt+v'], 'paste')
+    assert.deepEqual(Object.entries(bindings).filter(([, action]) => action === 'accept').flatMap(([keys]) => keys.split(/\s+/)).sort(), ['f8', 'f9'])
+    const exported = parseConfigDocument(stringify(document)).document
+    assert.equal(exported.ui_hint.search_edit_keys.accept, undefined)
+    assert.equal(exported.ui_hint.search_edit_keys.paste, undefined)
+    assert.deepEqual(cloneConfigDocument(resolveConfigDocument(defaults, exported)), cloneConfigDocument(effective))
+  }
+  const disabled = normalizeSearchEditBindings({ copy: '', cut: '' })
+  assert.deepEqual(Object.values(disabled).sort(), ['copy', 'cut'])
+  const effective = resolveConfigDocument(defaults, { ui_hint: { search_edit_keys: disabled } })
+  assert.equal(effective.ui_hint.search_edit_keys['primary+c'], undefined)
+  assert.equal(effective.ui_hint.search_edit_keys['primary+x'], undefined)
+  assert.throws(() => parseConfigDocument('[ui_hint.search_edit_keys]\nf9 = "unknown_action"'), /editing actions/)
+})

@@ -351,6 +351,16 @@ impl ConfigFile {
                 ));
             }
         }
+        let priority = &self.ui_hint.search_match_priority;
+        if priority
+            .iter()
+            .enumerate()
+            .any(|(index, kind)| priority[..index].contains(kind))
+        {
+            return Err(bad(
+                "ui_hint.search_match_priority requires label, text and pinyin exactly once".into(),
+            ));
+        }
         let point = &self.ui_hint.search_point;
         validate_optional_color(
             "ui_hint.search_point.input_background_color",

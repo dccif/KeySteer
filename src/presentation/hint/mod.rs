@@ -255,12 +255,17 @@ impl HintView<'_> {
                 .filter(|hint| hint.label.as_str().starts_with(self.content.prefix))
                 .count()
         };
+        // Appending a small search panel must not grow and copy the entire
+        // target buffer. Include its labels, background, swatch and point now.
+        let info_fields = self.info.as_ref().map_or(0, |info| info.field_count());
         let shape_capacity = if self.content.style.boundary_highlight.enabled {
             visible_count
         } else {
             0
-        };
-        let label_capacity = visible_count + usize::from(self.content.search.is_some());
+        } + usize::from(self.point.is_some())
+            + usize::from(self.info.is_some()) * 2;
+        let label_capacity =
+            visible_count + usize::from(self.content.search.is_some()) + info_fields * 3;
         let mut scene = OverlayScene::with_capacity(shape_capacity, label_capacity);
         scene.clip = self
             .content

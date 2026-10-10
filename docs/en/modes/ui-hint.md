@@ -29,6 +29,38 @@ Enter from Normal with `Primary+F`. By default it only moves the pointer: after 
 
 Vision needs macOS Screen Recording permission; keyboard capture still needs Accessibility permission. On startup, Windows asynchronously detects system OCR and locally installed WeChat OCR components without configuration. OCR engines and the WeChat helper are created only during scanning and released before it finishes. Leaving UI Hint for Normal or Idle cancels the UIA, OCR, and capture generation and releases its image, bitmap, targets, and oversized buffers. When neither OCR engine returns usable results, KeySteer uses built-in region recognition that does not depend on OpenCV.
 
+## Search and result previews
+
+<ModeVideo
+  file="uihint-search.mp4"
+  title="UI Hint search, copying, and color picking"
+  description="22-second bilingual demo, subtitles only: pinyin initials, result cycling, copying information, point adjustment, and color picking."
+/>
+
+https://github.com/user-attachments/assets/84d0872d-81f6-4e42-aa7f-767061cef646
+
+Press `/` to search text, Chinese pinyin initials, or label codes. Matching results immediately show the first ranked result panel. Press `Tab` to advance from the current result and wrap from the last back to the first. Editing the query clears the manual preview, filters again, and shows the new first result. By default, `Enter`, `/`, or `Primary+Q` accepts the current preview and moves the pointer; `Esc` cancels. Cycling itself does not move the pointer.
+
+Press `Ctrl+1/2/3/4` to copy text, accessibility information, coordinates, or color, respectively. Tap `Ctrl` to edit the point, adjust the sampling position with `H/J/K/L`, and use `Ctrl+Shift+4` to cycle through HEX, RGB, and HSL. All these keys are configurable.
+
+Confirmation, cancellation, and input editing use key = action entries in `[ui_hint.search_edit_keys]`, such as `"enter / primary+q" = "accept"` and `"primary+v" = "paste"`. Separate alternative keys with spaces on the left. Omitted actions keep their defaults. Legacy tables remain readable; exports use the new format.
+
+The cycling key uses the existing `point_next` action in `[ui_hint.search_bindings]` and accepts a different key or chord. During point adjustment it still cycles selected points. Space-separated multi-selection and concatenated fields retain their existing behavior.
+
+```toml
+[ui_hint]
+search_match_priority = ["pinyin", "text", "label"]
+
+[ui_hint.search_bindings]
+ctrl = "point_toggle"
+tab = "point_next" # Can be changed to f9, alt+f9, etc.
+"ctrl+shift+4" = "color_next"
+```
+
+Results rank by match quality first: whole words/codes → word/label prefixes → substrings. `search_match_priority` orders groups with equal match quality: `label` means label codes, `text` means OCR/accessibility text and control types, and `pinyin` means Chinese initials. Include each exactly once. The default is initials → text → labels; for example, `["label", "text", "pinyin"]` prefers labels when match quality is equal. An exact label precedes initials/text prefixes and substrings; ties retain scan order, and space-separated items retain input order. `@la` and `la@` always restrict matching to labels. An explicit `search_bindings` table replaces the default map; the example keeps the other default actions.
+
+Search already includes accessibility information and control types. For example, `text_field`, `输入框`, `文本框`, or Chinese initials `srk` can match identified input fields without an extra setting. These matches belong to `text` (initials belong to `pinyin`); accessibility and types do not have separate priority entries. Search uses keywords rather than natural-language commands such as “all input fields.”
+
 ## Common configuration
 
 ```toml

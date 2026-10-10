@@ -47,11 +47,23 @@ enum Match<T> {
 
 const SCAN_RETRY_TIMER_ID: &str = "ui_hint.scan_retry";
 const SEARCH_PREWARM_TIMER_ID: &str = "ui_hint.search_prewarm";
+// A work quantum, not a scan batch threshold or a delay. Rearming yields to
+// input and native event polling between chunks, including large scans.
+const SEARCH_PREWARM_TARGETS: usize = 256;
 const NO_WINDOW_UNDER_POINTER: &str =
     "No window under the pointer — move the pointer over a window";
 use crate::api::presentation::hint_cache::INLINE_LABELS;
 const MAX_INLINE_TARGETS: usize = INLINE_LABELS;
 const MAX_SCAN_TIMEOUT_MS: u64 = 30_000;
+
+/// A missing cursor starts at the first target; the last target wraps to it.
+fn next_target_position(
+    current: Option<usize>,
+    first: Option<usize>,
+    next: impl FnOnce(usize) -> usize,
+) -> Option<usize> {
+    first.map(|first| current.map_or(first, next))
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppStrategyOverride {
@@ -82,6 +94,7 @@ pub struct Settings {
     pub search_info_ui: CompiledSearchPanel,
     pub search_copy_keys: std::sync::Arc<[KeyChord]>,
     pub search_edit_keys: std::sync::Arc<[(KeyChord, crate::api::text_edit::EditAction)]>,
+    pub search_match_priority: crate::api::hint::CompiledSearchPriority,
     pub search_titles: [String; 4],
     pub search_point: PointSettings,
     pub lifecycle: TargetingLifecycle,
@@ -422,7 +435,7 @@ impl HintMode {
             Input::Search(query) => Some(query.as_str()),
             Input::Labels(_) => None,
         };
-        if query.is_some() {
+        if query.is_some_and(|query| !query.is_empty()) {
             self.session.ensure_search_names();
         }
 
@@ -433,50 +446,74 @@ impl HintMode {
                 std::borrow::Cow::Owned(query.to_lowercase())
             };
             let multiple = query.chars().any(char::is_whitespace);
+            let show_all = query.is_empty()
+                || multiple && query.ends_with(char::is_whitespace)
+                || query.split_whitespace().next_back() == Some("@");
             let previous_len = self.session.search_matches.len();
             let previous_selected = self.session.search_selected.len();
             let mut matched = 0;
             let mut selected = 0;
+            self.session.search_cycle.clear();
             self.session.search_seen.clear();
-            self.session
-                .search_seen
-                .resize(self.session.scanned.len(), false);
             // Each space-separated item runs the same search against original labels.
             // Union in item order; the first occurrence owns each target's position.
             self.session.search_terms.prepare(&query);
+            let needs_dedup = self.session.search_terms.needs_dedup();
+            if needs_dedup {
+                self.session
+                    .search_seen
+                    .resize(self.session.scanned.len(), false);
+            }
             for term in self.session.search_terms.iter(&query) {
                 let term = search::Term::new(term);
+                let mut buckets = [None; search::RANK_COUNT];
                 let (mut exact, mut last_match, mut term_matches) = (None, None, 0);
-                for hint in &self.session.search_hints {
-                    if self
-                        .session
-                        .search_text
-                        .get(hint.value)
-                        .is_some_and(|text| term.matches(text, hint.label.as_str()))
-                    {
+                for (hint_index, hint) in self.session.search_hints.iter().enumerate() {
+                    if let Some(rank) = self.session.search_text.get(hint.value).and_then(|text| {
+                        term.rank(
+                            text,
+                            hint.label.as_str(),
+                            &self.config.search_match_priority,
+                        )
+                    }) {
                         if hint.label.as_str() == term.code {
                             exact = Some(hint);
                         }
                         last_match = Some(hint);
                         term_matches += 1;
-                        if self.session.search_seen[hint.value] {
-                            continue;
+                        if needs_dedup {
+                            if self.session.search_seen[hint.value] {
+                                continue;
+                            }
+                            self.session.search_seen[hint.value] = true;
                         }
-                        self.session.search_seen[hint.value] = true;
                         if let Some(previous) = self.session.search_matches.get_mut(matched) {
+                            matches_changed |= *previous != hint_index;
+                            *previous = hint_index;
+                        } else {
+                            self.session.search_matches.push(hint_index);
+                        }
+                        // Candidate order keeps indices only. Update the displayed
+                        // labels in place, without a second full clone pass.
+                        let display_index = if show_all { hint_index } else { matched };
+                        if let Some(previous) = self.session.hints.get_mut(display_index) {
                             if previous.value != hint.value
                                 || previous.label != hint.label
                                 || previous.bounds != hint.bounds
                             {
                                 matches_changed = true;
-                                previous.clone_from(hint);
+                                if !show_all {
+                                    previous.clone_from(hint);
+                                }
                             }
-                        } else {
-                            self.session.search_matches.push(hint.clone());
+                        } else if !show_all {
+                            self.session.hints.push(hint.clone());
                         }
+                        self.session.search_cycle.push(rank, &mut buckets);
                         matched += 1;
                     }
                 }
+                self.session.search_cycle.append(buckets);
                 // A completed label takes priority over semantic collisions.
                 // Other search terms select a point only after disambiguation.
                 let resolved = exact.or_else(|| {
@@ -505,19 +542,21 @@ impl HintMode {
             matches_changed |= matched != previous_len;
             matches_changed |= selected != previous_selected;
             self.session.search_matches.truncate(matched);
+            self.session.search_focus = self.session.search_focus.take().and_then(|mut focused| {
+                focused.index = self.session.search_matches.iter().position(|&index| {
+                    let hint = &self.session.search_hints[index];
+                    hint.label == focused.label && hint.bounds == focused.bounds
+                })?;
+                Some(focused)
+            });
             self.session.search_selected.truncate(selected);
-            self.session.hints.clear();
-            if query.is_empty()
-                || multiple && query.ends_with(char::is_whitespace)
-                || query.split_whitespace().next_back() == Some("@")
-            {
+            if show_all {
+                self.session.hints.clear();
                 self.session
                     .hints
                     .extend(self.session.search_hints.iter().cloned());
             } else {
-                self.session
-                    .hints
-                    .extend(self.session.search_matches.iter().cloned());
+                self.session.hints.truncate(matched);
             }
             Ok(())
         } else {
@@ -758,13 +797,56 @@ impl HintMode {
         let Input::Search(query) = &self.input else {
             return None;
         };
+        if let Some(hint) = self
+            .session
+            .search_focus
+            .as_ref()
+            .and_then(|focus| self.session.search_matches.get(focus.index))
+            .and_then(|&index| self.session.search_hints.get(index))
+        {
+            return Some((false, std::slice::from_ref(hint)));
+        }
         let multiple = query.chars().any(char::is_whitespace);
         let hints = &self.session.search_selected;
-        if hints.is_empty() || query.trim().is_empty() && multiple || !multiple && hints.len() != 1
-        {
-            return None;
+        // Explicit space-separated selections retain their collection panel.
+        // Otherwise preview the highest-priority match immediately.
+        if multiple && !hints.is_empty() && !query.trim().is_empty() {
+            return Some((true, hints));
         }
-        Some((multiple, hints))
+        let first = self.session.search_cycle.first()?;
+        Some((
+            false,
+            std::slice::from_ref(&self.session.search_hints[self.session.search_matches[first]]),
+        ))
+    }
+
+    fn cycle_search_result(&mut self) -> bool {
+        let current = self
+            .session
+            .search_focus
+            .as_ref()
+            .map(|focus| focus.index)
+            .or_else(|| {
+                let (multiple, _) = self.search_result_hints()?;
+                if multiple {
+                    None
+                } else {
+                    self.session.search_cycle.first()
+                }
+            });
+        let Some(next) = self.session.search_cycle.next(current) else {
+            return false;
+        };
+        let changed = current != Some(next);
+        if changed {
+            let hint = &self.session.search_hints[self.session.search_matches[next]];
+            self.session.search_focus = Some(search::Focus {
+                index: next,
+                label: hint.label.clone(),
+                bounds: hint.bounds,
+            });
+        }
+        changed
     }
 
     fn search_info(&self) -> Option<crate::api::presentation::HintInfoView<'_>> {
@@ -811,6 +893,8 @@ impl HintMode {
     fn release_search(&mut self) {
         self.session.search_hints.clear();
         self.session.search_matches.clear();
+        self.session.search_cycle.clear();
+        self.session.search_focus = None;
         self.session.search_selected.clear();
         self.session.search_seen.clear();
         if let Input::Search(mut text) =
@@ -897,6 +981,9 @@ impl HintMode {
             if key.as_str() == "esc" {
                 return self.finish_search(false, ctx);
             }
+            if key.as_char().is_some() || key.as_str() == "backspace" {
+                self.session.search_focus = None;
+            }
         }
         if self.session.finished {
             return match key.as_str() {
@@ -953,12 +1040,11 @@ impl HintMode {
                 if self.input.text().is_empty() {
                     // Opening an empty query leaves the full label list intact.
                     // Avoid clearing and copying it back through the filter path.
-                    self.session.ensure_search_names();
                     self.session.search_matches.clear();
+                    self.session.search_cycle.clear();
+                    self.session.search_focus = None;
                     self.session.search_selected.clear();
-                    self.session
-                        .search_seen
-                        .resize(self.session.scanned.len(), false);
+                    self.session.search_seen.clear();
                     if !same_labels {
                         self.refresh_overlap_plan(ctx);
                     }
@@ -1237,6 +1323,13 @@ impl HintMode {
             use crate::api::text_edit::EditAction;
             let mut encoded = [0; 4];
             match event {
+                ModeEvent::CyclePointTarget => {
+                    return if self.cycle_search_result() {
+                        self.redraw()
+                    } else {
+                        CommandBatch::new()
+                    };
+                }
                 ModeEvent::TextEdit(EditAction::Accept) => {
                     return self.finish_search(true, ctx);
                 }
@@ -1284,6 +1377,7 @@ impl HintMode {
                     }
                     // Cursor-only changes repaint without rebuilding the search index.
                     if text_changed {
+                        self.session.search_focus = None;
                         let changed = self.relabel_with_refresh(ctx, false);
                         if changed || pending || previous_count != self.session.hints.len() {
                             self.refresh_overlap_plan(ctx);
@@ -1306,6 +1400,7 @@ impl HintMode {
                     return CommandBatch::new();
                 }
                 let pending = self.session.pending_relabel;
+                self.session.search_focus = None;
                 let old_fields = self.search_info().map(|info| info.field_count());
                 let shows_all = |query: &str| {
                     query.is_empty()
@@ -1341,6 +1436,7 @@ impl HintMode {
                     }
                     // A submitted value can differ from the last live edit.
                     // Filter it once; only the restored full view needs layout.
+                    self.session.search_focus = None;
                     self.relabel_with_refresh(ctx, false);
                 }
                 self.finish_search(text.is_some(), ctx)
@@ -1425,10 +1521,20 @@ impl HintMode {
             ModeEvent::Timer { id, .. }
                 if id == SEARCH_PREWARM_TIMER_ID
                     && self.session.active
-                    && !self.session.finished =>
+                    && !self.session.finished
+                    && !self.session.scanned.is_empty() =>
             {
-                self.session.ensure_search_names();
-                CommandBatch::new()
+                if self.session.prepare_search_names(SEARCH_PREWARM_TARGETS) {
+                    CommandBatch::new()
+                } else {
+                    // The scheduler snapshots due timers once per turn. A new
+                    // zero-delay dispatch runs after the next input poll.
+                    CommandBatch::one(Command::SetTimer {
+                        id: SEARCH_PREWARM_TIMER_ID.into(),
+                        delay: Duration::ZERO,
+                        repeating: false,
+                    })
+                }
             }
             ModeEvent::Timer { id, .. }
                 if id == SCAN_RETRY_TIMER_ID
@@ -2170,8 +2276,8 @@ mod tests {
         mode.handle(&ModeEvent::TextChanged("s missing".into()), &env.ctx());
         assert_eq!(mode.session.search_matches.len(), 155);
         assert!(mode.session.search_selected.is_empty());
-        assert!(mode.inspection.is_none());
-        assert!(mode.search_info().is_none());
+        assert_eq!(mode.inspection.as_ref().unwrap().members.len(), 1);
+        assert!(mode.search_info().is_some());
     }
 
     #[test]
@@ -2441,7 +2547,7 @@ mod tests {
     }
 
     #[test]
-    fn search_enter_only_commits_one_result_and_reuses_session_index() {
+    fn search_enter_commits_the_visible_result_and_reuses_session_index() {
         let env = Env::new();
         let mut mode = crate::app::mode_catalog::hint(&env.config);
         activate(&mut mode, &env);
@@ -2461,10 +2567,14 @@ mod tests {
             press(&mut mode, &env, "/");
             mode.handle(&ModeEvent::TextChanged(query.into()), &env.ctx());
             let out = press(&mut mode, &env, "enter");
-            assert!(!out.iter().any(|c| matches!(
-                c,
-                Command::FinishMode { .. } | Command::WarpPointer { .. } | Command::ScanUi(_)
-            )));
+            assert!(
+                !out.iter()
+                    .any(|c| matches!(c, Command::FinishMode { .. } | Command::ScanUi(_)))
+            );
+            assert_eq!(
+                out.iter().any(|c| matches!(c, Command::WarpPointer { .. })),
+                query == "文件"
+            );
             assert_eq!(
                 mode.session
                     .hints
@@ -2530,6 +2640,280 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_search_cycles_panels_accepts_current_result_and_resets_after_editing() {
+        let env = Env::new();
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
+        activate(&mut mode, &env);
+        deliver(
+            &mut mode,
+            &env,
+            vec![target("alpha", 0.0), target("bravo", 100.0)],
+        );
+        press(&mut mode, &env, "/");
+        let initial = mode.handle(&ModeEvent::TextChanged("button".into()), &env.ctx());
+        assert_fresh_scene(&mode, &env, &initial);
+        assert_eq!(mode.search_info().unwrap().hints[0].value, 0);
+        assert_eq!(mode.session.search_matches.len(), 2);
+        let labels: Vec<_> = mode
+            .session
+            .search_hints
+            .iter()
+            .map(|hint| hint.label.clone())
+            .collect();
+        let mut previous_sample = Some(sample_request(&initial));
+        for expected in [1, 0, 1] {
+            let out = mode.handle(&ModeEvent::CyclePointTarget, &env.ctx());
+            assert_fresh_scene(&mode, &env, &out);
+            assert_eq!(mode.search_info().unwrap().hints[0].value, expected);
+            assert_eq!(
+                mode.inspection.as_ref().unwrap().point,
+                mode.target_point(expected)
+            );
+            assert!(!mode.inspection.as_ref().unwrap().adjusting);
+            let request = sample_request(&out);
+            if let Some(stale) = previous_sample {
+                assert!(
+                    mode.handle(
+                        &ModeEvent::PointSampled(crate::api::point_sample::Sample {
+                            request: stale,
+                            color: Some(Color::rgb(1, 2, 3)),
+                        }),
+                        &env.ctx()
+                    )
+                    .is_empty()
+                );
+            }
+            previous_sample = Some(request);
+            assert!(
+                !out.iter()
+                    .any(|command| matches!(command, Command::WarpPointer { .. }))
+            );
+        }
+        let accepted = mode.handle(
+            &ModeEvent::TextEdit(crate::api::text_edit::EditAction::Accept),
+            &env.ctx(),
+        );
+        assert!(accepted.contains(&Command::warp_to(mode.target_point(1))));
+        assert_eq!(
+            mode.session
+                .hints
+                .iter()
+                .map(|hint| hint.label.clone())
+                .collect::<Vec<_>>(),
+            labels
+        );
+        press(&mut mode, &env, "/");
+        mode.handle(&ModeEvent::TextChanged("button".into()), &env.ctx());
+        mode.handle(&ModeEvent::CyclePointTarget, &env.ctx());
+        let changed = mode.handle(&ModeEvent::TextInserted('x'), &env.ctx());
+        assert!(mode.session.search_focus.is_none());
+        assert!(mode.search_info().is_none());
+        assert!(changed.contains(&Command::CancelPointSample));
+        assert!(
+            mode.handle(&ModeEvent::CyclePointTarget, &env.ctx())
+                .is_empty()
+        );
+        mode.handle(
+            &ModeEvent::TextEdit(crate::api::text_edit::EditAction::SelectAll),
+            &env.ctx(),
+        );
+        mode.handle(&ModeEvent::TextPasted("button".into()), &env.ctx());
+        assert_eq!(mode.search_info().unwrap().hints[0].value, 0);
+        mode.handle(&ModeEvent::CyclePointTarget, &env.ctx());
+        assert_eq!(mode.search_info().unwrap().hints[0].value, 1);
+    }
+
+    #[test]
+    fn search_cycles_respect_configured_match_groups_and_label_only_queries() {
+        use crate::api::hint::SearchMatchKind::{Label, Pinyin, Text};
+        for (priority, expected) in [
+            ([Label, Text, Pinyin], [0, 2, 1]),
+            ([Label, Pinyin, Text], [0, 1, 2]),
+            ([Pinyin, Text, Label], [1, 2, 0]),
+            ([Pinyin, Label, Text], [1, 0, 2]),
+            ([Text, Label, Pinyin], [2, 0, 1]),
+            ([Text, Pinyin, Label], [2, 1, 0]),
+        ] {
+            let env = Env::new();
+            let mut config = env.config.clone();
+            config.ui_hint.search_match_priority = priority;
+            let mut mode = crate::app::mode_catalog::hint(&config);
+            activate(&mut mode, &env);
+            deliver(
+                &mut mode,
+                &env,
+                vec![
+                    target("Other", 0.0),
+                    target("设置", 100.0),
+                    target("SZ command", 200.0),
+                ],
+            );
+            for (hint, code) in
+                mode.session
+                    .hints
+                    .iter_mut()
+                    .zip([&b"sz"[..], &b"bbb"[..], &b"ccc"[..]])
+            {
+                hint.label = crate::api::hint::HintCode(smallvec::SmallVec::from_slice(code));
+            }
+            press(&mut mode, &env, "/");
+            mode.handle(&ModeEvent::TextChanged("sz".into()), &env.ctx());
+            assert_eq!(mode.search_info().unwrap().hints[0].value, expected[0]);
+            for index in expected
+                .into_iter()
+                .skip(1)
+                .chain(std::iter::once(expected[0]))
+            {
+                mode.handle(&ModeEvent::CyclePointTarget, &env.ctx());
+                assert_eq!(mode.search_info().unwrap().hints[0].value, index);
+            }
+            for query in ["@sz", "sz@"] {
+                mode.handle(&ModeEvent::TextChanged(query.into()), &env.ctx());
+                assert_eq!(mode.session.search_matches.len(), 1);
+                mode.handle(&ModeEvent::CyclePointTarget, &env.ctx());
+                assert_eq!(mode.search_info().unwrap().hints[0].value, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn search_preview_prefers_quality_over_group_priority_and_preserves_it_on_streams() {
+        let env = Env::new();
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
+        activate(&mut mode, &env);
+        deliver(
+            &mut mode,
+            &env,
+            vec![
+                target("Other", 0.0),
+                target("关于设置", 100.0),
+                target("szextra", 200.0),
+            ],
+        );
+        for (hint, code) in
+            mode.session
+                .hints
+                .iter_mut()
+                .zip([&b"sz"[..], &b"bbb"[..], &b"ccc"[..]])
+        {
+            hint.label = crate::api::hint::HintCode(smallvec::SmallVec::from_slice(code));
+        }
+        press(&mut mode, &env, "/");
+        mode.handle(&ModeEvent::TextChanged("sz".into()), &env.ctx());
+        // An exact label beats text prefixes and pinyin substrings, despite
+        // labels being the lowest-priority group by default.
+        assert_eq!(mode.search_info().unwrap().hints[0].value, 0);
+        for expected in [2, 1, 0] {
+            mode.handle(&ModeEvent::CyclePointTarget, &env.ctx());
+            assert_eq!(mode.search_info().unwrap().hints[0].value, expected);
+        }
+        // Editing reselects the best result. A newly streamed complete pinyin
+        // word can then become the automatic preview before any Tab press.
+        mode.handle(&ModeEvent::TextChanged("missing".into()), &env.ctx());
+        mode.handle(&ModeEvent::TextChanged("sz".into()), &env.ctx());
+        let id = mode.session.scan_id;
+        mode.handle_owned(
+            ModeEvent::UiScanned(UiScanResult {
+                id,
+                targets: vec![target("设置", 300.0)],
+                retired: vec![],
+                status: UiScanStatus::Partial,
+            }),
+            &env.ctx(),
+        );
+        assert_eq!(
+            mode.session.scanned[mode.search_info().unwrap().hints[0].value].name,
+            "设置"
+        );
+    }
+
+    #[test]
+    fn search_preview_survives_streaming_and_clears_if_the_result_is_retired() {
+        let env = Env::new();
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
+        activate(&mut mode, &env);
+        deliver(
+            &mut mode,
+            &env,
+            vec![target("alpha", 0.0), target("bravo", 100.0)],
+        );
+        press(&mut mode, &env, "/");
+        mode.handle(&ModeEvent::TextChanged("button".into()), &env.ctx());
+        mode.handle(&ModeEvent::CyclePointTarget, &env.ctx());
+        let focused = mode.search_info().unwrap().hints[0].label.clone();
+        let rect = mode.session.scanned[1].rect;
+        let scan_id = mode.session.scan_id;
+        mode.handle_owned(
+            ModeEvent::UiScanned(UiScanResult {
+                id: scan_id,
+                targets: vec![target("charlie", 200.0)],
+                retired: vec![],
+                status: UiScanStatus::Partial,
+            }),
+            &env.ctx(),
+        );
+        assert_eq!(mode.search_info().unwrap().hints[0].label, focused);
+        mode.handle_owned(
+            ModeEvent::UiScanned(UiScanResult {
+                id: scan_id,
+                targets: vec![],
+                retired: vec![rect],
+                status: UiScanStatus::Partial,
+            }),
+            &env.ctx(),
+        );
+        assert!(mode.session.search_focus.is_none());
+        assert_eq!(
+            mode.session.scanned[mode.search_info().unwrap().hints[0].value].name,
+            "alpha"
+        );
+        assert!(mode.inspection.is_some());
+        mode.handle(&ModeEvent::CyclePointTarget, &env.ctx());
+        assert_eq!(
+            mode.session.scanned[mode.search_info().unwrap().hints[0].value].name,
+            "charlie"
+        );
+    }
+
+    #[test]
+    fn search_preview_keeps_identity_when_full_view_indices_shift() {
+        let env = Env::new();
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
+        activate(&mut mode, &env);
+        deliver(
+            &mut mode,
+            &env,
+            vec![
+                target("alpha", 0.0),
+                target("bravo", 100.0),
+                target("charlie", 200.0),
+            ],
+        );
+        press(&mut mode, &env, "/");
+        mode.handle(&ModeEvent::TextChanged("button ".into()), &env.ctx());
+        mode.handle(&ModeEvent::CyclePointTarget, &env.ctx());
+        let focused = mode.search_info().unwrap().hints[0].label.clone();
+        let retired = mode.session.scanned[0].rect;
+        let id = mode.session.scan_id;
+        let out = mode.handle_owned(
+            ModeEvent::UiScanned(UiScanResult {
+                id,
+                targets: vec![],
+                retired: vec![retired],
+                status: UiScanStatus::Partial,
+            }),
+            &env.ctx(),
+        );
+        assert_fresh_scene(&mode, &env, &out);
+        let preview = mode.search_info().unwrap().hints[0].value;
+        assert_eq!(mode.session.scanned[preview].name, "bravo");
+        assert_eq!(mode.search_info().unwrap().hints[0].label, focused);
+        mode.handle(&ModeEvent::CyclePointTarget, &env.ctx());
+        let preview = mode.search_info().unwrap().hints[0].value;
+        assert_eq!(mode.session.scanned[preview].name, "charlie");
+    }
+
+    #[test]
     fn explicit_label_search_excludes_semantic_matches_and_unions_in_order() {
         let env = Env::new();
         let mut mode = crate::app::mode_catalog::hint(&env.config);
@@ -2549,7 +2933,7 @@ mod tests {
             mode.handle(&ModeEvent::TextInserted(c), &env.ctx());
             assert_eq!(mode.session.hints.len(), if c == '@' { 2 } else { 1 });
             assert_eq!(mode.session.search_selected.len(), usize::from(c == 'a'));
-            assert_eq!(mode.inspection.is_some(), c == 'a');
+            assert_eq!(mode.inspection.is_some(), c != '@');
             assert!(mode.overlap_plan.is_ready());
             assert_eq!(mode.overlap_plan.layer_count(), 0);
         }
@@ -2564,7 +2948,7 @@ mod tests {
         mode.handle(&ModeEvent::TextChanged("k".into()), &env.ctx());
         assert_eq!(mode.session.hints.len(), 1);
         assert!(mode.session.search_selected.is_empty());
-        assert!(mode.inspection.is_none());
+        assert!(mode.inspection.is_some());
         mode.handle(&ModeEvent::TextChanged("la".into()), &env.ctx());
         assert_eq!(mode.session.hints.len(), 2);
         assert_eq!(mode.session.search_selected.len(), 1);
@@ -2601,7 +2985,12 @@ mod tests {
             1,
             "bare @ must not select all"
         );
-        assert_eq!(mode.session.search_matches[0].label.as_str(), "ka");
+        assert_eq!(
+            mode.session.search_hints[mode.session.search_matches[0]]
+                .label
+                .as_str(),
+            "ka"
+        );
         mode.handle(&ModeEvent::TextChanged("l@ @ka".into()), &env.ctx());
         assert_eq!(mode.session.search_matches.len(), 2);
         assert_eq!(mode.session.search_selected.len(), 1);
@@ -2614,7 +3003,7 @@ mod tests {
             mode.session
                 .search_matches
                 .iter()
-                .map(|h| h.label.as_str())
+                .map(|&index| mode.session.search_hints[index].label.as_str())
                 .collect::<Vec<_>>(),
             ["ka", "la"]
         );
@@ -2948,7 +3337,7 @@ mod tests {
             mode.session
                 .search_matches
                 .iter()
-                .map(|h| h.value)
+                .map(|&index| mode.session.search_hints[index].value)
                 .collect::<Vec<_>>(),
             [1, 0]
         );
@@ -3318,22 +3707,29 @@ mod tests {
             )
             .into_iter()
             .collect();
-        // Match Engine's end-of-turn handling after submitting the scene.
+        // Simulate successive Engine turns after the scene has been submitted.
         if commands.iter().any(|command| {
             matches!(command,
                 Command::SetTimer { id, .. } if id == SEARCH_PREWARM_TIMER_ID
             )
         }) {
-            assert!(
-                mode.handle(
-                    &ModeEvent::Timer {
-                        id: SEARCH_PREWARM_TIMER_ID.into(),
-                        elapsed: Duration::ZERO,
-                    },
-                    &env.ctx()
-                )
-                .is_empty()
-            );
+            let mut completed = false;
+            for _ in 0..=mode.session.scanned.len() / SEARCH_PREWARM_TARGETS {
+                if mode
+                    .handle(
+                        &ModeEvent::Timer {
+                            id: SEARCH_PREWARM_TIMER_ID.into(),
+                            elapsed: Duration::ZERO,
+                        },
+                        &env.ctx(),
+                    )
+                    .is_empty()
+                {
+                    completed = true;
+                    break;
+                }
+            }
+            assert!(completed, "prewarm must make bounded progress");
         }
         commands
     }
@@ -3655,6 +4051,129 @@ mod tests {
             assert!(mode.handle(&warm, &env.ctx()).is_empty());
             assert_eq!(mode.session.search_text.as_ptr(), storage);
             mode.handle(&ModeEvent::Deactivated, &env.ctx());
+            assert!(mode.handle(&warm, &env.ctx()).is_empty());
+            assert_eq!(mode.session.search_text.capacity(), 0);
+        }
+    }
+
+    #[test]
+    fn bounded_prewarm_yields_to_scan_updates_and_empty_search() {
+        let mut env = Env::new();
+        env.screens[0].bounds = Rect::new(0.0, 0.0, 12_000.0, 12_000.0);
+        env.screens[0].work_area = env.screens[0].bounds;
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
+        activate(&mut mode, &env);
+        let warm = ModeEvent::Timer {
+            id: SEARCH_PREWARM_TIMER_ID.into(),
+            elapsed: Duration::ZERO,
+        };
+        let values = (0..1_024)
+            .map(|index| UiTarget {
+                rect: Rect::new(
+                    (index % 100) as f64 * 80.0,
+                    (index / 100) as f64 * 40.0,
+                    64.0,
+                    24.0,
+                ),
+                name: format!("Control {index} 设置"),
+                role: SemanticRole::Button,
+                details: None,
+            })
+            .collect();
+        let commands = mode.handle_owned(
+            ModeEvent::UiScanned(UiScanResult {
+                id: mode.session.scan_id,
+                targets: values,
+                retired: Vec::new(),
+                status: UiScanStatus::Partial,
+            }),
+            &env.ctx(),
+        );
+        assert!(matches!(commands[0], Command::ShowOverlay(_)));
+        assert_eq!(scene_of(&commands).labels.len(), 1_024);
+        assert_eq!(mode.session.search_text.capacity(), 0);
+        let continuation = mode.handle(&warm, &env.ctx());
+        assert_eq!(mode.session.search_text.len(), SEARCH_PREWARM_TARGETS);
+        assert!(!mode.session.search_names_initialized);
+        assert!(
+            matches!(&continuation[0], Command::SetTimer { id, delay, repeating: false }
+            if id == SEARCH_PREWARM_TIMER_ID && delay.is_zero())
+        );
+        assert_eq!(continuation.len(), 1);
+        let text_storage = mode.session.search_text.as_ptr();
+        let commands = mode.handle_owned(
+            ModeEvent::UiScanned(UiScanResult {
+                id: mode.session.scan_id,
+                targets: vec![target("Late unique", 8_500.0)],
+                retired: Vec::new(),
+                status: UiScanStatus::Partial,
+            }),
+            &env.ctx(),
+        );
+        assert_eq!(scene_of(&commands).labels.len(), 1_025);
+        assert_eq!(mode.session.search_text.len(), SEARCH_PREWARM_TARGETS);
+        assert_eq!(mode.session.search_text.as_ptr(), text_storage);
+        press(&mut mode, &env, "/");
+        assert_eq!(
+            mode.session.search_text.len(),
+            SEARCH_PREWARM_TARGETS,
+            "empty search must preserve the bounded prewarm, not finish it synchronously"
+        );
+        mode.handle(&ModeEvent::TextChanged("unique".into()), &env.ctx());
+        assert!(mode.session.search_names_initialized);
+        assert_eq!(mode.session.search_text.len(), 1_025);
+        assert_eq!(mode.session.hints.len(), 1);
+        assert_eq!(
+            mode.session.scanned[mode.session.hints[0].value].name,
+            "Late unique"
+        );
+        assert!(mode.handle(&warm, &env.ctx()).is_empty());
+        mode.handle(&ModeEvent::Deactivated, &env.ctx());
+        assert!(mode.handle(&warm, &env.ctx()).is_empty());
+        assert_eq!(mode.session.search_text.capacity(), 0);
+    }
+
+    #[test]
+    fn prewarm_finishes_without_search_and_cancels_partial_work_on_exit() {
+        let env = Env::new();
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
+        let warm = ModeEvent::Timer {
+            id: SEARCH_PREWARM_TIMER_ID.into(),
+            elapsed: Duration::ZERO,
+        };
+        for complete in [false, true] {
+            activate(&mut mode, &env);
+            // Coincident rectangles still represent distinct named targets.
+            let values = (0..600)
+                .map(|i| target(&format!("Control {i}"), 20.0))
+                .collect();
+            mode.handle_owned(
+                ModeEvent::UiScanned(UiScanResult {
+                    id: mode.session.scan_id,
+                    targets: values,
+                    retired: Vec::new(),
+                    status: UiScanStatus::Success,
+                }),
+                &env.ctx(),
+            );
+            assert!(!mode.handle(&warm, &env.ctx()).is_empty());
+            if complete {
+                assert!(!mode.handle(&warm, &env.ctx()).is_empty());
+                assert!(mode.handle(&warm, &env.ctx()).is_empty());
+                assert!(mode.session.search_names_initialized);
+                assert_eq!(mode.session.search_text.len(), 600);
+                assert!(
+                    matches!(mode.input, Input::Labels(_)),
+                    "prepare before the user searches"
+                );
+            }
+            let commands = mode.handle(&ModeEvent::Deactivated, &env.ctx());
+            assert!(
+                commands
+                    .iter()
+                    .any(|command| matches!(command, Command::CancelTimer { id }
+                if id == SEARCH_PREWARM_TIMER_ID))
+            );
             assert!(mode.handle(&warm, &env.ctx()).is_empty());
             assert_eq!(mode.session.search_text.capacity(), 0);
         }

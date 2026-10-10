@@ -5,6 +5,16 @@ outline: false
 
 # 更新日志 / Release Notes
 
+## 0.11.7
+
+- UIHint 搜索有多个结果时，会自动显示最匹配结果的信息面板。默认按 `Tab` 切换，`Enter` 或 `/` 确认当前结果，`Esc` 取消；按键均可修改。
+- 搜索会优先展示更符合输入的结果。匹配程度相同时，默认按「简拼 → 文字 → 标签」选择，也可以在配置中调整顺序。
+- 新增 22 秒中英双语演示，快速了解简拼搜索、切换结果、复制信息、微调点位与取色。[观看视频](https://github.com/user-attachments/assets/84d0872d-81f6-4e42-aa7f-767061cef646)。
+
+- UIHint search now automatically previews the best match when several results are found. By default, press `Tab` to switch, `Enter` or `/` to confirm the current result, or `Esc` to cancel. These keys are customizable.
+- Search shows the closest matches first. Equally close matches default to Chinese initials → text → labels; you can change this order in settings.
+- Added a 22-second bilingual demo covering pinyin initials, result cycling, copying information, point adjustment, and color picking. [Watch the video](https://github.com/user-attachments/assets/84d0872d-81f6-4e42-aa7f-767061cef646).
+
 ## 0.11.6
 
 - Windows 提供三种 x64 构建：默认 AVX2（x86-64-v3）版、旧 CPU 兼容版、AVX-512（x86-64-v4）版。固定编译指令集，避免构建机器变化导致启动即退出。

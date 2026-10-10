@@ -659,6 +659,11 @@ overlap_cycle_key = "shift"
 # "normal"  keeps single-character labels as long as possible
 # "reverse" fills the two-character tier uniformly
 label_direction = "normal"
+# Search-result group priority for equal match quality; include each exactly once.
+# text includes OCR, accessibility text and control types (e.g. text_field).
+# Whole words/codes precede prefixes, then substrings; ties retain scan order.
+# The first result panel appears automatically; point_next advances from it.
+search_match_priority = ["pinyin", "text", "label"]
 # Accessibility tree depth limit; 0 means unlimited.
 max_depth = 50
 # Soft scan budget. Results stream onto the screen before this expires.
@@ -759,28 +764,29 @@ border_radius = -1
 
 # Search matches labels, accessibility semantics, OCR and Chinese initials.
 # Accept exits search and restores labels; a unique result also moves the pointer.
-# Shared overlay editor shortcuts. primary = Cmd on macOS, Ctrl on Windows.
-# Each entry is configurable; omitted entries inherit these defaults.
+# Shared overlay editor shortcuts. primary follows [key_aliases].
+# Keys = action; omitted actions inherit defaults. Multiple alternatives use spaces.
 [ui_hint.search_edit_keys]
-accept = "enter / primary+q" # alternatives separated by spaces
-cancel = "esc"
-paste = "primary+v"
-copy = "primary+c"
-cut = "primary+x"
-select_all = "primary+a"
-left = "left"
-right = "right"
-home = "home"
-end = "end"
-select_left = "shift+left"
-select_right = "shift+right"
-select_home = "shift+home"
-select_end = "shift+end"
-backspace = "backspace"
-delete = "delete"
+"enter / primary+q" = "accept" # alternatives separated by spaces
+"esc" = "cancel"
+"primary+v" = "paste"
+"primary+c" = "copy"
+"primary+x" = "cut"
+"primary+a" = "select_all"
+"left" = "left"
+"right" = "right"
+"home" = "home"
+"end" = "end"
+"shift+left" = "select_left"
+"shift+right" = "select_right"
+"shift+home" = "select_home"
+"shift+end" = "select_end"
+"backspace" = "backspace"
+"delete" = "delete"
 
 # A solo tap toggles point adjustment; copy chords never toggle it.
-# Color cycling also enters adjustment automatically when one result remains.
+# point_next previews search results while typing and switches points while adjusting.
+# Color cycling also enters adjustment automatically when a result panel is visible.
 [ui_hint.search_bindings]
 ctrl = "point_toggle"
 tab = "point_next"

@@ -37,7 +37,7 @@ KeySteer 是 Windows 和 macOS 上的原生键盘操控工具。用 `hjkl` 移�
 - **长按,拖拽**：可将鼠标左/中/右键转为按下状态，适合拖拽。
 - **Grid**：快速定位二键组合。
 - **Recursive Grid**：区域持续递归细分。
-- **UI Hint**：辅助功能，OCR，并行异步扫描为按钮、链接、菜单和输入框显示可键入标签。
+- **UI Hint**：辅助功能、OCR 并行异步扫描，为按钮、链接、菜单和输入框显示可键入标签；支持文字／简拼搜索、信息复制与取色。
 - **多显示器**：`Primary+S` 切换到下一块显示器。
 - **外观与配置**：`Grid`/`Hint` 标签样式、指示器等可通过 TOML 调整。
 
@@ -122,6 +122,16 @@ https://github.com/user-attachments/assets/cb399755-5cde-40a0-ba64-d00c7e581cc6
 扫描界面元素、标签筛选与控件定位。
 
 https://github.com/user-attachments/assets/71efcae3-eb11-46d0-aba4-0a5df5e9c80c
+
+### UI Hint 搜索：简拼、复制与取色
+
+- **搜索与预览**：按 `/` 输入文字或中文简拼，例如用 `sz` 搜索“设置”。自动显示最匹配结果的信息面板，按 `Tab` 切换结果。
+- **复制信息**：`Ctrl+1/2/3/4` 分别复制文字、辅助信息、坐标或颜色。
+- **点编辑与取色**：轻按 `Ctrl` 进入点编辑模式，用 `H/J/K/L` 微调取色位置，`Ctrl+Shift+4` 切换 HEX、RGB、HSL。
+
+https://github.com/user-attachments/assets/84d0872d-81f6-4e42-aa7f-767061cef646
+
+22 秒中英双语演示，纯字幕。[完整操作说明](docs/modes/ui-hint.md)。以上按键均可配置。
 
 ## 默认按键
 

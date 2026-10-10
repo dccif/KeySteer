@@ -88,6 +88,9 @@ pub(crate) fn hint_settings(config: &Config) -> modes::hint::Settings {
                 )
             })
             .collect(),
+        search_match_priority: crate::api::hint::CompiledSearchPriority::new(
+            config.ui_hint.search_match_priority,
+        ),
         search_titles: ["OCR", "Accessibility", "Coordinates", "Color"].map(String::from),
         search_point: modes::hint::PointSettings {
             field_modes: config.ui_hint.search_point.field_modes,

@@ -241,13 +241,18 @@ impl HintMode {
         event: &ModeEvent,
         ctx: &HostContext<'_>,
     ) -> Option<CommandBatch> {
-        let next_point = if matches!(event, ModeEvent::CyclePointTarget) {
-            self.inspection.as_ref().and_then(|point| {
-                point
-                    .members
-                    .get(point.position % point.members.len())
-                    .map(|(index, _)| self.target_point(*index))
-            })
+        let next_target = if matches!(event, ModeEvent::CyclePointTarget) {
+            self.inspection
+                .as_ref()
+                .filter(|point| point.adjusting)
+                .and_then(|point| {
+                    let position = next_target_position(
+                        point.position.checked_sub(1),
+                        (!point.members.is_empty()).then_some(0),
+                        |position| (position + 1) % point.members.len(),
+                    )?;
+                    Some((position, self.target_point(point.members[position].0)))
+                })
         } else {
             None
         };
@@ -279,9 +284,10 @@ impl HintMode {
                 if point.members.len() < 2 || point.copy_pending {
                     return Some(CommandBatch::new());
                 }
-                point.position = point.position % point.members.len() + 1;
-                let index = point.members[point.position - 1].0;
-                point.point = next_point?;
+                let (position, next_point) = next_target?;
+                point.position = position + 1;
+                let index = point.members[position].0;
+                point.point = next_point;
                 point.target = Some(index);
                 point.color = None;
                 point.movement.handle(&ModeEvent::Deactivated, ctx);

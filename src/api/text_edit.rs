@@ -247,6 +247,68 @@ mod tests {
         assert_eq!(selection.cursor, text.len());
     }
     #[test]
+    fn key_action_tables_combine_alternatives_and_preserve_sparse_defaults() {
+        let config = crate::config::Config::parse(
+            "[ui_hint.search_edit_keys]\nf8 = 'accept'\nf9 = 'accept'\n'alt+v' = 'paste'",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            config.ui_hint.search_edit_keys[&EditAction::Accept],
+            "f8 f9"
+        );
+        assert_eq!(config.ui_hint.search_edit_keys[&EditAction::Paste], "alt+v");
+        assert_eq!(config.ui_hint.search_edit_keys[&EditAction::Cancel], "esc");
+        let exported = config.to_toml().unwrap();
+        let table: toml::Value = toml::from_str(&exported).unwrap();
+        let bindings = table["ui_hint"]["search_edit_keys"].as_table().unwrap();
+        assert_eq!(bindings["f8 f9"].as_str(), Some("accept"));
+        assert_eq!(bindings["alt+v"].as_str(), Some("paste"));
+        assert!(!bindings.contains_key("paste"));
+        assert_eq!(
+            crate::config::Config::parse(&exported)
+                .unwrap()
+                .ui_hint
+                .search_edit_keys,
+            config.ui_hint.search_edit_keys,
+        );
+        assert!(
+            crate::config::Config::parse("[ui_hint.search_edit_keys]\nf8 = 'missing_action'")
+                .is_err()
+        );
+        for source in [
+            "'enter ctrl+1' = 'accept'",
+            "'enter enter' = 'accept'",
+            "'enter primary+v' = 'accept'",
+        ] {
+            let invalid =
+                crate::config::Config::parse(&format!("[ui_hint.search_edit_keys]\n{source}"))
+                    .unwrap();
+            assert!(invalid.validate().is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn legacy_edit_keys_export_in_key_action_format_with_disabled_actions_intact() {
+        let config = crate::config::Config::parse(
+            "[ui_hint.search_edit_keys]\naccept = 'f9'\ncopy = ''\ncut = ''",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let exported = config.to_toml().unwrap();
+        let table: toml::Value = toml::from_str(&exported).unwrap();
+        let bindings = table["ui_hint"]["search_edit_keys"].as_table().unwrap();
+        assert_eq!(bindings["f9"].as_str(), Some("accept"));
+        assert!(!bindings.contains_key("accept"));
+        let restored = crate::config::Config::parse(&exported).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(
+            restored.ui_hint.search_edit_keys,
+            config.ui_hint.search_edit_keys
+        );
+    }
+
+    #[test]
     fn sparse_configuration_keeps_defaults_and_rejects_shortcut_collisions() {
         let config =
             crate::config::Config::parse("[ui_hint.search_edit_keys]\npaste = 'alt+v'").unwrap();

@@ -5,6 +5,12 @@ outline: false
 
 # Release notes
 
+## 0.11.7
+
+- UIHint search now automatically previews the best match when several results are found. By default, press `Tab` to switch, `Enter` or `/` to confirm the current result, or `Esc` to cancel. These keys are customizable.
+- Search shows the closest matches first. Equally close matches default to Chinese initials → text → labels; you can change this order in settings.
+- Added a 22-second bilingual demo covering pinyin initials, result cycling, copying information, point adjustment, and color picking. [Watch the video](https://github.com/user-attachments/assets/84d0872d-81f6-4e42-aa7f-767061cef646).
+
 ## 0.11.6
 
 - Windows x64 now offers three builds: the default AVX2 (x86-64-v3) build, a compatible build for older CPUs, and an AVX-512 (x86-64-v4) build. Fixed instruction-set targets prevent startup crashes caused by changes to the build machine.

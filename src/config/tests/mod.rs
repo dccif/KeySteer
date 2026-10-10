@@ -2011,3 +2011,40 @@ input_border_color = { light = "#99AABBCC", dark = "#DDEEFFAA" }
         );
     }
 }
+
+#[test]
+fn search_match_priority_defaults_compiles_and_round_trips_with_strict_validation() {
+    use crate::api::hint::SearchMatchKind::{Label, Pinyin, Text};
+    assert_eq!(
+        Config::default().ui_hint.search_match_priority,
+        [Pinyin, Text, Label]
+    );
+    let config =
+        Config::parse("[ui_hint]\nsearch_match_priority = ['label', 'text', 'pinyin']").unwrap();
+    config.validate().unwrap();
+    assert_eq!(
+        crate::app::mode_catalog::hint_settings(&config).search_match_priority,
+        crate::api::hint::CompiledSearchPriority::new([Label, Text, Pinyin])
+    );
+    assert_eq!(
+        Config::parse(&config.to_toml().unwrap())
+            .unwrap()
+            .ui_hint
+            .search_match_priority,
+        [Label, Text, Pinyin]
+    );
+    for values in [
+        "[]",
+        "['label']",
+        "['label', 'text', 'pinyin', 'label']",
+        "['label', 'label', 'pinyin']",
+        "['label', 'text', 'unknown']",
+    ] {
+        assert!(
+            Config::parse(&format!("[ui_hint]\nsearch_match_priority = {values}"))
+                .and_then(|config| config.validate())
+                .is_err(),
+            "{values}"
+        );
+    }
+}

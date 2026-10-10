@@ -5,6 +5,42 @@ import { parseSplitRatios } from '../simulator/window-ratios.ts'
 
 export type ConfigDocument = Record<string, any>
 
+const searchEditActions = new Set([
+  'accept', 'cancel', 'paste', 'copy', 'cut', 'select_all',
+  'left', 'right', 'home', 'end', 'select_left', 'select_right',
+  'select_home', 'select_end', 'backspace', 'delete',
+])
+
+/** Import legacy action = keys tables, but keep the editable/exported model key = action. */
+export function normalizeSearchEditBindings(value: unknown): Record<string, string> {
+  if (!isRecord(value)) throw new Error('ui_hint.search_edit_keys must be a key = action table')
+  const entries = Object.entries(value)
+  if (entries.every(([, action]) => typeof action === 'string' && searchEditActions.has(action))) return { ...value }
+  if (!entries.every(([action, keys]) => searchEditActions.has(action) && typeof keys === 'string')) throw new Error('ui_hint.search_edit_keys requires known editing actions')
+  const result: Record<string, string> = {}
+  for (const [action, alternatives] of entries) {
+    let keys = alternatives as string
+    while (keys in result) {
+      if (keys.trim()) throw new Error('duplicate search editing key group')
+      keys += ' '
+    }
+    result[keys] = action
+  }
+  return result
+}
+
+function mergeSearchEditBindings(defaults: unknown, configured: unknown): Record<string, string> {
+  const base = normalizeSearchEditBindings(defaults ?? {})
+  const overrides = normalizeSearchEditBindings(configured)
+  const actions = new Set(Object.values(overrides))
+  const result = Object.fromEntries(Object.entries(base).filter(([, action]) => !actions.has(action)))
+  for (const [key, action] of Object.entries(overrides)) {
+    if (key in result && result[key] !== action) throw new Error('search editing keys must be distinct')
+    result[key] = action
+  }
+  return result
+}
+
 export interface ParsedConfigDocument {
   document: ConfigDocument
   bytes: number
@@ -134,6 +170,11 @@ export function parseConfigDocument(source: string): ParsedConfigDocument {
       if (!valid) throw new Error(`ui_hint.search_point.${key} is invalid`)
     }
   }
+  const priority = (parsed.ui_hint as ConfigDocument | undefined)?.search_match_priority
+  if (priority !== undefined && (!Array.isArray(priority) || priority.length !== 3 || new Set(priority).size !== 3 || priority.some(value => !['label', 'text', 'pinyin'].includes(value)))) throw new Error('ui_hint.search_match_priority requires label, text and pinyin exactly once')
+  const uiHint = parsed.ui_hint as ConfigDocument | undefined
+  const searchEditKeys = uiHint?.search_edit_keys
+  if (uiHint && searchEditKeys !== undefined) uiHint.search_edit_keys = normalizeSearchEditBindings(searchEditKeys)
   const searchBindings = (parsed.ui_hint as ConfigDocument | undefined)?.search_bindings
   if (searchBindings !== undefined && (!isRecord(searchBindings) || Object.values(searchBindings).some(value => !['point_toggle', 'point_next', 'color_next'].includes(String(value))))) throw new Error('ui_hint.search_bindings requires point_toggle, point_next or color_next')
   parseSplitRatios((parsed.window_quick as Record<string, unknown> | undefined)?.split_ratios)
@@ -186,6 +227,7 @@ export function deleteConfigPath(document: ConfigDocument, path: string): void {
 
 function mergeValue(defaultValue: unknown, configuredValue: unknown, path: string): unknown {
   if (configuredValue === undefined) return cloneConfigValue(defaultValue)
+  if (path === 'ui_hint.search_edit_keys') return mergeSearchEditBindings(defaultValue, configuredValue)
   if (replacementTables.has(path) || Array.isArray(configuredValue) || !isRecord(configuredValue)) {
     return cloneConfigValue(configuredValue)
   }
