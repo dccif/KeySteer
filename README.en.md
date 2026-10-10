@@ -123,7 +123,7 @@ https://github.com/user-attachments/assets/71efcae3-eb11-46d0-aba4-0a5df5e9c80c
 
 https://github.com/user-attachments/assets/84d0872d-81f6-4e42-aa7f-767061cef646
 
-22-second bilingual demo, subtitles only. [Full usage guide](docs/en/modes/ui-hint.md). All keys above are configurable.
+[Full usage guide](https://dccif.github.io/KeySteer/en/modes/ui-hint#search-and-result-previews)
 
 ## Default keys
 

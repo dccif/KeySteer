@@ -131,7 +131,7 @@ https://github.com/user-attachments/assets/71efcae3-eb11-46d0-aba4-0a5df5e9c80c
 
 https://github.com/user-attachments/assets/84d0872d-81f6-4e42-aa7f-767061cef646
 
-22 秒中英双语演示，纯字幕。[完整操作说明](docs/modes/ui-hint.md)。以上按键均可配置。
+[完整操作说明](https://dccif.github.io/KeySteer/modes/ui-hint#%E6%90%9C%E7%B4%A2%E4%B8%8E%E7%BB%93%E6%9E%9C%E9%A2%84%E8%A7%88)。
 
 ## 默认按键
 
