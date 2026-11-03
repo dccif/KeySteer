@@ -5,6 +5,11 @@ outline: 2
 
 # Release notes
 
+## 0.15.3
+
+- Improved UI Hint label display speed on macOS.
+- Reduced temporary allocations when processing scan results on Windows and macOS.
+
 ## 0.15.2
 
 **性能优化 / Performance**

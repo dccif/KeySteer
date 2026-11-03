@@ -204,9 +204,8 @@ impl ScanAccumulator {
         // Fusion order remains unchanged even for unpublished visual candidates.
         // Only retire identities that have actually reached the consumer.
         let mut previous = Vec::new();
-        let mut visible_retired = Vec::new();
         let preserve_names = !retired.is_empty() && targets.iter().any(needs_replaced_names);
-        for &rect in &retired {
+        retired.retain(|&rect| {
             let mut visible = false;
             self.search_spatial.any_match(rect, |index, old, _| {
                 if old == rect
@@ -221,12 +220,12 @@ impl ScanAccumulator {
                 }
                 false
             });
-            if self.defer_visual && visible {
-                visible_retired.push(rect);
-            }
-        }
-        if self.defer_visual {
-            retired = visible_retired;
+            !self.defer_visual || visible
+        });
+        if self.defer_visual && retired.len().saturating_mul(4) < retired.capacity() {
+            // A batch can replace many unpublished candidates but expose only
+            // a few retirements; do not keep the large buffer in the mailbox.
+            retired.shrink_to_fit();
         }
         // Cache order is publication order, independent of spatial bucket order.
         // Move retired evidence instead of making the mailbox and Hint recover
@@ -1328,6 +1327,43 @@ mod tests {
             scan.take_deferred().is_empty(),
             "early targets must not be duplicated at terminal"
         );
+    }
+
+    #[test]
+    fn replacement_retires_only_previously_published_visual_targets() {
+        use super::super::scan_progress::Progress;
+        let visible = target(0.0, 20.0, SemanticRole::Control);
+        let hidden = target(200.0, 20.0, SemanticRole::Control);
+        let mut scan = ScanAccumulator::new()
+            .defer_visual(true)
+            .progress_sources(&[TargetSource::Contour]);
+        scan.progress(
+            TargetSource::Contour,
+            Progress::Plan(vec![Rect::new(170.0, -20.0, 100.0, 100.0)]),
+        );
+        let initial = scan.push(
+            TargetSource::Contour,
+            vec![visible.clone(), hidden.clone()],
+            0.5,
+        );
+        assert_eq!(initial.targets.len(), 1);
+        assert_eq!(initial.targets[0].rect, visible.rect);
+
+        let replacement = |old: UiTarget| UiTarget {
+            role: SemanticRole::Button,
+            ..old
+        };
+        let update = scan.push(
+            TargetSource::Accessibility,
+            vec![replacement(hidden.clone()), replacement(visible.clone())],
+            0.5,
+        );
+        assert_eq!(update.retired, [visible.rect]);
+        assert_eq!(
+            update.targets.iter().map(|t| t.rect).collect::<Vec<_>>(),
+            [hidden.rect, visible.rect]
+        );
+        assert!(scan.take_deferred().is_empty());
     }
 
     #[test]

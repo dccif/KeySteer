@@ -100,6 +100,8 @@ pub struct MacOsBackend {
     background_budget: event_queue::BackgroundBudget,
     event_tx: EventSender,
     scan_mailbox: Arc<ScanMailbox>,
+    scan_previews: Arc<ScanMailbox>,
+    preview_view: ui_scan::PreviewView,
     scan_fusion: crate::platform::common::scan_fusion::Worker,
     scan_worker: ui_scan::UiScanWorker,
     pending: VecDeque<BackendEvent>,
@@ -195,6 +197,8 @@ impl MacOsBackend {
             background_budget: event_queue::BackgroundBudget::default(),
             event_tx,
             scan_mailbox,
+            scan_previews: Arc::new(ScanMailbox::default()),
+            preview_view: ui_scan::PreviewView::default(),
             scan_fusion: crate::platform::common::scan_fusion::Worker::default(),
             scan_worker: ui_scan::UiScanWorker::new(),
             pending: VecDeque::new(),
@@ -320,13 +324,20 @@ impl MacOsBackend {
         let event = self
             .scan_mailbox
             .take()
-            .map(|result| {
+            .map(|mut result| {
+                self.preview_view.authoritative(&mut result);
                 if result.status != crate::api::command::UiScanStatus::Partial {
                     // The engine retires its scan owner after this event.
                     // Cancel remaining native work before losing that route.
                     self.cancel_scan(result.id);
                 }
                 BackendEvent::UiScanned(result)
+            })
+            .or_else(|| {
+                self.scan_previews
+                    .take()
+                    .and_then(|result| self.preview_view.preview(result))
+                    .map(BackendEvent::UiScanned)
             })
             .or_else(|| self.pending.pop_front())
             .or_else(|| self.async_rx.try_recv().ok());
@@ -338,8 +349,10 @@ impl MacOsBackend {
         event
     }
 
-    fn cancel_scan(&self, id: u64) {
+    fn cancel_scan(&mut self, id: u64) {
         self.scan_mailbox.cancel(id);
+        self.scan_previews.cancel(id);
+        self.preview_view.cancel(id);
         self.scan_fusion.cancel(id);
         self.scan_worker.cancel_scan(id);
     }
@@ -883,20 +896,26 @@ impl Backend for MacOsBackend {
 
     fn request_ui_scan(&mut self, request: crate::api::UiScanRequest) -> Result<(), String> {
         let generation = self.scan_mailbox.begin(request.id);
+        let preview_generation = self.scan_previews.begin(request.id);
+        self.preview_view.begin(&request);
         let fusion = match self.scan_fusion.prepare(generation) {
             Ok(fusion) => fusion,
             Err(error) => {
                 self.scan_mailbox.cancel(request.id);
+                self.scan_previews.cancel(request.id);
+                self.preview_view.cancel(request.id);
                 return Err(error);
             }
         };
-        self.scan_worker.request_scan(
+        self.scan_worker.request_scan(ui_scan::ScanJob {
             request,
             generation,
-            Arc::clone(&self.scan_mailbox),
-            self.event_tx.clone(),
+            mailbox: Arc::clone(&self.scan_mailbox),
+            preview_mailbox: Arc::clone(&self.scan_previews),
+            preview_generation,
+            wake: self.event_tx.clone(),
             fusion,
-        );
+        });
         Ok(())
     }
 

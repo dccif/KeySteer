@@ -383,7 +383,7 @@ impl Drop for ProviderInput {
     }
 }
 
-pub fn detect(
+pub(super) fn detect(
     (scan_id, cache): (u64, &mut CaptureCache),
     regions: (
         impl IntoIterator<Item = Rect>,
@@ -393,7 +393,7 @@ pub fn detect(
     strategy: crate::api::UiScanStrategy,
     workers: &Workers,
     cancelled: impl Fn() -> bool + Send + Sync + 'static,
-    output: crate::platform::common::scan_fusion::Sink,
+    publisher: super::ui_scan::PartialPublisher,
 ) -> UiScanStatus {
     let run = || {
         detect_inner(
@@ -403,7 +403,7 @@ pub fn detect(
             strategy,
             workers,
             cancelled,
-            output,
+            publisher,
         )
     };
     run().unwrap_or_else(UiScanStatus::Failed)
@@ -419,8 +419,12 @@ fn detect_inner(
     strategy: crate::api::UiScanStrategy,
     workers: &Workers,
     cancelled: impl Fn() -> bool + Send + Sync + 'static,
-    output: crate::platform::common::scan_fusion::Sink,
+    publisher: super::ui_scan::PartialPublisher,
 ) -> Result<UiScanStatus, String> {
+    let super::ui_scan::PartialPublisher {
+        sink: output,
+        preview,
+    } = publisher;
     let deadline =
         Instant::now() + Duration::from_millis(options.request_timeout_ms.clamp(1, 30_000));
     let cancelled = Arc::new(cancelled);
@@ -484,6 +488,7 @@ fn detect_inner(
             let options = options.clone();
             let cancelled = Arc::clone(&cancelled);
             let output = output.clone();
+            let preview = preview.clone();
             move |_, stopped, resources| {
                 if source == TargetSource::SystemOcr {
                     stopped.reuse_processes(frame_workers);
@@ -568,7 +573,11 @@ fn detect_inner(
                                 deadline,
                                 stopped,
                                 &cancelled,
-                                (&publish, &progress),
+                                (
+                                    &publish,
+                                    &progress,
+                                    config.detect_rectangles.then_some(&preview),
+                                ),
                             )
                         } else if source == TargetSource::Contour {
                             let Some(workspace) = contour.as_deref_mut() else {
@@ -852,6 +861,12 @@ fn combined_status(statuses: &[UiScanStatus]) -> UiScanStatus {
 #[derive(serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum OcrMessage {
+    Preview {
+        index: usize,
+        status: i32,
+        message: String,
+        regions: Vec<OcrRegion>,
+    },
     Tile {
         index: usize,
         status: i32,
@@ -871,6 +886,30 @@ struct OcrRegion {
     label: String,
 }
 
+fn accept_ocr_phase(
+    index: usize,
+    is_preview: bool,
+    received: &mut [bool],
+    previews: &mut [bool],
+) -> Result<(), &'static str> {
+    let complete = received
+        .get_mut(index)
+        .ok_or("OCR returned an unknown tile")?;
+    if is_preview {
+        let seen = previews.get_mut(index).ok_or("unexpected OCR preview")?;
+        if *seen || *complete {
+            return Err("OCR returned a late or duplicate preview");
+        }
+        *seen = true;
+    } else {
+        if *complete || (!previews.is_empty() && previews.get(index) != Some(&true)) {
+            return Err("OCR returned a duplicate tile or omitted its preview");
+        }
+        *complete = true;
+    }
+    Ok(())
+}
+
 fn recognize_ocr_image(
     (image, bounds, tiles, parallelism): (RetainedVisionImage, Rect, &[Tile], usize),
     scan_id: u64,
@@ -878,9 +917,10 @@ fn recognize_ocr_image(
     deadline: Instant,
     stopped: &Signal,
     cancelled: &impl Fn() -> bool,
-    (publish, progress): (
+    (publish, progress, preview): (
         &impl Fn(Vec<UiTarget>),
         &impl Fn(crate::platform::common::scan_progress::Progress),
+        Option<&super::ui_scan::FastPreview>,
     ),
 ) -> UiScanStatus {
     let started = Instant::now();
@@ -916,6 +956,7 @@ fn recognize_ocr_image(
                 "tiles": crops,
                 "parallelism": parallelism,
                 "minimum_confidence": options.minimum_confidence,
+                "fast_preview": preview.is_some(),
             }),
         )
         .map_err(|error| format!("cannot send OCR layout: {error}"))?;
@@ -935,6 +976,11 @@ fn recognize_ocr_image(
         let mut output = BufReader::new(output);
         let mut bytes = Vec::new();
         let mut received = vec![false; tiles.len()];
+        let mut preview_received = if preview.is_some() {
+            vec![false; tiles.len()]
+        } else {
+            Vec::new()
+        };
         let mut published = false;
         loop {
             if let Some(status) = interrupted() {
@@ -955,9 +1001,10 @@ fn recognize_ocr_image(
             }
             let record = serde_json::from_slice(&bytes)
                 .map_err(|error| format!("invalid OCR result: {error}"))?;
-            match record {
+            let (is_preview, index, status, message, regions) = match record {
                 OcrMessage::Done => {
                     return if received.iter().all(|received| *received)
+                        && preview_received.iter().all(|received| *received)
                         && output.buffer().is_empty()
                     {
                         process.output = Some(output.into_inner());
@@ -972,74 +1019,96 @@ fn recognize_ocr_image(
                     status,
                     message,
                     regions,
-                } => {
-                    let tile = tiles.get(index).ok_or("OCR returned an unknown tile")?;
-                    if std::mem::replace(&mut received[index], true) {
-                        return Err("OCR returned a tile twice".into());
-                    }
-                    let status = native_status(status, message);
-                    if status != UiScanStatus::Success {
-                        return Ok(status);
-                    }
-                    let tile_bounds = pixel_rect_to_desktop(
-                        bounds,
-                        dimensions,
-                        Rect::new(
-                            tile.left_halo as f64,
-                            tile.top_halo as f64,
-                            (tile.right_halo - tile.left_halo) as f64,
-                            (tile.bottom_halo - tile.top_halo) as f64,
-                        ),
+                } => (false, index, status, message, regions),
+                OcrMessage::Preview {
+                    index,
+                    status,
+                    message,
+                    regions,
+                } => (true, index, status, message, regions),
+            };
+            let tile = tiles.get(index).ok_or("OCR returned an unknown tile")?;
+            accept_ocr_phase(index, is_preview, &mut received, &mut preview_received)?;
+            let status = native_status(status, message);
+            if status != UiScanStatus::Success {
+                if is_preview {
+                    crate::report_error!("macos-ocr-preview", "tile {index}: {status:?}");
+                    continue;
+                }
+                return Ok(status);
+            }
+            let tile_bounds = pixel_rect_to_desktop(
+                bounds,
+                dimensions,
+                Rect::new(
+                    tile.left_halo as f64,
+                    tile.top_halo as f64,
+                    (tile.right_halo - tile.left_halo) as f64,
+                    (tile.bottom_halo - tile.top_halo) as f64,
+                ),
+            );
+            let core = pixel_rect_to_desktop(
+                bounds,
+                dimensions,
+                Rect::new(
+                    tile.x as f64,
+                    tile.y as f64,
+                    (tile.right - tile.x) as f64,
+                    (tile.bottom - tile.y) as f64,
+                ),
+            );
+            let mut candidates = Vec::new();
+            for region in regions {
+                if let Some(status) = interrupted() {
+                    return Ok(status);
+                }
+                if region.label.len() > MAX_VISION_LABEL_BYTES {
+                    return Err("OCR returned an oversized text label".into());
+                }
+                let rect = normalized_to_global(
+                    tile_bounds,
+                    Rect::new(region.x, region.y, region.width, region.height),
+                );
+                if rect.is_empty() || !rect.width.is_finite() || !rect.height.is_finite() {
+                    continue;
+                }
+                candidates.push(Candidate {
+                    target: if is_preview {
+                        UiTarget {
+                            rect,
+                            name: String::new(),
+                            role: SemanticRole::Control,
+                            details: None,
+                        }
+                    } else {
+                        UiTarget::recognized_text(rect, region.label)
+                    },
+                    confidence: region.confidence,
+                    is_text: !is_preview,
+                });
+            }
+            let mut targets = merge_candidates(candidates, options.merge_iou_threshold);
+            targets.retain(|target| core.contains(&target.rect.center()));
+            if let Some(status) = interrupted() {
+                return Ok(status);
+            }
+            if is_preview {
+                if let Some(preview) = preview {
+                    preview.publish(targets);
+                }
+            } else {
+                let first = !published && !targets.is_empty();
+                published |= first;
+                publish(targets);
+                progress(crate::platform::common::scan_progress::Progress::Complete(
+                    tile_bounds,
+                ));
+                if first {
+                    crate::log_info!(
+                        "macos-ui-scan",
+                        "scan {scan_id}: OCR first targets after {} ms",
+                        started.elapsed().as_millis()
                     );
-                    let core = pixel_rect_to_desktop(
-                        bounds,
-                        dimensions,
-                        Rect::new(
-                            tile.x as f64,
-                            tile.y as f64,
-                            (tile.right - tile.x) as f64,
-                            (tile.bottom - tile.y) as f64,
-                        ),
-                    );
-                    let mut candidates = Vec::new();
-                    for region in regions {
-                        if let Some(status) = interrupted() {
-                            return Ok(status);
-                        }
-                        if region.label.len() > MAX_VISION_LABEL_BYTES {
-                            return Err("OCR returned an oversized text label".into());
-                        }
-                        let rect = normalized_to_global(
-                            tile_bounds,
-                            Rect::new(region.x, region.y, region.width, region.height),
-                        );
-                        if rect.is_empty() || !rect.width.is_finite() || !rect.height.is_finite() {
-                            continue;
-                        }
-                        candidates.push(Candidate {
-                            target: UiTarget::recognized_text(rect, region.label),
-                            confidence: region.confidence,
-                            is_text: true,
-                        });
-                    }
-                    let mut targets = merge_candidates(candidates, options.merge_iou_threshold);
-                    targets.retain(|target| core.contains(&target.rect.center()));
-                    if let Some(status) = interrupted() {
-                        return Ok(status);
-                    }
-                    let first = !published && !targets.is_empty();
-                    published |= first;
-                    publish(targets);
-                    progress(crate::platform::common::scan_progress::Progress::Complete(
-                        tile_bounds,
-                    ));
-                    if first {
-                        crate::log_info!(
-                            "macos-ui-scan",
-                            "scan {scan_id}: OCR first targets after {} ms",
-                            started.elapsed().as_millis()
-                        );
-                    }
                 }
             }
         }
@@ -1285,6 +1354,28 @@ fn intersection_over_union(a: Rect, b: Rect) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ocr_phases_reject_missing_duplicate_and_unexpected_records() {
+        let mut received = [false, false];
+        let mut previews = [false, false];
+        assert!(accept_ocr_phase(0, false, &mut received, &mut previews).is_err());
+        assert_eq!(received, [false, false]);
+        assert!(accept_ocr_phase(0, true, &mut received, &mut previews).is_ok());
+        assert!(accept_ocr_phase(0, true, &mut received, &mut previews).is_err());
+        assert!(accept_ocr_phase(1, true, &mut received, &mut previews).is_ok());
+        assert!(accept_ocr_phase(0, false, &mut received, &mut previews).is_ok());
+        assert!(accept_ocr_phase(0, true, &mut received, &mut previews).is_err());
+        assert!(accept_ocr_phase(0, false, &mut received, &mut previews).is_err());
+        assert!(accept_ocr_phase(1, false, &mut received, &mut previews).is_ok());
+        assert!(accept_ocr_phase(2, true, &mut received, &mut previews).is_err());
+
+        let mut received = [false];
+        let mut previews = [];
+        assert!(accept_ocr_phase(0, true, &mut received, &mut previews).is_err());
+        assert!(accept_ocr_phase(0, false, &mut received, &mut previews).is_ok());
+        assert!(accept_ocr_phase(0, false, &mut received, &mut previews).is_err());
+    }
 
     #[test]
     fn displays_share_a_hardware_dependent_ocr_request_budget() {

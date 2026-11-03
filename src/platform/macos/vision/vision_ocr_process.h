@@ -141,6 +141,9 @@ static int32_t recognizeOcrFrame(void) {
         NSDictionary *options = decoded;
         NSArray *tiles = options[@"tiles"];
         NSNumber *parallelism = options[@"parallelism"], *confidence = options[@"minimum_confidence"];
+        id previewOption = options[@"fast_preview"];
+        if (previewOption != nil && ![previewOption isKindOfClass:NSNumber.class]) return 1;
+        bool fastPreview = [previewOption boolValue];
         if (![tiles isKindOfClass:NSArray.class] || tiles.count == 0
             || ![parallelism isKindOfClass:NSNumber.class] || ![confidence isKindOfClass:NSNumber.class]) return 1;
         size_t lanes = MIN(MIN(parallelism.unsignedIntegerValue, NMK_MAX_OCR_IN_FLIGHT), tiles.count);
@@ -164,57 +167,62 @@ static int32_t recognizeOcrFrame(void) {
         if (image == NULL) return 1;
         NmkSetLatestVisionScan(1);
         NSLock *output = [[NSLock alloc] init];
-        _Atomic size_t next = 0;
-        _Atomic size_t *cursor = &next;
-        dispatch_apply(lanes, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t lane) {
-            (void)lane;
-            size_t index;
-            while ((index = atomic_fetch_add_explicit(cursor, 1, memory_order_relaxed)) < tiles.count) {
-                @autoreleasepool {
-                    id tile = tiles[index];
-                    if (![tile isKindOfClass:NSArray.class] || [tile count] != 4) _exit(1);
-                    for (id value in tile) if (![value isKindOfClass:NSNumber.class]) _exit(1);
-                    uintptr_t crop = NmkCropVisionImage((uintptr_t)image,
-                        [tile[0] unsignedLongLongValue], [tile[1] unsignedLongLongValue],
-                        [tile[2] unsignedLongLongValue], [tile[3] unsignedLongLongValue]);
-                    if (crop == 0) _exit(1);
+        // Finish the fast pass across the whole frame before any lane enters
+        // slow multilingual OCR. The image backing is shared by both passes.
+        for (unsigned pass = fastPreview ? 0 : 1; pass < 2; pass++) {
+            _Atomic size_t next = 0;
+            _Atomic size_t *cursor = &next;
+            dispatch_apply(lanes, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t lane) {
+                (void)lane;
+                size_t index;
+                while ((index = atomic_fetch_add_explicit(cursor, 1, memory_order_relaxed)) < tiles.count) {
+                    @autoreleasepool {
+                        id tile = tiles[index];
+                        if (![tile isKindOfClass:NSArray.class] || [tile count] != 4) _exit(1);
+                        for (id value in tile) if (![value isKindOfClass:NSNumber.class]) _exit(1);
+                        uintptr_t crop = NmkCropVisionImage((uintptr_t)image,
+                            [tile[0] unsignedLongLongValue], [tile[1] unsignedLongLongValue],
+                            [tile[2] unsignedLongLongValue], [tile[3] unsignedLongLongValue]);
+                        if (crop == 0) _exit(1);
 #ifdef NMK_VISION_TESTING
-                    if (getenv("KEYSTEER_TEST_OCR_HANG") != NULL) {
-                        [output lock];
-                        bool sent = writeOcrMessage(@{@"kind": @"blocked", @"index": @(index)});
-                        [output unlock];
-                        if (!sent) _exit(1);
-                        // Fault injection deliberately never returns, even
-                        // after cooperative VNRequest cancellation.
-                        for (;;) pause();
-                    }
+                        if (getenv("KEYSTEER_TEST_OCR_HANG") != NULL) {
+                            [output lock];
+                            bool sent = writeOcrMessage(@{@"kind": @"blocked", @"index": @(index)});
+                            [output unlock];
+                            if (!sent) _exit(1);
+                            // Fault injection deliberately never returns, even
+                            // after cooperative VNRequest cancellation.
+                            for (;;) pause();
+                        }
 #endif
-                    NmkVisionConfig config = {.detect_text = true, .minimum_confidence = confidence.doubleValue};
-                    NmkVisionResult *result = NmkRecognizeVisionImage(crop, CGRectZero, config, 1);
-                    NmkReleaseVisionImage(crop);
-                    if (result == NULL) _exit(1);
-                    NSMutableArray *regions = [NSMutableArray array];
-                    for (uint64_t region = 0; region < result->count; region++) {
-                        NmkVisionRegion *value = &result->regions[region];
-                        NSString *label = [[NSString alloc] initWithBytes:value->label
-                            length:(NSUInteger)value->label_len encoding:NSUTF8StringEncoding] ?: @"";
-                        [regions addObject:@{@"x": @(value->x), @"y": @(value->y),
-                            @"width": @(value->width), @"height": @(value->height),
-                            @"confidence": @(value->confidence), @"label": label}];
+                        NmkVisionConfig config = {.detect_text = true, .minimum_confidence = confidence.doubleValue};
+                        NmkVisionResult *result = recognizeVisionImage(crop, CGRectZero, config, 1, pass == 0);
+                        if (result == NULL) _exit(1);
+                        NSMutableArray *regions = [NSMutableArray array];
+                        for (uint64_t region = 0; region < result->count; region++) {
+                            NmkVisionRegion *value = &result->regions[region];
+                            NSString *label = pass == 0 ? @"" :
+                                ([[NSString alloc] initWithBytes:value->label
+                                    length:(NSUInteger)value->label_len encoding:NSUTF8StringEncoding] ?: @"");
+                            [regions addObject:@{@"x": @(value->x), @"y": @(value->y),
+                                @"width": @(value->width), @"height": @(value->height),
+                                @"confidence": @(value->confidence), @"label": label}];
+                        }
+                        NSString *message = result->message != NULL
+                            ? [[NSString alloc] initWithBytes:result->message length:(NSUInteger)result->message_len
+                                encoding:NSUTF8StringEncoding] ?: @"" : @"";
+                        NSDictionary *record = @{@"kind": pass == 0 ? @"preview" : @"tile", @"index": @(index),
+                            @"status": @(result->status), @"regions": regions, @"message": message};
+                        [output lock];
+                        bool sent = writeOcrMessage(record);
+                        [output unlock];
+                        NmkFreeVisionResult(result);
+                        if (!sent) _exit(1);
+                        NmkReleaseVisionImage(crop);
                     }
-                    NSString *message = result->message != NULL
-                        ? [[NSString alloc] initWithBytes:result->message length:(NSUInteger)result->message_len
-                            encoding:NSUTF8StringEncoding] ?: @"" : @"";
-                    NSDictionary *record = @{@"kind": @"tile", @"index": @(index),
-                        @"status": @(result->status), @"regions": regions, @"message": message};
-                    [output lock];
-                    bool sent = writeOcrMessage(record);
-                    [output unlock];
-                    NmkFreeVisionResult(result);
-                    if (!sent) _exit(1);
                 }
-            }
-        });
+            });
+        }
         CGImageRelease(image);
         return writeOcrMessage(@{@"kind": @"done"}) ? 0 : 1;
     }

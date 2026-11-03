@@ -685,12 +685,10 @@ uintptr_t NmkCropVisionImage(uintptr_t imageHandle, uint64_t x, uint64_t y, uint
     return (uintptr_t)CGImageCreateWithImageInRect(image, CGRectMake(x, y, width, height));
 }
 
-static VNRecognizeTextRequest *makeUiTextRequest(void) {
+static VNRecognizeTextRequest *makeUiTextRequest(bool fastPreview) {
     VNRecognizeTextRequest *textRequest = [[VNRecognizeTextRequest alloc] init];
-    // The fast path has limited language support and defaults to English.
-    // Prefer Chinese for short UI labels, while allowing Vision to pick
-    // the appropriate model for other languages and mixed text.
-    textRequest.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
+    textRequest.recognitionLevel = fastPreview
+        ? VNRequestTextRecognitionLevelFast : VNRequestTextRecognitionLevelAccurate;
     // Revision 3 can spend over a minute compiling ANE models for a
     // freshly built app, even with an explicit CPU compute device.
     // Revision 2 supports all three configured languages and avoids
@@ -703,14 +701,17 @@ static VNRecognizeTextRequest *makeUiTextRequest(void) {
     // discard it before recognition. Capture size and scan deadlines
     // still bound the work, independently of AX and contours.
     textRequest.minimumTextHeight = 0.0f;
-    textRequest.recognitionLanguages = @[@"zh-Hans", @"zh-Hant", @"en-US"];
-    textRequest.automaticallyDetectsLanguage = YES;
+    // Preview text is never published: Fast cannot recognize Chinese. Its
+    // geometry is provisional until the normal multilingual request returns.
+    textRequest.recognitionLanguages = fastPreview
+        ? @[@"en-US"] : @[@"zh-Hans", @"zh-Hant", @"en-US"];
+    textRequest.automaticallyDetectsLanguage = !fastPreview;
     textRequest.usesLanguageCorrection = NO;
     return textRequest;
 }
 
-NmkVisionResult *NmkRecognizeVisionImage(
-    uintptr_t imageHandle, CGRect capturedBounds, NmkVisionConfig config, uint64_t scanID) {
+static NmkVisionResult *recognizeVisionImage(
+    uintptr_t imageHandle, CGRect capturedBounds, NmkVisionConfig config, uint64_t scanID, bool fastPreview) {
     @autoreleasepool {
         CGImageRef image = (CGImageRef)imageHandle;
         if (image == NULL || !scanIsCurrent(scanID)) {
@@ -728,7 +729,7 @@ NmkVisionResult *NmkRecognizeVisionImage(
             [requests addObject:rectangleRequest];
         }
         if (config.detect_text) {
-            textRequest = makeUiTextRequest();
+            textRequest = makeUiTextRequest(fastPreview);
             [requests addObject:textRequest];
         }
 
@@ -771,7 +772,6 @@ NmkVisionResult *NmkRecognizeVisionImage(
             }
             if (result->count >= capacity) break;
             if (observation.confidence < config.minimum_confidence) continue;
-            VNRecognizedText *candidate = [observation topCandidates:1].firstObject;
             CGRect box = observation.boundingBox;
             NmkVisionRegion *out = &result->regions[result->count++];
             out->x = box.origin.x;
@@ -780,11 +780,14 @@ NmkVisionResult *NmkRecognizeVisionImage(
             out->height = box.size.height;
             out->confidence = observation.confidence;
             out->is_text = true;
-            NSString *label = candidate.string ?: @"";
-            const char *utf8 = label.UTF8String;
-            if (utf8 != NULL) {
-                out->label_len = (uint64_t)strlen(utf8);
-                out->label = strdup(utf8);
+            if (!fastPreview) {
+                VNRecognizedText *candidate = [observation topCandidates:1].firstObject;
+                NSString *label = candidate.string ?: @"";
+                const char *utf8 = label.UTF8String;
+                if (utf8 != NULL) {
+                    out->label_len = (uint64_t)strlen(utf8);
+                    out->label = strdup(utf8);
+                }
             }
         }
         for (VNRectangleObservation *observation in rectangleResults) {
@@ -811,6 +814,11 @@ NmkVisionResult *NmkRecognizeVisionImage(
         }
         return result;
     }
+}
+
+NmkVisionResult *NmkRecognizeVisionImage(
+    uintptr_t imageHandle, CGRect capturedBounds, NmkVisionConfig config, uint64_t scanID) {
+    return recognizeVisionImage(imageHandle, capturedBounds, config, scanID, false);
 }
 
 void NmkFreeVisionResult(NmkVisionResult *result) {

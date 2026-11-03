@@ -24,7 +24,7 @@ macOS 更新器测试覆盖握手、签名、交换与回滚、退出通知及�
 
 公共 `overlay_geometry` 回归覆盖 Retina 倍率、Windows 100%／125%／150%／200% 预缩放样式、负坐标和连续移动中的固定像素尺寸，以及双行徽标共同右边界；两端另验证原生局部坐标转换。`cargo test --lib platform::macos::display::overlay::tests -- --include-ignored --test-threads=1` 执行离屏 CoreText／Core Animation 检查：字号度量、缩放和尺寸变化时重绘、单纯移动时复用位图。Windows 的 `directcomposition_smoke` ignored 测试还比较小数锚点在同一像素内移动、完整帧及位置快路径的实际画面，并确认不重画表面。交叉编译不能替代这些原生测试或内外屏实际清晰度验收。
 
-正式构建使用 `cargo build --locked --release --bin keysteer --no-default-features`。单元测试由 `cfg(test)` 隔离，测试依赖放在 dev-dependencies。主包不暴露基准接口或对应 feature，`--all-features` 不依赖本地性能目录。性能测试、适配代码、独立锁文件及原始结果只保留本地，不纳入提交；用户要求发布的已核验汇总可用于性能页面。需要访问内部实现时在隔离副本内适配，不能为基准扩大生产 API。
+正式构建使用 `cargo build --locked --release --bin keysteer --no-default-features`。macOS 上优先通过 rustup 代理或 `rustup run <toolchain> cargo ...` 启动构建；直接调用工具链目录里的 Cargo／rustc 时，部分工具链可能因缺少动态库搜索路径而让 `rust-objcopy` 无法加载 `libLLVM.dylib`，导致去符号失败。不要通过关闭 `strip` 或写死本机路径来隐藏警告。单元测试由 `cfg(test)` 隔离，测试依赖放在 dev-dependencies。主包不暴露基准接口或对应 feature，`--all-features` 不依赖本地性能目录。性能测试、适配代码、独立锁文件及原始结果只保留本地，不纳入提交；用户要求发布的已核验汇总可用于性能页面。需要访问内部实现时在隔离副本内适配，不能为基准扩大生产 API。
 
 ## 性能与原生验证
 

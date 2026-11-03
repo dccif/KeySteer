@@ -5,6 +5,14 @@ outline: 2
 
 # 更新日志 / Release Notes
 
+## 0.15.3
+
+- 优化 macOS 上 UI Hint 的标签显示速度。
+- 优化 Windows 和 macOS 的扫描结果处理，减少临时内存分配。
+
+- Improved UI Hint label display speed on macOS.
+- Reduced temporary allocations when processing scan results on Windows and macOS.
+
 ## 0.15.2
 
 **性能优化 / Performance**

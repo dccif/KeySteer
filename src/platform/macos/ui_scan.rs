@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::api::command::{UiScanRequest, UiScanStatus, UiScanStrategy};
+use crate::api::command::{UiScanRequest, UiScanResult, UiScanStatus, UiScanStrategy};
 use crate::platform::common::scan_fusion::{Handle, Options, Sink};
 use crate::platform::common::scan_mailbox::ScanMailbox;
 use crate::platform::common::scan_priority::ScanPriority;
@@ -18,12 +18,14 @@ use super::{EventSender, accessibility, scan_workers::Workers, vision};
 static LATEST_SCAN: AtomicU64 = AtomicU64::new(0);
 const STOP_TIMEOUT: Duration = Duration::from_millis(500);
 
-struct ScanJob {
-    request: UiScanRequest,
-    generation: u64,
-    mailbox: Arc<ScanMailbox>,
-    wake: EventSender,
-    fusion: Handle,
+pub(super) struct ScanJob {
+    pub(super) request: UiScanRequest,
+    pub(super) generation: u64,
+    pub(super) mailbox: Arc<ScanMailbox>,
+    pub(super) preview_mailbox: Arc<ScanMailbox>,
+    pub(super) preview_generation: u64,
+    pub(super) wake: EventSender,
+    pub(super) fusion: Handle,
 }
 
 struct ScanContext {
@@ -77,38 +79,18 @@ impl UiScanWorker {
         }
     }
 
-    pub(super) fn request_scan(
-        &mut self,
-        request: UiScanRequest,
-        generation: u64,
-        mailbox: Arc<ScanMailbox>,
-        wake: EventSender,
-        fusion: Handle,
-    ) {
-        LATEST_SCAN.store(generation, Ordering::Release);
-        vision::mark_latest(generation);
+    pub(super) fn request_scan(&mut self, job: ScanJob) {
+        LATEST_SCAN.store(job.generation, Ordering::Release);
+        vision::mark_latest(job.generation);
         let queue = match self.ensure_started() {
             Ok(queue) => queue,
             Err(error) => {
-                if mailbox.publish(
-                    generation,
-                    request.id,
-                    Vec::new(),
-                    UiScanStatus::Failed(error),
-                ) {
-                    wake.wake();
-                }
+                job.publish(Vec::new(), UiScanStatus::Failed(error));
                 return;
             }
         };
         queue.providers.cancel_all();
-        drop(queue.submit(ScanJob {
-            request,
-            generation,
-            mailbox,
-            wake,
-            fusion,
-        }));
+        drop(queue.submit(job));
     }
 
     pub(super) fn cancel_scan(&self, request_id: u64) {
@@ -194,15 +176,138 @@ impl Drop for UiScanWorker {
 
 /// AX and Vision only submit buffers; one common worker owns all fusion state.
 #[derive(Clone)]
-struct PartialPublisher {
-    sink: Sink,
+pub(super) struct PartialPublisher {
+    pub(super) sink: Sink,
+    pub(super) preview: FastPreview,
 }
+
+/// Preview geometry has its own mailbox and never enters the OCR evidence.
+#[derive(Clone)]
+pub(super) struct FastPreview {
+    mailbox: Arc<ScanMailbox>,
+    generation: u64,
+    id: u64,
+    wake: EventSender,
+    accepts: Arc<dyn Fn(&crate::api::UiTarget) -> bool + Send + Sync>,
+    current: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl FastPreview {
+    pub(super) fn publish(&self, mut targets: Vec<crate::api::UiTarget>) {
+        targets.retain(|target| (self.accepts)(target));
+        if !targets.is_empty()
+            && (self.current)()
+            && self
+                .mailbox
+                .publish(self.generation, self.id, targets, UiScanStatus::Partial)
+        {
+            self.wake.wake();
+        }
+    }
+}
+
+/// Main-thread view of provisional geometry. Keep it outside the fusion
+/// evidence so a rough English line cannot change the final OCR result.
+#[derive(Default)]
+pub(super) struct PreviewView {
+    id: Option<u64>,
+    authoritative: Vec<crate::api::Rect>,
+    visible: Vec<crate::api::Rect>,
+}
+
+impl PreviewView {
+    pub(super) fn begin(&mut self, request: &UiScanRequest) {
+        let (text, rectangles) =
+            crate::platform::common::contour::sources(request.strategy, &request.vision);
+        *self = Self {
+            id: (text && rectangles).then_some(request.id),
+            ..Self::default()
+        };
+    }
+
+    pub(super) fn cancel(&mut self, id: u64) {
+        if self.id == Some(id) {
+            *self = Self::default();
+        }
+    }
+
+    pub(super) fn authoritative(&mut self, result: &mut UiScanResult) {
+        if self.id != Some(result.id) {
+            return;
+        }
+        if result.status != UiScanStatus::Partial {
+            // Every remaining preview is retired at completion. Reuse its
+            // storage when possible and never compare it with final targets.
+            if result.retired.is_empty() {
+                std::mem::swap(&mut result.retired, &mut self.visible);
+            } else {
+                self.visible.retain(|rect| !result.retired.contains(rect));
+                result.retired.append(&mut self.visible);
+            }
+            *self = Self::default();
+            return;
+        }
+        if !result.retired.is_empty() {
+            self.authoritative
+                .retain(|rect| !result.retired.contains(rect));
+        }
+        let mut removed = Vec::new();
+        self.visible.retain(|rect| {
+            let retired = result.retired.contains(rect);
+            if retired
+                || result
+                    .targets
+                    .iter()
+                    .any(|target| rect.intersect(&target.rect).is_some())
+            {
+                if !retired {
+                    removed.push(*rect);
+                }
+                false
+            } else {
+                true
+            }
+        });
+        result.retired.extend(removed);
+        self.authoritative
+            .extend(result.targets.iter().map(|target| target.rect));
+    }
+
+    pub(super) fn preview(&mut self, mut result: UiScanResult) -> Option<UiScanResult> {
+        if self.id != Some(result.id) {
+            return None;
+        }
+        result.targets.retain(|target| {
+            if self
+                .authoritative
+                .iter()
+                .chain(&self.visible)
+                .any(|rect| rect.intersect(&target.rect).is_some())
+            {
+                false
+            } else {
+                self.visible.push(target.rect);
+                true
+            }
+        });
+        (!result.targets.is_empty()).then_some(result)
+    }
+}
+
 impl PartialPublisher {
     fn new(job: &ScanJob, pid: libc::pid_t, activation_pid: Option<libc::pid_t>) -> Self {
         let generation = job.generation;
         let bounds = job.request.bounds;
         let screens = job.request.screen_bounds.clone();
         let wake = job.wake.clone();
+        let accepts: Arc<dyn Fn(&crate::api::UiTarget) -> bool + Send + Sync> =
+            Arc::new(move |target| {
+                let center = target.rect.center();
+                bounds.is_none_or(|bounds| bounds.contains(&center))
+                    && (screens.is_empty() || screens.iter().any(|screen| screen.contains(&center)))
+            });
+        let current: Arc<dyn Fn() -> bool + Send + Sync> =
+            Arc::new(move || autoreleasepool(|_| scan_is_current(generation, pid, activation_pid)));
         let sink = job.fusion.begin(Options {
             id: job.request.id,
 
@@ -235,16 +340,20 @@ impl PartialPublisher {
             },
             output: Arc::clone(&job.mailbox),
             wake: Arc::new(move || wake.wake()),
-            accepts: Arc::new(move |target| {
-                let center = target.rect.center();
-                bounds.is_none_or(|bounds| bounds.contains(&center))
-                    && (screens.is_empty() || screens.iter().any(|screen| screen.contains(&center)))
-            }),
-            current: Arc::new(move || {
-                autoreleasepool(|_| scan_is_current(generation, pid, activation_pid))
-            }),
+            accepts: Arc::clone(&accepts),
+            current: Arc::clone(&current),
         });
-        Self { sink }
+        Self {
+            sink,
+            preview: FastPreview {
+                mailbox: Arc::clone(&job.preview_mailbox),
+                generation: job.preview_generation,
+                id: job.request.id,
+                wake: job.wake.clone(),
+                accepts,
+                current,
+            },
+        }
     }
     fn push(&self, source: TargetSource, targets: Vec<crate::api::UiTarget>) {
         self.sink.submit(source, targets);
@@ -571,7 +680,7 @@ fn scan_vision(
         request.strategy,
         providers,
         move || !scan_id_is_current(generation),
-        publisher.sink.clone(),
+        publisher.clone(),
     )
 }
 
@@ -598,12 +707,309 @@ mod tests {
         }
     }
 
+    fn preview_request(id: u64) -> UiScanRequest {
+        let mut request = request(id);
+        request.strategy = UiScanStrategy::Hybrid;
+        request
+    }
+
     #[test]
     fn scan_strategies_use_only_their_configured_sources() {
         assert_eq!(scan_sources(UiScanStrategy::AxTree), (true, false));
         assert_eq!(scan_sources(UiScanStrategy::Vision), (false, true));
         assert_eq!(scan_sources(UiScanStrategy::Contour), (false, true));
         assert_eq!(scan_sources(UiScanStrategy::Hybrid), (true, true));
+    }
+
+    #[test]
+    fn preview_state_tracks_only_scans_that_can_publish_fast_geometry() {
+        use crate::api::{Rect, SemanticRole, UiTarget};
+        let rect = Rect::new(0.0, 0.0, 20.0, 20.0);
+        let target = UiTarget {
+            rect,
+            role: SemanticRole::Control,
+            name: String::new(),
+            details: None,
+        };
+        let mut view = PreviewView::default();
+        for (strategy, text, rectangles, enabled) in [
+            (UiScanStrategy::AxTree, true, true, false),
+            (UiScanStrategy::Contour, true, true, false),
+            (UiScanStrategy::Vision, true, false, false),
+            (UiScanStrategy::Vision, false, true, false),
+            (UiScanStrategy::Vision, true, true, true),
+            (UiScanStrategy::Hybrid, false, false, true),
+            (UiScanStrategy::AxTree, true, true, false),
+        ] {
+            let mut request = request(1);
+            request.strategy = strategy;
+            request.vision.detect_text = text;
+            request.vision.detect_rectangles = rectangles;
+            view.begin(&request);
+            let mut result = UiScanResult {
+                id: request.id,
+                targets: vec![target.clone()],
+                retired: Vec::new(),
+                status: UiScanStatus::Partial,
+            };
+            view.authoritative(&mut result);
+            assert_eq!(result.targets.as_slice(), std::slice::from_ref(&target));
+            assert_eq!(view.id, enabled.then_some(request.id));
+            let expected: &[Rect] = if enabled { &[rect] } else { &[] };
+            assert_eq!(view.authoritative.as_slice(), expected);
+            if !enabled {
+                assert!(
+                    view.preview(UiScanResult {
+                        id: request.id,
+                        targets: vec![target.clone()],
+                        retired: Vec::new(),
+                        status: UiScanStatus::Partial,
+                    })
+                    .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fast_geometry_is_replaced_atomically_without_merging_real_text() {
+        use crate::api::{Rect, SemanticRole, UiScanResult, UiTarget};
+        let mut view = PreviewView::default();
+        view.begin(&preview_request(7));
+        let rect = Rect::new(10.0, 10.0, 100.0, 20.0);
+        let provisional = UiTarget {
+            rect,
+            role: SemanticRole::Control,
+            name: String::new(),
+            details: None,
+        };
+        let preview = view
+            .preview(UiScanResult {
+                id: 7,
+                targets: vec![provisional],
+                retired: Vec::new(),
+                status: UiScanStatus::Partial,
+            })
+            .unwrap();
+        assert_eq!(preview.targets[0].rect, rect);
+        let left = UiTarget::recognized_text(Rect::new(10.0, 10.0, 40.0, 20.0), "左".into());
+        let right = UiTarget::recognized_text(Rect::new(70.0, 10.0, 40.0, 20.0), "right".into());
+        let mut actual = UiScanResult {
+            id: 7,
+            targets: vec![left.clone(), right.clone()],
+            retired: Vec::new(),
+            status: UiScanStatus::Partial,
+        };
+        view.authoritative(&mut actual);
+        assert_eq!(actual.retired, [rect]);
+        assert_eq!(actual.targets, [left, right]);
+        assert!(view.visible.is_empty());
+    }
+
+    #[test]
+    fn same_geometry_ocr_update_keeps_the_existing_hint_scene() {
+        use crate::api::{
+            Appearance, Command, HostContext, Mode, ModeEvent, Point, Rect, Screen, SemanticRole,
+            UiTarget,
+        };
+        let config = crate::config::Config::default();
+        let palette = config.palette(Appearance::Dark);
+        let screens = [Screen {
+            bounds: Rect::new(0.0, 0.0, 800.0, 600.0),
+            work_area: Rect::new(0.0, 0.0, 800.0, 600.0),
+            is_primary: true,
+            scale: 1.0,
+            name: None,
+        }];
+        let context = HostContext {
+            presenter: &crate::presentation::COMPOSER,
+            screens: &screens,
+            cursor: Point::default(),
+            focused_app: None,
+            palette: &palette,
+        };
+        let mut mode = crate::app::mode_catalog::hint(&config);
+        mode.handle(&ModeEvent::Activated { previous: None }, &context);
+        let rect = Rect::new(40.0, 40.0, 100.0, 20.0);
+        let mut view = PreviewView::default();
+        view.begin(&preview_request(1));
+        let preview = view
+            .preview(UiScanResult {
+                id: 1,
+                targets: vec![UiTarget {
+                    rect,
+                    role: SemanticRole::Control,
+                    name: String::new(),
+                    details: None,
+                }],
+                retired: Vec::new(),
+                status: UiScanStatus::Partial,
+            })
+            .unwrap();
+        let first = mode.handle_owned(ModeEvent::UiScanned(preview), &context);
+        assert!(
+            first
+                .iter()
+                .any(|command| matches!(command, Command::ShowOverlay(_)))
+        );
+        let mut actual = UiScanResult {
+            id: 1,
+            targets: vec![UiTarget::recognized_text(rect, "设置 Settings".into())],
+            retired: Vec::new(),
+            status: UiScanStatus::Partial,
+        };
+        view.authoritative(&mut actual);
+        let update = mode.handle_owned(ModeEvent::UiScanned(actual), &context);
+        assert!(
+            !update
+                .iter()
+                .any(|command| matches!(command, Command::ShowOverlay(_)))
+        );
+    }
+
+    #[test]
+    fn previews_skip_existing_targets_and_do_not_survive_cancel_or_completion() {
+        use crate::api::{Rect, SemanticRole, UiScanResult, UiTarget};
+        let target = |x| UiTarget {
+            rect: Rect::new(x, 0.0, 20.0, 20.0),
+            role: SemanticRole::Control,
+            name: String::new(),
+            details: None,
+        };
+        let result = |id, targets, status| UiScanResult {
+            id,
+            targets,
+            retired: Vec::new(),
+            status,
+        };
+        let mut view = PreviewView::default();
+        view.begin(&preview_request(1));
+        view.authoritative(&mut result(1, vec![target(0.0)], UiScanStatus::Partial));
+        let preview = view
+            .preview(result(
+                1,
+                vec![target(0.0), target(40.0), target(40.0)],
+                UiScanStatus::Partial,
+            ))
+            .unwrap();
+        assert_eq!(preview.targets, [target(40.0)]);
+        let mut terminal = result(1, Vec::new(), UiScanStatus::Success);
+        view.authoritative(&mut terminal);
+        assert_eq!(terminal.retired, [target(40.0).rect]);
+        assert!(
+            view.preview(result(1, vec![target(60.0)], UiScanStatus::Partial))
+                .is_none()
+        );
+
+        view.begin(&preview_request(2));
+        view.cancel(1);
+        assert!(
+            view.preview(result(1, vec![target(60.0)], UiScanStatus::Partial))
+                .is_none()
+        );
+        assert!(
+            view.preview(result(2, vec![target(60.0)], UiScanStatus::Partial))
+                .is_some()
+        );
+        view.cancel(2);
+        assert!(
+            view.preview(result(2, vec![target(80.0)], UiScanStatus::Partial))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn terminal_results_preserve_targets_and_retire_all_previews_once() {
+        use crate::api::{Rect, SemanticRole, UiTarget};
+        let preview = |x| UiTarget {
+            rect: Rect::new(x, 0.0, 20.0, 20.0),
+            role: SemanticRole::Control,
+            name: String::new(),
+            details: None,
+        };
+        let (first, second) = (preview(0.0), preview(40.0));
+        for status in [
+            UiScanStatus::Success,
+            UiScanStatus::TimedOut,
+            UiScanStatus::Failed("OCR failed".into()),
+            UiScanStatus::ContextChanged,
+        ] {
+            for already_retired in [false, true] {
+                let mut view = PreviewView::default();
+                view.begin(&preview_request(1));
+                view.preview(UiScanResult {
+                    id: 1,
+                    targets: vec![first.clone(), second.clone()],
+                    retired: Vec::new(),
+                    status: UiScanStatus::Partial,
+                })
+                .unwrap();
+                let actual = UiTarget::recognized_text(first.rect, "设置".into());
+                let mut result = UiScanResult {
+                    id: 1,
+                    targets: vec![actual.clone()],
+                    retired: if already_retired {
+                        vec![second.rect]
+                    } else {
+                        Vec::new()
+                    },
+                    status: status.clone(),
+                };
+                view.authoritative(&mut result);
+                assert_eq!(result.targets, [actual]);
+                assert_eq!(result.status, status);
+                assert_eq!(
+                    result.retired,
+                    if already_retired {
+                        vec![second.rect, first.rect]
+                    } else {
+                        vec![first.rect, second.rect]
+                    }
+                );
+                assert!(view.visible.is_empty() && view.authoritative.is_empty());
+                assert!(view.id.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn late_fast_results_cannot_enter_a_new_scan() {
+        use crate::api::{Rect, SemanticRole, UiTarget};
+        use std::sync::atomic::AtomicUsize;
+
+        let mailbox = Arc::new(ScanMailbox::default());
+        let generation = mailbox.begin(1);
+        let checks = Arc::new(AtomicUsize::new(0));
+        let checked = Arc::clone(&checks);
+        let (sender, _receiver) = crate::platform::common::event_queue::channel();
+        let preview = FastPreview {
+            mailbox: Arc::clone(&mailbox),
+            generation,
+            id: 1,
+            wake: EventSender::new(sender),
+            accepts: Arc::new(|_| true),
+            current: Arc::new(move || {
+                checked.fetch_add(1, Ordering::Relaxed);
+                true
+            }),
+        };
+        preview.publish(Vec::new());
+        assert_eq!(checks.load(Ordering::Relaxed), 0);
+        let target = UiTarget {
+            rect: Rect::new(10.0, 10.0, 30.0, 20.0),
+            role: SemanticRole::Control,
+            name: String::new(),
+            details: None,
+        };
+        preview.publish(vec![target.clone()]);
+        assert_eq!(
+            mailbox.take().unwrap().targets.as_slice(),
+            std::slice::from_ref(&target)
+        );
+        assert!(mailbox.cancel(1));
+        mailbox.begin(2);
+        preview.publish(vec![target]);
+        assert!(mailbox.take().is_none());
     }
 
     #[test]
@@ -621,6 +1027,8 @@ mod tests {
                     request: request(2),
                     generation,
                     mailbox,
+                    preview_mailbox: Arc::new(ScanMailbox::default()),
+                    preview_generation: 0,
                     wake: EventSender::new(sender),
                     fusion: fusion.prepare(generation).unwrap(),
                 })
@@ -733,6 +1141,8 @@ mod tests {
                     request: request(1),
                     generation: first_generation,
                     mailbox: Arc::clone(&mailbox),
+                    preview_mailbox: Arc::new(ScanMailbox::default()),
+                    preview_generation: 0,
                     wake: wake.clone(),
                     fusion: fusion_worker.prepare(first_generation).unwrap(),
                 })
@@ -744,6 +1154,8 @@ mod tests {
                 request: request(2),
                 generation: second_generation,
                 mailbox,
+                preview_mailbox: Arc::new(ScanMailbox::default()),
+                preview_generation: 0,
                 wake,
                 fusion: fusion_worker.prepare(second_generation).unwrap(),
             })
@@ -774,6 +1186,8 @@ mod tests {
             request: request(7),
             generation,
             mailbox,
+            preview_mailbox: Arc::new(ScanMailbox::default()),
+            preview_generation: 0,
             wake: EventSender::new(sender),
             fusion: fusion_worker.prepare(generation).unwrap(),
         });
