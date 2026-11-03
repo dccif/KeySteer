@@ -31,6 +31,8 @@ import KeyLayout from '../.vitepress/components/KeyLayout'
 | 按键 | 作用 |
 | --- | --- |
 | 标签键 | 在当前格中继续细分 |
+| `U` | 在当前区域显示 UI Hint；按 `Tab`、`Backspace` 或 `Esc` 返回原网格区域 |
+| `I` | 在当前区域启动 Text Select；按 `Esc` 返回当前网格 |
 | `Backspace` / `Tab` | 返回上一层；根层再退则退出 |
 | `Space` | 回到第一层 |
 | `Enter` | 移动到当前区域中心，不点击 |
@@ -41,6 +43,8 @@ import KeyLayout from '../.vitepress/components/KeyLayout'
 ::: tip 小按钮可以慢慢找
 按错一层用 `Tab` 返回，想从头再来用空格。`Enter` 只把鼠标移到中心，需要点击时再按住 `Primary` 使用 Normal 的点击键。
 :::
+
+扫描沿用 UI Hint 或 Text Select 的设置，范围是当前网格区域。Text Select 可以用 `Alt+C` 细分并复制部分文字。可在 `[recursive_grid.bindings]` 改绑 `area_hint` 和 `area_text`；旧配置中的同名标签或继承动作会保留。
 
 ## 配置
 

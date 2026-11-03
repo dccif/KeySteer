@@ -546,6 +546,55 @@ impl ConfigFile {
             .map_err(|e| ConfigError::Parse(e.to_string()))?
             .unwrap_or_default();
         let aliases = compile_key_aliases(&key_aliases.effective()?)?;
+        // New region shortcuts must not replace existing labels or explicitly
+        // inherited user actions. Explicit local bindings still win.
+        let declares = |table: Option<&toml::Value>, shortcut: &str| {
+            table.and_then(toml::Value::as_table).is_some_and(|table| {
+                table
+                    .keys()
+                    .flat_map(|key| key.split_whitespace())
+                    .any(|key| {
+                        KeyChord::parse_with_aliases(key, &aliases)
+                            .is_ok_and(|chord| chord.canonical() == shortcut)
+                    })
+            })
+        };
+        let override_declares = |overrides: Option<&toml::Value>, shortcut: &str| {
+            overrides
+                .and_then(toml::Value::as_array)
+                .is_some_and(|entries| {
+                    entries
+                        .iter()
+                        .any(|entry| declares(entry.get("bindings"), shortcut))
+                })
+        };
+        let shortcuts = [
+            ("u", crate::api::binding::RegionTarget::UiHint),
+            ("i", crate::api::binding::RegionTarget::TextSelect),
+        ]
+        .map(|(shortcut, target)| {
+            let shortcut = aliases
+                .get(shortcut)
+                .cloned()
+                .unwrap_or_else(|| shortcut.to_owned());
+            let explicit = ["grid", "recursive_grid", "bisect"].map(|mode| {
+                declares(
+                    value.get(mode).and_then(|section| section.get("bindings")),
+                    &shortcut,
+                )
+            });
+            let normal = value.get("normal");
+            let normal_uses = declares(
+                normal.and_then(|section| section.get("bindings")),
+                &shortcut,
+            ) || override_declares(
+                normal.and_then(|section| section.get("app_configs")),
+                &shortcut,
+            );
+            let hotkeys_use = declares(value.get("hotkeys"), &shortcut)
+                || override_declares(value.get("app_configs"), &shortcut);
+            (shortcut, target, explicit, normal_uses, hotkeys_use)
+        });
         let mut config: Self = with_key_aliases(&aliases, || Self::deserialize(value))
             .map_err(|e| ConfigError::Parse(e.to_string()))?;
         config.resolved_key_aliases = aliases;
@@ -609,6 +658,47 @@ impl ConfigFile {
         }
         for (name, plugin) in &mut config.plugin_modes {
             apply_control_defaults(name, &mut plugin.bindings, &config.resolved_key_aliases)?;
+        }
+
+        for (key, target, explicit_keys, normal_uses, hotkeys_use) in shortcuts {
+            let inherited = |inherits: &[String]| {
+                inherits.iter().any(|mode| match mode.as_str() {
+                    "normal" => normal_uses,
+                    "hotkeys" | "idle" => hotkeys_use,
+                    _ => false,
+                })
+            };
+            let shortcut_char = key.chars().next().filter(|_| key.len() == 1);
+            let has_key = |keys: &str| {
+                shortcut_char.is_some_and(|shortcut| {
+                    keys.chars().any(|ch| ch.eq_ignore_ascii_case(&shortcut))
+                })
+            };
+            let reserved = [
+                has_key(&config.grid.keys) || inherited(&config.grid.inherits),
+                has_key(&config.recursive_grid.keys)
+                    || config
+                        .recursive_grid
+                        .layers
+                        .iter()
+                        .any(|layer| layer.keys.as_deref().is_some_and(has_key))
+                    || inherited(&config.recursive_grid.inherits),
+                inherited(&config.bisect.inherits),
+            ];
+            for ((explicit, reserved), bindings) in explicit_keys.into_iter().zip(reserved).zip([
+                &mut config.grid.bindings,
+                &mut config.recursive_grid.bindings,
+                &mut config.bisect.bindings,
+            ]) {
+                let binding = Binding::ScanRegion(target);
+                if !explicit {
+                    if reserved && bindings.get(key.as_str()) == Some(&binding) {
+                        bindings.remove(key.as_str());
+                    } else if !reserved {
+                        bindings.entry(key.clone()).or_insert(binding);
+                    }
+                }
+            }
         }
 
         Ok((config, warnings))

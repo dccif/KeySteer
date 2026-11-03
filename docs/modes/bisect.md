@@ -16,6 +16,8 @@ Bisect 是不显示字母的递归定位模式。从 Normal 按 `Primary+F` 进�
 | --- | --- |
 | `H` / `L` | 保留左／右半区，宽度减半 |
 | `K` / `J` | 保留上／下半区，高度减半 |
+| `U` | 在当前区域显示 UI Hint；按 `Tab`、`Backspace` 或 `Esc` 返回原二分区域 |
+| `I` | 在当前区域启动 Text Select；按 `Esc` 返回当前二分区域 |
 | `Tab` / `Backspace` | 撤销一次二分；根层再退则返回来源模式 |
 | `Space` | 回到整屏 |
 | `Enter` | 移到当前区域中心并完成选择，默认不点击 |
@@ -25,6 +27,8 @@ Bisect 是不显示字母的递归定位模式。从 Normal 按 `Primary+F` 进�
 | `Primary+Q` | 返回 Normal；从 Window 借用时恢复窗口会话 |
 
 两条中心参考线表示左右与上下的切分位置，每次按键只选择一个方向的半区。例如 `L → J → H` 会依次保留右半屏、该区域的下半区、再取其左半区。没有字母表、可调行列数或四分动作；方向键可以独立改绑。
+
+区域 UI Hint 和 Text Select 使用各自现有的扫描和显示设置，Text Select 可以用 `Alt+C` 细分并复制部分文字。可在 `[bisect.bindings]` 改绑 `area_hint` 和 `area_text`；旧配置中已有的继承动作会保留。
 
 ## 和 Recursive Grid 共用的行为
 

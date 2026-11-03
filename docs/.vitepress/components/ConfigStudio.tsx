@@ -100,6 +100,7 @@ const actionGroups: ActionGroup[] = [
   { name: '选择与导航', actions: [
     ['first_level', '回到第一层'], ['previous_level', '返回上一层'], ['reopen_selection', '返回已完成的选择'],
     ['confirm_selection', '确认选择'], ['cancel_selection', '取消选择'], ['search_selection', '搜索文字'],
+    ['area_hint', '扫描当前区域的 UI Hint'], ['area_text', '扫描当前区域的文字'],
     ['text_refine', '细分文字'], ['text_copy', '复制文字'], ['text_search', '搜索选词'],
     ['text_cycle_page', '循环翻页文字'],
     ['text_select_all', '全选文字'], ['text_clear_selection', '清空文字选择'],

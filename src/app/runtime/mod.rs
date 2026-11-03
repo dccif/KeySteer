@@ -1611,6 +1611,7 @@ impl Engine {
             | Binding::ToggleCursorFollowSelection
             | Binding::TargetingKey(_)
             | Binding::RescanUi
+            | Binding::ScanRegion(_)
             | Binding::TextSelect(_)
             | Binding::SelectionReset
             | Binding::Bisect(_)

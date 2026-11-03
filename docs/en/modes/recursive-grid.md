@@ -23,6 +23,8 @@ Enter it from Normal with `Primary+G`. The default grid is 3 × 3:
 | Key | Action |
 | --- | --- |
 | Label key | Subdivide the selected cell |
+| `U` | Show UI Hint within the current region; `Tab`, `Backspace`, or `Esc` returns to it |
+| `I` | Start Text Select within the current region; `Esc` returns to the grid |
 | `Backspace` / `Tab` | Go back one level; exit when backing out from the root |
 | `Space` | Return to the first level |
 | `Enter` | Move to the centre of the current area without clicking |
@@ -33,6 +35,8 @@ Enter it from Normal with `Primary+G`. The default grid is 3 × 3:
 ::: tip Take your time with small targets
 Use `Tab` to back up a level, or Space to start over. `Enter` only centers the pointer; hold `Primary` to use Normal click keys when ready.
 :::
+
+The region scans use UI Hint or Text Select settings. Use `Alt+C` in Text Select to refine and copy part of the text. Rebind `area_hint` and `area_text` in `[recursive_grid.bindings]`; existing labels and inherited user actions are preserved.
 
 ## Configuration
 

@@ -89,18 +89,17 @@ impl NativeTargetDeduper {
         target.name.hash(&mut hasher);
         target.role.hash(&mut hasher);
         let hash = hasher.finish();
-        if let Some(index) = self.semantic_buckets.get(&hash).and_then(|indices| {
-            indices.iter().copied().find(|&index| {
-                let (name, role, _) = &self.semantics[index];
-                name.as_str() == target.name.as_str() && role == &target.role
-            })
+        let indices = self.semantic_buckets.entry(hash).or_default();
+        if let Some(index) = indices.iter().copied().find(|&index| {
+            let (name, role, _) = &self.semantics[index];
+            name.as_str() == target.name.as_str() && role == &target.role
         }) {
             return index;
         }
         let index = self.semantics.len();
         self.semantics
             .push((target.name.as_str().into(), target.role, target.rect));
-        self.semantic_buckets.entry(hash).or_default().push(index);
+        indices.push(index);
         index
     }
 }
@@ -378,11 +377,13 @@ impl TargetIndex {
         std::mem::take(&mut self.retired)
     }
 
-    pub(super) fn expand_pending_text(&self, source: TargetSource, regions: &mut Vec<Rect>) {
+    /// Expand and merge one source's slice, returning its remaining prefix length.
+    pub(super) fn expand_pending_text(&self, source: TargetSource, regions: &mut [Rect]) -> usize {
+        let mut len = regions.len();
         let mut changed = true;
         while changed {
             changed = false;
-            for region in regions.iter_mut() {
+            for region in &mut regions[..len] {
                 for (entry, &rect) in self.evidence.iter().zip(&self.spatial.rects) {
                     if entry.active
                         && entry.source == source
@@ -396,11 +397,14 @@ impl TargetIndex {
                 }
             }
             let mut i = 0;
-            while i < regions.len() {
+            while i < len {
                 let mut j = i + 1;
-                while j < regions.len() {
+                while j < len {
                     if super::scan_progress::touches(regions[i], regions[j]) {
-                        let other = regions.swap_remove(j);
+                        // Compact like Vec::swap_remove; the caller truncates the suffix.
+                        let other = regions[j];
+                        len -= 1;
+                        regions[j] = regions[len];
                         regions[i] = regions[i].union(&other);
                         changed = true;
                     } else {
@@ -410,6 +414,7 @@ impl TargetIndex {
                 i += 1;
             }
         }
+        len
     }
 
     /// Join only genuinely overlapping text runs (typically OCR tile seams).
@@ -963,6 +968,35 @@ mod tests {
                 index.insert(&second, TargetSource::Accessibility, threshold)
             );
         }
+    }
+
+    #[test]
+    fn native_prefilter_checks_identity_with_multiple_hash_collisions() {
+        let rect = Rect::new(10.0, 10.0, 30.0, 20.0);
+        let candidate = UiTarget {
+            rect,
+            name: "candidate".into(),
+            role: SemanticRole::Button,
+            details: None,
+        };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        candidate.name.hash(&mut hasher);
+        candidate.role.hash(&mut hasher);
+        let hash = hasher.finish();
+        let mut deduper = NativeTargetDeduper::new(0.5);
+        // Model two distinct identities with the same hash before the real
+        // candidate. Hash equality alone must never make them duplicates.
+        deduper.semantics.extend([
+            ("other".into(), SemanticRole::Button, rect),
+            ("candidate".into(), SemanticRole::Link, rect),
+        ]);
+        deduper
+            .semantic_buckets
+            .insert(hash, smallvec::smallvec![0, 1]);
+
+        assert!(deduper.insert(&candidate));
+        assert!(!deduper.insert(&candidate));
+        assert_eq!(deduper.semantic_buckets[&hash].as_slice(), &[0, 1, 2]);
     }
 
     #[test]

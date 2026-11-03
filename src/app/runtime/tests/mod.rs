@@ -461,7 +461,7 @@ impl Mode for ProbeMode {
             ModeEvent::TextCopied => "text_copied",
             ModeEvent::TextSegmented(_) => "text_segmented",
             ModeEvent::Activated { .. } => "activated",
-            ModeEvent::Pushed { .. } => "pushed",
+            ModeEvent::Pushed { .. } | ModeEvent::PushedInRegion { .. } => "pushed",
             ModeEvent::Deactivated => "deactivated",
             ModeEvent::Suspended => "suspended",
             ModeEvent::Resumed => "resumed",

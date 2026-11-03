@@ -361,6 +361,8 @@ c = "window_overlap_previous"
 | `finish` | 完成当前定位会话。 |
 | `restart_mode` | 清空当前定位会话并重新开始。 |
 | `rescan` | 重新扫描 UI Hint。 |
+| `area_hint` | 在 Grid、Recursive Grid、Bisect 的当前区域显示 UI Hint，默认 `u`；`Tab`、`Backspace` 或 `Esc` 返回原区域。 |
+| `area_text` | 在上述网格的当前区域启动 Text Select，默认 `i`；`Esc` 返回原区域。 |
 | `escape` | 离开当前模式并返回 Idle。 |
 | `reload_config` | 从磁盘重新加载配置。 |
 | `set_config <path> <TOML值>` | 修改点号路径并持久化，例如 `set_config pointer.max_speed 800`。 |
@@ -413,6 +415,10 @@ scan_scope = "all" # window / active / screen / all
 这些规则适用于所有识别方式，两平台相同。`window` 选中鼠标窗口时会尝试激活它。文字选择通过独立的 `text_select.scan_scope` 选择相同四种范围，默认也为 `all`。选定范围后，空结果或识别失败不会改换范围；激活失败也不改范围。
 
 `screen` / `all` 使用全局 `strategy`，不会把前台程序的 `app_configs` 策略套用到其他程序。遮挡判断先排除完全隐藏的窗口，再保留控件的可见部分；视觉来源读取桌面实际合成画面。目标动态增长，默认没有 1 万条上限；视觉专用的 `rectangle_max_candidates = 0` 表示不限数量，已有显式正值仍有效，Hybrid 不使用该限制。超时、取消和图像尺寸保护继续生效。
+
+网格中的 `area_hint` 使用当前区域作为扫描范围，覆盖其中所有可见程序，并使用全局 `strategy`；扫描结果按原有 UI Hint 规则逐步显示。标签界面中，`previous_level`（以及默认 `Tab`）直接返回进入前的网格深度、路径与区域，扫描尚未完成时也可以返回；可在 `[ui_hint.bindings]` 改绑该动作。搜索输入框打开时，`Tab` 和 `Backspace` 继续执行搜索原有的预览和编辑操作；按 `Esc` 关闭搜索后，再按返回键回到网格。
+
+旧配置若已把 `u` 或 `i` 用作网格标签或继承的自定义动作，会保留原用途；可以在对应的网格绑定表中将扫描动作配置到其他键。显式本地绑定优先。区域 Text Select 仍按其 `after_copy` 执行，默认复制后进入 Normal；将 `[text_select.lifecycle]` 的 `after_copy` 设为 `"return"` 可返回原网格区域。
 
 切屏或更换目标会清除旧标签并重新识别；`all` 范围内跨屏移动保留标签。普通鼠标移动不会持续重扫。`Primary+R` 可手动刷新。
 
@@ -661,7 +667,7 @@ char_min_width = 40
 
 ## 可配置的选择操作
 
-`first_level` 回到第一层、清空本轮选择，`previous_level` 返回上一层，`confirm_selection` 确认选择，`cancel_selection` 取消选择并返回来源模式，`search_selection` 打开 UIHint 搜索；UIHint 的 `reopen_selection` 只在选择完成后返回。它们是模式动作，`escape` 仍保持全局进入 Idle 的原义。网格默认配置如下；`"tab backspace"` 表示两键任选其一，并非同时按下。
+`first_level` 回到第一层、清空本轮选择，`previous_level` 返回上一层，`confirm_selection` 确认选择，`cancel_selection` 取消选择并返回来源模式，`search_selection` 打开 UIHint 搜索；普通 UIHint 的 `reopen_selection` 只在选择完成后返回。它们是模式动作，`escape` 仍保持全局进入 Idle 的原义。网格默认配置如下；`"tab backspace"` 表示两键任选其一，并非同时按下。
 
 ```toml
 [grid.bindings]

@@ -2721,6 +2721,125 @@ fn search_match_priority_defaults_compiles_and_round_trips_with_strict_validatio
 }
 
 #[test]
+fn grid_region_ui_hint_defaults_can_be_rebound_or_disabled() {
+    for config in [Config::default(), Config::parse("").unwrap()] {
+        for bindings in [
+            &config.grid.bindings,
+            &config.recursive_grid.bindings,
+            &config.bisect.bindings,
+        ] {
+            assert_eq!(
+                bindings.get("u"),
+                Some(&Binding::parse("area_hint").unwrap())
+            );
+            assert_eq!(
+                bindings.get("i"),
+                Some(&Binding::parse("area_text").unwrap())
+            );
+        }
+    }
+    for mode in ["grid", "recursive_grid", "bisect"] {
+        let config = Config::parse(&format!(
+            "[{mode}.bindings]\nu = 'none'\nf8 = 'area_hint'\n"
+        ))
+        .unwrap();
+        let bindings = match mode {
+            "grid" => &config.grid.bindings,
+            "recursive_grid" => &config.recursive_grid.bindings,
+            _ => &config.bisect.bindings,
+        };
+        assert_eq!(bindings.get("u"), Some(&Binding::Disabled));
+        assert_eq!(
+            bindings.get("f8"),
+            Some(&Binding::parse("area_hint").unwrap())
+        );
+        let restored = Config::parse(&config.to_toml().unwrap()).unwrap();
+        let restored_bindings = match mode {
+            "grid" => &restored.grid.bindings,
+            "recursive_grid" => &restored.recursive_grid.bindings,
+            _ => &restored.bisect.bindings,
+        };
+        assert_eq!(restored_bindings.get("u"), Some(&Binding::Disabled));
+        assert_eq!(
+            restored_bindings.get("f8"),
+            Some(&Binding::parse("area_hint").unwrap())
+        );
+    }
+}
+
+#[test]
+fn grid_region_ui_hint_does_not_take_existing_labels_or_inherited_user_keys() {
+    let inherited = Config::parse("[normal.bindings]\nu = 'mouse_left'").unwrap();
+    for bindings in [
+        &inherited.grid.bindings,
+        &inherited.recursive_grid.bindings,
+        &inherited.bisect.bindings,
+    ] {
+        assert!(!bindings.contains_key("u"));
+    }
+    let hotkey = Config::parse("[hotkeys]\nu = 'mouse_left'").unwrap();
+    assert!(!hotkey.grid.bindings.contains_key("u"));
+    let labels = Config::parse(
+        "[grid]\nkeys = 'u2345qwertasdfgzxcvb'\n[recursive_grid]\nkeys = 'uweasdzxc'",
+    )
+    .unwrap();
+    assert!(!labels.grid.bindings.contains_key("u"));
+    assert!(!labels.recursive_grid.bindings.contains_key("u"));
+    let layer = Config::parse("[[recursive_grid.layers]]\ndepth = 0\nkeys = 'uweasdzxc'").unwrap();
+    assert!(!layer.recursive_grid.bindings.contains_key("u"));
+    let explicit =
+        Config::parse("[normal.bindings]\nu = 'mouse_left'\n[grid.bindings]\nu = 'area_hint'")
+            .unwrap();
+    assert_eq!(
+        explicit.grid.bindings.get("u"),
+        Some(&Binding::parse("area_hint").unwrap())
+    );
+    assert!(!explicit.bisect.bindings.contains_key("u"));
+    let restored = Config::parse(&inherited.to_toml().unwrap()).unwrap();
+    assert!(!restored.grid.bindings.contains_key("u"));
+
+    let text =
+        Config::parse("[grid]\nkeys = 'i2345qwertasdfgzxcvb'\n[normal.bindings]\ni = 'move_up'")
+            .unwrap();
+    for bindings in [
+        &text.grid.bindings,
+        &text.recursive_grid.bindings,
+        &text.bisect.bindings,
+    ] {
+        assert!(!bindings.contains_key("i"));
+        assert!(bindings.contains_key("u"));
+    }
+    let app_override =
+        Config::parse("[[normal.app_configs]]\nbundle_id = 'editor'\nbindings = { i = 'move_up' }")
+            .unwrap();
+    assert!(!app_override.grid.bindings.contains_key("i"));
+    let explicit =
+        Config::parse("[normal.bindings]\ni = 'move_up'\n[grid.bindings]\ni = 'area_text'")
+            .unwrap();
+    assert_eq!(
+        explicit.grid.bindings.get("i"),
+        Some(&Binding::parse("area_text").unwrap())
+    );
+    let remapped = Config::parse("[grid.bindings]\ni = 'none'\nf9 = 'area_text'").unwrap();
+    assert_eq!(remapped.grid.bindings.get("i"), Some(&Binding::Disabled));
+    assert_eq!(
+        remapped.grid.bindings.get("f9"),
+        Some(&Binding::parse("area_text").unwrap())
+    );
+    let alias =
+        Config::parse("[key_aliases]\ni = 'f9'\n[normal.bindings]\nf9 = 'move_up'").unwrap();
+    assert!(!alias.grid.bindings.contains_key("f9"));
+    let alias_label = Config::parse("[key_aliases]\ni = 'x'").unwrap();
+    assert!(!alias_label.grid.bindings.contains_key("x"));
+    let alias_explicit =
+        Config::parse("[key_aliases]\ni = 'f9'\n[grid.bindings]\nf9 = 'area_text'").unwrap();
+    assert_eq!(
+        alias_explicit.grid.bindings.get("f9"),
+        Some(&Binding::parse("area_text").unwrap())
+    );
+}
+
+#[test]
 fn formerly_fixed_controls_keep_defaults_in_sparse_configs_and_allow_none() {
     let config = Config::parse(
         r#"

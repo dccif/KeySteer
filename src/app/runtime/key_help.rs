@@ -128,11 +128,15 @@ impl Engine {
                 {
                     continue;
                 }
-                entries.push(format!(
-                    "{}  ·  {}",
-                    entry.chord.canonical(),
-                    entry.binding.canonical()
-                ));
+                let contextual = if id == &self.registry.active {
+                    self.registry
+                        .get(id)
+                        .and_then(|mode| mode.key_help_binding_label(&entry.chord, &entry.binding))
+                } else {
+                    None
+                };
+                let label = contextual.map_or_else(|| entry.binding.canonical(), str::to_owned);
+                entries.push(format!("{}  ·  {}", entry.chord.canonical(), label));
             }
         }
         entries

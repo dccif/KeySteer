@@ -7,11 +7,17 @@ outline: 2
 
 ## 0.15.3
 
+- Grid、Recursive Grid 和 Bisect 中按 `U` 可在当前网格区域显示 UI Hint，按 `I` 可在该区域选择文字；文字可用 `Alt+C` 逐级细分。
+- 在区域 UI Hint 标签界面按 `Tab` 或 `Backspace`，可返回进入时的网格层级和位置。
 - 优化 macOS 上 UI Hint 的标签显示速度。
 - 优化 Windows 和 macOS 的扫描结果处理，减少临时内存分配。
 
+- In Grid, Recursive Grid, and Bisect, press `U` for UI Hint or `I` for Text Select within the current grid area. Use `Alt+C` to refine the text selection.
+- In the area UI Hint label view, press `Tab` or `Backspace` to return to the grid at the same depth and position.
 - Improved UI Hint label display speed on macOS.
 - Reduced temporary allocations when processing scan results on Windows and macOS.
+
+https://github.com/user-attachments/assets/abc18585-0101-463f-9b4b-d47f70d76b97
 
 ## 0.15.2
 

@@ -29,6 +29,29 @@ use super::input::{Key, KeyChord, ModeId};
 /// Default interval used by `wait`/`wait 0` and repeated synthetic keystrokes.
 pub const DEFAULT_WAIT_MS: u64 = 100;
 
+/// A mode that can scan an explicitly selected desktop region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionTarget {
+    UiHint,
+    TextSelect,
+}
+
+impl RegionTarget {
+    pub fn mode(self) -> ModeId {
+        match self {
+            Self::UiHint => ModeId::ui_hint(),
+            Self::TextSelect => ModeId::text_select(),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::UiHint => "area_hint",
+            Self::TextSelect => "area_text",
+        }
+    }
+}
+
 /// A four-way direction, used by movement and scrolling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Direction {
@@ -189,6 +212,8 @@ pub enum Binding {
     },
     /// Request a fresh UI hint scan.
     RescanUi,
+    /// Open a scanning mode within the current targeting region.
+    ScanRegion(RegionTarget),
     /// Navigate the current selection without replacing its mode instance.
     SelectionReset,
     SelectionParent,
@@ -510,6 +535,8 @@ impl Binding {
             "slow_toggle" | "toggle_slow" => B::SpeedToggle(Speed::Slow),
             "fast_toggle" | "toggle_fast" => B::SpeedToggle(Speed::Fast),
             "follow" => B::ToggleCursorFollowSelection,
+            "area_hint" => B::ScanRegion(RegionTarget::UiHint),
+            "area_text" => B::ScanRegion(RegionTarget::TextSelect),
             "key_help" => B::KeyHelp,
             "finish" | "finish_mode" => B::FinishMode,
             "restart_mode" => B::RestartMode,
@@ -652,6 +679,7 @@ impl Binding {
             B::Exec { program, args } if args.is_empty() => format!("exec {program}"),
             B::Exec { program, args } => format!("exec {program} {}", args.join(" ")),
             B::RescanUi => "rescan".into(),
+            B::ScanRegion(target) => target.as_str().into(),
             B::SelectionReset => "first_level".into(),
             B::SelectionParent => "previous_level".into(),
             B::SelectionReopen => "reopen_selection".into(),
@@ -1024,6 +1052,8 @@ mod tests {
                 args: vec!["-la".into()],
             },
             Binding::RescanUi,
+            Binding::ScanRegion(RegionTarget::UiHint),
+            Binding::ScanRegion(RegionTarget::TextSelect),
             Binding::FinishMode,
             Binding::RestartMode,
             Binding::Escape,

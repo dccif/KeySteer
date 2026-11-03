@@ -495,6 +495,14 @@ pub(super) fn grid_control_defaults() -> Bindings {
 
 fn with_grid_shortcuts(mut bindings: Bindings) -> Bindings {
     bindings.extend([
+        (
+            "u".into(),
+            Binding::ScanRegion(crate::api::binding::RegionTarget::UiHint),
+        ),
+        (
+            "i".into(),
+            Binding::ScanRegion(crate::api::binding::RegionTarget::TextSelect),
+        ),
         ("`".into(), Binding::ToggleCursorFollowSelection),
         ("primary+q".into(), Binding::Mode(ModeId::normal())),
     ]);

@@ -7,8 +7,12 @@ outline: 2
 
 ## 0.15.3
 
+- In Grid, Recursive Grid, and Bisect, press `U` for UI Hint or `I` for Text Select within the current grid area. Use `Alt+C` to refine the text selection.
+- In the area UI Hint label view, press `Tab` or `Backspace` to return to the grid at the same depth and position.
 - Improved UI Hint label display speed on macOS.
 - Reduced temporary allocations when processing scan results on Windows and macOS.
+
+https://github.com/user-attachments/assets/abc18585-0101-463f-9b4b-d47f70d76b97
 
 ## 0.15.2
 

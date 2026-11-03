@@ -518,6 +518,9 @@ impl Engine {
                     self.activate(id, previous, backend)?;
                 }
                 Command::PushMode(id) => self.push_mode(id, backend)?,
+                Command::PushModeInRegion { mode, bounds } => {
+                    self.push_mode_in_region(mode, Some(bounds), backend)?
+                }
                 Command::PopMode => self.pop_mode(backend)?,
                 Command::RetargetScreen { index, preserve } => {
                     let Some(screen) = self.screens.get(index).cloned() else {

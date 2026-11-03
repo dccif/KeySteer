@@ -16,6 +16,8 @@ Bisect is recursive positioning without letter labels. Press `Primary+F` from No
 | --- | --- |
 | `H` / `L` | Keep the left/right half, halving width |
 | `K` / `J` | Keep the top/bottom half, halving height |
+| `U` | Show UI Hint within the current region; `Tab`, `Backspace`, or `Esc` returns to it |
+| `I` | Start Text Select within the current region; `Esc` returns to that region |
 | `Tab` / `Backspace` | Undo one cut; return to the previous mode at the root |
 | `Space` | Reset to the whole screen |
 | `Enter` | Move to the region's center and finish selection; no click by default |
@@ -25,6 +27,8 @@ Bisect is recursive positioning without letter labels. Press `Primary+F` from No
 | `Primary+Q` | Return to Normal; restore the window session when borrowed from Window |
 
 Two center guides mark the horizontal and vertical halves. Each key chooses only one half: `L → J → H` keeps the right half of the screen, its bottom half, then that region's left half. There is no label alphabet, configurable row/column count, or quadrant action. Direction keys can be rebound independently.
+
+Region scans use UI Hint or Text Select settings. Use `Alt+C` in Text Select to refine and copy part of the text. Rebind `area_hint` and `area_text` in `[bisect.bindings]`; existing inherited user actions are preserved.
 
 ## Shared Recursive Grid behavior
 

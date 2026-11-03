@@ -164,6 +164,19 @@ impl<G: GridPresentation> Mode for GridMode<G> {
                 ..
             } => {
                 let selection = match binding.as_ref() {
+                    Binding::ScanRegion(target) => {
+                        return self
+                            .controller
+                            .session
+                            .current()
+                            .filter(|area| !area.is_empty())
+                            .map_or_else(CommandBatch::new, |bounds| {
+                                CommandBatch::one(Command::PushModeInRegion {
+                                    mode: target.mode(),
+                                    bounds,
+                                })
+                            });
+                    }
                     Binding::Bisect(direction) => self.controller.cut(*direction),
                     Binding::SelectionReset => self.controller.reset_selection(ctx.active_bounds()),
                     Binding::SelectionParent => self.controller.parent(),
@@ -326,6 +339,42 @@ mod tests {
         )
         .into_iter()
         .collect()
+    }
+
+    #[test]
+    fn ui_hint_uses_the_current_region_for_all_grid_variants() {
+        fn assert_region<G: GridPresentation>(mode: &mut GridMode<G>, env: &Env, area: Rect) {
+            assert_eq!(mode.controller.session.current(), Some(area));
+            for (key, target) in [("u", ModeId::ui_hint()), ("i", ModeId::text_select())] {
+                assert_eq!(
+                    press(mode, env, key),
+                    vec![Command::PushModeInRegion {
+                        mode: target,
+                        bounds: area
+                    }]
+                );
+            }
+        }
+
+        let env = Env::new();
+        let screen = env.screens[0].bounds;
+        let mut grid = crate::app::mode_catalog::grid(&env.config);
+        let mut recursive = crate::app::mode_catalog::recursive_grid(&env.config);
+        let mut bisect = crate::app::mode_catalog::bisect(&env.config);
+        activate(&mut grid, &env);
+        activate(&mut recursive, &env);
+        activate(&mut bisect, &env);
+        assert_region(&mut grid, &env, screen);
+        assert_region(&mut recursive, &env, screen);
+        assert_region(&mut bisect, &env, screen);
+
+        press(&mut grid, &env, "1");
+        assert_region(&mut grid, &env, Rect::new(0.0, 0.0, 200.0, 150.0));
+        press(&mut recursive, &env, "q");
+        assert_region(&mut recursive, &env, screen.subdivision(3, 3, 0).unwrap());
+        bisect_action(&mut bisect, &env, "bisect_left");
+        bisect_action(&mut bisect, &env, "bisect_down");
+        assert_region(&mut bisect, &env, Rect::new(0.0, 300.0, 500.0, 300.0));
     }
 
     #[test]

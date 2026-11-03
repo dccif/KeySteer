@@ -34,10 +34,14 @@ import KeyLayout from '../.vitepress/components/KeyLayout'
 | 按键 | 作用 |
 | --- | --- |
 | 标签键 | 选择单元格并进入下一层 |
+| `U` | 在当前网格区域显示 UI Hint；按 `Tab`、`Backspace` 或 `Esc` 返回原网格区域 |
+| `I` | 对当前网格区域启动 Text Select；按 `Esc` 返回该网格 |
 | `` ` ``（Tab 上方的键） | 切换选择时是否跟随鼠标 |
 | `Primary+Q` / `Esc` | 返回 `Normal` |
 
 网格标签优先于继承自 `Normal` 的同名按键；例如 `q` 会选择网格，而不是退出。
+
+`U` 和 `I` 分别沿用 UI Hint 与 Text Select 的扫描、显示和操作方式，只扫描当前区域。Text Select 中可按 `Alt+C` 逐级细分文字，然后复制所选部分。可在 `[grid.bindings]` 改绑 `area_hint` 和 `area_text`；旧配置中已用于标签或继承自定义动作的按键会保留原用途。
 
 ## 配置
 

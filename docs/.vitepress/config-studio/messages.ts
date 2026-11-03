@@ -45,6 +45,8 @@ export const englishMessages: Record<string, string> = {
   "确认选择": "Accept selection",
   "取消选择": "Cancel selection",
   "搜索文字": "Search text",
+  "扫描当前区域的 UI Hint": "Scan UI hints in the current region",
+  "扫描当前区域的文字": "Select text in the current region",
   "细分文字": "Refine text",
   "复制文字": "Copy text",
   "搜索选词": "Search words",

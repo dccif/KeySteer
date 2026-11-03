@@ -24,10 +24,14 @@ Hold `Primary` to adjust with Normal movement, scrolling, and clicks. Release it
 | Key | Action |
 | --- | --- |
 | Label key | Select a cell and enter the next level |
+| `U` | Show UI Hint within the current grid region; `Tab`, `Backspace`, or `Esc` returns to it |
+| `I` | Start Text Select within the current grid region; `Esc` returns to the grid |
 | `` ` `` (the key above Tab) | Toggle whether selection follows the pointer |
 | `Primary+Q` / `Esc` | Return to Normal |
 
 Grid labels take priority over identically named inherited Normal bindings. For example, `q` selects a Grid cell rather than leaving the mode.
+
+`U` and `I` use the existing UI Hint and Text Select scans for the selected region. In Text Select, use `Alt+C` to refine the selection and copy part of the text. Rebind `area_hint` and `area_text` in `[grid.bindings]`. Existing labels and custom inherited actions keep their keys.
 
 ## Configuration
 

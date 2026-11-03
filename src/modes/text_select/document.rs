@@ -1,3 +1,4 @@
+use crate::api::text_select_preview as preview;
 use crate::api::{Rect, UiTarget};
 use smallvec::{SmallVec, smallvec};
 use std::{ops::Range, sync::Arc};
@@ -29,6 +30,7 @@ pub(super) struct Frame {
     /// Refined units in selection order, independent of their panel positions.
     selection_order: Vec<usize>,
     pub level: Level,
+    pub(super) previews: preview::Regions,
 }
 
 pub(super) struct ToggleUndo {
@@ -45,7 +47,16 @@ impl Default for Frame {
             selected: Vec::new(),
             selection_order: Vec::new(),
             level: Level::Regions,
+            previews: preview::Regions::default(),
         }
+    }
+}
+
+impl preview::PreviewFrame for Frame {
+    #[inline(always)]
+    fn reconcile_preview(&mut self, result: &crate::api::command::UiScanResult) -> bool {
+        self.previews
+            .reconcile(&mut self.text, &mut self.units, result)
     }
 }
 
@@ -54,7 +65,9 @@ impl Frame {
         let mut lines: Vec<_> = targets
             .iter()
             .filter(|t| {
-                !(t.name.trim().is_empty() && t.ocr_text().trim().is_empty()) && !t.rect.is_empty()
+                (preview::is_fast_preview(t)
+                    || !(t.name.trim().is_empty() && t.ocr_text().trim().is_empty()))
+                    && !t.rect.is_empty()
             })
             .collect();
         lines.sort_by(|a, b| {
@@ -108,6 +121,7 @@ impl Frame {
             }
         }
         groups.sort_by(|a, b| a.0.y.total_cmp(&b.0.y).then(a.0.x.total_cmp(&b.0.x)));
+        let previews = preview::Regions::from_groups(&groups);
         let mut text = String::new();
         let mut units = Vec::with_capacity(groups.len());
         let mut region_bounds = Vec::with_capacity(groups.len());
@@ -137,8 +151,19 @@ impl Frame {
             units,
             region_bounds,
             selected,
+            previews,
             ..Self::default()
         }
+    }
+
+    #[inline(always)]
+    pub fn selection_waiting_for_preview(&self) -> bool {
+        self.previews.waiting(&self.selected)
+    }
+
+    #[inline(always)]
+    pub fn selection_incomplete(&self) -> bool {
+        self.previews.incomplete(&self.selected)
     }
 
     pub fn toggle(&mut self, index: usize) {
@@ -203,6 +228,12 @@ impl Frame {
     pub fn write_selected_text(&self, text: &mut String) {
         text.clear();
         if self.level == Level::Regions {
+            if self
+                .previews
+                .write_deduplicated(&self.selected, &self.units, &self.text, text)
+            {
+                return;
+            }
             self.text_in_order(
                 text,
                 (0..self.units.len()).filter(|&index| self.selected[index]),
@@ -253,6 +284,7 @@ impl Frame {
             selected,
             selection_order,
             level,
+            previews: preview::Regions::default(),
         }
     }
 

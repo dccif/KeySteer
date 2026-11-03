@@ -157,6 +157,11 @@ pub enum Command {
     /// Temporarily place a modal plugin above the current mode without losing
     /// the current mode's navigation state.
     PushMode(ModeId),
+    /// Push a mode with an explicit desktop region for its new session.
+    PushModeInRegion {
+        mode: ModeId,
+        bounds: Rect,
+    },
     /// Close the current modal mode and restore the suspended mode.
     PopMode,
     /// Ask the active mode to move its state to a numbered display.
@@ -527,6 +532,11 @@ pub enum ModeEvent {
     /// This mode was pushed modally and must later return with `PopMode`.
     Pushed {
         previous: ModeId,
+    },
+    /// A modal session was opened with a caller-selected desktop region.
+    PushedInRegion {
+        previous: ModeId,
+        bounds: Rect,
     },
     /// This mode is about to be torn down.
     Deactivated,
@@ -974,6 +984,15 @@ pub trait Mode: Send {
     /// State-independent raw-key ownership for precompiled help.
     fn claims_key_for_help(&self, key: &Key) -> bool {
         self.claims_key(key)
+    }
+
+    /// Override a binding's help label when a mode gives it contextual behavior.
+    fn key_help_binding_label(
+        &self,
+        _chord: &super::input::KeyChord,
+        _binding: &Binding,
+    ) -> Option<&'static str> {
+        None
     }
 
     /// Fixed built-in hints that can be compiled with the binding tables.

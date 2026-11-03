@@ -573,11 +573,7 @@ fn detect_inner(
                                 deadline,
                                 stopped,
                                 &cancelled,
-                                (
-                                    &publish,
-                                    &progress,
-                                    config.detect_rectangles.then_some(&preview),
-                                ),
+                                (&publish, &progress, config.detect_text.then_some(&preview)),
                             )
                         } else if source == TargetSource::Contour {
                             let Some(workspace) = contour.as_deref_mut() else {

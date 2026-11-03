@@ -476,6 +476,8 @@ after_finish = "normal"
 after_click = "finish"
 
 [grid.bindings]
+u = "area_hint"
+i = "area_text"
 enter = "confirm_selection" # 确认当前选择
 esc = "cancel_selection" # 取消选择，返回来源模式
 "tab backspace" = "previous_level" # Tab 或 Backspace：返回上一层
@@ -506,6 +508,8 @@ after_finish = "keep"
 after_click = "keep"
 
 [recursive_grid.bindings]
+u = "area_hint"
+i = "area_text"
 enter = "confirm_selection" # 确认当前选择
 esc = "cancel_selection" # 取消选择，返回来源模式
 "tab backspace" = "previous_level" # Tab 或 Backspace：返回上一层
@@ -545,6 +549,8 @@ h = "bisect_left"
 j = "bisect_down"
 k = "bisect_up"
 l = "bisect_right"
+u = "area_hint"
+i = "area_text"
 enter = "confirm_selection"
 esc = "cancel_selection"
 "tab backspace" = "previous_level"

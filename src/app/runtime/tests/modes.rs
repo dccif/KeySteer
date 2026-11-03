@@ -1,4 +1,318 @@
 #[test]
+fn grid_region_ui_hint_uses_the_selected_area_and_restores_it_on_cancel() {
+    let screen = Rect::new(0.0, 0.0, 1000.0, 800.0);
+    for (name, steps, expected) in [
+        ("grid", vec!["1"], screen.subdivision(4, 5, 0).unwrap()),
+        ("recursive_grid", vec!["q"], screen.subdivision(3, 3, 0).unwrap()),
+        ("bisect", vec!["h", "j"], Rect::new(0.0, 400.0, 500.0, 400.0)),
+    ] {
+        let mut engine = text_input_engine(Config::default());
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+        engine.screens = backend.screens().unwrap();
+        engine.cursor = Point::new(500.0, 400.0);
+        let mode = ModeId::new(name).unwrap();
+        engine.activate(mode.clone(), Some(ModeId::normal()), &mut backend).unwrap();
+        for key in steps { point_keys(&mut engine, &mut backend, &[key]); }
+        point_keys(&mut engine, &mut backend, &["u"]);
+        assert_eq!(engine.active_mode(), &ModeId::ui_hint(), "{name}");
+        let request = log.lock().unwrap().scan_requests.last().unwrap().clone();
+        assert_eq!(request.bounds, Some(expected), "{name}");
+        assert_eq!(request.scope, crate::api::UiScanScope::Screen);
+
+        let center = expected.center();
+        engine.handle_backend_event(BackendEvent::UiScanned(crate::api::UiScanResult {
+            id: request.id,
+            status: UiScanStatus::Partial,
+            retired: Vec::new(),
+            targets: vec![
+                crate::api::UiTarget::recognized_text(Rect::new(center.x - 5.0, center.y - 5.0, 10.0, 10.0), "inside".into()),
+                crate::api::UiTarget::recognized_text(Rect::new(990.0, 0.0, 5.0, 5.0), "outside".into()),
+            ],
+        }), &mut backend).unwrap();
+        assert_eq!(log.lock().unwrap().scenes.last().unwrap().labels.len(), 1, "{name}");
+        point_keys(&mut engine, &mut backend, &["esc"]);
+        assert_eq!(engine.active_mode(), &mode, "{name}");
+        assert!(log.lock().unwrap().cancelled_scans.contains(&request.id), "{name}");
+        point_keys(&mut engine, &mut backend, &["u"]);
+        let second = log.lock().unwrap().scan_requests.last().unwrap().clone();
+        assert!(second.id > request.id);
+        assert_eq!(second.bounds, Some(expected), "{name}: selection must survive cancel");
+        point_keys(&mut engine, &mut backend, &["esc"]);
+        point_keys(&mut engine, &mut backend, &["space"]);
+        point_keys(&mut engine, &mut backend, &["u"]);
+        assert_eq!(log.lock().unwrap().scan_requests.last().unwrap().bounds, Some(screen), "{name}");
+    }
+}
+
+#[test]
+fn area_hint_previous_level_restores_each_grids_existing_depth_and_region() {
+    let screen = Rect::new(0.0, 0.0, 1000.0, 800.0);
+    let grid_parent = screen.subdivision(4, 5, 0).unwrap();
+    let recursive_parent = screen.subdivision(3, 3, 0).unwrap();
+    let bisect_parent = Rect::new(0.0, 0.0, 500.0, 800.0);
+    for (name, steps, parent, selected) in [
+        ("grid", vec!["1", "2"], grid_parent, grid_parent.subdivision(4, 5, 1).unwrap()),
+        ("recursive_grid", vec!["q", "w"], recursive_parent, recursive_parent.subdivision(3, 3, 1).unwrap()),
+        ("bisect", vec!["h", "j"], bisect_parent, Rect::new(0.0, 400.0, 500.0, 400.0)),
+    ] {
+        for key in ["tab", "backspace", "f8"] {
+            for deliver in [false, true] {
+                let mut config = Config::default();
+                config.ui_hint.bindings.insert("f8".into(), Binding::SelectionParent);
+                let mut engine = text_input_engine(config);
+                let (mut backend, log) = FakeBackend::new(Vec::new());
+                engine.screens = backend.screens().unwrap();
+                engine.cursor = Point::new(500.0, 400.0);
+                let mode = ModeId::new(name).unwrap();
+                engine.activate(mode.clone(), Some(ModeId::normal()), &mut backend).unwrap();
+                for step in &steps { point_keys(&mut engine, &mut backend, &[step]); }
+                point_keys(&mut engine, &mut backend, &["u"]);
+                let request = log.lock().unwrap().scan_requests.last().unwrap().clone();
+                assert_eq!(request.bounds, Some(selected), "{name}");
+                if deliver {
+                    let center = selected.center();
+                    engine.handle_backend_event(BackendEvent::UiScanned(crate::api::UiScanResult {
+                        id: request.id, status: UiScanStatus::Partial, retired: Vec::new(),
+                        targets: vec![crate::api::UiTarget::recognized_text(Rect::new(center.x, center.y, 4.0, 4.0), "inside".into())],
+                    }), &mut backend).unwrap();
+                }
+                point_keys(&mut engine, &mut backend, &[key]);
+                assert_eq!(engine.active_mode(), &mode, "{name} {key} before_results={}", !deliver);
+                assert!(log.lock().unwrap().cancelled_scans.contains(&request.id));
+                point_keys(&mut engine, &mut backend, &["u"]);
+                assert_eq!(log.lock().unwrap().scan_requests.last().unwrap().bounds, Some(selected));
+                point_keys(&mut engine, &mut backend, &[key]);
+                point_keys(&mut engine, &mut backend, &["backspace"]);
+                point_keys(&mut engine, &mut backend, &["u"]);
+                assert_eq!(log.lock().unwrap().scan_requests.last().unwrap().bounds, Some(parent), "{name} must retain its selection path");
+            }
+        }
+    }
+}
+
+#[test]
+fn area_hint_accepts_grouped_previous_level_binding() {
+    let config = Config::parse("[ui_hint.bindings]\n\"tab backspace\" = 'previous_level'").unwrap();
+    let mut engine = text_input_engine(config);
+    let (mut backend, log) = FakeBackend::new(Vec::new());
+    engine.screens = backend.screens().unwrap();
+    engine.activate(ModeId::grid(), Some(ModeId::normal()), &mut backend).unwrap();
+    point_keys(&mut engine, &mut backend, &["1"]);
+    for key in ["tab", "backspace"] {
+        point_keys(&mut engine, &mut backend, &["u"]);
+        let bounds = log.lock().unwrap().scan_requests.last().unwrap().bounds;
+        point_keys(&mut engine, &mut backend, &[key]);
+        assert_eq!(engine.active_mode(), &ModeId::grid());
+        point_keys(&mut engine, &mut backend, &["u"]);
+        assert_eq!(log.lock().unwrap().scan_requests.last().unwrap().bounds, bounds);
+        point_keys(&mut engine, &mut backend, &["esc"]);
+    }
+}
+
+#[test]
+fn area_hint_search_keeps_its_edit_keys_before_returning_to_the_grid() {
+    let config = Config::parse("[ui_hint.bindings]\n\"tab backspace\" = 'previous_level'").unwrap();
+    let mut engine = text_input_engine(config);
+    let (mut backend, log) = FakeBackend::new(Vec::new());
+    engine.screens = backend.screens().unwrap();
+    engine.activate(ModeId::grid(), Some(ModeId::normal()), &mut backend).unwrap();
+    point_keys(&mut engine, &mut backend, &["1"]);
+    point_keys(&mut engine, &mut backend, &["u"]);
+    let request = log.lock().unwrap().scan_requests.last().unwrap().clone();
+    let center = request.bounds.unwrap().center();
+    engine.handle_backend_event(BackendEvent::UiScanned(crate::api::UiScanResult {
+        id: request.id, status: UiScanStatus::Partial, retired: Vec::new(),
+        targets: vec![crate::api::UiTarget::recognized_text(Rect::new(center.x, center.y, 4.0, 4.0), "hello".into())],
+    }), &mut backend).unwrap();
+    point_keys(&mut engine, &mut backend, &["/"]);
+    let id = engine.scheduler.text_prompt.as_ref().unwrap().1.id;
+    engine.handle_backend_event(BackendEvent::TextPromptChanged {
+        id, text: "hello".into(),
+    }, &mut backend).unwrap();
+    point_keys(&mut engine, &mut backend, &["backspace"]);
+    point_keys(&mut engine, &mut backend, &["tab"]);
+    assert_eq!(engine.active_mode(), &ModeId::ui_hint());
+    assert!(engine.scheduler.text_prompt.is_some());
+    point_keys(&mut engine, &mut backend, &["esc"]);
+    assert!(engine.scheduler.text_prompt.is_none());
+    point_keys(&mut engine, &mut backend, &["backspace"]);
+    assert_eq!(engine.active_mode(), &ModeId::grid());
+    point_keys(&mut engine, &mut backend, &["u"]);
+    assert_eq!(log.lock().unwrap().scan_requests.last().unwrap().bounds, request.bounds);
+}
+
+#[test]
+fn area_hint_key_help_shows_tab_returns_to_grid() {
+    let mut config = Config::default();
+    config.ui_hint.bindings.insert("f9".into(), Binding::SelectionReopen);
+    let mut engine = text_input_engine(config);
+    let (mut backend, _) = FakeBackend::new(Vec::new());
+    engine.screens = backend.screens().unwrap();
+    engine.activate(ModeId::ui_hint(), Some(ModeId::normal()), &mut backend).unwrap();
+    assert!(engine.key_help_entries().iter().any(|entry| entry == "tab  ·  reopen_selection"));
+    engine.activate(ModeId::grid(), Some(ModeId::normal()), &mut backend).unwrap();
+    point_keys(&mut engine, &mut backend, &["u"]);
+    let help = engine.key_help_entries();
+    assert!(help.iter().any(|entry| entry == "tab  ·  previous_level"));
+    assert!(help.iter().any(|entry| entry == "f9  ·  reopen_selection"));
+    assert!(!help.iter().any(|entry| entry == "tab  ·  reopen_selection"));
+}
+
+#[test]
+fn grid_region_text_select_keeps_the_area_and_supports_partial_text_copy() {
+    let screen = Rect::new(0.0, 0.0, 1000.0, 800.0);
+    for (name, steps, expected) in [
+        ("grid", vec!["1"], screen.subdivision(4, 5, 0).unwrap()),
+        ("recursive_grid", vec!["q"], screen.subdivision(3, 3, 0).unwrap()),
+        ("bisect", vec!["h", "j"], Rect::new(0.0, 400.0, 500.0, 400.0)),
+    ] {
+        let mut config = Config::default();
+        config.text_select.lifecycle.after_copy = crate::api::LifecycleAction::Return;
+        let mut engine = text_input_engine(config);
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+        engine.screens = backend.screens().unwrap();
+        engine.cursor = Point::new(500.0, 400.0);
+        let mode = ModeId::new(name).unwrap();
+        engine.activate(mode.clone(), Some(ModeId::normal()), &mut backend).unwrap();
+        for key in steps { point_keys(&mut engine, &mut backend, &[key]); }
+        point_keys(&mut engine, &mut backend, &["i"]);
+        assert_eq!(engine.active_mode(), &ModeId::text_select(), "{name}");
+        let first = log.lock().unwrap().scan_requests.last().unwrap().clone();
+        assert_eq!(first.bounds, Some(expected), "{name}");
+        assert_eq!(first.scope, crate::api::UiScanScope::Screen);
+        assert_eq!(first.strategy, crate::api::UiScanStrategy::Vision);
+        assert!(first.vision.detect_text);
+        assert!(!first.vision.detect_rectangles);
+        point_keys(&mut engine, &mut backend, &["esc"]);
+        assert_eq!(engine.active_mode(), &mode, "{name}");
+        assert!(log.lock().unwrap().cancelled_scans.contains(&first.id));
+
+        point_keys(&mut engine, &mut backend, &["i"]);
+        let request = log.lock().unwrap().scan_requests.last().unwrap().clone();
+        assert!(request.id > first.id);
+        assert_eq!(request.bounds, Some(expected), "{name}");
+        let center = expected.center();
+        engine.handle_backend_event(BackendEvent::UiScanned(crate::api::UiScanResult {
+            id: first.id, status: UiScanStatus::Success, retired: Vec::new(),
+            targets: vec![crate::api::UiTarget::recognized_text(Rect::new(center.x, center.y, 10.0, 10.0), "stale".into())],
+        }), &mut backend).unwrap();
+        engine.handle_backend_event(BackendEvent::UiScanned(crate::api::UiScanResult {
+            id: request.id,
+            status: UiScanStatus::Success,
+            retired: Vec::new(),
+            targets: vec![
+                crate::api::UiTarget::recognized_text(Rect::new(center.x - 20.0, center.y - 5.0, 40.0, 10.0), "one two".into()),
+                crate::api::UiTarget::recognized_text(Rect::new(990.0, 0.0, 5.0, 5.0), "outside".into()),
+            ],
+        }), &mut backend).unwrap();
+        point_keys(&mut engine, &mut backend, &["a"]);
+        point_keys(&mut engine, &mut backend, &["left_alt", "c"]);
+        point_keys(&mut engine, &mut backend, &["backspace"]);
+        point_keys(&mut engine, &mut backend, &["1"]);
+        point_keys(&mut engine, &mut backend, &["enter"]);
+        assert_eq!(log.lock().unwrap().copied_text.last().map(String::as_str), Some("one"), "{name}");
+        assert_eq!(engine.active_mode(), &mode, "{name}");
+        point_keys(&mut engine, &mut backend, &["i"]);
+        assert_eq!(log.lock().unwrap().scan_requests.last().unwrap().bounds, Some(expected), "{name}: selection must survive copy and return");
+    }
+}
+
+#[test]
+fn region_scan_switches_reject_late_results_from_the_other_mode() {
+    let mut engine = text_input_engine(Config::default());
+    let (mut backend, log) = FakeBackend::new(Vec::new());
+    engine.screens = backend.screens().unwrap();
+    engine.activate(ModeId::grid(), Some(ModeId::normal()), &mut backend).unwrap();
+    for (first_key, next_key) in [("u", "i"), ("i", "u")] {
+        point_keys(&mut engine, &mut backend, &[first_key]);
+        let first = log.lock().unwrap().scan_requests.last().unwrap().id;
+        point_keys(&mut engine, &mut backend, &["esc"]);
+        point_keys(&mut engine, &mut backend, &[next_key]);
+        let next = log.lock().unwrap().scan_requests.last().unwrap().id;
+        assert_ne!(first, next);
+        let presentations = log.lock().unwrap().presents;
+        engine.handle_backend_event(BackendEvent::UiScanned(crate::api::UiScanResult {
+            id: first, status: UiScanStatus::Success, retired: Vec::new(),
+            targets: vec![crate::api::UiTarget::recognized_text(Rect::new(10.0, 10.0, 50.0, 20.0), "stale".into())],
+        }), &mut backend).unwrap();
+        assert_eq!(log.lock().unwrap().presents, presentations);
+        assert!(engine.scan_owners.contains_key(&next));
+        point_keys(&mut engine, &mut backend, &["esc"]);
+        assert_eq!(engine.active_mode(), &ModeId::grid());
+    }
+}
+
+#[test]
+fn region_ui_hint_does_not_suspend_the_grid_if_hint_is_disabled() {
+    let mut config = Config::default();
+    config.ui_hint.enabled = false;
+    let mut engine = text_input_engine(config);
+    let (mut backend, log) = FakeBackend::new(Vec::new());
+    engine.screens = backend.screens().unwrap();
+    engine.activate(ModeId::grid(), Some(ModeId::normal()), &mut backend).unwrap();
+    point_keys(&mut engine, &mut backend, &["u"]);
+    assert_eq!(engine.active_mode(), &ModeId::grid());
+    assert!(log.lock().unwrap().scan_requests.is_empty());
+    assert!(engine.registry.modal_stack.is_empty());
+}
+
+#[test]
+fn region_text_select_does_not_suspend_the_grid_if_disabled() {
+    let mut config = Config::default();
+    config.text_select.enabled = false;
+    let mut engine = text_input_engine(config);
+    let (mut backend, log) = FakeBackend::new(Vec::new());
+    engine.screens = backend.screens().unwrap();
+    engine.activate(ModeId::grid(), Some(ModeId::normal()), &mut backend).unwrap();
+    point_keys(&mut engine, &mut backend, &["i"]);
+    assert_eq!(engine.active_mode(), &ModeId::grid());
+    assert!(log.lock().unwrap().scan_requests.is_empty());
+    assert!(engine.registry.modal_stack.is_empty());
+}
+
+#[test]
+fn region_scan_can_be_moved_off_a_custom_grid_label() {
+    for (key, action, target) in [("u", "area_hint", ModeId::ui_hint()), ("i", "area_text", ModeId::text_select())] {
+        let config = Config::parse(&format!("[grid]\nkeys = '{key}2345qwertasdfgzxcvb'\n[grid.bindings]\nf8 = '{action}'")).unwrap();
+        let mut engine = text_input_engine(config);
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+        engine.screens = backend.screens().unwrap();
+        engine.activate(ModeId::grid(), Some(ModeId::normal()), &mut backend).unwrap();
+        point_keys(&mut engine, &mut backend, &[key]);
+        assert_eq!(engine.active_mode(), &ModeId::grid());
+        point_keys(&mut engine, &mut backend, &["f8"]);
+        assert_eq!(engine.active_mode(), &target);
+        assert_eq!(log.lock().unwrap().scan_requests.last().unwrap().bounds,
+            Some(Rect::new(0.0, 0.0, 200.0, 200.0)));
+    }
+}
+
+#[test]
+fn region_scan_nested_in_window_restores_both_sessions() {
+    for (key, target) in [("u", ModeId::ui_hint()), ("i", ModeId::text_select())] {
+        let config = Config::default();
+        let (mut engine, mut backend, log) = window_test_engine(&config);
+        let initial = enter_window(&mut engine, &mut backend, &log);
+        point_keys(&mut engine, &mut backend, &["g"]);
+        assert_eq!(engine.active_mode(), &ModeId::grid());
+        point_keys(&mut engine, &mut backend, &["1"]);
+        point_keys(&mut engine, &mut backend, &[key]);
+        assert_eq!(engine.active_mode(), &target);
+        assert_eq!(engine.registry.modal_stack, vec![ModeId::window(), ModeId::grid()]);
+        let area = log.lock().unwrap().scan_requests.last().unwrap().bounds;
+        point_keys(&mut engine, &mut backend, &["esc"]);
+        assert_eq!(engine.active_mode(), &ModeId::grid());
+        point_keys(&mut engine, &mut backend, &[key]);
+        assert_eq!(log.lock().unwrap().scan_requests.last().unwrap().bounds, area);
+        point_keys(&mut engine, &mut backend, &["esc"]);
+        point_keys(&mut engine, &mut backend, &["esc"]);
+        assert_eq!(engine.active_mode(), &ModeId::window());
+        assert!(engine.registry.modal_stack.is_empty());
+        assert!(!log.lock().unwrap().cancelled_window_sessions.contains(&initial.session));
+    }
+}
+
+#[test]
 fn every_mode_compiles_optional_temporary_layers_with_the_same_precedence() {
     for mode in ["normal", "quick_switch", "text_input", "text_select", "grid", "recursive_grid", "bisect", "ui_hint", "window", "window_quick", "window_editor", "window_restore", "window_tab", "plugin:screen-selector"] {
         let section = if mode.starts_with("plugin:") { format!("plugin_modes.\"{mode}\"") } else { mode.into() };

@@ -76,6 +76,558 @@ fn words(mode: &mut TextSelectMode, env: &Env, text: &str, ranges: Vec<std::ops:
     settle(mode, env);
 }
 
+fn fast_preview(rect: Rect) -> UiTarget {
+    UiTarget {
+        rect,
+        role: crate::api::SemanticRole::Control,
+        name: String::new(),
+        details: None,
+    }
+}
+
+fn scan_delta(
+    mode: &mut TextSelectMode,
+    env: &Env,
+    targets: Vec<UiTarget>,
+    retired: Vec<Rect>,
+    status: UiScanStatus,
+) -> CommandBatch {
+    mode.scan(
+        UiScanResult {
+            id: mode.scan_id,
+            targets,
+            retired,
+            status,
+        },
+        &env.ctx(),
+    )
+}
+
+#[test]
+fn region_entry_reuses_ocr_and_fast_previews_only_inside_the_grid() {
+    let env = Env::new();
+    let mut mode = mode();
+    let area = Rect::new(10., 10., 200., 200.);
+    let out = mode.handle(
+        &ModeEvent::PushedInRegion {
+            previous: ModeId::grid(),
+            bounds: area,
+        },
+        &env.ctx(),
+    );
+    let request = out
+        .iter()
+        .find_map(|command| match command {
+            Command::ScanUi(request) => Some(request),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(request.scope, crate::api::UiScanScope::Screen);
+    assert_eq!(request.bounds, Some(area));
+    assert_eq!(request.capture_regions().collect::<Vec<_>>(), vec![area]);
+    assert_eq!(request.strategy, UiScanStrategy::Vision);
+    assert!(request.vision.detect_text);
+    assert!(!request.vision.detect_rectangles);
+    assert!(
+        out.iter()
+            .position(|command| matches!(command, Command::HideOverlay))
+            .unwrap()
+            < out
+                .iter()
+                .position(|command| matches!(command, Command::ScanUi(_)))
+                .unwrap()
+    );
+    let inside = Rect::new(20., 20., 40., 10.);
+    let outside = Rect::new(400., 20., 40., 10.);
+    scan_delta(
+        &mut mode,
+        &env,
+        vec![fast_preview(inside), fast_preview(outside)],
+        vec![],
+        UiScanStatus::Partial,
+    );
+    assert_eq!(mode.source.scanned.len(), 1);
+    assert_eq!(mode.source.scanned[0].rect, inside);
+    scan_delta(
+        &mut mode,
+        &env,
+        vec![
+            UiTarget::recognized_text(inside, "hello".into()),
+            UiTarget::recognized_text(outside, "outside".into()),
+        ],
+        vec![inside, outside],
+        UiScanStatus::Success,
+    );
+    settle(&mut mode, &env);
+    assert!(
+        mode.source
+            .scanned
+            .iter()
+            .all(|target| area.contains(&target.rect.center()))
+    );
+    assert!(
+        mode.source
+            .scanned
+            .iter()
+            .any(|target| target.name == "hello")
+    );
+
+    let rescanned = mode.handle(&ModeEvent::Restarted, &env.ctx());
+    assert!(rescanned.iter().any(
+        |command| matches!(command, Command::ScanUi(request) if request.bounds == Some(area))
+    ));
+    assert_eq!(
+        mode.handle(&ModeEvent::TextEdit(EditAction::Cancel), &env.ctx()),
+        CommandBatch::one(Command::PopMode)
+    );
+    mode.handle(&ModeEvent::Deactivated, &env.ctx());
+    let normal = mode.handle(
+        &ModeEvent::Activated {
+            previous: Some(ModeId::normal()),
+        },
+        &env.ctx(),
+    );
+    assert!(normal.iter().any(|command| matches!(command, Command::ScanUi(request)
+        if request.scope == crate::api::UiScanScope::All && request.bounds == Some(env.screens[0].bounds))));
+}
+
+#[test]
+fn fast_geometry_keeps_a_selected_label_until_accurate_text_can_be_copied() {
+    let env = Env::new();
+    let mut mode = mode();
+    mode.start(&env.ctx());
+    let rect = Rect::new(10., 10., 300., 20.);
+    let first = scan_delta(
+        &mut mode,
+        &env,
+        vec![fast_preview(rect)],
+        vec![],
+        UiScanStatus::Partial,
+    );
+    assert!(first.iter().any(|c| matches!(c, Command::ShowOverlay(_))));
+    let label = mode.search.search_hints[0].label.as_str().to_owned();
+    mode.insert(&format!("@{label}"), &env.ctx());
+    assert!(mode.frame.selection_waiting_for_preview());
+    assert!(mode.frozen);
+    let pending = mode.action(Action::Copy, &env.ctx());
+    assert!(!pending.iter().any(|c| matches!(c, Command::CopyText(_))));
+    assert_eq!(mode.preview_actions.pending(), Some(Action::Copy));
+
+    let partial = scan_delta(
+        &mut mode,
+        &env,
+        vec![UiTarget::recognized_text(
+            Rect::new(12., 10., 290., 20.),
+            "设置 Settings".into(),
+        )],
+        vec![rect],
+        UiScanStatus::Partial,
+    );
+    assert!(!partial.iter().any(|c| matches!(c, Command::CopyText(_))));
+    let complete = scan_delta(&mut mode, &env, vec![], vec![], UiScanStatus::Success);
+    assert!(
+        complete
+            .iter()
+            .any(|c| matches!(c, Command::CopyText(text) if text == "设置 Settings"))
+    );
+    assert_eq!(mode.search.search_hints[0].label.as_str(), label);
+    assert_eq!(mode.frame.region_bounds, [rect]);
+    assert_eq!(mode.frame.selected, [true]);
+    assert_eq!(mode.output, "设置 Settings");
+    assert!(mode.source.pending_relabel);
+}
+
+#[test]
+fn selecting_all_fast_regions_shows_the_waiting_status() {
+    let env = Env::new();
+    let mut mode = mode();
+    mode.start(&env.ctx());
+    let rect = Rect::new(10., 10., 300., 20.);
+    scan_delta(
+        &mut mode,
+        &env,
+        vec![fast_preview(rect)],
+        vec![],
+        UiScanStatus::Partial,
+    );
+    let selected = mode.action(Action::SelectAll, &env.ctx());
+    assert!(selected.iter().any(|command| {
+        match command {
+            Command::ShowOverlay(scene) => scene
+                .labels
+                .iter()
+                .any(|label| label.text.as_str() == "Recognizing text…"),
+            _ => false,
+        }
+    }));
+}
+
+#[test]
+fn fast_paragraph_waits_for_all_selected_rows_before_copying() {
+    let env = Env::new();
+    let mut mode = mode();
+    mode.start(&env.ctx());
+    let first = Rect::new(10., 10., 300., 20.);
+    let second = Rect::new(10., 35., 300., 20.);
+    scan_delta(
+        &mut mode,
+        &env,
+        vec![fast_preview(first), fast_preview(second)],
+        vec![],
+        UiScanStatus::Partial,
+    );
+    mode.insert("@a", &env.ctx());
+    mode.action(Action::Copy, &env.ctx());
+    let partial = scan_delta(
+        &mut mode,
+        &env,
+        vec![UiTarget::recognized_text(first, "第一行".into())],
+        vec![first],
+        UiScanStatus::Partial,
+    );
+    assert!(!partial.iter().any(|c| matches!(c, Command::CopyText(_))));
+    assert!(mode.output.is_empty());
+    assert_eq!(mode.preview_actions.pending(), Some(Action::Copy));
+    let partial = scan_delta(
+        &mut mode,
+        &env,
+        vec![UiTarget::recognized_text(second, "第二行".into())],
+        vec![second],
+        UiScanStatus::Partial,
+    );
+    assert!(!partial.iter().any(|c| matches!(c, Command::CopyText(_))));
+    let complete = scan_delta(&mut mode, &env, vec![], vec![], UiScanStatus::Success);
+    assert!(
+        complete
+            .iter()
+            .any(|c| matches!(c, Command::CopyText(text) if text == "第一行第二行"))
+    );
+}
+
+#[test]
+fn selecting_fast_boxes_that_merge_into_one_ocr_row_copies_it_once() {
+    let env = Env::new();
+    let mut mode = mode();
+    mode.start(&env.ctx());
+    let left = Rect::new(10., 10., 80., 20.);
+    let right = Rect::new(100., 10., 80., 20.);
+    scan_delta(
+        &mut mode,
+        &env,
+        vec![fast_preview(left), fast_preview(right)],
+        vec![],
+        UiScanStatus::Partial,
+    );
+    assert_eq!(mode.frame.units.len(), 2);
+    mode.action(Action::SelectAll, &env.ctx());
+    mode.action(Action::Copy, &env.ctx());
+    scan_delta(
+        &mut mode,
+        &env,
+        vec![UiTarget::recognized_text(
+            Rect::new(10., 10., 170., 20.),
+            "hello world".into(),
+        )],
+        vec![left, right],
+        UiScanStatus::Partial,
+    );
+    let complete = scan_delta(&mut mode, &env, vec![], vec![], UiScanStatus::Success);
+    assert!(
+        complete
+            .iter()
+            .any(|c| matches!(c, Command::CopyText(text) if text == "hello world"))
+    );
+    assert_eq!(mode.output, "hello world");
+}
+
+#[test]
+fn fast_selection_refines_only_after_accurate_split_rows_arrive() {
+    let env = Env::new();
+    let mut mode = mode();
+    mode.start(&env.ctx());
+    let rect = Rect::new(10., 10., 300., 20.);
+    scan_delta(
+        &mut mode,
+        &env,
+        vec![fast_preview(rect)],
+        vec![],
+        UiScanStatus::Partial,
+    );
+    mode.insert("@a", &env.ctx());
+    let pending = mode.action(Action::Refine, &env.ctx());
+    assert!(!pending.iter().any(|c| matches!(c, Command::SegmentText(_))));
+    let partial = scan_delta(
+        &mut mode,
+        &env,
+        vec![UiTarget::recognized_text(
+            Rect::new(10., 10., 100., 20.),
+            "hello".into(),
+        )],
+        vec![rect],
+        UiScanStatus::Partial,
+    );
+    assert!(!partial.iter().any(|c| matches!(c, Command::SegmentText(_))));
+    let partial = scan_delta(
+        &mut mode,
+        &env,
+        vec![UiTarget::recognized_text(
+            Rect::new(130., 10., 100., 20.),
+            "world".into(),
+        )],
+        vec![],
+        UiScanStatus::Partial,
+    );
+    assert!(!partial.iter().any(|c| matches!(c, Command::SegmentText(_))));
+    let complete = scan_delta(&mut mode, &env, vec![], vec![], UiScanStatus::Success);
+    assert!(complete.iter().any(
+        |c| matches!(c, Command::SegmentText(request) if request.text.as_ref() == "hello world")
+    ));
+    assert_eq!(mode.frame.level, Level::Words);
+}
+
+#[test]
+fn missing_preview_rows_never_copy_a_partial_selection() {
+    let env = Env::new();
+    let mut mode = mode();
+    mode.start(&env.ctx());
+    let first = Rect::new(10., 10., 300., 20.);
+    let second = Rect::new(10., 35., 300., 20.);
+    scan_delta(
+        &mut mode,
+        &env,
+        vec![fast_preview(first), fast_preview(second)],
+        vec![],
+        UiScanStatus::Partial,
+    );
+    mode.insert("@a", &env.ctx());
+    mode.action(Action::Copy, &env.ctx());
+    scan_delta(
+        &mut mode,
+        &env,
+        vec![UiTarget::recognized_text(first, "第一行".into())],
+        vec![first],
+        UiScanStatus::Partial,
+    );
+    let complete = scan_delta(&mut mode, &env, vec![], vec![second], UiScanStatus::Success);
+    assert!(!complete.iter().any(|c| matches!(c, Command::CopyText(_))));
+    assert!(mode.frame.selection_incomplete());
+    assert!(mode.output.is_empty());
+    assert_eq!(mode.preview_actions.pending(), None);
+    assert!(
+        !mode
+            .action(Action::Copy, &env.ctx())
+            .iter()
+            .any(|c| matches!(c, Command::CopyText(_)))
+    );
+}
+
+#[test]
+fn changing_input_cancels_a_queued_preview_action() {
+    let env = Env::new();
+    let mut mode = mode();
+    mode.start(&env.ctx());
+    let rect = Rect::new(10., 10., 300., 20.);
+    scan_delta(
+        &mut mode,
+        &env,
+        vec![fast_preview(rect)],
+        vec![],
+        UiScanStatus::Partial,
+    );
+    mode.insert("@a", &env.ctx());
+    mode.action(Action::Copy, &env.ctx());
+    mode.action(Action::ClearInput, &env.ctx());
+    let complete = scan_delta(
+        &mut mode,
+        &env,
+        vec![UiTarget::recognized_text(rect, "hello".into())],
+        vec![rect],
+        UiScanStatus::Partial,
+    );
+    assert_eq!(mode.preview_actions.pending(), None);
+    assert!(!complete.iter().any(|c| matches!(c, Command::CopyText(_))));
+}
+
+#[test]
+fn preview_replacement_before_deferred_timer_cannot_be_lost_on_selection() {
+    let env = Env::new();
+    let mut mode = mode();
+    mode.start(&env.ctx());
+    let rect = Rect::new(10., 10., 300., 20.);
+    scan_delta(
+        &mut mode,
+        &env,
+        vec![fast_preview(rect)],
+        vec![],
+        UiScanStatus::Partial,
+    );
+    scan_delta(
+        &mut mode,
+        &env,
+        vec![UiTarget::recognized_text(rect, "准确文字".into())],
+        vec![rect],
+        UiScanStatus::Partial,
+    );
+    assert!(mode.source.pending_relabel);
+    mode.insert("@a", &env.ctx());
+    let pending = mode.action(Action::Copy, &env.ctx());
+    assert!(!pending.iter().any(|c| matches!(c, Command::CopyText(_))));
+    let copy = scan_delta(&mut mode, &env, vec![], vec![], UiScanStatus::Success);
+    assert!(
+        copy.iter()
+            .any(|c| matches!(c, Command::CopyText(text) if text == "准确文字"))
+    );
+}
+
+#[test]
+fn fast_label_prefix_stays_bound_to_the_same_region_while_ocr_streams() {
+    let env = Env::new();
+    let mut mode = mode();
+    mode.start(&env.ctx());
+    let rects: Vec<_> = (0..30)
+        .map(|i| Rect::new(10., 10. + f64::from(i) * 25., 100., 10.))
+        .collect();
+    scan_delta(
+        &mut mode,
+        &env,
+        rects.iter().copied().map(fast_preview).collect(),
+        vec![],
+        UiScanStatus::Partial,
+    );
+    let hint = mode
+        .search
+        .search_hints
+        .iter()
+        .find(|hint| hint.label.as_str().len() > 1)
+        .unwrap();
+    let index = hint.value;
+    let label = hint.label.as_str().to_owned();
+    mode.insert(&format!("@{}", &label[..1]), &env.ctx());
+    assert!(mode.holds_preview_labels());
+    assert!(!mode.frozen);
+    scan_delta(
+        &mut mode,
+        &env,
+        vec![UiTarget::recognized_text(rects[index], "正确目标".into())],
+        vec![rects[index]],
+        UiScanStatus::Partial,
+    );
+    mode.maintain(&env.ctx());
+    assert!(mode.source.pending_relabel);
+    let hint = mode
+        .search
+        .search_hints
+        .iter()
+        .find(|hint| hint.value == index)
+        .unwrap();
+    assert_eq!(hint.label.as_str(), label);
+    assert_eq!(hint.bounds, rects[index]);
+    mode.insert(&label[1..], &env.ctx());
+    assert!(mode.frozen);
+    mode.action(Action::Copy, &env.ctx());
+    let complete = scan_delta(
+        &mut mode,
+        &env,
+        vec![],
+        rects
+            .iter()
+            .enumerate()
+            .filter_map(|(i, rect)| (i != index).then_some(*rect))
+            .collect(),
+        UiScanStatus::Success,
+    );
+    assert!(
+        complete
+            .iter()
+            .any(|c| matches!(c, Command::CopyText(text) if text == "正确目标"))
+    );
+}
+
+#[test]
+fn failed_and_stale_scans_cannot_complete_a_queued_copy() {
+    let env = Env::new();
+    let mut mode = mode();
+    mode.start(&env.ctx());
+    let previous_id = mode.scan_id;
+    let rect = Rect::new(10., 10., 300., 20.);
+    scan_delta(
+        &mut mode,
+        &env,
+        vec![fast_preview(rect)],
+        vec![],
+        UiScanStatus::Partial,
+    );
+    mode.insert("@a", &env.ctx());
+    mode.action(Action::Copy, &env.ctx());
+    let failed = scan_delta(
+        &mut mode,
+        &env,
+        vec![UiTarget::recognized_text(rect, "partial".into())],
+        vec![rect],
+        UiScanStatus::TimedOut,
+    );
+    assert!(!failed.iter().any(|c| matches!(c, Command::CopyText(_))));
+    assert!(mode.frame.selection_incomplete());
+    assert_eq!(mode.preview_actions.pending(), None);
+    mode.start(&env.ctx());
+    let stale = mode.scan(
+        UiScanResult {
+            id: previous_id,
+            targets: vec![UiTarget::recognized_text(rect, "stale".into())],
+            retired: vec![rect],
+            status: UiScanStatus::Success,
+        },
+        &env.ctx(),
+    );
+    assert!(stale.is_empty());
+    assert!(mode.frame.units.is_empty());
+}
+
+#[test]
+fn already_recognized_selection_can_refine_while_other_preview_is_pending() {
+    let env = Env::new();
+    let mut mode = mode();
+    mode.start(&env.ctx());
+    let preview = Rect::new(10., 10., 300., 20.);
+    let known = Rect::new(10., 100., 300., 20.);
+    scan_delta(
+        &mut mode,
+        &env,
+        vec![
+            fast_preview(preview),
+            UiTarget::recognized_text(known, "known".into()),
+        ],
+        vec![],
+        UiScanStatus::Partial,
+    );
+    let label = mode
+        .search
+        .search_hints
+        .iter()
+        .find(|hint| hint.value == 1)
+        .unwrap()
+        .label
+        .as_str()
+        .to_owned();
+    mode.insert(&format!("@{label}"), &env.ctx());
+    let refine = mode.action(Action::Refine, &env.ctx());
+    assert!(
+        refine.iter().any(
+            |c| matches!(c, Command::SegmentText(request) if request.text.as_ref() == "known")
+        )
+    );
+    scan_delta(
+        &mut mode,
+        &env,
+        vec![UiTarget::recognized_text(preview, "晚到文字".into())],
+        vec![preview],
+        UiScanStatus::Success,
+    );
+    mode.navigate(false, &env.ctx());
+    assert_eq!(&*mode.frame.text, "晚到文字\n\nknown");
+    assert_eq!(mode.frame.selected, [false, true]);
+}
+
 #[test]
 fn first_hints_and_early_input_paint_before_bounded_search_prewarm() {
     let env = Env::new();

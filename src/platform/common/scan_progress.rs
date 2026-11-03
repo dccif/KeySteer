@@ -19,7 +19,6 @@ struct Source {
 pub(super) struct ScanProgress {
     sources: Vec<Source>,
     blocked: Vec<Rect>,
-    scratch: Vec<Rect>,
     invalid: bool,
 }
 
@@ -88,17 +87,17 @@ impl ScanProgress {
             let Some(regions) = &source.regions else {
                 return false;
             };
-            self.scratch.clear();
-            self.scratch.extend(regions.iter().copied());
+            let start = self.blocked.len();
+            self.blocked.extend(regions.iter().copied());
             // Text can grow across tile seams. Close over both active text and
-            // touching unfinished tiles, including the gaps in their union.
-            // A later stitch must never reach an already published candidate.
+            // touching unfinished tiles within this source's appended range.
+            // Earlier sources must remain independent.
             if source.source != TargetSource::Accessibility
                 && source.source != TargetSource::Contour
             {
-                index.expand_pending_text(source.source, &mut self.scratch);
+                let len = index.expand_pending_text(source.source, &mut self.blocked[start..]);
+                self.blocked.truncate(start + len);
             }
-            self.blocked.extend(self.scratch.iter().copied());
         }
         self.blocked.iter().copied().all(usable)
     }
@@ -186,5 +185,60 @@ mod tests {
         assert!(progress.prepare(&TargetIndex::new()));
         assert!(!progress.ready(Rect::new(20., 140., 10., 10.)));
         assert!(progress.ready(Rect::new(300., 140., 10., 10.)));
+    }
+
+    #[test]
+    fn text_closure_does_not_merge_regions_from_other_sources() {
+        let native = Rect::new(0., 0., 40., 40.);
+        let left = Rect::new(45., 0., 40., 40.);
+        let right = Rect::new(90., 0., 40., 40.);
+        let third = Rect::new(175., 0., 40., 40.);
+        let disjoint = Rect::new(500., 0., 40., 40.);
+        let other_text_source = Rect::new(210., 0., 20., 40.);
+        let contour = Rect::new(300., 0., 30., 40.);
+        let mut progress = ScanProgress::new(&[
+            TargetSource::Accessibility,
+            TargetSource::SystemOcr,
+            TargetSource::NativeRectangles,
+            TargetSource::Contour,
+        ]);
+        for (source, regions) in [
+            (TargetSource::Accessibility, vec![native]),
+            (TargetSource::SystemOcr, vec![left, right, third, disjoint]),
+            (TargetSource::NativeRectangles, vec![other_text_source]),
+            (TargetSource::Contour, vec![contour]),
+        ] {
+            progress.update(source, Progress::Plan(regions));
+        }
+        let mut index = TargetIndex::new();
+        let text =
+            crate::api::UiTarget::recognized_text(Rect::new(130., 0., 40., 40.), "text".into());
+        assert!(index.insert(&text, TargetSource::SystemOcr, 0.5));
+        assert!(progress.prepare(&index));
+        assert_eq!(
+            progress.blocked,
+            [
+                native,
+                Rect::new(45., 0., 170., 40.),
+                disjoint,
+                other_text_source,
+                contour
+            ]
+        );
+
+        progress.update(TargetSource::SystemOcr, Progress::Complete(right));
+        assert!(progress.prepare(&index));
+        assert_eq!(
+            progress.blocked,
+            [
+                native,
+                left,
+                disjoint,
+                Rect::new(130., 0., 85., 40.),
+                other_text_source,
+                contour
+            ]
+        );
+        assert!(progress.ready(Rect::new(100., 0., 10., 10.)));
     }
 }

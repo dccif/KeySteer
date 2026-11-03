@@ -294,6 +294,29 @@ export function resolveConfigDocument(
       }))))
     if (!occupied && effective.normal?.bindings) effective.normal.bindings[key] = mode
   }
+  // Match native upgrade fallbacks for both region-scan shortcuts.
+  const declares = (table: unknown, key: string): boolean => isRecord(table) && Object.keys(table).some(keys =>
+    keys.split(/\s+/).some(chord => [false, true].some(isMac => {
+      const resolved = resolvedChordKeys(effective, chord, isMac)
+      const shortcut = resolvedChordKeys(effective, key, isMac)
+      return resolved.length === 1 && shortcut.length === 1 && resolved[0] === shortcut[0]
+    })))
+  for (const [key, action] of [['u', 'area_hint'], ['i', 'area_text']]) {
+    const normalUses = declares(document.normal?.bindings, key) || (document.normal?.app_configs ?? []).some((entry: ConfigDocument) => declares(entry.bindings, key))
+    const hotkeysUse = declares(document.hotkeys, key) || (document.app_configs ?? []).some((entry: ConfigDocument) => declares(entry.bindings, key))
+    for (const mode of ['grid', 'recursive_grid', 'bisect']) {
+      const settings = effective[mode]
+      const inherits = settings?.inherits ?? ['hotkeys', 'normal']
+      const shortcutKeys = [false, true].flatMap(isMac => resolvedChordKeys(effective, key, isMac)).filter(physical => [...physical].length === 1)
+      const labelUses = mode !== 'bisect' && shortcutKeys.some(physical => String(settings?.keys ?? '').toLowerCase().includes(physical)
+        || (settings?.layers ?? []).some((layer: ConfigDocument) => String(layer.keys ?? '').toLowerCase().includes(physical)))
+      const inheritedUses = inherits.some((name: string) => name === 'normal' ? normalUses : ['hotkeys', 'idle'].includes(name) && hotkeysUse)
+      const local = document[mode]?.bindings
+      const explicitlyBound = declares(local, key)
+      const sameSpelling = isRecord(local) && Object.keys(local).some(keys => keys.split(/\s+/).some(chord => chord.toLowerCase() === key))
+      if (settings?.bindings?.[key] === action && (explicitlyBound ? !sameSpelling : labelUses || inheritedUses)) delete settings.bindings[key]
+    }
+  }
   return effective
 }
 
@@ -324,7 +347,7 @@ export function deleteConfigPath(document: ConfigDocument, path: string): void {
 function mergeValue(defaultValue: unknown, configuredValue: unknown, path: string): unknown {
   if (configuredValue === undefined) return cloneConfigValue(defaultValue)
   if (path === 'ui_hint.search_edit_keys') return mergeSearchEditBindings(defaultValue, configuredValue)
-  const controls = new Set(['bisect_left', 'bisect_down', 'bisect_up', 'bisect_right', 'first_level', 'previous_level', 'reopen_selection', 'confirm_selection', 'cancel_selection', 'search_selection', 'window_area_number', 'window_next_page', 'window_previous_page', 'window_multi_cancel'])
+  const controls = new Set(['bisect_left', 'bisect_down', 'bisect_up', 'bisect_right', 'first_level', 'previous_level', 'reopen_selection', 'confirm_selection', 'cancel_selection', 'search_selection', 'area_hint', 'area_text', 'window_area_number', 'window_next_page', 'window_previous_page', 'window_multi_cancel'])
   if (['grid.bindings', 'recursive_grid.bindings', 'bisect.bindings', 'ui_hint.bindings', 'window_editor.bindings', 'window_restore.bindings', 'window.multi_select.bindings'].includes(path) && isRecord(defaultValue) && isRecord(configuredValue)) {
     const expand = (table: ConfigDocument) => Object.fromEntries(Object.entries(table).flatMap(([keys, value]) => keys.split(/\s+/).map(key => [key, value])))
     const configured = expand(configuredValue)

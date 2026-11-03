@@ -25,6 +25,7 @@ pub mod scroll;
 pub mod style;
 pub mod text_edit;
 pub mod text_select;
+pub(crate) mod text_select_preview;
 pub mod theme;
 pub mod window;
 pub mod window_layout;

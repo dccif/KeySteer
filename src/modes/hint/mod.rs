@@ -144,6 +144,7 @@ pub struct HintMode {
     session: ScanSession,
     input: Input,
     return_mode: ModeId,
+    region: super::scan_region::ScanRegionSession,
     held_overlap_keys: SmallVec<[Key; 2]>,
     overlap_cycle: usize,
     /// Source-agnostic visual layers over the merged UIA/Vision Hint list.
@@ -165,6 +166,7 @@ impl HintMode {
             session: ScanSession::default(),
             input: Input::Labels(OverlayText::default()),
             return_mode: ModeId::idle(),
+            region: super::scan_region::ScanRegionSession::default(),
             held_overlap_keys: SmallVec::new(),
             overlap_cycle: 0,
             overlap_plan: VisualLayerPlan::default(),
@@ -221,15 +223,11 @@ impl HintMode {
     }
 
     fn scan_request(&mut self, ctx: &HostContext<'_>) -> Command {
-        self.session.scan_id = self.session.scan_id.wrapping_add(1);
-        let screens = if self.config.scan_scope == crate::api::UiScanScope::All {
-            ctx.screens
-        } else {
-            ctx.active_screen()
-                .map(std::slice::from_ref)
-                .unwrap_or_default()
-        };
-        let bounds = crate::api::Screen::virtual_bounds(screens);
+        self.session.scan_id = super::scan_region::next_scan_id();
+        let area = self
+            .region
+            .area(ctx, self.config.scan_scope, self.session.scan_bounds);
+        let bounds = area.bounds;
         self.session.scan_bounds = Some(bounds);
         let timeout_multiplier = u64::from(self.session.retry_attempt).saturating_add(1);
         let timeout_ms = self
@@ -239,12 +237,8 @@ impl HintMode {
             .min(MAX_SCAN_TIMEOUT_MS);
         Command::scan_ui(UiScanRequest {
             id: self.session.scan_id,
-            scope: self.config.scan_scope,
-            screen_bounds: if screens.len() > 1 {
-                screens.iter().map(|screen| screen.bounds).collect()
-            } else {
-                Vec::new()
-            },
+            scope: area.scope,
+            screen_bounds: area.screen_bounds,
 
             timeout_ms,
             bounds: Some(bounds),
@@ -253,7 +247,7 @@ impl HintMode {
             visible_only: self.config.visible_check_enabled,
             clickable_only: !self.config.ignore_clickable_check,
             strategy: if matches!(
-                self.config.scan_scope,
+                area.scope,
                 crate::api::UiScanScope::Screen | crate::api::UiScanScope::All
             ) {
                 self.config.strategy
@@ -906,13 +900,31 @@ impl HintMode {
     }
 
     fn cancel(&self) -> CommandBatch {
+        if self.region.is_modal() {
+            return CommandBatch::one(self.region.return_command(&self.return_mode));
+        }
         CommandBatch::two(
             Command::HideOverlay,
             Command::SwitchMode(self.return_mode.clone()),
         )
     }
 
-    fn selection_action(&mut self, action: &Binding, ctx: &HostContext<'_>) -> CommandBatch {
+    fn lifecycle_commands(&self, action: &crate::api::LifecycleAction) -> CommandBatch {
+        self.region.lifecycle_commands(action, &self.return_mode)
+    }
+
+    fn selection_action(
+        &mut self,
+        action: &Binding,
+        key: &Key,
+        ctx: &HostContext<'_>,
+    ) -> CommandBatch {
+        if self.region.is_bounded()
+            && (matches!(action, Binding::SelectionParent)
+                || matches!(action, Binding::SelectionReopen) && key.as_str() == "tab")
+        {
+            return self.cancel();
+        }
         let action = if *action == Binding::SelectionReopen {
             if !self.session.finished {
                 return CommandBatch::new();
@@ -1160,6 +1172,13 @@ impl Mode for HintMode {
                 .is_some_and(|character| self.alphabet.contains(&character))
     }
 
+    fn key_help_binding_label(&self, chord: &KeyChord, binding: &Binding) -> Option<&'static str> {
+        (self.region.is_bounded()
+            && matches!(binding, Binding::SelectionReopen)
+            && chord.activation_key().as_str() == "tab")
+            .then_some("previous_level")
+    }
+
     fn available_keys(&self) -> Vec<(String, String)> {
         let mut keys = Vec::new();
         if self.session.finished {
@@ -1224,10 +1243,7 @@ impl Mode for HintMode {
         }
         self.finish_redraw(ctx, &mut out);
         if finishing {
-            out.extend(super::targeting::lifecycle_commands(
-                &self.config.lifecycle.after_finish,
-                &self.return_mode,
-            ));
+            out.extend(self.lifecycle_commands(&self.config.lifecycle.after_finish));
         }
         out
     }
@@ -1385,6 +1401,20 @@ impl HintMode {
             ModeEvent::Activated { previous } => {
                 self.session.active = true;
                 self.return_mode = previous.clone().unwrap_or_else(ModeId::idle);
+                self.region.reset();
+                self.request_scan(ctx)
+            }
+            ModeEvent::Pushed { previous } => {
+                self.session.active = true;
+                self.return_mode = previous.clone();
+                self.region.push(None);
+                self.request_scan(ctx)
+            }
+            ModeEvent::PushedInRegion { previous, bounds } => {
+                self.session.active = true;
+                self.return_mode = previous.clone();
+                self.region.push(Some(*bounds));
+                self.session.scan_bounds = Some(*bounds);
                 self.request_scan(ctx)
             }
             ModeEvent::Restarted => {
@@ -1397,12 +1427,12 @@ impl HintMode {
                 self.session.finished = true;
                 self.redraw()
             }
-            ModeEvent::Clicked { .. } => super::targeting::lifecycle_commands(
-                &self.config.lifecycle.after_click,
-                &self.return_mode,
-            ),
+            ModeEvent::Clicked { .. } => {
+                self.lifecycle_commands(&self.config.lifecycle.after_click)
+            }
             ModeEvent::Deactivated => {
                 self.session.active = false;
+                self.region.reset();
                 self.clear_scan_results();
                 self.session.scanning = false;
                 self.session.scan_bounds = None;
@@ -1499,6 +1529,7 @@ impl HintMode {
             }
             ModeEvent::Binding {
                 binding,
+                key,
                 state: KeyState::Down,
                 ..
             } if matches!(
@@ -1510,7 +1541,7 @@ impl HintMode {
                     | Binding::SelectionSearch
             ) =>
             {
-                self.selection_action(binding, ctx)
+                self.selection_action(binding, key, ctx)
             }
             ModeEvent::Binding {
                 binding,
@@ -1542,6 +1573,7 @@ impl HintMode {
             ModeEvent::PointerMoved(_)
                 if self.session.active
                     && !self.session.finished
+                    && !self.region.is_bounded()
                     && self.session.scan_bounds.is_some_and(|bounds| {
                         bounds
                             != if self.config.scan_scope == crate::api::UiScanScope::All {
@@ -4542,6 +4574,110 @@ mod tests {
             request.strategy,
             crate::api::command::UiScanStrategy::Hybrid
         );
+    }
+
+    #[test]
+    fn modal_region_scans_filter_results_and_remain_bounded_until_deactivation() {
+        let mut env = Env::new();
+        env.config.ui_hint.scan_scope = crate::api::UiScanScope::All;
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
+        let area = Rect::new(80.0, 80.0, 300.0, 150.0);
+        let out = mode.handle(
+            &ModeEvent::PushedInRegion {
+                previous: ModeId::grid(),
+                bounds: area,
+            },
+            &env.ctx(),
+        );
+        let request = out
+            .iter()
+            .find_map(|command| match command {
+                Command::ScanUi(request) => Some(request),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(request.scope, crate::api::UiScanScope::Screen);
+        assert_eq!(request.bounds, Some(area));
+        assert_eq!(request.capture_regions().collect::<Vec<_>>(), vec![area]);
+        assert_eq!(request.roles, env.config.ui_hint.clickable_roles);
+        assert_eq!(request.strategy, env.config.ui_hint.strategy);
+        let first_id = request.id;
+
+        let out = deliver(
+            &mut mode,
+            &env,
+            vec![target("inside", 100.0), target("outside", 500.0)],
+        );
+        assert_eq!(mode.session.scanned.len(), 1);
+        assert_eq!(mode.session.scanned[0].name, "inside");
+        assert_eq!(scene_of(&out).labels.len(), 1);
+        assert_eq!(scene_of(&out).clip, Some(area));
+        env.cursor = Point::new(2000.0, 2000.0);
+        assert!(
+            !mode
+                .handle(&ModeEvent::PointerMoved(env.cursor), &env.ctx())
+                .iter()
+                .any(|command| matches!(command, Command::ScanUi(_)))
+        );
+        let out = mode.request_scan(&env.ctx());
+        let rescanned = out
+            .iter()
+            .find_map(|command| match command {
+                Command::ScanUi(request) => Some(request),
+                _ => None,
+            })
+            .unwrap();
+        assert!(rescanned.id > first_id);
+        assert_eq!(rescanned.bounds, Some(area));
+        assert_eq!(press(&mut mode, &env, "esc"), vec![Command::PopMode]);
+
+        mode.handle(&ModeEvent::Deactivated, &env.ctx());
+        env.cursor = Point::new(500.0, 300.0);
+        let out = activate(&mut mode, &env);
+        let normal = out
+            .iter()
+            .find_map(|command| match command {
+                Command::ScanUi(request) => Some(request),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(normal.scope, crate::api::UiScanScope::All);
+        assert_eq!(normal.bounds, Some(env.screens[0].bounds));
+    }
+
+    #[test]
+    fn area_hint_previous_level_returns_even_with_a_prefix_or_finished_selection() {
+        let env = Env::new();
+        let mut mode = crate::app::mode_catalog::hint(&env.config);
+        mode.handle(
+            &ModeEvent::PushedInRegion {
+                previous: ModeId::grid(),
+                bounds: Rect::new(10., 10., 200., 200.),
+            },
+            &env.ctx(),
+        );
+        mode.input = Input::Labels("a".into());
+        assert_eq!(press(&mut mode, &env, "tab"), vec![Command::PopMode]);
+        let other_reopen = ModeEvent::Binding {
+            binding: Binding::SelectionReopen.into(),
+            key: Key::new("f9").unwrap(),
+            state: KeyState::Down,
+        };
+        assert!(mode.handle(&other_reopen, &env.ctx()).is_empty());
+        mode.session.finished = true;
+        let reopened = mode.handle(&other_reopen, &env.ctx());
+        assert!(
+            !reopened
+                .iter()
+                .any(|command| matches!(command, Command::PopMode))
+        );
+        assert!(!mode.session.finished);
+        mode.session.finished = true;
+        assert_eq!(press(&mut mode, &env, "backspace"), vec![Command::PopMode]);
+
+        mode.handle(&ModeEvent::Deactivated, &env.ctx());
+        activate(&mut mode, &env);
+        assert!(press(&mut mode, &env, "tab").is_empty());
     }
 
     #[test]

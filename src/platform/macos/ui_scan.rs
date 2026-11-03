@@ -217,10 +217,10 @@ pub(super) struct PreviewView {
 
 impl PreviewView {
     pub(super) fn begin(&mut self, request: &UiScanRequest) {
-        let (text, rectangles) =
+        let (text, _) =
             crate::platform::common::contour::sources(request.strategy, &request.vision);
         *self = Self {
-            id: (text && rectangles).then_some(request.id),
+            id: text.then_some(request.id),
             ..Self::default()
         };
     }
@@ -735,7 +735,7 @@ mod tests {
         for (strategy, text, rectangles, enabled) in [
             (UiScanStrategy::AxTree, true, true, false),
             (UiScanStrategy::Contour, true, true, false),
-            (UiScanStrategy::Vision, true, false, false),
+            (UiScanStrategy::Vision, true, false, true),
             (UiScanStrategy::Vision, false, true, false),
             (UiScanStrategy::Vision, true, true, true),
             (UiScanStrategy::Hybrid, false, false, true),
@@ -807,6 +807,84 @@ mod tests {
     }
 
     #[test]
+    fn text_selection_receives_fast_geometry_and_copies_only_accurate_text() {
+        use crate::api::{
+            Appearance, Command, HostContext, Mode, ModeEvent, Point, Rect, Screen, SemanticRole,
+            UiTarget, text_edit::EditAction,
+        };
+        let config = crate::config::Config::default();
+        let palette = config.palette(Appearance::Dark);
+        let screens = [Screen {
+            bounds: Rect::new(0.0, 0.0, 800.0, 600.0),
+            work_area: Rect::new(0.0, 0.0, 800.0, 600.0),
+            is_primary: true,
+            scale: 1.0,
+            name: None,
+        }];
+        let context = HostContext {
+            presenter: &crate::presentation::COMPOSER,
+            screens: &screens,
+            cursor: Point::default(),
+            focused_app: None,
+            palette: &palette,
+        };
+        let mut mode = crate::app::mode_catalog::text_select(&config);
+        let start = mode.handle(&ModeEvent::Activated { previous: None }, &context);
+        let request = start
+            .iter()
+            .find_map(|command| match command {
+                Command::ScanUi(request) => Some(request.as_ref()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(request.vision.detect_text && !request.vision.detect_rectangles);
+        let mut view = PreviewView::default();
+        view.begin(request);
+        let rect = Rect::new(40.0, 40.0, 100.0, 20.0);
+        let preview = view
+            .preview(UiScanResult {
+                id: request.id,
+                targets: vec![UiTarget {
+                    rect,
+                    role: SemanticRole::Control,
+                    name: String::new(),
+                    details: None,
+                }],
+                retired: Vec::new(),
+                status: UiScanStatus::Partial,
+            })
+            .unwrap();
+        let first = mode.handle_owned(ModeEvent::UiScanned(preview), &context);
+        assert!(first.iter().any(|c| matches!(c, Command::ShowOverlay(_))));
+        mode.handle(&ModeEvent::TextPasted("@a".into()), &context);
+        let pending = mode.handle(&ModeEvent::TextEdit(EditAction::Accept), &context);
+        assert!(!pending.iter().any(|c| matches!(c, Command::CopyText(_))));
+        let mut actual = UiScanResult {
+            id: request.id,
+            targets: vec![UiTarget::recognized_text(rect, "设置 Settings".into())],
+            retired: Vec::new(),
+            status: UiScanStatus::Partial,
+        };
+        view.authoritative(&mut actual);
+        assert_eq!(actual.retired, [rect]);
+        let partial = mode.handle_owned(ModeEvent::UiScanned(actual), &context);
+        assert!(!partial.iter().any(|c| matches!(c, Command::CopyText(_))));
+        let mut terminal = UiScanResult {
+            id: request.id,
+            targets: Vec::new(),
+            retired: Vec::new(),
+            status: UiScanStatus::Success,
+        };
+        view.authoritative(&mut terminal);
+        let complete = mode.handle_owned(ModeEvent::UiScanned(terminal), &context);
+        assert!(
+            complete
+                .iter()
+                .any(|c| matches!(c, Command::CopyText(text) if text == "设置 Settings"))
+        );
+    }
+
+    #[test]
     fn same_geometry_ocr_update_keeps_the_existing_hint_scene() {
         use crate::api::{
             Appearance, Command, HostContext, Mode, ModeEvent, Point, Rect, Screen, SemanticRole,
@@ -829,13 +907,20 @@ mod tests {
             palette: &palette,
         };
         let mut mode = crate::app::mode_catalog::hint(&config);
-        mode.handle(&ModeEvent::Activated { previous: None }, &context);
+        let start = mode.handle(&ModeEvent::Activated { previous: None }, &context);
+        let scan_id = start
+            .iter()
+            .find_map(|command| match command {
+                Command::ScanUi(request) => Some(request.id),
+                _ => None,
+            })
+            .unwrap();
         let rect = Rect::new(40.0, 40.0, 100.0, 20.0);
         let mut view = PreviewView::default();
-        view.begin(&preview_request(1));
+        view.begin(&preview_request(scan_id));
         let preview = view
             .preview(UiScanResult {
-                id: 1,
+                id: scan_id,
                 targets: vec![UiTarget {
                     rect,
                     role: SemanticRole::Control,
@@ -853,7 +938,7 @@ mod tests {
                 .any(|command| matches!(command, Command::ShowOverlay(_)))
         );
         let mut actual = UiScanResult {
-            id: 1,
+            id: scan_id,
             targets: vec![UiTarget::recognized_text(rect, "设置 Settings".into())],
             retired: Vec::new(),
             status: UiScanStatus::Partial,

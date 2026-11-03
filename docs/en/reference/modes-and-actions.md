@@ -361,6 +361,8 @@ The pointer stays within the target display. Apps may restrict movement, fullscr
 | `finish` | Finish the current targeting session. |
 | `restart_mode` | Clear and restart the current targeting session. |
 | `rescan` | Rescan UI Hint. |
+| `area_hint` | Show UI Hint within the current Grid, Recursive Grid, or Bisect region (default `u`); `Tab`, `Backspace`, or `Esc` returns to it. |
+| `area_text` | Start Text Select within the current grid region (default `i`); `Esc` returns to it. |
 | `escape` | Leave the current mode and return to Idle. |
 | `reload_config` | Reload configuration from disk. |
 | `set_config <path> <TOML value>` | Edit and persist a dotted path, for example `set_config pointer.max_speed 800`. |
@@ -413,6 +415,10 @@ scan_scope = "all" # window / active / screen / all
 All strategies use these rules on both platforms. The `window` scope attempts to activate the pointer's window. Text Select uses the same four choices through its independent `text_select.scan_scope`, also defaulting to `all`. Once selected, empty results, source failure, or activation failure do not change the scope.
 
 `screen` / `all` use the global `strategy`, without applying the foreground application's `app_configs` strategy to other applications. Visibility checks exclude fully covered windows and retain visible portions of controls; visual sources read the composited desktop. Results grow dynamically with no default 10,000-target ceiling. For visual-only scans, `rectangle_max_candidates = 0` means unlimited; explicit positive values still apply, and Hybrid ignores that option. Timeouts, cancellation and image-size protections remain active.
+
+From a grid, `area_hint` scans the selected region across visible applications using the global `strategy`. Results appear incrementally. In the label view, `previous_level` (and the default `Tab` action) returns directly to the grid's previous depth, path and region, even while the scan is running; rebind it in `[ui_hint.bindings]` if needed. While the search input is open, `Tab` and `Backspace` retain their search preview and editing actions. Press `Esc` to close search before using a return key to go back to the grid.
+
+Existing configurations retain `u` or `i` when used as grid labels or custom inherited actions. Bind the scan actions to another key, or explicitly bind them locally. Region Text Select follows its `after_copy` setting: the default enters Normal, while `return` restores the grid region.
 
 Changing displays or targets clears old labels and scans again; moving between displays within `all` preserves labels. Ordinary pointer movement does not keep rescanning. Press `Primary+R` to refresh manually.
 
@@ -641,7 +647,7 @@ char_min_width = 40
 
 ## Configurable selection controls
 
-`first_level` clears the selection and returns to the first level; `previous_level` goes back one level. `confirm_selection` confirms and `cancel_selection` cancels the selection and returns to the source mode. `search_selection` opens UIHint search. UIHint's `reopen_selection` only reopens a completed selection, retaining its original Tab behavior. Global `escape` still enters Idle. A group such as `"tab backspace"` means either key, not a chord.
+`first_level` clears the selection and returns to the first level; `previous_level` goes back one level. `confirm_selection` confirms and `cancel_selection` cancels the selection and returns to the source mode. `search_selection` opens UIHint search. In ordinary UIHint, `reopen_selection` only reopens a completed selection, retaining its original Tab behavior. Global `escape` still enters Idle. A group such as `"tab backspace"` means either key, not a chord.
 
 Existing defaults are unchanged. Sparse/older configurations inherit the formerly fixed controls; explicit `none` disables a key. For example:
 

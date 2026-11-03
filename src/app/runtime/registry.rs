@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use crate::api::backend::Backend;
 use crate::api::binding::Binding;
 use crate::api::command::{FocusedApp, HostContext, Mode, ModeEvent};
+use crate::api::geometry::Rect;
 use crate::api::input::{Key, KeyChord, ModeId};
 
 use super::input_router::CompiledKeymap;
@@ -790,7 +791,25 @@ impl Engine {
         target: ModeId,
         backend: &mut dyn Backend,
     ) -> Result<(), String> {
+        self.push_mode_in_region(target, None, backend)
+    }
+
+    pub(super) fn push_mode_in_region(
+        &mut self,
+        target: ModeId,
+        bounds: Option<Rect>,
+        backend: &mut dyn Backend,
+    ) -> Result<(), String> {
         if target == self.registry.active || !self.registry.contains_key(&target) {
+            return Ok(());
+        }
+        if bounds.is_some_and(|bounds| {
+            bounds.is_empty()
+                || !bounds.x.is_finite()
+                || !bounds.y.is_finite()
+                || !bounds.width.is_finite()
+                || !bounds.height.is_finite()
+        }) {
             return Ok(());
         }
         if self.registry.active == ModeId::normal()
@@ -806,7 +825,13 @@ impl Engine {
         self.dispatch(ModeEvent::Suspended, backend)?;
         self.registry.modal_stack.push(previous.clone());
         self.set_active(target);
-        self.dispatch(ModeEvent::Pushed { previous }, backend)
+        self.dispatch(
+            match bounds {
+                Some(bounds) => ModeEvent::PushedInRegion { previous, bounds },
+                None => ModeEvent::Pushed { previous },
+            },
+            backend,
+        )
     }
 
     pub(super) fn pop_mode(&mut self, backend: &mut dyn Backend) -> Result<(), String> {

@@ -5,6 +5,44 @@ import { readFile } from 'node:fs/promises'
 import { hintLabels } from './hint-labels.ts'
 import { quickSwitchColors } from './quick-switch-style.ts'
 
+test('grid region scan defaults and remaps survive config import and export', async () => {
+  const { stringify } = await import('smol-toml')
+  const defaults = parseConfigDocument(await readFile(new URL('../../../keysteer.default.toml', import.meta.url), 'utf8')).document
+  for (const mode of ['grid', 'recursive_grid', 'bisect']) {
+    assert.equal(defaults[mode].bindings.u, 'area_hint')
+    assert.equal(defaults[mode].bindings.i, 'area_text')
+    const sparse = resolveConfigDocument(defaults, parseConfigDocument(`[${mode}.bindings]\nf9 = 'follow'`).document)
+    assert.equal(sparse[mode].bindings.u, 'area_hint')
+    assert.equal(sparse[mode].bindings.i, 'area_text')
+    const document = parseConfigDocument(`[${mode}.bindings]\nu = 'none'\nf8 = 'area_hint'`).document
+    const effective = resolveConfigDocument(defaults, parseConfigDocument(stringify(document)).document)
+    assert.equal(effective[mode].bindings.u, 'none')
+    assert.equal(effective[mode].bindings.f8, 'area_hint')
+  }
+  const inherited = resolveConfigDocument(defaults, parseConfigDocument('[normal.bindings]\nu = "mouse_left"').document)
+  for (const mode of ['grid', 'recursive_grid', 'bisect']) assert.equal(inherited[mode].bindings.u, undefined)
+  const labels = resolveConfigDocument(defaults, parseConfigDocument('[grid]\nkeys = "u2345qwertasdfgzxcvb"\n[recursive_grid]\nkeys = "uweasdzxc"').document)
+  assert.equal(labels.grid.bindings.u, undefined)
+  assert.equal(labels.recursive_grid.bindings.u, undefined)
+  const explicit = resolveConfigDocument(defaults, parseConfigDocument('[normal.bindings]\nu = "mouse_left"\n[grid.bindings]\nu = "area_hint"').document)
+  assert.equal(explicit.grid.bindings.u, 'area_hint')
+  assert.equal(explicit.bisect.bindings.u, undefined)
+  const text = resolveConfigDocument(defaults, parseConfigDocument('[grid]\nkeys = "i2345qwertasdfgzxcvb"\n[normal.bindings]\ni = "move_up"').document)
+  for (const mode of ['grid', 'recursive_grid', 'bisect']) assert.equal(text[mode].bindings.i, undefined)
+  const app = resolveConfigDocument(defaults, parseConfigDocument('[[normal.app_configs]]\nbundle_id = "editor"\nbindings = { i = "move_up" }').document)
+  assert.equal(app.grid.bindings.i, undefined)
+  const textRemap = resolveConfigDocument(defaults, parseConfigDocument('[grid.bindings]\ni = "none"\nf9 = "area_text"').document)
+  assert.equal(textRemap.grid.bindings.i, 'none')
+  assert.equal(textRemap.grid.bindings.f9, 'area_text')
+  const alias = resolveConfigDocument(defaults, parseConfigDocument('[key_aliases]\ni = "f9"\n[normal.bindings]\nf9 = "move_up"').document)
+  assert.equal(alias.grid.bindings.i, undefined)
+  const aliasLabel = resolveConfigDocument(defaults, parseConfigDocument('[key_aliases]\ni = "x"').document)
+  assert.equal(aliasLabel.grid.bindings.i, undefined)
+  const aliasDisabled = resolveConfigDocument(defaults, parseConfigDocument('[key_aliases]\ni = "f9"\n[grid.bindings]\nf9 = "none"').document)
+  assert.equal(aliasDisabled.grid.bindings.i, undefined)
+  assert.equal(aliasDisabled.grid.bindings.f9, 'none')
+})
+
 test('text selection copy lifecycle inherits Normal and preserves overrides through export', async () => {
   const { stringify } = await import('smol-toml')
   const defaults = parseConfigDocument(await readFile(new URL('../../../keysteer.default.toml', import.meta.url), 'utf8')).document

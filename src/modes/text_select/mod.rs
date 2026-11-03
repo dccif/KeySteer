@@ -5,6 +5,7 @@ mod selection_input;
 mod tests;
 use super::hint::{Settings as HintSettings, search, session::ScanSession};
 use crate::api::hint as labeling;
+use crate::api::text_select_preview as preview;
 use crate::api::{
     Binding, Color, Command, CommandBatch, HostContext, Key, KeyChord, KeyState, Mode, ModeEvent,
     ModeId, Palette, Rect, UiScanRequest, UiScanStrategy,
@@ -35,6 +36,7 @@ pub struct TextSelectMode {
     scan_id: u64,
     segment_id: u64,
     pending_segment: bool,
+    preview_actions: preview::Actions,
     frozen: bool,
     source: ScanSession,
     search: ScanSession,
@@ -50,6 +52,7 @@ pub struct TextSelectMode {
     window: Option<Rect>,
     bounds: Option<Rect>,
     return_mode: ModeId,
+    region: super::scan_region::ScanRegionSession,
     copying: bool,
     layers: VisualLayerPlan,
     wide_placements: Option<Vec<(usize, Rect)>>,
@@ -108,6 +111,7 @@ impl TextSelectMode {
             scan_id: 0,
             segment_id: 0,
             pending_segment: false,
+            preview_actions: preview::Actions::default(),
             frozen: false,
             source: ScanSession::default(),
             search: ScanSession::default(),
@@ -122,6 +126,7 @@ impl TextSelectMode {
             window: None,
             bounds: None,
             return_mode: ModeId::normal(),
+            region: super::scan_region::ScanRegionSession::default(),
             copying: false,
             layers: VisualLayerPlan::default(),
             wide_placements: None,
@@ -240,6 +245,9 @@ impl TextSelectMode {
             self.frame.write_selected_text(&mut self.output);
             self.frame.selected.iter().filter(|&&s| s).count()
         };
+        if self.frame.selection_waiting_for_preview() || self.frame.selection_incomplete() {
+            self.output.clear();
+        }
         self.summary.clear();
         if selected != 0 {
             let unit = match self.frame.level {
@@ -274,6 +282,17 @@ impl TextSelectMode {
         }
     }
 
+    #[inline(always)]
+    fn holds_preview_labels(&self) -> bool {
+        preview::holds_labels(
+            self.frozen,
+            self.frame.level == Level::Regions,
+            &self.frame.previews,
+            &self.search.search_query,
+            &self.search.search_hints,
+        )
+    }
+
     fn finish(&mut self, ctx: &HostContext<'_>, mut commands: CommandBatch) -> CommandBatch {
         if self.frame.level == Level::Regions
             && !self.held_overlap_keys.is_empty()
@@ -283,11 +302,11 @@ impl TextSelectMode {
         }
         commands.push(self.render(ctx));
         // Submit the input/first hints before building pinyin or later batches.
-        if !self.pending_segment
+        let needs_maintenance = !self.pending_segment
             && ((self.frame.level != Level::Regions && self.search.search_pending)
                 || (!self.source.scanned.is_empty() && !self.search.search_names_initialized)
-                || (!self.frozen && self.source.pending_relabel))
-        {
+                || (!self.frozen && self.source.pending_relabel && !self.holds_preview_labels()));
+        if needs_maintenance {
             commands.push(Self::timer());
         }
         commands
@@ -315,7 +334,7 @@ impl TextSelectMode {
                 CommandBatch::new()
             };
         }
-        let changed = !self.frozen && self.source.pending_relabel;
+        let changed = !self.frozen && self.source.pending_relabel && !self.holds_preview_labels();
         if changed {
             self.source.apply_deferred();
             self.source.pending_relabel = false;
@@ -340,9 +359,10 @@ impl TextSelectMode {
         self.held_overlap_keys.clear();
         self.overlap_cycle = 0;
         self.active = true;
-        self.scan_id = self.scan_id.wrapping_add(1);
+        self.scan_id = super::scan_region::next_scan_id();
         self.segment_id = self.segment_id.wrapping_add(1);
         self.pending_segment = false;
+        self.preview_actions.clear();
         self.copying = false;
         self.frozen = false;
         self.source.clear_results();
@@ -353,14 +373,10 @@ impl TextSelectMode {
         self.status = "Recognizing text…".into();
         self.reindex();
         self.filter(0);
-        let screens = if self.config.hint.scan_scope == crate::api::UiScanScope::All {
-            ctx.screens
-        } else {
-            ctx.active_screen()
-                .map(std::slice::from_ref)
-                .unwrap_or_default()
-        };
-        let bounds = crate::api::Screen::virtual_bounds(screens);
+        let area = self
+            .region
+            .area(ctx, self.config.hint.scan_scope, self.bounds);
+        let bounds = area.bounds;
         self.bounds = Some(bounds);
         self.source.scan_bounds = self.bounds;
         let mut vision = self.config.hint.vision.clone();
@@ -372,14 +388,13 @@ impl TextSelectMode {
             },
             Command::CancelTextSegmentation,
         );
+        if self.region.is_bounded() {
+            commands.push(Command::HideOverlay);
+        }
         commands.push(Command::scan_ui(UiScanRequest {
             id: self.scan_id,
-            scope: self.config.hint.scan_scope,
-            screen_bounds: if screens.len() > 1 {
-                screens.iter().map(|s| s.bounds).collect()
-            } else {
-                Vec::new()
-            },
+            scope: area.scope,
+            screen_bounds: area.screen_bounds,
             timeout_ms: self.config.hint.scan_timeout_ms,
             bounds: Some(bounds),
             roles: Vec::new(),
@@ -409,13 +424,27 @@ impl TextSelectMode {
         self.finish(ctx, commands)
     }
 
+    #[inline(always)]
+    fn scan_event(&mut self, mut result: UiScanResult, ctx: &HostContext<'_>) -> CommandBatch {
+        if self.region.is_bounded()
+            && self.active
+            && result.id == self.scan_id
+            && let Some(bounds) = self.bounds
+        {
+            super::scan_region::retain_region_results(&mut result, bounds);
+        }
+        self.scan(result, ctx)
+    }
+
     fn scan(&mut self, mut result: UiScanResult, ctx: &HostContext<'_>) -> CommandBatch {
         if !self.active || result.id != self.scan_id {
             return CommandBatch::new();
         }
-        result
-            .targets
-            .retain(|t| !t.name.trim().is_empty() || !t.ocr_text().trim().is_empty());
+        result.targets.retain(|t| {
+            preview::is_fast_preview(t)
+                || !t.name.trim().is_empty()
+                || !t.ocr_text().trim().is_empty()
+        });
         self.status = match result.status {
             UiScanStatus::Partial => "Recognizing text…",
             UiScanStatus::PermissionDenied(_) => "Screen recording permission required",
@@ -426,12 +455,40 @@ impl TextSelectMode {
             _ => "No text found",
         }
         .into();
+        // Reconcile fast geometry before a deferred update can be selected.
+        let changed = preview::reconcile(&mut self.frame, &mut self.history, &result);
+        if changed {
+            self.search.search_text.clear();
+            self.search.search_names_initialized = false;
+            self.update_summary();
+        }
         if self.frozen || !self.source.scanned.is_empty() {
             if !result.targets.is_empty() || !result.retired.is_empty() {
                 self.source.defer_update(result.targets, result.retired);
             }
             return if self.frozen {
-                CommandBatch::new()
+                if let Some(action) = self.preview_actions.resolve(
+                    &result.status,
+                    self.frame.selection_waiting_for_preview(),
+                    self.frame.selection_incomplete(),
+                ) {
+                    return match action {
+                        Action::Copy => self.copy_selection(ctx, true),
+                        Action::Refine => self.refine_selection(ctx),
+                        _ => CommandBatch::new(),
+                    };
+                }
+                if changed {
+                    self.finish(ctx, CommandBatch::new())
+                } else {
+                    CommandBatch::new()
+                }
+            } else if self.holds_preview_labels() {
+                if changed {
+                    self.finish(ctx, CommandBatch::new())
+                } else {
+                    CommandBatch::new()
+                }
             } else {
                 CommandBatch::one(Self::timer())
             };
@@ -448,6 +505,24 @@ impl TextSelectMode {
         self.consume_selection_numbers(true);
         // Explicit acceptance may finish the remaining index, as in UIHint.
         self.filter(usize::MAX);
+        if self.wait_for_preview(Action::Refine) {
+            return self.finish(ctx, CommandBatch::new());
+        }
+        self.refine_selection(ctx)
+    }
+
+    #[inline(always)]
+    fn wait_for_preview(&mut self, action: Action) -> bool {
+        self.preview_actions.wait(
+            action,
+            self.frame.selection_waiting_for_preview(),
+            self.frame.selection_incomplete(),
+            &mut self.frozen,
+        )
+    }
+
+    #[inline(always)]
+    fn refine_selection(&mut self, ctx: &HostContext<'_>) -> CommandBatch {
         if self.output.is_empty() {
             return self.finish(ctx, CommandBatch::new());
         }
@@ -505,6 +580,7 @@ impl TextSelectMode {
 
     fn action(&mut self, action: Action, ctx: &HostContext<'_>) -> CommandBatch {
         self.automatic_selection = None;
+        self.preview_actions.clear();
         match action {
             Action::ClearInput => {
                 if self.search.search_query.is_empty() {
@@ -546,15 +622,10 @@ impl TextSelectMode {
                 }
                 let committed = self.consume_selection_numbers(true);
                 self.filter(usize::MAX);
-                if !self.output.is_empty() {
-                    self.copying = true;
-                    let mut commands = CommandBatch::new();
-                    if committed {
-                        commands.push(self.render(ctx));
-                    }
-                    commands.push(Command::CopyText(self.output.clone()));
-                    return commands;
+                if self.wait_for_preview(Action::Copy) {
+                    return self.finish(ctx, CommandBatch::new());
                 }
+                return self.copy_selection(ctx, committed);
             }
             Action::Search => {
                 // Search is always open. The configurable action selects its
@@ -567,9 +638,24 @@ impl TextSelectMode {
         self.finish(ctx, CommandBatch::new())
     }
 
+    #[inline(always)]
+    fn copy_selection(&mut self, ctx: &HostContext<'_>, render: bool) -> CommandBatch {
+        if self.output.is_empty() {
+            return self.finish(ctx, CommandBatch::new());
+        }
+        self.copying = true;
+        let mut commands = CommandBatch::new();
+        if render {
+            commands.push(self.render(ctx));
+        }
+        commands.push(Command::CopyText(self.output.clone()));
+        commands
+    }
+
     fn navigate(&mut self, reset: bool, ctx: &HostContext<'_>) -> CommandBatch {
         self.segment_id = self.segment_id.wrapping_add(1);
         self.pending_segment = false;
+        self.preview_actions.clear();
         self.copying = false;
         if reset || self.history.is_empty() {
             self.history.clear();
@@ -587,6 +673,7 @@ impl TextSelectMode {
     }
 
     fn query_changed(&mut self, inserted_separator: bool, ctx: &HostContext<'_>) -> CommandBatch {
+        self.preview_actions.clear();
         self.copying = false;
         self.search.search_focus = None;
         if !self.pending_segment {
@@ -870,9 +957,17 @@ impl TextSelectMode {
         // Refinement clears the query but retains the inherited selection.
         // Keep that preview visible; an untouched or reset region scan needs
         // only its hints and search input.
+        let preview_status = if self.frame.selection_incomplete() {
+            Some("Text recognition incomplete — rescan")
+        } else if self.frame.selection_waiting_for_preview() {
+            Some("Recognizing text…")
+        } else {
+            None
+        };
         if self.search.search_query.is_empty()
             && self.output.is_empty()
             && self.frame.level == Level::Regions
+            && preview_status.is_none()
         {
             return Command::ShowOverlay(Arc::new(ctx.presenter.compose(View::Hints(hints), ctx)));
         }
@@ -890,6 +985,8 @@ impl TextSelectMode {
         };
         let status = if self.pending_segment {
             "Segmenting words…"
+        } else if let Some(status) = preview_status {
+            status
         } else if self.frame.level != Level::Regions && self.output.is_empty() {
             "No text selected"
         } else if self.search.search_pending {
@@ -1005,7 +1102,7 @@ impl Mode for TextSelectMode {
     }
     fn handle_owned(&mut self, event: ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
         match event {
-            ModeEvent::UiScanned(result) => self.scan(result, ctx),
+            ModeEvent::UiScanned(result) => self.scan_event(result, ctx),
             ModeEvent::TextSegmented(result) => self.segmented(result, ctx),
             event => self.handle(&event, ctx),
         }
@@ -1013,15 +1110,30 @@ impl Mode for TextSelectMode {
     fn handle(&mut self, event: &ModeEvent, ctx: &HostContext<'_>) -> CommandBatch {
         match event {
             ModeEvent::Activated { previous } => {
+                self.region.reset();
                 self.return_mode = previous
                     .clone()
                     .filter(|id| *id != self.id())
                     .unwrap_or_else(ModeId::idle);
                 self.start(ctx)
             }
+            ModeEvent::Pushed { previous } | ModeEvent::PushedInRegion { previous, .. } => {
+                self.return_mode = previous.clone();
+                let bounds = match event {
+                    ModeEvent::PushedInRegion { bounds, .. } => Some(*bounds),
+                    _ => None,
+                };
+                self.region.push(bounds);
+                if bounds.is_some() {
+                    self.bounds = bounds;
+                }
+                self.start(ctx)
+            }
             ModeEvent::Restarted | ModeEvent::ScreensChanged(_) => self.start(ctx),
             ModeEvent::Deactivated => {
+                self.region.reset();
                 self.automatic_selection = None;
+                self.preview_actions.clear();
                 self.active = false;
                 self.held_overlap_keys.clear();
                 self.overlap_cycle = 0;
@@ -1055,7 +1167,7 @@ impl Mode for TextSelectMode {
                 self.overlap_key(key, *state, ctx)
             }
             ModeEvent::Timer { id, .. } if self.active && id == MAINTENANCE => self.maintain(ctx),
-            ModeEvent::UiScanned(result) => self.scan(result.clone(), ctx),
+            ModeEvent::UiScanned(result) => self.scan_event(result.clone(), ctx),
             ModeEvent::TextSegmented(result) => self.segmented(result.clone(), ctx),
             ModeEvent::PanelWindowBounds { id, bounds } if *id == self.scan_id => {
                 self.window = *bounds;
@@ -1072,7 +1184,7 @@ impl Mode for TextSelectMode {
                 Binding::SelectionAccept => self.action(Action::Copy, ctx),
                 Binding::SelectionSearch => self.action(Action::Search, ctx),
                 Binding::SelectionCancel | Binding::Escape => {
-                    CommandBatch::one(Command::SwitchMode(self.return_mode.clone()))
+                    CommandBatch::one(self.region.return_command(&self.return_mode))
                 }
                 Binding::RescanUi => self.start(ctx),
                 _ => CommandBatch::one(Command::DispatchActions(vec![(**binding).clone()])),
@@ -1081,13 +1193,11 @@ impl Mode for TextSelectMode {
             ModeEvent::TextPasted(text) => self.insert(text, ctx),
             ModeEvent::TextCopied if self.copying => {
                 self.copying = false;
-                super::targeting::lifecycle_commands(
-                    &self.config.lifecycle.after_copy,
-                    &self.return_mode,
-                )
+                self.region
+                    .lifecycle_commands(&self.config.lifecycle.after_copy, &self.return_mode)
             }
             ModeEvent::TextSubmitted(None) | ModeEvent::TextEdit(EditAction::Cancel) => {
-                CommandBatch::one(Command::SwitchMode(self.return_mode.clone()))
+                CommandBatch::one(self.region.return_command(&self.return_mode))
             }
             ModeEvent::TextEdit(EditAction::Accept) => self.action(Action::Copy, ctx),
             ModeEvent::TextEdit(EditAction::Paste) => CommandBatch::one(Command::ReadClipboard),

@@ -26,6 +26,7 @@ pub mod idle;
 pub mod normal;
 pub(crate) mod normal_targeting;
 pub mod quick_switch;
+mod scan_region;
 pub(crate) mod targeting;
 pub mod text_input;
 pub mod text_select;
