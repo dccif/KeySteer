@@ -1,4 +1,49 @@
 #[test]
+fn area_scan_labels_survive_grid_and_display_edges() {
+    for name in ["grid", "recursive_grid", "bisect"] {
+        for action in ["u", "i"] {
+            for scale in [1.0, 2.0] {
+                for origin in [Point::new(0., 0.), Point::new(-1400., -200.)] {
+                    for (dx, dy) in [(-2000, -2000), (-2000, 2000), (2000, -2000), (2000, 2000)] {
+                        let mut config = Config::default();
+                        config.ui_hint.label_x_offset = dx;
+                        config.ui_hint.label_y_offset = dy;
+                        let mut engine = text_input_engine(config);
+                        let (mut backend, log) = FakeBackend::new(Vec::new());
+                        let screen = Rect::new(origin.x, origin.y, 1000., 800.);
+                        engine.screens = vec![Screen { bounds: screen, work_area: screen, is_primary: true, scale, name: None }];
+                        engine.cursor = screen.center();
+                        engine.activate(ModeId::new(name).unwrap(), Some(ModeId::normal()), &mut backend).unwrap();
+                        let step = match name { "grid" => "1", "recursive_grid" => "q", _ => "h" };
+                        point_keys(&mut engine, &mut backend, &[step]);
+                        point_keys(&mut engine, &mut backend, &[action]);
+                        let request = log.lock().unwrap().scan_requests.last().unwrap().clone();
+                        let area = request.bounds.unwrap();
+                        assert_ne!(area, screen);
+                        engine.handle_backend_event(BackendEvent::UiScanned(crate::api::UiScanResult {
+                            id: request.id, status: UiScanStatus::Partial, retired: vec![],
+                            targets: vec![crate::api::UiTarget::recognized_text(Rect::new(area.right()-3., area.bottom()-3., 2., 2.), "edge".into())],
+                        }), &mut backend).unwrap();
+                        let state = log.lock().unwrap();
+                        let scene = state.scenes.last().unwrap().materialized();
+                        assert_eq!(scene.clip, Some(screen), "{name} {action}");
+                        let labels: Vec<_> = scene.labels.iter().filter(|label| label.z_index < 10_000).collect();
+                        assert!(!labels.is_empty(), "{name} {action}");
+                        for label in labels {
+                            #[cfg(target_os = "windows")]
+                            let rect = crate::api::overlay::scaled_label_geometry(&label.text, label.rect, &label.style, scale).0;
+                            #[cfg(not(target_os = "windows"))]
+                            let rect = label.rect;
+                            assert!(rect.left() >= screen.left() && rect.top() >= screen.top() && rect.right() <= screen.right() && rect.bottom() <= screen.bottom(), "{name} {action} {scale}: {rect:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn grid_region_ui_hint_uses_the_selected_area_and_restores_it_on_cancel() {
     let screen = Rect::new(0.0, 0.0, 1000.0, 800.0);
     for (name, steps, expected) in [

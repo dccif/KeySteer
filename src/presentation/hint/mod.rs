@@ -89,6 +89,36 @@ pub(crate) fn placed_hint_rect(
     )
 }
 
+// Region capture bounds must not crop label badges. Plan and draw the same
+// shifted geometry, including Windows' centre-based DPI expansion.
+fn placed_content_rect(
+    content: &HintContent<'_>,
+    hint: &CompactHint<usize>,
+    style: &LabelStyle,
+    uniform_width: Option<f64>,
+) -> Rect {
+    let mut rect = placed_hint_rect(&content.style, hint, style, uniform_width);
+    if let Some(viewport) = content.label_bounds {
+        let visual = visual_layer_rect(rect, viewport.scale);
+        let bounds = viewport.bounds;
+        // Include the configured stroke and raster rounding at the display edge.
+        let margin = (style.border_width.max(0.0) * viewport.scale * 0.5)
+            .ceil()
+            .max(1.0);
+        let x = visual.x.clamp(
+            bounds.x + margin,
+            (bounds.right() - visual.width - margin).max(bounds.x + margin),
+        );
+        let y = visual.y.clamp(
+            bounds.y + margin,
+            (bounds.bottom() - visual.height - margin).max(bounds.y + margin),
+        );
+        rect.x += x - visual.x;
+        rect.y += y - visual.y;
+    }
+    rect
+}
+
 #[cfg(target_os = "windows")]
 pub(crate) fn visual_layer_scale(ctx: &HostContext<'_>, scan_bounds: Option<Rect>) -> f64 {
     let center = scan_bounds.unwrap_or_else(|| ctx.active_bounds()).center();
@@ -181,7 +211,7 @@ pub(crate) fn prepare_hints(
                 content.prefix.is_empty() || hint.label.as_str().starts_with(content.prefix)
             })
             .map(|(index, hint)| {
-                let rect = placed_hint_rect(&content.style, hint, &style, uniform_width);
+                let rect = placed_content_rect(&content, hint, &style, uniform_width);
                 (index, visual_layer_rect(rect, visual_scale))
             })
     };
@@ -262,7 +292,9 @@ impl HintView<'_> {
                     && base.clip
                         == self
                             .content
-                            .scan_bounds
+                            .label_bounds
+                            .map(|v| v.bounds)
+                            .or(self.content.scan_bounds)
                             .or_else(|| Some(ctx.active_bounds()))
             })
             && let Some(scene) = self.cached_scene(cache, ctx)
@@ -293,7 +325,9 @@ impl HintView<'_> {
         let mut scene = OverlayScene::with_capacity(shape_capacity, label_capacity);
         scene.clip = self
             .content
-            .scan_bounds
+            .label_bounds
+            .map(|v| v.bounds)
+            .or(self.content.scan_bounds)
             .or_else(|| Some(ctx.active_bounds()));
 
         let mut label_style = resolved_hint_label_style(&self.content.style, palette);
@@ -398,7 +432,7 @@ impl HintView<'_> {
                         continue;
                     }
                     let rect =
-                        placed_hint_rect(&self.content.style, hint, &label_style, uniform_width);
+                        placed_content_rect(&self.content, hint, &label_style, uniform_width);
                     if let Some(slots) = &mut draw_slots {
                         slots[hint.value] = labels.len();
                     }
@@ -599,7 +633,7 @@ impl HintView<'_> {
             [(0, &hints[..index]), (index + 1, &hints[index + 1..])]
         });
         let mut append = |hint: &CompactHint<usize>, z_index| {
-            let rect = placed_hint_rect(&self.content.style, hint, style, uniform_width);
+            let rect = placed_content_rect(&self.content, hint, style, uniform_width);
             labels.push(OverlayLabel {
                 matched_prefix_len,
                 z_index,
@@ -658,7 +692,7 @@ impl HintView<'_> {
         }
         if let Some(index) = focused_index {
             let hint = &hints[index];
-            let rect = placed_hint_rect(&self.content.style, hint, style, uniform_width);
+            let rect = placed_content_rect(&self.content, hint, style, uniform_width);
             let mut highlighted = (**style).clone();
             self.content
                 .style
@@ -687,7 +721,7 @@ impl HintView<'_> {
         let top = self.layers.layer_count();
         let mut selected = None;
         let mut append = |hint: &CompactHint<usize>, rank: usize| {
-            let rect = placed_hint_rect(&self.content.style, hint, style, uniform_width);
+            let rect = placed_content_rect(&self.content, hint, style, uniform_width);
             if let Some(slots) = &mut draw_slots {
                 slots[hint.value] = labels.len();
             }

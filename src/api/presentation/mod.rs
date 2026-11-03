@@ -185,6 +185,25 @@ pub struct HintStyle<'a> {
 }
 
 #[derive(Clone, Copy)]
+pub struct HintLabelBounds {
+    pub bounds: Rect,
+    pub scale: f64,
+}
+
+impl HintLabelBounds {
+    pub fn new(bounds: Rect, screen_scale: f64) -> Self {
+        Self {
+            bounds,
+            scale: if cfg!(target_os = "windows") && screen_scale.is_finite() {
+                screen_scale.max(1.0)
+            } else {
+                1.0
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 pub struct HintContent<'a> {
     pub hints: &'a [CompactHint<usize>],
     /// Character count shared by the retained label code space, if uniform.
@@ -194,6 +213,8 @@ pub struct HintContent<'a> {
     pub search: Option<&'a str>,
     pub search_selection: crate::api::text_edit::Selection,
     pub scan_bounds: Option<Rect>,
+    /// Optional display bounds for region-scan labels, independent of capture.
+    pub label_bounds: Option<HintLabelBounds>,
     pub style: HintStyle<'a>,
 }
 
@@ -209,15 +230,14 @@ pub struct HintView<'a> {
     pub active_layer: Option<usize>,
 }
 
-pub struct TextChip<'a> {
-    pub code: &'a str,
-    pub text: &'a str,
-    pub selected: bool,
-}
 pub struct TextSelectView<'a> {
     pub hints: HintView<'a>,
     pub ui: &'a CompiledSearchPanel,
-    pub chips: &'a [TextChip<'a>],
+    /// Page-local hints index the original units and selection, without a
+    /// temporary array of borrowed chip data on each redraw.
+    pub chips: &'a [super::hint::CompactHint<usize>],
+    pub unit_text: &'a str,
+    pub units: &'a [std::ops::Range<usize>],
     pub grid_min_width: f64,
     pub text: &'a str,
     pub status: &'a str,

@@ -53,6 +53,20 @@ impl ScanRegionSession {
         self.bounded
     }
 
+    pub fn label_bounds(
+        &self,
+        ctx: &HostContext<'_>,
+        current: Option<Rect>,
+    ) -> Option<crate::api::presentation::HintLabelBounds> {
+        self.bounds(current).map(|area| {
+            let screen = Screen::containing(ctx.screens, &area.center());
+            crate::api::presentation::HintLabelBounds::new(
+                screen.map_or_else(|| ctx.active_bounds(), |screen| screen.bounds),
+                screen.map_or(1.0, |screen| screen.scale),
+            )
+        })
+    }
+
     pub fn area(
         &self,
         ctx: &HostContext<'_>,

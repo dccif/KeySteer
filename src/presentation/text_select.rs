@@ -13,6 +13,16 @@ struct ChipStyles {
 }
 
 impl TextSelectView<'_> {
+    fn chips(&self) -> impl ExactSizeIterator<Item = (&str, &str, bool)> {
+        self.chips.iter().map(|hint| {
+            (
+                hint.label.as_str(),
+                &self.unit_text[self.units[hint.value].clone()],
+                self.selected[hint.value],
+            )
+        })
+    }
+
     pub(crate) fn scene(self, ctx: &HostContext<'_>) -> OverlayScene {
         let (input, _) = super::hint::input_panel(
             self.hints.content.style.search_input_ui,
@@ -71,7 +81,7 @@ impl TextSelectView<'_> {
             .floor()
             .max(1.0) as usize;
         let cells = chip_layout(
-            self.chips,
+            self.chips(),
             width,
             font,
             scale,
@@ -173,17 +183,17 @@ impl TextSelectView<'_> {
         // Each word takes its own width; one long word never widens the whole grid.
         // Share styles only within this scene, creating each checked state on demand.
         let mut chip_styles = [None, None];
-        for (chip, cell) in self.chips.iter().zip(cells) {
+        for ((code, text, selected), cell) in self.chips().zip(cells) {
             let rect = Rect::new(
                 x + cell.x,
                 y + cell.y,
                 cell.width - 4.0 * scale,
                 chip_height - 4.0 * scale,
             );
-            let styles = chip_styles[usize::from(chip.selected)].get_or_insert_with(|| {
+            let styles = chip_styles[usize::from(selected)].get_or_insert_with(|| {
                 let mut style = (*text_style).clone();
                 style.background = base.background;
-                if chip.selected {
+                if selected {
                     highlight.apply(&mut style, ctx.palette);
                 }
                 let background = style.background;
@@ -212,13 +222,13 @@ impl TextSelectView<'_> {
                 corner_radius: 3.0 * scale,
                 z_index: 10_001,
             });
-            let mut code = OverlayText::from(if chip.selected { "✓ " } else { "" });
-            for ch in chip.code.chars().flat_map(char::to_uppercase) {
-                code.push(ch);
+            let mut label = OverlayText::from(if selected { "✓ " } else { "" });
+            for ch in code.chars().flat_map(char::to_uppercase) {
+                label.push(ch);
             }
             scene.push_label(
                 OverlayLabel::new(
-                    code,
+                    label,
                     Rect::new(
                         rect.x + 4.0 * scale,
                         rect.y + 2.0 * scale,
@@ -230,10 +240,9 @@ impl TextSelectView<'_> {
                 .with_fixed_bounds()
                 .with_z_index(10_002),
             );
-            let (first, more) =
-                preview_lines(chip.text, (rect.width - 8.0 * scale) / (font * 1.35))
-                    .next()
-                    .unwrap_or_default();
+            let (first, more) = preview_lines(text, (rect.width - 8.0 * scale) / (font * 1.35))
+                .next()
+                .unwrap_or_default();
             let mut text = OverlayText::from(first);
             if more {
                 text.push('…');
@@ -293,8 +302,8 @@ fn bounded_preview(text: &str) -> &str {
 
 /// Ordered row packing, bounded to the screen's available height. On short
 /// screens only oversized cells are capped; their text is elided when painted.
-fn chip_layout(
-    chips: &[crate::api::presentation::TextChip<'_>],
+fn chip_layout<'a>(
+    chips: impl ExactSizeIterator<Item = (&'a str, &'a str, bool)>,
     width: f64,
     font: f64,
     scale: f64,
@@ -307,12 +316,11 @@ fn chip_layout(
             .map(|g| if g.is_ascii() { 0.75 } else { 1.0 })
             .sum::<f64>()
     };
+    let count = chips.len();
     let mut cells: Vec<_> = chips
-        .iter()
-        .map(|chip| {
+        .map(|(code, text, _)| {
             // Reserve the checkmark even for unchecked cells, so toggling is stable.
-            let natural = ((advance(chip.text) * font * 1.35)
-                .max((advance(chip.code) + 1.5) * font * 0.7)
+            let natural = ((advance(text) * font * 1.35).max((advance(code) + 1.5) * font * 0.7)
                 + 16.0 * scale)
                 .max(min_width * scale)
                 .min(width);
@@ -340,7 +348,7 @@ fn chip_layout(
     {
         pack(
             &mut cells,
-            width / chips.len().div_ceil(max_rows.max(1)).max(1) as f64,
+            width / count.div_ceil(max_rows.max(1)).max(1) as f64,
         );
     }
     cells
@@ -375,7 +383,6 @@ fn preview_lines(text: &str, capacity: f64) -> impl Iterator<Item = (&str, bool)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::presentation::TextChip;
 
     #[test]
     fn word_cards_pack_individually_and_checks_do_not_move_them() {
@@ -392,39 +399,32 @@ mod tests {
             "e\u{301}",
         ]
         .into_iter()
-        .map(|text| TextChip {
-            code: "a",
-            text,
-            selected: true,
-        })
+        .map(|text| ("a", text, true))
         .collect();
-        let layout = chip_layout(&chips, 480., 14., 1., 48., 58., 8);
+        let layout = chip_layout(chips.iter().copied(), 480., 14., 1., 48., 58., 8);
         assert!(layout.iter().take_while(|cell| cell.y == 0.).count() > 3);
         assert!(layout[6].width > layout[0].width * 2.);
         for cell in &layout {
             assert!(cell.x >= 0. && cell.right() <= 480.001);
         }
-        chips[0].selected = false;
-        assert_eq!(layout, chip_layout(&chips, 480., 14., 1., 48., 58., 8));
+        chips[0].2 = false;
+        assert_eq!(
+            layout,
+            chip_layout(chips.iter().copied(), 480., 14., 1., 48., 58., 8)
+        );
     }
 
     #[test]
     fn character_density_scales_and_short_screens_keep_every_card() {
-        let chips: Vec<_> = (0..24)
-            .map(|_| TextChip {
-                code: "a",
-                text: "中",
-                selected: true,
-            })
-            .collect();
+        let chips: Vec<_> = (0..24).map(|_| ("a", "中", true)).collect();
         let columns = |layout: &[Rect]| layout.iter().take_while(|cell| cell.y == 0.).count();
-        let compact = chip_layout(&chips, 480., 14., 1., 40., 58., 8);
+        let compact = chip_layout(chips.iter().copied(), 480., 14., 1., 40., 58., 8);
         assert_eq!(columns(&compact), 12);
-        let roomy = chip_layout(&chips, 480., 14., 1., 80., 58., 8);
+        let roomy = chip_layout(chips.iter().copied(), 480., 14., 1., 80., 58., 8);
         assert_eq!(columns(&roomy), 6);
-        let scaled = chip_layout(&chips, 960., 28., 2., 40., 116., 8);
+        let scaled = chip_layout(chips.iter().copied(), 960., 28., 2., 40., 116., 8);
         assert_eq!(columns(&scaled), columns(&compact));
-        let short = chip_layout(&chips, 480., 14., 1., 240., 58., 2);
+        let short = chip_layout(chips.iter().copied(), 480., 14., 1., 240., 58., 2);
         assert_eq!(short.len(), 24);
         assert!(
             short

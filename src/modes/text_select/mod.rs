@@ -11,8 +11,7 @@ use crate::api::{
     ModeId, Palette, Rect, UiScanRequest, UiScanStrategy,
     command::{UiScanResult, UiScanStatus},
     presentation::{
-        HintContent, HintSceneCache, HintStyle, HintView, TextChip, TextSelectView, View,
-        VisualLayerPlan,
+        HintContent, HintSceneCache, HintStyle, HintView, TextSelectView, View, VisualLayerPlan,
     },
     text_edit::{EditAction, Selection},
     text_select::{Action, Lifecycle, Request, Segmented},
@@ -531,7 +530,9 @@ impl TextSelectMode {
         } else {
             Level::Characters
         };
-        let next = self.frame.descend(level);
+        // Filtering and preview reconciliation already wrote the exact copy
+        // selection to output. Snapshot it without joining the selection again.
+        let next = Frame::refined(&self.output, level);
         self.history.push(std::mem::replace(&mut self.frame, next));
         self.frozen = true;
         self.pending_segment = level == Level::Words;
@@ -859,6 +860,7 @@ impl TextSelectMode {
                 search: Some(&self.search.search_query),
                 search_selection: self.search.search_selection,
                 scan_bounds: self.bounds,
+                label_bounds: self.region.label_bounds(ctx, self.bounds),
                 style: HintStyle {
                     ui: &config.ui,
                     placement: config.placement,
@@ -949,6 +951,7 @@ impl TextSelectMode {
                 search: Some(&self.search.search_query),
                 search_selection: self.search.search_selection,
                 scan_bounds: self.bounds,
+                label_bounds: self.region.label_bounds(ctx, self.bounds),
                 style,
             },
             layers: &self.layers,
@@ -971,17 +974,10 @@ impl TextSelectMode {
         {
             return Command::ShowOverlay(Arc::new(ctx.presenter.compose(View::Hints(hints), ctx)));
         }
-        let chips: Vec<_> = if self.frame.level != Level::Regions && !self.pending_segment {
+        let chips = if self.frame.level != Level::Regions && !self.pending_segment {
             panel_hints(&self.search.hints, self.page)
-                .iter()
-                .map(|hint| TextChip {
-                    code: hint.label.as_str(),
-                    text: &self.frame.text[self.frame.units[hint.value].clone()],
-                    selected: self.frame.selected[hint.value],
-                })
-                .collect()
         } else {
-            Vec::new()
+            &[]
         };
         let status = if self.pending_segment {
             "Segmenting words…"
@@ -1002,7 +998,9 @@ impl TextSelectMode {
             View::TextSelect(TextSelectView {
                 hints,
                 ui: &self.config.hint.search_info_ui,
-                chips: &chips,
+                chips,
+                unit_text: &self.frame.text,
+                units: &self.frame.units,
                 grid_min_width: f64::from(if self.frame.level == Level::Characters {
                     self.config.ui.char_min_width
                 } else {

@@ -219,7 +219,8 @@ impl Frame {
         self.selected.fill(true);
     }
 
-    pub fn selected_text(&self) -> String {
+    #[cfg(test)]
+    fn selected_text(&self) -> String {
         let mut text = String::new();
         self.write_selected_text(&mut text);
         text
@@ -266,8 +267,8 @@ impl Frame {
         }
     }
 
-    pub fn descend(&self, level: Level) -> Self {
-        let text: Arc<str> = self.selected_text().into();
+    pub fn refined(text: &str, level: Level) -> Self {
+        let text: Arc<str> = text.into();
         // Words arrive asynchronously; provisional character choices would
         // never be displayed or selectable before apply_words replaces them.
         let units = if level == Level::Characters {
@@ -399,7 +400,7 @@ mod tests {
         ]);
         root.toggle(0);
         assert_eq!(root.region_bounds, [first.union(&last)]);
-        let mut words = root.descend(Level::Words);
+        let mut words = Frame::refined(&root.selected_text(), Level::Words);
         words.apply_words(&[0..2, 3..5, 6..12]);
         assert_eq!(words.selected_text(), "iW iW e\u{301}中");
         assert!(words.region_bounds.is_empty());
@@ -407,7 +408,7 @@ mod tests {
         words.toggle(0);
         words.toggle(2);
         let snapshot = words.clone();
-        let mut chars = words.descend(Level::Characters);
+        let mut chars = Frame::refined(&words.selected_text(), Level::Characters);
         assert_eq!(chars.selected_text(), "iW e\u{301}中");
         assert!(chars.region_bounds.is_empty());
         chars.clear_selection();
@@ -426,10 +427,10 @@ mod tests {
         )]);
         let mut root = root;
         root.toggle(0);
-        let mut words = root.descend(Level::Words);
+        let mut words = Frame::refined(&root.selected_text(), Level::Words);
         words.apply_words(&[0..6, 6..12, 15..21]);
         assert_eq!(words.selected_text(), root.selected_text());
-        let mut chars = words.descend(Level::Characters);
+        let mut chars = Frame::refined(&words.selected_text(), Level::Characters);
         assert!(chars.units.iter().any(|u| &chars.text[u.clone()] == "👨‍👩‍👧‍👦"));
         assert!(
             chars
@@ -563,10 +564,13 @@ mod tests {
         frame.select_all();
         let expected = "复制文字，测试。English words\n\n另一段";
         assert_eq!(frame.selected_text(), expected);
-        let mut words = frame.descend(Level::Words);
+        let mut words = Frame::refined(&frame.selected_text(), Level::Words);
         words.apply_words(&[]);
         assert_eq!(words.selected_text(), expected);
-        assert_eq!(words.descend(Level::Characters).selected_text(), expected);
+        assert_eq!(
+            Frame::refined(&words.selected_text(), Level::Characters).selected_text(),
+            expected
+        );
     }
 
     #[test]
@@ -576,7 +580,7 @@ mod tests {
             "hello".into(),
         )]);
         root.toggle(0);
-        let mut chars = root.descend(Level::Characters);
+        let mut chars = Frame::refined(&root.selected_text(), Level::Characters);
         chars.clear_selection();
         chars.toggle(0);
         chars.toggle(4);

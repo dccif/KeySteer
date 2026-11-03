@@ -507,6 +507,7 @@ impl HintMode {
             &self.session.hints,
             &self.input,
             self.session.scan_bounds,
+            self.region.label_bounds(ctx, self.session.scan_bounds),
             self.session.search_selection,
             self.uniform_label_chars(),
         );
@@ -600,7 +601,7 @@ impl HintMode {
         })
     }
 
-    fn view(&self) -> View<'_> {
+    fn view(&self, ctx: &HostContext<'_>) -> View<'_> {
         if self.session.search_pending {
             View::Status(StatusView {
                 text: "Preparing search…",
@@ -640,6 +641,7 @@ impl HintMode {
                     &self.session.hints,
                     &self.input,
                     self.session.scan_bounds,
+                    self.region.label_bounds(ctx, self.session.scan_bounds),
                     self.session.search_selection,
                     self.uniform_label_chars(),
                 ),
@@ -660,7 +662,7 @@ impl HintMode {
             return;
         };
         let view = match pending {
-            PendingView::Hints => self.view(),
+            PendingView::Hints => self.view(ctx),
             PendingView::Status => View::Status(StatusView {
                 text: self
                     .session
@@ -1131,6 +1133,7 @@ fn hint_content<'a>(
     hints: &'a [CompactHint<usize>],
     input: &'a Input,
     scan_bounds: Option<Rect>,
+    label_bounds: Option<crate::api::presentation::HintLabelBounds>,
     search_selection: crate::api::text_edit::Selection,
     uniform_label_chars: Option<usize>,
 ) -> HintContent<'a> {
@@ -1145,6 +1148,7 @@ fn hint_content<'a>(
         search,
         search_selection,
         scan_bounds,
+        label_bounds,
         style: hint_style(config),
     }
 }
@@ -1481,6 +1485,7 @@ impl HintMode {
                     &self.session.hints,
                     &self.input,
                     self.session.scan_bounds,
+                    self.region.label_bounds(ctx, self.session.scan_bounds),
                     self.session.search_selection,
                     self.uniform_label_chars(),
                 );
@@ -3053,7 +3058,7 @@ mod tests {
                 }
                 assert!(!mode.scene_cache.needs_warm());
                 for _ in 0..mode.session.hints.len() {
-                    let View::Hints(mut view) = mode.view() else {
+                    let View::Hints(mut view) = mode.view(&env.ctx()) else {
                         panic!("hints")
                     };
                     view.cache = None;
@@ -3112,7 +3117,7 @@ mod tests {
                 mode.handle(&ModeEvent::CyclePointTarget, &env.ctx());
             }
             let compare = |mode: &HintMode| {
-                let View::Hints(mut view) = mode.view() else {
+                let View::Hints(mut view) = mode.view(&env.ctx()) else {
                     panic!("hints")
                 };
                 view.cache = None;
@@ -3226,7 +3231,7 @@ mod tests {
             );
             assert!(frame.labels.len() <= 14);
             assert!(retained.omitted_label.is_some());
-            let View::Hints(mut view) = mode.view() else {
+            let View::Hints(mut view) = mode.view(&env.ctx()) else {
                 panic!("hint view")
             };
             view.cache = None;
@@ -3332,7 +3337,7 @@ mod tests {
                     .and_then(|info| info.hints.first().map(|hint| hint.value)),
                 current
             );
-            let View::Hints(mut view) = mode.view() else {
+            let View::Hints(mut view) = mode.view(&env.ctx()) else {
                 panic!("hint view")
             };
             view.cache = None;
@@ -3449,7 +3454,7 @@ mod tests {
             .iter()
             .find(|hint| hint.label != *current)
             .unwrap();
-        let View::Hints(mut view) = mode.view() else {
+        let View::Hints(mut view) = mode.view(&env.ctx()) else {
             panic!("hint view")
         };
         // A stale preview outside the visible prefix must never add a label.
@@ -3986,7 +3991,7 @@ mod tests {
     use crate::presentation::hint::visually_stacked;
     impl HintMode {
         fn scene(&self, ctx: &HostContext<'_>) -> OverlayScene {
-            ctx.presenter.compose(self.view(), ctx).materialized()
+            ctx.presenter.compose(self.view(ctx), ctx).materialized()
         }
         fn resolved_hint_label_style(&self, palette: &Palette) -> LabelStyle {
             crate::presentation::hint::resolved_hint_label_style(&hint_style(&self.config), palette)
@@ -4101,7 +4106,7 @@ mod tests {
         press(&mut mode, &env, "/");
         mode.handle(&ModeEvent::TextChanged("Control 0".into()), &env.ctx());
         assert_eq!(mode.uniform_label_chars(), Some(2));
-        let View::Hints(mut view) = mode.view() else {
+        let View::Hints(mut view) = mode.view(&env.ctx()) else {
             panic!()
         };
         let optimized = view.scene(&env.ctx());
@@ -4611,7 +4616,7 @@ mod tests {
         assert_eq!(mode.session.scanned.len(), 1);
         assert_eq!(mode.session.scanned[0].name, "inside");
         assert_eq!(scene_of(&out).labels.len(), 1);
-        assert_eq!(scene_of(&out).clip, Some(area));
+        assert_eq!(scene_of(&out).clip, Some(env.screens[0].bounds));
         env.cursor = Point::new(2000.0, 2000.0);
         assert!(
             !mode
@@ -4973,7 +4978,7 @@ mod tests {
         assert!(mode.session.search_pending);
         assert_eq!(mode.session.search_text.len(), 2 * SEARCH_PREWARM_TARGETS);
         assert!(mode.point_candidates().is_empty());
-        assert!(matches!(mode.view(), View::Status(_)));
+        assert!(matches!(mode.view(&env.ctx()), View::Status(_)));
         for _ in 0..3 {
             let before = mode.session.search_text.len();
             mode.handle(&warm, &env.ctx());
