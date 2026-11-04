@@ -5,6 +5,10 @@ outline: 2
 
 # Release notes
 
+## 0.15.5
+
+- Reduced repeated traversal and temporary allocations when UI Hint updates information for a target at the same position.
+
 ## 0.15.3
 
 - In Grid, Recursive Grid, and Bisect, press `U` for UI Hint or `I` for Text Select within the current grid area. Use `Alt+C` to refine the text selection.

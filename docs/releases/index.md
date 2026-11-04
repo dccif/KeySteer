@@ -5,6 +5,12 @@ outline: 2
 
 # 更新日志 / Release Notes
 
+## 0.15.5
+
+- 优化 UI Hint 对同一位置目标信息的更新，减少重复遍历和临时内存分配。
+
+- Reduced repeated traversal and temporary allocations when UI Hint updates information for a target at the same position.
+
 ## 0.15.3
 
 - Grid、Recursive Grid 和 Bisect 中按 `U` 可在当前网格区域显示 UI Hint，按 `I` 可在该区域选择文字；文字可用 `Alt+C` 逐级细分。

@@ -200,24 +200,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn instructions_name_a_concrete_next_step() {
+    fn instructions_are_plain_and_explain_accessibility_recovery() {
         let text = instructions();
         assert!(text.contains("Privacy & Security > Accessibility"));
         // Must always end with something the user can act on.
         assert!(text.contains("restart") || text.contains("reopen"));
-    }
-
-    #[test]
-    fn instructions_mention_the_stale_signature_case() {
         // A rebuild silently invalidates the grant; users get stuck here.
-        assert!(instructions().contains("toggle it off and on"));
-    }
-
-    #[test]
-    fn instructions_carry_no_escape_codes_when_redirected() {
+        assert!(text.contains("toggle it off and on"));
         // Test output is not a terminal, so the text must be plain.
         assert!(
-            !instructions().contains('\x1b'),
+            !text.contains('\x1b'),
             "escape codes would corrupt a log file"
         );
     }

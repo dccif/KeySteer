@@ -288,31 +288,23 @@ fn region_scan_switches_reject_late_results_from_the_other_mode() {
 }
 
 #[test]
-fn region_ui_hint_does_not_suspend_the_grid_if_hint_is_disabled() {
-    let mut config = Config::default();
-    config.ui_hint.enabled = false;
-    let mut engine = text_input_engine(config);
-    let (mut backend, log) = FakeBackend::new(Vec::new());
-    engine.screens = backend.screens().unwrap();
-    engine.activate(ModeId::grid(), Some(ModeId::normal()), &mut backend).unwrap();
-    point_keys(&mut engine, &mut backend, &["u"]);
-    assert_eq!(engine.active_mode(), &ModeId::grid());
-    assert!(log.lock().unwrap().scan_requests.is_empty());
-    assert!(engine.registry.modal_stack.is_empty());
-}
-
-#[test]
-fn region_text_select_does_not_suspend_the_grid_if_disabled() {
-    let mut config = Config::default();
-    config.text_select.enabled = false;
-    let mut engine = text_input_engine(config);
-    let (mut backend, log) = FakeBackend::new(Vec::new());
-    engine.screens = backend.screens().unwrap();
-    engine.activate(ModeId::grid(), Some(ModeId::normal()), &mut backend).unwrap();
-    point_keys(&mut engine, &mut backend, &["i"]);
-    assert_eq!(engine.active_mode(), &ModeId::grid());
-    assert!(log.lock().unwrap().scan_requests.is_empty());
-    assert!(engine.registry.modal_stack.is_empty());
+fn disabled_area_scan_modes_leave_the_grid_active() {
+    for (hint, key) in [(true, "u"), (false, "i")] {
+        let mut config = Config::default();
+        if hint {
+            config.ui_hint.enabled = false;
+        } else {
+            config.text_select.enabled = false;
+        }
+        let mut engine = text_input_engine(config);
+        let (mut backend, log) = FakeBackend::new(Vec::new());
+        engine.screens = backend.screens().unwrap();
+        engine.activate(ModeId::grid(), Some(ModeId::normal()), &mut backend).unwrap();
+        point_keys(&mut engine, &mut backend, &[key]);
+        assert_eq!(engine.active_mode(), &ModeId::grid(), "{key}");
+        assert!(log.lock().unwrap().scan_requests.is_empty(), "{key}");
+        assert!(engine.registry.modal_stack.is_empty(), "{key}");
+    }
 }
 
 #[test]
@@ -674,32 +666,17 @@ fn bindings_are_scoped_to_the_mode_that_declares_them() {
 }
 
 #[test]
-fn pressing_an_active_modes_own_key_returns_to_idle() {
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let mut engine = engine_with_probes(&seen, &[]);
+fn normal_exit_bindings_return_to_idle() {
+    for key in ["q", "esc"] {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = engine_with_probes(&seen, &[]);
+        let mut script = enter_normal();
+        script.extend([key_down(key), key_up(key)]);
+        let (mut backend, _) = FakeBackend::new(script);
+        engine.run(&mut backend).unwrap();
 
-    // Enter normal, then use its bare q exit binding.
-    let mut script = enter_normal();
-    script.push(key_down("q"));
-    script.push(key_up("q"));
-    let (mut backend, _) = FakeBackend::new(script);
-    engine.run(&mut backend).unwrap();
-
-    assert_eq!(engine.active_mode().as_str(), "idle");
-}
-
-#[test]
-fn escape_binding_returns_to_idle() {
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let mut engine = engine_with_probes(&seen, &[]);
-
-    let mut script = enter_normal();
-    script.push(key_down("q"));
-    script.push(key_up("q"));
-    let (mut backend, _) = FakeBackend::new(script);
-    engine.run(&mut backend).unwrap();
-
-    assert_eq!(engine.active_mode().as_str(), "idle");
+        assert_eq!(engine.active_mode().as_str(), "idle", "{key}");
+    }
 }
 
 #[test]

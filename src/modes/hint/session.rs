@@ -160,6 +160,22 @@ impl ScanSession {
         if targets.is_empty() && retired.is_empty() {
             return (false, true);
         }
+        // A single same-geometry refinement is common when OCR enriches an
+        // existing control. Avoid mapping and traversing every other target.
+        if targets.len() == 1 && retired == [targets[0].rect] {
+            self.ensure_scan_index();
+            if let Some(index) = self.unique_region_index(retired[0]) {
+                let changed = self.replace_target(index, &mut targets[0]);
+                self.metadata_only = changed;
+                let stable = crate::api::hint::LabelPlan::for_stream(
+                    self.label_plan_count,
+                    alphabet.len(),
+                    direction,
+                )
+                .is_some();
+                return (changed, stable);
+            }
+        }
         let mut removed_hints = Vec::new();
         let before = self.scanned.len();
         let mut first_changed = before;
@@ -206,8 +222,6 @@ impl ScanSession {
                 }));
                 self.rebuild_target_lookup();
                 self.invalidate_search_names();
-            } else if first_changed < before {
-                self.search_names_initialized = false;
             }
         }
         let retained = self.scanned.len();
@@ -329,19 +343,7 @@ impl ScanSession {
     fn replace_same_regions(&mut self, targets: &mut Vec<UiTarget>, remap: &mut [usize]) -> usize {
         const AMBIGUOUS: usize = usize::MAX - 1;
         for (incoming, target) in targets.iter().enumerate() {
-            let Some(&head) = self.seen_targets.get(&rect_hash(target.rect)) else {
-                continue;
-            };
-            let mut index = head;
-            let mut found = None;
-            while index != usize::MAX {
-                if self.scanned[index].rect == target.rect && found.replace(index).is_some() {
-                    found = None;
-                    break;
-                }
-                index = self.next_same_rect[index];
-            }
-            if let Some(index) = found {
+            if let Some(index) = self.unique_region_index(target.rect) {
                 remap[index] = match remap[index] {
                     0 => 0,
                     usize::MAX => incoming + 1,
@@ -361,14 +363,8 @@ impl ScanSession {
                 _ => {}
             }
             let incoming = *marker - 1;
-            if self.scanned[index] != targets[incoming] {
-                std::mem::swap(&mut self.scanned[index], &mut targets[incoming]);
+            if self.replace_target(index, &mut targets[incoming]) {
                 first_changed = first_changed.min(index);
-                if let Some(text) = self.search_text.get_mut(index)
-                    && text.invalidate()
-                {
-                    self.search_dirty.push(index);
-                }
             }
             *marker = 0;
             consumed.push(incoming);
@@ -385,6 +381,32 @@ impl ScanSession {
             });
         }
         first_changed
+    }
+
+    fn unique_region_index(&self, rect: Rect) -> Option<usize> {
+        let mut index = *self.seen_targets.get(&rect_hash(rect))?;
+        let mut found = None;
+        while index != usize::MAX {
+            if self.scanned[index].rect == rect && found.replace(index).is_some() {
+                return None;
+            }
+            index = self.next_same_rect[index];
+        }
+        found
+    }
+
+    fn replace_target(&mut self, index: usize, target: &mut UiTarget) -> bool {
+        if self.scanned[index] == *target {
+            return false;
+        }
+        std::mem::swap(&mut self.scanned[index], target);
+        if let Some(text) = self.search_text.get_mut(index)
+            && text.invalidate()
+        {
+            self.search_dirty.push(index);
+        }
+        self.search_names_initialized = false;
+        true
     }
 
     fn rebuild_target_lookup(&mut self) {
@@ -949,6 +971,106 @@ mod tests {
         assert!(session.search_text[1].matches("2", ""));
         session.clear_results();
         assert_eq!(session.search_dirty.capacity(), 8);
+    }
+
+    #[test]
+    fn single_metadata_update_matches_general_retirement_path() {
+        let alphabet = ['a', 's', 'd'];
+        for direction in [LabelDirection::Normal, LabelDirection::Reverse] {
+            for geometry in ["unique", "same_key", "ambiguous"] {
+                for changed in [false, true] {
+                    for valid_plan in [false, true] {
+                        for prepared in [0, 1, usize::MAX] {
+                            for released in [false, true] {
+                                let make_session = || {
+                                    let mut session = labeled_session(16, &alphabet, direction);
+                                    if geometry != "unique" {
+                                        session.scanned[1].rect = session.scanned[0].rect;
+                                        if geometry == "same_key" {
+                                            session.scanned[1].rect.x += 0.01;
+                                        }
+                                        session.hints[1].bounds = session.scanned[1].rect;
+                                        session.rebuild_target_lookup();
+                                    }
+                                    session.prepare_search_names(prepared);
+                                    if released {
+                                        session.release_scan_index();
+                                    }
+                                    if !valid_plan {
+                                        session.label_plan_count = 0;
+                                    }
+                                    session
+                                };
+                                let mut direct = make_session();
+                                let mut general = make_session();
+                                let mut target = direct.scanned[0].clone();
+                                if changed {
+                                    target.name = "new caption".into();
+                                }
+                                let rect = target.rect;
+                                let direct_result = direct.apply_stable_update(
+                                    vec![target.clone()],
+                                    &[rect],
+                                    &alphabet,
+                                    direction,
+                                    true,
+                                );
+                                let general_result = general.apply_stable_update(
+                                    vec![target],
+                                    &[rect, Rect::new(-1000.0, -1000.0, 1.0, 1.0)],
+                                    &alphabet,
+                                    direction,
+                                    true,
+                                );
+                                assert_eq!(direct_result, general_result);
+                                assert_eq!(direct.scanned, general.scanned);
+                                assert_eq!(direct.metadata_only, general.metadata_only);
+                                assert_eq!(direct.search_dirty, general.search_dirty);
+                                assert_eq!(
+                                    direct.search_names_initialized,
+                                    general.search_names_initialized
+                                );
+                                assert_eq!(direct.next_label_index, general.next_label_index);
+                                let hints = |session: &ScanSession| {
+                                    session
+                                        .hints
+                                        .iter()
+                                        .map(|hint| (hint.label.clone(), hint.bounds, hint.value))
+                                        .collect::<Vec<_>>()
+                                };
+                                assert_eq!(hints(&direct), hints(&general));
+                                direct.ensure_search_names();
+                                general.ensure_search_names();
+                                assert_eq!(direct.search_text.len(), general.search_text.len());
+                                for (a, b) in direct.search_text.iter().zip(&general.search_text) {
+                                    for term in ["new", "caption", "0", "1"] {
+                                        assert_eq!(a.matches_text(term), b.matches_text(term));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "allocation counter requires isolated execution"]
+    fn single_metadata_update_uses_no_target_count_sized_allocation() {
+        let alphabet = ['a', 's', 'd'];
+        let mut session = labeled_session(2_048, &alphabet, LabelDirection::Normal);
+        session.ensure_search_names();
+        let mut target = session.scanned[0].clone();
+        target.name = "new caption".into();
+        let rect = target.rect;
+        let incoming = vec![target];
+        let region = stats_alloc::Region::new(crate::TEST_ALLOCATOR);
+        let result =
+            session.apply_stable_update(incoming, &[rect], &alphabet, LabelDirection::Normal, true);
+        let stats = region.change();
+        assert_eq!(result, (true, true));
+        assert_eq!(stats.allocations + stats.reallocations, 0, "{stats:?}");
     }
 
     #[test]
