@@ -5,6 +5,10 @@ outline: 2
 
 # Release notes
 
+## 0.15.6
+
+- Raised the minimum Rust version to 1.100 and updated Rust and documentation dependencies.
+
 ## 0.15.5
 
 - Reduced repeated traversal and temporary allocations when UI Hint updates information for a target at the same position.

@@ -5,6 +5,12 @@ outline: 2
 
 # 更新日志 / Release Notes
 
+## 0.15.6
+
+- 升级 Rust 最低版本至 1.100，并更新 Rust 与文档依赖。
+
+- Raised the minimum Rust version to 1.100 and updated Rust and documentation dependencies.
+
 ## 0.15.5
 
 - 优化 UI Hint 对同一位置目标信息的更新，减少重复遍历和临时内存分配。
